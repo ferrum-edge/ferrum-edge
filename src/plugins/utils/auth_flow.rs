@@ -52,6 +52,66 @@ pub enum VerifyOutcome {
     Internal(String),
 }
 
+impl VerifyOutcome {
+    pub fn success(
+        consumer: Option<Arc<Consumer>>,
+        external_identity: Option<String>,
+        external_identity_header: Option<String>,
+    ) -> Self {
+        Self::Success {
+            consumer,
+            external_identity,
+            external_identity_header,
+        }
+    }
+
+    pub fn consumer(consumer: Arc<Consumer>) -> Self {
+        Self::success(Some(consumer), None, None)
+    }
+}
+
+macro_rules! impl_auth_plugin {
+    (
+        $ty:ty,
+        $name:literal,
+        $priority:expr,
+        $protocols:expr,
+        $runner:path
+        $(; $($extra:tt)*)?
+    ) => {
+        #[async_trait::async_trait]
+        impl crate::plugins::Plugin for $ty {
+            fn name(&self) -> &str {
+                $name
+            }
+
+            fn is_auth_plugin(&self) -> bool {
+                true
+            }
+
+            fn priority(&self) -> u16 {
+                $priority
+            }
+
+            fn supported_protocols(&self) -> &'static [crate::plugins::ProxyProtocol] {
+                $protocols
+            }
+
+            async fn authenticate(
+                &self,
+                ctx: &mut crate::plugins::RequestContext,
+                consumer_index: &crate::consumer_index::ConsumerIndex,
+            ) -> crate::plugins::PluginResult {
+                $runner(self, ctx, consumer_index).await
+            }
+
+            $($($extra)*)?
+        }
+    };
+}
+
+pub(crate) use impl_auth_plugin;
+
 #[async_trait]
 pub trait AuthMechanism: Send + Sync {
     fn mechanism_name(&self) -> &str;

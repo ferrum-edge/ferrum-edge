@@ -26,7 +26,7 @@ use crate::consumer_index::ConsumerIndex;
 use super::utils::auth_flow::{
     self, AuthMechanism, ExtractedCredential, VerifyOutcome, constant_time_eq,
 };
-use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
+use super::{RequestContext, strip_auth_scheme};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -164,11 +164,7 @@ impl AuthMechanism for BasicAuth {
             if let Some(stored_hash) = basic_creds.get("password_hash").and_then(|s| s.as_str())
                 && self.verify_password(&password, stored_hash)
             {
-                return VerifyOutcome::Success {
-                    consumer: Some(consumer),
-                    external_identity: None,
-                    external_identity_header: None,
-                };
+                return VerifyOutcome::consumer(consumer);
             }
         }
 
@@ -176,29 +172,10 @@ impl AuthMechanism for BasicAuth {
     }
 }
 
-#[async_trait]
-impl Plugin for BasicAuth {
-    fn name(&self) -> &str {
-        "basic_auth"
-    }
-
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
-    fn priority(&self) -> u16 {
-        super::priority::BASIC_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
-    }
-
-    async fn authenticate(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        auth_flow::run_auth(self, ctx, consumer_index).await
-    }
-}
+auth_flow::impl_auth_plugin!(
+    BasicAuth,
+    "basic_auth",
+    super::priority::BASIC_AUTH,
+    crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    auth_flow::run_auth
+);

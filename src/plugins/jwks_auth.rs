@@ -10,11 +10,11 @@ use url::Url;
 
 use crate::consumer_index::ConsumerIndex;
 
+use super::RequestContext;
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::utils::jwks_cache::get_or_create_jwks_store;
 use super::utils::jwks_store::JwksKeyStore;
-use super::{Plugin, PluginResult, RequestContext};
 
 /// Default JWKS refresh interval: 15 minutes.
 const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
@@ -305,11 +305,7 @@ impl JwksAuth {
             None
         };
 
-        VerifyOutcome::Success {
-            consumer,
-            external_identity: identity,
-            external_identity_header: header_value,
-        }
+        VerifyOutcome::success(consumer, identity, header_value)
     }
 
     /// Try to validate a token against all configured providers.
@@ -445,32 +441,12 @@ impl AuthMechanism for JwksAuth {
     }
 }
 
-#[async_trait]
-impl Plugin for JwksAuth {
-    fn name(&self) -> &str {
-        "jwks_auth"
-    }
-
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
-    fn priority(&self) -> u16 {
-        super::priority::JWKS_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
-    }
-
-    async fn authenticate(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        auth_flow::run_auth_external_identity(self, ctx, consumer_index).await
-    }
-
+auth_flow::impl_auth_plugin!(
+    JwksAuth,
+    "jwks_auth",
+    super::priority::JWKS_AUTH,
+    crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    auth_flow::run_auth_external_identity;
     fn warmup_hostnames(&self) -> Vec<String> {
         let mut hosts = Vec::new();
         for prov in &self.providers {
@@ -494,7 +470,7 @@ impl Plugin for JwksAuth {
         }
         uris
     }
-}
+);
 
 // ---------------------------------------------------------------------------
 // Helpers

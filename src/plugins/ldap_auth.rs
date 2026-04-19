@@ -41,7 +41,7 @@ use crate::consumer_index::ConsumerIndex;
 
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
-use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
+use super::{RequestContext, strip_auth_scheme};
 
 pub struct LdapAuth {
     ldap_url: String,
@@ -720,39 +720,19 @@ impl AuthMechanism for LdapAuth {
     }
 }
 
-#[async_trait]
-impl Plugin for LdapAuth {
-    fn name(&self) -> &str {
-        "ldap_auth"
-    }
-
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
-    fn priority(&self) -> u16 {
-        super::priority::LDAP_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
-    }
-
+auth_flow::impl_auth_plugin!(
+    LdapAuth,
+    "ldap_auth",
+    super::priority::LDAP_AUTH,
+    crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    auth_flow::run_auth_external_identity;
     fn warmup_hostnames(&self) -> Vec<String> {
         self.ldap_hostname
             .as_ref()
             .map(|h| vec![h.clone()])
             .unwrap_or_default()
     }
-
-    async fn authenticate(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        auth_flow::run_auth_external_identity(self, ctx, consumer_index).await
-    }
-}
+);
 
 impl LdapAuth {
     /// Build the auth result for a successfully authenticated LDAP user.
@@ -770,10 +750,10 @@ impl LdapAuth {
             );
         }
 
-        VerifyOutcome::Success {
+        VerifyOutcome::success(
             consumer,
-            external_identity: Some(username.to_string()),
-            external_identity_header: Some(username.to_string()),
-        }
+            Some(username.to_string()),
+            Some(username.to_string()),
+        )
     }
 }

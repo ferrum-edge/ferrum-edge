@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 use super::utils::auth_flow::{
     self, AuthMechanism, ExtractedCredential, VerifyOutcome, constant_time_eq,
 };
-use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
+use super::{RequestContext, strip_auth_scheme};
 use crate::consumer_index::ConsumerIndex;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -201,11 +201,7 @@ impl AuthMechanism for HmacAuth {
             {
                 let expected_sig = base64::engine::general_purpose::STANDARD.encode(&expected_mac);
                 if constant_time_eq(signature.as_bytes(), expected_sig.as_bytes()) {
-                    return VerifyOutcome::Success {
-                        consumer: Some(consumer),
-                        external_identity: None,
-                        external_identity_header: None,
-                    };
+                    return VerifyOutcome::consumer(consumer);
                 }
             }
         }
@@ -215,29 +211,10 @@ impl AuthMechanism for HmacAuth {
     }
 }
 
-#[async_trait]
-impl Plugin for HmacAuth {
-    fn name(&self) -> &str {
-        "hmac_auth"
-    }
-
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
-    fn priority(&self) -> u16 {
-        super::priority::HMAC_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
-    }
-
-    async fn authenticate(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        auth_flow::run_auth(self, ctx, consumer_index).await
-    }
-}
+auth_flow::impl_auth_plugin!(
+    HmacAuth,
+    "hmac_auth",
+    super::priority::HMAC_AUTH,
+    crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    auth_flow::run_auth
+);

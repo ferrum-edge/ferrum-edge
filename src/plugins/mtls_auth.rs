@@ -19,7 +19,7 @@ use x509_parser::prelude::*;
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
-use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
+use super::{PluginResult, RequestContext, StreamConnectionContext};
 
 /// Supported certificate fields for consumer identity matching.
 #[derive(Debug, Clone)]
@@ -382,11 +382,7 @@ impl MtlsAuth {
         };
 
         match consumer_index.find_by_mtls_identity(&identity) {
-            Some(consumer) => VerifyOutcome::Success {
-                consumer: Some(consumer),
-                external_identity: None,
-                external_identity_header: None,
-            },
+            Some(consumer) => VerifyOutcome::consumer(consumer),
             None => VerifyOutcome::ConsumerNotFound(
                 r#"{"error":"No consumer found for client certificate"}"#.into(),
             ),
@@ -435,32 +431,12 @@ impl AuthMechanism for MtlsAuth {
     }
 }
 
-#[async_trait]
-impl Plugin for MtlsAuth {
-    fn name(&self) -> &str {
-        "mtls_auth"
-    }
-
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
-    fn priority(&self) -> u16 {
-        super::priority::MTLS_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_AND_STREAM_PROTOCOLS
-    }
-
-    async fn authenticate(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        auth_flow::run_auth(self, ctx, consumer_index).await
-    }
-
+auth_flow::impl_auth_plugin!(
+    MtlsAuth,
+    "mtls_auth",
+    super::priority::MTLS_AUTH,
+    crate::plugins::HTTP_FAMILY_AND_STREAM_PROTOCOLS,
+    auth_flow::run_auth;
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let cert_der = match &ctx.tls_client_cert_der {
             Some(der) => der,
@@ -514,4 +490,4 @@ impl Plugin for MtlsAuth {
             VerifyOutcome::Success { consumer: None, .. } => PluginResult::Continue,
         }
     }
-}
+);

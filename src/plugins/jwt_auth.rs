@@ -22,7 +22,7 @@ use tracing::debug;
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
-use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
+use super::{RequestContext, strip_auth_scheme};
 
 /// Unsafe validation that skips signature verification, used only to extract
 /// claims before looking up the consumer's secret for proper verification.
@@ -149,11 +149,7 @@ impl AuthMechanism for JwtAuth {
             if let Some(secret) = jwt_cred.get("secret").and_then(|secret| secret.as_str()) {
                 let key = DecodingKey::from_secret(secret.as_bytes());
                 if decode::<serde_json::Value>(&token, &key, &validation).is_ok() {
-                    return VerifyOutcome::Success {
-                        consumer: Some(consumer),
-                        external_identity: None,
-                        external_identity_header: None,
-                    };
+                    return VerifyOutcome::consumer(consumer);
                 }
             }
         }
@@ -163,29 +159,10 @@ impl AuthMechanism for JwtAuth {
     }
 }
 
-#[async_trait]
-impl Plugin for JwtAuth {
-    fn name(&self) -> &str {
-        "jwt_auth"
-    }
-
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
-    fn priority(&self) -> u16 {
-        super::priority::JWT_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
-    }
-
-    async fn authenticate(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        auth_flow::run_auth(self, ctx, consumer_index).await
-    }
-}
+auth_flow::impl_auth_plugin!(
+    JwtAuth,
+    "jwt_auth",
+    super::priority::JWT_AUTH,
+    crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    auth_flow::run_auth
+);

@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 use crate::consumer_index::ConsumerIndex;
 
+use super::RequestContext;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
-use super::{Plugin, PluginResult, RequestContext};
 
 pub struct KeyAuth {
     /// Pre-lowercased header name for header-based key extraction.
@@ -110,39 +110,16 @@ impl AuthMechanism for KeyAuth {
         }
 
         match consumer_index.find_by_api_key(&api_key) {
-            Some(consumer) => VerifyOutcome::Success {
-                consumer: Some(consumer),
-                external_identity: None,
-                external_identity_header: None,
-            },
+            Some(consumer) => VerifyOutcome::consumer(consumer),
             None => VerifyOutcome::ConsumerNotFound(r#"{"error":"Invalid API key"}"#.into()),
         }
     }
 }
 
-#[async_trait]
-impl Plugin for KeyAuth {
-    fn name(&self) -> &str {
-        "key_auth"
-    }
-
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
-    fn priority(&self) -> u16 {
-        super::priority::KEY_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
-    }
-
-    async fn authenticate(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        auth_flow::run_auth(self, ctx, consumer_index).await
-    }
-}
+auth_flow::impl_auth_plugin!(
+    KeyAuth,
+    "key_auth",
+    super::priority::KEY_AUTH,
+    crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    auth_flow::run_auth
+);
