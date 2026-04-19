@@ -206,20 +206,32 @@ jobs:
           echo "list=$gws" >> "$GITHUB_OUTPUT"
           echo "Gateways: $gws"
 
+      # buildx with the docker-container driver is required for
+      # cache-from/cache-to type=gha — the default docker driver on
+      # ubuntu-latest only supports inline cache and will error out with
+      # "Cache export is not supported for the docker driver".
+      - name: Set up Docker Buildx
+        if: steps.skip_check.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
       - name: Build Ferrum Docker image
         if: steps.skip_check.outputs.skip != 'true'
-        run: |
-          # Build Ferrum into a Docker image so it runs under identical
-          # conditions to every other gateway (distroless Linux container on
-          # the same kernel). This ensures no gateway has a native-binary
-          # advantage — all are containerised with --network host.
-          echo "Building ferrum-edge:bench from repo Dockerfile..."
-          docker build \
-            --cache-from type=gha \
-            --cache-to type=gha,mode=max \
-            -t ferrum-edge:bench \
-            -f Dockerfile . 2>&1 | tail -20
-          docker image ls ferrum-edge:bench
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          tags: ferrum-edge:bench
+          # `load: true` imports the built image into the local Docker daemon
+          # so subsequent `docker run` calls in the harness can find it. The
+          # default buildx behaviour is to leave the image in the buildkit
+          # builder only, which `docker run` does not see.
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify Ferrum image loaded
+        if: steps.skip_check.outputs.skip != 'true'
+        run: docker image ls ferrum-edge:bench
 
       - name: Pre-pull competitor Docker images
         if: steps.skip_check.outputs.skip != 'true'
