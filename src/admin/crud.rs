@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::admin::AdminState;
 use crate::config::db_backend::{DatabaseBackend, PaginatedResult};
-use crate::config::types::{Consumer, GatewayConfig, PluginConfig, validate_resource_id};
+use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Upstream, validate_resource_id};
 
 pub(crate) type DbResult<T> = Result<T, anyhow::Error>;
 
@@ -340,6 +340,117 @@ pub(crate) async fn check_consumer_credential_uniqueness(
     }
 
     Ok(None)
+}
+
+impl AdminResource for Upstream {
+    const RESOURCE_NAME: &'static str = "upstream";
+    const RESOURCE_LABEL: &'static str = "Upstream";
+    const VALIDATION_ERROR_LABEL: &'static str = "upstream fields";
+    const NOT_FOUND_MESSAGE: &'static str = "Upstream not found";
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn set_id(&mut self, id: String) {
+        self.id = id;
+    }
+
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn set_namespace(&mut self, ns: String) {
+        self.namespace = ns;
+    }
+
+    fn set_created_at(&mut self, now: DateTime<Utc>) {
+        self.created_at = now;
+    }
+
+    fn set_updated_at(&mut self, now: DateTime<Utc>) {
+        self.updated_at = now;
+    }
+
+    fn normalize(&mut self) {
+        self.normalize_fields();
+    }
+
+    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), Vec<String>> {
+        if self.targets.is_empty() && self.service_discovery.is_none() {
+            return Err(vec![
+                "At least one target is required (or configure service_discovery)".to_string(),
+            ]);
+        }
+        self.validate_fields()
+    }
+
+    fn cached_items(config: &GatewayConfig) -> &[Self] {
+        &config.upstreams
+    }
+
+    fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+        if error
+            .to_string()
+            .contains("referenced by one or more proxies")
+        {
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": format!("{}", error)}),
+            );
+        }
+        super::json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &super::db_error_response(error),
+        )
+    }
+
+    async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
+        db.get_upstream(id).await
+    }
+
+    async fn db_list(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        pagination: &super::PaginationParams,
+    ) -> DbResult<PaginatedResult<Self>> {
+        db.list_upstreams_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
+            .await
+    }
+
+    async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+        db.create_upstream(resource).await
+    }
+
+    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+        db.update_upstream(resource).await
+    }
+
+    async fn db_delete(db: &dyn DatabaseBackend, id: &str) -> DbResult<bool> {
+        db.delete_upstream(id).await
+    }
+
+    async fn check_uniqueness(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        resource: &Self,
+        exclude_id: Option<&str>,
+    ) -> DbResult<Option<String>> {
+        if let Some(name) = resource.name.as_deref() {
+            match db
+                .check_upstream_name_unique(namespace, name, exclude_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(Some(format!("Upstream name '{}' already exists", name)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
