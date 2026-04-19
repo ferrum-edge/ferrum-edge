@@ -328,7 +328,31 @@ envoy_config_name() {
 # ── Kong (docker, DB-less) ──────────────────────────────────────────────────
 start_kong() {
     local cfg_src="$SCRIPT_DIR/configs/kong/$(kong_config_name)"
+    local cfg_dst="$SCRIPT_DIR/kong_runtime.yaml"
     echo "[kong] starting..."
+
+    # Template the benchmark CA cert into the declarative config.
+    #
+    # With `tls_verify: true` on a Kong service, nginx's upstream TLS
+    # verifier requires a trust anchor that Kong considers valid — which
+    # means a `ca_certificates` entity in the declarative config, NOT
+    # just `KONG_LUA_SSL_TRUSTED_CERTIFICATE` (that only scopes cosocket
+    # Lua callouts, not `proxy_pass` upstream handshakes). Per-config
+    # `ca_certificates` entries require the cert content inline, so we
+    # read cert.pem at start-up and substitute it into the config file
+    # written to $SCRIPT_DIR/kong_runtime.yaml (the running config
+    # Kong mounts).
+    #
+    # `proto_backend`'s self-signed cert carries `basicConstraints:
+    # CA:TRUE` (see tls_utils.rs) so Kong accepts it as a CA entity.
+    python3 - "$cfg_src" "$cfg_dst" "$CERT_DIR/cert.pem" <<'PYEOF'
+import sys, pathlib
+src, dst, cert_path = sys.argv[1], sys.argv[2], sys.argv[3]
+cert = pathlib.Path(cert_path).read_text().rstrip()
+indented = '\n'.join('      ' + line for line in cert.splitlines())
+text = pathlib.Path(src).read_text().replace('__BENCH_CA_PEM__', indented)
+pathlib.Path(dst).write_text(text)
+PYEOF
 
     local proxy_listen_env
     local stream_listen_env=""
@@ -375,7 +399,7 @@ start_kong() {
         -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=/certs/cert.pem" \
         -e "KONG_NGINX_STREAM_LUA_SSL_TRUSTED_CERTIFICATE=/certs/cert.pem" \
         "${extra_env[@]}" \
-        -v "$cfg_src:/kong/kong.yaml:ro" \
+        -v "$cfg_dst:/kong/kong.yaml:ro" \
         -v "$CERT_DIR:/certs:ro" \
         "$KONG_IMAGE")
 

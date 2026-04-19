@@ -1,4 +1,13 @@
 _format_version: "3.0"
+# Upstream TLS CA trust anchor. run_gateway_protocol_bench.sh::start_kong
+# reads proto_backend's generated self-signed cert and substitutes the PEM
+# content into the placeholder below. The cert carries basicConstraints
+# CA:TRUE so Kong's declarative ca_certificates entity accepts it.
+ca_certificates:
+  - id: "00000000-0000-0000-0000-000000000001"
+    cert: |
+__BENCH_CA_PEM__
+
 
 # Kong DB-less declarative configuration — gRPC end-to-end TLS.
 # Client grpcs → Kong (TLS termination, ALPN h2) → grpcs upstream on 50053.
@@ -10,6 +19,8 @@ services:
     port: 50053
     protocol: grpcs
     tls_verify: true
+    ca_certificates:
+      - "00000000-0000-0000-0000-000000000001"
     connect_timeout: 5000
     read_timeout: 30000
     write_timeout: 30000
