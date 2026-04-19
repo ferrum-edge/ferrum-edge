@@ -6,7 +6,7 @@ _format_version: "3.0"
 ca_certificates:
   - id: "00000000-0000-0000-0000-000000000001"
     cert: |
-__BENCH_CA_PEM__
+      __BENCH_CA_PEM__
 
 
 # Kong DB-less declarative configuration — gRPC end-to-end TLS.

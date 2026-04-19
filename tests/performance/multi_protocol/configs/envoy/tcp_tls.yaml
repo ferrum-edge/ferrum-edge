@@ -40,7 +40,7 @@ static_resources:
           common_tls_context:
             validation_context:
               trusted_ca:
-                filename: /certs/cert.pem
+                filename: CA_PATH
       load_assignment:
         cluster_name: backend_tcp
         endpoints:

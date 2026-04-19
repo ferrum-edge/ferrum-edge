@@ -70,7 +70,7 @@ static_resources:
             alpn_protocols: ["h2"]
             validation_context:
               trusted_ca:
-                filename: /certs/cert.pem
+                filename: CA_PATH
       load_assignment:
         cluster_name: backend_h2_tls
         endpoints:

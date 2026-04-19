@@ -62,11 +62,13 @@ static_resources:
             alpn_protocols: ["h2"]
             # Trust the benchmark's self-signed CA so the upstream TLS
             # handshake verifies instead of silently accepting any cert.
-            # The cert file is mounted at /certs/cert.pem inside the
-            # container by run_gateway_protocol_bench.sh::start_envoy.
+            # Templated: CA_PATH is replaced with the real cert path by
+            # both run_gateway_protocol_bench.sh (/certs/cert.pem inside
+            # the container) and run_protocol_test.sh (absolute host
+            # path).
             validation_context:
               trusted_ca:
-                filename: /certs/cert.pem
+                filename: CA_PATH
       load_assignment:
         cluster_name: backend_grpc
         endpoints:

@@ -298,9 +298,14 @@ ferrum_config_name() {
 start_envoy() {
     local cfg_src="$SCRIPT_DIR/configs/envoy/$(envoy_config_name)"
     local cfg_dst="$SCRIPT_DIR/envoy_runtime.yaml"
-    # Substitute CERT_PATH/KEY_PATH to mount points inside container
+    # Substitute CERT_PATH / KEY_PATH / CA_PATH to mount points inside
+    # container. CA_PATH is a separate placeholder (not reused as
+    # CERT_PATH) so run_protocol_test.sh can point it at an absolute
+    # host path when running Envoy directly, without Envoy container
+    # mount assumptions.
     sed -e "s|CERT_PATH|/certs/cert.pem|g" \
         -e "s|KEY_PATH|/certs/key.pem|g" \
+        -e "s|CA_PATH|/certs/cert.pem|g" \
         "$cfg_src" > "$cfg_dst"
 
     echo "[envoy] starting..."
@@ -349,8 +354,15 @@ start_kong() {
 import sys, pathlib
 src, dst, cert_path = sys.argv[1], sys.argv[2], sys.argv[3]
 cert = pathlib.Path(cert_path).read_text().rstrip()
-indented = '\n'.join('      ' + line for line in cert.splitlines())
-text = pathlib.Path(src).read_text().replace('__BENCH_CA_PEM__', indented)
+# The placeholder line in the checked-in YAML is `      __BENCH_CA_PEM__`
+# (6-space indent, inside the `cert: |` block scalar so the file parses
+# as valid YAML pre-render). When substituting, the first cert line
+# inherits the placeholder's leading whitespace; subsequent lines need
+# their own matching 6-space prefix so they stay inside the block
+# scalar.
+cert_lines = cert.splitlines()
+replacement = cert_lines[0] + '\n' + '\n'.join('      ' + l for l in cert_lines[1:])
+text = pathlib.Path(src).read_text().replace('__BENCH_CA_PEM__', replacement)
 pathlib.Path(dst).write_text(text)
 PYEOF
 
@@ -453,7 +465,11 @@ start_tyk() {
         -v "$CERT_DIR:/etc/tyk/certs:ro" \
         --entrypoint sh \
         "$TYK_IMAGE" \
-        -c 'cp /etc/tyk/certs/cert.pem /usr/local/share/ca-certificates/bench.crt && update-ca-certificates >/dev/null 2>&1; exec /opt/tyk-gateway/tyk --conf /opt/tyk-gateway/tyk.conf')
+        -c 'cp /etc/tyk/certs/cert.pem /usr/local/share/ca-certificates/bench.crt && update-ca-certificates >/dev/null 2>&1 && exec /opt/tyk-gateway/tyk --conf /opt/tyk-gateway/tyk.conf')
+    # All-`&&` chain so a trust-store setup failure exits before Tyk
+    # starts. Otherwise Tyk would run without the benchmark CA while
+    # every API config enforces ssl_insecure_skip_verify=false, turning
+    # the bench into silent 0-RPS rows rather than a loud startup error.
 
     wait_for_gateway
 }
