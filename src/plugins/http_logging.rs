@@ -64,6 +64,8 @@ impl HttpLogging {
             http_client,
         };
         let logger = BatchingLogger::spawn(
+            // Config remains `max_retries`; the shared retry policy counts the
+            // initial attempt plus those retries.
             build_batch_config(
                 config,
                 "http_logging",

@@ -16,10 +16,9 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio::time::Duration;
 
 use super::utils::{
@@ -85,6 +84,8 @@ impl TcpLogging {
         };
         let writer = Arc::new(Mutex::new(None));
         let logger = BatchingLogger::spawn(
+            // Config remains `max_retries`; the shared retry policy counts the
+            // initial attempt plus those retries.
             build_batch_config(
                 config,
                 "tcp_logging",
@@ -294,25 +295,39 @@ async fn send_batch(
         }
     }
 
-    let mut writer = writer_state.lock().await;
-    if writer.is_none() {
-        *writer = Some(connect_tcp(cfg).await?);
+    let mut connection = writer_state
+        .lock()
+        .map_err(|_| "TCP logging: writer state lock poisoned".to_string())?
+        .take();
+
+    if connection.is_none() {
+        connection = Some(connect_tcp(cfg).await?);
     }
 
-    let Some(connection) = writer.as_mut() else {
-        return Err("TCP logging: writer unavailable after reconnect".to_string());
-    };
-    match connection.write_all(&payload).await {
-        Ok(()) => match connection.flush().await {
-            Ok(()) => Ok(()),
+    let mut keep_connection = true;
+    let result = match connection.as_mut() {
+        Some(writer) => match writer.write_all(&payload).await {
+            Ok(()) => match writer.flush().await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    keep_connection = false;
+                    Err(format!("TCP logging: flush failed: {error}"))
+                }
+            },
             Err(error) => {
-                *writer = None;
-                Err(format!("TCP logging: flush failed: {error}"))
+                keep_connection = false;
+                Err(format!("TCP logging: write failed: {error}"))
             }
         },
-        Err(error) => {
-            *writer = None;
-            Err(format!("TCP logging: write failed: {error}"))
-        }
+        None => Err("TCP logging: writer unavailable after reconnect".to_string()),
+    };
+    if !keep_connection {
+        connection = None;
     }
+
+    *writer_state
+        .lock()
+        .map_err(|_| "TCP logging: writer state lock poisoned".to_string())? = connection;
+
+    result
 }

@@ -15,12 +15,11 @@
 //! Ethernet). Oversized datagrams may be fragmented or dropped.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::warn;
 
@@ -99,6 +98,8 @@ impl UdpLogging {
             last_resolve: Instant::now(),
         }));
         let logger = BatchingLogger::spawn(
+            // Config remains `max_retries`; the shared retry policy counts the
+            // initial attempt plus those retries.
             build_batch_config(
                 config,
                 "udp_logging",
@@ -253,29 +254,43 @@ async fn send_batch(
         }
     };
 
-    let mut state = state.lock().await;
+    let (mut sender, mut current_addr, mut last_resolve) = {
+        let mut state = state
+            .lock()
+            .map_err(|_| "udp_logging: flush state lock poisoned".to_string())?;
+        (state.sender.take(), state.current_addr, state.last_resolve)
+    };
 
-    if state.sender.is_none() {
-        let (sender, current_addr) = create_sender(cfg, cfg.dns_cache.as_ref()).await?;
-        state.sender = Some(sender);
-        state.current_addr = Some(current_addr);
-        state.last_resolve = Instant::now();
+    if sender.is_none() {
+        let (new_sender, new_addr) = create_sender(cfg, cfg.dns_cache.as_ref()).await?;
+        last_resolve = Instant::now();
+        sender = Some(new_sender);
+        current_addr = Some(new_addr);
     }
 
-    if !cfg.dtls_enabled && state.last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
-        state.last_resolve = Instant::now();
+    if !cfg.dtls_enabled && last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
+        last_resolve = Instant::now();
         if let Ok(new_addr) =
             resolve_udp_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "udp_logging").await
-            && state.current_addr != Some(new_addr)
+            && current_addr != Some(new_addr)
             && let Ok(new_sender) = build_sender_for_addr(cfg, new_addr).await
         {
-            state.sender = Some(new_sender);
-            state.current_addr = Some(new_addr);
+            sender = Some(new_sender);
+            current_addr = Some(new_addr);
         }
     }
 
-    let Some(sender) = state.sender.as_ref() else {
-        return Err("udp_logging: sender unavailable after initialization".to_string());
+    let result = match sender.as_ref() {
+        Some(sender) => sender.send(&payload).await,
+        None => Err("udp_logging: sender unavailable after initialization".to_string()),
     };
-    sender.send(&payload).await
+
+    let mut state = state
+        .lock()
+        .map_err(|_| "udp_logging: flush state lock poisoned".to_string())?;
+    state.sender = sender;
+    state.current_addr = current_addr;
+    state.last_resolve = last_resolve;
+
+    result
 }

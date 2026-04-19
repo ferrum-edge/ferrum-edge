@@ -18,14 +18,16 @@
 //! - **Authentication**: `Authorization` header for Bearer/Basic auth.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::warn;
 
 use super::utils::{
-    BatchConfigDefaults, BatchingLogger, PluginHttpClient, build_batch_config,
-    handle_http_batch_response, parse_http_endpoint,
+    BatchConfig, BatchConfigDefaults, BatchingLogger, PluginHttpClient, RetryPolicy,
+    build_batch_config, handle_http_batch_response, parse_http_endpoint,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
@@ -47,6 +49,7 @@ struct LokiFlushConfig {
     custom_headers: Vec<(String, String)>,
     http_client: PluginHttpClient,
     gzip: bool,
+    retry: RetryPolicy,
 }
 
 /// Static labels applied to every log entry, from plugin config.
@@ -109,6 +112,21 @@ impl LokiLogging {
             }
         }
 
+        // Config remains `max_retries`; the shared retry policy counts the
+        // initial attempt plus those retries.
+        let batch_config = build_batch_config(
+            config,
+            "loki_logging",
+            BatchConfigDefaults {
+                batch_size_key: "batch_size",
+                batch_size: 100,
+                flush_interval_ms: 1000,
+                min_flush_interval_ms: 100,
+                buffer_capacity: 10000,
+                max_retries: 3,
+                retry_delay_ms: 1000,
+            },
+        );
         let flush_config = LokiFlushConfig {
             endpoint_url,
             authorization_header: config["authorization_header"]
@@ -117,21 +135,18 @@ impl LokiLogging {
             custom_headers,
             http_client,
             gzip,
+            retry: batch_config.retry,
         };
         let logger = BatchingLogger::spawn(
-            build_batch_config(
-                config,
-                "loki_logging",
-                BatchConfigDefaults {
-                    batch_size_key: "batch_size",
-                    batch_size: 100,
-                    flush_interval_ms: 1000,
-                    min_flush_interval_ms: 100,
-                    buffer_capacity: 10000,
-                    max_retries: 3,
-                    retry_delay_ms: 1000,
+            // Loki retries inside `send_batch` so we can reuse the same
+            // serialized + gzipped body bytes across attempts.
+            BatchConfig {
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    delay: Duration::from_millis(0),
                 },
-            ),
+                ..batch_config
+            },
             move |batch| {
                 let flush_config = flush_config.clone();
                 async move { send_batch(&flush_config, batch).await }
@@ -296,22 +311,62 @@ fn build_loki_payload(batch: &[LokiEntry]) -> Value {
 /// Send a batch of entries to Loki.
 async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), String> {
     let entry_count = batch.len();
-    let payload = build_loki_payload(&batch);
+    let (body_bytes, content_encoding) = build_loki_body(cfg, &batch);
+    let attempts = cfg.retry.max_attempts.max(1);
 
-    let (body_bytes, content_encoding) = if cfg.gzip {
+    for attempt in 1..=attempts {
+        match send_batch_once(cfg, entry_count, body_bytes.clone(), content_encoding).await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < attempts => {
+                warn!(
+                    plugin = "loki_logging",
+                    "Loki logging: batch flush failed (attempt {}/{}): {}",
+                    attempt,
+                    attempts,
+                    error,
+                );
+                tokio::time::sleep(cfg.retry.delay).await;
+            }
+            Err(error) => {
+                warn!(
+                    plugin = "loki_logging",
+                    "Loki logging: batch discarded after {} attempts ({} entries lost): {}",
+                    attempts,
+                    entry_count,
+                    error,
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn build_loki_body(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> (Bytes, Option<&'static str>) {
+    let payload = build_loki_payload(batch);
+
+    if cfg.gzip {
         match gzip_json(&payload) {
-            Ok(compressed) => (compressed, Some("gzip")),
+            Ok(compressed) => (Bytes::from(compressed), Some("gzip")),
             Err(error) => {
                 warn!("Loki logging: gzip compression failed, sending uncompressed: {error}");
                 let raw = serde_json::to_vec(&payload).unwrap_or_default();
-                (raw, None)
+                (Bytes::from(raw), None)
             }
         }
     } else {
         let raw = serde_json::to_vec(&payload).unwrap_or_default();
-        (raw, None)
-    };
+        (Bytes::from(raw), None)
+    }
+}
 
+async fn send_batch_once(
+    cfg: &LokiFlushConfig,
+    entry_count: usize,
+    body_bytes: Bytes,
+    content_encoding: Option<&'static str>,
+) -> Result<(), String> {
     let mut req = cfg
         .http_client
         .get()

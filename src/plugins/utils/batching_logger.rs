@@ -140,9 +140,24 @@ where
 {
     let attempts = cfg.retry.max_attempts.max(1);
     let entry_count = batch.len();
+    let mut final_batch = Some(batch);
 
     for attempt in 1..=attempts {
-        match flush(batch.clone()).await {
+        // Reuse the owned batch on the final attempt so single-attempt plugins
+        // avoid the clone entirely and retried batches only clone N-1 times.
+        let attempt_batch = if attempt < attempts {
+            match final_batch.as_ref() {
+                Some(batch) => batch.clone(),
+                None => return,
+            }
+        } else {
+            match final_batch.take() {
+                Some(batch) => batch,
+                None => return,
+            }
+        };
+
+        match flush(attempt_batch).await {
             Ok(()) => return,
             Err(error) if attempt < attempts => {
                 warn!(

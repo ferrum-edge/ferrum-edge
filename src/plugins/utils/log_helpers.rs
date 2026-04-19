@@ -74,6 +74,8 @@ pub fn build_batch_config(
             .unwrap_or(defaults.buffer_capacity)
             .max(1) as usize,
         retry: RetryPolicy {
+            // Plugin config remains `max_retries`; RetryPolicy stores total
+            // attempts, so add the initial try here.
             max_attempts: config["max_retries"]
                 .as_u64()
                 .unwrap_or(defaults.max_retries) as u32

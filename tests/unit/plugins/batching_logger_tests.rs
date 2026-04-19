@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -247,4 +248,93 @@ async fn full_channel_warns_once_per_rate_limit_window() {
         .matches("batching_logger_drop: dropping queued log entry because buffer full")
         .count();
     assert_eq!(occurrences, 1, "drop warnings should be rate-limited");
+}
+
+struct CloneTracked {
+    value: u32,
+    clone_count: Arc<AtomicUsize>,
+}
+
+impl CloneTracked {
+    fn new(value: u32, clone_count: Arc<AtomicUsize>) -> Self {
+        Self { value, clone_count }
+    }
+}
+
+impl Clone for CloneTracked {
+    fn clone(&self) -> Self {
+        self.clone_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            value: self.value,
+            clone_count: Arc::clone(&self.clone_count),
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn single_attempt_flush_reuses_owned_batch_without_clone() {
+    let clone_count = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let notify_clone = Arc::clone(&notify);
+    let clone_count_for_flush = Arc::clone(&clone_count);
+
+    let logger = BatchingLogger::spawn(
+        BatchConfig {
+            retry: RetryPolicy {
+                max_attempts: 1,
+                delay: Duration::from_millis(0),
+            },
+            ..test_logger_config("batching_logger_single_attempt", 1, 8)
+        },
+        move |batch: Vec<CloneTracked>| {
+            let notify = Arc::clone(&notify_clone);
+            let clone_count = Arc::clone(&clone_count_for_flush);
+            async move {
+                assert_eq!(batch.len(), 1);
+                assert_eq!(batch[0].value, 11);
+                assert_eq!(clone_count.load(Ordering::Relaxed), 0);
+                notify.notify_one();
+                Ok(())
+            }
+        },
+    );
+
+    logger.try_send(CloneTracked::new(11, Arc::clone(&clone_count)));
+
+    wait_for_flush(&notify).await;
+    assert_eq!(clone_count.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn retries_clone_only_before_final_attempt() {
+    let clone_count = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let notify_clone = Arc::clone(&notify);
+    let attempts_clone = Arc::clone(&attempts);
+
+    let logger = BatchingLogger::spawn(
+        test_logger_config("batching_logger_clone_retries", 1, 8),
+        move |batch: Vec<CloneTracked>| {
+            let notify = Arc::clone(&notify_clone);
+            let attempts = Arc::clone(&attempts_clone);
+            async move {
+                assert_eq!(batch.len(), 1);
+                assert_eq!(batch[0].value, 22);
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                if attempt == 3 {
+                    notify.notify_one();
+                    Ok(())
+                } else {
+                    Err(format!("attempt {attempt} failed"))
+                }
+            }
+        },
+    );
+
+    logger.try_send(CloneTracked::new(22, Arc::clone(&clone_count)));
+
+    wait_for_flush(&notify).await;
+    assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    assert_eq!(clone_count.load(Ordering::Relaxed), 2);
 }

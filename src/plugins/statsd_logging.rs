@@ -14,8 +14,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 
 use super::utils::{
@@ -119,6 +118,8 @@ impl StatsdLogging {
             last_resolve: Instant::now(),
         }));
         let logger = BatchingLogger::spawn(
+            // Config remains `max_retries`; the shared retry policy counts the
+            // initial attempt plus those retries.
             build_batch_config(
                 config,
                 "statsd_logging",
@@ -307,23 +308,29 @@ async fn send_batch(
         return Ok(());
     }
 
-    let mut state = state.lock().await;
-    if state.socket.is_none() {
-        let current_addr = resolve_udp_endpoint(
+    let (mut socket, mut current_addr, mut last_resolve) = {
+        let mut state = state
+            .lock()
+            .map_err(|_| "statsd_logging: flush state lock poisoned".to_string())?;
+        (state.socket.take(), state.current_addr, state.last_resolve)
+    };
+
+    if socket.is_none() {
+        let resolved_addr = resolve_udp_endpoint(
             &cfg.hostname,
             cfg.port,
             cfg.dns_cache.as_ref(),
             "statsd_logging",
         )
         .await?;
-        let socket = bind_connected_udp_socket(current_addr, "statsd_logging").await?;
-        state.current_addr = Some(current_addr);
-        state.socket = Some(socket);
-        state.last_resolve = Instant::now();
+        let new_socket = bind_connected_udp_socket(resolved_addr, "statsd_logging").await?;
+        current_addr = Some(resolved_addr);
+        socket = Some(new_socket);
+        last_resolve = Instant::now();
     }
 
-    if state.last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
-        state.last_resolve = Instant::now();
+    if last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
+        last_resolve = Instant::now();
         if let Ok(new_addr) = resolve_udp_endpoint(
             &cfg.hostname,
             cfg.port,
@@ -331,46 +338,55 @@ async fn send_batch(
             "statsd_logging",
         )
         .await
-            && state.current_addr != Some(new_addr)
+            && current_addr != Some(new_addr)
             && let Ok(new_socket) = bind_connected_udp_socket(new_addr, "statsd_logging").await
         {
-            state.current_addr = Some(new_addr);
-            state.socket = Some(new_socket);
+            current_addr = Some(new_addr);
+            socket = Some(new_socket);
         }
     }
 
-    let Some(socket) = state.socket.as_ref() else {
-        return Err("statsd_logging: UDP socket unavailable after initialization".to_string());
-    };
-
-    const MAX_UDP_PAYLOAD: usize = 1472;
-    if payload.len() <= MAX_UDP_PAYLOAD {
-        socket
-            .send(payload.as_bytes())
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("statsd_logging: failed to send metrics: {error}"))
-    } else {
-        let mut chunk = String::with_capacity(MAX_UDP_PAYLOAD);
-        for line in payload.lines() {
-            if !chunk.is_empty() && chunk.len() + line.len() + 1 > MAX_UDP_PAYLOAD {
+    let result = if let Some(socket) = socket.as_ref() {
+        const MAX_UDP_PAYLOAD: usize = 1472;
+        if payload.len() <= MAX_UDP_PAYLOAD {
+            socket
+                .send(payload.as_bytes())
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("statsd_logging: failed to send metrics: {error}"))
+        } else {
+            let mut chunk = String::with_capacity(MAX_UDP_PAYLOAD);
+            for line in payload.lines() {
+                if !chunk.is_empty() && chunk.len() + line.len() + 1 > MAX_UDP_PAYLOAD {
+                    socket.send(chunk.as_bytes()).await.map_err(|error| {
+                        format!("statsd_logging: failed to send metrics chunk: {error}")
+                    })?;
+                    chunk.clear();
+                }
+                if !chunk.is_empty() {
+                    chunk.push('\n');
+                }
+                chunk.push_str(line);
+            }
+            if !chunk.is_empty() {
                 socket.send(chunk.as_bytes()).await.map_err(|error| {
                     format!("statsd_logging: failed to send metrics chunk: {error}")
                 })?;
-                chunk.clear();
             }
-            if !chunk.is_empty() {
-                chunk.push('\n');
-            }
-            chunk.push_str(line);
+            Ok(())
         }
-        if !chunk.is_empty() {
-            socket.send(chunk.as_bytes()).await.map_err(|error| {
-                format!("statsd_logging: failed to send metrics chunk: {error}")
-            })?;
-        }
-        Ok(())
-    }
+    } else {
+        Err("statsd_logging: UDP socket unavailable after initialization".to_string())
+    };
+
+    let mut state = state
+        .lock()
+        .map_err(|_| "statsd_logging: flush state lock poisoned".to_string())?;
+    state.socket = socket;
+    state.current_addr = current_addr;
+    state.last_resolve = last_resolve;
+
+    result
 }
 
 #[cfg(test)]

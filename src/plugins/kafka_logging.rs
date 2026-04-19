@@ -170,10 +170,15 @@ impl KafkaLogging {
         });
         let logger = BatchingLogger::spawn(
             BatchConfig {
+                // Kafka flushes one userspace message at a time here. Larger
+                // batches would still serialize one spawn_blocking send per
+                // entry while librdkafka owns the real batching underneath.
                 batch_size: 1,
                 flush_interval: Duration::from_millis(1000),
                 buffer_capacity,
                 retry: RetryPolicy {
+                    // librdkafka handles its own delivery retries; keep the
+                    // shared logger at a single attempt for each message.
                     max_attempts: 1,
                     delay: Duration::from_millis(0),
                 },
