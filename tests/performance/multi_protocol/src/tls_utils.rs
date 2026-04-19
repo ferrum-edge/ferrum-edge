@@ -64,7 +64,13 @@ pub fn generate_self_signed_certs(dir: &Path) -> anyhow::Result<(PathBuf, PathBu
     let key_path = dir.join("key.pem");
 
     std::fs::write(&ca_path, ca_cert.pem().as_bytes()).context("writing ca.pem")?;
-    std::fs::write(&cert_path, leaf_cert.pem().as_bytes()).context("writing cert.pem")?;
+    // cert.pem contains the leaf cert followed by the CA cert (full chain).
+    // Servers that present this file send both certs during the TLS
+    // handshake, allowing clients (Envoy, tonic, etc.) to build the chain
+    // without needing the CA cert separately during verification.
+    let mut fullchain = leaf_cert.pem();
+    fullchain.push_str(&ca_cert.pem());
+    std::fs::write(&cert_path, fullchain.as_bytes()).context("writing cert.pem")?;
     std::fs::write(&key_path, leaf_key.serialize_pem().as_bytes()).context("writing key.pem")?;
 
     Ok((cert_path, key_path))
