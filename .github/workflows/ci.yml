@@ -102,7 +102,16 @@ jobs:
         run: cargo build --bin ferrum-edge
 
       - name: Run end-to-end tests (gRPC, WebSocket, file mode, database, CP/DP)
-        run: cargo test --test functional_tests -- --ignored --skip test_scale_perf_30k_proxies --skip test_load_stress
+        # `--include-ignored` runs BOTH the ignored E2E tests and the
+        # non-ignored unit tests bundled into the functional_tests binary
+        # (e.g. the `common::config_builder::tests::*` module that
+        # regression-guards the shared test harness's builder API). Without
+        # `--include-ignored` those 10 tests would be silently filtered out
+        # (the functional-tests binary is the only place they're compiled —
+        # `tests/unit/` is a separate binary that cannot import tests/common).
+        # The two `--skip` filters drop only the two explicitly-named long
+        # stress suites; everything else runs.
+        run: cargo test --test functional_tests -- --include-ignored --skip test_scale_perf_30k_proxies --skip test_load_stress
         env:
           RUST_BACKTRACE: 1
         timeout-minutes: 15
