@@ -134,7 +134,7 @@ bench_params() {
         http1-tls) echo "http1 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3447/echo" ;;
         http2)     echo "http2 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3443/echo" ;;
         http3)     echo "http3 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3445/echo" ;;
-        grpcs)     echo "grpc https://127.0.0.1:${GATEWAY_HTTPS_PORT} https://127.0.0.1:50053 --ca-cert ${CERT_DIR}/cert.pem" ;;
+        grpcs)     echo "grpc https://127.0.0.1:${GATEWAY_HTTPS_PORT} https://127.0.0.1:50053 --ca-cert ${CERT_DIR}/ca.pem" ;;
         wss)       echo "ws wss://127.0.0.1:${GATEWAY_HTTPS_PORT}/ws wss://127.0.0.1:3446" ;;
         tcp-tls)   echo "tcp 127.0.0.1:${GATEWAY_TCP_TLS_PORT} 127.0.0.1:3444 --tls" ;;
         udp)       echo "udp 127.0.0.1:${GATEWAY_UDP_PORT} 127.0.0.1:3005" ;;
@@ -216,7 +216,7 @@ start_backend() {
             echo "[backend] healthy (pid $BACKEND_PID)"
             # Wait for cert generation
             for j in $(seq 1 10); do
-                [ -f "$CERT_DIR/cert.pem" ] && break
+                [ -f "$CERT_DIR/ca.pem" ] && [ -f "$CERT_DIR/cert.pem" ] && break
                 sleep 0.5
             done
             return
@@ -305,7 +305,7 @@ start_envoy() {
     # mount assumptions.
     sed -e "s|CERT_PATH|/certs/cert.pem|g" \
         -e "s|KEY_PATH|/certs/key.pem|g" \
-        -e "s|CA_PATH|/certs/cert.pem|g" \
+        -e "s|CA_PATH|/certs/ca.pem|g" \
         "$cfg_src" > "$cfg_dst"
 
     echo "[envoy] starting..."
@@ -348,9 +348,9 @@ start_kong() {
     # written to $SCRIPT_DIR/kong_runtime.yaml (the running config
     # Kong mounts).
     #
-    # `proto_backend`'s self-signed cert carries `basicConstraints:
-    # CA:TRUE` (see tls_utils.rs) so Kong accepts it as a CA entity.
-    python3 - "$cfg_src" "$cfg_dst" "$CERT_DIR/cert.pem" <<'PYEOF'
+    # The CA cert (ca.pem) carries `basicConstraints: CA:TRUE` so Kong
+    # accepts it as a CA entity.
+    python3 - "$cfg_src" "$cfg_dst" "$CERT_DIR/ca.pem" <<'PYEOF'
 import sys, pathlib
 src, dst, cert_path = sys.argv[1], sys.argv[2], sys.argv[3]
 cert = pathlib.Path(cert_path).read_text().rstrip()
@@ -408,8 +408,8 @@ PYEOF
         -e "KONG_SSL_CERT_KEY=/certs/key.pem" \
         -e "KONG_STREAM_SSL_CERT=/certs/cert.pem" \
         -e "KONG_STREAM_SSL_CERT_KEY=/certs/key.pem" \
-        -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=/certs/cert.pem" \
-        -e "KONG_NGINX_STREAM_LUA_SSL_TRUSTED_CERTIFICATE=/certs/cert.pem" \
+        -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
+        -e "KONG_NGINX_STREAM_LUA_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
         "${extra_env[@]}" \
         -v "$cfg_dst:/kong/kong.yaml:ro" \
         -v "$CERT_DIR:/certs:ro" \
@@ -465,7 +465,7 @@ start_tyk() {
         -v "$CERT_DIR:/etc/tyk/certs:ro" \
         --entrypoint sh \
         "$TYK_IMAGE" \
-        -c 'cp /etc/tyk/certs/cert.pem /usr/local/share/ca-certificates/bench.crt && update-ca-certificates >/dev/null 2>&1 && exec /opt/tyk-gateway/tyk --conf /opt/tyk-gateway/tyk.conf')
+        -c 'cp /etc/tyk/certs/ca.pem /usr/local/share/ca-certificates/bench.crt && update-ca-certificates >/dev/null 2>&1 && exec /opt/tyk-gateway/tyk --conf /opt/tyk-gateway/tyk.conf')
     # All-`&&` chain so a trust-store setup failure exits before Tyk
     # starts. Otherwise Tyk would run without the benchmark CA while
     # every API config enforces ssl_insecure_skip_verify=false, turning

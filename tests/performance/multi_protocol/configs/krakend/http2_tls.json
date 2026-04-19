@@ -20,7 +20,7 @@
   "client_tls": {
     "allow_insecure_connections": false,
     "ca_certs": [
-      "/certs/cert.pem"
+      "/certs/ca.pem"
     ]
   },
   "endpoints": [

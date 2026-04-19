@@ -685,7 +685,7 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
     let use_tls = args.tls;
 
     let tls_cfg = if use_tls {
-        Some(Arc::new(tls_utils::make_client_tls_config_insecure()))
+        Some(Arc::new(tls_utils::make_client_tls_config_insecure_raw()))
     } else {
         None
     };

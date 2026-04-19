@@ -14,7 +14,7 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: 3006
     frontend_tls: true
-    backend_tls_server_ca_cert_path: "/etc/ferrum/tls/cert.pem"
+    backend_tls_server_ca_cert_path: "/etc/ferrum/tls/ca.pem"
     udp_idle_timeout_seconds: 30
     auth_mode: single
     plugins: []

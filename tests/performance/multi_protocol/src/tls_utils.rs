@@ -6,50 +6,66 @@ use rustls::pki_types::{CertificateDer, ServerName};
 
 // ── Certificate generation ───────────────────────────────────────────────────
 
-/// Generate a self-signed cert+key pair and write them to `dir/cert.pem` and `dir/key.pem`.
-/// Returns `(cert_path, key_path)`.
+/// Generate a CA + leaf cert chain and write them to `dir/`.
+///
+/// Produces three files:
+/// - `ca.pem`   — CA certificate (CA:TRUE, for trust stores)
+/// - `cert.pem` — leaf certificate signed by CA (server identity)
+/// - `key.pem`  — leaf private key
+///
+/// Returns `(cert_path, key_path)` for the leaf cert.
+///
+/// A proper two-level chain is required because webpki (used by
+/// rustls/tonic) rejects certs with `basicConstraints: CA:TRUE` when
+/// presented as end-entity server certificates. Kong and Envoy require
+/// the trust anchor to have CA:TRUE. Splitting into CA + leaf satisfies
+/// both constraints.
 pub fn generate_self_signed_certs(dir: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
-    // rcgen needs a crypto provider installed
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     std::fs::create_dir_all(dir).context("creating cert directory")?;
 
-    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-        .context("generating ECDSA P-256 key pair")?;
+    // ── CA certificate (trust anchor) ──────────────────────────────────
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .context("generating CA key pair")?;
 
-    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .context("creating cert params")?;
-    params
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new())
+        .context("creating CA cert params")?;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.distinguished_name = rcgen::DistinguishedName::new();
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "bench CA");
+
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .context("self-signing CA certificate")?;
+
+    // ── Leaf certificate (server identity) ─────────────────────────────
+    let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .context("generating leaf key pair")?;
+
+    let mut leaf_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .context("creating leaf cert params")?;
+    leaf_params
         .subject_alt_names
         .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
             std::net::Ipv4Addr::new(127, 0, 0, 1),
         )));
-    // Mark the self-signed cert as a CA (with the basicConstraints CA:TRUE
-    // extension) so strict validators — Kong's `ca_certificates`
-    // declarative entity, Envoy's validation_context, and tonic's root
-    // store — will accept it as a trust anchor. Without the CA basic
-    // constraint, Kong rejects the entity outright:
-    //   "certificate does not appear to be a CA because it is missing the
-    //   \"CA\" basic constraint".
-    // This cert is used ONLY by the bench — it doesn't affect production
-    // code paths. It still serves as its own leaf cert (all gateways
-    // present it as their TLS server identity), which is standard for
-    // self-signed testing certs.
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
 
-    let cert = params
-        .self_signed(&key_pair)
-        .context("self-signing certificate")?;
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &ca_cert, &ca_key)
+        .context("signing leaf certificate with CA")?;
 
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-
+    // ── Write files ────────────────────────────────────────────────────
+    let ca_path = dir.join("ca.pem");
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
 
-    std::fs::write(&cert_path, cert_pem.as_bytes()).context("writing cert.pem")?;
-    std::fs::write(&key_path, key_pem.as_bytes()).context("writing key.pem")?;
+    std::fs::write(&ca_path, ca_cert.pem().as_bytes()).context("writing ca.pem")?;
+    std::fs::write(&cert_path, leaf_cert.pem().as_bytes()).context("writing cert.pem")?;
+    std::fs::write(&key_path, leaf_key.serialize_pem().as_bytes()).context("writing key.pem")?;
 
     Ok((cert_path, key_path))
 }
@@ -126,7 +142,7 @@ fn make_server_tls_config_base(
 // ── TLS client config (insecure – skip server cert verification) ─────────────
 
 /// Create a `rustls::ClientConfig` that skips server certificate verification.
-/// ALPN is set to `["h2", "http/1.1"]`.
+/// ALPN is set to `["h2", "http/1.1"]` — suitable for HTTP-family protocols.
 pub fn make_client_tls_config_insecure() -> rustls::ClientConfig {
     let mut cfg = rustls::ClientConfig::builder()
         .dangerous()
@@ -135,6 +151,16 @@ pub fn make_client_tls_config_insecure() -> rustls::ClientConfig {
 
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     cfg
+}
+
+/// Create a `rustls::ClientConfig` with no ALPN for raw stream protocols
+/// (TCP+TLS, DTLS). HTTP ALPN tokens on a raw-stream connection can
+/// confuse gateways that inspect the negotiated protocol.
+pub fn make_client_tls_config_insecure_raw() -> rustls::ClientConfig {
+    rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+        .with_no_client_auth()
 }
 
 // ── HTTP/3 (QUIC) configs ────────────────────────────────────────────────────
