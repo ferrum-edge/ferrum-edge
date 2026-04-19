@@ -27,8 +27,9 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::Client;
 use serde_json::json;
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -100,6 +101,8 @@ pub struct TestGateway {
     pub db_url: Option<String>,
     /// Path to the YAML/JSON config file (file mode only).
     pub config_path: Option<PathBuf>,
+    stdout_path: Option<PathBuf>,
+    stderr_path: Option<PathBuf>,
 }
 
 impl TestGateway {
@@ -181,6 +184,38 @@ impl TestGateway {
         std::fs::write(&p, contents)?;
         Ok(p)
     }
+
+    /// Read the captured stdout/stderr files when [`TestGatewayBuilder::capture_output`]
+    /// was enabled. Missing capture files return empty strings.
+    pub fn read_captured_output(&self) -> Result<(String, String), std::io::Error> {
+        let stdout = self
+            .stdout_path
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?
+            .unwrap_or_default();
+        let stderr = self
+            .stderr_path
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?
+            .unwrap_or_default();
+        Ok((stdout, stderr))
+    }
+
+    /// Read captured stderr + stdout in one string, keeping stderr first to
+    /// match the previous logging-test behaviour.
+    pub fn read_combined_captured_output(&self) -> Result<String, std::io::Error> {
+        let (stdout, stderr) = self.read_captured_output()?;
+        let mut combined = stderr;
+        if !stdout.is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&stdout);
+        }
+        Ok(combined)
+    }
 }
 
 impl Drop for TestGateway {
@@ -215,6 +250,9 @@ pub struct TestGatewayBuilder {
     /// Extra env vars to **remove** before spawning. Handy when the caller's
     /// parent shell has `FERRUM_*` set.
     scrub_env: Vec<String>,
+    clear_env: bool,
+    capture_output: bool,
+    omit_admin_jwt_secret: bool,
     namespace: Option<String>,
     db_poll_interval_seconds: u64,
 }
@@ -234,6 +272,9 @@ impl Default for TestGatewayBuilder {
             prefer_release: false,
             extra_env: Vec::new(),
             scrub_env: Vec::new(),
+            clear_env: false,
+            capture_output: false,
+            omit_admin_jwt_secret: false,
             namespace: None,
             db_poll_interval_seconds: 2,
         }
@@ -349,6 +390,29 @@ impl TestGatewayBuilder {
         self
     }
 
+    /// Start from a clean environment, preserving only a small set of base
+    /// process vars (`PATH`, `HOME`, `TMPDIR`) before applying the builder's
+    /// explicit `FERRUM_*` settings.
+    pub fn clear_env(mut self) -> Self {
+        self.clear_env = true;
+        self
+    }
+
+    /// Redirect stdout/stderr to temp files so tests can inspect structured
+    /// logs without risking pipe-buffer deadlocks.
+    pub fn capture_output(mut self) -> Self {
+        self.capture_output = true;
+        self
+    }
+
+    /// Omit `FERRUM_ADMIN_JWT_SECRET` from the subprocess env. Useful for
+    /// negative tests that assert database/CP mode rejects missing admin JWT
+    /// configuration.
+    pub fn omit_admin_jwt_secret(mut self) -> Self {
+        self.omit_admin_jwt_secret = true;
+        self
+    }
+
     /// Set `FERRUM_NAMESPACE`. When omitted, the gateway uses the default
     /// (`ferrum`).
     pub fn namespace(mut self, ns: impl Into<String>) -> Self {
@@ -392,6 +456,37 @@ impl TestGatewayBuilder {
         Err(last_err.unwrap_or_else(|| "spawn failed with no recorded error".into()))
     }
 
+    /// Spawn the gateway and assert it exits non-zero within `timeout`.
+    ///
+    /// This is useful for conflict-detection / missing-required-env tests where
+    /// success is the process rejecting bad configuration before it starts.
+    pub async fn spawn_expect_failure(
+        mut self,
+        timeout: Duration,
+    ) -> Result<FailedGatewayStart, Box<dyn std::error::Error + Send + Sync>> {
+        if self.auto_build {
+            ensure_gateway_built()?;
+        }
+        let max_attempts = self.max_attempts.max(1);
+        let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        for attempt in 1..=max_attempts {
+            match self.try_spawn_expect_failure(timeout).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    eprintln!(
+                        "TestGateway expected-failure attempt {}/{} failed: {}",
+                        attempt, max_attempts, e
+                    );
+                    last_err = Some(e);
+                    if attempt < max_attempts {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "expected failure failed with no recorded error".into()))
+    }
+
     async fn try_spawn(&mut self) -> Result<TestGateway, Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = TempDir::new()?;
         let admin_port = ephemeral_port().await?;
@@ -408,6 +503,10 @@ impl TestGatewayBuilder {
         }
 
         let mut cmd = Command::new(&binary);
+        if self.clear_env {
+            cmd.env_clear();
+            preserve_base_env(&mut cmd);
+        }
         for key in &self.scrub_env {
             cmd.env_remove(key);
         }
@@ -422,9 +521,23 @@ impl TestGatewayBuilder {
         for (k, v) in &env {
             cmd.env(k, v);
         }
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        let stdout_path = self
+            .capture_output
+            .then(|| temp_dir.path().join("gateway.stdout.log"));
+        let stderr_path = self
+            .capture_output
+            .then(|| temp_dir.path().join("gateway.stderr.log"));
+        cmd.stdin(Stdio::null());
+        if let Some(path) = &stdout_path {
+            cmd.stdout(Stdio::from(File::create(path)?));
+        } else {
+            cmd.stdout(Stdio::null());
+        }
+        if let Some(path) = &stderr_path {
+            cmd.stderr(Stdio::from(File::create(path)?));
+        } else {
+            cmd.stderr(Stdio::null());
+        }
 
         let child = cmd.spawn()?;
 
@@ -434,38 +547,171 @@ impl TestGatewayBuilder {
             db_url = env.get("FERRUM_DB_URL").cloned();
         }
 
+        let effective_proxy_port = env
+            .get("FERRUM_PROXY_HTTP_PORT")
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(proxy_port);
+        let effective_admin_port = env
+            .get("FERRUM_ADMIN_HTTP_PORT")
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(admin_port);
+
         let mut gw = TestGateway {
             temp_dir,
             child: Some(child),
-            proxy_port,
-            admin_port,
-            proxy_base_url: format!("http://127.0.0.1:{}", proxy_port),
-            admin_base_url: format!("http://127.0.0.1:{}", admin_port),
+            proxy_port: effective_proxy_port,
+            admin_port: effective_admin_port,
+            proxy_base_url: format!("http://127.0.0.1:{}", effective_proxy_port),
+            admin_base_url: format!("http://127.0.0.1:{}", effective_admin_port),
             jwt_secret: self.jwt_secret.clone(),
             jwt_issuer: self.jwt_issuer.clone(),
             basic_auth_hmac_secret: self.basic_auth_hmac_secret.clone(),
             db_url,
             config_path,
+            stdout_path,
+            stderr_path,
         };
 
         match gw.wait_for_health(self.health_timeout).await {
             Ok(()) => Ok(gw),
             Err(e) => {
+                let combined_logs = gw.read_combined_captured_output().unwrap_or_default();
                 // Clean up the failed child so the retry loop starts fresh.
                 gw.shutdown();
-                Err(e)
+                if combined_logs.is_empty() {
+                    Err(e)
+                } else {
+                    Err(format!("{e}\n--- captured gateway output ---\n{combined_logs}").into())
+                }
             }
         }
+    }
+
+    async fn try_spawn_expect_failure(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<FailedGatewayStart, Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = TempDir::new()?;
+        let admin_port = ephemeral_port().await?;
+        let proxy_port = ephemeral_port().await?;
+        let binary = locate_binary(self.prefer_release)?;
+        let (mut env, db_url, config_path) =
+            build_env(self, &temp_dir, admin_port, proxy_port).await?;
+        for (k, v) in &self.extra_env {
+            env.insert(k.clone(), v.clone());
+        }
+
+        let mut cmd = Command::new(&binary);
+        if self.clear_env {
+            cmd.env_clear();
+            preserve_base_env(&mut cmd);
+        }
+        for key in &self.scrub_env {
+            cmd.env_remove(key);
+        }
+        for var in SCRUB_DEFAULTS.iter() {
+            if !env.contains_key(*var) {
+                cmd.env_remove(*var);
+            }
+        }
+        for (k, v) in &env {
+            cmd.env(k, v);
+        }
+        let stdout_path = temp_dir.path().join("gateway.stdout.log");
+        let stderr_path = temp_dir.path().join("gateway.stderr.log");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::from(File::create(&stdout_path)?))
+            .stderr(Stdio::from(File::create(&stderr_path)?));
+
+        let mut child = cmd.spawn()?;
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+                let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+                return Err(format!(
+                    "gateway did not exit within {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                    timeout, stdout, stderr
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        if status.success() {
+            let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+            let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            return Err(format!(
+                "gateway unexpectedly exited successfully\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                stdout, stderr
+            )
+            .into());
+        }
+
+        Ok(FailedGatewayStart {
+            status: Some(status),
+            stdout: std::fs::read_to_string(&stdout_path).unwrap_or_default(),
+            stderr: std::fs::read_to_string(&stderr_path).unwrap_or_default(),
+            db_url,
+            config_path,
+            env,
+        })
+    }
+}
+
+pub struct FailedGatewayStart {
+    pub status: Option<ExitStatus>,
+    pub stdout: String,
+    pub stderr: String,
+    pub db_url: Option<String>,
+    pub config_path: Option<PathBuf>,
+    env: HashMap<String, String>,
+}
+
+impl FailedGatewayStart {
+    pub fn combined_output(&self) -> String {
+        let mut combined = self.stderr.clone();
+        if !self.stdout.is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&self.stdout);
+        }
+        combined
+    }
+
+    pub fn env_port(&self, key: &str) -> Option<u16> {
+        self.env.get(key)?.parse().ok()
     }
 }
 
 /// Env var names we scrub unless the builder explicitly sets them. Prevents
 /// parent-shell leakage from fighting the builder's defaults.
 const SCRUB_DEFAULTS: &[&str] = &[
+    "FERRUM_MODE",
     "FERRUM_FILE_CONFIG_PATH",
     "FERRUM_CP_GRPC_LISTEN_ADDR",
     "FERRUM_DP_CP_GRPC_URL",
     "FERRUM_DP_CP_GRPC_URLS",
+    "FERRUM_PROXY_HTTP_PORT",
+    "FERRUM_PROXY_HTTPS_PORT",
+    "FERRUM_ADMIN_HTTP_PORT",
+    "FERRUM_ADMIN_HTTPS_PORT",
+    "FERRUM_LOG_LEVEL",
+    "FERRUM_POOL_WARMUP_ENABLED",
+    "FERRUM_BASIC_AUTH_HMAC_SECRET",
+    "FERRUM_NAMESPACE",
+    "FERRUM_DB_TYPE",
+    "FERRUM_DB_URL",
+    "FERRUM_DB_POLL_INTERVAL",
+    "FERRUM_ADMIN_JWT_SECRET",
+    "FERRUM_ADMIN_JWT_ISSUER",
+    "FERRUM_CP_DP_GRPC_JWT_SECRET",
 ];
 
 /// Build the subprocess env map from the builder's mode + tuning knobs.
@@ -502,7 +748,9 @@ async fn build_env(
     match &b.mode {
         GatewayMode::Database(db) => {
             env.insert("FERRUM_MODE".into(), "database".into());
-            env.insert("FERRUM_ADMIN_JWT_SECRET".into(), b.jwt_secret.clone());
+            if !b.omit_admin_jwt_secret {
+                env.insert("FERRUM_ADMIN_JWT_SECRET".into(), b.jwt_secret.clone());
+            }
             env.insert("FERRUM_ADMIN_JWT_ISSUER".into(), b.jwt_issuer.clone());
             env.insert(
                 "FERRUM_DB_POLL_INTERVAL".into(),
@@ -517,7 +765,9 @@ async fn build_env(
             env.insert("FERRUM_MODE".into(), "file".into());
             // File mode generates its own admin JWT secret internally (read-only
             // API), but setting a secret makes admin tokens testable.
-            env.insert("FERRUM_ADMIN_JWT_SECRET".into(), b.jwt_secret.clone());
+            if !b.omit_admin_jwt_secret {
+                env.insert("FERRUM_ADMIN_JWT_SECRET".into(), b.jwt_secret.clone());
+            }
             env.insert("FERRUM_ADMIN_JWT_ISSUER".into(), b.jwt_issuer.clone());
             let path = temp.path().join("ferrum.yaml");
             std::fs::write(&path, config_yaml)?;
@@ -532,7 +782,9 @@ async fn build_env(
             grpc_listen_addr,
         } => {
             env.insert("FERRUM_MODE".into(), "cp".into());
-            env.insert("FERRUM_ADMIN_JWT_SECRET".into(), b.jwt_secret.clone());
+            if !b.omit_admin_jwt_secret {
+                env.insert("FERRUM_ADMIN_JWT_SECRET".into(), b.jwt_secret.clone());
+            }
             env.insert("FERRUM_ADMIN_JWT_ISSUER".into(), b.jwt_issuer.clone());
             env.insert(
                 "FERRUM_DB_POLL_INTERVAL".into(),
@@ -559,7 +811,9 @@ async fn build_env(
         }
         GatewayMode::DataPlane { cp_grpc_urls } => {
             env.insert("FERRUM_MODE".into(), "dp".into());
-            env.insert("FERRUM_ADMIN_JWT_SECRET".into(), b.jwt_secret.clone());
+            if !b.omit_admin_jwt_secret {
+                env.insert("FERRUM_ADMIN_JWT_SECRET".into(), b.jwt_secret.clone());
+            }
             env.insert("FERRUM_ADMIN_JWT_ISSUER".into(), b.jwt_issuer.clone());
             env.insert(
                 "FERRUM_CP_DP_GRPC_JWT_SECRET".into(),
@@ -612,17 +866,33 @@ async fn wait_for_health_inner(
     let health_url = format!("http://127.0.0.1:{}/health", admin_port);
     let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
     let deadline = Instant::now() + timeout;
+    let mut last_observation = String::from("no response yet");
     loop {
         if Instant::now() >= deadline {
             return Err(format!(
-                "gateway admin /health did not become ready on port {} within {:?}",
-                admin_port, timeout
+                "gateway admin /health did not become ready on port {} within {:?} (last observation: {})",
+                admin_port, timeout, last_observation
             )
             .into());
         }
         match client.get(&health_url).send().await {
             Ok(r) if r.status().is_success() => return Ok(()),
-            _ => tokio::time::sleep(Duration::from_millis(250)).await,
+            Ok(r) => {
+                last_observation = format!("HTTP {}", r.status());
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => {
+                last_observation = err.to_string();
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+fn preserve_base_env(cmd: &mut Command) {
+    for key in ["PATH", "HOME", "TMPDIR"] {
+        if let Ok(value) = std::env::var(key) {
+            cmd.env(key, value);
         }
     }
 }
