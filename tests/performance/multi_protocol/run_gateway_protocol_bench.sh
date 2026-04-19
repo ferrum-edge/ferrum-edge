@@ -59,6 +59,14 @@ case "$PROTOCOL" in
     udp|udp-dtls) PAYLOAD_SIZES="1024" ;;
 esac
 
+# Absolutize OUTPUT_DIR immediately so it survives any cd later in the script.
+# The workflow passes --output-dir as a relative path (e.g. "results/http1-tls/run_1")
+# expecting it to resolve against the caller's CWD (repo root), but start_backend
+# must cd into $SCRIPT_DIR before launching proto_backend so cert generation
+# lands in the expected location. Resolving to absolute upfront decouples the two.
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+
 # ── Gateway × protocol support matrix ─────────────────────────────────────────
 # Returns 0 if the gateway supports the protocol, 1 otherwise.
 supports() {
@@ -156,9 +164,21 @@ build_binaries() {
 # ── Backend ──────────────────────────────────────────────────────────────────
 start_backend() {
     echo "[backend] starting proto_backend..."
+    # proto_backend writes self-signed certs to ./certs relative to its CWD
+    # (see tests/performance/multi_protocol/proto_backend.rs — uses
+    # std::env::current_dir().join("certs")). We must cd into $SCRIPT_DIR so
+    # certs land at $CERT_DIR ($SCRIPT_DIR/certs), but we MUST restore the
+    # caller's CWD afterwards — otherwise relative paths passed by the
+    # workflow (e.g. --output-dir "results/http1-tls/run_1") would resolve
+    # against $SCRIPT_DIR instead of the repo root and subsequent run_bench
+    # writes to $OUTPUT_DIR/*.json would fail.
+    local saved_pwd
+    saved_pwd="$(pwd)"
     cd "$SCRIPT_DIR"
     ./target/release/proto_backend > "$SCRIPT_DIR/backend.log" 2>&1 &
     BACKEND_PID=$!
+    cd "$saved_pwd"
+
     for i in $(seq 1 20); do
         if curl -sf http://127.0.0.1:3010/health >/dev/null 2>&1; then
             echo "[backend] healthy (pid $BACKEND_PID)"
