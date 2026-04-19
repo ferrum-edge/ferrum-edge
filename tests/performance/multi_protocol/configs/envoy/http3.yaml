@@ -70,6 +70,9 @@ static_resources:
           upstream_tls_context:
             common_tls_context:
               alpn_protocols: ["h3"]
+              validation_context:
+                trusted_ca:
+                  filename: CA_PATH
       load_assignment:
         cluster_name: backend_h3
         endpoints:

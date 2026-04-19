@@ -18,7 +18,10 @@
     "enable_mtls": false
   },
   "client_tls": {
-    "allow_insecure_connections": true
+    "allow_insecure_connections": false,
+    "ca_certs": [
+      "/certs/cert.pem"
+    ]
   },
   "endpoints": [
     {
@@ -27,7 +30,9 @@
       "output_encoding": "no-op",
       "backend": [
         {
-          "host": ["https://127.0.0.1:3443"],
+          "host": [
+            "https://127.0.0.1:3443"
+          ],
           "url_pattern": "/echo",
           "encoding": "no-op",
           "disable_host_sanitize": true
@@ -40,7 +45,9 @@
       "output_encoding": "no-op",
       "backend": [
         {
-          "host": ["http://127.0.0.1:3010"],
+          "host": [
+            "http://127.0.0.1:3010"
+          ],
           "url_pattern": "/health",
           "encoding": "no-op"
         }

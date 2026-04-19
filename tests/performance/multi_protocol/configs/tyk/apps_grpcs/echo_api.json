@@ -11,12 +11,16 @@
     "target_url": "https://127.0.0.1:50053",
     "strip_listen_path": false,
     "transport": {
-      "ssl_insecure_skip_verify": true
+      "ssl_insecure_skip_verify": false
     }
   },
   "version_data": {
     "not_versioned": true,
     "default_version": "Default",
-    "versions": { "Default": { "name": "Default" } }
+    "versions": {
+      "Default": {
+        "name": "Default"
+      }
+    }
   }
 }

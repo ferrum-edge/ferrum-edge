@@ -271,7 +271,18 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(args.duration);
 
     let tls_cfg = if is_tls {
-        Some(Arc::new(tls_utils::make_client_tls_config_insecure()))
+        // Force ALPN to h2-only on the client side. The shared
+        // `make_client_tls_config_insecure()` helper defaults to
+        // `["h2", "http/1.1"]`; against a strict server that ONLY advertises
+        // `["h2"]` (e.g. Envoy with the h2 route config), some TLS stacks
+        // have been observed to negotiate http/1.1 when both sides offer
+        // the protocol in different orders — the downstream hyper h2
+        // handshake then fails on the first send_request, producing the
+        // classic 0 RPS / 100 errors pattern. Offering only h2 guarantees
+        // we either get h2 or fail the TLS handshake cleanly.
+        let mut cfg = tls_utils::make_client_tls_config_insecure();
+        cfg.alpn_protocols = vec![b"h2".to_vec()];
+        Some(Arc::new(cfg))
     } else {
         None
     };

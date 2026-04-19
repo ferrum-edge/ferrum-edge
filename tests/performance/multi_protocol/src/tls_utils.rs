@@ -25,6 +25,18 @@ pub fn generate_self_signed_certs(dir: &Path) -> anyhow::Result<(PathBuf, PathBu
         .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
             std::net::Ipv4Addr::new(127, 0, 0, 1),
         )));
+    // Mark the self-signed cert as a CA (with the basicConstraints CA:TRUE
+    // extension) so strict validators — Kong's `ca_certificates`
+    // declarative entity, Envoy's validation_context, and tonic's root
+    // store — will accept it as a trust anchor. Without the CA basic
+    // constraint, Kong rejects the entity outright:
+    //   "certificate does not appear to be a CA because it is missing the
+    //   \"CA\" basic constraint".
+    // This cert is used ONLY by the bench — it doesn't affect production
+    // code paths. It still serves as its own leaf cert (all gateways
+    // present it as their TLS server identity), which is standard for
+    // self-signed testing certs.
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
 
     let cert = params
         .self_signed(&key_pair)
