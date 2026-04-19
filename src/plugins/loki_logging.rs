@@ -1,10 +1,8 @@
 //! Loki access logging plugin — batched async log shipping to Grafana Loki.
 //!
 //! Serializes `TransactionSummary` and `StreamTransactionSummary` entries and
-//! sends them to Loki's push API (`/loki/api/v1/push`) in batches. Uses an
-//! mpsc channel to decouple the proxy hot path from network I/O: the `log()`
-//! hook enqueues the entry (non-blocking), and a background task drains the
-//! channel in configurable batch sizes with a flush interval timer.
+//! sends them to Loki's push API (`/loki/api/v1/push`) in batches. Uses
+//! `BatchingLogger<LokiEntry>` to decouple the proxy hot path from network I/O.
 //!
 //! Loki-specific features:
 //! - **Labels**: Low-cardinality indexed labels (service, environment, proxy
@@ -23,15 +21,15 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::warn;
 use url::Url;
 
-use super::utils::PluginHttpClient;
+use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
 /// A log entry with pre-computed labels and a JSON log line.
+#[derive(Clone)]
 struct LokiEntry {
     /// Sorted label key-value pairs (deterministic ordering for grouping).
     labels: BTreeMap<String, String>,
@@ -41,15 +39,12 @@ struct LokiEntry {
     line: String,
 }
 
-struct LokiBatchConfig {
+#[derive(Clone)]
+struct LokiFlushConfig {
     endpoint_url: String,
     authorization_header: Option<String>,
     custom_headers: Vec<(String, String)>,
     http_client: PluginHttpClient,
-    batch_size: usize,
-    flush_interval: Duration,
-    max_retries: u32,
-    retry_delay: Duration,
     gzip: bool,
 }
 
@@ -67,7 +62,7 @@ struct LabelConfig {
 }
 
 pub struct LokiLogging {
-    sender: mpsc::Sender<LokiEntry>,
+    logger: BatchingLogger<LokiEntry>,
     endpoint_hostname: Option<String>,
     label_config: LabelConfig,
 }
@@ -109,20 +104,16 @@ impl LokiLogging {
         // Parse static labels from config.
         let mut static_labels = BTreeMap::new();
         if let Some(labels_obj) = config["labels"].as_object() {
-            for (k, v) in labels_obj {
-                if let Some(val) = v.as_str() {
-                    static_labels.insert(k.clone(), val.to_string());
+            for (key, value) in labels_obj {
+                if let Some(label) = value.as_str() {
+                    static_labels.insert(key.clone(), label.to_string());
                 }
             }
         }
-        // Default "service" label if not provided.
         if !static_labels.contains_key("service") {
             static_labels.insert("service".to_string(), "ferrum-edge".to_string());
         }
 
-        // Prefer the new `include_proxy_id_label` key; fall back to the legacy
-        // `include_listen_path_label` (which also controlled the `proxy_id`
-        // label — the old name was misleading) for backward compatibility.
         let include_proxy_id = config["include_proxy_id_label"]
             .as_bool()
             .or_else(|| config["include_listen_path_label"].as_bool())
@@ -137,37 +128,44 @@ impl LokiLogging {
             include_status_class,
         };
 
-        // Parse custom headers (e.g., X-Scope-OrgID for multi-tenant Loki).
         let mut custom_headers = Vec::new();
         if let Some(headers_obj) = config["custom_headers"].as_object() {
-            for (k, v) in headers_obj {
-                if let Some(val) = v.as_str() {
-                    custom_headers.push((k.clone(), val.to_string()));
+            for (key, value) in headers_obj {
+                if let Some(header) = value.as_str() {
+                    custom_headers.push((key.clone(), header.to_string()));
                 }
             }
         }
 
-        let batch_config = LokiBatchConfig {
+        let flush_config = LokiFlushConfig {
             endpoint_url,
             authorization_header: config["authorization_header"]
                 .as_str()
-                .map(|s| s.to_string()),
+                .map(|value| value.to_string()),
             custom_headers,
             http_client,
-            batch_size,
-            flush_interval: Duration::from_millis(flush_interval_ms),
-            max_retries: config["max_retries"].as_u64().unwrap_or(3) as u32,
-            retry_delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
             gzip,
         };
-
-        let endpoint_hostname = parsed_url.host_str().map(|h| h.to_string());
-
-        let (sender, receiver) = mpsc::channel(buffer_capacity);
-        tokio::spawn(flush_loop(receiver, batch_config));
+        let endpoint_hostname = parsed_url.host_str().map(|host| host.to_string());
+        let logger = BatchingLogger::spawn(
+            BatchConfig {
+                batch_size,
+                flush_interval: Duration::from_millis(flush_interval_ms),
+                buffer_capacity,
+                retry: RetryPolicy {
+                    max_attempts: config["max_retries"].as_u64().unwrap_or(3) as u32 + 1,
+                    delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
+                },
+                plugin_name: "loki_logging",
+            },
+            move |batch| {
+                let flush_config = flush_config.clone();
+                async move { send_batch(&flush_config, batch).await }
+            },
+        );
 
         Ok(Self {
-            sender,
+            logger,
             endpoint_hostname,
             label_config,
         })
@@ -246,92 +244,40 @@ impl Plugin for LokiLogging {
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
         let labels = self.build_stream_labels(summary);
         let line = match serde_json::to_string(summary) {
-            Ok(l) => l,
-            Err(e) => {
-                warn!("Loki logging: failed to serialize stream summary: {e}");
+            Ok(line) => line,
+            Err(error) => {
+                warn!("Loki logging: failed to serialize stream summary: {error}");
                 return;
             }
         };
-        let entry = LokiEntry {
+        self.logger.try_send(LokiEntry {
             labels,
             timestamp_ns: timestamp_nanos_from_rfc3339(&summary.timestamp_disconnected),
             line,
-        };
-        if self.sender.try_send(entry).is_err() {
-            warn!("Loki logging buffer full — dropping stream log entry");
-        }
+        });
     }
 
     async fn log(&self, summary: &TransactionSummary) {
         let labels = self.build_http_labels(summary);
         let line = match serde_json::to_string(summary) {
-            Ok(l) => l,
-            Err(e) => {
-                warn!("Loki logging: failed to serialize transaction summary: {e}");
+            Ok(line) => line,
+            Err(error) => {
+                warn!("Loki logging: failed to serialize transaction summary: {error}");
                 return;
             }
         };
-        let entry = LokiEntry {
+        self.logger.try_send(LokiEntry {
             labels,
             timestamp_ns: timestamp_nanos_from_rfc3339(&summary.timestamp_received),
             line,
-        };
-        if self.sender.try_send(entry).is_err() {
-            warn!("Loki logging buffer full — dropping log entry");
-        }
+        });
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
         self.endpoint_hostname
             .as_ref()
-            .map(|h| vec![h.clone()])
+            .map(|host| vec![host.clone()])
             .unwrap_or_default()
-    }
-}
-
-/// Background task that drains the channel and flushes batches to Loki.
-async fn flush_loop(mut receiver: mpsc::Receiver<LokiEntry>, cfg: LokiBatchConfig) {
-    if cfg.endpoint_url.is_empty() {
-        while receiver.recv().await.is_some() {}
-        return;
-    }
-
-    let mut buffer: Vec<LokiEntry> = Vec::with_capacity(cfg.batch_size);
-    let mut timer = tokio::time::interval(cfg.flush_interval);
-    // The first tick completes immediately — consume it so the first real
-    // flush waits for one full interval.
-    timer.tick().await;
-
-    loop {
-        tokio::select! {
-            biased;
-
-            msg = receiver.recv() => {
-                match msg {
-                    Some(entry) => {
-                        buffer.push(entry);
-                        if buffer.len() >= cfg.batch_size {
-                            let batch = std::mem::take(&mut buffer);
-                            send_batch(&cfg, batch).await;
-                        }
-                    }
-                    None => {
-                        if !buffer.is_empty() {
-                            let batch = std::mem::take(&mut buffer);
-                            send_batch(&cfg, batch).await;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            _ = timer.tick() => {
-                if !buffer.is_empty() {
-                    let batch = std::mem::take(&mut buffer);
-                    send_batch(&cfg, batch).await;
-                }
-            }
-        }
     }
 }
 
@@ -340,8 +286,6 @@ type LokiStream = (BTreeMap<String, String>, Vec<(String, String)>);
 
 /// Group entries by label set and build the Loki push payload.
 fn build_loki_payload(batch: &[LokiEntry]) -> Value {
-    // Group by label set. BTreeMap serializes to a deterministic key, so we
-    // use its JSON representation as the grouping key.
     let mut streams: HashMap<String, LokiStream> = HashMap::new();
 
     for entry in batch {
@@ -359,7 +303,7 @@ fn build_loki_payload(batch: &[LokiEntry]) -> Value {
         .map(|(labels, values)| {
             let values_array: Vec<Value> = values
                 .into_iter()
-                .map(|(ts, line)| serde_json::json!([ts, line]))
+                .map(|(timestamp, line)| serde_json::json!([timestamp, line]))
                 .collect();
             serde_json::json!({
                 "stream": labels,
@@ -371,19 +315,16 @@ fn build_loki_payload(batch: &[LokiEntry]) -> Value {
     serde_json::json!({ "streams": streams_array })
 }
 
-/// Send a batch of entries to Loki, with retries.
-async fn send_batch(cfg: &LokiBatchConfig, batch: Vec<LokiEntry>) {
-    let total_attempts = cfg.max_retries + 1;
+/// Send a batch of entries to Loki.
+async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), String> {
     let entry_count = batch.len();
-
     let payload = build_loki_payload(&batch);
 
-    // Pre-serialize and optionally gzip the body so retries reuse the same bytes.
     let (body_bytes, content_encoding) = if cfg.gzip {
         match gzip_json(&payload) {
             Ok(compressed) => (compressed, Some("gzip")),
-            Err(e) => {
-                warn!("Loki logging: gzip compression failed, sending uncompressed: {e}");
+            Err(error) => {
+                warn!("Loki logging: gzip compression failed, sending uncompressed: {error}");
                 let raw = serde_json::to_vec(&payload).unwrap_or_default();
                 (raw, None)
             }
@@ -393,64 +334,42 @@ async fn send_batch(cfg: &LokiBatchConfig, batch: Vec<LokiEntry>) {
         (raw, None)
     };
 
-    for attempt in 1..=total_attempts {
-        let mut req = cfg
-            .http_client
-            .get()
-            .post(&cfg.endpoint_url)
-            .header("Content-Type", "application/json")
-            .body(body_bytes.clone());
+    let mut req = cfg
+        .http_client
+        .get()
+        .post(&cfg.endpoint_url)
+        .header("Content-Type", "application/json")
+        .body(body_bytes);
 
-        if let Some(encoding) = content_encoding {
-            req = req.header("Content-Encoding", encoding);
-        }
-        if let Some(auth) = &cfg.authorization_header {
-            req = req.header("Authorization", auth);
-        }
-        for (key, value) in &cfg.custom_headers {
-            req = req.header(key.as_str(), value.as_str());
-        }
-
-        match cfg.http_client.execute(req, "loki_logging").await {
-            Ok(response) if response.status().is_success() => return,
-            Ok(response) => {
-                let status = response.status();
-                warn!(
-                    "Loki logging batch failed with status {} (attempt {}/{})",
-                    status, attempt, total_attempts,
-                );
-                // 4xx is a client error (bad payload, auth) — retrying won't
-                // fix it. Exceptions: 408 (Request Timeout) and 429 (Too Many
-                // Requests) are transient throttling signals (Loki uses 429
-                // for ingestion rate-limits) and should be retried within the
-                // configured budget.
-                if status.is_client_error()
-                    && status != reqwest::StatusCode::REQUEST_TIMEOUT
-                    && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-                {
-                    warn!(
-                        "Loki logging batch discarded due to {} response ({} entries lost)",
-                        status, entry_count,
-                    );
-                    return;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Loki logging batch failed: {} (attempt {}/{})",
-                    e, attempt, total_attempts,
-                );
-            }
-        }
-        if attempt < total_attempts {
-            tokio::time::sleep(cfg.retry_delay).await;
-        }
+    if let Some(encoding) = content_encoding {
+        req = req.header("Content-Encoding", encoding);
+    }
+    if let Some(auth) = &cfg.authorization_header {
+        req = req.header("Authorization", auth);
+    }
+    for (key, value) in &cfg.custom_headers {
+        req = req.header(key.as_str(), value.as_str());
     }
 
-    warn!(
-        "Loki logging batch discarded after {} attempts ({} entries lost)",
-        total_attempts, entry_count,
-    );
+    match cfg.http_client.execute(req, "loki_logging").await {
+        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) => {
+            let status = response.status();
+            if status.is_client_error()
+                && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+            {
+                warn!(
+                    "Loki logging batch discarded due to {} response ({} entries lost)",
+                    status, entry_count,
+                );
+                Ok(())
+            } else {
+                Err(format!("Loki logging batch failed with status {status}"))
+            }
+        }
+        Err(error) => Err(format!("Loki logging batch failed: {error}")),
+    }
 }
 
 /// Gzip-compress a JSON value.
