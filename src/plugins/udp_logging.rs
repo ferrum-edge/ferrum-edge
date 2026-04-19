@@ -1,15 +1,13 @@
 //! UDP/DTLS access logging plugin — batched async log shipping over UDP.
 //!
 //! Serializes `TransactionSummary` and `StreamTransactionSummary` entries and
-//! sends them to a remote UDP endpoint in batches. Uses an mpsc channel to
-//! decouple the proxy hot path from network I/O: the `log()` hook enqueues
-//! the entry (non-blocking), and a background task drains the channel in
-//! configurable batch sizes with a flush interval timer.
+//! sends them to a remote UDP endpoint in batches. Uses
+//! `BatchingLogger<LogEntry>` to decouple the proxy hot path from network I/O.
 //!
 //! Supports both plain UDP and DTLS-encrypted transport. When `dtls` is
-//! enabled, the plugin performs a DTLS handshake at startup and encrypts
-//! all log datagrams. DTLS client certificates and CA verification are
-//! configurable for mutual TLS environments.
+//! enabled, the plugin performs a DTLS handshake on first use and encrypts all
+//! log datagrams. DTLS client certificates and CA verification are configurable
+//! for mutual TLS environments.
 //!
 //! Each batch is serialized as a JSON array and sent as a single UDP datagram.
 //! Operators should size `batch_size` to keep serialized payloads under the
@@ -17,33 +15,42 @@
 //! Ethernet). Oversized datagrams may be fragmented or dropped.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
-use tokio::time::{Duration, Instant};
+use tokio::time::Instant;
 use tracing::warn;
 
-use super::utils::PluginHttpClient;
+use super::utils::{
+    BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
+    UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, resolve_udp_endpoint,
+};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
 
-/// How often to re-resolve the remote UDP endpoint even if sends succeed.
-const RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
+#[derive(Clone)]
+struct UdpFlushConfig {
+    host: String,
+    port: u16,
+    dtls_enabled: bool,
+    dtls_cert_path: Option<String>,
+    dtls_key_path: Option<String>,
+    dtls_ca_cert_path: Option<String>,
+    dtls_no_verify: bool,
+    dns_cache: Option<DnsCache>,
+}
 
-/// Union type for log entries sent through the batched channel.
-#[derive(Clone, serde::Serialize)]
-#[serde(untagged)]
-enum LogEntry {
-    Http(TransactionSummary),
-    Stream(StreamTransactionSummary),
+struct UdpFlushState {
+    sender: Option<UdpSender>,
+    current_addr: Option<SocketAddr>,
+    last_resolve: Instant,
 }
 
 pub struct UdpLogging {
-    sender: mpsc::Sender<LogEntry>,
-    endpoint_hostname: Option<String>,
+    logger: BatchingLogger<SummaryLogEntry>,
+    endpoint_hostname: String,
 }
 
 impl UdpLogging {
@@ -68,7 +75,6 @@ impl UdpLogging {
         let dtls_ca_cert_path = config["dtls_ca_cert_path"].as_str().map(|s| s.to_string());
         let dtls_no_verify = config["dtls_no_verify"].as_bool().unwrap_or(false);
 
-        // Validate cert/key pairing
         if dtls_cert_path.is_some() != dtls_key_path.is_some() {
             return Err(
                 "udp_logging: 'dtls_cert_path' and 'dtls_key_path' must be provided together"
@@ -76,55 +82,49 @@ impl UdpLogging {
             );
         }
 
-        let batch_size = config["batch_size"].as_u64().unwrap_or(10).max(1) as usize;
-        let flush_interval_ms = config["flush_interval_ms"]
-            .as_u64()
-            .unwrap_or(1000)
-            .max(100);
-        let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
-        let max_retries = config["max_retries"].as_u64().unwrap_or(1) as u32;
-        let retry_delay = Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(500));
-
-        let endpoint_hostname = Some(host.clone());
-
-        let send_config = UdpSendConfig {
-            host,
+        let flush_config = UdpFlushConfig {
+            host: host.clone(),
             port: port as u16,
             dtls_enabled,
             dtls_cert_path,
             dtls_key_path,
             dtls_ca_cert_path,
             dtls_no_verify,
-            batch_size,
-            flush_interval: Duration::from_millis(flush_interval_ms),
-            max_retries,
-            retry_delay,
+            dns_cache: http_client.dns_cache().cloned(),
         };
-
-        let dns_cache = http_client.dns_cache().cloned();
-
-        let (sender, receiver) = mpsc::channel(buffer_capacity);
-        tokio::spawn(flush_loop(receiver, send_config, dns_cache));
+        let state = Arc::new(Mutex::new(UdpFlushState {
+            sender: None,
+            current_addr: None,
+            last_resolve: Instant::now(),
+        }));
+        let logger = BatchingLogger::spawn(
+            // Config remains `max_retries`; the shared retry policy counts the
+            // initial attempt plus those retries.
+            build_batch_config(
+                config,
+                "udp_logging",
+                BatchConfigDefaults {
+                    batch_size_key: "batch_size",
+                    batch_size: 10,
+                    flush_interval_ms: 1000,
+                    min_flush_interval_ms: 100,
+                    buffer_capacity: 10000,
+                    max_retries: 1,
+                    retry_delay_ms: 500,
+                },
+            ),
+            move |batch| {
+                let flush_config = flush_config.clone();
+                let state = Arc::clone(&state);
+                async move { send_batch(&flush_config, &state, batch).await }
+            },
+        );
 
         Ok(Self {
-            sender,
-            endpoint_hostname,
+            logger,
+            endpoint_hostname: host,
         })
     }
-}
-
-struct UdpSendConfig {
-    host: String,
-    port: u16,
-    dtls_enabled: bool,
-    dtls_cert_path: Option<String>,
-    dtls_key_path: Option<String>,
-    dtls_ca_cert_path: Option<String>,
-    dtls_no_verify: bool,
-    batch_size: usize,
-    flush_interval: Duration,
-    max_retries: u32,
-    retry_delay: Duration,
 }
 
 #[async_trait]
@@ -142,30 +142,15 @@ impl Plugin for UdpLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        if self
-            .sender
-            .try_send(LogEntry::Stream(summary.clone()))
-            .is_err()
-        {
-            warn!("UDP logging buffer full — dropping stream log entry");
-        }
+        self.logger.try_send(summary.into());
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        if self
-            .sender
-            .try_send(LogEntry::Http(summary.clone()))
-            .is_err()
-        {
-            warn!("UDP logging buffer full — dropping log entry");
-        }
+        self.logger.try_send(summary.into());
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        self.endpoint_hostname
-            .as_ref()
-            .map(|h| vec![h.clone()])
-            .unwrap_or_default()
+        vec![self.endpoint_hostname.clone()]
     }
 }
 
@@ -191,73 +176,31 @@ impl UdpSender {
     }
 }
 
-/// Resolve the remote UDP endpoint. Prefers the gateway's shared `DnsCache`
-/// (TTL-aware, stale-while-revalidate, background refresh) and falls back to
-/// `tokio::net::lookup_host` when no cache is present (tests / fallback).
-async fn resolve_endpoint(
-    host: &str,
-    port: u16,
-    dns_cache: Option<&DnsCache>,
-) -> Result<SocketAddr, String> {
-    if let Some(cache) = dns_cache {
-        match cache.resolve(host, None, None).await {
-            Ok(ip) => return Ok(SocketAddr::new(ip, port)),
-            Err(e) => {
-                warn!(
-                    "udp_logging: DNS cache resolution failed for '{host}': {e} — falling back to system DNS"
-                );
-            }
-        }
-    }
-    use tokio::net::lookup_host;
-    let addr_str = format!("{host}:{port}");
-    lookup_host(&addr_str)
-        .await
-        .map_err(|e| format!("udp_logging: DNS resolution failed for {addr_str}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("udp_logging: no addresses resolved for {addr_str}"))
-}
-
 async fn create_sender(
-    cfg: &UdpSendConfig,
+    cfg: &UdpFlushConfig,
     dns_cache: Option<&DnsCache>,
 ) -> Result<(UdpSender, SocketAddr), String> {
-    let remote_addr = resolve_endpoint(&cfg.host, cfg.port, dns_cache).await?;
+    let remote_addr = resolve_udp_endpoint(&cfg.host, cfg.port, dns_cache, "udp_logging").await?;
     let sender = build_sender_for_addr(cfg, remote_addr).await?;
     Ok((sender, remote_addr))
 }
 
 /// Bind an ephemeral local UDP socket, connect to `remote_addr`, and (if
-/// configured) complete a DTLS handshake. Extracted from `create_sender` so the
-/// periodic re-resolve path in `flush_loop` can rebuild the sender only when
-/// the resolved address actually changes, reusing the cached `SocketAddr`
-/// without a second DNS lookup.
+/// configured) complete a DTLS handshake.
 async fn build_sender_for_addr(
-    cfg: &UdpSendConfig,
+    cfg: &UdpFlushConfig,
     remote_addr: SocketAddr,
 ) -> Result<UdpSender, String> {
-    // Bind to an ephemeral local port — use IPv4 or IPv6 to match the remote
-    let bind_addr: SocketAddr = if remote_addr.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
-    } else {
-        "[::]:0".parse().unwrap()
-    };
-    let socket = UdpSocket::bind(bind_addr)
-        .await
-        .map_err(|e| format!("udp_logging: bind failed: {e}"))?;
-    socket
-        .connect(remote_addr)
-        .await
-        .map_err(|e| format!("udp_logging: connect to {remote_addr} failed: {e}"))?;
+    let socket = bind_connected_udp_socket(remote_addr, "udp_logging").await?;
 
     if cfg.dtls_enabled {
         let certificate =
             if let (Some(cert_path), Some(key_path)) = (&cfg.dtls_cert_path, &cfg.dtls_key_path) {
                 crate::dtls::load_dtls_certificate(cert_path, key_path)
-                    .map_err(|e| format!("udp_logging: DTLS cert load failed: {e}"))?
+                    .map_err(|error| format!("udp_logging: DTLS cert load failed: {error}"))?
             } else {
                 crate::dtls::generate_ephemeral_cert_public()
-                    .map_err(|e| format!("udp_logging: DTLS ephemeral cert failed: {e}"))?
+                    .map_err(|error| format!("udp_logging: DTLS ephemeral cert failed: {error}"))?
             };
 
         let (server_name, server_cert_verifier) = if cfg.dtls_no_verify {
@@ -265,7 +208,7 @@ async fn build_sender_for_addr(
         } else {
             let root_store = if let Some(ca_path) = &cfg.dtls_ca_cert_path {
                 crate::dtls::load_root_store_from_pem(ca_path)
-                    .map_err(|e| format!("udp_logging: DTLS CA load failed: {e}"))?
+                    .map_err(|error| format!("udp_logging: DTLS CA load failed: {error}"))?
             } else {
                 let mut roots = rustls::RootCertStore::empty();
                 roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -273,11 +216,8 @@ async fn build_sender_for_addr(
             };
             let server_name = rustls::pki_types::ServerName::try_from(cfg.host.clone())
                 .map_err(|_| format!("udp_logging: invalid DTLS server name: {}", cfg.host))?;
-            let verifier = crate::tls::build_server_verifier_with_crls(
-                root_store,
-                &[], // No CRL for logging endpoint
-            )
-            .map_err(|e| format!("udp_logging: DTLS verifier build failed: {e}"))?;
+            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &[])
+                .map_err(|error| format!("udp_logging: DTLS verifier build failed: {error}"))?;
             (
                 Some(server_name),
                 Some(verifier as Arc<dyn rustls::client::danger::ServerCertVerifier>),
@@ -293,7 +233,7 @@ async fn build_sender_for_addr(
 
         let dtls_conn = crate::dtls::DtlsConnection::connect(socket, params)
             .await
-            .map_err(|e| format!("udp_logging: DTLS handshake failed: {e}"))?;
+            .map_err(|error| format!("udp_logging: DTLS handshake failed: {error}"))?;
 
         Ok(UdpSender::Dtls(Arc::new(dtls_conn)))
     } else {
@@ -301,110 +241,56 @@ async fn build_sender_for_addr(
     }
 }
 
-async fn flush_loop(
-    mut receiver: mpsc::Receiver<LogEntry>,
-    cfg: UdpSendConfig,
-    dns_cache: Option<DnsCache>,
-) {
-    // Establish the UDP/DTLS connection. On failure, log and drain the channel.
-    let (mut sender, mut current_addr) = match create_sender(&cfg, dns_cache.as_ref()).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            warn!("udp_logging: failed to create sender, logs will be dropped: {e}");
-            while receiver.recv().await.is_some() {}
-            return;
-        }
-    };
-
-    let mut buffer: Vec<LogEntry> = Vec::with_capacity(cfg.batch_size);
-    let mut timer = tokio::time::interval(cfg.flush_interval);
-    // The first tick completes immediately — consume it so the first real
-    // flush waits for one full interval.
-    timer.tick().await;
-    // Periodic DNS re-resolution so a changing A/AAAA record propagates
-    // without requiring a gateway restart. Plain UDP can re-bind cheaply;
-    // DTLS reconnection is expensive, so we skip the re-resolve branch
-    // entirely when DTLS is enabled.
-    let mut last_resolve = Instant::now();
-
-    loop {
-        // DTLS reconnection is expensive (full handshake) — skip the entire
-        // re-resolve branch when DTLS is enabled so we don't tear down the
-        // session on every iteration. For plain UDP, only rebuild the sender
-        // when the resolved address has actually changed: a bind + connect
-        // every 60s under stable DNS would rotate the source port and pause
-        // the channel drain while the new socket is created. Always advance
-        // the timer when the interval elapses so transient DNS failures don't
-        // cause tight re-resolve loops.
-        if !cfg.dtls_enabled && last_resolve.elapsed() >= RE_RESOLVE_INTERVAL {
-            last_resolve = Instant::now();
-            if let Ok(new_addr) = resolve_endpoint(&cfg.host, cfg.port, dns_cache.as_ref()).await
-                && new_addr != current_addr
-                && let Ok(new_sender) = build_sender_for_addr(&cfg, new_addr).await
-            {
-                sender = new_sender;
-                current_addr = new_addr;
-            }
-        }
-
-        tokio::select! {
-            biased;
-
-            msg = receiver.recv() => {
-                match msg {
-                    Some(entry) => {
-                        buffer.push(entry);
-                        if buffer.len() >= cfg.batch_size {
-                            let batch = std::mem::take(&mut buffer);
-                            send_batch(&cfg, &sender, batch).await;
-                        }
-                    }
-                    None => {
-                        // Channel closed — flush remaining entries and exit.
-                        if !buffer.is_empty() {
-                            let batch = std::mem::take(&mut buffer);
-                            send_batch(&cfg, &sender, batch).await;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            _ = timer.tick() => {
-                if !buffer.is_empty() {
-                    let batch = std::mem::take(&mut buffer);
-                    send_batch(&cfg, &sender, batch).await;
-                }
-            }
-        }
-    }
-}
-
-async fn send_batch(cfg: &UdpSendConfig, sender: &UdpSender, batch: Vec<LogEntry>) {
-    let total_attempts = cfg.max_retries + 1;
-    let entry_count = batch.len();
-
+async fn send_batch(
+    cfg: &UdpFlushConfig,
+    state: &Mutex<UdpFlushState>,
+    batch: Vec<SummaryLogEntry>,
+) -> Result<(), String> {
     let payload = match serde_json::to_vec(&batch) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("udp_logging: failed to serialize batch: {e}");
-            return;
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!("udp_logging: failed to serialize batch: {error}");
+            return Ok(());
         }
     };
 
-    for attempt in 1..=total_attempts {
-        match sender.send(&payload).await {
-            Ok(()) => return,
-            Err(e) => {
-                warn!("UDP logging batch failed: {e} (attempt {attempt}/{total_attempts})",);
-            }
-        }
-        if attempt < total_attempts {
-            tokio::time::sleep(cfg.retry_delay).await;
+    let (mut sender, mut current_addr, mut last_resolve) = {
+        let mut state = state
+            .lock()
+            .map_err(|_| "udp_logging: flush state lock poisoned".to_string())?;
+        (state.sender.take(), state.current_addr, state.last_resolve)
+    };
+
+    if sender.is_none() {
+        let (new_sender, new_addr) = create_sender(cfg, cfg.dns_cache.as_ref()).await?;
+        last_resolve = Instant::now();
+        sender = Some(new_sender);
+        current_addr = Some(new_addr);
+    }
+
+    if !cfg.dtls_enabled && last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
+        last_resolve = Instant::now();
+        if let Ok(new_addr) =
+            resolve_udp_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "udp_logging").await
+            && current_addr != Some(new_addr)
+            && let Ok(new_sender) = build_sender_for_addr(cfg, new_addr).await
+        {
+            sender = Some(new_sender);
+            current_addr = Some(new_addr);
         }
     }
 
-    warn!(
-        "UDP logging batch discarded after {total_attempts} attempts ({entry_count} entries lost)",
-    );
+    let result = match sender.as_ref() {
+        Some(sender) => sender.send(&payload).await,
+        None => Err("udp_logging: sender unavailable after initialization".to_string()),
+    };
+
+    let mut state = state
+        .lock()
+        .map_err(|_| "udp_logging: flush state lock poisoned".to_string())?;
+    state.sender = sender;
+    state.current_addr = current_addr;
+    state.last_resolve = last_resolve;
+
+    result
 }

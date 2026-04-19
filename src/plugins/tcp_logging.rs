@@ -1,55 +1,44 @@
 //! TCP/TLS access logging plugin — batched async log shipping over TCP.
 //!
-//! Serializes `TransactionSummary` entries as newline-delimited JSON (NDJSON) and
-//! sends them to a remote TCP endpoint in batches. Uses an mpsc channel to decouple
-//! the proxy hot path from network I/O: the `log()` hook enqueues the entry
-//! (non-blocking), and a background task drains the channel in configurable batch
-//! sizes with a flush interval timer. Failed batches are retried with configurable
-//! delay, and the connection is re-established automatically on failure.
+//! Serializes `TransactionSummary` entries as newline-delimited JSON (NDJSON)
+//! and sends them to a remote TCP endpoint in batches. Uses
+//! `BatchingLogger<LogEntry>` to decouple the proxy hot path from network I/O.
+//! Failed batches are retried with configurable delay, and the connection is
+//! re-established automatically on failure.
 //!
 //! Supports both plaintext TCP and TLS-encrypted connections. TLS uses the
 //! gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`) and skip-verify
-//! (`FERRUM_TLS_NO_VERIFY`) settings, with per-plugin `tls_server_name` override.
+//! (`FERRUM_TLS_NO_VERIFY`) settings, with per-plugin `tls_server_name`
+//! override.
 //!
 //! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
 //! `LogEntry` union type, matching the http_logging plugin's behavior.
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tracing::warn;
 
-use super::utils::PluginHttpClient;
+use super::utils::{
+    BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
+};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
-/// Union type for log entries sent through the batched channel.
-#[derive(Clone, serde::Serialize)]
-#[serde(untagged)]
-enum LogEntry {
-    Http(TransactionSummary),
-    Stream(StreamTransactionSummary),
-}
-
-struct TcpConfig {
+#[derive(Clone)]
+struct TcpFlushConfig {
     host: String,
     port: u16,
     tls_enabled: bool,
     tls_server_name: Option<String>,
     tls_no_verify: bool,
     tls_ca_bundle_path: Option<String>,
-    batch_size: usize,
-    flush_interval: Duration,
-    max_retries: u32,
-    retry_delay: Duration,
     connect_timeout: Duration,
 }
 
 pub struct TcpLogging {
-    sender: mpsc::Sender<LogEntry>,
+    logger: BatchingLogger<SummaryLogEntry>,
     endpoint_hostname: String,
 }
 
@@ -74,42 +63,51 @@ impl TcpLogging {
         let port = port as u16;
 
         let tls_enabled = config["tls"].as_bool().unwrap_or(false);
-
         let tls_server_name = config["tls_server_name"]
             .as_str()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
-        let flush_interval_ms = config["flush_interval_ms"]
-            .as_u64()
-            .unwrap_or(1000)
-            .max(100);
-        let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
         let connect_timeout_ms = config["connect_timeout_ms"]
             .as_u64()
             .unwrap_or(5000)
             .max(100);
 
-        let tcp_config = TcpConfig {
+        let flush_config = TcpFlushConfig {
             host: host.clone(),
             port,
             tls_enabled,
             tls_server_name,
             tls_no_verify: http_client.tls_no_verify(),
             tls_ca_bundle_path: http_client.tls_ca_bundle_path().map(|s| s.to_string()),
-            batch_size,
-            flush_interval: Duration::from_millis(flush_interval_ms),
-            max_retries: config["max_retries"].as_u64().unwrap_or(3) as u32,
-            retry_delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
             connect_timeout: Duration::from_millis(connect_timeout_ms),
         };
-
-        let (sender, receiver) = mpsc::channel(buffer_capacity);
-        tokio::spawn(flush_loop(receiver, tcp_config));
+        let writer = Arc::new(Mutex::new(None));
+        let logger = BatchingLogger::spawn(
+            // Config remains `max_retries`; the shared retry policy counts the
+            // initial attempt plus those retries.
+            build_batch_config(
+                config,
+                "tcp_logging",
+                BatchConfigDefaults {
+                    batch_size_key: "batch_size",
+                    batch_size: 50,
+                    flush_interval_ms: 1000,
+                    min_flush_interval_ms: 100,
+                    buffer_capacity: 10000,
+                    max_retries: 3,
+                    retry_delay_ms: 1000,
+                },
+            ),
+            move |batch| {
+                let flush_config = flush_config.clone();
+                let writer = Arc::clone(&writer);
+                async move { send_batch(&flush_config, &writer, batch).await }
+            },
+        );
 
         Ok(Self {
-            sender,
+            logger,
             endpoint_hostname: host,
         })
     }
@@ -130,23 +128,11 @@ impl Plugin for TcpLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        if self
-            .sender
-            .try_send(LogEntry::Stream(summary.clone()))
-            .is_err()
-        {
-            warn!("TCP logging buffer full — dropping stream log entry");
-        }
+        self.logger.try_send(summary.into());
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        if self
-            .sender
-            .try_send(LogEntry::Http(summary.clone()))
-            .is_err()
-        {
-            warn!("TCP logging buffer full — dropping log entry");
-        }
+        self.logger.try_send(summary.into());
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -176,7 +162,7 @@ impl TcpWriter {
     }
 }
 
-async fn connect_tcp(cfg: &TcpConfig) -> Result<TcpWriter, String> {
+async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
     let addr = format!("{}:{}", cfg.host, cfg.port);
 
     let stream = tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(&addr))
@@ -188,16 +174,14 @@ async fn connect_tcp(cfg: &TcpConfig) -> Result<TcpWriter, String> {
         return Ok(TcpWriter::Plain(stream));
     }
 
-    // Build rustls TLS config
     let mut root_store = rustls::RootCertStore::empty();
 
     if !cfg.tls_no_verify {
         if let Some(ca_path) = &cfg.tls_ca_bundle_path {
-            // Custom CA — sole trust anchor (no webpki roots)
             match std::fs::read(ca_path) {
                 Ok(ca_pem) => {
                     let certs = rustls_pemfile::certs(&mut &ca_pem[..])
-                        .filter_map(|r| r.ok())
+                        .filter_map(|cert| cert.ok())
                         .collect::<Vec<_>>();
                     if certs.is_empty() {
                         return Err(format!(
@@ -205,19 +189,18 @@ async fn connect_tcp(cfg: &TcpConfig) -> Result<TcpWriter, String> {
                         ));
                     }
                     for cert in certs {
-                        root_store.add(cert).map_err(|e| {
-                            format!("TCP logging: failed to add CA cert from {ca_path}: {e}")
+                        root_store.add(cert).map_err(|error| {
+                            format!("TCP logging: failed to add CA cert from {ca_path}: {error}")
                         })?;
                     }
                 }
-                Err(e) => {
+                Err(error) => {
                     return Err(format!(
-                        "TCP logging: failed to read CA bundle {ca_path}: {e}"
+                        "TCP logging: failed to read CA bundle {ca_path}: {error}"
                     ));
                 }
             }
         } else {
-            // No custom CA — use webpki roots
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
     }
@@ -234,16 +217,16 @@ async fn connect_tcp(cfg: &TcpConfig) -> Result<TcpWriter, String> {
     };
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-
-    // Use tls_server_name if provided, otherwise fall back to host
     let server_name_str = cfg.tls_server_name.as_deref().unwrap_or(&cfg.host);
     let server_name = rustls::pki_types::ServerName::try_from(server_name_str.to_string())
-        .map_err(|e| format!("TCP logging: invalid TLS server name '{server_name_str}': {e}"))?;
+        .map_err(|error| {
+            format!("TCP logging: invalid TLS server name '{server_name_str}': {error}")
+        })?;
 
     let tls_stream = connector
         .connect(server_name, stream)
         .await
-        .map_err(|e| format!("TCP logging: TLS handshake failed with {addr}: {e}"))?;
+        .map_err(|error| format!("TCP logging: TLS handshake failed with {addr}: {error}"))?;
 
     Ok(TcpWriter::Tls(Box::new(tls_stream)))
 }
@@ -299,64 +282,12 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 }
 
-async fn flush_loop(mut receiver: mpsc::Receiver<LogEntry>, cfg: TcpConfig) {
-    let mut buffer: Vec<LogEntry> = Vec::with_capacity(cfg.batch_size);
-    let mut timer = tokio::time::interval(cfg.flush_interval);
-    // The first tick completes immediately — consume it so the first real
-    // flush waits for one full interval.
-    timer.tick().await;
-
-    // Persistent connection — reconnected on failure.
-    let mut writer: Option<TcpWriter> = None;
-
-    loop {
-        tokio::select! {
-            biased;
-
-            msg = receiver.recv() => {
-                match msg {
-                    Some(entry) => {
-                        buffer.push(entry);
-                        if buffer.len() >= cfg.batch_size {
-                            let batch = std::mem::take(&mut buffer);
-                            writer = send_batch(&cfg, batch, writer).await;
-                        }
-                    }
-                    None => {
-                        // Channel closed — flush remaining entries and exit.
-                        if !buffer.is_empty() {
-                            let batch = std::mem::take(&mut buffer);
-                            let _ = send_batch(&cfg, batch, writer).await;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            _ = timer.tick() => {
-                if !buffer.is_empty() {
-                    let batch = std::mem::take(&mut buffer);
-                    writer = send_batch(&cfg, batch, writer).await;
-                }
-            }
-        }
-    }
-}
-
-/// Serialize a batch as NDJSON and send over the TCP connection.
-///
-/// Returns the connection on success (for reuse), or `None` on failure.
-/// Re-establishes the connection if `writer` is `None` or the write fails.
 async fn send_batch(
-    cfg: &TcpConfig,
-    batch: Vec<LogEntry>,
-    mut writer: Option<TcpWriter>,
-) -> Option<TcpWriter> {
-    let total_attempts = cfg.max_retries + 1;
-    let entry_count = batch.len();
-
-    // Pre-serialize the batch as NDJSON (newline-delimited JSON).
-    let mut payload = Vec::with_capacity(entry_count * 256);
+    cfg: &TcpFlushConfig,
+    writer_state: &Mutex<Option<TcpWriter>>,
+    batch: Vec<SummaryLogEntry>,
+) -> Result<(), String> {
+    let mut payload = Vec::with_capacity(batch.len() * 256);
     for entry in &batch {
         if let Ok(json) = serde_json::to_vec(entry) {
             payload.extend_from_slice(&json);
@@ -364,56 +295,39 @@ async fn send_batch(
         }
     }
 
-    for attempt in 1..=total_attempts {
-        // Ensure we have a connection.
-        if writer.is_none() {
-            match connect_tcp(cfg).await {
-                Ok(w) => writer = Some(w),
-                Err(e) => {
-                    warn!(
-                        "TCP logging: connection failed: {} (attempt {}/{})",
-                        e, attempt, total_attempts,
-                    );
-                    if attempt < total_attempts {
-                        tokio::time::sleep(cfg.retry_delay).await;
-                    }
-                    continue;
-                }
-            }
-        }
+    let mut connection = writer_state
+        .lock()
+        .map_err(|_| "TCP logging: writer state lock poisoned".to_string())?
+        .take();
 
-        // Write the payload.
-        let Some(w) = writer.as_mut() else {
-            continue;
-        };
-        match w.write_all(&payload).await {
-            Ok(()) => match w.flush().await {
-                Ok(()) => return writer,
-                Err(e) => {
-                    warn!(
-                        "TCP logging: flush failed: {} (attempt {}/{})",
-                        e, attempt, total_attempts,
-                    );
-                    writer = None; // Connection is broken, reconnect next attempt.
-                }
-            },
-            Err(e) => {
-                warn!(
-                    "TCP logging: write failed: {} (attempt {}/{})",
-                    e, attempt, total_attempts,
-                );
-                writer = None; // Connection is broken, reconnect next attempt.
-            }
-        }
-
-        if attempt < total_attempts {
-            tokio::time::sleep(cfg.retry_delay).await;
-        }
+    if connection.is_none() {
+        connection = Some(connect_tcp(cfg).await?);
     }
 
-    warn!(
-        "TCP logging batch discarded after {} attempts ({} entries lost)",
-        total_attempts, entry_count,
-    );
-    None
+    let mut keep_connection = true;
+    let result = match connection.as_mut() {
+        Some(writer) => match writer.write_all(&payload).await {
+            Ok(()) => match writer.flush().await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    keep_connection = false;
+                    Err(format!("TCP logging: flush failed: {error}"))
+                }
+            },
+            Err(error) => {
+                keep_connection = false;
+                Err(format!("TCP logging: write failed: {error}"))
+            }
+        },
+        None => Err("TCP logging: writer unavailable after reconnect".to_string()),
+    };
+    if !keep_connection {
+        connection = None;
+    }
+
+    *writer_state
+        .lock()
+        .map_err(|_| "TCP logging: writer state lock poisoned".to_string())? = connection;
+
+    result
 }
