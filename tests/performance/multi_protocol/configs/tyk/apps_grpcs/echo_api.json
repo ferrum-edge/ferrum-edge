@@ -11,8 +11,7 @@
     "target_url": "https://127.0.0.1:50053",
     "strip_listen_path": false,
     "transport": {
-      "ssl_insecure_skip_verify": false,
-      "ssl_ca_cert": "/etc/tyk/certs/cert.pem"
+      "ssl_insecure_skip_verify": false
     }
   },
   "version_data": {

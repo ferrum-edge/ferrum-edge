@@ -437,11 +437,23 @@ start_tyk() {
     # Tyk listens on 8443 when TLS is enabled in tyk.conf
     echo "[tyk] starting with apps=$apps_dir..."
 
+    # Install the benchmark CA into the container's system trust store
+    # before launching Tyk. Tyk Classic API `transport.ssl_ca_cert` does
+    # NOT configure upstream trust (confirmed locally: it's a no-op —
+    # handshakes fail with the same error whether ssl_ca_cert points at
+    # the real cert or a nonexistent path). The Go `net/http` transport
+    # Tyk uses for reverse-proxy upstreams consults the default system
+    # RootCAs pool, so the reliable fix is to install the PEM as a
+    # system CA before starting the gateway. Tyk's image is Debian
+    # bookworm-based with `update-ca-certificates` available, and runs
+    # as root by default.
     GATEWAY_CID=$(docker run -d --rm --network host \
         -v "$apps_dir:/etc/tyk/apps:ro" \
         -v "$tyk_conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$CERT_DIR:/etc/tyk/certs:ro" \
-        "$TYK_IMAGE")
+        --entrypoint sh \
+        "$TYK_IMAGE" \
+        -c 'cp /etc/tyk/certs/cert.pem /usr/local/share/ca-certificates/bench.crt && update-ca-certificates >/dev/null 2>&1; exec /opt/tyk-gateway/tyk --conf /opt/tyk-gateway/tyk.conf')
 
     wait_for_gateway
 }
