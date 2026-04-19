@@ -651,16 +651,14 @@ fn locate_binary(
 /// Build the gateway binary at most once per test-binary process. Parallel
 /// tests share the result via `OnceLock`.
 ///
-/// If either a debug or release binary already exists, we skip the build —
-/// callers that want a fresh build can `cargo build` outside the harness.
+/// Always invokes `cargo build --bin ferrum-edge` — cargo's own incremental
+/// build is a no-op (~100ms) when nothing has changed, and guarantees that
+/// tests never run against a stale binary after a source edit. Callers that
+/// want to skip the build entirely (e.g. when the binary was built by an
+/// outer CI step) can opt out via [`TestGatewayBuilder::skip_auto_build`].
 fn ensure_gateway_built() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
     let result = RESULT.get_or_init(|| -> Result<(), String> {
-        let debug = PathBuf::from("./target/debug/ferrum-edge");
-        let release = PathBuf::from("./target/release/ferrum-edge");
-        if debug.exists() || release.exists() {
-            return Ok(());
-        }
         let status = Command::new("cargo")
             .args(["build", "--bin", "ferrum-edge"])
             .stdout(Stdio::null())
