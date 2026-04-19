@@ -4,148 +4,23 @@
 //! - `/metrics` endpoint on admin port returns Prometheus exposition format after traffic
 //! - Request count metrics reflect actual traffic volume
 //!
-//! Uses file mode with ephemeral ports and an echo backend.
+//! Uses file mode with the shared `TestGateway` harness + shared echo server
+//! (no bind-drop-rebind race).
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_prometheus
 
-use std::io::Write;
+use crate::common::{TestGateway, spawn_http_echo};
 use std::time::Duration;
-use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::time::sleep;
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/// Start a simple HTTP echo backend.
-async fn start_echo_backend(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .expect("Failed to bind echo backend");
-
-    loop {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
-                let _n = stream.read(&mut buf).await.unwrap_or(0);
-
-                let body = r#"{"status":"ok"}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            });
-        }
-    }
-}
-
-/// Detect the gateway binary path (debug preferred, fallback to release).
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        "./target/release/ferrum-edge"
-    } else {
-        panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
-    }
-}
-
-/// Start the gateway in file mode with the given config and ports.
-fn start_gateway(config_path: &str, proxy_port: u16, admin_port: u16) -> std::process::Child {
-    let binary_path = gateway_binary_path();
-
-    std::process::Command::new(binary_path)
-        .env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path)
-        .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_LOG_LEVEL", "debug")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("Failed to start gateway binary")
-}
-
-/// Wait for the gateway admin health endpoint to respond.
-/// Returns true if healthy, false if timed out.
-async fn wait_for_gateway(admin_port: u16) -> bool {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
-}
-
-/// Allocate an ephemeral port by binding to port 0 and returning the assigned port.
-async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-/// Start the gateway with retry logic for port allocation races.
-/// Allocates fresh gateway/admin ports each attempt.
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
-    const MAX_ATTEMPTS: u32 = 3;
-    for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_port = ephemeral_port().await;
-        let admin_port = ephemeral_port().await;
-
-        let mut child = start_gateway(config_path, proxy_port, admin_port);
-
-        if wait_for_gateway(admin_port).await {
-            return (child, proxy_port, admin_port);
-        }
-
-        eprintln!(
-            "Gateway startup attempt {}/{} failed (proxy_port={}, admin_port={})",
-            attempt, MAX_ATTEMPTS, proxy_port, admin_port
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-
-        if attempt < MAX_ATTEMPTS {
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
-    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
-}
-
-// ============================================================================
-// Functional Tests
-// ============================================================================
 
 /// Test that the `/metrics` endpoint returns Prometheus-format data after traffic
 /// flows through the gateway.
-///
-/// 1. Start an echo backend
-/// 2. Start gateway in file mode with prometheus_metrics plugin
-/// 3. Send a request through the gateway
-/// 4. Scrape `/metrics` on the admin port
-/// 5. Verify 200 status and Prometheus text format with `ferrum_` metric names
 #[ignore]
 #[tokio::test]
 async fn test_prometheus_metrics_endpoint_returns_data() {
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let config_path = temp_dir.path().join("config.yaml");
+    let backend = spawn_http_echo().await.expect("spawn echo");
 
-    let backend_port = ephemeral_port().await;
-
-    let config_content = format!(
+    let config = format!(
         r#"
 proxies:
   - id: "test-proxy"
@@ -168,29 +43,22 @@ plugin_configs:
     enabled: true
     config:
       render_cache_ttl_seconds: 0
-"#
+"#,
+        backend_port = backend.port,
     );
 
-    let mut config_file =
-        std::fs::File::create(&config_path).expect("Failed to create config file");
-    config_file
-        .write_all(config_content.as_bytes())
-        .expect("Failed to write config");
-    drop(config_file);
-
-    // Start echo backend
-    tokio::spawn(start_echo_backend(backend_port));
-    sleep(Duration::from_millis(500)).await;
-
-    // Start gateway with retry
-    let (mut gateway, proxy_port, admin_port) =
-        start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("debug")
+        .spawn()
+        .await
+        .expect("start gateway");
 
     let client = reqwest::Client::new();
 
     // Send a request through the proxy to generate metrics
     let proxy_resp = client
-        .get(format!("http://127.0.0.1:{}/test/hello", proxy_port))
+        .get(gateway.proxy_url("/test/hello"))
         .send()
         .await
         .expect("Failed to send proxy request");
@@ -201,7 +69,7 @@ plugin_configs:
 
     // Scrape /metrics on admin port
     let metrics_resp = client
-        .get(format!("http://127.0.0.1:{}/metrics", admin_port))
+        .get(gateway.admin_url("/metrics"))
         .send()
         .await
         .expect("Failed to scrape /metrics");
@@ -238,27 +106,15 @@ plugin_configs:
         "/metrics should contain ferrum_request_duration_ms. Body:\n{}",
         body
     );
-
-    // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
 }
 
 /// Test that metrics reflect actual traffic volume.
-///
-/// 1. Start echo backend + gateway with prometheus_metrics plugin
-/// 2. Send 3 requests through the gateway
-/// 3. Scrape `/metrics`
-/// 4. Verify request count metrics show values > 0
 #[ignore]
 #[tokio::test]
 async fn test_prometheus_metrics_reflect_traffic() {
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let config_path = temp_dir.path().join("config.yaml");
+    let backend = spawn_http_echo().await.expect("spawn echo");
 
-    let backend_port = ephemeral_port().await;
-
-    let config_content = format!(
+    let config = format!(
         r#"
 proxies:
   - id: "traffic-proxy"
@@ -281,30 +137,23 @@ plugin_configs:
     enabled: true
     config:
       render_cache_ttl_seconds: 0
-"#
+"#,
+        backend_port = backend.port,
     );
 
-    let mut config_file =
-        std::fs::File::create(&config_path).expect("Failed to create config file");
-    config_file
-        .write_all(config_content.as_bytes())
-        .expect("Failed to write config");
-    drop(config_file);
-
-    // Start echo backend
-    tokio::spawn(start_echo_backend(backend_port));
-    sleep(Duration::from_millis(500)).await;
-
-    // Start gateway with retry
-    let (mut gateway, proxy_port, admin_port) =
-        start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("debug")
+        .spawn()
+        .await
+        .expect("start gateway");
 
     let client = reqwest::Client::new();
 
     // Send 3 requests through the proxy
     for i in 0..3 {
         let resp = client
-            .get(format!("http://127.0.0.1:{}/traffic/req{}", proxy_port, i))
+            .get(gateway.proxy_url(&format!("/traffic/req{}", i)))
             .send()
             .await
             .expect("Failed to send proxy request");
@@ -316,7 +165,7 @@ plugin_configs:
 
     // Scrape /metrics
     let metrics_resp = client
-        .get(format!("http://127.0.0.1:{}/metrics", admin_port))
+        .get(gateway.admin_url("/metrics"))
         .send()
         .await
         .expect("Failed to scrape /metrics");
@@ -336,7 +185,6 @@ plugin_configs:
             && line.contains("status_code=\"200\"")
         {
             found_counter = true;
-            // Line format: ferrum_requests_total{proxy_id="...",method="...",status_code="200"} 3
             let count_str = line.rsplit(' ').next().unwrap_or("0");
             let count: u64 = count_str
                 .parse()
@@ -381,8 +229,4 @@ plugin_configs:
         "Did not find ferrum_request_duration_ms_count for traffic-proxy. Full /metrics:\n{}",
         body
     );
-
-    // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
 }
