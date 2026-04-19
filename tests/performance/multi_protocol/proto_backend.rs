@@ -643,8 +643,14 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     {
+        // H1-only ALPN — critical so gateway upstream clients that offer `h2`
+        // (Go net/http defaults in Kong/Tyk/KrakenD) cannot silently negotiate
+        // h2 against our HTTP/1.1-only hyper server and then fail mid-parse.
+        // Using the generic make_server_tls_config here advertises both `h2`
+        // and `http/1.1`, which lets h2-preferring clients through and then
+        // the HTTP/1.1 byte parser rejects every request.
         let h1_tls = Arc::new(
-            tls_utils::make_server_tls_config(&cert_path, &key_path)
+            tls_utils::make_server_tls_config_h1_only(&cert_path, &key_path)
                 .context("building h1-tls server config")?,
         );
         tokio::spawn(async move {

@@ -49,6 +49,34 @@ pub fn make_server_tls_config(
     cert_path: &Path,
     key_path: &Path,
 ) -> anyhow::Result<rustls::ServerConfig> {
+    let mut cfg = make_server_tls_config_base(cert_path, key_path)?;
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(cfg)
+}
+
+/// Build a `rustls::ServerConfig` that advertises ONLY `http/1.1` via ALPN.
+///
+/// Use this for the dedicated H1-over-TLS listener (port 3447). The generic
+/// `make_server_tls_config` advertises both `h2` and `http/1.1`, so if a
+/// gateway's upstream client (e.g. Kong/Tyk/KrakenD Go `net/http` defaults,
+/// which offer h2) hits that listener, TLS will negotiate `h2` and then the
+/// hyper HTTP/1.1 server bytes-parse will fail — the benchmark silently
+/// downgrades to "broken connections" instead of measuring H1-over-TLS
+/// throughput. Advertising only `http/1.1` here forces every client to
+/// either get `http/1.1` or fail the TLS handshake cleanly.
+pub fn make_server_tls_config_h1_only(
+    cert_path: &Path,
+    key_path: &Path,
+) -> anyhow::Result<rustls::ServerConfig> {
+    let mut cfg = make_server_tls_config_base(cert_path, key_path)?;
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(cfg)
+}
+
+fn make_server_tls_config_base(
+    cert_path: &Path,
+    key_path: &Path,
+) -> anyhow::Result<rustls::ServerConfig> {
     let cert_bytes = std::fs::read(cert_path).context("reading server cert")?;
     let key_bytes = std::fs::read(key_path).context("reading server key")?;
 
@@ -59,13 +87,10 @@ pub fn make_server_tls_config(
         .context("parsing PEM key")?
         .context("no private key found in PEM")?;
 
-    let mut cfg = rustls::ServerConfig::builder()
+    rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .context("building server TLS config")?;
-
-    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(cfg)
+        .context("building server TLS config")
 }
 
 // ── TLS client config (insecure – skip server cert verification) ─────────────
