@@ -10,7 +10,6 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
 
 use crate::consumer_index::ConsumerIndex;
 
@@ -50,26 +49,22 @@ impl KeyAuth {
         })
     }
 
-    fn extract_key(
-        &self,
-        ctx: &RequestContext,
-        headers: &HashMap<String, String>,
-    ) -> Option<String> {
+    fn extract_key(&self, ctx: &RequestContext) -> Option<String> {
         if let Some(ref lower) = self.header_name_lower {
-            headers
+            ctx.headers
                 .get(lower.as_str())
                 .or_else(|| {
                     self.header_name_original
                         .as_ref()
-                        .and_then(|orig| headers.get(orig.as_str()))
+                        .and_then(|orig| ctx.headers.get(orig.as_str()))
                 })
                 .cloned()
         } else if let Some(ref param) = self.query_param_name {
             ctx.query_params.get(param.as_str()).cloned()
         } else {
-            headers
+            ctx.headers
                 .get("x-api-key")
-                .or_else(|| headers.get("X-API-Key"))
+                .or_else(|| ctx.headers.get("X-API-Key"))
                 .cloned()
         }
     }
@@ -81,12 +76,8 @@ impl AuthMechanism for KeyAuth {
         "key_auth"
     }
 
-    fn extract(
-        &self,
-        ctx: &RequestContext,
-        headers: &HashMap<String, String>,
-    ) -> ExtractedCredential {
-        match self.extract_key(ctx, headers) {
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        match self.extract_key(ctx) {
             Some(key) => ExtractedCredential::ApiKey(key),
             None => ExtractedCredential::Missing,
         }

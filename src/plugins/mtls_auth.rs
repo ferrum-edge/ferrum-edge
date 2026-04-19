@@ -396,11 +396,7 @@ impl AuthMechanism for MtlsAuth {
         "mtls_auth"
     }
 
-    fn extract(
-        &self,
-        ctx: &RequestContext,
-        _headers: &HashMap<String, String>,
-    ) -> ExtractedCredential {
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         match &ctx.tls_client_cert_der {
             Some(der_bytes) => ExtractedCredential::MtlsCert {
                 der_bytes: Arc::clone(der_bytes),
@@ -487,7 +483,11 @@ auth_flow::impl_auth_plugin!(
                 body,
                 headers: HashMap::new(),
             },
-            VerifyOutcome::Success { consumer: None, .. } => PluginResult::Continue,
+            VerifyOutcome::Success { consumer: None, .. } => PluginResult::Reject {
+                status_code: 401,
+                body: r#"{"error":"No consumer found for client certificate"}"#.into(),
+                headers: HashMap::new(),
+            },
         }
     }
 );

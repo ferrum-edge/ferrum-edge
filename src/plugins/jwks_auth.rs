@@ -2,7 +2,6 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -392,12 +391,8 @@ impl AuthMechanism for JwksAuth {
         "jwks_auth"
     }
 
-    fn extract(
-        &self,
-        _ctx: &RequestContext,
-        headers: &HashMap<String, String>,
-    ) -> ExtractedCredential {
-        match headers.get("authorization") {
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        match ctx.headers.get("authorization") {
             None => ExtractedCredential::Missing,
             Some(value) if value.starts_with("Bearer ") || value.starts_with("bearer ") => {
                 ExtractedCredential::BearerToken(value[7..].to_string())

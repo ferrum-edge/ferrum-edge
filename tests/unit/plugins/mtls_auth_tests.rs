@@ -787,6 +787,18 @@ async fn test_mtls_auth_stream_connect_identifies_consumer() {
     );
 }
 
+#[tokio::test]
+async fn test_mtls_auth_stream_connect_rejects_unknown_consumer() {
+    let cert_der = create_test_cert("unknown-client.example.com", None, None);
+    let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
+    let mut ctx = create_stream_ctx_with_cert(cert_der, vec![consumer]);
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert_reject(result, Some(401));
+    assert!(ctx.identified_consumer.is_none());
+}
+
 // --- DTLS/UDP mTLS auth tests ---
 
 fn create_udp_stream_ctx_with_cert(

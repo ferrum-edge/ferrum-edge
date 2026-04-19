@@ -44,7 +44,11 @@ pub enum VerifyOutcome {
         external_identity_header: Option<String>,
     },
     NotApplicable,
+    /// Credential was malformed, but the issue was only discovered during
+    /// provider-specific verification rather than initial extraction.
     InvalidFormat(String),
+    /// Credential was well-formed enough to verify, but failed semantic or
+    /// cryptographic validation.
     Invalid(String),
     ConsumerNotFound(String),
     VerificationFailed(String),
@@ -116,11 +120,7 @@ pub(crate) use impl_auth_plugin;
 pub trait AuthMechanism: Send + Sync {
     fn mechanism_name(&self) -> &str;
 
-    fn extract(
-        &self,
-        ctx: &RequestContext,
-        headers: &HashMap<String, String>,
-    ) -> ExtractedCredential;
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential;
 
     async fn verify(
         &self,
@@ -151,10 +151,7 @@ async fn run_auth_impl<M: AuthMechanism>(
     consumer_index: &ConsumerIndex,
     allow_external_identity: bool,
 ) -> PluginResult {
-    let credential = {
-        let headers = &ctx.headers;
-        mechanism.extract(ctx, headers)
-    };
+    let credential = mechanism.extract(ctx);
 
     match credential {
         ExtractedCredential::Missing => {
@@ -249,11 +246,7 @@ mod tests {
             "fake_auth"
         }
 
-        fn extract(
-            &self,
-            _ctx: &RequestContext,
-            _headers: &HashMap<String, String>,
-        ) -> ExtractedCredential {
+        fn extract(&self, _ctx: &RequestContext) -> ExtractedCredential {
             self.extracted.clone()
         }
 

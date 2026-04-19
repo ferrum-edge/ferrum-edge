@@ -16,7 +16,6 @@ use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use sha2::{Sha256, Sha512};
-use std::collections::HashMap;
 use tracing::{debug, warn};
 
 use super::utils::auth_flow::{
@@ -88,12 +87,8 @@ impl AuthMechanism for HmacAuth {
         "hmac_auth"
     }
 
-    fn extract(
-        &self,
-        ctx: &RequestContext,
-        headers: &HashMap<String, String>,
-    ) -> ExtractedCredential {
-        let Some(auth_header) = headers.get("authorization") else {
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        let Some(auth_header) = ctx.headers.get("authorization") else {
             return ExtractedCredential::Missing;
         };
 
@@ -146,7 +141,7 @@ impl AuthMechanism for HmacAuth {
             username,
             algorithm,
             signature,
-            date: headers.get("date").cloned().unwrap_or_default(),
+            date: ctx.headers.get("date").cloned().unwrap_or_default(),
             method: ctx.method.clone(),
             path: ctx.path.clone(),
         }

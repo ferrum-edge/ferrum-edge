@@ -229,10 +229,13 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, RequestContext, access_control::AccessControl, key_auth::KeyAuth,
+};
 use ferrum_edge::proxy::grpc_proxy::grpc_status;
 use ferrum_edge::proxy::run_authentication_phase;
 use hyper::StatusCode;
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -322,6 +325,56 @@ async fn test_multi_auth_accepts_external_identity_without_consumer() {
     assert!(result.is_none());
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
     assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_single_auth_without_acl_allows_anonymous_request_when_credentials_are_missing() {
+    let key_auth: Arc<dyn Plugin> = Arc::new(KeyAuth::new(&json!({})).unwrap());
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![key_auth];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/key-auth".to_string(),
+    );
+
+    let result =
+        run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    assert!(result.is_none());
+    assert!(ctx.identified_consumer.is_none());
+    assert!(ctx.authenticated_identity.is_none());
+}
+
+#[tokio::test]
+async fn test_single_auth_plus_acl_rejects_anonymous_request_after_auth_falls_through() {
+    let key_auth: Arc<dyn Plugin> = Arc::new(KeyAuth::new(&json!({})).unwrap());
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![key_auth];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/key-auth".to_string(),
+    );
+
+    let auth_result =
+        run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
+    assert!(auth_result.is_none());
+
+    let acl = AccessControl::new(&json!({
+        "allowed_consumers": ["alice"]
+    }))
+    .unwrap();
+
+    match acl.authorize(&mut ctx).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 401);
+            assert_eq!(body, r#"{"error":"No consumer identified"}"#);
+        }
+        other => panic!("expected ACL to reject anonymous request, got {other:?}"),
+    }
 }
 
 #[test]

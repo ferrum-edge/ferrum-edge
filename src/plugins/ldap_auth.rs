@@ -32,7 +32,6 @@ use base64::Engine;
 use dashmap::DashMap;
 use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -604,12 +603,8 @@ impl AuthMechanism for LdapAuth {
         "ldap_auth"
     }
 
-    fn extract(
-        &self,
-        _ctx: &RequestContext,
-        headers: &HashMap<String, String>,
-    ) -> ExtractedCredential {
-        let auth_header = match headers.get("authorization") {
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        let auth_header = match ctx.headers.get("authorization") {
             Some(header) => header,
             None => return ExtractedCredential::Missing,
         };

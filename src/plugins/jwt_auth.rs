@@ -16,7 +16,6 @@
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, dangerous::insecure_decode, decode};
 use serde_json::Value;
-use std::collections::HashMap;
 use tracing::debug;
 
 use crate::consumer_index::ConsumerIndex;
@@ -51,14 +50,10 @@ impl JwtAuth {
         })
     }
 
-    fn extract_token(
-        &self,
-        ctx: &RequestContext,
-        headers: &HashMap<String, String>,
-    ) -> Option<String> {
+    fn extract_token(&self, ctx: &RequestContext) -> Option<String> {
         if self.token_lookup.starts_with("header:") {
             let header_name = &self.token_lookup["header:".len()..];
-            headers.get(&header_name.to_lowercase()).map(|v| {
+            ctx.headers.get(&header_name.to_lowercase()).map(|v| {
                 strip_auth_scheme(v, "Bearer")
                     .unwrap_or(v.as_str())
                     .to_string()
@@ -67,7 +62,7 @@ impl JwtAuth {
             let param_name = &self.token_lookup["query:".len()..];
             ctx.query_params.get(param_name).cloned()
         } else {
-            headers
+            ctx.headers
                 .get("authorization")
                 .and_then(|v| strip_auth_scheme(v, "Bearer").map(str::to_string))
         }
@@ -80,12 +75,8 @@ impl AuthMechanism for JwtAuth {
         "jwt_auth"
     }
 
-    fn extract(
-        &self,
-        ctx: &RequestContext,
-        headers: &HashMap<String, String>,
-    ) -> ExtractedCredential {
-        match self.extract_token(ctx, headers) {
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        match self.extract_token(ctx) {
             Some(token) => ExtractedCredential::BearerToken(token),
             None => ExtractedCredential::Missing,
         }

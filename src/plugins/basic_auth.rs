@@ -18,7 +18,6 @@ use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use sha2::Sha256;
-use std::collections::HashMap;
 use tracing::{debug, error, warn};
 
 use crate::consumer_index::ConsumerIndex;
@@ -101,12 +100,8 @@ impl AuthMechanism for BasicAuth {
         "basic_auth"
     }
 
-    fn extract(
-        &self,
-        _ctx: &RequestContext,
-        headers: &HashMap<String, String>,
-    ) -> ExtractedCredential {
-        let Some(auth_header) = headers.get("authorization") else {
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        let Some(auth_header) = ctx.headers.get("authorization") else {
             return ExtractedCredential::Missing;
         };
 
