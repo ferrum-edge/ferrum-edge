@@ -864,14 +864,11 @@ pub(crate) fn size_limited_streaming_body(
         max_bytes,
         bytes_seen: 0,
     };
-    // Wrap in coalescing adapter for efficient frame batching.
-    let coalescing = CoalescingBody {
-        inner: limited,
-        buffer: BytesMut::new(),
-        done: false,
-        stashed_error: None,
+    let coalescing = Coalescing::new(
+        ReqwestFrameSource { inner: limited },
+        COALESCE_TARGET,
         content_length,
-    };
+    );
     ProxyBody::streaming(Box::pin(coalescing))
 }
 
@@ -1191,65 +1188,22 @@ fn content_length_hint(content_length: Option<u64>) -> http_body::SizeHint {
     content_length.map(http_body::SizeHint::with_exact).unwrap_or_default()
 }
 
-// -- CoalescingBody -----------------------------------------------------------
-
-/// Minimum chunk size (bytes) before yielding a frame to hyper's H1 encoder.
-///
-/// Small response chunks from reqwest's byte stream (typically 8–32 KB from
-/// hyper's HTTP/1.1 client) cause excessive write syscalls when forwarded
-/// one-at-a-time. This adapter collects contiguous chunks into a single
-/// [`Bytes`] of at least `COALESCE_TARGET` bytes before yielding, reducing
-/// the number of frames hyper writes by ~8–16× for large bodies.
-///
-/// The target is chosen to balance syscall reduction against memory latency:
-/// 128 KB fits comfortably in L2 cache on modern CPUs and has a
-/// default read reservation (8 × 16 KB slices).
 const COALESCE_TARGET: usize = 128 * 1024;
 
-/// A response body adapter that coalesces small chunks from a reqwest byte
-/// stream into larger frames for efficient forwarding.
-///
-/// When the inner stream yields a chunk smaller than [`COALESCE_TARGET`],
-/// the adapter buffers it and immediately re-polls for more data. Once the
-/// buffer reaches the target size or the inner stream returns `Pending`/`None`,
-/// the accumulated buffer is yielded as a single frame.
-///
-/// For chunks that already meet or exceed the target, they pass through
-/// without copying (zero-overhead fast path).
-pub(crate) struct CoalescingBody<S> {
-    inner: S,
-    buffer: BytesMut,
-    done: bool,
-    /// Error stashed while flushing buffered data. Returned on the next
-    /// `poll_frame` call after the buffer has been drained.
-    stashed_error: Option<ProxyBodyError>,
-    /// Exact body length from Content-Length (if known). Forwarded via
-    /// `size_hint()` so hyper writes a Content-Length response instead of
-    /// chunked encoding.
-    content_length: Option<u64>,
-}
-
-/// Wraps a reqwest response into a coalescing body.
-///
-/// `content_length` should be the value of the backend's Content-Length header
-/// (if present) so the adapter can propagate an exact size hint.
 pub(crate) fn coalescing_body(
     response: reqwest::Response,
     content_length: Option<u64>,
 ) -> ProxyBody {
     use futures_util::StreamExt;
 
-    let stream = response.bytes_stream().map(|r| {
-        r.map(Frame::data)
-            .map_err(|e| Box::new(e) as ProxyBodyError)
-    });
-    let body = CoalescingBody {
-        inner: stream,
-        buffer: BytesMut::new(),
-        done: false,
-        stashed_error: None,
+    let stream = response
+        .bytes_stream()
+        .map(|r| r.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
+    let body = Coalescing::new(
+        ReqwestFrameSource { inner: stream },
+        COALESCE_TARGET,
         content_length,
-    };
+    );
     ProxyBody::streaming(Box::pin(body))
 }
 
