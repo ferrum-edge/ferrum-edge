@@ -5,6 +5,7 @@
 //! `tokio::io::copy_bidirectional` for optimal zero-copy throughput.
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -14,7 +15,8 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
-use crate::tls::{NoVerifier, TlsPolicy};
+use crate::tls::TlsPolicy;
+use crate::tls::backend::BackendTlsConfigBuilder;
 
 use crate::config::types::{BackendProtocol, GatewayConfig, Proxy};
 use crate::consumer_index::ConsumerIndex;
@@ -327,64 +329,22 @@ impl CachedBackendTlsConfig {
         proxy: &Proxy,
         tls_no_verify: bool,
         global_tls_ca_bundle_path: Option<&str>,
+        global_client_cert_path: Option<&str>,
+        global_client_key_path: Option<&str>,
         tls_policy: Option<&TlsPolicy>,
         crls: &crate::tls::CrlList,
     ) -> Result<Self, anyhow::Error> {
-        // Build root certificate store:
-        // - Custom CA configured → empty store + only that CA (no public roots)
-        // - No CA configured → webpki/system roots as default fallback
-        let ca_path = proxy
-            .resolved_tls
-            .server_ca_cert_path
-            .as_deref()
-            .or(global_tls_ca_bundle_path);
-        let mut root_store = if ca_path.is_some() {
-            rustls::RootCertStore::empty()
-        } else {
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
-        };
-        if let Some(ca_path) = ca_path {
-            let ca_data = std::fs::read(ca_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read CA cert {}: {}", ca_path, e))?;
-            let certs = rustls_pemfile::certs(&mut &ca_data[..])
-                .filter_map(|r| r.ok())
-                .collect::<Vec<_>>();
-            for cert in certs {
-                root_store
-                    .add(cert)
-                    .map_err(|e| anyhow::anyhow!("Failed to add CA cert: {}", e))?;
-            }
+        let tls_config = BackendTlsConfigBuilder {
+            proxy,
+            policy: tls_policy,
+            global_ca: global_tls_ca_bundle_path.map(Path::new),
+            global_no_verify: tls_no_verify,
+            global_client_cert: global_client_cert_path.map(Path::new),
+            global_client_key: global_client_key_path.map(Path::new),
+            crls,
         }
-
-        // Build TLS client config with optional client auth, using TLS policy
-        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
-        let builder = crate::tls::backend_client_config_builder(tls_policy)?;
-        let mut tls_config = if let (Some(cert_path), Some(key_path)) = (
-            &proxy.resolved_tls.client_cert_path,
-            &proxy.resolved_tls.client_key_path,
-        ) {
-            let cert_data = std::fs::read(cert_path)?;
-            let key_data = std::fs::read(key_path)?;
-            let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
-                .filter_map(|r| r.ok())
-                .collect();
-            let key = rustls_pemfile::private_key(&mut &key_data[..])
-                .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?
-                .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
-            builder
-                .with_webpki_verifier(verifier)
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| anyhow::anyhow!("Failed to set client auth cert: {}", e))?
-        } else {
-            builder.with_webpki_verifier(verifier).with_no_client_auth()
-        };
-
-        // Disable verification only if explicitly requested
-        if !proxy.resolved_tls.verify_server_cert || tls_no_verify {
-            tls_config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(NoVerifier));
-        }
+        .build_rustls()
+        .map_err(|e| anyhow::anyhow!("Failed to build backend TLS config: {}", e))?;
 
         Ok(Self {
             config: Arc::new(tls_config),
@@ -419,6 +379,10 @@ pub struct TcpListenerConfig {
     pub tls_no_verify: bool,
     /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
     pub tls_ca_bundle_path: Option<String>,
+    /// Global client certificate path for outbound backend mTLS fallback.
+    pub backend_tls_client_cert_path: Option<String>,
+    /// Global client key path for outbound backend mTLS fallback.
+    pub backend_tls_client_key_path: Option<String>,
     pub plugin_cache: Arc<PluginCache>,
     /// Global default TCP idle timeout in seconds. Per-proxy `tcp_idle_timeout_seconds` overrides.
     pub tcp_idle_timeout_seconds: u64,
@@ -472,6 +436,8 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         metrics,
         tls_no_verify,
         tls_ca_bundle_path,
+        backend_tls_client_cert_path,
+        backend_tls_client_key_path,
         plugin_cache,
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
         tcp_half_close_max_wait_seconds,
@@ -525,7 +491,15 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
             .find(|p| *p.id == *proxy_id)
             .filter(|p| p.backend_protocol == BackendProtocol::TcpTls)
             .map(|proxy| {
-                CachedBackendTlsConfig::build(proxy, tls_no_verify, tls_ca_bundle_path.as_deref(), tls_policy.as_deref(), &crls)
+                CachedBackendTlsConfig::build(
+                    proxy,
+                    tls_no_verify,
+                    tls_ca_bundle_path.as_deref(),
+                    backend_tls_client_cert_path.as_deref(),
+                    backend_tls_client_key_path.as_deref(),
+                    tls_policy.as_deref(),
+                    &crls,
+                )
                     .map(Arc::new)
                     .unwrap_or_else(|e| {
                         warn!(proxy_id = %proxy_id, "Failed to pre-build backend TLS config: {}, will retry per-connection", e);

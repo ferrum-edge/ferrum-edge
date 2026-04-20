@@ -687,6 +687,8 @@ impl ProxyState {
             None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
             env_config_arc.tls_no_verify,
             env_config_arc.tls_ca_bundle_path.clone(),
+            env_config_arc.backend_tls_client_cert_path.clone(),
+            env_config_arc.backend_tls_client_key_path.clone(),
             env_config_arc.tcp_idle_timeout_seconds,
             env_config_arc.tcp_half_close_max_wait_seconds,
             env_config_arc.udp_max_sessions,

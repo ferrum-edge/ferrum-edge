@@ -63,6 +63,10 @@ pub struct StreamListenerManager {
     tls_no_verify: bool,
     /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
     tls_ca_bundle_path: Option<String>,
+    /// Global backend mTLS client certificate fallback for TCP/TLS backends.
+    backend_tls_client_cert_path: Option<String>,
+    /// Global backend mTLS client key fallback for TCP/TLS backends.
+    backend_tls_client_key_path: Option<String>,
     /// Global default TCP idle timeout in seconds (per-proxy `tcp_idle_timeout_seconds` overrides).
     tcp_idle_timeout_seconds: u64,
     /// Hard cap (seconds) on Phase 2 of the TCP bidirectional relay.
@@ -111,6 +115,8 @@ impl StreamListenerManager {
         frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<String>,
+        backend_tls_client_cert_path: Option<String>,
+        backend_tls_client_key_path: Option<String>,
         tcp_idle_timeout_seconds: u64,
         tcp_half_close_max_wait_seconds: u64,
         udp_max_sessions: usize,
@@ -142,6 +148,8 @@ impl StreamListenerManager {
             frontend_dtls_client_ca_path: arc_swap::ArcSwap::new(Arc::new(None)),
             tls_no_verify,
             tls_ca_bundle_path,
+            backend_tls_client_cert_path,
+            backend_tls_client_key_path,
             tcp_idle_timeout_seconds,
             tcp_half_close_max_wait_seconds,
             udp_max_sessions,
@@ -475,6 +483,8 @@ impl StreamListenerManager {
                 let tls_policy = self.tls_policy.clone();
                 let crls = self.crls.clone();
                 let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
+                let backend_tls_client_cert_path = self.backend_tls_client_cert_path.clone();
+                let backend_tls_client_key_path = self.backend_tls_client_key_path.clone();
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
                 let tcp_fastopen = self.tcp_fastopen_enabled;
@@ -495,6 +505,8 @@ impl StreamListenerManager {
                         metrics,
                         tls_no_verify,
                         tls_ca_bundle_path,
+                        backend_tls_client_cert_path,
+                        backend_tls_client_key_path,
                         plugin_cache,
                         tcp_idle_timeout_seconds: tcp_idle_timeout,
                         tcp_half_close_max_wait_seconds: tcp_half_close_max_wait,

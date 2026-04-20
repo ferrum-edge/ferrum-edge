@@ -101,6 +101,8 @@ fn create_manager(config: GatewayConfig) -> StreamListenerManager {
         None, // no frontend TLS
         false,
         None,
+        None,
+        None,
         300,
         300, // tcp_half_close_max_wait_seconds
         10_000,
@@ -175,6 +177,8 @@ async fn test_reconcile_starts_tcp_listener() {
         None,
         false,
         None,
+        None,
+        None,
         300,
         300, // tcp_half_close_max_wait_seconds
         10_000,
@@ -240,6 +244,8 @@ async fn test_reconcile_starts_udp_listener() {
         cb_cache,
         None,
         false,
+        None,
+        None,
         None,
         300,
         300, // tcp_half_close_max_wait_seconds
@@ -319,6 +325,8 @@ async fn test_reconcile_detects_port_conflict() {
         None,
         false,
         None,
+        None,
+        None,
         300,
         300, // tcp_half_close_max_wait_seconds
         10_000,
@@ -392,6 +400,8 @@ async fn test_reconcile_defers_tcp_without_tls_config() {
         None, // No frontend TLS config
         false,
         None,
+        None,
+        None,
         300,
         300, // tcp_half_close_max_wait_seconds
         10_000,
@@ -458,6 +468,8 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
         cb_cache,
         None,
         false,
+        None,
+        None,
         None,
         300,
         300, // tcp_half_close_max_wait_seconds
@@ -528,6 +540,8 @@ async fn test_shutdown_all_releases_ports() {
         cb_cache,
         None,
         false,
+        None,
+        None,
         None,
         300,
         300, // tcp_half_close_max_wait_seconds
@@ -609,6 +623,8 @@ async fn test_wait_until_started_succeeds_for_tcp() {
         cb_cache,
         None,
         false,
+        None,
+        None,
         None,
         300,
         300, // tcp_half_close_max_wait_seconds
