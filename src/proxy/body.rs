@@ -1190,6 +1190,10 @@ fn content_length_hint(content_length: Option<u64>) -> http_body::SizeHint {
 
 const COALESCE_TARGET: usize = 128 * 1024;
 
+const H3_COALESCE_MIN_BYTES: usize = 8 * 1024;
+const H3_COALESCE_MAX_BYTES: usize = 32 * 1024;
+const H3_FLUSH_INTERVAL: Duration = Duration::from_millis(2);
+
 pub(crate) fn coalescing_body(
     response: reqwest::Response,
     content_length: Option<u64>,
@@ -1516,44 +1520,15 @@ impl http_body::Body for CoalescingH2Body {
     }
 }
 
-// -- CoalescingH3Body ---------------------------------------------------------
-
-/// A response body adapter that reads chunks from an h3 `RequestStream` and
-/// coalesces them into larger frames before yielding.
-///
-/// Follows the same pattern as [`CoalescingH2Body`] — small chunks are buffered
-/// until reaching the coalesce target, large chunks pass through directly.
-/// Unlike H2, h3 `RequestStream` uses an async `recv_data()` method rather
-/// than implementing `http_body::Body`, so this adapter bridges the API gap.
-pub(crate) struct CoalescingH3Body {
-    recv_stream: crate::http3::client::H3RequestStream,
-    buffer: BytesMut,
-    done: bool,
-    /// Error stashed while flushing buffered data. Returned on the next
-    /// `poll_frame` call after the buffer has been drained, preventing
-    /// silent response truncation.
-    stashed_error: Option<ProxyBodyError>,
-    content_length: Option<u64>,
-    coalesce_target: usize,
-}
-
-/// Wraps an h3 `RequestStream` into a coalescing streaming body.
-///
-/// `content_length` should be the value of the backend's Content-Length header
-/// (if present) so the adapter can propagate an exact size hint.
 pub(crate) fn coalescing_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
     content_length: Option<u64>,
     coalesce_target: usize,
 ) -> ProxyBody {
-    let body = CoalescingH3Body {
-        recv_stream,
-        buffer: BytesMut::new(),
-        done: false,
-        stashed_error: None,
-        content_length,
-        coalesce_target,
-    };
+    let source = H3FrameSource::new(recv_stream);
+    let h3_target = coalesce_target.clamp(H3_COALESCE_MIN_BYTES, H3_COALESCE_MAX_BYTES);
+    let body =
+        Coalescing::with_flush_after(source, h3_target, content_length, Some(H3_FLUSH_INTERVAL));
     ProxyBody::streaming(Box::pin(body))
 }
 
