@@ -120,18 +120,6 @@ fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
     conf.get(key).map(|v| v.to_string())
 }
 
-/// Resolve a configuration value with a default fallback.
-fn resolve_var_or(conf: &ConfFile, key: &str, default: &str) -> String {
-    resolve_var(conf, key).unwrap_or_else(|| default.to_string())
-}
-
-/// Resolve a bool configuration value ("true" or "1").
-fn resolve_bool(conf: &ConfFile, key: &str, default: bool) -> bool {
-    resolve_var(conf, key)
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(default)
-}
-
 /// Tri-state toggle: `auto` (detect at runtime), `true` (force on), `false` (force off).
 ///
 /// Used for Linux-specific optimizations that can probe the kernel at startup.
@@ -177,16 +165,6 @@ impl std::fmt::Display for AutoBool {
             Self::True => write!(f, "true"),
             Self::False => write!(f, "false"),
         }
-    }
-}
-
-/// Resolve an `AutoBool` configuration value: "auto", "true"/"1", "false"/"0".
-fn resolve_auto_bool(conf: &ConfFile, key: &str, default: AutoBool) -> AutoBool {
-    match resolve_var(conf, key).as_deref() {
-        Some("auto") => AutoBool::Auto,
-        Some("true") | Some("1") => AutoBool::True,
-        Some("false") | Some("0") => AutoBool::False,
-        _ => default,
     }
 }
 
@@ -2078,22 +2056,4 @@ impl EnvConfig {
 
         Ok(())
     }
-}
-
-fn resolve_u16(conf: &ConfFile, key: &str, default: u16) -> u16 {
-    resolve_var(conf, key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn resolve_u64(conf: &ConfFile, key: &str, default: u64) -> u64 {
-    resolve_var(conf, key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn resolve_usize(conf: &ConfFile, key: &str, default: usize) -> usize {
-    resolve_var(conf, key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
 }
