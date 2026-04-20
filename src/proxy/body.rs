@@ -19,6 +19,8 @@ use std::time::Instant;
 /// Error type for streaming response bodies.
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
+pub(crate) type BoxError = ProxyBodyError;
+
 /// A response body that is either fully buffered or streamed from the backend.
 ///
 /// Optionally carries a [`RequestGuard`] that keeps the `active_requests`
@@ -896,6 +898,97 @@ where
     }
 }
 
+pub(crate) trait FrameSource {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>>;
+}
+
+#[rustfmt::skip]
+pub(crate) struct ReqwestFrameSource<S> { inner: S }
+
+impl<S> FrameSource for ReqwestFrameSource<S>
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, BoxError>> + Unpin,
+{
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        futures_util::Stream::poll_next(Pin::new(&mut self.get_mut().inner), cx)
+    }
+}
+
+impl FrameSource for Incoming {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        http_body::Body::poll_frame(self, cx)
+            .map(|opt| opt.map(|r| r.map_err(|e| Box::new(e) as BoxError)))
+    }
+}
+
+#[rustfmt::skip]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum H3FrameSourceState { Data, Trailers, Done }
+
+#[rustfmt::skip]
+pub(crate) struct H3FrameSource { recv_stream: crate::http3::client::H3RequestStream, state: H3FrameSourceState }
+
+impl H3FrameSource {
+    #[rustfmt::skip]
+    fn new(recv_stream: crate::http3::client::H3RequestStream) -> Self {
+        Self { recv_stream, state: H3FrameSourceState::Data }
+    }
+}
+
+impl FrameSource for H3FrameSource {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        use bytes::Buf;
+
+        let this = self.get_mut();
+        loop {
+            match this.state {
+                H3FrameSourceState::Data => match this.recv_stream.poll_recv_data(cx) {
+                    Poll::Ready(Ok(Some(mut buf))) => {
+                        let data = buf.copy_to_bytes(buf.remaining());
+                        return Poll::Ready(Some(Ok(Frame::data(data))));
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        this.state = H3FrameSourceState::Trailers;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        this.state = H3FrameSourceState::Done;
+                        return Poll::Ready(Some(Err(Box::new(e) as BoxError)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                H3FrameSourceState::Trailers => match this.recv_stream.poll_recv_trailers(cx) {
+                    Poll::Ready(Ok(Some(trailers))) => {
+                        this.state = H3FrameSourceState::Done;
+                        return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        this.state = H3FrameSourceState::Done;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Ready(Err(e)) => {
+                        this.state = H3FrameSourceState::Done;
+                        return Poll::Ready(Some(Err(Box::new(e) as BoxError)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                H3FrameSourceState::Done => return Poll::Ready(None),
+            }
+        }
+    }
+}
+
 // -- CoalescingBody -----------------------------------------------------------
 
 /// Minimum chunk size (bytes) before yielding a frame to hyper's H1 encoder.
@@ -1495,5 +1588,89 @@ impl http_body::Body for CoalescingH3Body {
         } else {
             http_body::SizeHint::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::Stream;
+    use futures_util::task::noop_waker;
+    use std::collections::VecDeque;
+
+    #[rustfmt::skip]
+    enum MockStep { Frame(Result<Frame<Bytes>, BoxError>), End, Pending }
+
+    #[rustfmt::skip]
+    struct MockSource { steps: VecDeque<MockStep> }
+
+    impl MockSource {
+        #[rustfmt::skip]
+        fn new(steps: Vec<MockStep>) -> Self {
+            Self { steps: steps.into() }
+        }
+    }
+
+    impl FrameSource for MockSource {
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            match self.get_mut().steps.pop_front().unwrap_or(MockStep::End) {
+                MockStep::Frame(frame) => Poll::Ready(Some(frame)),
+                MockStep::End => Poll::Ready(None),
+                MockStep::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl Stream for MockSource {
+        type Item = Result<Frame<Bytes>, BoxError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            match self.get_mut().steps.pop_front().unwrap_or(MockStep::End) {
+                MockStep::Frame(frame) => Poll::Ready(Some(frame)),
+                MockStep::End => Poll::Ready(None),
+                MockStep::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    #[rustfmt::skip]
+    fn poll_source<S: FrameSource + Unpin>(source: &mut S) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        Pin::new(source).poll_frame(&mut cx)
+    }
+
+    #[test]
+    fn reqwest_frame_source_forwards_data_trailer_and_end() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+
+        let mut source = ReqwestFrameSource {
+            inner: MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from("hello")))),
+                MockStep::Frame(Ok(Frame::trailers(trailers))),
+                MockStep::End,
+            ]),
+        };
+
+        match poll_source(&mut source) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"hello");
+            }
+            other => panic!("expected first data frame, got {other:?}"),
+        }
+
+        match poll_source(&mut source) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let trailers = frame.trailers_ref().expect("expected trailers frame");
+                assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+            }
+            other => panic!("expected trailer frame, got {other:?}"),
+        }
+
+        assert!(matches!(poll_source(&mut source), Poll::Ready(None)));
     }
 }
