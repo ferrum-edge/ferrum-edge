@@ -453,7 +453,7 @@ pub struct EnvConfig {
     pub dns_try_tcp_on_error: bool,
     /// Number of nameservers to query concurrently per lookup. Default: 3.
     pub dns_num_concurrent_reqs: usize,
-    /// Maximum in-flight queries per multiplexed connection. Default: 128.
+    /// Maximum in-flight queries per multiplexed connection. Default: 512.
     pub dns_max_active_requests: usize,
 
     /// Path to a PEM file containing trusted CA certificates for outbound TLS verification.
@@ -988,7 +988,7 @@ impl Default for EnvConfig {
             dns_failed_retry_interval: 10,
             dns_try_tcp_on_error: true,
             dns_num_concurrent_reqs: 3,
-            dns_max_active_requests: 128,
+            dns_max_active_requests: 512,
             tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -1235,7 +1235,7 @@ impl EnvConfig {
             dns_failed_retry_interval: u64 = "FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS" => 10u64;
             dns_try_tcp_on_error: bool = "FERRUM_DNS_TRY_TCP_ON_ERROR" => true;
             dns_num_concurrent_reqs: usize = "FERRUM_DNS_NUM_CONCURRENT_REQS" => 3usize, clamp(1usize, 10usize);
-            dns_max_active_requests: usize = "FERRUM_DNS_MAX_ACTIVE_REQUESTS" => 128usize, clamp(1usize, 1024usize);
+            dns_max_active_requests: usize = "FERRUM_DNS_MAX_ACTIVE_REQUESTS" => 512usize, clamp(1usize, 4096usize);
         }
 
         env_config! {

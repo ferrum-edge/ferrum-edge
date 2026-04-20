@@ -139,7 +139,7 @@ fn create_proxy_state() -> ProxyState {
         failed_retry_interval_seconds: 10,
         try_tcp_on_error: true,
         num_concurrent_reqs: 3,
-        max_active_requests: 128,
+        max_active_requests: 512,
     });
     ProxyState::new(
         GatewayConfig::default(),

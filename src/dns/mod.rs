@@ -98,7 +98,7 @@ pub struct DnsConfig {
     pub try_tcp_on_error: bool,
     /// Number of nameservers to query concurrently per lookup. Default: 3.
     pub num_concurrent_reqs: usize,
-    /// Maximum in-flight queries per multiplexed connection. Default: 128.
+    /// Maximum in-flight queries per multiplexed connection. Default: 512.
     pub max_active_requests: usize,
     /// Backend IP allowlist policy for SSRF protection.
     pub backend_allow_ips: crate::config::BackendAllowIps,
@@ -122,7 +122,7 @@ impl Default for DnsConfig {
             failed_retry_interval_seconds: 10,
             try_tcp_on_error: true,
             num_concurrent_reqs: 3,
-            max_active_requests: 128,
+            max_active_requests: 512,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
         }
     }
