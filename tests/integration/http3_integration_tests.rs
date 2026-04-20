@@ -910,30 +910,20 @@ async fn test_http3_streaming_decision_logic() {
     );
 }
 
-/// Test HTTP/3 chunk coalescing constants are appropriate
+/// Test HTTP/3 chunk coalescing defaults are appropriate
 #[tokio::test]
-async fn test_http3_coalesce_constants() {
-    // The coalescing thresholds should be in the optimal 8–32 KiB range for QUIC.
-    // Too small = excessive framing overhead. Too large = latency spike.
-    let coalesce_min = 8_192usize; // H3_COALESCE_MIN_BYTES
-    let coalesce_max = 32_768usize; // H3_COALESCE_MAX_BYTES
-    let flush_interval_ms = 2u64; // H3_FLUSH_INTERVAL
-
+async fn test_http3_coalesce_defaults() {
+    let env = ferrum_edge::config::EnvConfig::default();
+    assert_eq!(env.http3_coalesce_min_bytes, 32_768);
+    assert_eq!(env.http3_coalesce_max_bytes, 32_768);
+    assert_eq!(env.http3_flush_interval_micros, 200);
     assert!(
-        coalesce_min >= 4_096,
-        "Coalesce minimum should be at least 4 KiB"
+        env.http3_coalesce_min_bytes <= env.http3_coalesce_max_bytes,
+        "MIN must be <= MAX (enforced at parse time)"
     );
     assert!(
-        coalesce_max <= 65_536,
-        "Coalesce maximum should be at most 64 KiB to bound per-stream memory"
-    );
-    assert!(
-        coalesce_min < coalesce_max,
-        "Min must be less than max for adaptive range"
-    );
-    assert!(
-        (1..=10).contains(&flush_interval_ms),
-        "Flush interval should be 1–10ms to balance latency vs efficiency"
+        env.http3_flush_interval_micros <= 10_000,
+        "Flush interval > 10 ms regresses small-payload latency"
     );
 }
 

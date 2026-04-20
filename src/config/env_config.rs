@@ -494,6 +494,29 @@ pub struct EnvConfig {
     /// HTTP/3 pool idle timeout in seconds (default: 120).
     /// Connections idle longer than this are evicted from the pool.
     pub http3_pool_idle_timeout_seconds: u64,
+    /// Minimum bytes buffered before flushing a coalesced HTTP/3 DATA frame
+    /// on the response streaming path (default: 32_768). Acts as the flush
+    /// target — once the buffer reaches this size on chunk arrival, it is
+    /// flushed. Clamped to `<= http3_coalesce_max_bytes` at parse time.
+    /// Legal range: [1024, http3_coalesce_max_bytes].
+    pub http3_coalesce_min_bytes: usize,
+    /// Maximum bytes for the HTTP/3 response streaming coalesce buffer
+    /// (default: 32_768). Used as the `BytesMut::with_capacity` initial
+    /// allocation and as the upper bound that clamps `coalesce_min_bytes`
+    /// at parse time. Higher values reduce reallocations for large-backend
+    /// responses at the cost of per-stream memory. Legal range:
+    /// [1024, 1_048_576].
+    pub http3_coalesce_max_bytes: usize,
+    /// Time-based flush interval on the HTTP/3 response streaming path in
+    /// microseconds (default: 200). Floor: 50 µs to prevent "flush every
+    /// poll" footguns. Legal range: [50, 100_000].
+    pub http3_flush_interval_micros: u64,
+    /// Initial QUIC path MTU in bytes used to build `TransportConfig`
+    /// (default: 1500). quinn's baseline of 1200 forces ~9 packets for a
+    /// 10 KiB payload; 1500 is safe on modern networks and quinn backs off
+    /// via black-hole detection if a smaller MTU is required. Legal range:
+    /// [1200, 65527] (quinn's accepted bounds).
+    pub http3_initial_mtu: u16,
     /// Milliseconds the gRPC backend pool waits on a saturated HTTP/2 sender
     /// for a free stream before opening a fresh connection (default: 1).
     /// Lower values reduce queueing for unary gRPC under load. Set to 0 to
@@ -979,6 +1002,10 @@ impl Default for EnvConfig {
             http3_send_window: 8_388_608,           // 8 MiB
             http3_connections_per_backend: 4,
             http3_pool_idle_timeout_seconds: 120,
+            http3_coalesce_min_bytes: 32_768,
+            http3_coalesce_max_bytes: 32_768,
+            http3_flush_interval_micros: 200,
+            http3_initial_mtu: 1500,
             grpc_pool_ready_wait_ms: 1,
             pool_warmup_enabled: true,
             pool_warmup_concurrency: 500,
@@ -1224,6 +1251,9 @@ impl EnvConfig {
             http3_send_window: u64 = "FERRUM_HTTP3_SEND_WINDOW" => 8_388_608u64;
             http3_connections_per_backend: usize = "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND" => 4usize, max(1usize);
             http3_pool_idle_timeout_seconds: u64 = "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS" => 120u64;
+            http3_coalesce_max_bytes: usize = "FERRUM_HTTP3_COALESCE_MAX_BYTES" => crate::http3::config::H3_COALESCE_MAX_DEFAULT, clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, crate::http3::config::H3_COALESCE_MAX_CAP);
+            http3_flush_interval_micros: u64 = "FERRUM_HTTP3_FLUSH_INTERVAL_MICROS" => 200u64, clamp(crate::http3::config::H3_FLUSH_INTERVAL_MIN_MICROS, crate::http3::config::H3_FLUSH_INTERVAL_MAX_MICROS);
+            http3_initial_mtu: u16 = "FERRUM_HTTP3_INITIAL_MTU" => 1500u16;
             grpc_pool_ready_wait_ms: u64 = "FERRUM_GRPC_POOL_READY_WAIT_MS" => 1u64;
             pool_warmup_enabled: bool = "FERRUM_POOL_WARMUP_ENABLED" => true;
             pool_warmup_concurrency: usize = "FERRUM_POOL_WARMUP_CONCURRENCY" => 500usize, max(1usize);
@@ -1404,6 +1434,27 @@ impl EnvConfig {
             || AutoBool::Auto,
         )?;
 
+        // `http3_coalesce_min_bytes` depends on the runtime-parsed
+        // `http3_coalesce_max_bytes`, so it lives outside the macro block.
+        let http3_coalesce_min_bytes: usize = {
+            let raw: usize =
+                env_config_macro::resolve_default(conf, "FERRUM_HTTP3_COALESCE_MIN_BYTES", || {
+                    crate::http3::config::H3_COALESCE_MAX_DEFAULT
+                })?;
+            let clamped = raw.clamp(
+                crate::http3::config::H3_COALESCE_MIN_FLOOR,
+                http3_coalesce_max_bytes,
+            );
+            if raw > http3_coalesce_max_bytes {
+                tracing::warn!(
+                    "FERRUM_HTTP3_COALESCE_MIN_BYTES={} exceeds FERRUM_HTTP3_COALESCE_MAX_BYTES={}; clamping MIN to MAX",
+                    raw,
+                    http3_coalesce_max_bytes,
+                );
+            }
+            clamped
+        };
+
         let config = Self {
             mode: mode.clone(),
             namespace,
@@ -1510,6 +1561,10 @@ impl EnvConfig {
             http3_send_window,
             http3_connections_per_backend,
             http3_pool_idle_timeout_seconds,
+            http3_coalesce_min_bytes,
+            http3_coalesce_max_bytes,
+            http3_flush_interval_micros,
+            http3_initial_mtu,
             grpc_pool_ready_wait_ms,
             pool_warmup_enabled,
             pool_warmup_concurrency,
@@ -2035,6 +2090,17 @@ impl EnvConfig {
         if let Some(ref path) = self.tls_ca_bundle_path {
             crate::config::types::validate_pem_cert_file("FERRUM_TLS_CA_BUNDLE_PATH", path)
                 .map_err(|e| e.to_string())?;
+        }
+
+        if self.http3_initial_mtu < crate::http3::config::QUIC_INITIAL_MTU_MIN
+            || self.http3_initial_mtu > crate::http3::config::QUIC_INITIAL_MTU_MAX
+        {
+            return Err(format!(
+                "FERRUM_HTTP3_INITIAL_MTU ({}) is outside quinn's legal range [{}, {}]",
+                self.http3_initial_mtu,
+                crate::http3::config::QUIC_INITIAL_MTU_MIN,
+                crate::http3::config::QUIC_INITIAL_MTU_MAX,
+            ));
         }
 
         // Non-fatal security warnings

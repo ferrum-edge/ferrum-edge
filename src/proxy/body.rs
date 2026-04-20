@@ -890,9 +890,6 @@ where
 }
 
 const COALESCE_TARGET: usize = 128 * 1024;
-const H3_COALESCE_MIN_BYTES: usize = 8 * 1024;
-const H3_COALESCE_MAX_BYTES: usize = 32 * 1024;
-const H3_FLUSH_INTERVAL: Duration = Duration::from_millis(2);
 pub(crate) trait FrameSource {
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -1065,6 +1062,27 @@ impl<S: FrameSource> Coalescing<S> {
             inner,
             target_bytes,
             buffer: BytesMut::with_capacity(target_bytes.min(COALESCE_TARGET)),
+            stashed_trailer: None,
+            stashed_error: None,
+            done: false,
+            content_length,
+            flush_after,
+            flush_timer: None,
+            flush_timer_armed: false,
+        }
+    }
+
+    fn with_flush_after_and_capacity(
+        inner: S,
+        target_bytes: usize,
+        buffer_capacity: usize,
+        content_length: Option<u64>,
+        flush_after: Option<Duration>,
+    ) -> Self {
+        Self {
+            inner,
+            target_bytes,
+            buffer: BytesMut::with_capacity(buffer_capacity),
             stashed_trailer: None,
             stashed_error: None,
             done: false,
@@ -1378,12 +1396,24 @@ pub(crate) fn direct_streaming_h2_body(body: Incoming, content_length: Option<u6
 pub(crate) fn coalescing_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
     content_length: Option<u64>,
-    coalesce_target: usize,
+    coalesce_min_bytes: usize,
+    coalesce_max_bytes: usize,
+    flush_interval: Duration,
 ) -> ProxyBody {
     let source = H3FrameSource::new(recv_stream);
-    let h3_target = coalesce_target.clamp(H3_COALESCE_MIN_BYTES, H3_COALESCE_MAX_BYTES);
-    let body =
-        Coalescing::with_flush_after(source, h3_target, content_length, Some(H3_FLUSH_INTERVAL));
+    let buffer_capacity = coalesce_max_bytes.clamp(
+        crate::http3::config::H3_COALESCE_MIN_FLOOR,
+        crate::http3::config::H3_COALESCE_MAX_CAP,
+    );
+    let target_bytes =
+        coalesce_min_bytes.clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, buffer_capacity);
+    let body = Coalescing::with_flush_after_and_capacity(
+        source,
+        target_bytes,
+        buffer_capacity,
+        content_length,
+        Some(flush_interval),
+    );
     ProxyBody::streaming(Box::pin(body))
 }
 

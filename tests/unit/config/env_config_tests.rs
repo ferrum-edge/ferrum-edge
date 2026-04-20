@@ -331,6 +331,350 @@ fn test_env_config_http3_defaults() {
 }
 
 #[test]
+fn test_http3_coalesce_min_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP3_COALESCE_MIN_BYTES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_coalesce_min_bytes, 32_768);
+        },
+    );
+}
+
+#[test]
+fn test_http3_coalesce_min_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_COALESCE_MIN_BYTES", "16384"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_coalesce_min_bytes, 16_384);
+        },
+    );
+}
+
+#[test]
+fn test_http3_coalesce_min_clamped_above_max() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_COALESCE_MIN_BYTES", "65536"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_coalesce_min_bytes, 32_768);
+        },
+    );
+}
+
+#[test]
+fn test_http3_coalesce_min_clamped_below_floor() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_COALESCE_MIN_BYTES", "512"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_coalesce_min_bytes, 1024);
+        },
+    );
+}
+
+#[test]
+fn test_http3_coalesce_max_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP3_COALESCE_MAX_BYTES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_coalesce_max_bytes, 32_768);
+        },
+    );
+}
+
+#[test]
+fn test_http3_coalesce_max_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_COALESCE_MAX_BYTES", "131072"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_coalesce_max_bytes, 131_072);
+        },
+    );
+}
+
+#[test]
+fn test_http3_coalesce_max_clamped_above_cap() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_COALESCE_MAX_BYTES", "2097152"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_coalesce_max_bytes, 1_048_576);
+        },
+    );
+}
+
+#[test]
+fn test_http3_coalesce_max_clamped_below_floor() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_COALESCE_MAX_BYTES", "512"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_coalesce_max_bytes, 1024);
+        },
+    );
+}
+
+#[test]
+fn test_http3_coalesce_min_clamped_to_runtime_max() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_COALESCE_MAX_BYTES", "16384"),
+            ("FERRUM_HTTP3_COALESCE_MIN_BYTES", "65536"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_coalesce_max_bytes, 16_384);
+            assert_eq!(config.http3_coalesce_min_bytes, 16_384);
+        },
+    );
+}
+
+#[test]
+fn test_http3_coalesce_min_allows_large_value_when_max_raised() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_COALESCE_MAX_BYTES", "262144"),
+            ("FERRUM_HTTP3_COALESCE_MIN_BYTES", "131072"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_coalesce_max_bytes, 262_144);
+            assert_eq!(config.http3_coalesce_min_bytes, 131_072);
+        },
+    );
+}
+
+#[test]
+fn test_http3_coalesce_min_non_numeric_rejected() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_COALESCE_MIN_BYTES", "abc"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                err.contains("FERRUM_HTTP3_COALESCE_MIN_BYTES"),
+                "unexpected error: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_http3_flush_interval_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP3_FLUSH_INTERVAL_MICROS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_flush_interval_micros, 200);
+        },
+    );
+}
+
+#[test]
+fn test_http3_flush_interval_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_FLUSH_INTERVAL_MICROS", "500"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_flush_interval_micros, 500);
+        },
+    );
+}
+
+#[test]
+fn test_http3_flush_interval_floor() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_FLUSH_INTERVAL_MICROS", "10"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_flush_interval_micros, 50);
+        },
+    );
+}
+
+#[test]
+fn test_http3_flush_interval_ceiling() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_FLUSH_INTERVAL_MICROS", "200000"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_flush_interval_micros, 100_000);
+        },
+    );
+}
+
+#[test]
+fn test_http3_initial_mtu_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP3_INITIAL_MTU");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_initial_mtu, 1500);
+        },
+    );
+}
+
+#[test]
+fn test_http3_initial_mtu_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_INITIAL_MTU", "1350"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_initial_mtu, 1350);
+        },
+    );
+}
+
+#[test]
+fn test_http3_initial_mtu_below_min_rejected() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_INITIAL_MTU", "1199"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                err.contains("FERRUM_HTTP3_INITIAL_MTU"),
+                "unexpected error: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_http3_initial_mtu_above_max_rejected() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_INITIAL_MTU", "65528"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                err.contains("FERRUM_HTTP3_INITIAL_MTU"),
+                "unexpected error: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_http3_initial_mtu_u16_overflow_rejected() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_INITIAL_MTU", "70000"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                err.contains("FERRUM_HTTP3_INITIAL_MTU"),
+                "unexpected error: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_http3_initial_mtu_non_numeric_rejected() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_INITIAL_MTU", "abc"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                err.contains("FERRUM_HTTP3_INITIAL_MTU"),
+                "unexpected error: {err}"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_env_config_http2_reset_and_websocket_limits_custom() {
     with_env_vars(
         &[

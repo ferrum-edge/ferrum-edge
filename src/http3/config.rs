@@ -2,6 +2,35 @@
 
 use std::time::Duration;
 
+/// Default value for the H3 response streaming coalesce-buffer initial capacity
+/// and MIN upper bound (when `FERRUM_HTTP3_COALESCE_MAX_BYTES` is unset).
+/// See `FERRUM_HTTP3_COALESCE_MAX_BYTES` for runtime tuning.
+pub const H3_COALESCE_MAX_DEFAULT: usize = 32_768;
+
+/// Absolute upper bound operators may set via `FERRUM_HTTP3_COALESCE_MAX_BYTES`.
+/// Bounds per-stream memory regardless of configuration.
+pub const H3_COALESCE_MAX_CAP: usize = 1_048_576;
+
+/// Absolute lower bound for both MIN and MAX coalesce bytes. Values below this
+/// erase the benefit of coalescing entirely.
+pub const H3_COALESCE_MIN_FLOOR: usize = 1024;
+
+/// Floor for the H3 response streaming flush interval in microseconds.
+/// Values below this would cause the select-loop to flush on almost every poll
+/// and erase the benefit of coalescing entirely.
+pub const H3_FLUSH_INTERVAL_MIN_MICROS: u64 = 50;
+
+/// Upper bound for the H3 response streaming flush interval in microseconds
+/// (100 ms — anything higher is a latency bug, not a tuning knob).
+pub const H3_FLUSH_INTERVAL_MAX_MICROS: u64 = 100_000;
+
+/// QUIC minimum initial MTU (per quinn). Lower values are rejected by quinn.
+pub const QUIC_INITIAL_MTU_MIN: u16 = 1200;
+
+/// QUIC maximum initial MTU (per quinn — limited by the 16-bit varint space
+/// after accounting for UDP/IP headers).
+pub const QUIC_INITIAL_MTU_MAX: u16 = 65527;
+
 /// HTTP/3 server configuration
 #[derive(Debug, Clone)]
 pub struct Http3ServerConfig {
@@ -33,6 +62,13 @@ pub struct Http3ServerConfig {
     /// across all streams on a single QUIC connection.
     /// Default: 8 MiB (8_388_608).
     pub send_window: u64,
+
+    /// Initial QUIC path MTU in bytes (`TransportConfig::initial_mtu`).
+    /// quinn's default is 1200 (the QUIC minimum), which forces ~9 packets
+    /// for a 10 KiB payload. 1500 is safe on virtually all modern networks;
+    /// quinn uses path-MTU black-hole detection to back off if a smaller MTU
+    /// is required. Default: 1500. Legal range: [1200, 65527].
+    pub initial_mtu: u16,
 }
 
 impl Http3ServerConfig {
@@ -44,6 +80,7 @@ impl Http3ServerConfig {
             stream_receive_window: env.http3_stream_receive_window,
             receive_window: env.http3_receive_window,
             send_window: env.http3_send_window,
+            initial_mtu: env.http3_initial_mtu,
         }
     }
 }
@@ -56,6 +93,7 @@ impl Default for Http3ServerConfig {
             stream_receive_window: 8_388_608, // 8 MiB
             receive_window: 33_554_432,       // 32 MiB
             send_window: 8_388_608,           // 8 MiB
+            initial_mtu: 1500,
         }
     }
 }

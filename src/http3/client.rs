@@ -574,6 +574,7 @@ impl Http3ConnectionPool {
         let cfg = h3_config.unwrap_or(&default_cfg);
 
         let mut transport_config = quinn::TransportConfig::default();
+        transport_config.initial_mtu(cfg.initial_mtu);
         transport_config.stream_receive_window(
             quinn::VarInt::from_u64(cfg.stream_receive_window)
                 .unwrap_or(quinn::VarInt::from_u32(1_048_576)),
@@ -644,6 +645,7 @@ impl Http3ConnectionPool {
         let cfg = h3_config.unwrap_or(&default_cfg);
 
         let mut transport_config = quinn::TransportConfig::default();
+        transport_config.initial_mtu(cfg.initial_mtu);
         transport_config.stream_receive_window(
             quinn::VarInt::from_u64(cfg.stream_receive_window)
                 .unwrap_or(quinn::VarInt::from_u32(1_048_576)),
@@ -1370,6 +1372,7 @@ impl Http3Client {
 
         // Apply QUIC transport tuning for the client side
         let mut transport_config = quinn::TransportConfig::default();
+        transport_config.initial_mtu(cfg.initial_mtu);
         transport_config.stream_receive_window(
             quinn::VarInt::from_u64(cfg.stream_receive_window)
                 .unwrap_or(quinn::VarInt::from_u32(1_048_576)),

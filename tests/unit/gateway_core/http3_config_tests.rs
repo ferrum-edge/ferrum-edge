@@ -12,6 +12,18 @@ fn test_http3_server_config_default_values() {
     assert_eq!(config.stream_receive_window, 8_388_608); // 8 MiB
     assert_eq!(config.receive_window, 33_554_432); // 32 MiB
     assert_eq!(config.send_window, 8_388_608); // 8 MiB
+    assert_eq!(config.initial_mtu, 1500);
+}
+
+#[test]
+fn test_http3_server_config_initial_mtu_from_env() {
+    let env = EnvConfig {
+        http3_initial_mtu: 1350,
+        ..Default::default()
+    };
+
+    let config = Http3ServerConfig::from_env_config(&env);
+    assert_eq!(config.initial_mtu, 1350);
 }
 
 #[test]

@@ -181,6 +181,7 @@ pub async fn start_http3_listener_with_signal(
         .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
 
     let mut transport_config = quinn::TransportConfig::default();
+    transport_config.initial_mtu(h3_config.initial_mtu);
     transport_config.max_idle_timeout(Some(
         h3_config
             .idle_timeout
@@ -1265,9 +1266,13 @@ async fn handle_h3_request(
         // Stream response body from backend h3 recv_stream to frontend h3 stream.
         // Uses a pinned Sleep that is reset in-place to avoid allocating a new
         // timer wheel entry on every select! iteration.
-        let mut coalesce_buf = BytesMut::with_capacity(H3_COALESCE_MAX_BYTES);
+        let coalesce_min_bytes = state.env_config.http3_coalesce_min_bytes;
+        let coalesce_max_bytes = state.env_config.http3_coalesce_max_bytes;
+        let flush_interval =
+            std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros);
+        let mut coalesce_buf = BytesMut::with_capacity(coalesce_max_bytes);
         let mut total_streamed: usize = 0;
-        let flush_timer = tokio::time::sleep(H3_FLUSH_INTERVAL);
+        let flush_timer = tokio::time::sleep(flush_interval);
         tokio::pin!(flush_timer);
         let mut stream_done = false;
         let mut bytes_streamed: u64 = 0;
@@ -1294,7 +1299,7 @@ async fn handle_h3_request(
                                 }
                             }
                             coalesce_buf.extend_from_slice(chunk_bytes);
-                            if coalesce_buf.len() >= H3_COALESCE_MIN_BYTES {
+                            if coalesce_buf.len() >= coalesce_min_bytes {
                                 let data = coalesce_buf.split().freeze();
                                 let data_len = data.len() as u64;
                                 if stream.send_data(data).await.is_err() {
@@ -1303,7 +1308,7 @@ async fn handle_h3_request(
                                     break 'outer;
                                 }
                                 bytes_streamed += data_len;
-                                flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
+                                flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
                             }
                         }
                         Ok(None) => { stream_done = true; }
@@ -1331,7 +1336,7 @@ async fn handle_h3_request(
                         break 'outer;
                     }
                     bytes_streamed += data_len;
-                    flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
+                    flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
                 }
             }
             if stream_done {
@@ -1968,21 +1973,6 @@ async fn handle_h3_request(
     Ok(())
 }
 
-/// Minimum coalescing threshold for QUIC DATA frames. Small frames add per-frame
-/// overhead (QUIC packet headers, HTTP/3 frame headers). Buffering until we have
-/// at least this many bytes amortises the overhead. 8 KiB is the lower bound of
-/// the optimal 8–32 KiB range for typical QUIC path MTUs (~1200 bytes).
-const H3_COALESCE_MIN_BYTES: usize = 8_192;
-
-/// Maximum coalescing buffer size. Even if data arrives fast, we flush at this
-/// threshold to bound per-stream memory and avoid introducing latency.
-const H3_COALESCE_MAX_BYTES: usize = 32_768;
-
-/// Time-based flush interval. If the coalescing buffer has data but hasn't
-/// reached the size threshold, flush after this duration to avoid stalling
-/// small or tail responses. 2ms balances latency vs frame efficiency.
-const H3_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
-
 /// Build the h3 backend header list from proxy request headers.
 ///
 /// Strips hop-by-hop headers per RFC 7230 §6.1, handles Host/preserve_host_header,
@@ -2329,9 +2319,13 @@ async fn proxy_to_backend_h3_streaming(
     // Stream response body chunks from the h3 backend recv_stream with adaptive
     // coalescing and time-based flushing. Uses a pinned Sleep to avoid
     // allocating a new timer wheel entry on every select! iteration.
-    let mut coalesce_buf = BytesMut::with_capacity(H3_COALESCE_MAX_BYTES);
+    let coalesce_min_bytes = state.env_config.http3_coalesce_min_bytes;
+    let coalesce_max_bytes = state.env_config.http3_coalesce_max_bytes;
+    let flush_interval =
+        std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros);
+    let mut coalesce_buf = BytesMut::with_capacity(coalesce_max_bytes);
     let mut total_streamed: usize = 0;
-    let flush_timer = tokio::time::sleep(H3_FLUSH_INTERVAL);
+    let flush_timer = tokio::time::sleep(flush_interval);
     tokio::pin!(flush_timer);
     let mut stream_done = false;
     let mut bytes_streamed: u64 = 0;
@@ -2362,7 +2356,7 @@ async fn proxy_to_backend_h3_streaming(
 
                         coalesce_buf.extend_from_slice(chunk_bytes);
 
-                        if coalesce_buf.len() >= H3_COALESCE_MIN_BYTES {
+                        if coalesce_buf.len() >= coalesce_min_bytes {
                             let data = coalesce_buf.split().freeze();
                             let data_len = data.len() as u64;
                             if h3_stream.send_data(data).await.is_err() {
@@ -2371,7 +2365,7 @@ async fn proxy_to_backend_h3_streaming(
                                 break 'outer;
                             }
                             bytes_streamed += data_len;
-                            flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
+                            flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
                         }
                     }
                     Ok(None) => {
@@ -2404,7 +2398,7 @@ async fn proxy_to_backend_h3_streaming(
                     break 'outer;
                 }
                 bytes_streamed += data_len;
-                flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
+                flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
             }
         }
 

@@ -6569,7 +6569,9 @@ async fn handle_proxy_request_inner(
                 crate::proxy::body::coalescing_h3_body(
                     h3_resp.recv_stream,
                     cl,
-                    state.h2_coalesce_target_bytes,
+                    state.env_config.http3_coalesce_min_bytes,
+                    state.env_config.http3_coalesce_max_bytes,
+                    std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
                 )
             }
         }
