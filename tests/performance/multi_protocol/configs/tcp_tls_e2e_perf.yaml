@@ -5,13 +5,17 @@
 proxies:
   - id: "tcp-tls-e2e-echo"
     name: "TCP+TLS E2E Echo"
-    listen_path: ""
+    # `listen_path` MUST be omitted on stream proxies — setting it to an
+    # empty string deserializes to Some("") which is a hard validation
+    # error ("stream proxy must not set listen_path"), causing the Ferrum
+    # container to exit on startup with nothing visible to the bench
+    # harness. Omit the field entirely.
     listen_port: 5001
     backend_protocol: tcp_tls
     backend_host: "127.0.0.1"
     backend_port: 3444
     frontend_tls: true
-    backend_tls_verify_server_cert: false
+    backend_tls_server_ca_cert_path: "/etc/ferrum/tls/ca.pem"
     backend_connect_timeout_ms: 5000
     backend_read_timeout_ms: 30000
     backend_write_timeout_ms: 30000

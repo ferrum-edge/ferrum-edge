@@ -13,169 +13,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_admin
 
-use chrono::Utc;
-use jsonwebtoken::{EncodingKey, Header, encode};
+use crate::common::TestGateway;
 use serde_json::json;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime};
-use tempfile::TempDir;
-use uuid::Uuid;
-
-// ============================================================================
-// Test Harness
-// ============================================================================
-
-struct AdminTestHarness {
-    _temp_dir: TempDir,
-    gateway_process: Option<Child>,
-    admin_base_url: String,
-    jwt_secret: String,
-    jwt_issuer: String,
-}
-
-impl AdminTestHarness {
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // Retry harness creation up to 3 times to handle ephemeral port races.
-        // The bind-drop-rebind pattern (bind port 0, get port N, drop, spawn
-        // gateway with port N) is vulnerable to another process stealing port N
-        // between the drop and the gateway bind. In CI with parallel tests this
-        // happens occasionally. Retrying with fresh ports is the simplest fix.
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match Self::try_new().await {
-                Ok(harness) => return Ok(harness),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Harness startup attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to create harness after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    async fn try_new() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-admin-ops-jwt-secret-1234567890".to_string();
-        let jwt_issuer = "ferrum-edge-admin-test".to_string();
-
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
-        let db_url = format!(
-            "sqlite:{}?mode=rwc",
-            temp_dir.path().join("test.db").to_string_lossy()
-        );
-
-        // Build the gateway binary if not already built
-        let build_status = Command::new("cargo")
-            .args(["build", "--bin", "ferrum-edge"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !build_status.success() {
-            return Err("Failed to build ferrum-edge".into());
-        }
-
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-            "./target/debug/ferrum-edge"
-        } else {
-            "./target/release/ferrum-edge"
-        };
-
-        let child = Command::new(binary_path)
-            .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
-            .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", &db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2")
-            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "info")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
-
-        let mut harness = Self {
-            _temp_dir: temp_dir,
-            gateway_process: Some(child),
-            admin_base_url,
-            jwt_secret,
-            jwt_issuer,
-        };
-
-        match harness.wait_for_health().await {
-            Ok(()) => Ok(harness),
-            Err(e) => {
-                // Kill the gateway process before returning the error so the
-                // retry loop can start fresh with new ports.
-                if let Some(mut child) = harness.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway did not start within 30 seconds".into());
-            }
-            match reqwest::get(&health_url).await {
-                Ok(r) if r.status().is_success() => return Ok(()),
-                _ => tokio::time::sleep(Duration::from_millis(500)).await,
-            }
-        }
-    }
-
-    fn auth_header(&self) -> String {
-        let now = Utc::now();
-        let claims = json!({
-            "iss": self.jwt_issuer,
-            "sub": "test-admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
-            "jti": Uuid::new_v4().to_string()
-        });
-        let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
-        let token = encode(&header, &claims, &key).unwrap();
-        format!("Bearer {}", token)
-    }
-}
-
-impl Drop for AdminTestHarness {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
 
 // ============================================================================
 // Health Endpoint Test
@@ -184,7 +23,8 @@ impl Drop for AdminTestHarness {
 #[tokio::test]
 #[ignore]
 async fn test_admin_health_endpoint() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -211,7 +51,8 @@ async fn test_admin_health_endpoint() {
 #[tokio::test]
 #[ignore]
 async fn test_admin_backup_and_restore() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -357,7 +198,8 @@ async fn test_admin_backup_and_restore() {
 #[tokio::test]
 #[ignore]
 async fn test_admin_batch_create() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -457,7 +299,8 @@ async fn test_admin_batch_create() {
 #[tokio::test]
 #[ignore]
 async fn test_admin_consumer_credential_crud() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -573,7 +416,8 @@ async fn test_admin_consumer_credential_crud() {
 #[tokio::test]
 #[ignore]
 async fn test_admin_plugin_config_crud() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -723,7 +567,8 @@ async fn test_admin_plugin_config_crud() {
 #[tokio::test]
 #[ignore]
 async fn test_admin_proxy_listing_pagination() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -803,7 +648,8 @@ async fn test_admin_proxy_listing_pagination() {
 #[tokio::test]
 #[ignore]
 async fn test_admin_stats_endpoint() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -848,7 +694,8 @@ async fn test_admin_stats_endpoint() {
 #[tokio::test]
 #[ignore]
 async fn test_admin_requires_authentication() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .spawn()
         .await
         .expect("Failed to create harness");
 

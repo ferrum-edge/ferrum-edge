@@ -104,6 +104,35 @@ pub mod _test_support {
         .await
     }
 
+    /// Test-only entry point that exposes `backend_read_timeout` and
+    /// `backend_write_timeout` so per-direction timeout enforcement can be
+    /// exercised directly.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bidirectional_copy_for_test_with_timeouts<C, B>(
+        client: C,
+        backend: B,
+        idle_timeout: Option<std::time::Duration>,
+        half_close_cap: Option<std::time::Duration>,
+        backend_read_timeout: Option<std::time::Duration>,
+        backend_write_timeout: Option<std::time::Duration>,
+        buf_size: usize,
+    ) -> StreamCopyResult
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        crate::proxy::tcp_proxy::bidirectional_copy_for_test_with_timeouts(
+            client,
+            backend,
+            idle_timeout,
+            half_close_cap,
+            backend_read_timeout,
+            backend_write_timeout,
+            buf_size,
+        )
+        .await
+    }
+
     /// Invoke the internal `bidirectional_splice` (Linux zero-copy relay) for
     /// unit tests. Only available on Linux — on other platforms there is no
     /// splice path to exercise.

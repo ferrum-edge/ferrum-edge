@@ -37,7 +37,10 @@ static_resources:
         name: envoy.transport_sockets.tls
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-          common_tls_context: {}
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: CA_PATH
       load_assignment:
         cluster_name: backend_tcp
         endpoints:

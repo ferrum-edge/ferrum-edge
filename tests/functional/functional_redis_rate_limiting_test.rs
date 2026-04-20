@@ -18,13 +18,11 @@
 //!
 //! Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
-use chrono::Utc;
+use crate::common::TestGateway;
+
 use futures_util::{SinkExt, StreamExt};
-use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime};
-use tempfile::TempDir;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use uuid::Uuid;
@@ -112,109 +110,25 @@ async fn delete_redis_keys_by_prefix(prefix: &str) {
 // ============================================================================
 
 struct RedisRateLimitHarness {
-    _temp_dir: TempDir,
-    gateway_process: Option<Child>,
+    _gw: TestGateway,
     proxy_base_url: String,
     admin_base_url: String,
-    jwt_secret: String,
-    jwt_issuer: String,
 }
 
 impl RedisRateLimitHarness {
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match Self::try_new().await {
-                Ok(harness) => return Ok(harness),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Harness startup attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to create harness after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    async fn try_new() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-redis-rl-jwt-secret-1234567890".to_string();
-        let jwt_issuer = "ferrum-edge-redis-rl-test".to_string();
-
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
-        let db_url = format!(
-            "sqlite:{}?mode=rwc",
-            temp_dir.path().join("test_redis_rl.db").to_string_lossy()
-        );
-
-        // Start gateway (SQLite with ?mode=rwc auto-creates the database)
-        let binary_path = gateway_binary_path();
-        let gateway_process = Command::new(binary_path)
-            .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
-            .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", &db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2")
-            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "debug")
+    async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let gw = TestGateway::builder()
+            .jwt_secret("test-redis-rl-jwt-secret-1234567890")
+            .jwt_issuer("ferrum-edge-redis-rl-test")
+            .log_level("debug")
             .env("FERRUM_TRUSTED_PROXIES", "127.0.0.1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        let mut harness = Self {
-            _temp_dir: temp_dir,
-            gateway_process: Some(gateway_process),
-            proxy_base_url: format!("http://127.0.0.1:{}", proxy_port),
-            admin_base_url: format!("http://127.0.0.1:{}", admin_port),
-            jwt_secret,
-            jwt_issuer,
-        };
-
-        match harness.wait_for_health().await {
-            Ok(()) => Ok(harness),
-            Err(e) => {
-                if let Some(mut child) = harness.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway did not start within 30 seconds".into());
-            }
-            match reqwest::get(&health_url).await {
-                Ok(r) if r.status().is_success() => return Ok(()),
-                _ => sleep(Duration::from_millis(500)).await,
-            }
-        }
+            .spawn()
+            .await?;
+        Ok(Self {
+            proxy_base_url: gw.proxy_base_url.clone(),
+            admin_base_url: gw.admin_base_url.clone(),
+            _gw: gw,
+        })
     }
 
     /// Wait for the DB poll to pick up config changes by actively probing a route.
@@ -241,18 +155,7 @@ impl RedisRateLimitHarness {
     }
 
     fn generate_admin_token(&self) -> String {
-        let now = Utc::now();
-        let claims = json!({
-            "iss": self.jwt_issuer,
-            "sub": "test-admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
-            "jti": Uuid::new_v4().to_string()
-        });
-        let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
-        encode(&header, &claims, &key).expect("Failed to encode admin JWT")
+        self._gw.admin_token()
     }
 
     fn auth_header(&self) -> String {
@@ -315,25 +218,26 @@ impl RedisRateLimitHarness {
     }
 }
 
-impl Drop for RedisRateLimitHarness {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
 // ============================================================================
 // Helpers
 // ============================================================================
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
+async fn spawn_file_gateway(
+    config: String,
+    proxy_port: u16,
+    extra_env: Vec<(String, String)>,
+) -> TestGateway {
+    let mut builder = TestGateway::builder()
+        .mode_file(config)
+        .log_level("debug")
+        .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string());
+    for (key, value) in extra_env {
+        builder = builder.env(key, value);
     }
+    builder
+        .spawn()
+        .await
+        .expect("Failed to start gateway instance")
 }
 
 async fn start_header_echo_backend(
@@ -843,13 +747,8 @@ async fn test_ai_rate_limiter_redis_shared_across_instances() {
     let _backend = start_ai_backend(backend_port, 500).await.unwrap();
 
     let unique_prefix = format!("ferrum:test:ai:shared:{}", Uuid::new_v4().simple());
-    let temp_dir = TempDir::new().unwrap();
-
-    let start_instance = |instance_num: u16, proxy_port: u16, prefix: String| {
-        let config_path = temp_dir
-            .path()
-            .join(format!("ai_shared_config_{}.yaml", instance_num));
-        let config = format!(
+    let config = |prefix: &str| {
+        format!(
             r#"
 proxies:
   - id: "shared-ai-proxy"
@@ -877,19 +776,7 @@ plugin_configs:
       redis_url: "{REDIS_URL}"
       redis_key_prefix: "{prefix}"
 "#,
-        );
-        std::fs::write(&config_path, config).expect("Failed to write config");
-
-        Command::new(gateway_binary_path())
-            .env("FERRUM_MODE", "file")
-            .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
-            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-            .env("RUST_LOG", "ferrum_edge=debug")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to start gateway instance")
+        )
     };
 
     let port1 = {
@@ -905,33 +792,21 @@ plugin_configs:
         p
     };
 
-    let mut gw1 = start_instance(1, port1, unique_prefix.clone());
-    let mut gw2 = start_instance(2, port2, unique_prefix.clone());
-
-    sleep(Duration::from_secs(5)).await;
+    let mut gw1 = spawn_file_gateway(
+        config(&unique_prefix),
+        port1,
+        vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
+    )
+    .await;
+    let mut gw2 = spawn_file_gateway(
+        config(&unique_prefix),
+        port2,
+        vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
+    )
+    .await;
 
     let client = reqwest::Client::new();
     let request_body = r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#;
-
-    for port in [port1, port2] {
-        let deadline = SystemTime::now() + Duration::from_secs(10);
-        loop {
-            if SystemTime::now() >= deadline {
-                panic!("Gateway on port {} did not start", port);
-            }
-            match client
-                .get(format!(
-                    "http://127.0.0.1:{}/health-probe-nonexistent",
-                    port
-                ))
-                .send()
-                .await
-            {
-                Ok(_) => break,
-                Err(_) => sleep(Duration::from_millis(500)).await,
-            }
-        }
-    }
 
     flush_redis_db().await;
     sleep(Duration::from_millis(200)).await;
@@ -982,10 +857,8 @@ plugin_configs:
         "3rd shared AI request should be rejected after both instances consume 1000 tokens"
     );
 
-    let _ = gw1.kill();
-    let _ = gw1.wait();
-    let _ = gw2.kill();
-    let _ = gw2.wait();
+    gw1.shutdown();
+    gw2.shutdown();
     println!("test_ai_rate_limiter_redis_shared_across_instances PASSED");
 }
 
@@ -1020,8 +893,6 @@ async fn test_ws_rate_limiting_redis_centralized() {
 
     let unique_prefix = format!("ferrum:test:ws:{}", Uuid::new_v4().simple());
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
     let config = format!(
         r#"
 proxies:
@@ -1050,20 +921,12 @@ plugin_configs:
       redis_key_prefix: "{unique_prefix}"
 "#,
     );
-    std::fs::write(&config_path, config).expect("Failed to write config");
-
-    let mut gateway = Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
-        .env("FERRUM_PROXY_HTTP_PORT", gateway_port.to_string())
-        .env("RUST_LOG", "ferrum_edge=debug")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("Failed to start gateway");
-
-    sleep(Duration::from_secs(3)).await;
+    let mut gateway = spawn_file_gateway(
+        config,
+        gateway_port,
+        vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
+    )
+    .await;
 
     let url = format!("ws://127.0.0.1:{}/ws-redis", gateway_port);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
@@ -1122,8 +985,7 @@ plugin_configs:
         "Connection should have been closed by Redis-backed rate limiter"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_ws_rate_limiting_redis_centralized PASSED");
 }
@@ -1161,13 +1023,8 @@ async fn test_ws_rate_limiting_redis_namespaces_instance_connections() {
     sleep(Duration::from_millis(300)).await;
 
     let unique_prefix = format!("ferrum:test:ws-shared:{}", Uuid::new_v4().simple());
-    let temp_dir = TempDir::new().unwrap();
-
-    let start_instance = |instance_num: u16, proxy_port: u16, prefix: String| {
-        let config_path = temp_dir
-            .path()
-            .join(format!("ws_config_{}.yaml", instance_num));
-        let config = format!(
+    let config = |prefix: &str| {
+        format!(
             r#"
 proxies:
   - id: "ws-shared-redis-proxy"
@@ -1194,46 +1051,21 @@ plugin_configs:
       redis_url: "{REDIS_URL}"
       redis_key_prefix: "{prefix}"
 "#,
-        );
-        std::fs::write(&config_path, config).expect("Failed to write config");
-
-        Command::new(gateway_binary_path())
-            .env("FERRUM_MODE", "file")
-            .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
-            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-            .env("RUST_LOG", "ferrum_edge=debug")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to start gateway instance")
+        )
     };
 
-    let mut gw1 = start_instance(1, port1, unique_prefix.clone());
-    let mut gw2 = start_instance(2, port2, unique_prefix.clone());
-
-    sleep(Duration::from_secs(5)).await;
-
-    let http_client = reqwest::Client::new();
-    for port in [port1, port2] {
-        let deadline = SystemTime::now() + Duration::from_secs(10);
-        loop {
-            if SystemTime::now() >= deadline {
-                panic!("Gateway on port {} did not start", port);
-            }
-            match http_client
-                .get(format!(
-                    "http://127.0.0.1:{}/health-probe-nonexistent",
-                    port
-                ))
-                .send()
-                .await
-            {
-                Ok(_) => break,
-                Err(_) => sleep(Duration::from_millis(500)).await,
-            }
-        }
-    }
+    let mut gw1 = spawn_file_gateway(
+        config(&unique_prefix),
+        port1,
+        vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
+    )
+    .await;
+    let mut gw2 = spawn_file_gateway(
+        config(&unique_prefix),
+        port2,
+        vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
+    )
+    .await;
 
     flush_redis_db().await;
     sleep(Duration::from_millis(200)).await;
@@ -1277,10 +1109,8 @@ plugin_configs:
 
     let _ = ws1.close(None).await;
     let _ = ws2.close(None).await;
-    let _ = gw1.kill();
-    let _ = gw1.wait();
-    let _ = gw2.kill();
-    let _ = gw2.wait();
+    gw1.shutdown();
+    gw2.shutdown();
     echo_handle.abort();
     println!("test_ws_rate_limiting_redis_namespaces_instance_connections PASSED");
 }
@@ -1307,14 +1137,8 @@ async fn test_rate_limiting_redis_shared_across_instances() {
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
 
     let unique_prefix = format!("ferrum:test:shared:{}", Uuid::new_v4().simple());
-    let temp_dir = TempDir::new().unwrap();
-
-    // Helper to start a file-mode gateway with rate limiting
-    let start_instance = |instance_num: u16, proxy_port: u16, prefix: String| {
-        let config_path = temp_dir
-            .path()
-            .join(format!("config_{}.yaml", instance_num));
-        let config = format!(
+    let config = |prefix: &str| {
+        format!(
             r#"
 proxies:
   - id: "shared-rl-proxy"
@@ -1342,19 +1166,7 @@ plugin_configs:
       redis_url: "{REDIS_URL}"
       redis_key_prefix: "{prefix}"
 "#,
-        );
-        std::fs::write(&config_path, config).expect("Failed to write config");
-
-        Command::new(gateway_binary_path())
-            .env("FERRUM_MODE", "file")
-            .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
-            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-            .env("RUST_LOG", "ferrum_edge=debug")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to start gateway instance")
+        )
     };
 
     // Allocate ports for two gateway instances
@@ -1371,36 +1183,20 @@ plugin_configs:
         p
     };
 
-    let mut gw1 = start_instance(1, port1, unique_prefix.clone());
-    let mut gw2 = start_instance(2, port2, unique_prefix.clone());
-
-    // Wait for both gateways to start and load config
-    sleep(Duration::from_secs(5)).await;
+    let mut gw1 = spawn_file_gateway(
+        config(&unique_prefix),
+        port1,
+        vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
+    )
+    .await;
+    let mut gw2 = spawn_file_gateway(
+        config(&unique_prefix),
+        port2,
+        vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
+    )
+    .await;
 
     let client = reqwest::Client::new();
-
-    // Verify both gateways are serving the route by hitting a non-existent path
-    // (which returns 404 but proves the gateway is up and listening)
-    for port in [port1, port2] {
-        let deadline = SystemTime::now() + Duration::from_secs(10);
-        loop {
-            if SystemTime::now() >= deadline {
-                panic!("Gateway on port {} did not start", port);
-            }
-            match client
-                .get(format!(
-                    "http://127.0.0.1:{}/health-probe-nonexistent",
-                    port
-                ))
-                .send()
-                .await
-            {
-                // Any response (including 404) means the gateway is up
-                Ok(_) => break,
-                _ => sleep(Duration::from_millis(500)).await,
-            }
-        }
-    }
 
     // Flush Redis to start with clean counters (no warmup interference)
     flush_redis_db().await;
@@ -1460,10 +1256,8 @@ plugin_configs:
         "6th request (to GW2) should also be rate limited — shared Redis counter"
     );
 
-    let _ = gw1.kill();
-    let _ = gw1.wait();
-    let _ = gw2.kill();
-    let _ = gw2.wait();
+    gw1.shutdown();
+    gw2.shutdown();
     println!("test_rate_limiting_redis_shared_across_instances PASSED");
 }
 
@@ -1488,20 +1282,14 @@ async fn test_rate_limiting_redis_namespace_key_prefix_isolation() {
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
 
-    let temp_dir = TempDir::new().unwrap();
-
     // Distinct namespaces per run so a reused Redis DB can't leak between
     // test invocations.
     let ns_run = Uuid::new_v4().simple().to_string();
     let ns_a = format!("nsiso-a-{}", ns_run);
     let ns_b = format!("nsiso-b-{}", ns_run);
 
-    let start_instance = |instance_num: u16, proxy_port: u16, namespace: String| {
-        let config_path = temp_dir
-            .path()
-            .join(format!("ns_iso_config_{}.yaml", instance_num));
-        // No redis_key_prefix → uses plugin default `{namespace}:rate_limiting`.
-        let config = format!(
+    let config = |namespace: &str| {
+        format!(
             r#"
 proxies:
   - id: "ns-iso-proxy"
@@ -1530,20 +1318,7 @@ plugin_configs:
       sync_mode: "redis"
       redis_url: "{REDIS_URL}"
 "#
-        );
-        std::fs::write(&config_path, config).expect("write ns_iso config");
-
-        Command::new(gateway_binary_path())
-            .env("FERRUM_MODE", "file")
-            .env("FERRUM_NAMESPACE", &namespace)
-            .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
-            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-            .env("RUST_LOG", "error")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn gateway")
+        )
     };
 
     // Ephemeral ports for both gateways.
@@ -1560,33 +1335,26 @@ plugin_configs:
         p
     };
 
-    let mut gw_a = start_instance(1, port_a, ns_a.clone());
-    let mut gw_b = start_instance(2, port_b, ns_b.clone());
-
-    sleep(Duration::from_secs(5)).await;
+    let mut gw_a = spawn_file_gateway(
+        config(&ns_a),
+        port_a,
+        vec![
+            ("FERRUM_NAMESPACE".to_string(), ns_a.clone()),
+            ("RUST_LOG".to_string(), "error".to_string()),
+        ],
+    )
+    .await;
+    let mut gw_b = spawn_file_gateway(
+        config(&ns_b),
+        port_b,
+        vec![
+            ("FERRUM_NAMESPACE".to_string(), ns_b.clone()),
+            ("RUST_LOG".to_string(), "error".to_string()),
+        ],
+    )
+    .await;
 
     let client = reqwest::Client::new();
-
-    // Readiness probe — any HTTP response means the gateway is listening.
-    for port in [port_a, port_b] {
-        let deadline = SystemTime::now() + Duration::from_secs(10);
-        loop {
-            if SystemTime::now() >= deadline {
-                let _ = gw_a.kill();
-                let _ = gw_b.kill();
-                panic!("Gateway on port {} did not start", port);
-            }
-            if client
-                .get(format!("http://127.0.0.1:{}/health-probe", port))
-                .send()
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            sleep(Duration::from_millis(500)).await;
-        }
-    }
 
     // Burn gateway A's budget (max_requests=2).
     for i in 1..=2 {
@@ -1638,9 +1406,7 @@ plugin_configs:
     delete_redis_keys_by_prefix(&format!("{}:rate_limiting", ns_a)).await;
     delete_redis_keys_by_prefix(&format!("{}:rate_limiting", ns_b)).await;
 
-    let _ = gw_a.kill();
-    let _ = gw_a.wait();
-    let _ = gw_b.kill();
-    let _ = gw_b.wait();
+    gw_a.shutdown();
+    gw_b.shutdown();
     println!("test_rate_limiting_redis_namespace_key_prefix_isolation PASSED");
 }

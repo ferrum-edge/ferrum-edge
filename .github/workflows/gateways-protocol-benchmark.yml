@@ -18,7 +18,10 @@
 #                                                               Tyk/KrakenD: no HTTP/3 at all)
 #   grpcs     : ferrum, envoy, kong, tyk                       (KrakenD CE: no gRPC)
 #   wss       : ferrum, envoy, kong, tyk                       (KrakenD CE: no WebSockets)
-#   tcp-tls   : ferrum, envoy, kong, tyk                       (KrakenD: no raw TCP)
+#   tcp-tls   : ferrum, envoy, kong                            (KrakenD: no raw TCP;
+#                                                               Tyk OSS v5.3: per-API `listen_port`
+#                                                               + `protocol: tls` rejected with
+#                                                               "trying to open disabled port")
 #   udp       : ferrum, envoy, kong                            (Tyk/KrakenD: no UDP)
 #   udp-dtls  : ferrum                                         (only Ferrum; direct backend baseline)
 
@@ -191,7 +194,7 @@ jobs:
             wss)       all="ferrum envoy kong tyk" ;;
             grpcs)     all="ferrum envoy kong tyk" ;;
             http3)     all="ferrum envoy" ;;
-            tcp-tls)   all="ferrum envoy kong tyk" ;;
+            tcp-tls)   all="ferrum envoy kong" ;;
             udp)       all="ferrum envoy kong" ;;
             udp-dtls)  all="ferrum" ;;
           esac

@@ -10,6 +10,7 @@
 //! Run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_mtls --ignored --nocapture
 
+use crate::common::TestGateway;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use std::io::Write;
 use std::sync::Arc;
@@ -195,54 +196,10 @@ async fn start_tcp_echo_on(listener: TcpListener) -> tokio::task::JoinHandle<()>
 // Gateway Helpers
 // ============================================================================
 
-fn gw_bin() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
-fn start_gw(cfg: &str, http_port: u16, envs: &[(&str, &str)]) -> std::process::Child {
-    let mut cmd = std::process::Command::new(gw_bin());
-    cmd.env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", cfg)
-        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("RUST_LOG", "ferrum_gateway=debug")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
-    cmd.spawn().expect("spawn gateway")
-}
-
 /// Allocate an ephemeral port by binding to port 0 and returning the assigned port.
 async fn alloc_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     l.local_addr().unwrap().port()
-}
-
-/// Wait for the gateway to become healthy by polling the admin HTTP health endpoint.
-/// Returns true if healthy within the timeout, false otherwise.
-async fn wait_for_gateway(admin_http_port: u16) -> bool {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
-    for _ in 0..30 {
-        if let Ok(resp) = client
-            .get(format!("http://127.0.0.1:{}/health", admin_http_port))
-            .send()
-            .await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-    false
 }
 
 /// Port set returned by the retry wrapper. Fields are Option so tests can
@@ -266,7 +223,7 @@ async fn start_gateway_with_retry<F, G>(
     cfg_path: &std::path::Path,
     build_config: F,
     build_envs: G,
-) -> (std::process::Child, GatewayPorts)
+) -> (TestGateway, GatewayPorts)
 where
     F: Fn(&GatewayPorts) -> String,
     G: Fn(&GatewayPorts) -> Vec<(String, String)>,
@@ -286,29 +243,28 @@ where
         let config_content = build_config(&ports);
         write_cfg(cfg_path, &config_content);
 
-        // Build env vec
-        let extra_envs = build_envs(&ports);
-        let env_refs: Vec<(&str, &str)> = extra_envs
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        let mut child = start_gw(cfg_path.to_str().unwrap(), ports.proxy_http, &env_refs);
-
-        if wait_for_gateway(ports.admin_http).await {
-            return (child, ports);
+        let mut builder = TestGateway::builder()
+            .mode_file(config_content)
+            // The outer loop rewrites the config and allocates fresh ports,
+            // so each harness attempt intentionally gets one gateway spawn.
+            .max_attempts(1)
+            .capture_output()
+            .env("FERRUM_PROXY_HTTP_PORT", ports.proxy_http.to_string())
+            .env("RUST_LOG", "ferrum_gateway=debug");
+        for (key, value) in build_envs(&ports) {
+            builder = builder.env(key, value);
         }
 
-        last_err = format!(
-            "gateway did not become healthy (proxy_http={}, admin_http={})",
-            ports.proxy_http, ports.admin_http
-        );
-        eprintln!(
-            "Gateway startup attempt {}/{} failed: {}",
-            attempt, MAX_ATTEMPTS, last_err
-        );
-        let _ = child.kill();
-        let _ = child.wait();
+        match builder.spawn().await {
+            Ok(gw) => return (gw, ports),
+            Err(e) => {
+                last_err = e.to_string();
+                eprintln!(
+                    "Gateway startup attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, last_err
+                );
+            }
+        }
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
         }
@@ -446,8 +402,7 @@ plugin_configs: []
         .await
         .expect("valid client cert should succeed");
     assert_eq!(r.status().as_u16(), 200);
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -513,8 +468,7 @@ plugin_configs: []
         .send()
         .await;
     assert!(r.is_err(), "no client cert → rejected");
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -582,8 +536,7 @@ plugin_configs: []
         .send()
         .await;
     assert!(r.is_err(), "wrong CA cert → rejected");
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -649,8 +602,7 @@ plugin_configs: []
         .await
         .expect("trusted backend should succeed");
     assert_eq!(r.status().as_u16(), 200);
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -717,8 +669,7 @@ plugin_configs: []
         .await
         .expect("should return 502, not hang");
     assert_eq!(r.status().as_u16(), 502);
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -790,8 +741,7 @@ plugin_configs: []
         .await
         .expect("gateway with client cert should reach mTLS backend");
     assert_eq!(r.status().as_u16(), 200);
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -858,8 +808,7 @@ plugin_configs: []
         .await
         .expect("should return 502, not hang");
     assert_eq!(r.status().as_u16(), 502);
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -931,8 +880,7 @@ plugin_configs: []
         .await
         .expect("global mTLS cert should work");
     assert_eq!(r.status().as_u16(), 200);
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -1000,8 +948,7 @@ plugin_configs: []
         .await
         .expect("admin mTLS with valid cert should succeed");
     assert_eq!(r.status().as_u16(), 200);
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -1067,8 +1014,7 @@ plugin_configs: []
         .send()
         .await;
     assert!(r.is_err(), "no client cert → admin rejected");
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -1157,8 +1103,7 @@ plugin_configs: []
         .unwrap()
         .unwrap();
     assert_eq!(&buf[..n], b"Hello TCP mTLS!");
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -1243,8 +1188,7 @@ plugin_configs: []
             }
         }
     }
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -1310,7 +1254,6 @@ plugin_configs: []
         .await
         .expect("global CA bundle should work");
     assert_eq!(r.status().as_u16(), 200);
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }

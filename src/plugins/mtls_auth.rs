@@ -12,12 +12,14 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::debug;
 use x509_parser::prelude::*;
 
 use crate::consumer_index::ConsumerIndex;
 
-use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
+use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::{PluginResult, RequestContext, StreamConnectionContext};
 
 /// Supported certificate fields for consumer identity matching.
 #[derive(Debug, Clone)]
@@ -264,11 +266,12 @@ impl MtlsAuth {
         Ok(())
     }
 
-    /// Extract the configured field value from a DER-encoded X.509 certificate.
-    fn extract_cert_identity(&self, der_bytes: &[u8]) -> Result<String, String> {
-        let (_, cert) = X509Certificate::from_der(der_bytes)
-            .map_err(|e| format!("Failed to parse client certificate: {}", e))?;
-
+    /// Extract the configured field value from a parsed X.509 certificate.
+    fn extract_cert_identity(
+        &self,
+        cert: &X509Certificate<'_>,
+        der_bytes: &[u8],
+    ) -> Result<String, String> {
         match &self.cert_field {
             CertField::SubjectCn => {
                 let cn = cert
@@ -349,22 +352,17 @@ impl MtlsAuth {
         }
     }
 
-    fn authenticate_consumer(
+    fn verify_client_cert(
         &self,
         cert_der: &[u8],
         chain_der: Option<&[Vec<u8>]>,
         consumer_index: &ConsumerIndex,
-    ) -> Result<std::sync::Arc<crate::config::types::Consumer>, PluginResult> {
-        // Parse the certificate once for both issuer verification and identity extraction.
+    ) -> VerifyOutcome {
         let (_, parsed_cert) = match X509Certificate::from_der(cert_der) {
-            Ok(result) => result,
+            Ok(parsed) => parsed,
             Err(e) => {
                 debug!("mtls_auth: failed to parse certificate: {}", e);
-                return Err(PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid client certificate"}"#.into(),
-                    headers: HashMap::new(),
-                });
+                return VerifyOutcome::Invalid(r#"{"error":"Invalid client certificate"}"#.into());
             }
         };
 
@@ -372,86 +370,69 @@ impl MtlsAuth {
             && let Err(reason) = self.verify_issuer_constraints(&parsed_cert, chain_der)
         {
             debug!("mtls_auth: issuer constraint failed: {}", reason);
-            return Err(PluginResult::Reject {
-                status_code: 403,
-                body: serde_json::json!({ "error": reason }).to_string(),
-                headers: HashMap::new(),
-            });
+            return VerifyOutcome::Forbidden(serde_json::json!({ "error": reason }).to_string());
         }
 
-        let identity = match self.extract_cert_identity(cert_der) {
+        let identity = match self.extract_cert_identity(&parsed_cert, cert_der) {
             Ok(id) => id,
             Err(e) => {
                 debug!("mtls_auth: failed to extract identity: {}", e);
-                return Err(PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid client certificate"}"#.into(),
-                    headers: HashMap::new(),
-                });
+                return VerifyOutcome::Invalid(r#"{"error":"Invalid client certificate"}"#.into());
             }
         };
 
         match consumer_index.find_by_mtls_identity(&identity) {
-            Some(consumer) => Ok(consumer),
-            None => Err(PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"No consumer found for client certificate"}"#.into(),
-                headers: HashMap::new(),
-            }),
+            Some(consumer) => VerifyOutcome::consumer(consumer),
+            None => VerifyOutcome::ConsumerNotFound(
+                r#"{"error":"No consumer found for client certificate"}"#.into(),
+            ),
         }
     }
 }
 
 #[async_trait]
-impl Plugin for MtlsAuth {
-    fn name(&self) -> &str {
+impl AuthMechanism for MtlsAuth {
+    fn mechanism_name(&self) -> &str {
         "mtls_auth"
     }
 
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
-    fn priority(&self) -> u16 {
-        super::priority::MTLS_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_AND_STREAM_PROTOCOLS
-    }
-
-    async fn authenticate(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        let cert_der = match &ctx.tls_client_cert_der {
-            Some(der) => der,
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"No client certificate presented"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        match self.authenticate_consumer(
-            cert_der,
-            ctx.tls_client_cert_chain_der.as_ref().map(|c| c.as_slice()),
-            consumer_index,
-        ) {
-            Ok(consumer) => {
-                if ctx.identified_consumer.is_none() {
-                    debug!("mtls_auth: identified consumer '{}'", consumer.username);
-                    ctx.identified_consumer = Some(consumer);
-                }
-                PluginResult::Continue
-            }
-            Err(reject) => reject,
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        match &ctx.tls_client_cert_der {
+            Some(der_bytes) => ExtractedCredential::MtlsCert {
+                der_bytes: Arc::clone(der_bytes),
+                chain_der: ctx.tls_client_cert_chain_der.clone(),
+            },
+            None => ExtractedCredential::Missing,
         }
     }
 
+    async fn verify(
+        &self,
+        credential: ExtractedCredential,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        let ExtractedCredential::MtlsCert {
+            der_bytes,
+            chain_der,
+        } = credential
+        else {
+            return VerifyOutcome::NotApplicable;
+        };
+
+        self.verify_client_cert(
+            der_bytes.as_slice(),
+            chain_der.as_ref().map(|chain| chain.as_slice()),
+            consumer_index,
+        )
+    }
+}
+
+auth_flow::impl_auth_plugin!(
+    MtlsAuth,
+    "mtls_auth",
+    super::priority::MTLS_AUTH,
+    crate::plugins::HTTP_FAMILY_AND_STREAM_PROTOCOLS,
+    auth_flow::run_auth;
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let cert_der = match &ctx.tls_client_cert_der {
             Some(der) => der,
@@ -464,12 +445,15 @@ impl Plugin for MtlsAuth {
             }
         };
 
-        match self.authenticate_consumer(
-            cert_der,
+        match self.verify_client_cert(
+            cert_der.as_slice(),
             ctx.tls_client_cert_chain_der.as_ref().map(|c| c.as_slice()),
             ctx.consumer_index.as_ref(),
         ) {
-            Ok(consumer) => {
+            VerifyOutcome::Success {
+                consumer: Some(consumer),
+                ..
+            } => {
                 if ctx.identified_consumer.is_none() {
                     debug!(
                         "mtls_auth: identified stream consumer '{}'",
@@ -480,7 +464,30 @@ impl Plugin for MtlsAuth {
                 }
                 PluginResult::Continue
             }
-            Err(reject) => reject,
+            VerifyOutcome::NotApplicable => PluginResult::Continue,
+            VerifyOutcome::Forbidden(body) => PluginResult::Reject {
+                status_code: 403,
+                body,
+                headers: HashMap::new(),
+            },
+            VerifyOutcome::Internal(body) => PluginResult::Reject {
+                status_code: 500,
+                body,
+                headers: HashMap::new(),
+            },
+            VerifyOutcome::Invalid(body)
+            | VerifyOutcome::InvalidFormat(body)
+            | VerifyOutcome::ConsumerNotFound(body)
+            | VerifyOutcome::VerificationFailed(body) => PluginResult::Reject {
+                status_code: 401,
+                body,
+                headers: HashMap::new(),
+            },
+            VerifyOutcome::Success { consumer: None, .. } => PluginResult::Reject {
+                status_code: 401,
+                body: r#"{"error":"No consumer found for client certificate"}"#.into(),
+                headers: HashMap::new(),
+            },
         }
     }
-}
+);

@@ -241,7 +241,10 @@ async fn test_jwks_auth_missing_bearer_token() {
 
     let mut ctx = make_ctx();
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_none());
+    assert!(ctx.authenticated_identity.is_none());
+    assert!(ctx.authenticated_identity_header.is_none());
 }
 
 #[tokio::test]

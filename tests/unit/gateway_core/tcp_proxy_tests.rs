@@ -1,5 +1,6 @@
 use ferrum_edge::_test_support::{
-    StreamIoSide, bidirectional_copy_for_test, classify_stream_error, disconnect_cause_for_failure,
+    StreamIoSide, bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts,
+    classify_stream_error, disconnect_cause_for_failure,
 };
 use ferrum_edge::plugins::{Direction, DisconnectCause};
 use ferrum_edge::retry::ErrorClass;
@@ -718,4 +719,208 @@ fn test_disconnect_cause_missing_side_falls_back_to_recv_error() {
         ),
         DisconnectCause::RecvError,
     );
+}
+
+// ── backend_read_timeout / backend_write_timeout tests ──────────────────────
+
+/// Stream that accepts writes but never produces a read — `poll_read` always
+/// returns `Pending`. Used to simulate a silent peer that holds the TCP
+/// connection open without sending any bytes.
+struct NeverReadStream;
+
+impl AsyncRead for NeverReadStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for NeverReadStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Stream that produces bytes forever on read (one payload per call) but
+/// never completes a write — `poll_write` always returns `Pending`. Used to
+/// simulate a peer whose TCP send buffer is stuck (we're writing to them,
+/// they're not draining).
+struct NeverWriteStream;
+
+impl AsyncRead for NeverWriteStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let n = buf.remaining().min(1024);
+        buf.initialize_unfilled_to(n);
+        buf.advance(n);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for NeverWriteStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Pending
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// backend_read_timeout fires when the backend stops producing bytes — even
+/// with idle_timeout disabled. This is the raw `timeout server` semantic
+/// that HAProxy/nginx expose; maps the `backend_read_timeout_ms` config
+/// field onto TCP streams. `first_failure` must be attributed to
+/// `BackendToClient` (the b2c direction reads from backend), with
+/// `ReadWriteTimeout` class so downstream logging surfaces an
+/// `IdleTimeout` disconnect cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_backend_read_timeout_fires_on_silent_backend() {
+    // Client: silent but alive (emulates the classic wedge — both peers
+    // happy to wait forever). Backend: never produces bytes.
+    let client = NeverReadStream;
+    let backend = NeverReadStream;
+
+    let start = std::time::Instant::now();
+    let result = bidirectional_copy_for_test_with_timeouts(
+        client,
+        backend,
+        None,                             // idle_timeout disabled
+        None,                             // half_close_cap disabled
+        Some(Duration::from_millis(200)), // backend_read_timeout
+        None,                             // backend_write_timeout
+        8 * 1024,
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "backend_read_timeout must fire promptly; elapsed = {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "backend_read_timeout should not fire before the configured duration; elapsed = {:?}",
+        elapsed
+    );
+
+    let (dir, class, side, msg) = result
+        .first_failure
+        .as_ref()
+        .expect("backend_read_timeout must produce first_failure");
+    assert_eq!(
+        *dir,
+        Direction::BackendToClient,
+        "b2c direction reads from backend — timeout should be attributed there"
+    );
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert_eq!(*side, Some(StreamIoSide::Read));
+    assert!(
+        msg.contains("read timeout"),
+        "failure message should reflect a read timeout, got: {}",
+        msg
+    );
+    assert_eq!(
+        disconnect_cause_for_failure(*dir, class, *side),
+        DisconnectCause::IdleTimeout,
+        "ReadWriteTimeout class should map to IdleTimeout disconnect cause"
+    );
+}
+
+/// backend_write_timeout fires when the backend's socket send buffer stops
+/// draining (we're writing, they're not reading). Attributed to
+/// `ClientToBackend` (c2b direction writes to backend) on the write side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_backend_write_timeout_fires_on_stuck_backend() {
+    // Client: produces bytes forever. Backend: accepts no writes (send
+    // buffer permanently stuck) but is silent on reads.
+    let client = NeverWriteStream;
+    let backend = NeverWriteStream;
+
+    let start = std::time::Instant::now();
+    let result = bidirectional_copy_for_test_with_timeouts(
+        client,
+        backend,
+        None,
+        None,
+        None,                             // backend_read_timeout
+        Some(Duration::from_millis(200)), // backend_write_timeout
+        8 * 1024,
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "backend_write_timeout must fire promptly; elapsed = {:?}",
+        elapsed
+    );
+
+    let (dir, class, side, msg) = result
+        .first_failure
+        .as_ref()
+        .expect("backend_write_timeout must produce first_failure");
+    assert_eq!(
+        *dir,
+        Direction::ClientToBackend,
+        "c2b direction writes to backend — write timeout should be attributed there"
+    );
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert_eq!(*side, Some(StreamIoSide::Write));
+    assert!(
+        msg.contains("write timeout"),
+        "failure message should reflect a write timeout, got: {}",
+        msg
+    );
+}
+
+/// When backend timeouts are enabled but no traffic flows, the read timeout
+/// (applied to the b2c direction) fires before the write timeout — because
+/// the c2b direction needs bytes from the client to attempt a backend write.
+/// With a silent client+backend, only b2c's backend read is actively
+/// waiting. This anchors the directional routing: backend_read_timeout →
+/// b2c read; backend_write_timeout → c2b write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_backend_read_timeout_only_applies_to_backend_side() {
+    let client = NeverReadStream;
+    let backend = NeverReadStream;
+
+    let result = bidirectional_copy_for_test_with_timeouts(
+        client,
+        backend,
+        None,
+        None,
+        Some(Duration::from_millis(200)), // backend_read: fires
+        Some(Duration::from_secs(60)),    // backend_write: long (should NOT fire)
+        8 * 1024,
+    )
+    .await;
+
+    let (dir, class, side, _) = result.first_failure.as_ref().unwrap();
+    assert_eq!(*dir, Direction::BackendToClient);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert_eq!(*side, Some(StreamIoSide::Read));
 }

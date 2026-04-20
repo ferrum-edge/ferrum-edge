@@ -11,181 +11,63 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_credential_rotation
 
+use crate::common::TestGateway;
 use base64::Engine;
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use sha2::Sha256;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime};
-use tempfile::TempDir;
-use uuid::Uuid;
+use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
 
 // ============================================================================
-// Test Harness
+// Test Harness — thin wrapper around TestGateway. Subprocess lifecycle, retry,
+// health polling, and JWT minting live in TestGateway; this struct just
+// pairs the gateway with its rotation-specific backend echo server and
+// exposes the URL fields tests reference directly.
 // ============================================================================
 
 struct RotationTestHarness {
-    _temp_dir: TempDir,
-    gateway_process: Option<Child>,
+    gw: TestGateway,
     proxy_base_url: String,
     admin_base_url: String,
-    jwt_secret: String,
-    jwt_issuer: String,
     backend_port: u16,
     _backend_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RotationTestHarness {
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // Retry harness creation up to 3 times to handle ephemeral port races.
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match Self::try_new().await {
-                Ok(harness) => return Ok(harness),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Harness startup attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to create harness after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    async fn try_new() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-admin-rotation-jwt-secret-key-1234567890".to_string();
-        let jwt_issuer = "ferrum-edge-rotation-test".to_string();
-
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
-        // Backend echo server — hold the listener and pass it to the echo task
-        // to avoid the drop-and-rebind race on the backend port.
+    async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Backend echo server — hold the listener and pass it to the echo
+        // task to avoid the drop-and-rebind race on the backend port.
         let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let backend_port = backend_listener.local_addr()?.port();
         let backend_handle = start_echo_backend_on(backend_listener);
 
-        let db_url = format!(
-            "sqlite:{}?mode=rwc",
-            temp_dir.path().join("test.db").to_string_lossy()
-        );
-
-        let build_status = Command::new("cargo")
-            .args(["build", "--bin", "ferrum-edge"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !build_status.success() {
-            return Err("Failed to build ferrum-edge".into());
-        }
-
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-            "./target/debug/ferrum-edge"
-        } else {
-            "./target/release/ferrum-edge"
-        };
-
-        let child = Command::new(binary_path)
-            .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
-            .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", &db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2")
-            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "info")
+        let gw = TestGateway::builder()
+            .log_level("info")
             .env("FERRUM_MAX_CREDENTIALS_PER_TYPE", "2")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .spawn()
+            .await?;
 
-        let proxy_base_url = format!("http://127.0.0.1:{}", proxy_port);
-        let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
-
-        let mut harness = Self {
-            _temp_dir: temp_dir,
-            gateway_process: Some(child),
-            proxy_base_url,
-            admin_base_url,
-            jwt_secret,
-            jwt_issuer,
+        Ok(Self {
+            proxy_base_url: gw.proxy_base_url.clone(),
+            admin_base_url: gw.admin_base_url.clone(),
+            gw,
             backend_port,
             _backend_handle: Some(backend_handle),
-        };
-
-        match harness.wait_for_health().await {
-            Ok(()) => Ok(harness),
-            Err(e) => {
-                if let Some(mut child) = harness.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway did not start within 30 seconds".into());
-            }
-            match reqwest::get(&health_url).await {
-                Ok(r) if r.status().is_success() => return Ok(()),
-                _ => tokio::time::sleep(Duration::from_millis(500)).await,
-            }
-        }
+        })
     }
 
     fn admin_auth_header(&self) -> String {
-        let now = Utc::now();
-        let claims = json!({
-            "iss": self.jwt_issuer,
-            "sub": "test-admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
-            "jti": Uuid::new_v4().to_string()
-        });
-        let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
-        let token = encode(&header, &claims, &key).unwrap();
-        format!("Bearer {}", token)
+        self.gw.auth_header()
     }
 }
 
-impl Drop for RotationTestHarness {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
+// Drop impl omitted: `self.gw` (TestGateway) kills the gateway subprocess on
+// drop; the backend task is aborted when its JoinHandle is dropped via
+// `_backend_handle`.
 
 /// Echo backend that always returns 200 JSON. Accepts a pre-bound listener to
 /// avoid same-process port races.

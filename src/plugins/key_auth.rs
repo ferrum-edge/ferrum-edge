@@ -10,12 +10,11 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
-use tracing::debug;
 
 use crate::consumer_index::ConsumerIndex;
 
-use super::{Plugin, PluginResult, RequestContext};
+use super::RequestContext;
+use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 
 pub struct KeyAuth {
     /// Pre-lowercased header name for header-based key extraction.
@@ -72,37 +71,25 @@ impl KeyAuth {
 }
 
 #[async_trait]
-impl Plugin for KeyAuth {
-    fn name(&self) -> &str {
+impl AuthMechanism for KeyAuth {
+    fn mechanism_name(&self) -> &str {
         "key_auth"
     }
 
-    fn is_auth_plugin(&self) -> bool {
-        true
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        match self.extract_key(ctx) {
+            Some(key) => ExtractedCredential::ApiKey(key),
+            None => ExtractedCredential::Missing,
+        }
     }
 
-    fn priority(&self) -> u16 {
-        super::priority::KEY_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
-    }
-
-    async fn authenticate(
+    async fn verify(
         &self,
-        ctx: &mut RequestContext,
+        credential: ExtractedCredential,
         consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        let api_key = match self.extract_key(ctx) {
-            Some(k) => k,
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Missing API key"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
+    ) -> VerifyOutcome {
+        let ExtractedCredential::ApiKey(api_key) = credential else {
+            return VerifyOutcome::NotApplicable;
         };
 
         // Reject empty / whitespace-only keys before hitting the index. This
@@ -110,26 +97,20 @@ impl Plugin for KeyAuth {
         // accidentally matching every request that sends a blank header, and
         // gives clients a clearer error than a generic "Invalid API key".
         if api_key.trim().is_empty() {
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Missing API key"}"#.into(),
-                headers: HashMap::new(),
-            };
+            return VerifyOutcome::Invalid(r#"{"error":"Missing API key"}"#.into());
         }
 
-        // O(1) lookup by API key via ConsumerIndex
-        if let Some(consumer) = consumer_index.find_by_api_key(&api_key) {
-            if ctx.identified_consumer.is_none() {
-                debug!("key_auth: identified consumer '{}'", consumer.username);
-                ctx.identified_consumer = Some(consumer);
-            }
-            return PluginResult::Continue;
-        }
-
-        PluginResult::Reject {
-            status_code: 401,
-            body: r#"{"error":"Invalid API key"}"#.into(),
-            headers: HashMap::new(),
+        match consumer_index.find_by_api_key(&api_key) {
+            Some(consumer) => VerifyOutcome::consumer(consumer),
+            None => VerifyOutcome::ConsumerNotFound(r#"{"error":"Invalid API key"}"#.into()),
         }
     }
 }
+
+auth_flow::impl_auth_plugin!(
+    KeyAuth,
+    "key_auth",
+    super::priority::KEY_AUTH,
+    crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    auth_flow::run_auth
+);

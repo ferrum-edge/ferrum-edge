@@ -11,210 +11,19 @@
 //!   cargo build --bin ferrum-edge
 //!   cargo test --test functional_tests -- --ignored functional_admin_observability --nocapture
 
-use chrono::Utc;
-use jsonwebtoken::{EncodingKey, Header, encode};
+use crate::common::TestGateway;
 use serde_json::json;
-use std::io::Write;
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
-use tempfile::TempDir;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
-use uuid::Uuid;
 
 // ============================================================================
-// DB-mode harness (reused from functional_admin_operations_test.rs conventions)
+// File-mode slow backend (specific to the /overload 503 test — simulates a
+// backend slow enough to pin FERRUM_MAX_REQUESTS above the critical threshold).
 // ============================================================================
-
-struct AdminTestHarness {
-    _temp_dir: TempDir,
-    gateway_process: Option<Child>,
-    admin_base_url: String,
-    jwt_secret: String,
-    jwt_issuer: String,
-}
-
-impl AdminTestHarness {
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // Retry harness creation up to 3 times (ephemeral port races — see CLAUDE.md).
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match Self::try_new(None).await {
-                Ok(harness) => return Ok(harness),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Harness startup attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to create harness after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    /// Create a harness with a custom restore body-size limit (MiB).
-    async fn new_with_restore_limit(mib: u32) -> Result<Self, Box<dyn std::error::Error>> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match Self::try_new(Some(mib)).await {
-                Ok(harness) => return Ok(harness),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Harness (restore limit={}MiB) startup attempt {}/{} failed: {}",
-                        mib, attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to create harness (restore limit) after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    async fn try_new(restore_max_mib: Option<u32>) -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-admin-observability-jwt-secret-1234567890".to_string();
-        let jwt_issuer = "ferrum-edge-admin-obs-test".to_string();
-
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
-        let db_url = format!(
-            "sqlite:{}?mode=rwc",
-            temp_dir.path().join("test.db").to_string_lossy()
-        );
-
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-            "./target/debug/ferrum-edge"
-        } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-            "./target/release/ferrum-edge"
-        } else {
-            return Err(
-                "ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.".into(),
-            );
-        };
-
-        let mut cmd = Command::new(binary_path);
-        cmd.env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
-            .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", &db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2")
-            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "warn")
-            .env("FERRUM_POOL_WARMUP_ENABLED", "false");
-
-        if let Some(mib) = restore_max_mib {
-            cmd.env("FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB", mib.to_string());
-        }
-
-        let child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
-
-        let mut harness = Self {
-            _temp_dir: temp_dir,
-            gateway_process: Some(child),
-            admin_base_url,
-            jwt_secret,
-            jwt_issuer,
-        };
-
-        match harness.wait_for_health().await {
-            Ok(()) => Ok(harness),
-            Err(e) => {
-                if let Some(mut child) = harness.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway did not start within 30 seconds".into());
-            }
-            match reqwest::get(&health_url).await {
-                Ok(r) if r.status().is_success() => return Ok(()),
-                _ => tokio::time::sleep(Duration::from_millis(500)).await,
-            }
-        }
-    }
-
-    fn auth_header(&self) -> String {
-        let now = Utc::now();
-        let claims = json!({
-            "iss": self.jwt_issuer,
-            "sub": "test-admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
-            "jti": Uuid::new_v4().to_string()
-        });
-        let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
-        let token = encode(&header, &claims, &key).unwrap();
-        format!("Bearer {}", token)
-    }
-}
-
-impl Drop for AdminTestHarness {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-// ============================================================================
-// File-mode harness (slow backend, tight request cap — for /overload 503 test)
-// ============================================================================
-
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        "./target/release/ferrum-edge"
-    } else {
-        panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
-    }
-}
 
 /// Start a minimal HTTP/1.1 slow backend on a pre-bound listener. Sleeps
 /// `delay_ms` before replying 200 OK with Connection: close.
@@ -252,9 +61,8 @@ async fn spawn_slow_backend(delay_ms: u64) -> (u16, Arc<AtomicBool>, tokio::task
     (port, stop, handle)
 }
 
-fn write_file_config(temp_dir: &TempDir, backend_port: u16) -> std::path::PathBuf {
-    let config_path = temp_dir.path().join("config.yaml");
-    let content = format!(
+fn file_config_yaml(backend_port: u16) -> String {
+    format!(
         r#"
 proxies:
   - id: "slow-proxy"
@@ -267,100 +75,7 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-    );
-    let mut f = std::fs::File::create(&config_path).expect("create config");
-    f.write_all(content.as_bytes()).expect("write config");
-    drop(f);
-    config_path
-}
-
-async fn ephemeral_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
-
-fn start_file_gateway(
-    config_path: &str,
-    proxy_port: u16,
-    admin_port: u16,
-    max_requests: u32,
-    req_critical: f64,
-    check_interval_ms: u32,
-) -> Child {
-    let mut cmd = Command::new(gateway_binary_path());
-    cmd.env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path)
-        .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_LOG_LEVEL", "warn")
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .env("FERRUM_MAX_REQUESTS", max_requests.to_string())
-        .env(
-            "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD",
-            req_critical.to_string(),
-        )
-        .env(
-            "FERRUM_OVERLOAD_CHECK_INTERVAL_MS",
-            check_interval_ms.to_string(),
-        )
-        .env("FERRUM_SHUTDOWN_DRAIN_SECONDS", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    cmd.spawn().expect("spawn gateway")
-}
-
-async fn wait_for_file_gateway(admin_port: u16) -> bool {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{admin_port}/health");
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
-}
-
-async fn start_file_gateway_with_retry(
-    config_path: &str,
-    max_requests: u32,
-    req_critical: f64,
-    check_interval_ms: u32,
-) -> (Child, u16, u16) {
-    const MAX_ATTEMPTS: u32 = 3;
-    for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_port = ephemeral_port().await;
-        let admin_port = ephemeral_port().await;
-        let mut child = start_file_gateway(
-            config_path,
-            proxy_port,
-            admin_port,
-            max_requests,
-            req_critical,
-            check_interval_ms,
-        );
-        if wait_for_file_gateway(admin_port).await {
-            return (child, proxy_port, admin_port);
-        }
-        eprintln!(
-            "file-mode gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
-             (proxy_port={proxy_port}, admin_port={admin_port})"
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < MAX_ATTEMPTS {
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
-    panic!("file-mode gateway did not start after {MAX_ATTEMPTS} attempts");
+    )
 }
 
 // ============================================================================
@@ -371,7 +86,9 @@ async fn start_file_gateway_with_retry(
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cluster_endpoint_database_mode() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .log_level("warn")
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -410,7 +127,9 @@ async fn test_cluster_endpoint_database_mode() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_overload_endpoint_shape_unauthenticated() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .log_level("warn")
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -493,13 +212,21 @@ async fn test_overload_endpoint_shape_unauthenticated() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_overload_returns_503_under_request_critical() {
-    let temp_dir = TempDir::new().expect("tempdir");
     let (backend_port, stop, _backend) = spawn_slow_backend(3000).await;
-    let config_path = write_file_config(&temp_dir, backend_port);
 
     // req_critical=0.5 with max_requests=4 => critical when active_requests >= 2.
-    let (mut gw, proxy_port, admin_port) =
-        start_file_gateway_with_retry(config_path.to_str().unwrap(), 4, 0.5, 200).await;
+    let gw = TestGateway::builder()
+        .mode_file(file_config_yaml(backend_port))
+        .log_level("warn")
+        .env("FERRUM_MAX_REQUESTS", "4")
+        .env("FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD", "0.5")
+        .env("FERRUM_OVERLOAD_CHECK_INTERVAL_MS", "200")
+        .env("FERRUM_SHUTDOWN_DRAIN_SECONDS", "1")
+        .spawn()
+        .await
+        .expect("spawn file-mode gateway");
+    let proxy_port = gw.proxy_port;
+    let admin_port = gw.admin_port;
 
     // Fire 6 concurrent slow requests in the background.
     let mut join_handles = Vec::new();
@@ -553,10 +280,10 @@ async fn test_overload_returns_503_under_request_critical() {
         let _ = h.await;
     }
 
-    // Teardown.
+    // Teardown. TestGateway's Drop kills the gateway; we still need to stop
+    // the backend task so its listener releases.
     stop.store(true, Ordering::Relaxed);
-    let _ = gw.kill();
-    let _ = gw.wait();
+    drop(gw);
     sleep(Duration::from_millis(100)).await;
 
     assert!(
@@ -570,7 +297,9 @@ async fn test_overload_returns_503_under_request_critical() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_namespaces_distinct_sorted() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .log_level("warn")
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -645,7 +374,9 @@ async fn test_namespaces_distinct_sorted() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_namespaces_requires_jwt() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .log_level("warn")
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -681,7 +412,9 @@ async fn test_namespaces_requires_jwt() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cluster_requires_jwt() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .log_level("warn")
+        .spawn()
         .await
         .expect("Failed to create harness");
 
@@ -716,7 +449,10 @@ async fn test_cluster_requires_jwt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restore_body_size_limit() {
     // FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB=1
-    let harness = AdminTestHarness::new_with_restore_limit(1)
+    let harness = TestGateway::builder()
+        .log_level("warn")
+        .env("FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB", "1")
+        .spawn()
         .await
         .expect("Failed to create harness with restore limit");
 
@@ -751,7 +487,9 @@ async fn test_restore_body_size_limit() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restore_malformed_json() {
-    let harness = AdminTestHarness::new()
+    let harness = TestGateway::builder()
+        .log_level("warn")
+        .spawn()
         .await
         .expect("Failed to create harness");
 

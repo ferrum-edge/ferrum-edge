@@ -22,4 +22,5 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture
 
+mod common;
 mod functional;

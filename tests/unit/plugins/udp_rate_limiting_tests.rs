@@ -1,15 +1,19 @@
 use std::sync::Arc;
 
 use ferrum_edge::plugins::{
-    Plugin, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext, UdpDatagramDirection,
-    UdpDatagramVerdict,
+    Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
+    UdpDatagramDirection, UdpDatagramVerdict,
 };
 use serde_json::json;
 
 fn make_plugin(
     config: serde_json::Value,
 ) -> ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting {
-    ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting::new(&config).unwrap()
+    ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
+        &config,
+        PluginHttpClient::default(),
+    )
+    .unwrap()
 }
 
 fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext {
@@ -63,7 +67,10 @@ fn tracked_keys_count_starts_at_zero() {
 
 #[test]
 fn config_requires_at_least_one_limit() {
-    let result = ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting::new(&json!({}));
+    let result = ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
+        &json!({}),
+        PluginHttpClient::default(),
+    );
     match result {
         Err(msg) => assert!(msg.contains("at least one of"), "unexpected error: {msg}"),
         Ok(_) => panic!("expected error but got Ok"),

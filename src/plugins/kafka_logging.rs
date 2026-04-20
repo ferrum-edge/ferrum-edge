@@ -1,57 +1,39 @@
-//! Kafka access logging plugin — async log shipping to Apache Kafka.
-//!
-//! Serializes `TransactionSummary` entries and produces them to a Kafka topic.
-//! Uses an mpsc channel to decouple the proxy hot path from Kafka I/O: the
-//! `log()` hook enqueues the entry (non-blocking), and a background task drains
-//! the channel and produces messages via rdkafka's `ThreadedProducer`.
-//!
-//! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
-//! `LogEntry` union type. Kafka batching, compression, and delivery retries
-//! are handled by librdkafka internally.
+//! Kafka access logging plugin — async log shipping to Apache Kafka via
+//! `BatchingLogger<LogEntry>`, with librdkafka still owning internal batching,
+//! compression, and delivery retries for both HTTP and stream summaries.
 
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{BaseRecord, DefaultProducerContext, Producer, ThreadedProducer};
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::task::spawn_blocking;
 use tracing::warn;
 
-use super::utils::http_client::PluginHttpClient;
+use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy, SummaryLogEntry};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
-/// Union type for log entries sent through the channel.
-#[derive(Clone, serde::Serialize)]
-#[serde(untagged)]
-enum LogEntry {
-    Http(TransactionSummary),
-    Stream(StreamTransactionSummary),
-}
-
-/// Which `TransactionSummary` field to use as the Kafka partition key.
+#[derive(Clone, Copy)]
 enum KeyField {
-    /// Partition by client IP (default) — groups a client's logs together.
     ClientIp,
-    /// Partition by proxy/route ID.
     ProxyId,
-    /// Null key — round-robin across partitions.
     None,
 }
 
-impl LogEntry {
-    fn partition_key(&self, key_field: &KeyField) -> Option<String> {
-        match (self, key_field) {
-            (_, KeyField::None) => None,
-            (LogEntry::Http(s), KeyField::ClientIp) => Some(s.client_ip.clone()),
-            (LogEntry::Stream(s), KeyField::ClientIp) => Some(s.client_ip.clone()),
-            (LogEntry::Http(s), KeyField::ProxyId) => s.matched_proxy_id.clone(),
-            (LogEntry::Stream(s), KeyField::ProxyId) => Some(s.proxy_id.clone()),
-        }
+struct KafkaFlushState {
+    producer: ThreadedProducer<DefaultProducerContext>,
+    flush_timeout: Duration,
+}
+
+impl Drop for KafkaFlushState {
+    fn drop(&mut self) {
+        let _ = self.producer.flush(self.flush_timeout);
     }
 }
 
 pub struct KafkaLogging {
-    sender: mpsc::Sender<LogEntry>,
+    logger: BatchingLogger<SummaryLogEntry>,
     broker_hostnames: Vec<String>,
 }
 
@@ -72,7 +54,6 @@ impl KafkaLogging {
             .to_string();
 
         let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
-
         let flush_timeout_seconds = config["flush_timeout_seconds"].as_u64().unwrap_or(5).max(1);
 
         let key_field = match config["key_field"].as_str() {
@@ -88,12 +69,11 @@ impl KafkaLogging {
             }
         };
 
-        // Build rdkafka ClientConfig — librdkafka handles batching, compression, retries.
         let mut kafka_config = ClientConfig::new();
         kafka_config.set("bootstrap.servers", broker_list);
 
-        if let Some(v) = config["message_timeout_ms"].as_u64() {
-            kafka_config.set("message.timeout.ms", v.to_string());
+        if let Some(value) = config["message_timeout_ms"].as_u64() {
+            kafka_config.set("message.timeout.ms", value.to_string());
         }
 
         let compression = config["compression"].as_str().unwrap_or("lz4");
@@ -122,12 +102,9 @@ impl KafkaLogging {
             }
         }
 
-        // Security protocol (plaintext / ssl / sasl_plaintext / sasl_ssl).
         if let Some(protocol) = config["security_protocol"].as_str() {
             kafka_config.set("security.protocol", protocol);
         }
-
-        // SASL authentication.
         if let Some(mechanism) = config["sasl_mechanism"].as_str() {
             kafka_config.set("sasl.mechanism", mechanism);
         }
@@ -138,17 +115,12 @@ impl KafkaLogging {
             kafka_config.set("sasl.password", password);
         }
 
-        // SSL / TLS — plugin-level fields override gateway defaults.
-        //
-        // CA trust: plugin `ssl_ca_location` > gateway `FERRUM_TLS_CA_BUNDLE_PATH`.
-        // When neither is set, librdkafka uses system CA roots.
         if let Some(ca) = config["ssl_ca_location"].as_str() {
             kafka_config.set("ssl.ca.location", ca);
         } else if let Some(gateway_ca) = http_client.tls_ca_bundle_path() {
             kafka_config.set("ssl.ca.location", gateway_ca);
         }
 
-        // Verification: plugin `ssl_no_verify` > gateway `FERRUM_TLS_NO_VERIFY`.
         let ssl_no_verify = config["ssl_no_verify"]
             .as_bool()
             .unwrap_or(http_client.tls_no_verify());
@@ -163,46 +135,64 @@ impl KafkaLogging {
             kafka_config.set("ssl.key.location", key);
         }
 
-        // Escape hatch: arbitrary librdkafka producer properties.
         if let Some(props) = config["producer_config"].as_object() {
-            for (k, v) in props {
-                if let Some(val) = v.as_str() {
-                    kafka_config.set(k, val);
+            for (key, value) in props {
+                if let Some(prop) = value.as_str() {
+                    kafka_config.set(key, prop);
                 }
             }
         }
 
         let producer: ThreadedProducer<DefaultProducerContext> = kafka_config
             .create()
-            .map_err(|e| format!("kafka_logging: failed to create Kafka producer: {e}"))?;
+            .map_err(|error| format!("kafka_logging: failed to create Kafka producer: {error}"))?;
 
-        // Extract broker hostnames for DNS warmup (skip IP addresses).
         let broker_hostnames: Vec<String> = broker_list
             .split(',')
             .filter_map(|broker| {
                 let trimmed = broker.trim();
-                // IPv6 bracket notation: [::1]:9092
                 let host = if trimmed.starts_with('[') {
-                    trimmed.split(']').next().map(|h| h.trim_start_matches('['))
+                    trimmed
+                        .split(']')
+                        .next()
+                        .map(|value| value.trim_start_matches('['))
                 } else {
                     trimmed.split(':').next()
                 };
-                host.filter(|h| !h.is_empty() && h.parse::<std::net::IpAddr>().is_err())
-                    .map(|h| h.to_string())
+                host.filter(|value| !value.is_empty() && value.parse::<std::net::IpAddr>().is_err())
+                    .map(|value| value.to_string())
             })
             .collect();
 
-        let (sender, receiver) = mpsc::channel(buffer_capacity);
-        tokio::spawn(produce_loop(
-            receiver,
+        let state = Arc::new(KafkaFlushState {
             producer,
-            topic,
-            key_field,
-            flush_timeout_seconds,
-        ));
+            flush_timeout: Duration::from_secs(flush_timeout_seconds),
+        });
+        let logger = BatchingLogger::spawn(
+            BatchConfig {
+                // Kafka flushes one userspace message at a time here. Larger
+                // batches would still serialize one spawn_blocking send per
+                // entry while librdkafka owns the real batching underneath.
+                batch_size: 1,
+                flush_interval: Duration::from_millis(1000),
+                buffer_capacity,
+                retry: RetryPolicy {
+                    // librdkafka handles its own delivery retries; keep the
+                    // shared logger at a single attempt for each message.
+                    max_attempts: 1,
+                    delay: Duration::from_millis(0),
+                },
+                plugin_name: "kafka_logging",
+            },
+            move |batch| {
+                let state = Arc::clone(&state);
+                let topic = topic.clone();
+                async move { send_batch(&state, &topic, key_field, batch).await }
+            },
+        );
 
         Ok(Self {
-            sender,
+            logger,
             broker_hostnames,
         })
     }
@@ -223,23 +213,11 @@ impl Plugin for KafkaLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        if self
-            .sender
-            .try_send(LogEntry::Stream(summary.clone()))
-            .is_err()
-        {
-            warn!("Kafka logging buffer full — dropping stream log entry");
-        }
+        self.logger.try_send(summary.into());
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        if self
-            .sender
-            .try_send(LogEntry::Http(summary.clone()))
-            .is_err()
-        {
-            warn!("Kafka logging buffer full — dropping log entry");
-        }
+        self.logger.try_send(summary.into());
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -247,51 +225,54 @@ impl Plugin for KafkaLogging {
     }
 }
 
-/// Background task: drains the mpsc channel and produces to Kafka.
-///
-/// Each message is serialized to JSON and enqueued into librdkafka's internal
-/// buffer via `ThreadedProducer::send()` (synchronous, non-blocking).
-/// librdkafka handles batching, compression, delivery retries, and partition
-/// assignment in its own background thread.
-async fn produce_loop(
-    mut receiver: mpsc::Receiver<LogEntry>,
-    producer: ThreadedProducer<DefaultProducerContext>,
-    topic: String,
+async fn send_batch(
+    state: &Arc<KafkaFlushState>,
+    topic: &str,
     key_field: KeyField,
-    flush_timeout_seconds: u64,
-) {
-    while let Some(entry) = receiver.recv().await {
+    batch: Vec<SummaryLogEntry>,
+) -> Result<(), String> {
+    for entry in batch {
         let payload = match serde_json::to_string(&entry) {
             Ok(json) => json,
-            Err(e) => {
-                warn!("Kafka logging: failed to serialize log entry: {e}");
+            Err(error) => {
+                warn!("Kafka logging: failed to serialize log entry: {error}");
                 continue;
             }
         };
-
-        let key = entry.partition_key(&key_field);
-
-        // Enqueue into librdkafka's internal buffer. The ThreadedProducer's
-        // background thread handles actual delivery and retries.
-        let err = match key {
-            Some(ref k) => producer
-                .send(
-                    BaseRecord::<str, str>::to(&topic)
-                        .payload(&payload)
-                        .key(k.as_str()),
-                )
-                .err()
-                .map(|(e, _)| e),
-            None => producer
-                .send(BaseRecord::<(), str>::to(&topic).payload(&payload))
-                .err()
-                .map(|(e, _)| e),
+        let key = match key_field {
+            KeyField::None => None,
+            KeyField::ClientIp => Some(entry.client_ip().to_string()),
+            KeyField::ProxyId => entry.proxy_id().map(str::to_string),
         };
-        if let Some(e) = err {
-            warn!("Kafka logging: failed to enqueue message: {e}");
-        }
+        let state = Arc::clone(state);
+        let topic = topic.to_string();
+
+        spawn_blocking(move || {
+            let enqueue_error = match key {
+                Some(key) => state
+                    .producer
+                    .send(
+                        BaseRecord::<str, str>::to(&topic)
+                            .payload(&payload)
+                            .key(key.as_str()),
+                    )
+                    .err()
+                    .map(|(error, _)| error),
+                None => state
+                    .producer
+                    .send(BaseRecord::<(), str>::to(&topic).payload(&payload))
+                    .err()
+                    .map(|(error, _)| error),
+            };
+
+            match enqueue_error {
+                Some(error) => Err(format!("Kafka logging: failed to enqueue message: {error}")),
+                None => Ok(()),
+            }
+        })
+        .await
+        .map_err(|error| format!("Kafka logging: producer task join failed: {error}"))??;
     }
 
-    // Channel closed — flush any remaining messages in librdkafka's buffer.
-    let _ = producer.flush(Duration::from_secs(flush_timeout_seconds));
+    Ok(())
 }

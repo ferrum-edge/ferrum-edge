@@ -20,12 +20,13 @@
 //!
 //! Run: `cargo test --test functional_tests -- --ignored functional_protocol_validation --nocapture`
 
+use crate::common::TestGateway;
+
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::time::Duration;
-use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
@@ -102,83 +103,6 @@ async fn start_header_echo_server_on(listener: TcpListener) {
             let _ = stream.shutdown().await;
         });
     }
-}
-
-// ============================================================================
-// Gateway subprocess helpers
-// ============================================================================
-
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        "./target/release/ferrum-edge"
-    } else {
-        panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
-    }
-}
-
-fn start_gateway_in_file_mode(
-    config_path: &str,
-    http_port: u16,
-    admin_port: u16,
-) -> std::process::Child {
-    std::process::Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path)
-        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_LOG_LEVEL", "warn")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("Failed to start gateway binary")
-}
-
-async fn wait_for_gateway(admin_port: u16) -> bool {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{admin_port}/health");
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
-}
-
-async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
-    const MAX_ATTEMPTS: u32 = 3;
-    for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_port = ephemeral_port().await;
-        let admin_port = ephemeral_port().await;
-
-        let mut child = start_gateway_in_file_mode(config_path, proxy_port, admin_port);
-        if wait_for_gateway(admin_port).await {
-            return (child, proxy_port, admin_port);
-        }
-
-        eprintln!(
-            "Gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
-             (proxy_port={proxy_port}, admin_port={admin_port})"
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < MAX_ATTEMPTS {
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
-    panic!("Gateway did not start after {MAX_ATTEMPTS} attempts");
 }
 
 // ============================================================================
@@ -291,17 +215,16 @@ fn header_value<'a>(hdrs: &'a [(String, String)], name: &str) -> Option<&'a str>
 // Config + test harness
 // ============================================================================
 
-/// Write a minimal FILE-mode YAML config pointing to the echo backend.
+/// Build a minimal FILE-mode YAML config pointing to the echo backend.
 /// When `with_host` is true, the proxy is restricted to `example.com` so the
 /// trailing-dot test can exercise host-based routing.
-fn write_config(temp_dir: &TempDir, echo_port: u16, with_host: bool) -> std::path::PathBuf {
-    let config_path = temp_dir.path().join("config.yaml");
+fn build_config(echo_port: u16, with_host: bool) -> String {
     let hosts_line = if with_host {
         "    hosts:\n      - \"example.com\"\n"
     } else {
         ""
     };
-    let content = format!(
+    format!(
         "proxies:\n\
          \x20 - id: \"echo-http\"\n\
          \x20   listen_path: \"/\"\n\
@@ -313,41 +236,37 @@ fn write_config(temp_dir: &TempDir, echo_port: u16, with_host: bool) -> std::pat
          consumers: []\n\
          plugin_configs: []\n",
         hosts = hosts_line,
-    );
-    std::fs::write(&config_path, content).expect("write config");
-    config_path
+    )
 }
 
 /// Harness that spins up an echo backend + gateway in file mode.
 struct Harness {
-    gateway: std::process::Child,
+    _gateway: TestGateway,
     echo_task: tokio::task::JoinHandle<()>,
     proxy_port: u16,
-    _temp_dir: TempDir,
 }
 
 impl Harness {
     async fn new(with_host: bool) -> Self {
-        let temp_dir = TempDir::new().expect("temp dir");
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
         sleep(Duration::from_millis(150)).await;
 
-        let config_path = write_config(&temp_dir, echo_port, with_host);
-        let (gateway, proxy_port, _admin_port) =
-            start_gateway_with_retry(config_path.to_str().unwrap()).await;
+        let gateway = TestGateway::builder()
+            .mode_file(build_config(echo_port, with_host))
+            .log_level("warn")
+            .spawn()
+            .await
+            .expect("start gateway");
         Harness {
-            gateway,
+            proxy_port: gateway.proxy_port,
+            _gateway: gateway,
             echo_task,
-            proxy_port,
-            _temp_dir: temp_dir,
         }
     }
 
-    fn cleanup(mut self) {
-        let _ = self.gateway.kill();
-        let _ = self.gateway.wait();
+    fn cleanup(self) {
         self.echo_task.abort();
     }
 }

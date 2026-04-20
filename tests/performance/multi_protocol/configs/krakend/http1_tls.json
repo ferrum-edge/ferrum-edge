@@ -17,7 +17,10 @@
     "private_key": "KEY_PATH"
   },
   "client_tls": {
-    "allow_insecure_connections": true
+    "allow_insecure_connections": false,
+    "ca_certs": [
+      "/certs/ca.pem"
+    ]
   },
   "endpoints": [
     {
@@ -26,7 +29,9 @@
       "output_encoding": "no-op",
       "backend": [
         {
-          "host": ["https://127.0.0.1:3447"],
+          "host": [
+            "https://127.0.0.1:3447"
+          ],
           "url_pattern": "/echo",
           "encoding": "no-op",
           "disable_host_sanitize": true
@@ -39,7 +44,9 @@
       "output_encoding": "no-op",
       "backend": [
         {
-          "host": ["http://127.0.0.1:3010"],
+          "host": [
+            "http://127.0.0.1:3010"
+          ],
           "url_pattern": "/health",
           "encoding": "no-op"
         }

@@ -40,6 +40,7 @@ mod functional_scale_perf_test;
 mod functional_secrets_test;
 mod functional_serverless_mirror_test;
 mod functional_service_discovery_test;
+mod functional_shared_harness_smoke_test;
 mod functional_sse_test;
 mod functional_stream_listener_failure_test;
 mod functional_tcp_proxy_test;

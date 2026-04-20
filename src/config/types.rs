@@ -2507,6 +2507,18 @@ impl Proxy {
 }
 
 impl Consumer {
+    /// Normalize a credential value to a list of object entries for backward
+    /// compatibility with both single-object and array-of-objects formats.
+    pub(crate) fn credential_entries_from_value(
+        credential_value: &serde_json::Value,
+    ) -> Vec<&serde_json::Value> {
+        match credential_value {
+            serde_json::Value::Array(arr) => arr.iter().filter(|v| v.is_object()).collect(),
+            val if val.is_object() => vec![val],
+            _ => vec![],
+        }
+    }
+
     /// Returns all credential entries for a given type, normalizing both
     /// single-object and array-of-objects formats for backward compatibility.
     ///
@@ -2517,8 +2529,7 @@ impl Consumer {
     /// lookup, iterating 1-2 entries). Non-object array elements are filtered out.
     pub fn credential_entries(&self, cred_type: &str) -> Vec<&serde_json::Value> {
         match self.credentials.get(cred_type) {
-            Some(serde_json::Value::Array(arr)) => arr.iter().filter(|v| v.is_object()).collect(),
-            Some(val) if val.is_object() => vec![val],
+            Some(credential_value) => Self::credential_entries_from_value(credential_value),
             _ => vec![],
         }
     }
@@ -2678,6 +2689,122 @@ impl Consumer {
             Err(errors)
         }
     }
+}
+
+pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
+    let mut redacted = consumer.clone();
+
+    fn redact_field(cred_value: &mut serde_json::Value, field: &str) {
+        match cred_value {
+            serde_json::Value::Array(arr) => {
+                for entry in arr {
+                    if let Some(obj) = entry.as_object_mut()
+                        && obj.contains_key(field)
+                    {
+                        obj.insert(field.to_string(), serde_json::json!("[REDACTED]"));
+                    }
+                }
+            }
+            serde_json::Value::Object(obj) if obj.contains_key(field) => {
+                obj.insert(field.to_string(), serde_json::json!("[REDACTED]"));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(basic) = redacted.credentials.get_mut("basicauth") {
+        redact_field(basic, "password_hash");
+    }
+    if let Some(hmac) = redacted.credentials.get_mut("hmac_auth") {
+        redact_field(hmac, "secret");
+    }
+    if let Some(jwt) = redacted.credentials.get_mut("jwt") {
+        redact_field(jwt, "secret");
+    }
+
+    redacted
+}
+
+pub(crate) fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
+    if let Some(basic) = consumer.credentials.get_mut("basicauth") {
+        match basic {
+            serde_json::Value::Array(arr) => {
+                for entry in arr.iter_mut() {
+                    if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
+                        let hash = hash_basic_auth_password(pass).map_err(|e| {
+                            format!(
+                                "Failed to hash password for consumer {}: {}",
+                                consumer.id, e
+                            )
+                        })?;
+                        entry["password_hash"] = serde_json::json!(hash);
+                        if let Some(obj) = entry.as_object_mut() {
+                            obj.remove("password");
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Some(pass) = basic.get("password").and_then(|p| p.as_str()) {
+                    let hash = hash_basic_auth_password(pass).map_err(|e| {
+                        format!(
+                            "Failed to hash password for consumer {}: {}",
+                            consumer.id, e
+                        )
+                    })?;
+                    basic["password_hash"] = serde_json::json!(hash);
+                    if let Some(obj) = basic.as_object_mut() {
+                        obj.remove("password");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn hash_basic_auth_password(password: &str) -> Result<String, String> {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let secret = crate::config::conf_file::resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::plugins::basic_auth::DEFAULT_HMAC_SECRET.to_string());
+
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|e| format!("Failed to create HMAC instance: {}", e))?;
+    mac.update(password.as_bytes());
+    let hash = hex::encode(mac.finalize().into_bytes());
+    Ok(format!("hmac_sha256:{}", hash))
+}
+
+pub(crate) fn hash_credential_passwords(cred: &mut serde_json::Value) -> Result<(), String> {
+    match cred {
+        serde_json::Value::Array(arr) => {
+            for entry in arr.iter_mut() {
+                if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
+                    let hash = hash_basic_auth_password(pass)?;
+                    entry["password_hash"] = serde_json::json!(hash);
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.remove("password");
+                    }
+                }
+            }
+        }
+        _ => {
+            if let Some(pass) = cred.get("password").and_then(|p| p.as_str()) {
+                let hash = hash_basic_auth_password(pass)?;
+                cred["password_hash"] = serde_json::json!(hash);
+                if let Some(obj) = cred.as_object_mut() {
+                    obj.remove("password");
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 impl Upstream {

@@ -1,41 +1,8 @@
-//! WebSocket Frame Rate Limiting Plugin
-//!
-//! Rate limits WebSocket frames per-connection using a token bucket algorithm.
-//! When a connection exceeds the configured frames-per-second, the WebSocket
-//! is closed with close code 1008 (Policy Violation).
-//!
-//! Unlike the HTTP `rate_limiting` plugin which operates per-IP or per-consumer,
-//! this plugin operates per-WebSocket-connection. Each connection gets its own
-//! independent token bucket, identified by a monotonic connection ID.
-//!
-//! # Centralized mode (`sync_mode: "redis"`)
-//!
-//! When configured with Redis, frame counters are stored in Redis instead of
-//! in-memory state. Because `connection_id` is process-local, each plugin
-//! instance namespaces its Redis keys with a unique instance identifier to
-//! avoid cross-instance collisions.
-//!
-//! Note: This mode externalizes the counter backend and preserves fallback
-//! behavior, but it does not make per-connection limits portable across
-//! reconnects to a different gateway instance.
-//!
-//! Config:
-//! ```json
-//! {
-//!   "frames_per_second": 100,
-//!   "burst_size": 150,
-//!   "close_reason": "Frame rate exceeded",
-//!   "sync_mode": "redis",
-//!   "redis_url": "redis://redis-host:6379/0"
-//! }
-//! ```
-//!
-//! If `burst_size` is not set, it defaults to `frames_per_second` (no extra burst).
+//! WebSocket frame rate limiting with shared local/Redis/failover storage.
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
@@ -43,96 +10,34 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tracing::warn;
 use uuid::Uuid;
 
+use super::utils::rate_limit::{RateLimitBackend, WsFrameRateAlgorithm, WsRateLimitOp};
 use super::{Plugin, PluginHttpClient, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
 
-use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
-
-/// Maximum tracked connections before triggering forced eviction.
 const MAX_STATE_ENTRIES: usize = 50_000;
-
-/// Interval between periodic eviction sweeps (every N frames across all connections).
-/// At 100 FPS across 100 connections, this triggers roughly every 10 seconds.
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
 
-/// Per-connection token bucket for frame rate limiting.
-#[derive(Debug)]
-struct TokenBucket {
-    tokens: f64,
-    capacity: f64,
-    refill_rate: f64,
-    last_refill: Instant,
-}
-
-impl TokenBucket {
-    fn new(capacity: f64, refill_rate: f64) -> Self {
-        Self {
-            tokens: capacity,
-            capacity,
-            refill_rate,
-            last_refill: Instant::now(),
-        }
-    }
-
-    fn check_and_consume(&mut self) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.last_refill = now;
-
-        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
-
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Returns true if this bucket has had recent activity (within 2x the window).
-    fn is_active(&self, now: Instant) -> bool {
-        if self.refill_rate <= 0.0 || self.capacity <= 0.0 {
-            // Zero-rate buckets can never refill — always consider stale for eviction
-            return false;
-        }
-        let window_secs = self.capacity / self.refill_rate;
-        now.duration_since(self.last_refill).as_secs_f64() < window_secs * 2.0
-    }
-}
-
 pub struct WsRateLimiting {
-    frames_per_second: f64,
-    burst_size: f64,
     close_reason: String,
-    /// Per-connection token buckets keyed by connection_id.
-    state: Arc<DashMap<u64, TokenBucket>>,
-    /// Monotonic frame counter for periodic eviction (not per-connection).
-    frame_counter: std::sync::atomic::AtomicU64,
-    /// Redis-backed rate limiter for centralized mode.
-    redis_client: Option<Arc<RedisRateLimitClient>>,
-    /// Unique namespace for Redis-backed counters so process-local
-    /// connection IDs do not collide across gateway instances.
+    frame_counter: AtomicU64,
     redis_instance_id: String,
+    limiter: RateLimitBackend<u64, WsFrameRateAlgorithm>,
 }
 
 impl WsRateLimiting {
-    /// RFC 6455 §5.5 control-frame payload limit. The Close frame's payload
-    /// includes a 2-byte status code followed by an optional UTF-8 reason,
-    /// so the reason itself is capped at 123 bytes.
     const MAX_CLOSE_REASON_BYTES: usize = 123;
 
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let frames_per_second = config["frames_per_second"].as_u64().unwrap_or(100) as f64;
-
-        let burst_size = config["burst_size"]
-            .as_u64()
-            .map(|v| v as f64)
-            .unwrap_or(frames_per_second);
-
         if frames_per_second == 0.0 {
             return Err(
                 "ws_rate_limiting: 'frames_per_second' must be greater than zero".to_string(),
             );
         }
+
+        let burst_size = config["burst_size"]
+            .as_u64()
+            .map(|value| value as f64)
+            .unwrap_or(frames_per_second);
 
         let mut close_reason = config["close_reason"]
             .as_str()
@@ -149,35 +54,16 @@ impl WsRateLimiting {
             ));
         }
 
-        let dns_cache = http_client.dns_cache().cloned();
-        let tls_no_verify = http_client.tls_no_verify();
-        let tls_ca_bundle_path = http_client.tls_ca_bundle_path().map(|s| s.to_string());
-        let redis_client = RedisConfig::from_plugin_config(
-            config,
-            &format!("{}:ws_rate_limiting", http_client.namespace()),
-        )
-        .map(|cfg| {
-            tracing::info!(
-                redis_url = %cfg.url,
-                key_prefix = %cfg.key_prefix,
-                "ws_rate_limiting: centralized Redis mode enabled"
-            );
-            Arc::new(RedisRateLimitClient::new(
-                cfg,
-                dns_cache,
-                tls_no_verify,
-                tls_ca_bundle_path.as_deref(),
-            ))
-        });
-
         Ok(Self {
-            frames_per_second,
-            burst_size,
             close_reason,
-            state: Arc::new(DashMap::new()),
-            frame_counter: std::sync::atomic::AtomicU64::new(0),
-            redis_client,
+            frame_counter: AtomicU64::new(0),
             redis_instance_id: Uuid::new_v4().simple().to_string(),
+            limiter: RateLimitBackend::from_plugin_config(
+                "ws_rate_limiting",
+                config,
+                &http_client,
+                WsFrameRateAlgorithm::new(frames_per_second, burst_size),
+            ),
         })
     }
 
@@ -185,9 +71,6 @@ impl WsRateLimiting {
         format!("{}:{}:{}", self.redis_instance_id, proxy_id, connection_id)
     }
 
-    /// Truncate `value` at the largest UTF-8 char boundary that is `<= max_bytes`,
-    /// returning the byte length to truncate to. Mirrors the helper in
-    /// `ws_message_size_limiting` so close-frame reasons stay well-formed.
     fn truncate_utf8_boundary(value: &str, max_bytes: usize) -> usize {
         let mut end = value.len().min(max_bytes);
         while end > 0 && !value.is_char_boundary(end) {
@@ -196,44 +79,15 @@ impl WsRateLimiting {
         end
     }
 
-    /// Evict stale entries to prevent unbounded memory growth.
-    ///
-    /// Two triggers:
-    /// 1. **Capacity**: always evict when exceeding MAX_STATE_ENTRIES
-    /// 2. **Periodic**: every EVICTION_CHECK_INTERVAL frames, evict inactive buckets
-    ///    even if under capacity (prevents slow accumulation in low-traffic deployments)
     fn maybe_evict(&self) {
-        let count = self
-            .frame_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        let over_capacity = self.state.len() > MAX_STATE_ENTRIES;
-        let periodic =
-            count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && !self.state.is_empty();
+        let count = self.frame_counter.fetch_add(1, Ordering::Relaxed);
+        let over_capacity = self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES;
+        let periodic = count > 0
+            && count.is_multiple_of(EVICTION_CHECK_INTERVAL)
+            && self.limiter.tracked_keys_count() > 0;
 
         if over_capacity || periodic {
-            let now = Instant::now();
-            self.state.retain(|_, bucket| bucket.is_active(now));
-        }
-    }
-
-    /// Check frame rate against Redis. Returns `Some(true)` if allowed,
-    /// `Some(false)` if rate exceeded, `None` if Redis unavailable.
-    async fn check_rate_redis(&self, proxy_id: &str, connection_id: u64) -> Option<bool> {
-        let redis = self.redis_client.as_ref()?;
-        if !redis.is_available() {
-            return None;
-        }
-
-        // Use 1-second fixed windows for frame rate limiting
-        let window_idx = RedisRateLimitClient::window_index(1);
-        let scope_key = self.redis_connection_scope_key(proxy_id, connection_id);
-        let key = redis.make_key(&[scope_key.as_str(), &window_idx.to_string()]);
-
-        // INCR + EXPIRE with 2s TTL (current + previous window)
-        match redis.incr_with_expire(&key, 2).await {
-            Ok(count) => Some(count <= self.burst_size as i64),
-            Err(()) => None,
+            self.limiter.retain_active_at(Instant::now());
         }
     }
 }
@@ -257,15 +111,11 @@ impl Plugin for WsRateLimiting {
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        self.redis_client
-            .as_ref()
-            .and_then(|r| r.warmup_hostname())
-            .into_iter()
-            .collect()
+        self.limiter.warmup_hostname().into_iter().collect()
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
-        Some(self.state.len())
+        Some(self.limiter.tracked_keys_count())
     }
 
     async fn on_ws_frame(
@@ -277,54 +127,30 @@ impl Plugin for WsRateLimiting {
     ) -> Option<Message> {
         self.maybe_evict();
 
-        // Try Redis first if configured
-        if self.redis_client.is_some()
-            && let Some(allowed) = self.check_rate_redis(proxy_id, connection_id).await
-        {
-            if !allowed {
-                let dir_label = match direction {
-                    WebSocketFrameDirection::ClientToBackend => "client->backend",
-                    WebSocketFrameDirection::BackendToClient => "backend->client",
-                };
-                warn!(
-                    plugin = "ws_rate_limiting",
-                    proxy_id = %proxy_id,
-                    connection_id = connection_id,
-                    direction = dir_label,
-                    "WebSocket frame rate exceeded (redis), closing connection"
-                );
-                return Some(Message::Close(Some(CloseFrame {
-                    code: CloseCode::Policy,
-                    reason: self.close_reason.clone().into(),
-                })));
-            }
-            return None; // Allowed by Redis
+        let redis_key = self.redis_connection_scope_key(proxy_id, connection_id);
+        let outcome = self
+            .limiter
+            .check(connection_id, &redis_key, &WsRateLimitOp)
+            .await;
+
+        if outcome.allowed {
+            return None;
         }
 
-        // Local mode
-        let mut entry = self
-            .state
-            .entry(connection_id)
-            .or_insert_with(|| TokenBucket::new(self.burst_size, self.frames_per_second));
-
-        if !entry.value_mut().check_and_consume() {
-            let dir_label = match direction {
-                WebSocketFrameDirection::ClientToBackend => "client->backend",
-                WebSocketFrameDirection::BackendToClient => "backend->client",
-            };
-            warn!(
-                plugin = "ws_rate_limiting",
-                proxy_id = %proxy_id,
-                connection_id = connection_id,
-                direction = dir_label,
-                "WebSocket frame rate exceeded, closing connection"
-            );
-            return Some(Message::Close(Some(CloseFrame {
-                code: CloseCode::Policy,
-                reason: self.close_reason.clone().into(),
-            })));
-        }
-
-        None
+        let dir_label = match direction {
+            WebSocketFrameDirection::ClientToBackend => "client->backend",
+            WebSocketFrameDirection::BackendToClient => "backend->client",
+        };
+        warn!(
+            plugin = "ws_rate_limiting",
+            proxy_id = %proxy_id,
+            connection_id,
+            direction = dir_label,
+            "WebSocket frame rate exceeded, closing connection"
+        );
+        Some(Message::Close(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: self.close_reason.clone().into(),
+        })))
     }
 }

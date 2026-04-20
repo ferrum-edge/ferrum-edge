@@ -357,6 +357,14 @@ proxies:
     tcp_idle_timeout_seconds: 30    # 30 sec for short-lived cache connections
 ```
 
+## TCP Backend Timeouts
+
+`backend_read_timeout_ms` and `backend_write_timeout_ms` only apply to **HTTP** and **gRPC** backend pools — not to raw TCP / TCP+TLS proxies. The TCP relay uses `tcp_idle_timeout_seconds` (bidirectional) and the OS TCP keep-alive for stalled-session detection.
+
+The two HTTP-shaped fields default to 30,000 ms in the proxy schema (and the SQL CHECK constraint requires `> 0`), which is appropriate for HTTP request/response cycles but wrong for long-lived TCP workloads where one-directional silence is normal (database keep-alives, message-broker streams, SSH/IMAP passthrough). Wiring those defaults onto raw TCP would tear down healthy connections after 30 s of read or write inactivity. Until the per-direction enforcement is rewritten as an inactivity-based watchdog (HAProxy-style `timeout server` semantics, where the timer pauses while the other direction is making progress), the TCP code path passes `None` to the relay's per-direction timeout slots and relies on `tcp_idle_timeout_seconds`.
+
+The `bidirectional_copy` helper accepts per-direction `backend_read_timeout` and `backend_write_timeout` arguments and unit tests cover them — that infrastructure is in place for the future inactivity-based wiring.
+
 ## UDP Session Management
 
 UDP is connectionless, so the gateway tracks sessions by client source address (`SocketAddr`). Each unique client gets a dedicated backend socket for reply routing.

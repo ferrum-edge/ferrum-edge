@@ -1,312 +1,46 @@
 //! Comprehensive Functional Test for DATABASE MODE
 //!
 //! This test verifies the complete functionality of ferrum-edge in database mode:
-//! - Building the gateway binary
-//! - Creating and using a temporary SQLite database
-//! - Starting the gateway in database mode
+//! - Starting the gateway in database mode (via shared `TestGateway` harness)
 //! - Admin API operations (proxies, consumers, plugins)
 //! - Proxy routing and request forwarding
 //! - Proxy CRUD operations with live updates
 //! - Health and metrics endpoints
 //!
-//! Run with: cargo test --test functional_database_test -- --ignored --nocapture
+//! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_database
 
-use chrono::Utc;
-use jsonwebtoken::{EncodingKey, Header, encode};
+use crate::common::{TestGateway, spawn_http_echo};
 use serde_json::json;
-use std::process::{Child, Command};
-use std::time::{Duration, SystemTime};
-use tempfile::TempDir;
-use uuid::Uuid;
-
-/// Test harness for database mode functional testing
-struct DatabaseModeTestHarness {
-    /// Temporary directory for database and logs
-    temp_dir: TempDir,
-    /// Gateway process handle
-    gateway_process: Option<Child>,
-    /// Base URLs for API endpoints
-    proxy_base_url: String,
-    admin_base_url: String,
-    /// JWT configuration
-    jwt_secret: String,
-    jwt_issuer: String,
-    /// Admin API port (randomized)
-    admin_port: u16,
-    /// Proxy port (randomized)
-    proxy_port: u16,
-}
-
-impl DatabaseModeTestHarness {
-    /// Create a new test harness with random ports
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-gateway-secret-key-1234567890".to_string();
-        let jwt_issuer = "ferrum-edge-test".to_string();
-
-        // Get available ports by binding to 0
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
-        let proxy_base_url = format!("http://127.0.0.1:{}", proxy_port);
-        let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
-
-        Ok(Self {
-            temp_dir,
-            gateway_process: None,
-            proxy_base_url,
-            admin_base_url,
-            jwt_secret,
-            jwt_issuer,
-            admin_port,
-            proxy_port,
-        })
-    }
-
-    /// Get path to temporary database
-    fn db_path(&self) -> String {
-        self.temp_dir
-            .path()
-            .join("test.db")
-            .to_string_lossy()
-            .to_string()
-    }
-
-    /// Start the gateway binary in database mode with retry for ephemeral port races
-    async fn start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match self.try_start_gateway().await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Gateway startup attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        // Reallocate ports for the next attempt
-                        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                        self.admin_port = admin_listener.local_addr()?.port();
-                        drop(admin_listener);
-
-                        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                        self.proxy_port = proxy_listener.local_addr()?.port();
-                        drop(proxy_listener);
-
-                        self.proxy_base_url = format!("http://127.0.0.1:{}", self.proxy_port);
-                        self.admin_base_url = format!("http://127.0.0.1:{}", self.admin_port);
-
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to start gateway after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    /// Single attempt to start the gateway binary in database mode
-    async fn try_start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let db_url = format!("sqlite:{}?mode=rwc", self.db_path());
-
-        // Build the gateway binary if not already built
-        let build_status = Command::new("cargo").args(["build"]).status()?;
-
-        if !build_status.success() {
-            return Err("Failed to build ferrum-edge".into());
-        }
-
-        // Use debug binary (matches default `cargo test` profile)
-        // Falls back to release if debug doesn't exist
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-            "./target/debug/ferrum-edge"
-        } else {
-            "./target/release/ferrum-edge"
-        };
-
-        // Start the gateway process with database mode environment variables
-        let child = Command::new(binary_path)
-            .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
-            .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", &db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2") // 2 second poll interval
-            .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "info")
-            .spawn()?;
-
-        self.gateway_process = Some(child);
-
-        // Wait for gateway to be ready; kill on failure
-        match self.wait_for_health().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if let Some(mut child) = self.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Poll the health endpoint until gateway is ready (max 30 seconds)
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway did not start within 30 seconds".into());
-            }
-
-            match reqwest::get(&health_url).await {
-                Ok(response) if response.status().is_success() => {
-                    println!("Gateway is ready!");
-                    return Ok(());
-                }
-                _ => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-        }
-    }
-
-    /// Generate a valid JWT token
-    fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let now = Utc::now();
-        let claims = json!({
-            "iss": self.jwt_issuer,
-            "sub": "test-admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
-            "jti": Uuid::new_v4().to_string()
-        });
-
-        let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
-
-        Ok(encode(&header, &claims, &key)?)
-    }
-
-    /// Get authorized HTTP client
-    fn get_client(&self) -> Result<reqwest::Client, Box<dyn std::error::Error>> {
-        Ok(reqwest::Client::new())
-    }
-}
-
-impl Drop for DatabaseModeTestHarness {
-    fn drop(&mut self) {
-        // Kill gateway process
-        if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-/// Create a simple echo HTTP server for backend testing
-async fn start_echo_backend(
-    port: u16,
-) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-
-    let handle = tokio::spawn(async move {
-        while let Ok((socket, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-                let (reader, mut writer) = socket.into_split();
-                let mut buf_reader = tokio::io::BufReader::new(reader);
-                let mut line = String::new();
-
-                // Read request line
-                if buf_reader.read_line(&mut line).await.is_err() {
-                    return;
-                }
-
-                // Read headers until blank line
-                let mut headers = String::new();
-                loop {
-                    line.clear();
-                    if buf_reader.read_line(&mut line).await.is_err() {
-                        return;
-                    }
-                    if line == "\r\n" || line == "\n" {
-                        break;
-                    }
-                    headers.push_str(&line);
-                }
-
-                // Send simple 200 OK response
-                let body = r#"{"status":"ok","echo":true}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = writer.write_all(response.as_bytes()).await;
-            });
-        }
-    });
-
-    Ok(handle)
-}
+use std::time::Duration;
 
 #[tokio::test]
 #[ignore]
 async fn test_database_mode_comprehensive() {
     println!("\n=== Starting Database Mode Functional Test ===\n");
 
-    // Setup
-    let mut harness = DatabaseModeTestHarness::new()
-        .await
-        .expect("Failed to create test harness");
-
-    println!("Test harness created:");
-    println!("  Database: {}", harness.db_path());
-    println!("  Proxy URL: {}", harness.proxy_base_url);
-    println!("  Admin URL: {}", harness.admin_base_url);
-
-    // Start echo backend on a random port
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind backend listener");
-    let backend_port = backend_listener
-        .local_addr()
-        .expect("Failed to get address")
-        .port();
-    drop(backend_listener);
-
-    let _backend_handle = start_echo_backend(backend_port)
+    // Spawn echo backend (listener held inside the task — no bind-drop-rebind race)
+    let backend = spawn_http_echo()
         .await
         .expect("Failed to start echo backend");
+    println!("Echo backend started on port {}", backend.port);
 
-    println!("Echo backend started on port {}", backend_port);
-
-    // Start gateway
-    harness
-        .start_gateway()
+    // Start gateway in database mode via the shared harness (handles 3-attempt
+    // retry, fresh ports per attempt, JWT minting, Drop-kill on failure).
+    let mut gateway = TestGateway::builder()
+        .mode_database_sqlite()
+        .jwt_issuer("ferrum-edge-test")
+        .log_level("info")
+        .db_poll_interval_seconds(2)
+        .spawn()
         .await
         .expect("Failed to start gateway");
 
-    let client = harness.get_client().expect("Failed to create HTTP client");
-    let token = harness
-        .generate_token()
-        .expect("Failed to generate JWT token");
-    let auth_header = format!("Bearer {}", token);
+    println!("Test harness created:");
+    println!("  Proxy URL: {}", gateway.proxy_url(""));
+    println!("  Admin URL: {}", gateway.admin_url(""));
+
+    let client = reqwest::Client::new();
+    let auth_header = gateway.auth_header();
 
     // Test 1: Create a proxy via Admin API
     println!("\n--- Test 1: Create Proxy ---");
@@ -315,12 +49,12 @@ async fn test_database_mode_comprehensive() {
         "listen_path": "/test-path",
         "backend_protocol": "http",
         "backend_host": "localhost",
-        "backend_port": backend_port,
+        "backend_port": backend.port,
         "strip_listen_path": true,
     });
 
     let response = client
-        .post(format!("{}/proxies", harness.admin_base_url))
+        .post(gateway.admin_url("/proxies"))
         .header("Authorization", &auth_header)
         .json(&proxy_data)
         .send()
@@ -341,7 +75,7 @@ async fn test_database_mode_comprehensive() {
     // Test 2: Verify proxy exists via GET
     println!("\n--- Test 2: Get Proxy ---");
     let response = client
-        .get(format!("{}/proxies/test-proxy-1", harness.admin_base_url))
+        .get(gateway.admin_url("/proxies/test-proxy-1"))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -358,7 +92,7 @@ async fn test_database_mode_comprehensive() {
     // Test 3: Send request through proxy
     println!("\n--- Test 3: Route Request Through Proxy ---");
     let proxy_response = client
-        .get(format!("{}/test-path", harness.proxy_base_url))
+        .get(gateway.proxy_url("/test-path"))
         .send()
         .await
         .expect("Failed to send request through proxy");
@@ -372,7 +106,14 @@ async fn test_database_mode_comprehensive() {
         .json()
         .await
         .expect("Failed to parse proxy response body");
-    assert!(response_body["echo"].as_bool().unwrap_or(false));
+    // Shared echo returns {"echo":"<backend_path>"}. With strip_listen_path=true
+    // the backend sees "/" (listen_path "/test-path" stripped).
+    assert_eq!(
+        response_body["echo"].as_str(),
+        Some("/"),
+        "Backend should receive stripped path, got {:?}",
+        response_body["echo"]
+    );
     println!("✓ Request successfully routed through proxy");
 
     // Test 4: Update the proxy
@@ -382,12 +123,12 @@ async fn test_database_mode_comprehensive() {
         "listen_path": "/test-path",
         "backend_protocol": "http",
         "backend_host": "localhost",
-        "backend_port": backend_port,
+        "backend_port": backend.port,
         "strip_listen_path": false, // Changed
     });
 
     let response = client
-        .put(format!("{}/proxies/test-proxy-1", harness.admin_base_url))
+        .put(gateway.admin_url("/proxies/test-proxy-1"))
         .header("Authorization", &auth_header)
         .json(&updated_proxy_data)
         .send()
@@ -402,7 +143,7 @@ async fn test_database_mode_comprehensive() {
 
     // Verify update took effect
     let response = client
-        .get(format!("{}/proxies/test-proxy-1", harness.admin_base_url))
+        .get(gateway.admin_url("/proxies/test-proxy-1"))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -421,7 +162,7 @@ async fn test_database_mode_comprehensive() {
     });
 
     let response = client
-        .post(format!("{}/consumers", harness.admin_base_url))
+        .post(gateway.admin_url("/consumers"))
         .header("Authorization", &auth_header)
         .json(&consumer_data)
         .send()
@@ -438,10 +179,7 @@ async fn test_database_mode_comprehensive() {
     // Test 6: Get consumer
     println!("\n--- Test 6: Get Consumer ---");
     let response = client
-        .get(format!(
-            "{}/consumers/test-consumer-1",
-            harness.admin_base_url
-        ))
+        .get(gateway.admin_url("/consumers/test-consumer-1"))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -467,7 +205,7 @@ async fn test_database_mode_comprehensive() {
     });
 
     let response = client
-        .post(format!("{}/plugins/config", harness.admin_base_url))
+        .post(gateway.admin_url("/plugins/config"))
         .header("Authorization", &auth_header)
         .json(&plugin_config_data)
         .send()
@@ -484,10 +222,7 @@ async fn test_database_mode_comprehensive() {
     // Test 8: Get plugin config
     println!("\n--- Test 8: Get Plugin Config ---");
     let response = client
-        .get(format!(
-            "{}/plugins/config/test-plugin-1",
-            harness.admin_base_url
-        ))
+        .get(gateway.admin_url("/plugins/config/test-plugin-1"))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -504,7 +239,7 @@ async fn test_database_mode_comprehensive() {
     // Test 9: Test health endpoint
     println!("\n--- Test 9: Health Endpoint ---");
     let response = client
-        .get(format!("{}/health", harness.admin_base_url))
+        .get(gateway.admin_url("/health"))
         .send()
         .await
         .expect("Failed to get health");
@@ -517,7 +252,7 @@ async fn test_database_mode_comprehensive() {
     // Test 10: Test metrics endpoint
     println!("\n--- Test 10: Metrics Endpoint ---");
     let response = client
-        .get(format!("{}/admin/metrics", harness.admin_base_url))
+        .get(gateway.admin_url("/admin/metrics"))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -533,7 +268,7 @@ async fn test_database_mode_comprehensive() {
     // Test 11: Delete proxy
     println!("\n--- Test 11: Delete Proxy ---");
     let response = client
-        .delete(format!("{}/proxies/test-proxy-1", harness.admin_base_url))
+        .delete(gateway.admin_url("/proxies/test-proxy-1"))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -548,7 +283,7 @@ async fn test_database_mode_comprehensive() {
     // Verify proxy is deleted (should get 404)
     println!("\n--- Test 12: Verify Proxy Deletion ---");
     let response = client
-        .get(format!("{}/proxies/test-proxy-1", harness.admin_base_url))
+        .get(gateway.admin_url("/proxies/test-proxy-1"))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -559,10 +294,7 @@ async fn test_database_mode_comprehensive() {
 
     // Test 13: Request to deleted proxy should fail
     println!("\n--- Test 13: Verify Deleted Proxy Not Routable ---");
-    let response = client
-        .get(format!("{}/test-path", harness.proxy_base_url))
-        .send()
-        .await;
+    let response = client.get(gateway.proxy_url("/test-path")).send().await;
 
     // Should either fail to connect or get 404
     assert!(
@@ -574,7 +306,7 @@ async fn test_database_mode_comprehensive() {
     // Test 14: JWT authentication is required
     println!("\n--- Test 14: JWT Authentication Required ---");
     let response = client
-        .get(format!("{}/proxies", harness.admin_base_url))
+        .get(gateway.admin_url("/proxies"))
         .send() // No auth header
         .await
         .expect("Failed to send request without auth");
@@ -594,12 +326,12 @@ async fn test_database_mode_comprehensive() {
         "listen_path": "/another-path",
         "backend_protocol": "http",
         "backend_host": "localhost",
-        "backend_port": backend_port,
+        "backend_port": backend.port,
         "strip_listen_path": true,
     });
 
     client
-        .post(format!("{}/proxies", harness.admin_base_url))
+        .post(gateway.admin_url("/proxies"))
         .header("Authorization", &auth_header)
         .json(&proxy_data)
         .send()
@@ -607,7 +339,7 @@ async fn test_database_mode_comprehensive() {
         .expect("Failed to create second proxy");
 
     let response = client
-        .get(format!("{}/proxies", harness.admin_base_url))
+        .get(gateway.admin_url("/proxies"))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -618,5 +350,6 @@ async fn test_database_mode_comprehensive() {
     assert!(proxies.is_array(), "Proxies response should be an array");
     println!("✓ Proxy listing works");
 
+    gateway.shutdown();
     println!("\n=== All Tests Passed ===\n");
 }

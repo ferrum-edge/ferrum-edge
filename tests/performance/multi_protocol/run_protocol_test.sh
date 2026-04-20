@@ -156,7 +156,7 @@ start_gateway() {
     # Wait for certs from backend
     local cert_dir="$SCRIPT_DIR/certs"
     for i in $(seq 1 5); do
-        [ -f "$cert_dir/cert.pem" ] && break
+        [ -f "$cert_dir/ca.pem" ] && [ -f "$cert_dir/cert.pem" ] && break
         sleep 1
     done
 
@@ -273,6 +273,7 @@ prepare_envoy_config() {
 
     sed -e "s|CERT_PATH|${cert_dir}/cert.pem|g" \
         -e "s|KEY_PATH|${cert_dir}/key.pem|g" \
+        -e "s|CA_PATH|${cert_dir}/ca.pem|g" \
         "$src_config" > "$runtime_config"
 
     echo "$runtime_config"

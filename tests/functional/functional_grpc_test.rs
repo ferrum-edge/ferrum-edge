@@ -728,8 +728,8 @@ async fn test_grpc_key_auth_rejects_missing_key() {
     assert!(
         headers
             .get("grpc-message")
-            .is_some_and(|msg| msg.contains("Missing API key")),
-        "gRPC auth rejection should expose the plugin message"
+            .is_some_and(|msg| msg.contains("Authentication required")),
+        "gRPC auth rejection should expose the auth-phase message"
     );
 
     // Also verify an INVALID key is rejected

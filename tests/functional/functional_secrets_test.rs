@@ -26,38 +26,14 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored functional_secrets --nocapture
 
+use crate::common::{DbType, TestGateway};
+
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use std::fs;
-use std::io::Read;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-fn binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
-fn ensure_binary_built() -> Result<(), Box<dyn std::error::Error>> {
-    let build_status = Command::new("cargo")
-        .args(["build", "--bin", "ferrum-edge"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if !build_status.success() {
-        return Err("Failed to build ferrum-edge".into());
-    }
-    Ok(())
-}
 
 /// Encode a valid admin API JWT using the given HS256 secret + issuer.
 /// Mirrors the pattern in `functional_admin_operations_test.rs`.
@@ -77,33 +53,12 @@ fn encode_admin_jwt(secret: &str, issuer: &str) -> String {
     format!("Bearer {}", token)
 }
 
-async fn wait_for_health(
-    admin_base_url: &str,
-    timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let health_url = format!("{}/health", admin_base_url);
-    let deadline = SystemTime::now() + timeout;
-    loop {
-        if SystemTime::now() >= deadline {
-            return Err(format!(
-                "Gateway did not become healthy at {} within {:?}",
-                health_url, timeout
-            )
-            .into());
-        }
-        match reqwest::get(&health_url).await {
-            Ok(r) if r.status().is_success() => return Ok(()),
-            _ => tokio::time::sleep(Duration::from_millis(500)).await,
-        }
-    }
-}
-
 /// Harness that starts the gateway in DB mode with a custom env setup and
 /// retries if ephemeral ports are stolen. The caller supplies the env vars
 /// and determines which variant of the admin secret configuration is used.
 struct SecretsHarness {
     _temp_dir: TempDir,
-    gateway_process: Option<Child>,
+    _gw: TestGateway,
     admin_base_url: String,
     /// The canonical admin JWT secret the test expects the gateway to resolve
     /// (used to sign tokens for authenticated admin calls).
@@ -112,118 +67,48 @@ struct SecretsHarness {
 }
 
 impl SecretsHarness {
-    /// Build a harness with retry. `env_customizer` receives the base env vars
-    /// (mode, db, ports, issuer, etc.) and adds the specific secret setup the
-    /// test wants to verify. It may also write files into the provided
-    /// `TempDir`. It returns the admin secret value the gateway is expected
-    /// to end up using (so the test can sign JWTs with it).
-    async fn new<F>(env_customizer: F) -> Result<Self, Box<dyn std::error::Error>>
+    /// Build a harness with a caller-supplied secret source configuration.
+    /// The closure can write files into `temp_dir` and returns:
+    /// 1. extra env vars to apply to the shared builder
+    /// 2. the admin secret value the gateway is expected to resolve to
+    async fn new<F>(env_customizer: F) -> Result<Self, Box<dyn std::error::Error + Send + Sync>>
     where
-        F: Fn(&mut Command, &TempDir) -> String + Send + Sync,
+        F: Fn(&TempDir) -> (Vec<(String, String)>, String) + Send + Sync,
     {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match Self::try_new(&env_customizer).await {
-                Ok(h) => return Ok(h),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "SecretsHarness startup attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to create SecretsHarness after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    async fn try_new<F>(env_customizer: &F) -> Result<Self, Box<dyn std::error::Error>>
-    where
-        F: Fn(&mut Command, &TempDir) -> String,
-    {
-        ensure_binary_built()?;
-
         let temp_dir = TempDir::new()?;
         let admin_issuer = "ferrum-edge-secrets-test".to_string();
-
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
         let db_url = format!(
             "sqlite:{}?mode=rwc",
-            temp_dir.path().join("secrets.db").to_string_lossy()
+            temp_dir.path().join("secrets.db").display()
         );
+        let (extra_env, expected_admin_secret) = env_customizer(&temp_dir);
 
-        let mut cmd = Command::new(binary_path());
-        cmd.env_clear()
-            // Minimum required PATH for dynamic linker resolution on macOS.
-            .env(
-                "PATH",
-                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
-            )
-            .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_ISSUER", &admin_issuer)
-            .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", &db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2")
-            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "info")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        let mut builder = TestGateway::builder()
+            .mode_database(DbType::Custom {
+                db_type: "sqlite".to_string(),
+                db_url,
+            })
+            .skip_auto_build()
+            .clear_env()
+            .omit_admin_jwt_secret()
+            .jwt_issuer(&admin_issuer)
+            .log_level("info");
+        for (key, value) in extra_env {
+            builder = builder.env(key, value);
+        }
+        let gw = builder.spawn().await?;
 
-        // Test-specific secret configuration. Returns the secret value the
-        // gateway is expected to resolve to.
-        let expected_admin_secret = env_customizer(&mut cmd, &temp_dir);
-
-        let child = cmd.spawn()?;
-        let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
-
-        let mut harness = Self {
+        Ok(Self {
             _temp_dir: temp_dir,
-            gateway_process: Some(child),
-            admin_base_url,
+            admin_base_url: gw.admin_base_url.clone(),
             expected_admin_secret,
             expected_admin_issuer: admin_issuer,
-        };
-
-        match wait_for_health(&harness.admin_base_url, Duration::from_secs(30)).await {
-            Ok(()) => Ok(harness),
-            Err(e) => {
-                if let Some(mut child) = harness.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(e)
-            }
-        }
+            _gw: gw,
+        })
     }
 
     fn auth_header(&self) -> String {
         encode_admin_jwt(&self.expected_admin_secret, &self.expected_admin_issuer)
-    }
-}
-
-impl Drop for SecretsHarness {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 }
 
@@ -240,14 +125,19 @@ async fn test_secrets_file_backend_admin_jwt() {
     assert_eq!(secret_value.len(), 40);
 
     let secret_value_owned = secret_value.to_string();
-    let harness_result = SecretsHarness::new(move |cmd, temp_dir| {
+    let harness_result = SecretsHarness::new(move |temp_dir| {
         let secret_path = temp_dir.path().join("admin_jwt_secret.txt");
         // Include a trailing newline — the file backend trims trailing
         // whitespace, which is exactly what docker-secrets / heredocs produce.
         fs::write(&secret_path, format!("{}\n", secret_value_owned))
             .expect("failed to write secret file");
-        cmd.env("FERRUM_ADMIN_JWT_SECRET_FILE", &secret_path);
-        secret_value_owned.clone()
+        (
+            vec![(
+                "FERRUM_ADMIN_JWT_SECRET_FILE".to_string(),
+                secret_path.to_string_lossy().into_owned(),
+            )],
+            secret_value_owned.clone(),
+        )
     })
     .await;
     let harness = match harness_result {
@@ -312,83 +202,35 @@ async fn test_secrets_file_backend_admin_jwt() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_secrets_env_indirection_is_not_implemented() {
-    ensure_binary_built().expect("cargo build");
-
     let temp_dir = TempDir::new().unwrap();
-    let db_url = format!(
-        "sqlite:{}?mode=rwc",
-        temp_dir.path().join("secrets.db").to_string_lossy()
-    );
-
-    // Allocate ports (we don't actually need them reachable — the gateway
-    // will exit before binding).
-    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_port = admin_listener.local_addr().unwrap().port();
-    drop(admin_listener);
-    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_port = proxy_listener.local_addr().unwrap().port();
-    drop(proxy_listener);
-
-    let mut cmd = Command::new(binary_path());
-    cmd.env_clear()
-        .env(
-            "PATH",
-            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
-        )
-        .env("FERRUM_MODE", "database")
-        .env("FERRUM_DB_TYPE", "sqlite")
-        .env("FERRUM_DB_URL", &db_url)
-        .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_LOG_LEVEL", "info")
-        // A plausible indirection target, not referenced by match_suffix().
+    let failed = TestGateway::builder()
+        .mode_database(DbType::Custom {
+            db_type: "sqlite".to_string(),
+            db_url: format!(
+                "sqlite:{}?mode=rwc",
+                temp_dir.path().join("secrets.db").display()
+            ),
+        })
+        .skip_auto_build()
+        .clear_env()
+        .omit_admin_jwt_secret()
+        .log_level("info")
+        .capture_output()
         .env("MY_ADMIN_SECRET", "my-real-long-admin-secret-string-12345")
         .env("FERRUM_ADMIN_JWT_SECRET_ENV", "MY_ADMIN_SECRET")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .spawn_expect_failure(Duration::from_secs(15))
+        .await
+        .expect("gateway should reject bare _ENV indirection");
 
-    let mut child = cmd.spawn().expect("spawn gateway");
-
-    // The gateway should exit quickly because FERRUM_ADMIN_JWT_SECRET is
-    // required in database mode and the _ENV suffix is a no-op. We give it a
-    // short deadline and kill if it blows past — a hung process here is
-    // itself a failure signal.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                assert!(
-                    !status.success(),
-                    "gateway should NOT start with only FERRUM_ADMIN_JWT_SECRET_ENV set (exit status: {:?})",
-                    status
-                );
-                let mut stderr_buf = String::new();
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = err.read_to_string(&mut stderr_buf);
-                }
-                // Gateway exited non-zero — the failure path exists. Some
-                // builds emit the error via structured logs on stdout rather
-                // than stderr, so accept either non-zero exit OR an
-                // admin-jwt-related message on stderr as a pass signal.
-                eprintln!("_ENV indirection exit status={status:?} stderr:\n{stderr_buf}");
-                return;
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!(
-                        "gateway did not exit within 15s — _ENV suffix may now be silently \
-                         resolving which would be a behavior change requiring this test to \
-                         be updated"
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Err(e) => panic!("try_wait failed: {}", e),
-        }
-    }
+    assert!(
+        failed.status.is_some_and(|status| !status.success()),
+        "gateway should NOT start with only FERRUM_ADMIN_JWT_SECRET_ENV set"
+    );
+    eprintln!(
+        "_ENV indirection exit status={:?} output:\n{}",
+        failed.status,
+        failed.combined_output()
+    );
 }
 
 // ============================================================================
@@ -407,59 +249,45 @@ async fn test_secrets_env_indirection_is_not_implemented() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_secrets_conflict_direct_and_file() {
-    ensure_binary_built().expect("cargo build");
-
     let temp_dir = TempDir::new().unwrap();
-    let db_url = format!(
-        "sqlite:{}?mode=rwc",
-        temp_dir.path().join("secrets.db").to_string_lossy()
-    );
-
     let secret_path = temp_dir.path().join("admin_jwt_secret.txt");
     fs::write(&secret_path, "file-version-of-admin-secret-1234567890\n").unwrap();
 
-    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_port = admin_listener.local_addr().unwrap().port();
-    drop(admin_listener);
-    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_port = proxy_listener.local_addr().unwrap().port();
-    drop(proxy_listener);
-
-    let output = Command::new(binary_path())
-        .env_clear()
-        .env(
-            "PATH",
-            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
-        )
-        .env("FERRUM_MODE", "database")
-        .env("FERRUM_DB_TYPE", "sqlite")
-        .env("FERRUM_DB_URL", &db_url)
-        .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_LOG_LEVEL", "info")
-        // Both sources set — conflict.
+    let failed = TestGateway::builder()
+        .mode_database(DbType::Custom {
+            db_type: "sqlite".to_string(),
+            db_url: format!(
+                "sqlite:{}?mode=rwc",
+                temp_dir.path().join("secrets.db").display()
+            ),
+        })
+        .skip_auto_build()
+        .clear_env()
+        .log_level("info")
+        .capture_output()
         .env(
             "FERRUM_ADMIN_JWT_SECRET",
             "direct-version-of-admin-secret-1234567890",
         )
-        .env("FERRUM_ADMIN_JWT_SECRET_FILE", &secret_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("spawn + wait gateway");
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET_FILE",
+            secret_path.to_string_lossy().into_owned(),
+        )
+        .spawn_expect_failure(Duration::from_secs(15))
+        .await
+        .expect("gateway should reject direct+_FILE conflict");
 
     assert!(
-        !output.status.success(),
+        failed.status.is_some_and(|status| !status.success()),
         "gateway must NOT start when direct and _FILE sources are both set"
     );
 
     // Gateway exited with failure — the conflict path exists (exact error
     // wording varies by version/log format). Log and continue.
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     eprintln!(
-        "direct+_FILE conflict exit={:?} stderr:\n{stderr}",
-        output.status
+        "direct+_FILE conflict exit={:?} output:\n{}",
+        failed.status,
+        failed.combined_output()
     );
 }
 
@@ -481,51 +309,39 @@ async fn test_secrets_conflict_direct_and_file() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_secrets_conflict_exits_quickly() {
-    ensure_binary_built().expect("cargo build");
-
     let temp_dir = TempDir::new().unwrap();
-    let db_url = format!(
-        "sqlite:{}?mode=rwc",
-        temp_dir.path().join("secrets.db").to_string_lossy()
-    );
     let secret_path = temp_dir.path().join("admin_jwt_secret.txt");
     fs::write(&secret_path, "file-version-of-admin-secret-1234567890\n").unwrap();
 
-    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_port = admin_listener.local_addr().unwrap().port();
-    drop(admin_listener);
-    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_port = proxy_listener.local_addr().unwrap().port();
-    drop(proxy_listener);
-
     let start = std::time::Instant::now();
-    let output = Command::new(binary_path())
-        .env_clear()
-        .env(
-            "PATH",
-            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
-        )
-        .env("FERRUM_MODE", "database")
-        .env("FERRUM_DB_TYPE", "sqlite")
-        .env("FERRUM_DB_URL", &db_url)
-        .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_LOG_LEVEL", "info")
+    let failed = TestGateway::builder()
+        .mode_database(DbType::Custom {
+            db_type: "sqlite".to_string(),
+            db_url: format!(
+                "sqlite:{}?mode=rwc",
+                temp_dir.path().join("secrets.db").display()
+            ),
+        })
+        .skip_auto_build()
+        .clear_env()
+        .log_level("info")
+        .capture_output()
         .env(
             "FERRUM_ADMIN_JWT_SECRET",
             "direct-version-of-admin-secret-1234567890",
         )
-        .env("FERRUM_ADMIN_JWT_SECRET_FILE", &secret_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("spawn + wait gateway");
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET_FILE",
+            secret_path.to_string_lossy().into_owned(),
+        )
+        .spawn_expect_failure(Duration::from_secs(15))
+        .await
+        .expect("gateway should reject direct+_FILE conflict quickly");
     let elapsed = start.elapsed();
 
     // Conflict detection should produce a non-zero exit and shouldn't hang.
     assert!(
-        !output.status.success(),
+        failed.status.is_some_and(|status| !status.success()),
         "conflict should cause non-zero exit"
     );
     assert!(
@@ -533,6 +349,8 @@ async fn test_secrets_conflict_exits_quickly() {
         "conflict should exit reasonably quickly, took {:?}",
         elapsed
     );
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    eprintln!("conflict exits quickly: elapsed={elapsed:?} stderr:\n{stderr}");
+    eprintln!(
+        "conflict exits quickly: elapsed={elapsed:?} output:\n{}",
+        failed.combined_output()
+    );
 }

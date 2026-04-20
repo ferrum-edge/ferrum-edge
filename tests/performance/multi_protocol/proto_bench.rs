@@ -266,12 +266,35 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .context("invalid address")?;
-    let path = url.path().to_string();
+    // HTTP/2 requires requests built with a full absolute URI so hyper can
+    // populate the mandatory `:authority` pseudo-header. Using only the path
+    // (e.g. "/echo") emits a HEADERS frame with no `:authority`, which
+    // strict HTTP/2 servers (Envoy) reject as a "Violation in HTTP
+    // messaging rule" protocol error — GOAWAY + broken pipe on every
+    // stream, 0 RPS. See RFC 9113 §8.3.1.
+    let authority = format!("{host}:{port}");
+    let request_uri = format!(
+        "{}://{}{}",
+        if is_tls { "https" } else { "http" },
+        authority,
+        url.path()
+    );
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
 
     let tls_cfg = if is_tls {
-        Some(Arc::new(tls_utils::make_client_tls_config_insecure()))
+        // Force ALPN to h2-only on the client side. The shared
+        // `make_client_tls_config_insecure()` helper defaults to
+        // `["h2", "http/1.1"]`; against a strict server that ONLY advertises
+        // `["h2"]` (e.g. Envoy with the h2 route config), some TLS stacks
+        // have been observed to negotiate http/1.1 when both sides offer
+        // the protocol in different orders — the downstream hyper h2
+        // handshake then fails on the first send_request, producing the
+        // classic 0 RPS / 100 errors pattern. Offering only h2 guarantees
+        // we either get h2 or fail the TLS handshake cleanly.
+        let mut cfg = tls_utils::make_client_tls_config_insecure();
+        cfg.alpn_protocols = vec![b"h2".to_vec()];
+        Some(Arc::new(cfg))
     } else {
         None
     };
@@ -336,12 +359,12 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     let mut handles = Vec::new();
     for i in 0..args.concurrency {
         let mut send_req = senders[i as usize % num_conns].clone();
-        let path = path.clone();
+        let uri = request_uri.clone();
         let payload = payload.clone();
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
             while Instant::now() < deadline {
-                let req = hyper::Request::post(&path)
+                let req = hyper::Request::post(&uri)
                     .body(http_body_util::Full::new(payload.clone()))
                     .unwrap();
                 let start = Instant::now();
@@ -674,7 +697,7 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
     let use_tls = args.tls;
 
     let tls_cfg = if use_tls {
-        Some(Arc::new(tls_utils::make_client_tls_config_insecure()))
+        Some(Arc::new(tls_utils::make_client_tls_config_insecure_raw()))
     } else {
         None
     };
@@ -740,18 +763,44 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                             tokio::task::yield_now().await;
                         }
                     }
+                    // Shut down the write half cleanly so the peer sees EOF
+                    // and stops echoing. Without this, the writer task drops
+                    // `wr` at deadline in the middle of a repeated payload
+                    // cycle — the LAST payload is only partially sent, the
+                    // reader is mid-way through a `read_exact(payload.len())`
+                    // that will never complete (the remaining bytes will
+                    // never arrive because we're no longer writing), and the
+                    // TCP FIN is never issued because `rd` on the other task
+                    // still keeps the TlsStream alive. Reader hangs forever
+                    // until the process wallclock-kills. Reproduced locally
+                    // at 500 KiB × 100 conns: ~6/100 connections wedge in
+                    // ESTABLISHED with half-received payloads.
+                    let _ = wr.shutdown().await;
                     Ok(())
                 });
 
+                // Read with a short per-attempt timeout so a stalled backend
+                // or partial echo cannot wedge the task indefinitely. 5s is
+                // generous — a healthy 5 MiB read at concurrency 25 completes
+                // in <250ms on localhost, so any stall beyond that is a real
+                // failure that should be surfaced, not papered over.
                 let mut buf = vec![0u8; payload.len()];
                 while Instant::now() < deadline {
                     let start = Instant::now();
-                    match rd.read_exact(&mut buf).await {
-                        Ok(_) => {
+                    let read_timeout = Duration::from_secs(5);
+                    match tokio::time::timeout(read_timeout, rd.read_exact(&mut buf)).await {
+                        Ok(Ok(_)) => {
                             let latency = start.elapsed().as_micros() as u64;
                             metrics.record(latency, buf.len());
                         }
+                        Ok(Err(_)) => {
+                            metrics.record_error();
+                            break;
+                        }
                         Err(_) => {
+                            // Read timeout — no bytes flowing. Record as an
+                            // error and bail so the bench doesn't wallclock
+                            // itself into oblivion on a wedged connection.
                             metrics.record_error();
                             break;
                         }

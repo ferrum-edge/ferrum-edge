@@ -7,225 +7,12 @@
 //! - Round-robin load balancing across upstream targets
 //! - upstream_id persistence (read back from DB matches what was written)
 //!
-//! Run with: cargo test --test functional_db_upstream_test -- --ignored --nocapture
+//! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_db_upstream
 
-use chrono::Utc;
-use jsonwebtoken::{EncodingKey, Header, encode};
+use crate::common::{TestGateway, spawn_http_identifying};
 use serde_json::json;
 use std::collections::HashMap;
-use std::process::{Child, Command};
-use std::time::{Duration, SystemTime};
-use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use uuid::Uuid;
-
-// ============================================================================
-// Identifying Echo Server — each backend returns its own identity
-// ============================================================================
-
-async fn start_identifying_server(port: u16, name: &'static str) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap_or_else(|_| panic!("Failed to bind server {} on port {}", name, port));
-
-    loop {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let server_name = name;
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]).to_string();
-
-                let path = request
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap_or("/");
-
-                let body = format!(r#"{{"server":"{}","path":"{}"}}"#, server_name, path);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            });
-        }
-    }
-}
-
-// ============================================================================
-// Test Harness
-// ============================================================================
-
-struct DbUpstreamTestHarness {
-    temp_dir: TempDir,
-    gateway_process: Option<Child>,
-    proxy_base_url: String,
-    admin_base_url: String,
-    jwt_secret: String,
-    jwt_issuer: String,
-    admin_port: u16,
-    proxy_port: u16,
-}
-
-impl DbUpstreamTestHarness {
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-upstream-secret-key-1234567890".to_string();
-        let jwt_issuer = "ferrum-edge-test".to_string();
-
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
-        Ok(Self {
-            temp_dir,
-            gateway_process: None,
-            proxy_base_url: format!("http://127.0.0.1:{}", proxy_port),
-            admin_base_url: format!("http://127.0.0.1:{}", admin_port),
-            jwt_secret,
-            jwt_issuer,
-            admin_port,
-            proxy_port,
-        })
-    }
-
-    fn db_path(&self) -> String {
-        self.temp_dir
-            .path()
-            .join("test.db")
-            .to_string_lossy()
-            .to_string()
-    }
-
-    /// Reallocate ephemeral ports after a failed startup attempt.
-    async fn reallocate_ports(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        self.admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        self.proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
-        self.admin_base_url = format!("http://127.0.0.1:{}", self.admin_port);
-        self.proxy_base_url = format!("http://127.0.0.1:{}", self.proxy_port);
-        Ok(())
-    }
-
-    /// Start the gateway, retrying up to 3 times with fresh ports to handle
-    /// ephemeral port races.
-    async fn start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match self.try_start_gateway().await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "start_gateway attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        self.reallocate_ports().await?;
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to start gateway after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    async fn try_start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let db_url = format!("sqlite:{}?mode=rwc", self.db_path());
-
-        let build_status = Command::new("cargo").args(["build"]).status()?;
-        if !build_status.success() {
-            return Err("Failed to build ferrum-edge".into());
-        }
-
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-            "./target/debug/ferrum-edge"
-        } else {
-            "./target/release/ferrum-edge"
-        };
-
-        let child = Command::new(binary_path)
-            .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
-            .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", &db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2")
-            .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "info")
-            .spawn()?;
-
-        self.gateway_process = Some(child);
-        match self.wait_for_health().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if let Some(mut child) = self.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway did not start within 30 seconds".into());
-            }
-            match reqwest::get(&health_url).await {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                _ => tokio::time::sleep(Duration::from_millis(500)).await,
-            }
-        }
-    }
-
-    fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let now = Utc::now();
-        let claims = json!({
-            "iss": self.jwt_issuer,
-            "sub": "test-admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
-            "jti": Uuid::new_v4().to_string()
-        });
-        let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
-        Ok(encode(&header, &claims, &key)?)
-    }
-}
-
-impl Drop for DbUpstreamTestHarness {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
+use std::time::Duration;
 
 fn parse_server_name(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
@@ -243,53 +30,39 @@ fn parse_server_name(body: &str) -> String {
 async fn test_database_mode_upstream_load_balancing() {
     println!("\n=== Starting Database Mode Upstream Load Balancing Test ===\n");
 
-    // Allocate ports for backend servers
-    let mut backend_ports = Vec::new();
-    for _ in 0..3 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("Failed to bind backend listener");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        backend_ports.push(port);
-    }
-
-    // Start 3 identifying backend servers
-    let s1_port = backend_ports[0];
-    let s2_port = backend_ports[1];
-    let s3_port = backend_ports[2];
-
-    // We need 'static str for the server names, but we use ports to distinguish
-    let s1 = tokio::spawn(start_identifying_server(s1_port, "server1"));
-    let s2 = tokio::spawn(start_identifying_server(s2_port, "server2"));
-    let s3 = tokio::spawn(start_identifying_server(s3_port, "server3"));
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Start 3 identifying backend servers (listeners held by the harness — no
+    // bind-drop-rebind race).
+    let mut s1 = spawn_http_identifying("server1")
+        .await
+        .expect("Failed to spawn server1");
+    let mut s2 = spawn_http_identifying("server2")
+        .await
+        .expect("Failed to spawn server2");
+    let mut s3 = spawn_http_identifying("server3")
+        .await
+        .expect("Failed to spawn server3");
 
     println!(
         "Backend servers started on ports: {}, {}, {}",
-        s1_port, s2_port, s3_port
+        s1.port, s2.port, s3.port
     );
 
-    // Start gateway in database mode
-    let mut harness = DbUpstreamTestHarness::new()
-        .await
-        .expect("Failed to create test harness");
-
-    println!("Test harness created:");
-    println!("  Database: {}", harness.db_path());
-    println!("  Proxy URL: {}", harness.proxy_base_url);
-    println!("  Admin URL: {}", harness.admin_base_url);
-
-    harness
-        .start_gateway()
+    // Start gateway in database mode.
+    let mut gateway = TestGateway::builder()
+        .mode_database_sqlite()
+        .jwt_issuer("ferrum-edge-test")
+        .log_level("info")
+        .db_poll_interval_seconds(2)
+        .spawn()
         .await
         .expect("Failed to start gateway");
 
+    println!("Test harness created:");
+    println!("  Proxy URL: {}", gateway.proxy_url(""));
+    println!("  Admin URL: {}", gateway.admin_url(""));
+
     let client = reqwest::Client::new();
-    let token = harness
-        .generate_token()
-        .expect("Failed to generate JWT token");
-    let auth_header = format!("Bearer {}", token);
+    let auth_header = gateway.auth_header();
 
     // Step 1: Create an upstream with 3 targets via Admin API
     println!("\n--- Step 1: Create Upstream ---");
@@ -298,14 +71,14 @@ async fn test_database_mode_upstream_load_balancing() {
         "name": "Round Robin DB Upstream",
         "algorithm": "round_robin",
         "targets": [
-            { "host": "127.0.0.1", "port": s1_port, "weight": 1 },
-            { "host": "127.0.0.1", "port": s2_port, "weight": 1 },
-            { "host": "127.0.0.1", "port": s3_port, "weight": 1 }
+            { "host": "127.0.0.1", "port": s1.port, "weight": 1 },
+            { "host": "127.0.0.1", "port": s2.port, "weight": 1 },
+            { "host": "127.0.0.1", "port": s3.port, "weight": 1 }
         ]
     });
 
     let response = client
-        .post(format!("{}/upstreams", harness.admin_base_url))
+        .post(gateway.admin_url("/upstreams"))
         .header("Authorization", &auth_header)
         .json(&upstream_data)
         .send()
@@ -322,10 +95,7 @@ async fn test_database_mode_upstream_load_balancing() {
     // Step 2: Verify upstream was persisted
     println!("\n--- Step 2: Verify Upstream ---");
     let response = client
-        .get(format!(
-            "{}/upstreams/upstream-rr-db",
-            harness.admin_base_url
-        ))
+        .get(gateway.admin_url("/upstreams/upstream-rr-db"))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -344,13 +114,13 @@ async fn test_database_mode_upstream_load_balancing() {
         "listen_path": "/lb-api",
         "backend_protocol": "http",
         "backend_host": "127.0.0.1",
-        "backend_port": s1_port,
+        "backend_port": s1.port,
         "strip_listen_path": true,
         "upstream_id": "upstream-rr-db"
     });
 
     let response = client
-        .post(format!("{}/proxies", harness.admin_base_url))
+        .post(gateway.admin_url("/proxies"))
         .header("Authorization", &auth_header)
         .json(&proxy_data)
         .send()
@@ -367,7 +137,7 @@ async fn test_database_mode_upstream_load_balancing() {
     // Step 4: Verify proxy has upstream_id persisted
     println!("\n--- Step 4: Verify Proxy upstream_id ---");
     let response = client
-        .get(format!("{}/proxies/lb-proxy-db", harness.admin_base_url))
+        .get(gateway.admin_url("/proxies/lb-proxy-db"))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -393,7 +163,7 @@ async fn test_database_mode_upstream_load_balancing() {
 
     for i in 0..30 {
         let resp = client
-            .get(format!("{}/lb-api/test-{}", harness.proxy_base_url, i))
+            .get(gateway.proxy_url(&format!("/lb-api/test-{}", i)))
             .send()
             .await;
 
@@ -441,13 +211,13 @@ async fn test_database_mode_upstream_load_balancing() {
         "listen_path": "/lb-api",
         "backend_protocol": "http",
         "backend_host": "127.0.0.1",
-        "backend_port": s1_port,
+        "backend_port": s1.port,
         "strip_listen_path": true,
         "upstream_id": null
     });
 
     let response = client
-        .put(format!("{}/proxies/lb-proxy-db", harness.admin_base_url))
+        .put(gateway.admin_url("/proxies/lb-proxy-db"))
         .header("Authorization", &auth_header)
         .json(&updated_proxy_data)
         .send()
@@ -462,7 +232,7 @@ async fn test_database_mode_upstream_load_balancing() {
 
     // Verify upstream_id is now null
     let response = client
-        .get(format!("{}/proxies/lb-proxy-db", harness.admin_base_url))
+        .get(gateway.admin_url("/proxies/lb-proxy-db"))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -484,7 +254,7 @@ async fn test_database_mode_upstream_load_balancing() {
     let mut direct_counts: HashMap<String, u32> = HashMap::new();
     for i in 0..10 {
         let resp = client
-            .get(format!("{}/lb-api/direct-{}", harness.proxy_base_url, i))
+            .get(gateway.proxy_url(&format!("/lb-api/direct-{}", i)))
             .send()
             .await;
 
@@ -516,6 +286,7 @@ async fn test_database_mode_upstream_load_balancing() {
     println!("Direct routing verified: all traffic to server1");
 
     // Cleanup
+    gateway.shutdown();
     s1.abort();
     s2.abort();
     s3.abort();

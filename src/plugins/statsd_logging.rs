@@ -2,9 +2,8 @@
 //!
 //! Extracts metrics from `TransactionSummary` and `StreamTransactionSummary`
 //! entries and sends them to a StatsD-compatible server (StatsD, Datadog,
-//! Telegraf, etc.) over UDP. Uses an mpsc channel to decouple the proxy hot
-//! path from socket I/O: the `log()` hook enqueues the entry (non-blocking),
-//! and a background task formats and sends metrics in batches.
+//! Telegraf, etc.) over UDP. Uses `BatchingLogger<MetricEntry>` to decouple
+//! the proxy hot path from socket I/O.
 //!
 //! Hostname resolution uses the gateway's shared `DnsCache` (pre-warmed via
 //! `warmup_hostnames()`) with TTL, stale-while-revalidate, and background
@@ -14,13 +13,14 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::net::{IpAddr, SocketAddr};
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
-use tokio::time::{Duration, Instant};
-use tracing::warn;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use tokio::time::Instant;
 
-use super::utils::PluginHttpClient;
+use super::utils::{
+    BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
+    UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, resolve_udp_endpoint,
+};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
 
@@ -43,24 +43,25 @@ fn sanitize_tag_value(input: &str) -> String {
     out
 }
 
-/// Union type for entries sent through the channel.
-#[derive(Clone)]
-enum MetricEntry {
-    Http(TransactionSummary),
-    Stream(StreamTransactionSummary),
-}
+type MetricEntry = SummaryLogEntry;
 
-struct StatsdConfig {
+#[derive(Clone)]
+struct StatsdFlushConfig {
     hostname: String,
     port: u16,
     prefix: String,
     global_tags: String,
-    flush_interval: Duration,
-    max_batch_lines: usize,
+    dns_cache: Option<DnsCache>,
+}
+
+struct StatsdFlushState {
+    socket: Option<tokio::net::UdpSocket>,
+    current_addr: Option<SocketAddr>,
+    last_resolve: Instant,
 }
 
 pub struct StatsdLogging {
-    sender: mpsc::Sender<MetricEntry>,
+    logger: BatchingLogger<MetricEntry>,
     hostname: String,
 }
 
@@ -83,26 +84,17 @@ impl StatsdLogging {
 
         let ns = http_client.namespace();
         let prefix = config["prefix"].as_str().unwrap_or(ns).to_string();
-
-        // Build a global tags suffix string (DogStatsD/Datadog extension).
-        // Config: {"global_tags": {"env": "prod", "region": "us-east-1"}}
-        // When namespace is non-default and not already present in global_tags,
-        // inject a namespace tag automatically for metric isolation.
         let global_tags = {
             let mut pairs: Vec<String> = if let Some(tags_obj) = config["global_tags"].as_object() {
                 tags_obj
                     .iter()
-                    .map(|(k, v)| {
-                        let val = v.as_str().unwrap_or("");
-                        format!("{k}:{val}")
-                    })
+                    .map(|(key, value)| format!("{key}:{}", value.as_str().unwrap_or("")))
                     .collect()
             } else {
                 Vec::new()
             };
-            // Auto-inject namespace tag when non-default.
             if ns != crate::config::types::DEFAULT_NAMESPACE
-                && !pairs.iter().any(|p| p.starts_with("namespace:"))
+                && !pairs.iter().any(|pair| pair.starts_with("namespace:"))
             {
                 pairs.push(format!("namespace:{ns}"));
             }
@@ -113,26 +105,43 @@ impl StatsdLogging {
             }
         };
 
-        let flush_interval_ms = config["flush_interval_ms"].as_u64().unwrap_or(500).max(50);
-        let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
-        let max_batch_lines = config["max_batch_lines"].as_u64().unwrap_or(50).max(1) as usize;
-
-        let statsd_config = StatsdConfig {
+        let flush_config = StatsdFlushConfig {
             hostname: host.clone(),
             port: port as u16,
             prefix,
             global_tags,
-            flush_interval: Duration::from_millis(flush_interval_ms),
-            max_batch_lines,
+            dns_cache: http_client.dns_cache().cloned(),
         };
-
-        let dns_cache = http_client.dns_cache().cloned();
-
-        let (sender, receiver) = mpsc::channel(buffer_capacity);
-        tokio::spawn(flush_loop(receiver, statsd_config, dns_cache));
+        let state = Arc::new(Mutex::new(StatsdFlushState {
+            socket: None,
+            current_addr: None,
+            last_resolve: Instant::now(),
+        }));
+        let logger = BatchingLogger::spawn(
+            // Config remains `max_retries`; the shared retry policy counts the
+            // initial attempt plus those retries.
+            build_batch_config(
+                config,
+                "statsd_logging",
+                BatchConfigDefaults {
+                    batch_size_key: "max_batch_lines",
+                    batch_size: 50,
+                    flush_interval_ms: 500,
+                    min_flush_interval_ms: 50,
+                    buffer_capacity: 10000,
+                    max_retries: 0,
+                    retry_delay_ms: 0,
+                },
+            ),
+            move |batch| {
+                let flush_config = flush_config.clone();
+                let state = Arc::clone(&state);
+                async move { send_batch(&flush_config, &state, batch).await }
+            },
+        );
 
         Ok(Self {
-            sender,
+            logger,
             hostname: host,
         })
     }
@@ -153,23 +162,11 @@ impl Plugin for StatsdLogging {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        if self
-            .sender
-            .try_send(MetricEntry::Http(summary.clone()))
-            .is_err()
-        {
-            warn!("StatsD logging buffer full — dropping log entry");
-        }
+        self.logger.try_send(summary.into());
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        if self
-            .sender
-            .try_send(MetricEntry::Stream(summary.clone()))
-            .is_err()
-        {
-            warn!("StatsD logging buffer full — dropping stream log entry");
-        }
+        self.logger.try_send(summary.into());
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -184,9 +181,6 @@ fn format_http_metrics(
     global_tags: &str,
     buf: &mut String,
 ) {
-    // Per-request tags: method, status, proxy. Operator-controlled values
-    // (proxy name/id) are sanitized so that delimiters in the name don't
-    // corrupt downstream parsing.
     let method = sanitize_tag_value(&summary.http_method);
     let status = summary.response_status_code;
     let status_class = format!("{}xx", status / 100);
@@ -202,49 +196,33 @@ fn format_http_metrics(
         extra = if global_tags.is_empty() {
             String::new()
         } else {
-            // global_tags already starts with "|#", strip the "|#" and prepend ","
             format!(",{}", &global_tags[2..])
         }
     );
 
-    // Counter: request count
     use std::fmt::Write;
     let _ = writeln!(buf, "{prefix}.request.count:1|c{tags}");
-
-    // Timer: total latency (ms)
     let _ = writeln!(
         buf,
         "{prefix}.request.latency_total_ms:{:.2}|ms{tags}",
         summary.latency_total_ms,
     );
-
-    // Timer: backend TTFB (ms)
     let _ = writeln!(
         buf,
         "{prefix}.request.latency_backend_ttfb_ms:{:.2}|ms{tags}",
         summary.latency_backend_ttfb_ms,
     );
-
-    // Timer: gateway overhead (ms)
     let _ = writeln!(
         buf,
         "{prefix}.request.latency_gateway_overhead_ms:{:.2}|ms{tags}",
         summary.latency_gateway_overhead_ms,
     );
-
-    // Timer: plugin execution (ms)
     let _ = writeln!(
         buf,
         "{prefix}.request.latency_plugin_execution_ms:{:.2}|ms{tags}",
         summary.latency_plugin_execution_ms,
     );
-
-    // Counter: status code bucket
     let _ = writeln!(buf, "{prefix}.request.status.{status_class}:1|c{tags}");
-
-    // Counter: client disconnect (client aborted before receiving the full
-    // response). Only emitted when the flag is set so that every request
-    // doesn't carry a zero-valued counter through the line protocol.
     if summary.client_disconnected {
         let _ = writeln!(buf, "{prefix}.request.client_disconnect:1|c{tags}");
     }
@@ -266,9 +244,6 @@ fn format_stream_metrics(
         "false"
     };
 
-    // Bounded-cardinality enum values from DisconnectCause / Direction.
-    // Falls back to "unknown" when the field is None so dashboards can filter
-    // on a consistent value set.
     let cause_tag = match summary.disconnect_cause {
         Some(crate::plugins::DisconnectCause::IdleTimeout) => "idle_timeout",
         Some(crate::plugins::DisconnectCause::RecvError) => "recv_error",
@@ -293,173 +268,30 @@ fn format_stream_metrics(
     );
 
     use std::fmt::Write;
-
-    // Counter: stream connection count
     let _ = writeln!(buf, "{prefix}.stream.count:1|c{tags}");
-
-    // Timer: stream duration (ms)
     let _ = writeln!(
         buf,
         "{prefix}.stream.duration_ms:{:.2}|ms{tags}",
         summary.duration_ms,
     );
-
-    // Gauge: bytes sent/received
     let _ = writeln!(
         buf,
         "{prefix}.stream.bytes_sent:{}|g{tags}",
-        summary.bytes_sent,
+        summary.bytes_sent
     );
     let _ = writeln!(
         buf,
         "{prefix}.stream.bytes_received:{}|g{tags}",
         summary.bytes_received,
     );
-
-    // Counter: stream disconnect, labelled by cause and direction via the
-    // composed `tags` above. Always emitted (including on clean shutdowns)
-    // so dashboards can compute graceful-vs-error ratios directly.
     let _ = writeln!(buf, "{prefix}.stream.disconnect:1|c{tags}");
 }
 
-/// Resolve the StatsD hostname to an IP address. Uses the gateway's DNS cache
-/// when available (pre-warmed, TTL-aware, stale-while-revalidate). Falls back
-/// to `tokio::net::lookup_host` when no cache is present (tests / fallback).
-async fn resolve_host(
-    hostname: &str,
-    port: u16,
-    dns_cache: &Option<DnsCache>,
-) -> Option<SocketAddr> {
-    if let Some(cache) = dns_cache {
-        match cache.resolve(hostname, None, None).await {
-            Ok(ip) => return Some(SocketAddr::new(ip, port)),
-            Err(e) => {
-                warn!(
-                    "statsd_logging: DNS cache resolution failed for '{hostname}': {e} — falling back to system DNS"
-                );
-            }
-        }
-    }
-
-    // Fallback: direct lookup (tests or when DNS cache is unavailable).
-    let addr_str = format!("{hostname}:{port}");
-    match tokio::net::lookup_host(&addr_str).await {
-        Ok(mut addrs) => addrs.next(),
-        Err(e) => {
-            warn!("statsd_logging: failed to resolve '{addr_str}': {e}");
-            None
-        }
-    }
-}
-
-/// Bind a UDP socket whose address family matches the resolved endpoint.
-async fn bind_and_connect(addr: SocketAddr) -> Option<UdpSocket> {
-    let bind_addr = if addr.ip() == IpAddr::from([0u8; 16]) || addr.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let socket = match UdpSocket::bind(bind_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("statsd_logging: failed to bind UDP socket: {e}");
-            return None;
-        }
-    };
-    if let Err(e) = socket.connect(addr).await {
-        warn!("statsd_logging: failed to connect UDP socket to {addr}: {e}");
-        return None;
-    }
-    Some(socket)
-}
-
-/// How often to re-resolve the StatsD hostname even when sends succeed. DNS is
-/// also re-checked opportunistically on send failures.
-const RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
-
-async fn flush_loop(
-    mut receiver: mpsc::Receiver<MetricEntry>,
-    cfg: StatsdConfig,
-    dns_cache: Option<DnsCache>,
-) {
-    // Initial resolve. If it fails we still drain the channel so producers
-    // don't backpressure the hot path — metrics are dropped until the DNS
-    // situation improves on restart.
-    let mut current_addr = match resolve_host(&cfg.hostname, cfg.port, &dns_cache).await {
-        Some(addr) => addr,
-        None => {
-            warn!(
-                "statsd_logging: could not resolve '{}:{}' — metrics will be lost",
-                cfg.hostname, cfg.port
-            );
-            while receiver.recv().await.is_some() {}
-            return;
-        }
-    };
-    let mut socket = match bind_and_connect(current_addr).await {
-        Some(s) => s,
-        None => {
-            while receiver.recv().await.is_some() {}
-            return;
-        }
-    };
-    let mut last_resolve = Instant::now();
-
-    let mut buffer: Vec<MetricEntry> = Vec::with_capacity(cfg.max_batch_lines);
-    let mut timer = tokio::time::interval(cfg.flush_interval);
-    timer.tick().await; // consume immediate first tick
-
-    loop {
-        // Opportunistic re-resolve. Stale DNS is the main reason StatsD
-        // traffic silently goes into a black hole; 60s is a compromise
-        // between reactivity and resolver load. Always advance the timer
-        // when the interval elapses so a transient DNS failure doesn't pin
-        // the loop into re-resolving on every iteration.
-        if last_resolve.elapsed() >= RE_RESOLVE_INTERVAL {
-            last_resolve = Instant::now();
-            if let Some(new_addr) = resolve_host(&cfg.hostname, cfg.port, &dns_cache).await
-                && new_addr != current_addr
-                && let Some(new_sock) = bind_and_connect(new_addr).await
-            {
-                current_addr = new_addr;
-                socket = new_sock;
-            }
-        }
-
-        tokio::select! {
-            biased;
-
-            msg = receiver.recv() => {
-                match msg {
-                    Some(entry) => {
-                        buffer.push(entry);
-                        if buffer.len() >= cfg.max_batch_lines {
-                            let batch = std::mem::take(&mut buffer);
-                            send_batch(&socket, &cfg, batch).await;
-                        }
-                    }
-                    None => {
-                        // Channel closed — flush remaining entries and exit.
-                        if !buffer.is_empty() {
-                            let batch = std::mem::take(&mut buffer);
-                            send_batch(&socket, &cfg, batch).await;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            _ = timer.tick() => {
-                if !buffer.is_empty() {
-                    let batch = std::mem::take(&mut buffer);
-                    send_batch(&socket, &cfg, batch).await;
-                }
-            }
-        }
-    }
-}
-
-async fn send_batch(socket: &UdpSocket, cfg: &StatsdConfig, batch: Vec<MetricEntry>) {
+async fn send_batch(
+    cfg: &StatsdFlushConfig,
+    state: &Mutex<StatsdFlushState>,
+    batch: Vec<MetricEntry>,
+) -> Result<(), String> {
     let mut payload = String::with_capacity(batch.len() * 128);
     for entry in &batch {
         match entry {
@@ -473,40 +305,88 @@ async fn send_batch(socket: &UdpSocket, cfg: &StatsdConfig, batch: Vec<MetricEnt
     }
 
     if payload.is_empty() {
-        return;
+        return Ok(());
     }
 
-    // StatsD servers accept newline-delimited metrics in a single UDP packet.
-    // Max safe UDP payload is ~1472 bytes (MTU 1500 - IP/UDP headers).
-    // Split into chunks if payload exceeds that.
-    const MAX_UDP_PAYLOAD: usize = 1472;
+    let (mut socket, mut current_addr, mut last_resolve) = {
+        let mut state = state
+            .lock()
+            .map_err(|_| "statsd_logging: flush state lock poisoned".to_string())?;
+        (state.socket.take(), state.current_addr, state.last_resolve)
+    };
 
-    if payload.len() <= MAX_UDP_PAYLOAD {
-        if let Err(e) = socket.send(payload.as_bytes()).await {
-            warn!("statsd_logging: failed to send metrics: {e}");
+    if socket.is_none() {
+        let resolved_addr = resolve_udp_endpoint(
+            &cfg.hostname,
+            cfg.port,
+            cfg.dns_cache.as_ref(),
+            "statsd_logging",
+        )
+        .await?;
+        let new_socket = bind_connected_udp_socket(resolved_addr, "statsd_logging").await?;
+        current_addr = Some(resolved_addr);
+        socket = Some(new_socket);
+        last_resolve = Instant::now();
+    }
+
+    if last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
+        last_resolve = Instant::now();
+        if let Ok(new_addr) = resolve_udp_endpoint(
+            &cfg.hostname,
+            cfg.port,
+            cfg.dns_cache.as_ref(),
+            "statsd_logging",
+        )
+        .await
+            && current_addr != Some(new_addr)
+            && let Ok(new_socket) = bind_connected_udp_socket(new_addr, "statsd_logging").await
+        {
+            current_addr = Some(new_addr);
+            socket = Some(new_socket);
         }
-    } else {
-        // Split on newline boundaries, packing as many lines per packet as fit.
-        let mut chunk = String::with_capacity(MAX_UDP_PAYLOAD);
-        for line in payload.lines() {
-            // +1 for the newline we'll re-add
-            if !chunk.is_empty() && chunk.len() + line.len() + 1 > MAX_UDP_PAYLOAD {
-                if let Err(e) = socket.send(chunk.as_bytes()).await {
-                    warn!("statsd_logging: failed to send metrics chunk: {e}");
+    }
+
+    let result = if let Some(socket) = socket.as_ref() {
+        const MAX_UDP_PAYLOAD: usize = 1472;
+        if payload.len() <= MAX_UDP_PAYLOAD {
+            socket
+                .send(payload.as_bytes())
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("statsd_logging: failed to send metrics: {error}"))
+        } else {
+            let mut chunk = String::with_capacity(MAX_UDP_PAYLOAD);
+            for line in payload.lines() {
+                if !chunk.is_empty() && chunk.len() + line.len() + 1 > MAX_UDP_PAYLOAD {
+                    socket.send(chunk.as_bytes()).await.map_err(|error| {
+                        format!("statsd_logging: failed to send metrics chunk: {error}")
+                    })?;
+                    chunk.clear();
                 }
-                chunk.clear();
+                if !chunk.is_empty() {
+                    chunk.push('\n');
+                }
+                chunk.push_str(line);
             }
             if !chunk.is_empty() {
-                chunk.push('\n');
+                socket.send(chunk.as_bytes()).await.map_err(|error| {
+                    format!("statsd_logging: failed to send metrics chunk: {error}")
+                })?;
             }
-            chunk.push_str(line);
+            Ok(())
         }
-        if !chunk.is_empty()
-            && let Err(e) = socket.send(chunk.as_bytes()).await
-        {
-            warn!("statsd_logging: failed to send metrics chunk: {e}");
-        }
-    }
+    } else {
+        Err("statsd_logging: UDP socket unavailable after initialization".to_string())
+    };
+
+    let mut state = state
+        .lock()
+        .map_err(|_| "statsd_logging: flush state lock poisoned".to_string())?;
+    state.socket = socket;
+    state.current_addr = current_addr;
+    state.last_resolve = last_resolve;
+
+    result
 }
 
 #[cfg(test)]
@@ -515,7 +395,6 @@ mod tests {
 
     #[test]
     fn sanitize_tag_value_replaces_delimiters() {
-        // StatsD/DogStatsD tag delimiters must not survive in tag values.
         assert_eq!(sanitize_tag_value("foo,bar"), "foo_bar");
         assert_eq!(sanitize_tag_value("foo|bar"), "foo_bar");
         assert_eq!(sanitize_tag_value("foo#bar"), "foo_bar");
@@ -542,12 +421,6 @@ mod tests {
 
     #[test]
     fn sanitize_tag_value_mixed_attack_string() {
-        // The motivating case: an operator-controlled proxy name that
-        // contains several delimiters should be fully neutralized.
-        assert_eq!(
-            sanitize_tag_value("evil,|#:proxy"),
-            "evil____proxy",
-            "delimiter injection must not survive sanitization"
-        );
+        assert_eq!(sanitize_tag_value("evil,|#:proxy"), "evil____proxy");
     }
 }

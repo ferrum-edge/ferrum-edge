@@ -1546,9 +1546,9 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
-        "udp_rate_limiting" => Ok(Some(Arc::new(udp_rate_limiting::UdpRateLimiting::new(
-            config,
-        )?))),
+        "udp_rate_limiting" => Ok(Some(Arc::new(
+            udp_rate_limiting::UdpRateLimiting::new_with_http_client(config, http_client.clone())?,
+        ))),
         "spec_expose" => Ok(Some(Arc::new(spec_expose::SpecExpose::new(
             config,
             http_client,

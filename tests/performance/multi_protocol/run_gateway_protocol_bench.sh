@@ -94,11 +94,19 @@ supports() {
     #   Docker image bundles no third-party H2-upstream module. So a
     #   Kong/http2 row would measure client→H2→Kong→H1→backend, i.e. not
     #   uniform H2 end-to-end. http2 therefore excludes kong.
+    #
+    # - Tyk tcp-tls: Tyk Gateway v5.3 rejects per-API `listen_port` +
+    #   `protocol: "tls"` definitions with "trying to open disabled
+    #   port" unless the port is pre-registered at the gateway level,
+    #   which requires enterprise/custom-domain config the OSS image
+    #   doesn't ship. Documented as a Tyk OSS limitation, not a bench
+    #   harness bug. Remove once Tyk OSS supports secondary TCP/TLS
+    #   listener ports or the bench config moves Tyk TCP onto :8443.
     case "$gw:$proto" in
         ferrum:*)  return 0 ;;
         envoy:http1-tls|envoy:http2|envoy:http3|envoy:grpcs|envoy:wss|envoy:tcp-tls|envoy:udp) return 0 ;;
         kong:http1-tls|kong:grpcs|kong:wss|kong:tcp-tls|kong:udp) return 0 ;;
-        tyk:http1-tls|tyk:http2|tyk:grpcs|tyk:wss|tyk:tcp-tls) return 0 ;;
+        tyk:http1-tls|tyk:http2|tyk:grpcs|tyk:wss) return 0 ;;
         krakend:http1-tls|krakend:http2) return 0 ;;
         *) return 1 ;;
     esac
@@ -126,7 +134,7 @@ bench_params() {
         http1-tls) echo "http1 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3447/echo" ;;
         http2)     echo "http2 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3443/echo" ;;
         http3)     echo "http3 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3445/echo" ;;
-        grpcs)     echo "grpc https://127.0.0.1:${GATEWAY_HTTPS_PORT} https://127.0.0.1:50053 --ca-cert ${CERT_DIR}/cert.pem" ;;
+        grpcs)     echo "grpc https://127.0.0.1:${GATEWAY_HTTPS_PORT} https://127.0.0.1:50053 --ca-cert ${CERT_DIR}/ca.pem" ;;
         wss)       echo "ws wss://127.0.0.1:${GATEWAY_HTTPS_PORT}/ws wss://127.0.0.1:3446" ;;
         tcp-tls)   echo "tcp 127.0.0.1:${GATEWAY_TCP_TLS_PORT} 127.0.0.1:3444 --tls" ;;
         udp)       echo "udp 127.0.0.1:${GATEWAY_UDP_PORT} 127.0.0.1:3005" ;;
@@ -208,7 +216,7 @@ start_backend() {
             echo "[backend] healthy (pid $BACKEND_PID)"
             # Wait for cert generation
             for j in $(seq 1 10); do
-                [ -f "$CERT_DIR/cert.pem" ] && break
+                [ -f "$CERT_DIR/ca.pem" ] && [ -f "$CERT_DIR/cert.pem" ] && break
                 sleep 0.5
             done
             return
@@ -255,13 +263,13 @@ start_ferrum() {
         -e "FERRUM_ADD_FORWARDED_HEADER=false" \
         -e "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0" \
         -e "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0" \
+        -e "FERRUM_MAX_GRPC_RECV_SIZE_BYTES=0" \
         -e "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0" \
         -e "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0" \
         -e "FERRUM_MAX_CONNECTIONS=0" \
         -e "FERRUM_POOL_MAX_IDLE_PER_HOST=200" \
         -e "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true" \
         -e "FERRUM_POOL_WARMUP_ENABLED=true" \
-        -e "FERRUM_TLS_NO_VERIFY=true" \
         -e "FERRUM_WEBSOCKET_TUNNEL_MODE=true" \
         -e "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608" \
         -e "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432" \
@@ -271,6 +279,8 @@ start_ferrum() {
         -e "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000" \
         -e "FERRUM_UDP_MAX_SESSIONS=10000" \
         -e "FERRUM_UDP_RECVMMSG_BATCH_SIZE=64" \
+        -e "FERRUM_TCP_IDLE_TIMEOUT_SECONDS=30" \
+        -e "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=30" \
         "${extra_env[@]}" \
         "$FERRUM_IMAGE")
 
@@ -299,9 +309,14 @@ ferrum_config_name() {
 start_envoy() {
     local cfg_src="$SCRIPT_DIR/configs/envoy/$(envoy_config_name)"
     local cfg_dst="$SCRIPT_DIR/envoy_runtime.yaml"
-    # Substitute CERT_PATH/KEY_PATH to mount points inside container
+    # Substitute CERT_PATH / KEY_PATH / CA_PATH to mount points inside
+    # container. CA_PATH is a separate placeholder (not reused as
+    # CERT_PATH) so run_protocol_test.sh can point it at an absolute
+    # host path when running Envoy directly, without Envoy container
+    # mount assumptions.
     sed -e "s|CERT_PATH|/certs/cert.pem|g" \
         -e "s|KEY_PATH|/certs/key.pem|g" \
+        -e "s|CA_PATH|/certs/ca.pem|g" \
         "$cfg_src" > "$cfg_dst"
 
     echo "[envoy] starting..."
@@ -329,7 +344,38 @@ envoy_config_name() {
 # ── Kong (docker, DB-less) ──────────────────────────────────────────────────
 start_kong() {
     local cfg_src="$SCRIPT_DIR/configs/kong/$(kong_config_name)"
+    local cfg_dst="$SCRIPT_DIR/kong_runtime.yaml"
     echo "[kong] starting..."
+
+    # Template the benchmark CA cert into the declarative config.
+    #
+    # With `tls_verify: true` on a Kong service, nginx's upstream TLS
+    # verifier requires a trust anchor that Kong considers valid — which
+    # means a `ca_certificates` entity in the declarative config, NOT
+    # just `KONG_LUA_SSL_TRUSTED_CERTIFICATE` (that only scopes cosocket
+    # Lua callouts, not `proxy_pass` upstream handshakes). Per-config
+    # `ca_certificates` entries require the cert content inline, so we
+    # read cert.pem at start-up and substitute it into the config file
+    # written to $SCRIPT_DIR/kong_runtime.yaml (the running config
+    # Kong mounts).
+    #
+    # The CA cert (ca.pem) carries `basicConstraints: CA:TRUE` so Kong
+    # accepts it as a CA entity.
+    python3 - "$cfg_src" "$cfg_dst" "$CERT_DIR/ca.pem" <<'PYEOF'
+import sys, pathlib
+src, dst, cert_path = sys.argv[1], sys.argv[2], sys.argv[3]
+cert = pathlib.Path(cert_path).read_text().rstrip()
+# The placeholder line in the checked-in YAML is `      __BENCH_CA_PEM__`
+# (6-space indent, inside the `cert: |` block scalar so the file parses
+# as valid YAML pre-render). When substituting, the first cert line
+# inherits the placeholder's leading whitespace; subsequent lines need
+# their own matching 6-space prefix so they stay inside the block
+# scalar.
+cert_lines = cert.splitlines()
+replacement = cert_lines[0] + '\n' + '\n'.join('      ' + l for l in cert_lines[1:])
+text = pathlib.Path(src).read_text().replace('__BENCH_CA_PEM__', replacement)
+pathlib.Path(dst).write_text(text)
+PYEOF
 
     local proxy_listen_env
     local stream_listen_env=""
@@ -373,11 +419,10 @@ start_kong() {
         -e "KONG_SSL_CERT_KEY=/certs/key.pem" \
         -e "KONG_STREAM_SSL_CERT=/certs/cert.pem" \
         -e "KONG_STREAM_SSL_CERT_KEY=/certs/key.pem" \
-        -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=/certs/cert.pem" \
-        -e "KONG_NGINX_PROXY_PROXY_SSL_VERIFY=off" \
-        -e "KONG_NGINX_STREAM_PROXY_SSL_VERIFY=off" \
+        -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
+        -e "KONG_NGINX_STREAM_LUA_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
         "${extra_env[@]}" \
-        -v "$cfg_src:/kong/kong.yaml:ro" \
+        -v "$cfg_dst:/kong/kong.yaml:ro" \
         -v "$CERT_DIR:/certs:ro" \
         "$KONG_IMAGE")
 
@@ -415,11 +460,27 @@ start_tyk() {
     # Tyk listens on 8443 when TLS is enabled in tyk.conf
     echo "[tyk] starting with apps=$apps_dir..."
 
+    # Install the benchmark CA into the container's system trust store
+    # before launching Tyk. Tyk Classic API `transport.ssl_ca_cert` does
+    # NOT configure upstream trust (confirmed locally: it's a no-op —
+    # handshakes fail with the same error whether ssl_ca_cert points at
+    # the real cert or a nonexistent path). The Go `net/http` transport
+    # Tyk uses for reverse-proxy upstreams consults the default system
+    # RootCAs pool, so the reliable fix is to install the PEM as a
+    # system CA before starting the gateway. Tyk's image is Debian
+    # bookworm-based with `update-ca-certificates` available, and runs
+    # as root by default.
     GATEWAY_CID=$(docker run -d --rm --network host \
         -v "$apps_dir:/etc/tyk/apps:ro" \
         -v "$tyk_conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$CERT_DIR:/etc/tyk/certs:ro" \
-        "$TYK_IMAGE")
+        --entrypoint sh \
+        "$TYK_IMAGE" \
+        -c 'cp /etc/tyk/certs/ca.pem /usr/local/share/ca-certificates/bench.crt && update-ca-certificates >/dev/null 2>&1 && exec /opt/tyk-gateway/tyk --conf /opt/tyk-gateway/tyk.conf')
+    # All-`&&` chain so a trust-store setup failure exits before Tyk
+    # starts. Otherwise Tyk would run without the benchmark CA while
+    # every API config enforces ssl_insecure_skip_verify=false, turning
+    # the bench into silent 0-RPS rows rather than a loud startup error.
 
     wait_for_gateway
 }
@@ -484,6 +545,18 @@ container_has_fatal_log() {
     return 1
 }
 
+# Active UDP probe — sends a datagram and waits briefly for an echo reply.
+# Returns 0 iff the reply content matches. Used to confirm an echo-style
+# UDP gateway (Ferrum/Envoy/Kong plain UDP) is fully forwarding before
+# the bench fires, because the nginx-stream / udp_proxy cold-start window
+# can swallow the first datagrams and cause 0 RPS benchmarks.
+probe_udp_echo() {
+    local port=$1
+    local out
+    out=$(echo -n "bench-probe" | nc -u -w 1 127.0.0.1 "$port" 2>/dev/null | head -c 32)
+    [ "$out" = "bench-probe" ]
+}
+
 wait_for_gateway() {
     local target_port
     case "$PROTOCOL" in
@@ -496,9 +569,37 @@ wait_for_gateway() {
 
     for i in $(seq 1 40); do
         case "$PROTOCOL" in
-            udp|udp-dtls|http3)
-                # UDP/QUIC: no TCP handshake to probe. Give the listener a
-                # moment to bind, then verify container health + clean logs.
+            udp)
+                # Plain UDP: container-alive check is not enough because
+                # Kong's stream-subsystem cold start can drop datagrams
+                # for 5-15 seconds after the listener binds. Actively
+                # probe with a UDP packet and wait for the echo reply;
+                # only declare ready when a round-trip actually completes.
+                if [ "$i" -ge 6 ]; then
+                    if container_has_fatal_log; then
+                        echo "[gateway] fatal log entry detected for $PROTOCOL" >&2
+                        docker logs "$GATEWAY_CID" 2>&1 | tail -30 >&2 || true
+                        return 1
+                    fi
+                    if ! container_alive; then
+                        echo "[gateway] container exited for $PROTOCOL" >&2
+                        docker logs "$GATEWAY_CID" 2>&1 | tail -30 >&2 || true
+                        return 1
+                    fi
+                    if probe_udp_echo "$target_port"; then
+                        echo "[gateway] udp ready on port $target_port (active probe)"
+                        sleep 1
+                        return 0
+                    fi
+                fi
+                sleep 0.5
+                ;;
+            udp-dtls|http3)
+                # UDP/DTLS + QUIC cannot be probed with a plain UDP datagram
+                # because the first packet has to be a DTLS/QUIC ClientHello.
+                # Fall back to container-alive + fatal-log scan, same as
+                # before — these protocols don't exhibit the Kong-style
+                # cold-start drop problem in the current matrix.
                 if [ "$i" -ge 6 ]; then
                     if container_has_fatal_log; then
                         echo "[gateway] fatal log entry detected for $PROTOCOL" >&2
@@ -506,7 +607,7 @@ wait_for_gateway() {
                         return 1
                     fi
                     if container_alive; then
-                        echo "[gateway] container alive for $PROTOCOL (udp/quic — no port probe)"
+                        echo "[gateway] container alive for $PROTOCOL (udp-encrypted/quic — no active probe)"
                         sleep 1
                         return 0
                     fi

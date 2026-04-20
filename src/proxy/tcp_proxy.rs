@@ -258,7 +258,45 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    bidirectional_copy(client, backend, idle_timeout, half_close_cap, buf_size).await
+    bidirectional_copy(
+        client,
+        backend,
+        idle_timeout,
+        half_close_cap,
+        None,
+        None,
+        buf_size,
+    )
+    .await
+}
+
+/// Crate-visible entry point exposing the full `bidirectional_copy` signature
+/// for tests that need to exercise per-direction `backend_read_timeout` /
+/// `backend_write_timeout` enforcement.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) async fn bidirectional_copy_for_test_with_timeouts<C, B>(
+    client: C,
+    backend: B,
+    idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
+    backend_read_timeout: Option<Duration>,
+    backend_write_timeout: Option<Duration>,
+    buf_size: usize,
+) -> StreamCopyResult
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    bidirectional_copy(
+        client,
+        backend,
+        idle_timeout,
+        half_close_cap,
+        backend_read_timeout,
+        backend_write_timeout,
+        buf_size,
+    )
+    .await
 }
 
 /// Crate-visible entry point to the Linux `bidirectional_splice` for the
@@ -1054,6 +1092,8 @@ async fn handle_tcp_connection_inner(
             backend_stream,
             idle_timeout,
             half_close_cap,
+            None,
+            None,
             buf_size,
         )
         .await;
@@ -1366,7 +1406,16 @@ async fn handle_tcp_connection_inner(
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         match backend_stream {
             BackendStream::Tls(bs) => {
-                bidirectional_copy(tls_stream, bs, idle_timeout, half_close_cap, buf_size).await
+                bidirectional_copy(
+                    tls_stream,
+                    bs,
+                    idle_timeout,
+                    half_close_cap,
+                    None,
+                    None,
+                    buf_size,
+                )
+                .await
             }
             BackendStream::Plain(bs) => {
                 // On Linux with kTLS, attempt to install TLS keys into the kernel
@@ -1396,6 +1445,8 @@ async fn handle_tcp_connection_inner(
                                     bs_back,
                                     idle_timeout,
                                     half_close_cap,
+                                    None,
+                                    None,
                                     buf_size,
                                 )
                                 .await
@@ -1424,13 +1475,30 @@ async fn handle_tcp_connection_inner(
                             }
                         }
                     } else {
-                        bidirectional_copy(tls_stream, bs, idle_timeout, half_close_cap, buf_size)
-                            .await
+                        bidirectional_copy(
+                            tls_stream,
+                            bs,
+                            idle_timeout,
+                            half_close_cap,
+                            None,
+                            None,
+                            buf_size,
+                        )
+                        .await
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    bidirectional_copy(tls_stream, bs, idle_timeout, half_close_cap, buf_size).await
+                    bidirectional_copy(
+                        tls_stream,
+                        bs,
+                        idle_timeout,
+                        half_close_cap,
+                        None,
+                        None,
+                        buf_size,
+                    )
+                    .await
                 }
             }
         }
@@ -1439,7 +1507,16 @@ async fn handle_tcp_connection_inner(
         match backend_stream {
             BackendStream::Tls(bs) => {
                 used_splice = false;
-                bidirectional_copy(client_stream, bs, idle_timeout, half_close_cap, buf_size).await
+                bidirectional_copy(
+                    client_stream,
+                    bs,
+                    idle_timeout,
+                    half_close_cap,
+                    None,
+                    None,
+                    buf_size,
+                )
+                .await
             }
             BackendStream::Plain(bs) => {
                 // On Linux, use splice(2) for zero-copy relay when both sides
@@ -1471,8 +1548,16 @@ async fn handle_tcp_connection_inner(
                 #[cfg(not(target_os = "linux"))]
                 {
                     used_splice = false;
-                    bidirectional_copy(client_stream, bs, idle_timeout, half_close_cap, buf_size)
-                        .await
+                    bidirectional_copy(
+                        client_stream,
+                        bs,
+                        idle_timeout,
+                        half_close_cap,
+                        None,
+                        None,
+                        buf_size,
+                    )
+                    .await
                 }
             }
         }
@@ -1683,6 +1768,8 @@ async fn copy_one_direction<R, W>(
     mut reader: R,
     mut writer: W,
     buf_size: usize,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
     bytes: Arc<AtomicU64>,
     last_activity: Option<Arc<AtomicU64>>,
 ) -> Result<(), (StreamIoSide, std::io::Error)>
@@ -1692,9 +1779,38 @@ where
 {
     let mut buf = vec![0u8; buf_size.max(4096)];
     loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => return Err((StreamIoSide::Read, e)),
+        // Per-read timeout: when set, a single `read()` that blocks longer than
+        // the configured duration surfaces as an `ErrorKind::TimedOut` error —
+        // classified downstream as `ReadWriteTimeout`. Different from the
+        // bidirectional `idle_timeout`, which only fires when BOTH directions
+        // are quiet — here, any single direction going quiet past its timeout
+        // closes the session.
+        //
+        // NOTE: the production TCP code path currently passes `None` for both
+        // `read_timeout` and `write_timeout`. Wiring the proxy schema's
+        // `backend_read_timeout_ms` / `backend_write_timeout_ms` (default
+        // 30 000 ms each) into this helper trips P1/P2 issues flagged by
+        // Codex on PR #454: a wall-clock timeout on a single `read()` /
+        // `write_all()` misclassifies normal request-upload silence and
+        // slow-but-progressing writes as stalls. The eventual fix is
+        // inactivity-based (HAProxy `timeout server` semantics with progress
+        // reset); the parameters remain on this helper so the unit tests can
+        // exercise the future direction.
+        let n = match read_timeout {
+            Some(t) => match tokio::time::timeout(t, reader.read(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err((StreamIoSide::Read, e)),
+                Err(_) => {
+                    return Err((
+                        StreamIoSide::Read,
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout exceeded"),
+                    ));
+                }
+            },
+            None => match reader.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => return Err((StreamIoSide::Read, e)),
+            },
         };
         if n == 0 {
             // Clean EOF — shut down the writer side so the peer observes a
@@ -1709,8 +1825,22 @@ where
         if let Some(ref la) = last_activity {
             la.store(coarse_now_ms(), Ordering::Relaxed);
         }
-        if let Err(e) = writer.write_all(&buf[..n]).await {
-            return Err((StreamIoSide::Write, e));
+        match write_timeout {
+            Some(t) => match tokio::time::timeout(t, writer.write_all(&buf[..n])).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err((StreamIoSide::Write, e)),
+                Err(_) => {
+                    return Err((
+                        StreamIoSide::Write,
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout exceeded"),
+                    ));
+                }
+            },
+            None => {
+                if let Err(e) = writer.write_all(&buf[..n]).await {
+                    return Err((StreamIoSide::Write, e));
+                }
+            }
         }
         bytes.fetch_add(n as u64, Ordering::Relaxed);
         if let Some(ref la) = last_activity {
@@ -1755,19 +1885,27 @@ async fn bidirectional_copy<C, B>(
     mut backend: B,
     idle_timeout: Option<Duration>,
     half_close_cap: Option<Duration>,
+    backend_read_timeout: Option<Duration>,
+    backend_write_timeout: Option<Duration>,
     buf_size: usize,
 ) -> StreamCopyResult
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    // Fast path: both drain bounds disabled → use tokio's optimised
+    // Fast path: all per-direction bounds disabled → use tokio's optimised
     // bidirectional copy directly. No split (no BiLock overhead), no select
     // loop. On error we classify with `Direction::Unknown` because
     // `copy_bidirectional_with_sizes` doesn't report which half failed first.
+    // `backend_read_timeout` / `backend_write_timeout` inherently require the
+    // direction-tracking path — they wrap individual `read`/`write` calls
+    // inside `copy_one_direction`, which tokio's bidirectional copy does not
+    // expose. Any non-zero timeout here opts out of the fast path.
     let idle_disabled = idle_timeout.is_none_or(|d| d.is_zero());
     let cap_disabled = half_close_cap.is_none_or(|d| d.is_zero());
-    if idle_disabled && cap_disabled {
+    let read_to_disabled = backend_read_timeout.is_none_or(|d| d.is_zero());
+    let write_to_disabled = backend_write_timeout.is_none_or(|d| d.is_zero());
+    if idle_disabled && cap_disabled && read_to_disabled && write_to_disabled {
         return match tokio::io::copy_bidirectional_with_sizes(
             &mut client,
             &mut backend,
@@ -1814,8 +1952,30 @@ where
     let la_c2b = last_activity.clone();
     let la_b2c = last_activity.clone();
 
-    let c2b_fut = copy_one_direction(client_read, backend_write, buf_size, c2b_bytes_task, la_c2b);
-    let b2c_fut = copy_one_direction(backend_read, client_write, buf_size, b2c_bytes_task, la_b2c);
+    // Per-direction timeouts:
+    // * c2b reads from CLIENT (no client-read timeout config) and writes to
+    //   BACKEND (`backend_write_timeout` — enforce when backend's socket send
+    //   buffer stops draining for too long).
+    // * b2c reads from BACKEND (`backend_read_timeout` — enforce when backend
+    //   goes silent) and writes to CLIENT (no client-write timeout config).
+    let c2b_fut = copy_one_direction(
+        client_read,
+        backend_write,
+        buf_size,
+        None,
+        backend_write_timeout,
+        c2b_bytes_task,
+        la_c2b,
+    );
+    let b2c_fut = copy_one_direction(
+        backend_read,
+        client_write,
+        buf_size,
+        backend_read_timeout,
+        None,
+        b2c_bytes_task,
+        la_b2c,
+    );
     tokio::pin!(c2b_fut);
     tokio::pin!(b2c_fut);
 
@@ -1833,9 +1993,17 @@ where
             result = &mut c2b_fut, if !c2b_done => {
                 c2b_done = true;
                 if let Err((side, e)) = result {
-                    let msg = e.to_string();
-                    let err: anyhow::Error =
-                        anyhow::anyhow!("Bidirectional copy error (client→backend, {:?}): {}", side, e);
+                    let msg = format!("Bidirectional copy error (client→backend, {:?}): {}", side, e);
+                    // Wrap via `anyhow::Error::new(e)` so the source chain keeps
+                    // the underlying `io::Error` — `classify_stream_error` walks
+                    // `Error::source()` to downcast and read `io::ErrorKind`. A
+                    // `anyhow!("{:?}: {}", side, e)` formats `e` into a string
+                    // and drops the type, so `ErrorKind::TimedOut` would no
+                    // longer classify as `ReadWriteTimeout`.
+                    let err: anyhow::Error = anyhow::Error::new(e).context(format!(
+                        "Bidirectional copy error (client→backend, {:?})",
+                        side
+                    ));
                     if first_failure.is_none() {
                         first_failure = Some((
                             Direction::ClientToBackend,
@@ -1850,9 +2018,11 @@ where
             result = &mut b2c_fut, if !b2c_done => {
                 b2c_done = true;
                 if let Err((side, e)) = result {
-                    let msg = e.to_string();
-                    let err: anyhow::Error =
-                        anyhow::anyhow!("Bidirectional copy error (backend→client, {:?}): {}", side, e);
+                    let msg = format!("Bidirectional copy error (backend→client, {:?}): {}", side, e);
+                    let err: anyhow::Error = anyhow::Error::new(e).context(format!(
+                        "Bidirectional copy error (backend→client, {:?})",
+                        side
+                    ));
                     if first_failure.is_none() {
                         first_failure = Some((
                             Direction::BackendToClient,
@@ -1922,12 +2092,14 @@ where
                 Ok(Ok(())) => {}
                 Ok(Err((side, e))) => {
                     if first_failure.is_none() {
-                        let msg = e.to_string();
-                        let err: anyhow::Error = anyhow::anyhow!(
+                        let msg = format!(
                             "Bidirectional copy error (client→backend, {:?}): {}",
-                            side,
-                            e
+                            side, e
                         );
+                        let err: anyhow::Error = anyhow::Error::new(e).context(format!(
+                            "Bidirectional copy error (client→backend, {:?})",
+                            side
+                        ));
                         first_failure = Some((
                             Direction::ClientToBackend,
                             classify_stream_error(&err),
@@ -1956,12 +2128,14 @@ where
                 Ok(Ok(())) => {}
                 Ok(Err((side, e))) => {
                     if first_failure.is_none() {
-                        let msg = e.to_string();
-                        let err: anyhow::Error = anyhow::anyhow!(
+                        let msg = format!(
                             "Bidirectional copy error (backend→client, {:?}): {}",
-                            side,
-                            e
+                            side, e
                         );
+                        let err: anyhow::Error = anyhow::Error::new(e).context(format!(
+                            "Bidirectional copy error (backend→client, {:?})",
+                            side
+                        ));
                         first_failure = Some((
                             Direction::BackendToClient,
                             classify_stream_error(&err),
@@ -2020,10 +2194,10 @@ where
                         Direction::BackendToClient => "backend→client",
                         Direction::Unknown => "unknown",
                     };
-                    let err: anyhow::Error = anyhow::anyhow!(
-                        "Bidirectional copy error ({}, {:?}): {}",
-                        dir_label, side, e
-                    );
+                    let err: anyhow::Error = anyhow::Error::new(e).context(format!(
+                        "Bidirectional copy error ({}, {:?})",
+                        dir_label, side
+                    ));
                     return Some((direction, classify_stream_error(&err), Some(side), msg));
                 }
                 return None;

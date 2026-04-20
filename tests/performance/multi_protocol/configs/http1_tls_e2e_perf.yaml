@@ -14,7 +14,7 @@ proxies:
     backend_connect_timeout_ms: 5000
     backend_read_timeout_ms: 10000
     backend_write_timeout_ms: 10000
-    backend_tls_verify_server_cert: false
+    backend_tls_server_ca_cert_path: "/etc/ferrum/tls/ca.pem"
     auth_mode: single
     plugins: []
 

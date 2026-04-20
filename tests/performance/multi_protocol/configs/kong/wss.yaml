@@ -2,14 +2,27 @@ _format_version: "3.0"
 
 # Kong DB-less declarative configuration — WSS end-to-end TLS.
 # Client WSS → Kong (TLS termination + WS upgrade) → WSS upstream on 3446.
-# Every hop encrypted. Kong proxies WebSocket transparently over HTTPS routes.
+#
+# Uses `protocol: wss` + `protocols: [ws, wss]` on the route so Kong
+# uses its native WebSocket proxy path. With `protocol: wss`, Kong
+# rejects per-service `ca_certificates` (schema conditional validation),
+# so the CA trust for upstream cert verification comes from the global
+# KONG_LUA_SSL_TRUSTED_CERTIFICATE env var set by the harness, which
+# points at the benchmark's ca.pem.
+#
+# `host: localhost` (not 127.0.0.1) matters — Kong 3.10's Lua WebSocket
+# upstream TLS verifier matches the connect hostname against cert DNS
+# SANs, not IP SANs. The bench cert has both DNS:localhost and
+# IP:127.0.0.1, but using `127.0.0.1` here triggers "certificate host
+# mismatch" 502s on every WS upgrade. `localhost` matches the DNS SAN
+# and, with `--network host`, resolves to the backend on the runner.
 
 services:
   - name: ws-service
-    host: 127.0.0.1
+    host: localhost
     port: 3446
-    protocol: https
-    tls_verify: false
+    protocol: wss
+    tls_verify: true
     connect_timeout: 5000
     read_timeout: 3600000
     write_timeout: 3600000
@@ -18,8 +31,8 @@ services:
         paths:
           - /ws
         protocols:
-          - http
-          - https
+          - ws
+          - wss
         strip_path: true
         preserve_host: false
 

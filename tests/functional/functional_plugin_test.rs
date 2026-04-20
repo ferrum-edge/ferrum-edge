@@ -15,171 +15,46 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_plugin
 
+use crate::common::TestGateway;
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tempfile::TempDir;
-use uuid::Uuid;
 
 // ============================================================================
-// Test Harness
+// Test Harness — thin wrapper around TestGateway that keeps the plugin-specific
+// helper methods (create_proxy / create_plugin / update_proxy / wait_for_route /
+// wait_for_poll). The subprocess lifecycle + retry + JWT minting live in
+// TestGateway; only the admin-API shortcuts are plugin-test-specific.
 // ============================================================================
 
 struct PluginTestHarness {
-    _temp_dir: TempDir,
-    gateway_process: Option<Child>,
+    gw: TestGateway,
     proxy_base_url: String,
     admin_base_url: String,
-    jwt_secret: String,
-    jwt_issuer: String,
-    #[allow(dead_code)]
-    admin_port: u16,
-    #[allow(dead_code)]
-    proxy_port: u16,
 }
 
 impl PluginTestHarness {
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match Self::try_new().await {
-                Ok(harness) => return Ok(harness),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Harness startup attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to create harness after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    async fn try_new() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-plugin-jwt-secret-1234567890ab".to_string();
-        let jwt_issuer = "ferrum-edge-plugin-test".to_string();
-
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
-        let db_url = format!(
-            "sqlite:{}?mode=rwc",
-            temp_dir.path().join("test.db").to_string_lossy()
-        );
-
-        // Build the gateway binary if not already built
-        let build_status = Command::new("cargo")
-            .args(["build", "--bin", "ferrum-edge"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !build_status.success() {
-            return Err("Failed to build ferrum-edge".into());
-        }
-
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-            "./target/debug/ferrum-edge"
-        } else {
-            "./target/release/ferrum-edge"
-        };
-
-        let child = Command::new(binary_path)
-            .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
-            .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", &db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2")
-            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "debug")
+    async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let gw = TestGateway::builder()
+            .log_level("debug")
             .env("FERRUM_TRUSTED_PROXIES", "127.0.0.1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        let proxy_base_url = format!("http://127.0.0.1:{}", proxy_port);
-        let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
-
-        let mut harness = Self {
-            _temp_dir: temp_dir,
-            gateway_process: Some(child),
-            proxy_base_url,
-            admin_base_url,
-            jwt_secret,
-            jwt_issuer,
-            admin_port,
-            proxy_port,
-        };
-
-        match harness.wait_for_health().await {
-            Ok(()) => Ok(harness),
-            Err(e) => {
-                if let Some(mut child) = harness.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway did not start within 30 seconds".into());
-            }
-            match reqwest::get(&health_url).await {
-                Ok(r) if r.status().is_success() => return Ok(()),
-                _ => tokio::time::sleep(Duration::from_millis(500)).await,
-            }
-        }
-    }
-
-    fn generate_admin_token(&self) -> String {
-        let now = Utc::now();
-        let claims = json!({
-            "iss": self.jwt_issuer,
-            "sub": "test-admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
-            "jti": Uuid::new_v4().to_string()
-        });
-        let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
-        encode(&header, &claims, &key).expect("Failed to encode admin JWT")
+            .spawn()
+            .await?;
+        Ok(Self {
+            proxy_base_url: gw.proxy_base_url.clone(),
+            admin_base_url: gw.admin_base_url.clone(),
+            gw,
+        })
     }
 
     fn auth_header(&self) -> String {
-        format!("Bearer {}", self.generate_admin_token())
+        self.gw.auth_header()
     }
 
     async fn create_proxy(
@@ -271,14 +146,9 @@ impl PluginTestHarness {
     }
 }
 
-impl Drop for PluginTestHarness {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
+// Drop impl omitted: `self.gw` is a TestGateway which kills the gateway
+// subprocess on drop. The field ordering ensures `gw` drops after the URL
+// strings, which don't care about drop order.
 
 /// Echo backend that returns request headers as JSON response body.
 /// Response body format: {"method":"GET","path":"/...","headers":{"key":"val",...}}
