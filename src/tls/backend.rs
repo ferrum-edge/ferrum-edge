@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,41 @@ pub enum TlsError {
     },
     #[error("rustls: {0}")]
     Rustls(String),
+}
+
+/// Shared cache for backend rustls client configs keyed by connection identity.
+///
+/// Reusing the same `Arc<ClientConfig>` lets protocol pools share rustls'
+/// in-memory session resumption state across new backend connections instead
+/// of resetting it on every reconnect.
+#[derive(Clone, Default)]
+pub struct BackendTlsConfigCache {
+    configs: Arc<DashMap<String, Arc<ClientConfig>>>,
+}
+
+impl BackendTlsConfigCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get_or_try_build<E, F>(&self, key: String, build: F) -> Result<Arc<ClientConfig>, E>
+    where
+        F: FnOnce() -> Result<ClientConfig, E>,
+    {
+        if let Some(existing) = self.configs.get(&key) {
+            return Ok(existing.clone());
+        }
+
+        let config = Arc::new(build()?);
+
+        match self.configs.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => Ok(entry.get().clone()),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(config.clone());
+                Ok(config)
+            }
+        }
+    }
 }
 
 /// Build the backend trust store using the CA chain resolution from CLAUDE.md:
@@ -269,6 +305,7 @@ fn load_private_key(path: &Path, kind: &'static str) -> Result<PrivateKeyDer<'st
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Once};
 
     use chrono::Utc;
@@ -458,6 +495,15 @@ mod tests {
         }
     }
 
+    fn new_test_client_config() -> rustls::ClientConfig {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("default protocol versions")
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth()
+    }
+
     fn quic_incompatible_policy() -> TlsPolicy {
         let base_provider = rustls::crypto::ring::default_provider();
         let provider = rustls::crypto::CryptoProvider {
@@ -475,6 +521,29 @@ mod tests {
             session_cache_size: 4096,
             early_data_max_size: 0,
         }
+    }
+
+    #[test]
+    fn backend_tls_config_cache_reuses_built_configs() {
+        ensure_crypto_provider();
+        let cache = BackendTlsConfigCache::new();
+        let builds = AtomicUsize::new(0);
+
+        let first = cache
+            .get_or_try_build("backend-a".to_string(), || {
+                builds.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, TlsError>(new_test_client_config())
+            })
+            .expect("first config");
+        let second = cache
+            .get_or_try_build("backend-a".to_string(), || {
+                builds.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, TlsError>(new_test_client_config())
+            })
+            .expect("second config");
+
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

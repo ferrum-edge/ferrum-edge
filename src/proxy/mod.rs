@@ -100,6 +100,40 @@ static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
 type WarmupTask =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>;
 
+fn warn_if_h3_backend_tls_policy_incompatible(
+    config: &GatewayConfig,
+    tls_policy: Option<&TlsPolicy>,
+) {
+    let Some(policy) = tls_policy else {
+        return;
+    };
+
+    let h3_proxy_ids: Vec<&str> = config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.backend_protocol == BackendProtocol::H3)
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    if h3_proxy_ids.is_empty() {
+        return;
+    }
+
+    if let Err(err) = crate::tls::validate_backend_tls_policy_for_quic(policy) {
+        let sample = h3_proxy_ids
+            .iter()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            h3_proxy_count = h3_proxy_ids.len(),
+            h3_proxy_sample = %sample,
+            "Backend TLS policy is incompatible with HTTP/3/QUIC ({}). H3 backends will fall back to rustls safe defaults for the QUIC builder.",
+            err
+        );
+    }
+}
+
 /// Check if the request is a WebSocket upgrade request.
 ///
 /// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
@@ -568,6 +602,7 @@ impl ProxyState {
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let tls_policy_arc = tls_policy.map(Arc::new);
+        warn_if_h3_backend_tls_policy_incompatible(&config, tls_policy_arc.as_deref());
         let crls = crate::tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
         let grpc_pool = Arc::new(GrpcConnectionPool::new(
             global_pool_config.clone(),
@@ -1378,6 +1413,7 @@ impl ProxyState {
                 self.adaptive_buffer.prune_missing(&active_ids);
             }
 
+            warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
             self.config.store(Arc::new(new_config));
 
             // Reconcile stream proxy listeners (TCP/UDP)
@@ -1528,6 +1564,7 @@ impl ProxyState {
             self.adaptive_buffer.prune_missing(&active_ids);
         }
 
+        warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
         self.config.store(Arc::new(new_config));
 
         // Reconcile stream proxy listeners if any proxies changed
@@ -1917,6 +1954,7 @@ impl ProxyState {
         }
 
         // Store updated config
+        warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
         self.config.store(Arc::new(new_config));
 
         // Reconcile stream proxy listeners if any stream proxies changed

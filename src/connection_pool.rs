@@ -16,7 +16,7 @@ use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::tls::TlsPolicy;
-use crate::tls::backend::BackendTlsConfigBuilder;
+use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
 use anyhow::Result;
 use dashmap::DashMap;
 use std::net::SocketAddr;
@@ -65,6 +65,9 @@ pub struct ConnectionPool {
     tls_policy: Option<Arc<TlsPolicy>>,
     /// Certificate Revocation Lists for backend TLS verification.
     crls: crate::tls::CrlList,
+    /// Shared HTTP/3 backend TLS configs so QUIC reconnects reuse rustls'
+    /// in-memory session resumption state.
+    backend_h3_tls_configs: BackendTlsConfigCache,
 }
 
 impl ConnectionPool {
@@ -89,6 +92,7 @@ impl ConnectionPool {
             dns_cache,
             tls_policy,
             crls,
+            backend_h3_tls_configs: BackendTlsConfigCache::new(),
         };
 
         // Start cleanup task
@@ -381,34 +385,36 @@ impl ConnectionPool {
         &self,
         proxy: &Proxy,
     ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
-        let mut client_config = BackendTlsConfigBuilder {
-            proxy,
-            policy: self.tls_policy.as_deref(),
-            global_ca: self
-                .global_mtls_config
-                .tls_ca_bundle_path
-                .as_deref()
-                .map(Path::new),
-            global_no_verify: self.global_mtls_config.tls_no_verify,
-            global_client_cert: self
-                .global_mtls_config
-                .backend_tls_client_cert_path
-                .as_deref()
-                .map(Path::new),
-            global_client_key: self
-                .global_mtls_config
-                .backend_tls_client_key_path
-                .as_deref()
-                .map(Path::new),
-            crls: &self.crls,
-        }
-        .build_rustls_quic()
-        .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))?;
+        self.backend_h3_tls_configs
+            .get_or_try_build(self.create_pool_key(proxy), || {
+                let mut client_config = BackendTlsConfigBuilder {
+                    proxy,
+                    policy: self.tls_policy.as_deref(),
+                    global_ca: self
+                        .global_mtls_config
+                        .tls_ca_bundle_path
+                        .as_deref()
+                        .map(Path::new),
+                    global_no_verify: self.global_mtls_config.tls_no_verify,
+                    global_client_cert: self
+                        .global_mtls_config
+                        .backend_tls_client_cert_path
+                        .as_deref()
+                        .map(Path::new),
+                    global_client_key: self
+                        .global_mtls_config
+                        .backend_tls_client_key_path
+                        .as_deref()
+                        .map(Path::new),
+                    crls: &self.crls,
+                }
+                .build_rustls_quic()
+                .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))?;
 
-        // HTTP/3 requires ALPN protocol "h3"
-        client_config.alpn_protocols = vec![b"h3".to_vec()];
-
-        Ok(Arc::new(client_config))
+                // HTTP/3 requires ALPN protocol "h3".
+                client_config.alpn_protocols = vec![b"h3".to_vec()];
+                Ok(client_config)
+            })
     }
 
     /// Clear all pooled connections

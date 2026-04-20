@@ -21,7 +21,7 @@ use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::DnsCache;
 use crate::tls::TlsPolicy;
-use crate::tls::backend::BackendTlsConfigBuilder;
+use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -61,6 +61,9 @@ pub struct Http2ConnectionPool {
     tls_policy: Option<Arc<TlsPolicy>>,
     /// Certificate Revocation Lists for backend TLS verification.
     crls: crate::tls::CrlList,
+    /// Shared H2 backend TLS configs so new pooled connections reuse rustls'
+    /// session resumption state instead of rebuilding from scratch.
+    tls_configs: BackendTlsConfigCache,
 }
 
 impl Default for Http2ConnectionPool {
@@ -88,6 +91,7 @@ impl Http2ConnectionPool {
             global_env_config,
             tls_policy,
             crls,
+            tls_configs: BackendTlsConfigCache::new(),
         };
 
         pool.start_cleanup_task();
@@ -459,6 +463,50 @@ impl Http2ConnectionPool {
         }
     }
 
+    fn get_tls_config(&self, proxy: &Proxy) -> Result<Arc<rustls::ClientConfig>, Http2PoolError> {
+        self.tls_configs
+            .get_or_try_build(Self::pool_key_owned(proxy), || {
+                let mut tls_config = BackendTlsConfigBuilder {
+                    proxy,
+                    policy: self.tls_policy.as_deref(),
+                    global_ca: self
+                        .global_env_config
+                        .tls_ca_bundle_path
+                        .as_deref()
+                        .map(Path::new),
+                    global_no_verify: self.global_env_config.tls_no_verify,
+                    global_client_cert: self
+                        .global_env_config
+                        .backend_tls_client_cert_path
+                        .as_deref()
+                        .map(Path::new),
+                    global_client_key: self
+                        .global_env_config
+                        .backend_tls_client_key_path
+                        .as_deref()
+                        .map(Path::new),
+                    crls: &self.crls,
+                }
+                .build_rustls()
+                .map_err(|e| {
+                    let message = format!("Failed to build backend TLS config: {}", e);
+                    let source = match e {
+                        crate::tls::backend::TlsError::Io { source, .. } => {
+                            Some(InternalSource::Io(source))
+                        }
+                        crate::tls::backend::TlsError::Pem { .. }
+                        | crate::tls::backend::TlsError::Rustls(_) => {
+                            Some(InternalSource::Message(message.clone()))
+                        }
+                    };
+                    Http2PoolError::Internal { message, source }
+                })?;
+
+                tls_config.alpn_protocols = vec![b"h2".to_vec()];
+                Ok(tls_config)
+            })
+    }
+
     /// Create an h2 (TLS) connection with ALPN negotiation, mTLS, and custom CA bundles.
     async fn create_tls_connection(
         &self,
@@ -470,45 +518,8 @@ impl Http2ConnectionPool {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
-        let mut tls_config = BackendTlsConfigBuilder {
-            proxy,
-            policy: self.tls_policy.as_deref(),
-            global_ca: self
-                .global_env_config
-                .tls_ca_bundle_path
-                .as_deref()
-                .map(Path::new),
-            global_no_verify: self.global_env_config.tls_no_verify,
-            global_client_cert: self
-                .global_env_config
-                .backend_tls_client_cert_path
-                .as_deref()
-                .map(Path::new),
-            global_client_key: self
-                .global_env_config
-                .backend_tls_client_key_path
-                .as_deref()
-                .map(Path::new),
-            crls: &self.crls,
-        }
-        .build_rustls()
-        .map_err(|e| {
-            let message = format!("Failed to build backend TLS config: {}", e);
-            let source = match e {
-                crate::tls::backend::TlsError::Io { source, .. } => {
-                    Some(InternalSource::Io(source))
-                }
-                crate::tls::backend::TlsError::Pem { .. }
-                | crate::tls::backend::TlsError::Rustls(_) => {
-                    Some(InternalSource::Message(message.clone()))
-                }
-            };
-            Http2PoolError::Internal { message, source }
-        })?;
-
-        tls_config.alpn_protocols = vec![b"h2".to_vec()];
-
-        let connector = TlsConnector::from(Arc::new(tls_config));
+        let tls_config = self.get_tls_config(proxy)?;
+        let connector = TlsConnector::from(tls_config);
         let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
             // Invalid SNI server name is a configuration/DNS problem, not a
             // transient backend issue — classify as DNS lookup.

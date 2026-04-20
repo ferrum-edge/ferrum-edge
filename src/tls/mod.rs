@@ -458,6 +458,40 @@ pub fn apply_client_session_resumption(
     config.resumption = rustls::client::Resumption::in_memory_sessions(cache_size);
 }
 
+/// Validate that the backend TLS policy can be converted into a QUIC-capable
+/// rustls client config for HTTP/3 backends.
+pub fn validate_backend_tls_policy_for_quic(policy: &TlsPolicy) -> Result<(), anyhow::Error> {
+    if !policy
+        .protocol_versions
+        .iter()
+        .any(|version| std::ptr::eq(*version, &rustls::version::TLS13))
+    {
+        return Err(anyhow::anyhow!("QUIC requires TLS 1.3 support"));
+    }
+
+    if !policy.crypto_provider.cipher_suites.iter().any(|suite| {
+        matches!(
+            suite.suite(),
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+                | rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
+                | rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        )
+    }) {
+        return Err(anyhow::anyhow!(
+            "QUIC requires at least one TLS 1.3 cipher suite"
+        ));
+    }
+
+    let config = backend_client_config_builder(Some(policy))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+
+    quinn::crypto::rustls::QuicClientConfig::try_from(config)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to create QUIC client config: {}", e))
+}
+
 /// Build a rustls `ClientConfig` builder for backend/outbound connections
 /// using the TLS policy's cipher suites, key exchange groups, and protocol versions.
 ///
@@ -709,5 +743,55 @@ mod tests {
         };
         let mut config = new_test_client_config();
         apply_client_session_resumption(&mut config, Some(&policy));
+    }
+
+    #[test]
+    fn validate_backend_tls_policy_for_quic_accepts_tls13_defaults() {
+        let policy = TlsPolicy {
+            protocol_versions: vec![&rustls::version::TLS13],
+            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            prefer_server_cipher_order: false,
+            session_cache_size: 4096,
+            early_data_max_size: 0,
+        };
+
+        validate_backend_tls_policy_for_quic(&policy)
+            .expect("TLS 1.3 defaults should support QUIC");
+    }
+
+    #[test]
+    fn validate_backend_tls_policy_for_quic_rejects_tls12_only_policy() {
+        let policy = TlsPolicy {
+            protocol_versions: vec![&rustls::version::TLS12],
+            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            prefer_server_cipher_order: false,
+            session_cache_size: 4096,
+            early_data_max_size: 0,
+        };
+
+        let err = validate_backend_tls_policy_for_quic(&policy).unwrap_err();
+        assert!(err.to_string().contains("QUIC"));
+    }
+
+    #[test]
+    fn validate_backend_tls_policy_for_quic_rejects_tls12_only_cipher_suites() {
+        let base_provider = rustls::crypto::ring::default_provider();
+        let provider = rustls::crypto::CryptoProvider {
+            cipher_suites: vec![
+                rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            ],
+            kx_groups: base_provider.kx_groups,
+            ..base_provider
+        };
+        let policy = TlsPolicy {
+            protocol_versions: vec![&rustls::version::TLS13],
+            crypto_provider: Arc::new(provider),
+            prefer_server_cipher_order: false,
+            session_cache_size: 4096,
+            early_data_max_size: 0,
+        };
+
+        let err = validate_backend_tls_policy_for_quic(&policy).unwrap_err();
+        assert!(err.to_string().contains("TLS 1.3 cipher suite"));
     }
 }

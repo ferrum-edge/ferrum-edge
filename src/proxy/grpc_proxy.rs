@@ -40,7 +40,7 @@ use crate::config::PoolConfig;
 use crate::config::types::{BackendProtocol, Proxy};
 use crate::dns::DnsCache;
 use crate::tls::TlsPolicy;
-use crate::tls::backend::BackendTlsConfigBuilder;
+use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
 
 /// Sum type for gRPC request bodies: either pre-buffered or streaming from the
 /// client. This allows a single pool type (`SendRequest<GrpcBody>`) to handle
@@ -161,6 +161,9 @@ pub struct GrpcConnectionPool {
     /// How long to wait for stream capacity on a live sender before opening a
     /// new backend connection shard.
     sender_ready_wait: Duration,
+    /// Shared H2 TLS configs so GRPCS reconnects reuse rustls' session
+    /// resumption state instead of starting from a fresh config each time.
+    tls_configs: BackendTlsConfigCache,
 }
 
 impl Default for GrpcConnectionPool {
@@ -190,6 +193,7 @@ impl GrpcConnectionPool {
             tls_policy,
             crls,
             sender_ready_wait,
+            tls_configs: BackendTlsConfigCache::new(),
         };
 
         pool.start_cleanup_task();
@@ -269,6 +273,40 @@ impl GrpcConnectionPool {
             use std::fmt::Write;
             let _ = write!(buf, "{shard}");
         }
+    }
+
+    fn get_tls_config(&self, proxy: &Proxy) -> Result<Arc<rustls::ClientConfig>, GrpcProxyError> {
+        self.tls_configs
+            .get_or_try_build(Self::pool_key_owned(proxy), || {
+                let mut tls_config = BackendTlsConfigBuilder {
+                    proxy,
+                    policy: self.tls_policy.as_deref(),
+                    global_ca: self
+                        .global_env_config
+                        .tls_ca_bundle_path
+                        .as_deref()
+                        .map(Path::new),
+                    global_no_verify: self.global_env_config.tls_no_verify,
+                    global_client_cert: self
+                        .global_env_config
+                        .backend_tls_client_cert_path
+                        .as_deref()
+                        .map(Path::new),
+                    global_client_key: self
+                        .global_env_config
+                        .backend_tls_client_key_path
+                        .as_deref()
+                        .map(Path::new),
+                    crls: &self.crls,
+                }
+                .build_rustls()
+                .map_err(|e| {
+                    GrpcProxyError::Internal(format!("Failed to build backend TLS config: {}", e))
+                })?;
+
+                tls_config.alpn_protocols = vec![b"h2".to_vec()];
+                Ok(tls_config)
+            })
     }
 
     /// Get or create an HTTP/2 connection to the gRPC backend.
@@ -570,35 +608,8 @@ impl GrpcConnectionPool {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
-        let mut tls_config = BackendTlsConfigBuilder {
-            proxy,
-            policy: self.tls_policy.as_deref(),
-            global_ca: self
-                .global_env_config
-                .tls_ca_bundle_path
-                .as_deref()
-                .map(Path::new),
-            global_no_verify: self.global_env_config.tls_no_verify,
-            global_client_cert: self
-                .global_env_config
-                .backend_tls_client_cert_path
-                .as_deref()
-                .map(Path::new),
-            global_client_key: self
-                .global_env_config
-                .backend_tls_client_key_path
-                .as_deref()
-                .map(Path::new),
-            crls: &self.crls,
-        }
-        .build_rustls()
-        .map_err(|e| {
-            GrpcProxyError::Internal(format!("Failed to build backend TLS config: {}", e))
-        })?;
-
-        tls_config.alpn_protocols = vec![b"h2".to_vec()];
-
-        let connector = TlsConnector::from(Arc::new(tls_config));
+        let tls_config = self.get_tls_config(proxy)?;
+        let connector = TlsConnector::from(tls_config);
         let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
             GrpcProxyError::BackendUnavailable(format!("Invalid server name: {}", e))
         })?;
