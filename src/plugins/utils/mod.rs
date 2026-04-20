@@ -12,6 +12,7 @@ pub mod json_escape;
 pub mod jwks_cache;
 pub mod jwks_store;
 pub mod log_helpers;
+pub mod rate_limit;
 pub mod redis_rate_limiter;
 pub mod udp_endpoint;
 

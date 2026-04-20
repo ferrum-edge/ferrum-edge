@@ -547,6 +547,53 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Increment one counter by 1 and another by a specific amount in a single
+    /// pipelined round-trip. Returns `(new_count, new_total)`.
+    pub async fn incr_and_incrby_with_expire(
+        &self,
+        count_key: &str,
+        total_key: &str,
+        amount: i64,
+        ttl_seconds: u64,
+    ) -> Result<(i64, i64), ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let result: Result<(i64, i64), redis::RedisError> = redis::pipe()
+            .atomic()
+            .cmd("INCR")
+            .arg(count_key)
+            .cmd("INCRBY")
+            .arg(total_key)
+            .arg(amount)
+            .cmd("EXPIRE")
+            .arg(count_key)
+            .arg(ttl_seconds as i64)
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(total_key)
+            .arg(ttl_seconds as i64)
+            .ignore()
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok((count, total)) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok((count, total))
+            }
+            Err(e) => {
+                warn!(
+                    count_key = %count_key,
+                    total_key = %total_key,
+                    error = %e,
+                    "Redis INCR+INCRBY+EXPIRE pipeline failed — falling back to local rate limiting"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
     /// Get two counters in a single pipelined round-trip. Returns (0, 0) for missing keys.
     ///
     /// Used by the AI token rate limiter to fetch both the previous and current
