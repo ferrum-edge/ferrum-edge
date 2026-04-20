@@ -106,7 +106,7 @@ x509-parser = "0.18"
 vaultrs = { version = "0.8", optional = true }
 aws-config = { version = "1.1", features = ["behavior-version-latest"], optional = true }
 aws-sdk-secretsmanager = { version = "1", optional = true }
-google-cloud-secretmanager-v1 = { version = "1.7", optional = true }
+google-cloud-secretmanager-v1 = { version = "1.8", optional = true }
 azure_security_keyvault_secrets = { version = "0.13", optional = true }
 azure_identity = { version = "0.34", optional = true }
 azure_core = { version = "0.34", optional = true }
