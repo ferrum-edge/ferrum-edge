@@ -218,6 +218,9 @@ fn create_proxy_state() -> ProxyState {
         slow_threshold_ms: None,
         refresh_threshold_percent: 90,
         failed_retry_interval_seconds: 10,
+        try_tcp_on_error: true,
+        num_concurrent_reqs: 3,
+        max_active_requests: 512,
     });
     let env_config = create_test_env_config();
     ProxyState::new(GatewayConfig::default(), dns_cache, env_config, None).unwrap()

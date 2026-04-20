@@ -43,6 +43,9 @@ pub async fn run(
         slow_threshold_ms: env_config.dns_slow_threshold_ms,
         refresh_threshold_percent: env_config.dns_refresh_threshold_percent,
         failed_retry_interval_seconds: env_config.dns_failed_retry_interval,
+        try_tcp_on_error: env_config.dns_try_tcp_on_error,
+        num_concurrent_reqs: env_config.dns_num_concurrent_reqs,
+        max_active_requests: env_config.dns_max_active_requests,
         backend_allow_ips: env_config.backend_allow_ips.clone(),
     });
 

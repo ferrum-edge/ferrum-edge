@@ -94,6 +94,12 @@ pub struct DnsConfig {
     /// Interval (seconds) for the background task that retries failed DNS lookups.
     /// Default: 10. Set to 0 to disable the retry task.
     pub failed_retry_interval_seconds: u64,
+    /// Retry over TCP when UDP responses are truncated or fail. Default: true.
+    pub try_tcp_on_error: bool,
+    /// Number of nameservers to query concurrently per lookup. Default: 3.
+    pub num_concurrent_reqs: usize,
+    /// Maximum in-flight queries per multiplexed connection. Default: 512.
+    pub max_active_requests: usize,
     /// Backend IP allowlist policy for SSRF protection.
     pub backend_allow_ips: crate::config::BackendAllowIps,
 }
@@ -114,6 +120,9 @@ impl Default for DnsConfig {
             slow_threshold_ms: None,
             warmup_concurrency: 500,
             failed_retry_interval_seconds: 10,
+            try_tcp_on_error: true,
+            num_concurrent_reqs: 3,
+            max_active_requests: 512,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
         }
     }
@@ -1100,6 +1109,15 @@ fn build_resolver(config: &DnsConfig) -> Resolver<TokioRuntimeProvider> {
 
     // Always check hosts file
     resolver_opts.use_hosts_file = ResolveHosts::Always;
+
+    // Retry over TCP when UDP responses are truncated or fail
+    resolver_opts.try_tcp_on_error = config.try_tcp_on_error;
+
+    // Race queries against multiple nameservers in parallel to reduce P99 latency
+    resolver_opts.num_concurrent_reqs = config.num_concurrent_reqs;
+
+    // Allow more in-flight queries per connection during bulk warmup
+    resolver_opts.max_active_requests = config.max_active_requests;
 
     // Build the resolver
     let mut builder =

@@ -567,6 +567,9 @@ All gateway components share a single `DnsCache` instance:
 - **Stale-while-revalidate**: Serves the old IP while refreshing in the background, avoiding DNS latency on the hot path
 - **Background refresh**: A dedicated task refreshes entries before they expire (at configurable `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` of TTL, default 90%), using each entry's own applied TTL for threshold computation (not a single global TTL). Scan interval is 5s to handle short-TTL records promptly.
 - **Failed DNS retry task**: A separate background task (`FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS`, default 10s) scans for error-cached entries whose error TTL has expired and re-attempts resolution. Logs at `warn` level for each retry attempt and outcome. Set to 0 to disable.
+- **TCP fallback**: `FERRUM_DNS_TRY_TCP_ON_ERROR` (default `true`) retries over TCP when UDP responses are truncated or fail, preventing silently empty results for large record sets.
+- **Concurrent nameserver queries**: `FERRUM_DNS_NUM_CONCURRENT_REQS` (default 3, range 1-10) races queries against multiple configured nameservers in parallel to reduce P99 DNS latency.
+- **Active request concurrency**: `FERRUM_DNS_MAX_ACTIVE_REQUESTS` (default 512, range 1-4096) limits in-flight queries per multiplexed upstream connection. Should be >= `FERRUM_DNS_WARMUP_CONCURRENCY` to avoid throttling startup.
 - **`DnsCacheResolver`**: Implements `reqwest::dns::Resolve` — plugged into every `reqwest::Client` for automatic cache integration
 - **Custom nameservers**: Supports `FERRUM_DNS_RESOLVER_ADDRESS` for internal DNS (e.g., Consul DNS, CoreDNS)
 - **Record type optimization**: Remembers whether A or AAAA succeeded last for each hostname, querying that type first on refresh

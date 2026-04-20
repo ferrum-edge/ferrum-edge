@@ -449,6 +449,12 @@ pub struct EnvConfig {
     /// Interval (seconds) for the background task that retries failed DNS lookups.
     /// Default: 10. Set to 0 to disable.
     pub dns_failed_retry_interval: u64,
+    /// Retry DNS queries over TCP when UDP responses are truncated or fail. Default: true.
+    pub dns_try_tcp_on_error: bool,
+    /// Number of nameservers to query concurrently per lookup. Default: 3.
+    pub dns_num_concurrent_reqs: usize,
+    /// Maximum in-flight queries per multiplexed connection. Default: 512.
+    pub dns_max_active_requests: usize,
 
     /// Path to a PEM file containing trusted CA certificates for outbound TLS verification.
     /// Used by backend proxy connections, service discovery, and plugin HTTP calls.
@@ -981,6 +987,9 @@ impl Default for EnvConfig {
             dns_slow_threshold_ms: None,
             dns_refresh_threshold_percent: 90,
             dns_failed_retry_interval: 10,
+            dns_try_tcp_on_error: true,
+            dns_num_concurrent_reqs: 3,
+            dns_max_active_requests: 512,
             tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -1225,6 +1234,9 @@ impl EnvConfig {
             dns_slow_threshold_ms: Option<u64> = "FERRUM_DNS_SLOW_THRESHOLD_MS";
             dns_refresh_threshold_percent: u8 = "FERRUM_DNS_REFRESH_THRESHOLD_PERCENT" => 90u8, clamp(1u8, 99u8);
             dns_failed_retry_interval: u64 = "FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS" => 10u64;
+            dns_try_tcp_on_error: bool = "FERRUM_DNS_TRY_TCP_ON_ERROR" => true;
+            dns_num_concurrent_reqs: usize = "FERRUM_DNS_NUM_CONCURRENT_REQS" => 3usize, clamp(1usize, 10usize);
+            dns_max_active_requests: usize = "FERRUM_DNS_MAX_ACTIVE_REQUESTS" => 512usize, clamp(1usize, 4096usize);
         }
 
         env_config! {
@@ -1546,6 +1558,9 @@ impl EnvConfig {
             dns_slow_threshold_ms,
             dns_refresh_threshold_percent,
             dns_failed_retry_interval,
+            dns_try_tcp_on_error,
+            dns_num_concurrent_reqs,
+            dns_max_active_requests,
             tls_ca_bundle_path,
             backend_tls_client_cert_path,
             backend_tls_client_key_path,
