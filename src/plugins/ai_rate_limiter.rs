@@ -1,97 +1,16 @@
-//! AI Token Rate Limiter Plugin
-//!
-//! Rate-limits consumers by LLM token consumption rather than request count.
-//! A 10-token request and a 50,000-token request shouldn't count the same.
-//!
-//! Works in two phases:
-//! 1. `before_proxy`: Check if consumer/IP is already over the token limit.
-//! 2. `on_response_body`: After the response comes back, extract token usage
-//!    and accumulate it against the consumer/IP's token budget.
-//!
-//! Supports OpenAI, Anthropic, Google Gemini, Cohere, Mistral, and AWS Bedrock
-//! response formats with auto-detection. Also supports SSE (Server-Sent Events)
-//! streaming responses — when `ai_token_metrics` is active it reads tokens from
-//! metadata; when used standalone it parses SSE `data:` lines directly.
-//!
-//! # Centralized mode (`sync_mode: "redis"`)
-//!
-//! When configured with Redis, token budgets are shared across all gateway
-//! instances. This prevents consumers from exceeding limits by spreading
-//! requests across multiple data planes.
+//! AI token-budget rate limiting with shared local/Redis/failover storage.
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::Instant;
 use tracing::{debug, warn};
 
+use super::utils::rate_limit::{
+    AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome,
+};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
-use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
-
-/// A sliding window that tracks token consumption over time.
-#[derive(Debug)]
-struct TokenWindow {
-    /// Timestamped token usage entries: (when, how_many_tokens).
-    entries: VecDeque<(Instant, u64)>,
-    window_duration: Duration,
-    limit: u64,
-    /// Running sum of `entries[].tokens`. Maintained by `record_usage` and
-    /// `current_usage` so each call is O(amortised stale-evicted) instead
-    /// of O(n) full re-summation per request.
-    total: u64,
-}
-
-impl TokenWindow {
-    fn new(limit: u64, window_duration: Duration) -> Self {
-        Self {
-            entries: VecDeque::new(),
-            window_duration,
-            limit,
-            total: 0,
-        }
-    }
-
-    /// Evict stale entries and return current token usage within the window.
-    /// Maintains a running `total` so that the per-call cost is amortised
-    /// O(stale-evicted) instead of O(n) per call.
-    fn current_usage(&mut self) -> u64 {
-        let now = Instant::now();
-        let cutoff = now - self.window_duration;
-        while let Some((ts, tokens)) = self.entries.front() {
-            if *ts < cutoff {
-                let popped = *tokens;
-                self.entries.pop_front();
-                self.total = self.total.saturating_sub(popped);
-            } else {
-                break;
-            }
-        }
-        self.total
-    }
-
-    /// Record token usage.
-    fn record_usage(&mut self, tokens: u64) {
-        self.entries.push_back((Instant::now(), tokens));
-        self.total = self.total.saturating_add(tokens);
-    }
-
-    /// Tokens remaining before limit is reached.
-    fn remaining(&mut self) -> u64 {
-        self.limit.saturating_sub(self.current_usage())
-    }
-
-    /// Whether there has been any activity in the window.
-    fn has_recent_activity(&self, now: Instant) -> bool {
-        self.entries
-            .back()
-            .is_some_and(|(ts, _)| now.duration_since(*ts) < self.window_duration)
-    }
-}
-
-/// Maximum state entries before triggering eviction.
 const MAX_STATE_ENTRIES: usize = 100_000;
 
 pub struct AiRateLimiter {
@@ -101,8 +20,7 @@ pub struct AiRateLimiter {
     limit_by: String,
     expose_headers: bool,
     provider: String,
-    state: Arc<DashMap<String, TokenWindow>>,
-    redis_client: Option<Arc<RedisRateLimitClient>>,
+    limiter: RateLimitBackend<String, AiTokenRateAlgorithm>,
 }
 
 impl AiRateLimiter {
@@ -113,10 +31,12 @@ impl AiRateLimiter {
         if token_limit == 0 {
             return Err("ai_rate_limiter: 'token_limit' must be greater than zero".to_string());
         }
+
         let window_seconds = config["window_seconds"].as_u64().unwrap_or(60);
         if window_seconds == 0 {
             return Err("ai_rate_limiter: 'window_seconds' must be greater than zero".to_string());
         }
+
         let count_mode = config["count_mode"]
             .as_str()
             .unwrap_or("total_tokens")
@@ -130,6 +50,7 @@ impl AiRateLimiter {
                 count_mode
             ));
         }
+
         let limit_by = config["limit_by"]
             .as_str()
             .unwrap_or("consumer")
@@ -140,34 +61,14 @@ impl AiRateLimiter {
                 limit_by
             ));
         }
+
         let expose_headers = config["expose_headers"].as_bool().unwrap_or(false);
         let provider = config["provider"]
             .as_str()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|value| !value.is_empty())
             .unwrap_or("auto")
             .to_ascii_lowercase();
-
-        let dns_cache = http_client.dns_cache().cloned();
-        let tls_no_verify = http_client.tls_no_verify();
-        let tls_ca_bundle_path = http_client.tls_ca_bundle_path().map(|s| s.to_string());
-        let redis_client = RedisConfig::from_plugin_config(
-            config,
-            &format!("{}:ai_rate_limiter", http_client.namespace()),
-        )
-        .map(|cfg| {
-            tracing::info!(
-                redis_url = %cfg.url,
-                key_prefix = %cfg.key_prefix,
-                "ai_rate_limiter: centralized Redis mode enabled"
-            );
-            Arc::new(RedisRateLimitClient::new(
-                cfg,
-                dns_cache,
-                tls_no_verify,
-                tls_ca_bundle_path.as_deref(),
-            ))
-        });
 
         Ok(Self {
             token_limit,
@@ -176,105 +77,105 @@ impl AiRateLimiter {
             limit_by,
             expose_headers,
             provider,
-            state: Arc::new(DashMap::new()),
-            redis_client,
+            limiter: RateLimitBackend::from_plugin_config(
+                "ai_rate_limiter",
+                config,
+                &http_client,
+                AiTokenRateAlgorithm::new(token_limit, window_seconds),
+            ),
         })
     }
 
-    /// Build the rate limit key from the request context.
-    ///
-    /// Uses `String::push_str` against a pre-sized buffer instead of `format!`
-    /// so the call is a single allocation per request rather than the multi-
-    /// allocation path through the format machinery.
     fn rate_key(&self, ctx: &RequestContext) -> String {
         if self.limit_by == "consumer"
             && let Some(identity) = ctx.effective_identity()
         {
-            let mut s = String::with_capacity(identity.len() + 9);
-            s.push_str("consumer:");
-            s.push_str(identity);
-            return s;
+            let mut key = String::with_capacity(identity.len() + 9);
+            key.push_str("consumer:");
+            key.push_str(identity);
+            return key;
         }
-        let mut s = String::with_capacity(ctx.client_ip.len() + 3);
-        s.push_str("ip:");
-        s.push_str(&ctx.client_ip);
-        s
+
+        let mut key = String::with_capacity(ctx.client_ip.len() + 3);
+        key.push_str("ip:");
+        key.push_str(&ctx.client_ip);
+        key
     }
 
-    /// Evict stale entries to prevent unbounded memory growth.
     fn evict_stale_entries(&self) {
-        if self.state.len() <= MAX_STATE_ENTRIES {
+        if self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES {
+            self.limiter.retain_active_at(Instant::now());
+        }
+    }
+
+    fn store_metadata(&self, ctx: &mut RequestContext, outcome: &RateLimitOutcome) {
+        if !self.expose_headers {
             return;
         }
-        let now = Instant::now();
-        self.state
-            .retain(|_, window| window.has_recent_activity(now));
+
+        ctx.metadata.insert(
+            "ai_ratelimit_limit".to_string(),
+            self.token_limit.to_string(),
+        );
+        ctx.metadata.insert(
+            "ai_ratelimit_window".to_string(),
+            self.window_seconds.to_string(),
+        );
+        ctx.metadata.insert(
+            "ai_ratelimit_remaining".to_string(),
+            outcome.remaining.unwrap_or(0).to_string(),
+        );
+        ctx.metadata.insert(
+            "ai_ratelimit_usage".to_string(),
+            outcome.usage.unwrap_or(0).to_string(),
+        );
     }
 
-    /// Check token budget against Redis. Returns `None` if Redis is unavailable.
-    async fn check_budget_redis(&self, key: &str) -> Option<(u64, bool)> {
-        let redis = self.redis_client.as_ref()?;
-        if !redis.is_available() {
-            return None;
+    fn reject(&self, usage: u64) -> PluginResult {
+        let mut headers = HashMap::new();
+        if self.expose_headers {
+            headers.insert(
+                "x-ai-ratelimit-limit".to_string(),
+                self.token_limit.to_string(),
+            );
+            headers.insert("x-ai-ratelimit-remaining".to_string(), "0".to_string());
+            headers.insert(
+                "x-ai-ratelimit-window".to_string(),
+                self.window_seconds.to_string(),
+            );
+            headers.insert("x-ai-ratelimit-usage".to_string(), usage.to_string());
         }
 
-        let window_secs = self.window_seconds.max(1);
-        let curr_idx = RedisRateLimitClient::window_index(window_secs);
-        let prev_idx = curr_idx.saturating_sub(1);
-        let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(window_secs);
-
-        let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
-        let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
-
-        // Pipeline both GETs in a single round-trip
-        let (prev_count, curr_count) = match redis.get_two_counters(&prev_key, &curr_key).await {
-            Ok(v) => v,
-            Err(()) => return None,
-        };
-
-        let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
-        let current_usage = weighted as u64;
-        let exceeded = current_usage >= self.token_limit;
-
-        Some((current_usage, exceeded))
+        PluginResult::Reject {
+            status_code: 429,
+            body: format!(
+                r#"{{"error":"AI token rate limit exceeded","details":"Token usage {} exceeds limit {} in window of {} seconds"}}"#,
+                usage, self.token_limit, self.window_seconds
+            ),
+            headers,
+        }
     }
 
-    /// Record token usage in Redis. Returns `false` if Redis is unavailable.
-    async fn record_usage_redis(&self, key: &str, tokens: u64) -> bool {
-        let redis = match self.redis_client.as_ref() {
-            Some(r) if r.is_available() => r,
-            _ => return false,
-        };
-
-        let window_secs = self.window_seconds.max(1);
-        let curr_idx = RedisRateLimitClient::window_index(window_secs);
-        let redis_key = redis.make_key(&[key, &curr_idx.to_string()]);
-
-        // TTL: 2x window so previous window data is available for weighted calc
-        let ttl = window_secs * 2 + 1;
-
-        redis
-            .incrby_with_expire(&redis_key, tokens as i64, ttl)
-            .await
-            .is_ok()
+    async fn record_usage(&self, key: String, tokens: u64) {
+        let _ = self
+            .limiter
+            .check(key.clone(), &key, &AiRateLimitOp::RecordUsage { tokens })
+            .await;
     }
 
-    /// Try to read the token count from metadata written by ai_token_metrics.
-    /// This avoids re-parsing the response JSON when both plugins are active
-    /// (ai_token_metrics runs at priority 4100, before this plugin at 4200).
     fn read_tokens_from_metadata(&self, metadata: &HashMap<String, String>) -> Option<u64> {
         let key = match self.count_mode.as_str() {
             "prompt_tokens" => "ai_prompt_tokens",
             "completion_tokens" => "ai_completion_tokens",
             _ => "ai_total_tokens",
         };
-        metadata.get(key).and_then(|v| v.parse::<u64>().ok())
+        metadata
+            .get(key)
+            .and_then(|value| value.parse::<u64>().ok())
     }
 
-    /// Extract token count from a response body based on provider and count_mode.
     fn extract_token_count(&self, body: &[u8]) -> Option<u64> {
         let json: Value = serde_json::from_slice(body).ok()?;
-
         let (prompt, completion, total) = if self.provider != "auto" {
             self.extract_by_provider(&json)?
         } else {
@@ -285,15 +186,14 @@ impl AiRateLimiter {
             "prompt_tokens" => prompt.or(Some(0)),
             "completion_tokens" => completion.or(Some(0)),
             _ => total.or_else(|| match (prompt, completion) {
-                (Some(p), Some(c)) => Some(p.saturating_add(c)),
-                (Some(p), None) => Some(p),
-                (None, Some(c)) => Some(c),
+                (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
+                (Some(prompt), None) => Some(prompt),
+                (None, Some(completion)) => Some(completion),
                 _ => None,
             }),
         }
     }
 
-    /// Extract tokens using a specific provider format.
     fn extract_by_provider(&self, json: &Value) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
         match self.provider.as_str() {
             "openai" | "mistral" => Some(Self::extract_openai(json)),
@@ -305,40 +205,38 @@ impl AiRateLimiter {
         }
     }
 
-    /// Auto-detect provider and extract tokens.
     fn auto_extract(&self, json: &Value) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
-        // Google Gemini
         if json
             .get("usageMetadata")
-            .and_then(|u| u.get("promptTokenCount"))
+            .and_then(|usage| usage.get("promptTokenCount"))
             .is_some()
         {
             return Some(Self::extract_google(json));
         }
-        // Anthropic
         if json
             .get("usage")
-            .and_then(|u| u.get("input_tokens"))
+            .and_then(|usage| usage.get("input_tokens"))
             .is_some()
         {
             return Some(Self::extract_anthropic(json));
         }
-        // Cohere
-        if json.get("meta").and_then(|m| m.get("tokens")).is_some() {
+        if json
+            .get("meta")
+            .and_then(|meta| meta.get("tokens"))
+            .is_some()
+        {
             return Some(Self::extract_cohere(json));
         }
-        // Bedrock
         if json
             .get("usage")
-            .and_then(|u| u.get("inputTokens"))
+            .and_then(|usage| usage.get("inputTokens"))
             .is_some()
         {
             return Some(Self::extract_bedrock(json));
         }
-        // OpenAI (and compatible)
         if json
             .get("usage")
-            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|usage| usage.get("prompt_tokens"))
             .is_some()
         {
             return Some(Self::extract_openai(json));
@@ -348,28 +246,29 @@ impl AiRateLimiter {
 
     fn extract_openai(json: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
         let usage = json.get("usage");
-        let prompt = usage
-            .and_then(|u| u.get("prompt_tokens"))
-            .and_then(|v| v.as_u64());
-        let completion = usage
-            .and_then(|u| u.get("completion_tokens"))
-            .and_then(|v| v.as_u64());
-        let total = usage
-            .and_then(|u| u.get("total_tokens"))
-            .and_then(|v| v.as_u64());
-        (prompt, completion, total)
+        (
+            usage
+                .and_then(|value| value.get("prompt_tokens"))
+                .and_then(|value| value.as_u64()),
+            usage
+                .and_then(|value| value.get("completion_tokens"))
+                .and_then(|value| value.as_u64()),
+            usage
+                .and_then(|value| value.get("total_tokens"))
+                .and_then(|value| value.as_u64()),
+        )
     }
 
     fn extract_anthropic(json: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
         let usage = json.get("usage");
         let prompt = usage
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(|v| v.as_u64());
+            .and_then(|value| value.get("input_tokens"))
+            .and_then(|value| value.as_u64());
         let completion = usage
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(|v| v.as_u64());
+            .and_then(|value| value.get("output_tokens"))
+            .and_then(|value| value.as_u64());
         let total = match (prompt, completion) {
-            (Some(p), Some(c)) => Some(p.saturating_add(c)),
+            (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
             _ => None,
         };
         (prompt, completion, total)
@@ -377,28 +276,29 @@ impl AiRateLimiter {
 
     fn extract_google(json: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
         let usage = json.get("usageMetadata");
-        let prompt = usage
-            .and_then(|u| u.get("promptTokenCount"))
-            .and_then(|v| v.as_u64());
-        let completion = usage
-            .and_then(|u| u.get("candidatesTokenCount"))
-            .and_then(|v| v.as_u64());
-        let total = usage
-            .and_then(|u| u.get("totalTokenCount"))
-            .and_then(|v| v.as_u64());
-        (prompt, completion, total)
+        (
+            usage
+                .and_then(|value| value.get("promptTokenCount"))
+                .and_then(|value| value.as_u64()),
+            usage
+                .and_then(|value| value.get("candidatesTokenCount"))
+                .and_then(|value| value.as_u64()),
+            usage
+                .and_then(|value| value.get("totalTokenCount"))
+                .and_then(|value| value.as_u64()),
+        )
     }
 
     fn extract_cohere(json: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
-        let tokens = json.get("meta").and_then(|m| m.get("tokens"));
+        let tokens = json.get("meta").and_then(|meta| meta.get("tokens"));
         let prompt = tokens
-            .and_then(|t| t.get("input_tokens"))
-            .and_then(|v| v.as_u64());
+            .and_then(|value| value.get("input_tokens"))
+            .and_then(|value| value.as_u64());
         let completion = tokens
-            .and_then(|t| t.get("output_tokens"))
-            .and_then(|v| v.as_u64());
+            .and_then(|value| value.get("output_tokens"))
+            .and_then(|value| value.as_u64());
         let total = match (prompt, completion) {
-            (Some(p), Some(c)) => Some(p.saturating_add(c)),
+            (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
             _ => None,
         };
         (prompt, completion, total)
@@ -406,31 +306,26 @@ impl AiRateLimiter {
 
     fn extract_bedrock(json: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
         let usage = json.get("usage");
-        let prompt = usage
-            .and_then(|u| u.get("inputTokens"))
-            .and_then(|v| v.as_u64());
-        let completion = usage
-            .and_then(|u| u.get("outputTokens"))
-            .and_then(|v| v.as_u64());
-        let total = usage
-            .and_then(|u| u.get("totalTokens"))
-            .and_then(|v| v.as_u64());
-        (prompt, completion, total)
+        (
+            usage
+                .and_then(|value| value.get("inputTokens"))
+                .and_then(|value| value.as_u64()),
+            usage
+                .and_then(|value| value.get("outputTokens"))
+                .and_then(|value| value.as_u64()),
+            usage
+                .and_then(|value| value.get("totalTokens"))
+                .and_then(|value| value.as_u64()),
+        )
     }
 
-    /// Extract token count from an SSE (text/event-stream) response body.
-    ///
-    /// Parses `data:` lines looking for usage information in the final chunk
-    /// (OpenAI with `stream_options.include_usage`) or in Anthropic's
-    /// `message_start`/`message_delta` events.
     fn extract_token_count_from_sse(&self, body: &[u8]) -> Option<u64> {
-        let body_str = std::str::from_utf8(body).ok()?;
-
+        let body = std::str::from_utf8(body).ok()?;
         let mut prompt_tokens: Option<u64> = None;
         let mut completion_tokens: Option<u64> = None;
         let mut total_tokens: Option<u64> = None;
 
-        for line in body_str.lines() {
+        for line in body.lines() {
             let data = if let Some(stripped) = line.strip_prefix("data: ") {
                 stripped.trim()
             } else if let Some(stripped) = line.strip_prefix("data:") {
@@ -444,58 +339,49 @@ impl AiRateLimiter {
             }
 
             let json: Value = match serde_json::from_str(data) {
-                Ok(v) => v,
+                Ok(value) => value,
                 Err(_) => continue,
             };
 
-            // OpenAI final chunk: usage object with prompt_tokens/completion_tokens
             if let Some(usage) = json.get("usage")
                 && usage.is_object()
-                && !usage.as_object().is_some_and(|o| o.is_empty())
+                && !usage.as_object().is_some_and(|object| object.is_empty())
             {
-                let (p, c, t) = if self.provider != "auto" {
+                let (prompt, completion, total) = if self.provider != "auto" {
                     self.extract_by_provider(&json)
                         .unwrap_or_else(|| Self::extract_openai(&json))
                 } else {
                     self.auto_extract(&json)
                         .unwrap_or_else(|| Self::extract_openai(&json))
                 };
-                prompt_tokens = p;
-                completion_tokens = c;
-                total_tokens = t;
+                prompt_tokens = prompt;
+                completion_tokens = completion;
+                total_tokens = total;
             }
 
-            // Anthropic: message_start has input_tokens
-            if json.get("type").and_then(|t| t.as_str()) == Some("message_start")
+            if json.get("type").and_then(|value| value.as_str()) == Some("message_start")
                 && let Some(message) = json.get("message")
                 && let Some(usage) = message.get("usage")
             {
-                prompt_tokens = usage.get("input_tokens").and_then(|v| v.as_u64());
+                prompt_tokens = usage.get("input_tokens").and_then(|value| value.as_u64());
             }
 
-            // Anthropic: message_delta has output_tokens
-            if json.get("type").and_then(|t| t.as_str()) == Some("message_delta")
+            if json.get("type").and_then(|value| value.as_str()) == Some("message_delta")
                 && let Some(usage) = json.get("usage")
             {
-                completion_tokens = usage.get("output_tokens").and_then(|v| v.as_u64());
+                completion_tokens = usage.get("output_tokens").and_then(|value| value.as_u64());
             }
         }
 
-        // Compute total if not provided. Handle partial state: an SSE stream
-        // that only contained `message_delta` events (no `message_start`) is
-        // still useful — return the completion_tokens we did see rather than
-        // dropping the whole count. Use `saturating_add` to avoid overflow
-        // even though billions of tokens per request is unrealistic.
         if total_tokens.is_none() {
             total_tokens = match (prompt_tokens, completion_tokens) {
-                (Some(p), Some(c)) => Some(p.saturating_add(c)),
-                (Some(p), None) => Some(p),
-                (None, Some(c)) => Some(c),
+                (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
+                (Some(prompt), None) => Some(prompt),
+                (None, Some(completion)) => Some(completion),
                 (None, None) => None,
             };
         }
 
-        // Return the appropriate count based on count_mode
         match self.count_mode.as_str() {
             "prompt_tokens" => prompt_tokens.or(Some(0)),
             "completion_tokens" => completion_tokens.or(Some(0)),
@@ -523,18 +409,11 @@ impl Plugin for AiRateLimiter {
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        self.redis_client
-            .as_ref()
-            .and_then(|r| r.warmup_hostname())
-            .into_iter()
-            .collect()
+        self.limiter.warmup_hostname().into_iter().collect()
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
-        // Only the local-mode DashMap is observable here. Redis-backed
-        // counters are stored externally and are reported through Redis
-        // metrics instead.
-        Some(self.state.len())
+        Some(self.limiter.tracked_keys_count())
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -542,8 +421,6 @@ impl Plugin for AiRateLimiter {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // Only buffer for POST requests — AI/LLM API calls that contain token
-        // usage in the response body. Method-only check covers multipart uploads.
         ctx.method == "POST"
     }
 
@@ -559,122 +436,24 @@ impl Plugin for AiRateLimiter {
         self.evict_stale_entries();
 
         let key = self.rate_key(ctx);
-        let window_duration = Duration::from_secs(self.window_seconds.max(1));
+        let outcome = self
+            .limiter
+            .check(key.clone(), &key, &AiRateLimitOp::CheckBudget)
+            .await;
 
-        // Try Redis first if configured
-        if self.redis_client.is_some()
-            && let Some((current_usage, exceeded)) = self.check_budget_redis(&key).await
-        {
-            if exceeded {
-                warn!(
-                    rate_limit_key = %key,
-                    current_tokens = current_usage,
-                    limit = self.token_limit,
-                    plugin = "ai_rate_limiter",
-                    "AI token rate limit exceeded (redis)"
-                );
-                let mut headers = HashMap::new();
-                if self.expose_headers {
-                    headers.insert(
-                        "x-ai-ratelimit-limit".to_string(),
-                        self.token_limit.to_string(),
-                    );
-                    headers.insert("x-ai-ratelimit-remaining".to_string(), "0".to_string());
-                    headers.insert(
-                        "x-ai-ratelimit-window".to_string(),
-                        self.window_seconds.to_string(),
-                    );
-                    headers.insert(
-                        "x-ai-ratelimit-usage".to_string(),
-                        current_usage.to_string(),
-                    );
-                }
-                return PluginResult::Reject {
-                    status_code: 429,
-                    body: format!(
-                        r#"{{"error":"AI token rate limit exceeded","details":"Token usage {} exceeds limit {} in window of {} seconds"}}"#,
-                        current_usage, self.token_limit, self.window_seconds
-                    ),
-                    headers,
-                };
-            }
-
-            // Store rate info for header injection
-            if self.expose_headers {
-                let remaining = self.token_limit.saturating_sub(current_usage);
-                ctx.metadata.insert(
-                    "ai_ratelimit_limit".to_string(),
-                    self.token_limit.to_string(),
-                );
-                ctx.metadata
-                    .insert("ai_ratelimit_remaining".to_string(), remaining.to_string());
-                ctx.metadata.insert(
-                    "ai_ratelimit_window".to_string(),
-                    self.window_seconds.to_string(),
-                );
-                ctx.metadata
-                    .insert("ai_ratelimit_usage".to_string(), current_usage.to_string());
-            }
-
-            return PluginResult::Continue;
-        }
-
-        // Local mode
-        let mut entry = self
-            .state
-            .entry(key.clone())
-            .or_insert_with(|| TokenWindow::new(self.token_limit, window_duration));
-
-        let current = entry.current_usage();
-
-        if current >= self.token_limit {
+        if !outcome.allowed {
+            let usage = outcome.usage.unwrap_or(0);
             warn!(
                 rate_limit_key = %key,
-                current_tokens = current,
+                current_tokens = usage,
                 limit = self.token_limit,
                 plugin = "ai_rate_limiter",
                 "AI token rate limit exceeded"
             );
-            let mut headers = HashMap::new();
-            if self.expose_headers {
-                headers.insert(
-                    "x-ai-ratelimit-limit".to_string(),
-                    self.token_limit.to_string(),
-                );
-                headers.insert("x-ai-ratelimit-remaining".to_string(), "0".to_string());
-                headers.insert(
-                    "x-ai-ratelimit-window".to_string(),
-                    self.window_seconds.to_string(),
-                );
-                headers.insert("x-ai-ratelimit-usage".to_string(), current.to_string());
-            }
-            return PluginResult::Reject {
-                status_code: 429,
-                body: format!(
-                    r#"{{"error":"AI token rate limit exceeded","details":"Token usage {} exceeds limit {} in window of {} seconds"}}"#,
-                    current, self.token_limit, self.window_seconds
-                ),
-                headers,
-            };
+            return self.reject(usage);
         }
 
-        // Store rate info in metadata for header injection
-        if self.expose_headers {
-            let remaining = entry.remaining();
-            ctx.metadata.insert(
-                "ai_ratelimit_limit".to_string(),
-                self.token_limit.to_string(),
-            );
-            ctx.metadata
-                .insert("ai_ratelimit_remaining".to_string(), remaining.to_string());
-            ctx.metadata.insert(
-                "ai_ratelimit_window".to_string(),
-                self.window_seconds.to_string(),
-            );
-            ctx.metadata
-                .insert("ai_ratelimit_usage".to_string(), current.to_string());
-        }
-
+        self.store_metadata(ctx, &outcome);
         PluginResult::Continue
     }
 
@@ -684,40 +463,27 @@ impl Plugin for AiRateLimiter {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // When ai_federation short-circuits via RejectBinary, on_response_body
-        // never fires. Record token usage here on the rejection path instead.
-        // The ai_federation_provider key distinguishes federation responses from
-        // normal proxy responses, preventing double-counting.
         if ctx.metadata.contains_key("ai_federation_provider")
             && let Some(tokens) = self.read_tokens_from_metadata(&ctx.metadata)
         {
-            let key = self.rate_key(ctx);
-            if self.redis_client.is_some() && self.record_usage_redis(&key, tokens).await {
-                // recorded in redis
-            } else {
-                let window_duration = Duration::from_secs(self.window_seconds.max(1));
-                let mut entry = self
-                    .state
-                    .entry(key)
-                    .or_insert_with(|| TokenWindow::new(self.token_limit, window_duration));
-                entry.record_usage(tokens);
-            }
+            self.record_usage(self.rate_key(ctx), tokens).await;
         }
 
         if !self.expose_headers {
             return PluginResult::Continue;
         }
-        // Inject rate limit headers into response
+
         for (meta_key, header_name) in &[
             ("ai_ratelimit_limit", "x-ai-ratelimit-limit"),
             ("ai_ratelimit_remaining", "x-ai-ratelimit-remaining"),
             ("ai_ratelimit_window", "x-ai-ratelimit-window"),
             ("ai_ratelimit_usage", "x-ai-ratelimit-usage"),
         ] {
-            if let Some(val) = ctx.metadata.get(*meta_key) {
-                response_headers.insert(header_name.to_string(), val.clone());
+            if let Some(value) = ctx.metadata.get(*meta_key) {
+                response_headers.insert(header_name.to_string(), value.clone());
             }
         }
+
         PluginResult::Continue
     }
 
@@ -728,7 +494,6 @@ impl Plugin for AiRateLimiter {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Only count tokens for successful responses
         if !(200..300).contains(&response_status) {
             debug!(
                 "ai_rate_limiter: skipping non-2xx response (status {})",
@@ -737,56 +502,36 @@ impl Plugin for AiRateLimiter {
             return PluginResult::Continue;
         }
 
-        // Try to read token count from ai_token_metrics metadata first (avoids
-        // re-parsing the response JSON when both plugins are active). Falls back
-        // to parsing the body directly if metadata isn't available.
         let tokens = self.read_tokens_from_metadata(&ctx.metadata).or_else(|| {
             let content_type = response_headers
                 .get("content-type")
-                .map(|s| s.as_str())
+                .map(String::as_str)
                 .unwrap_or("");
 
             if body.is_empty() {
                 return None;
             }
 
-            // SSE streaming responses
             if content_type.contains("text/event-stream") || content_type.contains("event-stream") {
                 return self.extract_token_count_from_sse(body);
             }
 
-            // Regular JSON responses
             if !content_type.contains("json") {
                 return None;
             }
+
             self.extract_token_count(body)
         });
 
         let tokens = match tokens {
-            Some(t) => t,
+            Some(tokens) => tokens,
             None => {
                 debug!("ai_rate_limiter: could not extract token count from response");
                 return PluginResult::Continue;
             }
         };
 
-        // Record token usage
-        let key = self.rate_key(ctx);
-
-        // Try Redis first if configured
-        if self.redis_client.is_some() && self.record_usage_redis(&key, tokens).await {
-            return PluginResult::Continue;
-        }
-
-        // Local mode
-        let window_duration = Duration::from_secs(self.window_seconds.max(1));
-        let mut entry = self
-            .state
-            .entry(key)
-            .or_insert_with(|| TokenWindow::new(self.token_limit, window_duration));
-
-        entry.record_usage(tokens);
-
+        self.record_usage(self.rate_key(ctx), tokens).await;
         PluginResult::Continue
     }
 }

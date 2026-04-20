@@ -222,9 +222,11 @@ fn test_env_config_cp_mode_missing_grpc_listen() {
         ],
         || {
             remove_var("FERRUM_CP_GRPC_LISTEN_ADDR");
-            let result = EnvConfig::from_env();
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("FERRUM_CP_GRPC_LISTEN_ADDR"));
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.cp_grpc_listen_addr,
+                Some("0.0.0.0:50051".to_string())
+            );
         },
     );
 }
@@ -1781,7 +1783,7 @@ fn test_plugin_http_slow_threshold_zero() {
 }
 
 #[test]
-fn test_plugin_http_slow_threshold_invalid_falls_back_to_default() {
+fn test_plugin_http_slow_threshold_invalid_errors() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "file"),
@@ -1789,8 +1791,13 @@ fn test_plugin_http_slow_threshold_invalid_falls_back_to_default() {
             ("FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS", "not_a_number"),
         ],
         || {
-            let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.plugin_http_slow_threshold_ms, 1000);
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS")
+            );
         },
     );
 }
@@ -1830,7 +1837,7 @@ fn test_plugin_http_retries_custom() {
 }
 
 #[test]
-fn test_plugin_http_retries_invalid_fall_back_to_defaults() {
+fn test_plugin_http_retries_invalid_error() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "file"),
@@ -1839,9 +1846,13 @@ fn test_plugin_http_retries_invalid_fall_back_to_defaults() {
             ("FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS", "also_bad"),
         ],
         || {
-            let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.plugin_http_max_retries, 0);
-            assert_eq!(config.plugin_http_retry_delay_ms, 100);
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("FERRUM_PLUGIN_HTTP_MAX_RETRIES")
+            );
         },
     );
 }
@@ -2250,7 +2261,7 @@ fn test_env_config_db_pool_min_connections_zero_allowed() {
 }
 
 #[test]
-fn test_env_config_db_pool_invalid_values_use_defaults() {
+fn test_env_config_db_pool_invalid_values_error() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "file"),
@@ -2259,14 +2270,12 @@ fn test_env_config_db_pool_invalid_values_use_defaults() {
             ("FERRUM_DB_POOL_MIN_CONNECTIONS", "abc"),
         ],
         || {
-            let config = EnvConfig::from_env().unwrap();
-            assert_eq!(
-                config.db_pool_max_connections, 10,
-                "invalid max_connections should fall back to default"
-            );
-            assert_eq!(
-                config.db_pool_min_connections, 1,
-                "invalid min_connections should fall back to default"
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("FERRUM_DB_POOL_MAX_CONNECTIONS")
             );
         },
     );
@@ -2369,7 +2378,7 @@ fn test_db_slow_query_threshold_custom() {
 }
 
 #[test]
-fn test_db_slow_query_threshold_invalid_falls_back_to_none() {
+fn test_db_slow_query_threshold_invalid_errors() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "file"),
@@ -2377,8 +2386,13 @@ fn test_db_slow_query_threshold_invalid_falls_back_to_none() {
             ("FERRUM_DB_SLOW_QUERY_THRESHOLD_MS", "not_a_number"),
         ],
         || {
-            let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.db_slow_query_threshold_ms, None);
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("FERRUM_DB_SLOW_QUERY_THRESHOLD_MS")
+            );
         },
     );
 }

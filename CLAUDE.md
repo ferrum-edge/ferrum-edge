@@ -556,7 +556,7 @@ All gateway components share a single `DnsCache` instance:
 
 ### Centralized Rate Limiting (Redis)
 
-All three rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`) support centralized mode via `sync_mode: "redis"` in their plugin config. When enabled, rate limit counters are stored in Redis instead of in-memory DashMaps, allowing multiple gateway instances (e.g., multiple data planes) to enforce a single shared rate limit.
+All four rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`) support centralized mode via `sync_mode: "redis"` in their plugin config. When enabled, rate limit counters are stored in Redis instead of in-memory DashMaps, allowing multiple gateway instances (e.g., multiple data planes) to enforce a single shared rate limit.
 
 **Architecture:**
 - **Shared client**: `src/plugins/utils/redis_rate_limiter.rs` provides `RedisRateLimitClient` — a shared Redis client with lazy connection, auto-reconnect via `ConnectionManager`, and background health checking.
@@ -566,10 +566,10 @@ All three rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_li
 - **TLS**: Supports `rediss://` URLs. CA verification and skip-verify use gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`.
 - **Protocol compatibility**: Uses the standard RESP protocol, so works with **Redis, Valkey, DragonflyDB, KeyDB, or Garnet** — any RESP-compatible server.
 - **Per-plugin isolation**: Each plugin instance has its own Redis connection and key prefix. Different proxies can use different Redis instances.
-- **Namespace isolation**: The `PluginHttpClient` carries the gateway's `FERRUM_NAMESPACE` to all plugins. Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `ai_semantic_cache`, `request_deduplication`) use it as the default key prefix so that gateways with different namespaces sharing the same Redis cluster do not collide. Observability plugins (`prometheus_metrics`, `statsd_logging`, `api_chargeback`) inject a `namespace` label/tag when `FERRUM_NAMESPACE` is non-default. When namespace is the default (`"ferrum"`), output is identical to pre-namespace behavior — no label is added, and keys use the same `ferrum:` prefix as before.
+- **Namespace isolation**: The `PluginHttpClient` carries the gateway's `FERRUM_NAMESPACE` to all plugins. Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `ai_semantic_cache`, `request_deduplication`) use it as the default key prefix so that gateways with different namespaces sharing the same Redis cluster do not collide. Observability plugins (`prometheus_metrics`, `statsd_logging`, `api_chargeback`) inject a `namespace` label/tag when `FERRUM_NAMESPACE` is non-default. When namespace is the default (`"ferrum"`), output is identical to pre-namespace behavior — no label is added, and keys use the same `ferrum:` prefix as before.
 - **No DB schema changes**: Plugin config is stored as opaque JSON (`serde_json::Value`) in the `plugin_configs` table, so new config fields are backward-compatible.
 
-**Config fields** (same for all three plugins):
+**Config fields** (same for all four rate limiting plugins):
 - `sync_mode`: `"local"` (default) or `"redis"`
 - `redis_url`: Connection URL (required when `sync_mode: "redis"`)
 - `redis_tls`: Enable TLS (CA verification and skip-verify use gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`)

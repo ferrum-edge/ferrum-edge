@@ -13,6 +13,10 @@ use super::conf_file::ConfFile;
 use std::collections::{HashMap, HashSet};
 use std::env;
 
+#[macro_use]
+#[path = "env_config_macro.rs"]
+mod env_config_macro;
+
 /// The operating mode of the gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatingMode {
@@ -116,18 +120,6 @@ fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
     conf.get(key).map(|v| v.to_string())
 }
 
-/// Resolve a configuration value with a default fallback.
-fn resolve_var_or(conf: &ConfFile, key: &str, default: &str) -> String {
-    resolve_var(conf, key).unwrap_or_else(|| default.to_string())
-}
-
-/// Resolve a bool configuration value ("true" or "1").
-fn resolve_bool(conf: &ConfFile, key: &str, default: bool) -> bool {
-    resolve_var(conf, key)
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(default)
-}
-
 /// Tri-state toggle: `auto` (detect at runtime), `true` (force on), `false` (force off).
 ///
 /// Used for Linux-specific optimizations that can probe the kernel at startup.
@@ -173,16 +165,6 @@ impl std::fmt::Display for AutoBool {
             Self::True => write!(f, "true"),
             Self::False => write!(f, "false"),
         }
-    }
-}
-
-/// Resolve an `AutoBool` configuration value: "auto", "true"/"1", "false"/"0".
-fn resolve_auto_bool(conf: &ConfFile, key: &str, default: AutoBool) -> AutoBool {
-    match resolve_var(conf, key).as_deref() {
-        Some("auto") => AutoBool::Auto,
-        Some("true") | Some("1") => AutoBool::True,
-        Some("false") | Some("0") => AutoBool::False,
-        _ => default,
     }
 }
 
@@ -1091,614 +1073,523 @@ impl EnvConfig {
     pub fn from_env_with_conf(conf: &ConfFile) -> Result<Self, String> {
         let mode = OperatingMode::resolve(conf)?;
 
-        let dns_overrides: HashMap<String, String> = resolve_var(conf, "FERRUM_DNS_OVERRIDES")
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        // Mechanical env vars are declared in one place so parse/default semantics
+        // stay consistent and malformed values fail loudly instead of silently
+        // falling back to defaults.
+        env_config! {
+            conf = conf, mode = &mode;
+            [core]
+            dns_overrides: HashMap<String, String> = "FERRUM_DNS_OVERRIDES" => HashMap::new();
+            namespace: String = "FERRUM_NAMESPACE" => "ferrum".to_string();
+            log_level: String = "FERRUM_LOG_LEVEL" => "error".to_string();
+            log_buffer_capacity: usize = "FERRUM_LOG_BUFFER_CAPACITY" => 128_000usize;
+            enable_streaming_latency_tracking: bool = "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING" => false;
+        }
 
-        let namespace = resolve_var_or(conf, "FERRUM_NAMESPACE", "ferrum");
+        env_config! {
+            conf = conf, mode = &mode;
+            [proxy]
+            proxy_http_port: u16 = "FERRUM_PROXY_HTTP_PORT" => 8000u16;
+            proxy_https_port: u16 = "FERRUM_PROXY_HTTPS_PORT" => 8443u16;
+            frontend_tls_cert_path: Option<String> = "FERRUM_FRONTEND_TLS_CERT_PATH";
+            frontend_tls_key_path: Option<String> = "FERRUM_FRONTEND_TLS_KEY_PATH";
+            proxy_bind_address: String = "FERRUM_PROXY_BIND_ADDRESS" => "0.0.0.0".to_string();
+        }
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [admin]
+            admin_http_port: u16 = "FERRUM_ADMIN_HTTP_PORT" => 9000u16;
+            admin_https_port: u16 = "FERRUM_ADMIN_HTTPS_PORT" => 9443u16;
+            admin_tls_cert_path: Option<String> = "FERRUM_ADMIN_TLS_CERT_PATH";
+            admin_tls_key_path: Option<String> = "FERRUM_ADMIN_TLS_KEY_PATH";
+            admin_bind_address: String = "FERRUM_ADMIN_BIND_ADDRESS" => "0.0.0.0".to_string();
+            admin_jwt_secret: Option<String> = "FERRUM_ADMIN_JWT_SECRET"
+                => required_for(["database", "cp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
+            admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
+            admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
+        }
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [database]
+            db_type: Option<String> = "FERRUM_DB_TYPE";
+            db_url: Option<String> = "FERRUM_DB_URL";
+            db_poll_interval: u64 = "FERRUM_DB_POLL_INTERVAL" => 30u64;
+            db_tls_enabled: bool = "FERRUM_DB_TLS_ENABLED" => false;
+            db_tls_ca_cert_path: Option<String> = "FERRUM_DB_TLS_CA_CERT_PATH";
+            db_tls_client_cert_path: Option<String> = "FERRUM_DB_TLS_CLIENT_CERT_PATH";
+            db_tls_client_key_path: Option<String> = "FERRUM_DB_TLS_CLIENT_KEY_PATH";
+            db_tls_insecure: bool = "FERRUM_DB_TLS_INSECURE" => false;
+            db_ssl_mode: Option<String> = "FERRUM_DB_SSL_MODE";
+            db_ssl_root_cert: Option<String> = "FERRUM_DB_SSL_ROOT_CERT";
+            db_ssl_client_cert: Option<String> = "FERRUM_DB_SSL_CLIENT_CERT";
+            db_ssl_client_key: Option<String> = "FERRUM_DB_SSL_CLIENT_KEY";
+            file_config_path: Option<String> = "FERRUM_FILE_CONFIG_PATH";
+            db_config_backup_path: Option<String> = "FERRUM_DB_CONFIG_BACKUP_PATH";
+            db_read_replica_url: Option<String> = "FERRUM_DB_READ_REPLICA_URL";
+            db_slow_query_threshold_ms: Option<u64> = "FERRUM_DB_SLOW_QUERY_THRESHOLD_MS";
+            db_pool_max_connections: u32 = "FERRUM_DB_POOL_MAX_CONNECTIONS" => 10u32, max(1u32);
+            db_pool_min_connections: u32 = "FERRUM_DB_POOL_MIN_CONNECTIONS" => 1u32;
+            db_pool_acquire_timeout_seconds: u64 = "FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS" => 30u64;
+            db_pool_idle_timeout_seconds: u64 = "FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS" => 600u64;
+            db_pool_max_lifetime_seconds: u64 = "FERRUM_DB_POOL_MAX_LIFETIME_SECONDS" => 300u64;
+            db_pool_connect_timeout_seconds: u64 = "FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS" => 10u64;
+            db_pool_statement_timeout_seconds: u64 = "FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS" => 30u64;
+            mongo_database: String = "FERRUM_MONGO_DATABASE" => "ferrum".to_string();
+            mongo_app_name: Option<String> = "FERRUM_MONGO_APP_NAME";
+            mongo_replica_set: Option<String> = "FERRUM_MONGO_REPLICA_SET";
+            mongo_auth_mechanism: Option<String> = "FERRUM_MONGO_AUTH_MECHANISM";
+            mongo_server_selection_timeout_seconds: u64 = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS" => 30u64;
+            mongo_connect_timeout_seconds: u64 = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS" => 10u64;
+        }
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [cp_dp]
+            cp_dp_grpc_jwt_secret: Option<String> = "FERRUM_CP_DP_GRPC_JWT_SECRET"
+                => required_for(["cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
+            dp_cp_grpc_url: Option<String> = "FERRUM_DP_CP_GRPC_URL";
+            dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
+            dp_cp_failover_primary_retry_secs: u64 = "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS" => 300u64;
+            cp_grpc_tls_cert_path: Option<String> = "FERRUM_CP_GRPC_TLS_CERT_PATH";
+            cp_grpc_tls_key_path: Option<String> = "FERRUM_CP_GRPC_TLS_KEY_PATH";
+            cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
+            cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
+            dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
+            dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
+            dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
+            dp_grpc_tls_no_verify: bool = "FERRUM_DP_GRPC_TLS_NO_VERIFY" => false;
+        }
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [limits]
+            max_header_size_bytes: usize = "FERRUM_MAX_HEADER_SIZE_BYTES" => 32_768usize;
+            max_single_header_size_bytes: usize = "FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES" => 16_384usize;
+            max_header_count: usize = "FERRUM_MAX_HEADER_COUNT" => 100usize;
+            max_request_body_size_bytes: usize = "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES" => 10_485_760usize;
+            max_response_body_size_bytes: usize = "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => 10_485_760usize;
+            response_buffer_cutoff_bytes: usize = "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES" => 65_536usize;
+            h2_coalesce_target_bytes: usize = "FERRUM_H2_COALESCE_TARGET_BYTES" => 131_072usize, clamp(16_384usize, 1_048_576usize);
+            max_url_length_bytes: usize = "FERRUM_MAX_URL_LENGTH_BYTES" => 8_192usize;
+            max_query_params: usize = "FERRUM_MAX_QUERY_PARAMS" => 100usize;
+            max_grpc_recv_size_bytes: usize = "FERRUM_MAX_GRPC_RECV_SIZE_BYTES" => 4_194_304usize;
+            max_websocket_frame_size_bytes: usize = "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES" => 16_777_216usize;
+            websocket_write_buffer_size: usize = "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE" => 131_072usize;
+            websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
+            max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
+            http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
+        }
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [dns]
+            dns_resolver_address: Option<String> = "FERRUM_DNS_RESOLVER_ADDRESS";
+            dns_resolver_hosts_file: Option<String> = "FERRUM_DNS_RESOLVER_HOSTS_FILE";
+            dns_order: Option<String> = "FERRUM_DNS_ORDER";
+            dns_ttl_override: Option<u64> = "FERRUM_DNS_TTL_OVERRIDE_SECONDS";
+            dns_min_ttl: u64 = "FERRUM_DNS_MIN_TTL_SECONDS" => 5u64;
+            dns_stale_ttl: u64 = "FERRUM_DNS_STALE_TTL" => 3600u64;
+            dns_error_ttl: u64 = "FERRUM_DNS_ERROR_TTL" => 5u64;
+            dns_cache_max_size: usize = "FERRUM_DNS_CACHE_MAX_SIZE" => 10_000usize;
+            dns_warmup_concurrency: usize = "FERRUM_DNS_WARMUP_CONCURRENCY" => 500usize, max(1usize);
+            dns_slow_threshold_ms: Option<u64> = "FERRUM_DNS_SLOW_THRESHOLD_MS";
+            dns_refresh_threshold_percent: u8 = "FERRUM_DNS_REFRESH_THRESHOLD_PERCENT" => 90u8, clamp(1u8, 99u8);
+            dns_failed_retry_interval: u64 = "FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS" => 10u64;
+        }
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [tls]
+            tls_ca_bundle_path: Option<String> = "FERRUM_TLS_CA_BUNDLE_PATH";
+            backend_tls_client_cert_path: Option<String> = "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH";
+            backend_tls_client_key_path: Option<String> = "FERRUM_BACKEND_TLS_CLIENT_KEY_PATH";
+            frontend_tls_client_ca_bundle_path: Option<String> = "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH";
+            admin_tls_client_ca_bundle_path: Option<String> = "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH";
+            tls_no_verify: bool = "FERRUM_TLS_NO_VERIFY" => false;
+            admin_tls_no_verify: bool = "FERRUM_ADMIN_TLS_NO_VERIFY" => false;
+            admin_read_only: bool = "FERRUM_ADMIN_READ_ONLY" => false;
+            stream_proxy_bind_address: String = "FERRUM_STREAM_PROXY_BIND_ADDRESS" => "0.0.0.0".to_string();
+            dtls_cert_path: Option<String> = "FERRUM_DTLS_CERT_PATH";
+            dtls_key_path: Option<String> = "FERRUM_DTLS_KEY_PATH";
+            dtls_client_ca_cert_path: Option<String> = "FERRUM_DTLS_CLIENT_CA_CERT_PATH";
+            dtls_max_plaintext_bytes: usize = "FERRUM_DTLS_MAX_PLAINTEXT_BYTES" => 16_384usize;
+            dtls_record_overhead_bytes: usize = "FERRUM_DTLS_RECORD_OVERHEAD_BYTES" => 64usize;
+            enable_http3: bool = "FERRUM_ENABLE_HTTP3" => false;
+            http3_idle_timeout: u64 = "FERRUM_HTTP3_IDLE_TIMEOUT" => 30u64;
+            http3_max_streams: u32 = "FERRUM_HTTP3_MAX_STREAMS" => 1000u32;
+            http3_stream_receive_window: u64 = "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW" => 8_388_608u64;
+            http3_receive_window: u64 = "FERRUM_HTTP3_RECEIVE_WINDOW" => 33_554_432u64;
+            http3_send_window: u64 = "FERRUM_HTTP3_SEND_WINDOW" => 8_388_608u64;
+            http3_connections_per_backend: usize = "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND" => 4usize, max(1usize);
+            http3_pool_idle_timeout_seconds: u64 = "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS" => 120u64;
+            grpc_pool_ready_wait_ms: u64 = "FERRUM_GRPC_POOL_READY_WAIT_MS" => 1u64;
+            pool_warmup_enabled: bool = "FERRUM_POOL_WARMUP_ENABLED" => true;
+            pool_warmup_concurrency: usize = "FERRUM_POOL_WARMUP_CONCURRENCY" => 500usize, max(1usize);
+            pool_cleanup_interval_seconds: u64 = "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS" => 30u64;
+            router_cache_max_entries: usize = "FERRUM_ROUTER_CACHE_MAX_ENTRIES" => 0usize;
+            tcp_idle_timeout_seconds: u64 = "FERRUM_TCP_IDLE_TIMEOUT_SECONDS" => 300u64;
+            tcp_half_close_max_wait_seconds: u64 = "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS" => 300u64;
+            udp_max_sessions: usize = "FERRUM_UDP_MAX_SESSIONS" => 10_000usize, max(1usize);
+            udp_cleanup_interval_seconds: u64 = "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS" => 10u64;
+            udp_recvmmsg_batch_size: usize = "FERRUM_UDP_RECVMMSG_BATCH_SIZE" => 64usize, clamp(1usize, 1024usize);
+            adaptive_buffer_enabled: bool = "FERRUM_ADAPTIVE_BUFFER_ENABLED" => true;
+            adaptive_batch_limit_enabled: bool = "FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED" => true;
+            adaptive_buffer_ewma_alpha: u64 = "FERRUM_ADAPTIVE_BUFFER_EWMA_ALPHA" => 300u64, clamp(1u64, 999u64);
+            adaptive_buffer_min_size: usize = "FERRUM_ADAPTIVE_BUFFER_MIN_SIZE" => 8_192usize, clamp(1024usize, 1_048_576usize);
+            adaptive_buffer_max_size: usize = "FERRUM_ADAPTIVE_BUFFER_MAX_SIZE" => 262_144usize, clamp(1024usize, 1_048_576usize);
+            adaptive_buffer_default_size: usize = "FERRUM_ADAPTIVE_BUFFER_DEFAULT_SIZE" => 65_536usize, clamp(1024usize, 1_048_576usize);
+            adaptive_batch_limit_default: usize = "FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT" => 6_000usize, max(1usize);
+            tls_min_version: String = "FERRUM_TLS_MIN_VERSION" => "1.2".to_string();
+            tls_max_version: String = "FERRUM_TLS_MAX_VERSION" => "1.3".to_string();
+            tls_cipher_suites: Option<String> = "FERRUM_TLS_CIPHER_SUITES";
+            tls_prefer_server_cipher_order: bool = "FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER" => true;
+            tls_curves: Option<String> = "FERRUM_TLS_CURVES";
+            tls_session_cache_size: usize = "FERRUM_TLS_SESSION_CACHE_SIZE" => 4096usize;
+            tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
+        }
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [client_ip]
+            trusted_proxies: String = "FERRUM_TRUSTED_PROXIES" => String::new();
+            backend_allow_ips: BackendAllowIps = "FERRUM_BACKEND_ALLOW_IPS" => BackendAllowIps::Both;
+            add_via_header: bool = "FERRUM_ADD_VIA_HEADER" => true;
+            via_pseudonym: String = "FERRUM_VIA_PSEUDONYM" => "ferrum-edge".to_string();
+            add_forwarded_header: bool = "FERRUM_ADD_FORWARDED_HEADER" => false;
+            basic_auth_hmac_secret: Option<String> = "FERRUM_BASIC_AUTH_HMAC_SECRET";
+            plugin_http_slow_threshold_ms: u64 = "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS" => 1000u64;
+            plugin_http_max_retries: u32 = "FERRUM_PLUGIN_HTTP_MAX_RETRIES" => 0u32;
+            plugin_http_retry_delay_ms: u64 = "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS" => 100u64;
+            tls_crl_file_path: Option<String> = "FERRUM_TLS_CRL_FILE_PATH";
+            admin_allowed_cidrs: String = "FERRUM_ADMIN_ALLOWED_CIDRS" => String::new();
+            admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
+            migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
+            migrate_dry_run: bool = "FERRUM_MIGRATE_DRY_RUN" => false;
+        }
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [runtime]
+            max_connections: usize = "FERRUM_MAX_CONNECTIONS" => 100_000usize;
+            max_requests: usize = "FERRUM_MAX_REQUESTS" => 0usize;
+            max_concurrent_requests_per_ip: u64 = "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP" => 0u64;
+            per_ip_cleanup_interval_seconds: u64 = "FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS" => 60u64;
+            circuit_breaker_cache_max_entries: usize = "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES" => 10_000usize;
+            status_counts_max_entries: usize = "FERRUM_STATUS_COUNTS_MAX_ENTRIES" => 200usize;
+            tcp_listen_backlog: u32 = "FERRUM_TCP_LISTEN_BACKLOG" => 2048u32, max(128u32);
+            server_http2_max_concurrent_streams: u32 = "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS" => 1000u32, max(1u32);
+            server_http2_max_pending_accept_reset_streams: usize = "FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS" => 64usize, max(1usize);
+            server_http2_max_local_error_reset_streams: usize = "FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS" => 256usize, max(1usize);
+            websocket_max_connections: usize = "FERRUM_WEBSOCKET_MAX_CONNECTIONS" => 20_000usize;
+            overload_check_interval_ms: u64 = "FERRUM_OVERLOAD_CHECK_INTERVAL_MS" => 1000u64, max(100u64);
+            overload_fd_pressure_threshold: f64 = "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD" => 0.80f64, clamp(0.0f64, 1.0f64);
+            overload_fd_critical_threshold: f64 = "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD" => 0.95f64, clamp(0.0f64, 1.0f64);
+            overload_conn_pressure_threshold: f64 = "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD" => 0.85f64, clamp(0.0f64, 1.0f64);
+            overload_conn_critical_threshold: f64 = "FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD" => 0.95f64, clamp(0.0f64, 1.0f64);
+            overload_req_pressure_threshold: f64 = "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD" => 0.85f64, clamp(0.0f64, 1.0f64);
+            overload_req_critical_threshold: f64 = "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD" => 0.95f64, clamp(0.0f64, 1.0f64);
+            overload_loop_warn_us: u64 = "FERRUM_OVERLOAD_LOOP_WARN_US" => 10_000u64;
+            overload_loop_critical_us: u64 = "FERRUM_OVERLOAD_LOOP_CRITICAL_US" => 500_000u64;
+            shutdown_drain_seconds: u64 = "FERRUM_SHUTDOWN_DRAIN_SECONDS" => 30u64;
+            status_metrics_window_seconds: u64 = "FERRUM_STATUS_METRICS_WINDOW_SECONDS" => 30u64, max(1u64);
+            tls_offload_threads: usize = "FERRUM_TLS_OFFLOAD_THREADS" => 0usize;
+            tcp_fastopen_queue_len: u16 = "FERRUM_TCP_FASTOPEN_QUEUE_LEN" => 256u16;
+            so_busy_poll_us: u32 = "FERRUM_SO_BUSY_POLL_US" => 0u32;
+        }
+
+        // Keep this hand-written: the CP gRPC listener inherits the admin bind
+        // address when unset, so the default depends on another parsed field.
+        let cp_grpc_listen_addr =
+            match env_config_macro::resolve_optional::<String>(conf, "FERRUM_CP_GRPC_LISTEN_ADDR")?
+            {
+                Some(addr) => Some(addr),
+                None if matches!(mode, OperatingMode::ControlPlane) => {
+                    Some(format!("{}:50051", admin_bind_address))
+                }
+                None => None,
+            };
+
+        // Keep this hand-written: failover URLs are part of a broader
+        // cross-variable validation path (TLS consistency vs. the primary).
+        let db_failover_urls =
+            env_config_macro::resolve_optional::<Vec<String>>(conf, "FERRUM_DB_FAILOVER_URLS")?
+                .unwrap_or_default();
+
+        // Keep this hand-written: 0-RTT methods emit startup warnings/info and
+        // normalize each token to uppercase.
+        let tls_early_data_methods: HashSet<String> = env_config_macro::resolve_optional::<
+            Vec<String>,
+        >(
+            conf, "FERRUM_TLS_EARLY_DATA_METHODS"
+        )?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|method| method.to_ascii_uppercase())
+        .filter(|method| !method.is_empty())
+        .collect();
+        for method in &tls_early_data_methods {
+            if method != "GET" {
+                tracing::warn!(
+                    "FERRUM_TLS_EARLY_DATA_METHODS includes non-GET method '{}' — \
+                     0-RTT early data is replayable, which is dangerous for \
+                     non-idempotent operations",
+                    method
+                );
+            }
+        }
+        if !tls_early_data_methods.is_empty() {
+            tracing::info!(
+                "TLS 1.3 0-RTT early data enabled for methods: {:?}",
+                tls_early_data_methods
+            );
+        }
+
+        // Keep this hand-written: the value is pre-lowercased at load time so
+        // request handling can avoid allocating on every lookup.
+        let real_ip_header =
+            env_config_macro::resolve_optional::<String>(conf, "FERRUM_REAL_IP_HEADER")?
+                .map(|header| header.to_ascii_lowercase());
+
+        // Keep these hand-written: optional runtime tunables clamp only when
+        // set, and accept_threads has an `auto` runtime probe fallback.
+        let worker_threads =
+            env_config_macro::resolve_optional::<usize>(conf, "FERRUM_WORKER_THREADS")?
+                .map(|threads| threads.max(1));
+        let blocking_threads =
+            env_config_macro::resolve_optional::<usize>(conf, "FERRUM_BLOCKING_THREADS")?
+                .map(|threads| threads.max(1));
+        let accept_threads_raw =
+            env_config_macro::resolve_default::<usize, _>(conf, "FERRUM_ACCEPT_THREADS", || {
+                0usize
+            })?;
+        let accept_threads = if accept_threads_raw == 0 {
+            std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get())
+                .unwrap_or(1)
+        } else {
+            accept_threads_raw
+        };
+
+        // Keep these hand-written: `auto` probe toggles deliberately stay out
+        // of the macro escape hatch so their startup semantics remain obvious.
+        let tcp_fastopen_enabled = env_config_macro::resolve_default::<AutoBool, _>(
+            conf,
+            "FERRUM_TCP_FASTOPEN_ENABLED",
+            || AutoBool::Auto,
+        )?;
+        let ktls_enabled =
+            env_config_macro::resolve_default::<AutoBool, _>(conf, "FERRUM_KTLS_ENABLED", || {
+                AutoBool::Auto
+            })?;
+        let io_uring_splice_enabled = env_config_macro::resolve_default::<AutoBool, _>(
+            conf,
+            "FERRUM_IO_URING_SPLICE_ENABLED",
+            || AutoBool::Auto,
+        )?;
+        let udp_gro_enabled = env_config_macro::resolve_default::<AutoBool, _>(
+            conf,
+            "FERRUM_UDP_GRO_ENABLED",
+            || AutoBool::Auto,
+        )?;
+        let udp_gso_enabled = env_config_macro::resolve_default::<AutoBool, _>(
+            conf,
+            "FERRUM_UDP_GSO_ENABLED",
+            || AutoBool::Auto,
+        )?;
+        let udp_pktinfo_enabled = env_config_macro::resolve_default::<AutoBool, _>(
+            conf,
+            "FERRUM_UDP_PKTINFO_ENABLED",
+            || AutoBool::Auto,
+        )?;
 
         let config = Self {
             mode: mode.clone(),
             namespace,
-            log_level: resolve_var_or(conf, "FERRUM_LOG_LEVEL", "error"),
-            log_buffer_capacity: resolve_usize(conf, "FERRUM_LOG_BUFFER_CAPACITY", 128_000),
-            enable_streaming_latency_tracking: resolve_bool(
-                conf,
-                "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING",
-                false,
-            ),
-
-            proxy_http_port: resolve_u16(conf, "FERRUM_PROXY_HTTP_PORT", 8000),
-            proxy_https_port: resolve_u16(conf, "FERRUM_PROXY_HTTPS_PORT", 8443),
-            frontend_tls_cert_path: resolve_var(conf, "FERRUM_FRONTEND_TLS_CERT_PATH"),
-            frontend_tls_key_path: resolve_var(conf, "FERRUM_FRONTEND_TLS_KEY_PATH"),
-            proxy_bind_address: resolve_var_or(conf, "FERRUM_PROXY_BIND_ADDRESS", "0.0.0.0"),
-
-            admin_http_port: resolve_u16(conf, "FERRUM_ADMIN_HTTP_PORT", 9000),
-            admin_https_port: resolve_u16(conf, "FERRUM_ADMIN_HTTPS_PORT", 9443),
-            admin_tls_cert_path: resolve_var(conf, "FERRUM_ADMIN_TLS_CERT_PATH"),
-            admin_tls_key_path: resolve_var(conf, "FERRUM_ADMIN_TLS_KEY_PATH"),
-            admin_bind_address: resolve_var_or(conf, "FERRUM_ADMIN_BIND_ADDRESS", "0.0.0.0"),
-            admin_jwt_secret: resolve_var(conf, "FERRUM_ADMIN_JWT_SECRET"),
-            admin_jwt_issuer: resolve_var_or(conf, "FERRUM_ADMIN_JWT_ISSUER", "ferrum-edge"),
-            admin_jwt_max_ttl: resolve_u64(conf, "FERRUM_ADMIN_JWT_MAX_TTL", 3600),
-            db_type: resolve_var(conf, "FERRUM_DB_TYPE"),
-            db_url: resolve_var(conf, "FERRUM_DB_URL"),
-            db_poll_interval: resolve_u64(conf, "FERRUM_DB_POLL_INTERVAL", 30),
-            db_tls_enabled: resolve_bool(conf, "FERRUM_DB_TLS_ENABLED", false),
-            db_tls_ca_cert_path: resolve_var(conf, "FERRUM_DB_TLS_CA_CERT_PATH"),
-            db_tls_client_cert_path: resolve_var(conf, "FERRUM_DB_TLS_CLIENT_CERT_PATH"),
-            db_tls_client_key_path: resolve_var(conf, "FERRUM_DB_TLS_CLIENT_KEY_PATH"),
-            db_tls_insecure: resolve_bool(conf, "FERRUM_DB_TLS_INSECURE", false),
-
-            // Database TLS/SSL
-            db_ssl_mode: resolve_var(conf, "FERRUM_DB_SSL_MODE"),
-            db_ssl_root_cert: resolve_var(conf, "FERRUM_DB_SSL_ROOT_CERT"),
-            db_ssl_client_cert: resolve_var(conf, "FERRUM_DB_SSL_CLIENT_CERT"),
-            db_ssl_client_key: resolve_var(conf, "FERRUM_DB_SSL_CLIENT_KEY"),
-
-            file_config_path: resolve_var(conf, "FERRUM_FILE_CONFIG_PATH"),
-            db_config_backup_path: resolve_var(conf, "FERRUM_DB_CONFIG_BACKUP_PATH"),
-            db_failover_urls: resolve_var(conf, "FERRUM_DB_FAILOVER_URLS")
-                .map(|s| {
-                    s.split(',')
-                        .map(|u| u.trim().to_string())
-                        .filter(|u| !u.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default(),
-            db_read_replica_url: resolve_var(conf, "FERRUM_DB_READ_REPLICA_URL"),
-
-            db_slow_query_threshold_ms: resolve_var(conf, "FERRUM_DB_SLOW_QUERY_THRESHOLD_MS")
-                .and_then(|v| v.parse().ok()),
-
-            // Database connection pool tuning
-            db_pool_max_connections: resolve_var(conf, "FERRUM_DB_POOL_MAX_CONNECTIONS")
-                .and_then(|v| v.parse().ok())
-                .map(|v: u32| v.max(1))
-                .unwrap_or(10),
-            db_pool_min_connections: resolve_var(conf, "FERRUM_DB_POOL_MIN_CONNECTIONS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1),
-            db_pool_acquire_timeout_seconds: resolve_u64(
-                conf,
-                "FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS",
-                30,
-            ),
-            db_pool_idle_timeout_seconds: resolve_u64(
-                conf,
-                "FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS",
-                600,
-            ),
-            db_pool_max_lifetime_seconds: resolve_u64(
-                conf,
-                "FERRUM_DB_POOL_MAX_LIFETIME_SECONDS",
-                300,
-            ),
-            db_pool_connect_timeout_seconds: resolve_u64(
-                conf,
-                "FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS",
-                10,
-            ),
-            db_pool_statement_timeout_seconds: resolve_u64(
-                conf,
-                "FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS",
-                30,
-            ),
-
-            // MongoDB-specific
-            mongo_database: resolve_var(conf, "FERRUM_MONGO_DATABASE")
-                .unwrap_or_else(|| "ferrum".to_string()),
-            mongo_app_name: resolve_var(conf, "FERRUM_MONGO_APP_NAME"),
-            mongo_replica_set: resolve_var(conf, "FERRUM_MONGO_REPLICA_SET"),
-            mongo_auth_mechanism: resolve_var(conf, "FERRUM_MONGO_AUTH_MECHANISM"),
-            mongo_server_selection_timeout_seconds: resolve_u64(
-                conf,
-                "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS",
-                30,
-            ),
-            mongo_connect_timeout_seconds: resolve_u64(
-                conf,
-                "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS",
-                10,
-            ),
-
-            cp_grpc_listen_addr: resolve_var(conf, "FERRUM_CP_GRPC_LISTEN_ADDR"),
-            cp_dp_grpc_jwt_secret: resolve_var(conf, "FERRUM_CP_DP_GRPC_JWT_SECRET"),
-            dp_cp_grpc_url: resolve_var(conf, "FERRUM_DP_CP_GRPC_URL"),
-            dp_cp_grpc_urls: resolve_var(conf, "FERRUM_DP_CP_GRPC_URLS")
-                .map(|s| {
-                    s.split(',')
-                        .map(|u| u.trim().to_string())
-                        .filter(|u| !u.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default(),
-            dp_cp_failover_primary_retry_secs: resolve_u64(
-                conf,
-                "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS",
-                300,
-            ),
-
-            // CP gRPC TLS
-            cp_grpc_tls_cert_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_CERT_PATH"),
-            cp_grpc_tls_key_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_KEY_PATH"),
-            cp_grpc_tls_client_ca_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH"),
-            cp_broadcast_channel_capacity: resolve_usize(
-                conf,
-                "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY",
-                128,
-            ),
-
-            // DP gRPC TLS
-            dp_grpc_tls_ca_cert_path: resolve_var(conf, "FERRUM_DP_GRPC_TLS_CA_CERT_PATH"),
-            dp_grpc_tls_client_cert_path: resolve_var(conf, "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH"),
-            dp_grpc_tls_client_key_path: resolve_var(conf, "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH"),
-            dp_grpc_tls_no_verify: resolve_bool(conf, "FERRUM_DP_GRPC_TLS_NO_VERIFY", false),
-
-            max_header_size_bytes: resolve_usize(conf, "FERRUM_MAX_HEADER_SIZE_BYTES", 32_768),
-            max_single_header_size_bytes: resolve_usize(
-                conf,
-                "FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES",
-                16_384,
-            ),
-            max_header_count: resolve_usize(conf, "FERRUM_MAX_HEADER_COUNT", 100),
-            max_request_body_size_bytes: resolve_usize(
-                conf,
-                "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
-                10_485_760,
-            ),
-            max_response_body_size_bytes: resolve_usize(
-                conf,
-                "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES",
-                10_485_760,
-            ),
-            response_buffer_cutoff_bytes: resolve_usize(
-                conf,
-                "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES",
-                65_536,
-            ),
-            h2_coalesce_target_bytes: resolve_usize(
-                conf,
-                "FERRUM_H2_COALESCE_TARGET_BYTES",
-                131_072,
-            )
-            .clamp(16_384, 1_048_576),
-            max_url_length_bytes: resolve_usize(conf, "FERRUM_MAX_URL_LENGTH_BYTES", 8_192),
-            max_query_params: resolve_usize(conf, "FERRUM_MAX_QUERY_PARAMS", 100),
-            max_grpc_recv_size_bytes: resolve_usize(
-                conf,
-                "FERRUM_MAX_GRPC_RECV_SIZE_BYTES",
-                4_194_304,
-            ),
-            max_websocket_frame_size_bytes: resolve_usize(
-                conf,
-                "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES",
-                16_777_216,
-            ),
-            websocket_write_buffer_size: resolve_usize(
-                conf,
-                "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE",
-                131_072, // 128 KB — optimal for 10KB-100KB payloads
-            ),
-            websocket_tunnel_mode: resolve_bool(conf, "FERRUM_WEBSOCKET_TUNNEL_MODE", false),
-            max_credentials_per_type: resolve_usize(conf, "FERRUM_MAX_CREDENTIALS_PER_TYPE", 2),
-            http_header_read_timeout_seconds: resolve_u64(
-                conf,
-                "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS",
-                10,
-            ),
-
+            log_level,
+            log_buffer_capacity,
+            enable_streaming_latency_tracking,
+            proxy_http_port,
+            proxy_https_port,
+            frontend_tls_cert_path,
+            frontend_tls_key_path,
+            proxy_bind_address,
+            admin_http_port,
+            admin_https_port,
+            admin_tls_cert_path,
+            admin_tls_key_path,
+            admin_bind_address,
+            admin_jwt_secret,
+            admin_jwt_issuer,
+            admin_jwt_max_ttl,
+            db_type,
+            db_url,
+            db_poll_interval,
+            db_tls_enabled,
+            db_tls_ca_cert_path,
+            db_tls_client_cert_path,
+            db_tls_client_key_path,
+            db_tls_insecure,
+            db_ssl_mode,
+            db_ssl_root_cert,
+            db_ssl_client_cert,
+            db_ssl_client_key,
+            file_config_path,
+            db_config_backup_path,
+            db_failover_urls,
+            db_read_replica_url,
+            db_slow_query_threshold_ms,
+            db_pool_max_connections,
+            db_pool_min_connections,
+            db_pool_acquire_timeout_seconds,
+            db_pool_idle_timeout_seconds,
+            db_pool_max_lifetime_seconds,
+            db_pool_connect_timeout_seconds,
+            db_pool_statement_timeout_seconds,
+            mongo_database,
+            mongo_app_name,
+            mongo_replica_set,
+            mongo_auth_mechanism,
+            mongo_server_selection_timeout_seconds,
+            mongo_connect_timeout_seconds,
+            cp_grpc_listen_addr,
+            cp_dp_grpc_jwt_secret,
+            dp_cp_grpc_url,
+            dp_cp_grpc_urls,
+            dp_cp_failover_primary_retry_secs,
+            cp_grpc_tls_cert_path,
+            cp_grpc_tls_key_path,
+            cp_grpc_tls_client_ca_path,
+            cp_broadcast_channel_capacity,
+            dp_grpc_tls_ca_cert_path,
+            dp_grpc_tls_client_cert_path,
+            dp_grpc_tls_client_key_path,
+            dp_grpc_tls_no_verify,
+            max_header_size_bytes,
+            max_single_header_size_bytes,
+            max_header_count,
+            max_request_body_size_bytes,
+            max_response_body_size_bytes,
+            response_buffer_cutoff_bytes,
+            h2_coalesce_target_bytes,
+            max_url_length_bytes,
+            max_query_params,
+            max_grpc_recv_size_bytes,
+            max_websocket_frame_size_bytes,
+            websocket_write_buffer_size,
+            websocket_tunnel_mode,
+            max_credentials_per_type,
+            http_header_read_timeout_seconds,
             dns_overrides,
-            dns_resolver_address: resolve_var(conf, "FERRUM_DNS_RESOLVER_ADDRESS"),
-            dns_resolver_hosts_file: resolve_var(conf, "FERRUM_DNS_RESOLVER_HOSTS_FILE"),
-            dns_order: resolve_var(conf, "FERRUM_DNS_ORDER"),
-            dns_ttl_override: resolve_var(conf, "FERRUM_DNS_TTL_OVERRIDE_SECONDS")
-                .and_then(|v| v.parse().ok()),
-            dns_min_ttl: resolve_u64(conf, "FERRUM_DNS_MIN_TTL_SECONDS", 5),
-            dns_stale_ttl: resolve_u64(conf, "FERRUM_DNS_STALE_TTL", 3600),
-            dns_error_ttl: resolve_u64(conf, "FERRUM_DNS_ERROR_TTL", 5),
-            dns_cache_max_size: resolve_var(conf, "FERRUM_DNS_CACHE_MAX_SIZE")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10_000),
-            dns_warmup_concurrency: resolve_var(conf, "FERRUM_DNS_WARMUP_CONCURRENCY")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(500)
-                .max(1),
-            dns_slow_threshold_ms: resolve_var(conf, "FERRUM_DNS_SLOW_THRESHOLD_MS")
-                .and_then(|v| v.parse().ok()),
-            dns_refresh_threshold_percent: resolve_var(
-                conf,
-                "FERRUM_DNS_REFRESH_THRESHOLD_PERCENT",
-            )
-            .and_then(|v| v.parse::<u8>().ok())
-            .unwrap_or(90)
-            .clamp(1, 99),
-            dns_failed_retry_interval: resolve_u64(
-                conf,
-                "FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS",
-                10,
-            ),
-
-            // Global TLS trust store and mTLS
-            tls_ca_bundle_path: resolve_var(conf, "FERRUM_TLS_CA_BUNDLE_PATH"),
-            backend_tls_client_cert_path: resolve_var(conf, "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH"),
-            backend_tls_client_key_path: resolve_var(conf, "FERRUM_BACKEND_TLS_CLIENT_KEY_PATH"),
-
-            // Global Frontend mTLS (client certificate verification)
-            frontend_tls_client_ca_bundle_path: resolve_var(
-                conf,
-                "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH",
-            ),
-
-            // Admin API TLS enhancements
-            admin_tls_client_ca_bundle_path: resolve_var(
-                conf,
-                "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH",
-            ),
-            tls_no_verify: resolve_bool(conf, "FERRUM_TLS_NO_VERIFY", false),
-            admin_tls_no_verify: resolve_bool(conf, "FERRUM_ADMIN_TLS_NO_VERIFY", false),
-            admin_read_only: resolve_bool(conf, "FERRUM_ADMIN_READ_ONLY", false),
-            stream_proxy_bind_address: resolve_var_or(
-                conf,
-                "FERRUM_STREAM_PROXY_BIND_ADDRESS",
-                "0.0.0.0",
-            ),
-            dtls_cert_path: resolve_var(conf, "FERRUM_DTLS_CERT_PATH"),
-            dtls_key_path: resolve_var(conf, "FERRUM_DTLS_KEY_PATH"),
-            dtls_client_ca_cert_path: resolve_var(conf, "FERRUM_DTLS_CLIENT_CA_CERT_PATH"),
-            dtls_max_plaintext_bytes: resolve_var(conf, "FERRUM_DTLS_MAX_PLAINTEXT_BYTES")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(16_384),
-            dtls_record_overhead_bytes: resolve_var(conf, "FERRUM_DTLS_RECORD_OVERHEAD_BYTES")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(64),
-
-            // HTTP/3 / QUIC
-            enable_http3: resolve_bool(conf, "FERRUM_ENABLE_HTTP3", false),
-            http3_idle_timeout: resolve_u64(conf, "FERRUM_HTTP3_IDLE_TIMEOUT", 30),
-            http3_max_streams: resolve_var(conf, "FERRUM_HTTP3_MAX_STREAMS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1000),
-            http3_stream_receive_window: resolve_u64(
-                conf,
-                "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW",
-                8_388_608,
-            ),
-            http3_receive_window: resolve_u64(conf, "FERRUM_HTTP3_RECEIVE_WINDOW", 33_554_432),
-            http3_send_window: resolve_u64(conf, "FERRUM_HTTP3_SEND_WINDOW", 8_388_608),
-            http3_connections_per_backend: resolve_var(
-                conf,
-                "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND",
-            )
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4)
-            .max(1),
-            http3_pool_idle_timeout_seconds: resolve_u64(
-                conf,
-                "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS",
-                120,
-            ),
-            grpc_pool_ready_wait_ms: resolve_u64(conf, "FERRUM_GRPC_POOL_READY_WAIT_MS", 1),
-
-            // Connection pool warmup
-            pool_warmup_enabled: resolve_bool(conf, "FERRUM_POOL_WARMUP_ENABLED", true),
-            pool_warmup_concurrency: resolve_var(conf, "FERRUM_POOL_WARMUP_CONCURRENCY")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(500)
-                .max(1),
-
-            // Connection pool cleanup
-            pool_cleanup_interval_seconds: resolve_u64(
-                conf,
-                "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS",
-                30,
-            ),
-
-            // Router cache
-            router_cache_max_entries: resolve_usize(
-                conf,
-                "FERRUM_ROUTER_CACHE_MAX_ENTRIES",
-                0, // 0 = auto-scale: max(10_000, proxies × 3)
-            ),
-
-            // TCP proxy
-            tcp_idle_timeout_seconds: resolve_u64(conf, "FERRUM_TCP_IDLE_TIMEOUT_SECONDS", 300),
-            tcp_half_close_max_wait_seconds: resolve_u64(
-                conf,
-                "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS",
-                300,
-            ),
-
-            // UDP proxy
-            udp_max_sessions: resolve_var(conf, "FERRUM_UDP_MAX_SESSIONS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10_000)
-                .max(1),
-            udp_cleanup_interval_seconds: resolve_u64(
-                conf,
-                "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS",
-                10,
-            ),
-            udp_recvmmsg_batch_size: resolve_usize(conf, "FERRUM_UDP_RECVMMSG_BATCH_SIZE", 64)
-                .clamp(1, 1024),
-            // Adaptive Buffer Sizing
-            adaptive_buffer_enabled: resolve_bool(conf, "FERRUM_ADAPTIVE_BUFFER_ENABLED", true),
-            adaptive_batch_limit_enabled: resolve_bool(
-                conf,
-                "FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED",
-                true,
-            ),
-            adaptive_buffer_ewma_alpha: resolve_u64(conf, "FERRUM_ADAPTIVE_BUFFER_EWMA_ALPHA", 300)
-                .clamp(1, 999),
-            adaptive_buffer_min_size: resolve_usize(conf, "FERRUM_ADAPTIVE_BUFFER_MIN_SIZE", 8_192)
-                .clamp(1024, 1_048_576),
-            adaptive_buffer_max_size: resolve_usize(
-                conf,
-                "FERRUM_ADAPTIVE_BUFFER_MAX_SIZE",
-                262_144,
-            )
-            .clamp(1024, 1_048_576),
-            adaptive_buffer_default_size: resolve_usize(
-                conf,
-                "FERRUM_ADAPTIVE_BUFFER_DEFAULT_SIZE",
-                65_536,
-            )
-            .clamp(1024, 1_048_576),
-            adaptive_batch_limit_default: resolve_usize(
-                conf,
-                "FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT",
-                6_000,
-            )
-            .max(1),
-
-            // TLS Hardening
-            tls_min_version: resolve_var_or(conf, "FERRUM_TLS_MIN_VERSION", "1.2"),
-            tls_max_version: resolve_var_or(conf, "FERRUM_TLS_MAX_VERSION", "1.3"),
-            tls_cipher_suites: resolve_var(conf, "FERRUM_TLS_CIPHER_SUITES"),
-            tls_prefer_server_cipher_order: resolve_var(
-                conf,
-                "FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER",
-            )
-            .map(|v| v == "true")
-            .unwrap_or(true),
-            tls_curves: resolve_var(conf, "FERRUM_TLS_CURVES"),
-            tls_session_cache_size: resolve_usize(conf, "FERRUM_TLS_SESSION_CACHE_SIZE", 4096),
-            tls_cert_expiry_warning_days: resolve_u64(
-                conf,
-                "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS",
-                30,
-            ),
-            tls_early_data_methods: {
-                let methods: HashSet<String> = resolve_var(conf, "FERRUM_TLS_EARLY_DATA_METHODS")
-                    .map(|s| {
-                        s.split(',')
-                            .map(|m| m.trim().to_uppercase())
-                            .filter(|m| !m.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for m in &methods {
-                    if m != "GET" {
-                        tracing::warn!(
-                            "FERRUM_TLS_EARLY_DATA_METHODS includes non-GET method '{}' — \
-                             0-RTT early data is replayable, which is dangerous for \
-                             non-idempotent operations",
-                            m
-                        );
-                    }
-                }
-                if !methods.is_empty() {
-                    tracing::info!(
-                        "TLS 1.3 0-RTT early data enabled for methods: {:?}",
-                        methods
-                    );
-                }
-                methods
-            },
-
-            // Client IP resolution
-            trusted_proxies: resolve_var_or(conf, "FERRUM_TRUSTED_PROXIES", ""),
-            backend_allow_ips: match resolve_var_or(conf, "FERRUM_BACKEND_ALLOW_IPS", "both")
-                .to_lowercase()
-                .as_str()
-            {
-                "private" => BackendAllowIps::Private,
-                "public" => BackendAllowIps::Public,
-                "both" => BackendAllowIps::Both,
-                other => {
-                    return Err(format!(
-                        "Invalid FERRUM_BACKEND_ALLOW_IPS '{}'. Expected: private, public, both",
-                        other
-                    ));
-                }
-            },
-            add_via_header: resolve_var_or(conf, "FERRUM_ADD_VIA_HEADER", "true")
-                .eq_ignore_ascii_case("true"),
-            via_pseudonym: resolve_var_or(conf, "FERRUM_VIA_PSEUDONYM", "ferrum-edge"),
-            add_forwarded_header: resolve_var_or(conf, "FERRUM_ADD_FORWARDED_HEADER", "false")
-                .eq_ignore_ascii_case("true"),
-            // Pre-lowercase at load time so the hot path avoids per-request
-            // to_lowercase() allocation when looking up this header in ctx.headers
-            // (which stores hyper's already-lowercased header names).
-            real_ip_header: resolve_var(conf, "FERRUM_REAL_IP_HEADER").map(|h| h.to_lowercase()),
-
-            basic_auth_hmac_secret: resolve_var(conf, "FERRUM_BASIC_AUTH_HMAC_SECRET"),
-
-            plugin_http_slow_threshold_ms: resolve_u64(
-                conf,
-                "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS",
-                1000,
-            ),
-            plugin_http_max_retries: resolve_var(conf, "FERRUM_PLUGIN_HTTP_MAX_RETRIES")
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(0),
-            plugin_http_retry_delay_ms: resolve_u64(conf, "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS", 100),
-
-            tls_crl_file_path: resolve_var(conf, "FERRUM_TLS_CRL_FILE_PATH"),
-            admin_allowed_cidrs: resolve_var_or(conf, "FERRUM_ADMIN_ALLOWED_CIDRS", ""),
-            admin_restore_max_body_size_mib: resolve_usize(
-                conf,
-                "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB",
-                100,
-            ),
-            migrate_action: resolve_var_or(conf, "FERRUM_MIGRATE_ACTION", "up").to_lowercase(),
-            migrate_dry_run: resolve_bool(conf, "FERRUM_MIGRATE_DRY_RUN", false),
-            worker_threads: resolve_var(conf, "FERRUM_WORKER_THREADS")
-                .and_then(|v| v.parse().ok())
-                .map(|v: usize| v.max(1)),
-            blocking_threads: resolve_var(conf, "FERRUM_BLOCKING_THREADS")
-                .and_then(|v| v.parse().ok())
-                .map(|v: usize| v.max(1)),
-            max_connections: resolve_var(conf, "FERRUM_MAX_CONNECTIONS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100_000),
-            max_requests: resolve_var(conf, "FERRUM_MAX_REQUESTS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            max_concurrent_requests_per_ip: resolve_u64(
-                conf,
-                "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP",
-                0,
-            ),
-            per_ip_cleanup_interval_seconds: resolve_u64(
-                conf,
-                "FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS",
-                60,
-            ),
-            circuit_breaker_cache_max_entries: resolve_usize(
-                conf,
-                "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES",
-                10_000,
-            ),
-            status_counts_max_entries: resolve_usize(conf, "FERRUM_STATUS_COUNTS_MAX_ENTRIES", 200),
-            tcp_listen_backlog: resolve_var(conf, "FERRUM_TCP_LISTEN_BACKLOG")
-                .and_then(|v| v.parse().ok())
-                .map(|v: u32| v.max(128))
-                .unwrap_or(2048),
-            accept_threads: {
-                let raw = resolve_var(conf, "FERRUM_ACCEPT_THREADS")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0usize);
-                if raw == 0 {
-                    // Auto-detect: use available CPU cores
-                    std::thread::available_parallelism()
-                        .map(|p| p.get())
-                        .unwrap_or(1)
-                } else {
-                    raw
-                }
-            },
-            server_http2_max_concurrent_streams: resolve_var(
-                conf,
-                "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS",
-            )
-            .and_then(|v| v.parse().ok())
-            .map(|v: u32| v.max(1))
-            .unwrap_or(1000),
-            server_http2_max_pending_accept_reset_streams: resolve_var(
-                conf,
-                "FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS",
-            )
-            .and_then(|v| v.parse().ok())
-            .map(|v: usize| v.max(1))
-            .unwrap_or(64),
-            server_http2_max_local_error_reset_streams: resolve_var(
-                conf,
-                "FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS",
-            )
-            .and_then(|v| v.parse().ok())
-            .map(|v: usize| v.max(1))
-            .unwrap_or(256),
-            websocket_max_connections: resolve_var(conf, "FERRUM_WEBSOCKET_MAX_CONNECTIONS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20_000),
-            overload_check_interval_ms: resolve_u64(
-                conf,
-                "FERRUM_OVERLOAD_CHECK_INTERVAL_MS",
-                1000,
-            )
-            .max(100), // minimum 100ms to prevent busy-looping
-            overload_fd_pressure_threshold: resolve_var(
-                conf,
-                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD",
-            )
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.80)
-            .clamp(0.0, 1.0),
-            overload_fd_critical_threshold: resolve_var(
-                conf,
-                "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD",
-            )
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.95)
-            .clamp(0.0, 1.0),
-            overload_conn_pressure_threshold: resolve_var(
-                conf,
-                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD",
-            )
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.85)
-            .clamp(0.0, 1.0),
-            overload_conn_critical_threshold: resolve_var(
-                conf,
-                "FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD",
-            )
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.95)
-            .clamp(0.0, 1.0),
-            overload_req_pressure_threshold: resolve_var(
-                conf,
-                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD",
-            )
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.85)
-            .clamp(0.0, 1.0),
-            overload_req_critical_threshold: resolve_var(
-                conf,
-                "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD",
-            )
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.95)
-            .clamp(0.0, 1.0),
-            overload_loop_warn_us: resolve_u64(conf, "FERRUM_OVERLOAD_LOOP_WARN_US", 10_000),
-            overload_loop_critical_us: resolve_u64(
-                conf,
-                "FERRUM_OVERLOAD_LOOP_CRITICAL_US",
-                500_000,
-            ),
-            shutdown_drain_seconds: resolve_u64(conf, "FERRUM_SHUTDOWN_DRAIN_SECONDS", 30),
-            status_metrics_window_seconds: resolve_u64(
-                conf,
-                "FERRUM_STATUS_METRICS_WINDOW_SECONDS",
-                30,
-            )
-            .max(1),
-            tls_offload_threads: resolve_usize(conf, "FERRUM_TLS_OFFLOAD_THREADS", 0),
-            tcp_fastopen_enabled: resolve_auto_bool(
-                conf,
-                "FERRUM_TCP_FASTOPEN_ENABLED",
-                AutoBool::Auto,
-            ),
-            tcp_fastopen_queue_len: resolve_var(conf, "FERRUM_TCP_FASTOPEN_QUEUE_LEN")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(256),
-            ktls_enabled: resolve_auto_bool(conf, "FERRUM_KTLS_ENABLED", AutoBool::Auto),
-            io_uring_splice_enabled: resolve_auto_bool(
-                conf,
-                "FERRUM_IO_URING_SPLICE_ENABLED",
-                AutoBool::Auto,
-            ),
-            udp_gro_enabled: resolve_auto_bool(conf, "FERRUM_UDP_GRO_ENABLED", AutoBool::Auto),
-            udp_gso_enabled: resolve_auto_bool(conf, "FERRUM_UDP_GSO_ENABLED", AutoBool::Auto),
-            udp_pktinfo_enabled: resolve_auto_bool(
-                conf,
-                "FERRUM_UDP_PKTINFO_ENABLED",
-                AutoBool::Auto,
-            ),
-            so_busy_poll_us: resolve_var(conf, "FERRUM_SO_BUSY_POLL_US")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+            dns_resolver_address,
+            dns_resolver_hosts_file,
+            dns_order,
+            dns_ttl_override,
+            dns_min_ttl,
+            dns_stale_ttl,
+            dns_error_ttl,
+            dns_cache_max_size,
+            dns_warmup_concurrency,
+            dns_slow_threshold_ms,
+            dns_refresh_threshold_percent,
+            dns_failed_retry_interval,
+            tls_ca_bundle_path,
+            backend_tls_client_cert_path,
+            backend_tls_client_key_path,
+            frontend_tls_client_ca_bundle_path,
+            admin_tls_client_ca_bundle_path,
+            tls_no_verify,
+            admin_read_only,
+            admin_tls_no_verify,
+            enable_http3,
+            http3_idle_timeout,
+            http3_max_streams,
+            http3_stream_receive_window,
+            http3_receive_window,
+            http3_send_window,
+            http3_connections_per_backend,
+            http3_pool_idle_timeout_seconds,
+            grpc_pool_ready_wait_ms,
+            pool_warmup_enabled,
+            pool_warmup_concurrency,
+            pool_cleanup_interval_seconds,
+            router_cache_max_entries,
+            tcp_idle_timeout_seconds,
+            tcp_half_close_max_wait_seconds,
+            udp_max_sessions,
+            udp_cleanup_interval_seconds,
+            udp_recvmmsg_batch_size,
+            adaptive_buffer_enabled,
+            adaptive_batch_limit_enabled,
+            adaptive_buffer_ewma_alpha,
+            adaptive_buffer_min_size,
+            adaptive_buffer_max_size,
+            adaptive_buffer_default_size,
+            adaptive_batch_limit_default,
+            tls_min_version,
+            tls_max_version,
+            tls_cipher_suites,
+            tls_prefer_server_cipher_order,
+            tls_curves,
+            tls_session_cache_size,
+            tls_cert_expiry_warning_days,
+            tls_early_data_methods,
+            stream_proxy_bind_address,
+            dtls_cert_path,
+            dtls_key_path,
+            dtls_client_ca_cert_path,
+            dtls_max_plaintext_bytes,
+            dtls_record_overhead_bytes,
+            trusted_proxies,
+            backend_allow_ips,
+            add_via_header,
+            via_pseudonym,
+            add_forwarded_header,
+            real_ip_header,
+            basic_auth_hmac_secret,
+            plugin_http_slow_threshold_ms,
+            plugin_http_max_retries,
+            plugin_http_retry_delay_ms,
+            tls_crl_file_path,
+            admin_allowed_cidrs,
+            admin_restore_max_body_size_mib,
+            migrate_action,
+            migrate_dry_run,
+            worker_threads,
+            blocking_threads,
+            max_connections,
+            max_requests,
+            max_concurrent_requests_per_ip,
+            per_ip_cleanup_interval_seconds,
+            circuit_breaker_cache_max_entries,
+            status_counts_max_entries,
+            tcp_listen_backlog,
+            accept_threads,
+            server_http2_max_concurrent_streams,
+            server_http2_max_pending_accept_reset_streams,
+            server_http2_max_local_error_reset_streams,
+            websocket_max_connections,
+            overload_check_interval_ms,
+            overload_fd_pressure_threshold,
+            overload_fd_critical_threshold,
+            overload_conn_pressure_threshold,
+            overload_conn_critical_threshold,
+            overload_req_pressure_threshold,
+            overload_req_critical_threshold,
+            overload_loop_warn_us,
+            overload_loop_critical_us,
+            shutdown_drain_seconds,
+            status_metrics_window_seconds,
+            tls_offload_threads,
+            tcp_fastopen_enabled,
+            tcp_fastopen_queue_len,
+            ktls_enabled,
+            io_uring_splice_enabled,
+            udp_gro_enabled,
+            udp_gso_enabled,
+            udp_pktinfo_enabled,
+            so_busy_poll_us,
         };
 
         config.validate()?;
@@ -2007,21 +1898,6 @@ impl EnvConfig {
     fn validate(&self) -> Result<(), String> {
         match &self.mode {
             OperatingMode::Database | OperatingMode::ControlPlane => {
-                match self.admin_jwt_secret {
-                    None => {
-                        return Err(
-                            "FERRUM_ADMIN_JWT_SECRET is required in database/cp mode".into()
-                        );
-                    }
-                    Some(ref s) if s.len() < crate::config::types::MIN_JWT_SECRET_LENGTH => {
-                        return Err(format!(
-                            "FERRUM_ADMIN_JWT_SECRET must be at least {} characters (got {})",
-                            crate::config::types::MIN_JWT_SECRET_LENGTH,
-                            s.len()
-                        ));
-                    }
-                    _ => {}
-                }
                 if self.db_type.is_none() {
                     return Err("FERRUM_DB_TYPE is required in database/cp mode".into());
                 }
@@ -2040,19 +1916,6 @@ impl EnvConfig {
                         "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in dp mode"
                             .into(),
                     );
-                }
-                match self.cp_dp_grpc_jwt_secret {
-                    None => {
-                        return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode".into());
-                    }
-                    Some(ref s) if s.len() < crate::config::types::MIN_JWT_SECRET_LENGTH => {
-                        return Err(format!(
-                            "FERRUM_CP_DP_GRPC_JWT_SECRET must be at least {} characters (got {})",
-                            crate::config::types::MIN_JWT_SECRET_LENGTH,
-                            s.len()
-                        ));
-                    }
-                    _ => {}
                 }
             }
             OperatingMode::Migrate => {
@@ -2121,22 +1984,10 @@ impl EnvConfig {
         }
 
         if self.mode == OperatingMode::ControlPlane {
-            if self.cp_grpc_listen_addr.is_none() {
-                return Err("FERRUM_CP_GRPC_LISTEN_ADDR is required in cp mode".into());
-            }
-            match self.cp_dp_grpc_jwt_secret {
-                None => {
-                    return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in cp mode".into());
-                }
-                Some(ref s) if s.len() < crate::config::types::MIN_JWT_SECRET_LENGTH => {
-                    return Err(format!(
-                        "FERRUM_CP_DP_GRPC_JWT_SECRET must be at least {} characters (got {})",
-                        crate::config::types::MIN_JWT_SECRET_LENGTH,
-                        s.len()
-                    ));
-                }
-                _ => {}
-            }
+            assert!(
+                self.cp_grpc_listen_addr.is_some(),
+                "cp_grpc_listen_addr is populated during from_env_with_conf()"
+            );
         }
 
         // Validate bind addresses are valid IP addresses
@@ -2205,22 +2056,4 @@ impl EnvConfig {
 
         Ok(())
     }
-}
-
-fn resolve_u16(conf: &ConfFile, key: &str, default: u16) -> u16 {
-    resolve_var(conf, key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn resolve_u64(conf: &ConfFile, key: &str, default: u64) -> u64 {
-    resolve_var(conf, key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn resolve_usize(conf: &ConfFile, key: &str, default: usize) -> usize {
-    resolve_var(conf, key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
 }
