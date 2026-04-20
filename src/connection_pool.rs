@@ -381,139 +381,29 @@ impl ConnectionPool {
         &self,
         proxy: &Proxy,
     ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
-        use rustls_pemfile::certs;
-        use std::io::BufReader;
-
-        // Determine whether to skip server certificate verification
-        let skip_verify =
-            !proxy.resolved_tls.verify_server_cert || self.global_mtls_config.tls_no_verify;
-
-        // Determine CA path: proxy-specific CA takes priority over global CA bundle
-        let ca_path = proxy
-            .resolved_tls
-            .server_ca_cert_path
-            .as_ref()
-            .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
-
-        // Build root certificate store:
-        // - Custom CA configured → empty store + only that CA (no public roots)
-        // - No CA configured → webpki/system roots as default fallback
-        let mut root_store = if ca_path.is_some() {
-            rustls::RootCertStore::empty()
-        } else {
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
-        };
-
-        if skip_verify {
-            tracing::warn!("Backend TLS certificate verification DISABLED for HTTP/3 backend");
-        } else if let Some(ca_path) = ca_path {
-            // CA path configured (proxy or global): trust ONLY this CA, not public roots
-            let ca_file = std::fs::File::open(ca_path).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to open backend CA certificate '{}' for HTTP/3: {}",
-                    ca_path,
-                    e
-                )
-            })?;
-            let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
-                .filter_map(|r| r.ok())
-                .collect();
-            if ca_certs.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "No valid CA certificates found in '{}' for HTTP/3 backend",
-                    ca_path
-                ));
-            }
-            let (added, _) = root_store.add_parsable_certificates(ca_certs);
-            if added > 0 {
-                tracing::debug!(
-                    "Added {} CA certificates from {} for HTTP/3 backend",
-                    added,
-                    ca_path
-                );
-            }
+        let mut client_config = BackendTlsConfigBuilder {
+            proxy,
+            policy: self.tls_policy.as_deref(),
+            global_ca: self
+                .global_mtls_config
+                .tls_ca_bundle_path
+                .as_deref()
+                .map(Path::new),
+            global_no_verify: self.global_mtls_config.tls_no_verify,
+            global_client_cert: self
+                .global_mtls_config
+                .backend_tls_client_cert_path
+                .as_deref()
+                .map(Path::new),
+            global_client_key: self
+                .global_mtls_config
+                .backend_tls_client_key_path
+                .as_deref()
+                .map(Path::new),
+            crls: &self.crls,
         }
-
-        // Helper: build a ClientConfig builder using TLS policy or defaults.
-        // For HTTP/3, TLS 1.3 is mandatory (QUIC requires it). If the TLS policy
-        // restricts to TLS 1.2 only, we still need TLS 1.3 for HTTP/3 — so the
-        // policy is applied best-effort.
-        let policy_builder =
-            || -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
-                crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
-                    .unwrap_or_else(|_| rustls::ClientConfig::builder())
-            };
-
-        // Build client config with optional mTLS (resolved_tls → global fallback)
-        let cert_path = proxy.resolved_tls.client_cert_path.as_ref().or(self
-            .global_mtls_config
-            .backend_tls_client_cert_path
-            .as_ref());
-        let key_path = proxy
-            .resolved_tls
-            .client_key_path
-            .as_ref()
-            .or(self.global_mtls_config.backend_tls_client_key_path.as_ref());
-        let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-            // mTLS: load client certificate and key
-            let cert_file = std::fs::File::open(cert_path).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to open client certificate '{}' for HTTP/3 mTLS: {}",
-                    cert_path,
-                    e
-                )
-            })?;
-            let key_file = std::fs::File::open(key_path).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to open client key '{}' for HTTP/3 mTLS: {}",
-                    key_path,
-                    e
-                )
-            })?;
-            let client_certs: Vec<_> = certs(&mut BufReader::new(cert_file))
-                .filter_map(|r| r.ok())
-                .collect();
-            if client_certs.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "No valid certificates found in '{}' for HTTP/3 mTLS",
-                    cert_path
-                ));
-            }
-            let client_keys: Vec<_> =
-                rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(key_file))
-                    .filter_map(|r| r.ok())
-                    .collect();
-            let key = client_keys.into_iter().next().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No valid PKCS8 private keys found in '{}' for HTTP/3 mTLS",
-                    key_path
-                )
-            })?;
-            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)?;
-            policy_builder()
-                .with_webpki_verifier(verifier)
-                .with_client_auth_cert(client_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key))
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to configure mTLS for HTTP/3 (cert='{}', key='{}'): {}",
-                        cert_path,
-                        key_path,
-                        e
-                    )
-                })?
-        } else {
-            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)?;
-            policy_builder()
-                .with_webpki_verifier(verifier)
-                .with_no_client_auth()
-        };
-
-        // Apply NoVerifier if explicitly opted out of verification
-        if skip_verify {
-            client_config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(crate::tls::NoVerifier));
-        }
+        .build_rustls()
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))?;
 
         // HTTP/3 requires ALPN protocol "h3"
         client_config.alpn_protocols = vec![b"h3".to_vec()];
