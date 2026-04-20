@@ -4172,6 +4172,14 @@ pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
     ctx.effective_identity().is_some()
 }
 
+fn missing_authentication_reject() -> (u16, Vec<u8>, HashMap<String, String>) {
+    (
+        401,
+        br#"{"error":"Authentication required"}"#.to_vec(),
+        HashMap::new(),
+    )
+}
+
 pub async fn run_authentication_phase(
     auth_mode: AuthMode,
     auth_plugins: &[Arc<dyn Plugin>],
@@ -4200,7 +4208,11 @@ pub async fn run_authentication_phase(
                     }
                 }
             }
-            last_reject.filter(|_| !auth_plugins.is_empty() && !request_is_authenticated(ctx))
+            if request_is_authenticated(ctx) || auth_plugins.is_empty() {
+                None
+            } else {
+                Some(last_reject.unwrap_or_else(missing_authentication_reject))
+            }
         }
         AuthMode::Single => {
             for auth_plugin in auth_plugins {
@@ -4214,7 +4226,11 @@ pub async fn run_authentication_phase(
                     PluginResult::Continue => {}
                 }
             }
-            None
+            if request_is_authenticated(ctx) || auth_plugins.is_empty() {
+                None
+            } else {
+                Some(missing_authentication_reject())
+            }
         }
     }
 }

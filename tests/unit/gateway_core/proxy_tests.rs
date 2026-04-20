@@ -229,9 +229,7 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
-use ferrum_edge::plugins::{
-    Plugin, PluginResult, RequestContext, access_control::AccessControl, key_auth::KeyAuth,
-};
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, key_auth::KeyAuth};
 use ferrum_edge::proxy::grpc_proxy::grpc_status;
 use ferrum_edge::proxy::run_authentication_phase;
 use hyper::StatusCode;
@@ -328,7 +326,7 @@ async fn test_multi_auth_accepts_external_identity_without_consumer() {
 }
 
 #[tokio::test]
-async fn test_single_auth_without_acl_allows_anonymous_request_when_credentials_are_missing() {
+async fn test_single_auth_missing_credentials_rejects_before_backend() {
     let key_auth: Arc<dyn Plugin> = Arc::new(KeyAuth::new(&json!({})).unwrap());
     let auth_plugins: Vec<Arc<dyn Plugin>> = vec![key_auth];
     let consumer_index = ConsumerIndex::new(&[]);
@@ -341,15 +339,23 @@ async fn test_single_auth_without_acl_allows_anonymous_request_when_credentials_
     let result =
         run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
 
-    assert!(result.is_none());
+    let (status_code, body, _headers) = result.expect("missing credentials should reject");
+    assert_eq!(status_code, 401);
+    assert_eq!(body, br#"{"error":"Authentication required"}"#);
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
 }
 
 #[tokio::test]
-async fn test_single_auth_plus_acl_rejects_anonymous_request_after_auth_falls_through() {
+async fn test_multi_auth_all_missing_credentials_rejects_before_backend() {
     let key_auth: Arc<dyn Plugin> = Arc::new(KeyAuth::new(&json!({})).unwrap());
-    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![key_auth];
+    let rejecting: Arc<dyn Plugin> = Arc::new(
+        KeyAuth::new(&json!({
+            "key_location": "query:api_key"
+        }))
+        .unwrap(),
+    );
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![key_auth, rejecting];
     let consumer_index = ConsumerIndex::new(&[]);
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -357,24 +363,14 @@ async fn test_single_auth_plus_acl_rejects_anonymous_request_after_auth_falls_th
         "/key-auth".to_string(),
     );
 
-    let auth_result =
-        run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
-    assert!(auth_result.is_none());
+    let result =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index).await;
 
-    let acl = AccessControl::new(&json!({
-        "allowed_consumers": ["alice"]
-    }))
-    .unwrap();
-
-    match acl.authorize(&mut ctx).await {
-        PluginResult::Reject {
-            status_code, body, ..
-        } => {
-            assert_eq!(status_code, 401);
-            assert_eq!(body, r#"{"error":"No consumer identified"}"#);
-        }
-        other => panic!("expected ACL to reject anonymous request, got {other:?}"),
-    }
+    let (status_code, body, _headers) = result.expect("all-missing multi-auth should reject");
+    assert_eq!(status_code, 401);
+    assert_eq!(body, br#"{"error":"Authentication required"}"#);
+    assert!(ctx.identified_consumer.is_none());
+    assert!(ctx.authenticated_identity.is_none());
 }
 
 #[test]

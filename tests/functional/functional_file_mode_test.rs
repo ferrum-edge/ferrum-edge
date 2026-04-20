@@ -313,7 +313,7 @@ plugin_configs:
 
     let client = reqwest::Client::new();
 
-    // Test 1: Request without API key should continue without consumer headers
+    // Test 1: Request without API key should be rejected (401)
     let resp = client
         .get(gateway.proxy_url("/auth-api/test"))
         .send()
@@ -321,19 +321,8 @@ plugin_configs:
         .expect("Request should complete");
     assert_eq!(
         resp.status().as_u16(),
-        200,
-        "Request without API key should continue"
-    );
-    let body: serde_json::Value = resp.json().await.expect("Response should be valid JSON");
-    assert_eq!(
-        body.get("x-consumer-username").and_then(|v| v.as_str()),
-        None,
-        "X-Consumer-Username header should not be forwarded without auth"
-    );
-    assert_eq!(
-        body.get("x-consumer-custom-id").and_then(|v| v.as_str()),
-        None,
-        "X-Consumer-Custom-Id header should not be forwarded without auth"
+        401,
+        "Request without API key should be rejected"
     );
 
     // Test 2: Request with valid API key should succeed and include consumer headers

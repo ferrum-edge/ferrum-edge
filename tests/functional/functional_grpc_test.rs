@@ -705,7 +705,7 @@ async fn test_grpc_key_auth_rejects_missing_key() {
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
-    // Send gRPC request WITHOUT an API key — missing credentials should fall through
+    // Send gRPC request WITHOUT an API key — should be rejected
     let (status, headers, body) = send_grpc_request(
         &gateway_addr,
         "/grpc-secure/my.EchoService/Echo",
@@ -715,16 +715,21 @@ async fn test_grpc_key_auth_rejects_missing_key() {
     .await
     .expect("Request should complete");
 
-    assert_eq!(status, 200, "gRPC proxy should still return HTTP 200");
-    assert!(body.is_empty(), "Empty request body should remain empty");
+    assert_eq!(status, 200, "gRPC auth rejection should return HTTP 200");
+    assert!(
+        body.is_empty(),
+        "gRPC auth rejection should be trailers-only"
+    );
     assert_eq!(
         headers.get("grpc-status").map(|s| s.as_str()),
-        Some("0"),
-        "Missing API key should continue to the backend"
+        Some("16"),
+        "Missing API key should map to grpc-status 16 (UNAUTHENTICATED)"
     );
     assert!(
-        headers.get("grpc-message").is_some_and(|msg| msg == "OK"),
-        "Backend success should preserve the gRPC OK message"
+        headers
+            .get("grpc-message")
+            .is_some_and(|msg| msg.contains("Authentication required")),
+        "gRPC auth rejection should expose the auth-phase message"
     );
 
     // Also verify an INVALID key is rejected

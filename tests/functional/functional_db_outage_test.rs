@@ -1170,10 +1170,10 @@ async fn test_db_outage_key_auth_continues() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        200,
-        "Missing API key should continue before outage"
+        401,
+        "Missing API key should be rejected before outage"
     );
-    println!("  No key: 200 (pre-outage)");
+    println!("  No key: 401 (pre-outage)");
 
     // --- Simulate DB outage ---
     println!("\nPhase 2: Simulating database outage...");
@@ -1216,10 +1216,10 @@ async fn test_db_outage_key_auth_continues() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        200,
-        "Missing API key should continue during outage"
+        401,
+        "Missing API key should be rejected during outage"
     );
-    println!("  No key: 200 (during outage)");
+    println!("  No key: 401 (during outage)");
 
     // --- Restore DB ---
     println!("\nPhase 3: Restoring database...");

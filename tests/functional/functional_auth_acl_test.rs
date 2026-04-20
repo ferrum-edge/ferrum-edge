@@ -1037,14 +1037,14 @@ async fn test_auth_acl_comprehensive() {
         .send()
         .await
         .expect("Request failed");
-    assert!(
-        resp.status().is_success(),
-        "Missing API key should continue without authenticating: {}",
-        resp.status()
-    );
+    assert_eq!(resp.status(), 401, "Missing API key should return 401");
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["echo"].as_bool().unwrap_or(false));
-    println!("✓ Missing API key continued without authenticating");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|err| err.contains("Authentication required"))
+    );
+    println!("✓ Missing API key rejected with 401");
 
     // Test 4: Key Auth — different consumer (bob)
     println!("\n--- Test 4: Key Auth — Bob's API Key ---");
@@ -1142,14 +1142,12 @@ async fn test_auth_acl_comprehensive() {
         .send()
         .await
         .expect("Request failed");
-    assert!(
-        resp.status().is_success(),
-        "Basic auth without header should continue without authenticating: {}",
-        resp.status()
+    assert_eq!(
+        resp.status(),
+        401,
+        "Basic auth without header should return 401"
     );
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["echo"].as_bool().unwrap_or(false));
-    println!("✓ Missing basic auth header continued without authenticating");
+    println!("✓ Missing auth header rejected with 401");
 
     // Test 10: Basic Auth — malformed header (not Basic scheme)
     println!("\n--- Test 10: Basic Auth — Malformed Header ---");
@@ -1241,14 +1239,8 @@ async fn test_auth_acl_comprehensive() {
         .send()
         .await
         .expect("Request failed");
-    assert!(
-        resp.status().is_success(),
-        "Missing JWT should continue without authenticating: {}",
-        resp.status()
-    );
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["echo"].as_bool().unwrap_or(false));
-    println!("✓ Missing JWT token continued without authenticating");
+    assert_eq!(resp.status(), 401, "Missing JWT should return 401");
+    println!("✓ Missing JWT token rejected with 401");
 
     // Test 16: JWT Auth — malformed token
     println!("\n--- Test 16: JWT Auth — Malformed Token ---");
@@ -1363,14 +1355,12 @@ async fn test_auth_acl_comprehensive() {
         .send()
         .await
         .expect("Request failed");
-    assert!(
-        resp.status().is_success(),
-        "HMAC without auth header should continue without authenticating: {}",
-        resp.status()
+    assert_eq!(
+        resp.status(),
+        401,
+        "HMAC without auth header should return 401"
     );
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["echo"].as_bool().unwrap_or(false));
-    println!("✓ Missing HMAC auth header continued without authenticating");
+    println!("✓ Missing HMAC auth header rejected with 401");
 
     // ==========================================
     // ACCESS CONTROL (ACL) TESTS
@@ -1537,14 +1527,12 @@ async fn test_auth_acl_comprehensive() {
         .send()
         .await
         .expect("Request failed");
-    assert!(
-        resp.status().is_success(),
-        "Multi-auth with no credentials should continue without authenticating: {}",
-        resp.status()
+    assert_eq!(
+        resp.status(),
+        401,
+        "Multi-auth with no credentials should return 401"
     );
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["echo"].as_bool().unwrap_or(false));
-    println!("✓ Multi-auth with no credentials continued without authenticating");
+    println!("✓ Multi-auth with no credentials rejected with 401");
 
     // Test 32: Multi-Auth — invalid credentials for all methods
     println!("\n--- Test 32: Multi-Auth — All Invalid Credentials ---");
