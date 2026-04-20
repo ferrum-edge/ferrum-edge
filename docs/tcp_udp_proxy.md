@@ -74,8 +74,6 @@ proxies:
 | `backend_protocol` | `string` | (required) | One of: `tcp`, `tcp_tls`, `udp`, `dtls` |
 | `frontend_tls` | `bool` | `false` | Terminate TLS (TCP) or DTLS (UDP) on incoming connections |
 | `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
-| `backend_read_timeout_ms` | `u64` | `30000` | Per-read timeout on the backend-side read half (b2c). Fires when the backend goes silent mid-stream. Matches HAProxy `timeout server` / nginx `proxy_read_timeout`. 0 = disabled. Not applied on the splice / kTLS / fast paths. |
-| `backend_write_timeout_ms` | `u64` | `30000` | Per-write timeout on the backend-side write half (c2b). Fires when the backend's socket send buffer stops draining. 0 = disabled. Same path-applicability caveat as `backend_read_timeout_ms`. |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
 
 ### Synthetic `listen_path`
@@ -359,35 +357,13 @@ proxies:
     tcp_idle_timeout_seconds: 30    # 30 sec for short-lived cache connections
 ```
 
-## TCP Per-Direction Backend Timeouts
+## TCP Backend Timeouts
 
-`backend_read_timeout_ms` and `backend_write_timeout_ms` are enforced on TCP streams in addition to HTTP/gRPC backend pools, matching HAProxy `timeout server` and nginx `proxy_read_timeout` semantics.
+`backend_read_timeout_ms` and `backend_write_timeout_ms` only apply to **HTTP** and **gRPC** backend pools — not to raw TCP / TCP+TLS proxies. The TCP relay uses `tcp_idle_timeout_seconds` (bidirectional) and the OS TCP keep-alive for stalled-session detection.
 
-- **`backend_read_timeout_ms`**: applied to the backend-side read in the `bidirectional_copy` loop (b2c direction). Fires `ReadWriteTimeout` when the backend stops sending bytes during an active read.
-- **`backend_write_timeout_ms`**: applied to the backend-side write (c2b direction). Fires when the backend socket's send buffer is full long enough to indicate the backend has stopped reading from its socket.
+The two HTTP-shaped fields default to 30,000 ms in the proxy schema (and the SQL CHECK constraint requires `> 0`), which is appropriate for HTTP request/response cycles but wrong for long-lived TCP workloads where one-directional silence is normal (database keep-alives, message-broker streams, SSH/IMAP passthrough). Wiring those defaults onto raw TCP would tear down healthy connections after 30 s of read or write inactivity. Until the per-direction enforcement is rewritten as an inactivity-based watchdog (HAProxy-style `timeout server` semantics, where the timer pauses while the other direction is making progress), the TCP code path passes `None` to the relay's per-direction timeout slots and relies on `tcp_idle_timeout_seconds`.
 
-**Defaults are shared with the HTTP/gRPC paths (30,000 ms each).** For long-lived TCP workloads where 30 seconds of one-directional silence is normal (database keep-alives, message-broker streams, SSH/IMAP passthrough), explicitly set these to a higher value or `0` to disable. `tcp_idle_timeout_seconds` is the right knob for "no traffic in either direction"; the per-direction timeouts are stricter — any single direction going quiet past its timeout closes the session.
-
-**Not applied on the high-throughput paths**: the per-direction timeouts only run on the direction-tracking copy. They are skipped for:
-- The `copy_bidirectional_with_sizes` fast path (engaged only when `tcp_idle_timeout_seconds`, `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` are all `0`/disabled).
-- The Linux `splice(2)` zero-copy relay (kernel-side, no per-read hook).
-- The kTLS-accelerated splice path (same kernel-side pipe).
-
-These paths rely on `tcp_idle_timeout_seconds` (and the OS TCP keep-alive) instead. If you need strict per-direction enforcement for a TCP proxy, leave the per-direction timeouts non-zero — that pulls the relay into the direction-tracking path.
-
-```yaml
-proxies:
-  # Long-lived MySQL passthrough — disable per-direction timeouts so the
-  # relay falls back onto the OS TCP keepalive and the 5-minute idle timeout.
-  - id: "mysql-proxy"
-    listen_port: 3306
-    backend_protocol: tcp
-    backend_host: "mysql.internal"
-    backend_port: 3306
-    backend_read_timeout_ms: 0
-    backend_write_timeout_ms: 0
-    tcp_idle_timeout_seconds: 600
-```
+The `bidirectional_copy` helper accepts per-direction `backend_read_timeout` and `backend_write_timeout` arguments and unit tests cover them — that infrastructure is in place for the future inactivity-based wiring.
 
 ## UDP Session Management
 

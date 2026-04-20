@@ -770,21 +770,6 @@ struct TcpConnParams {
     dns_override: Option<String>,
     dns_cache_ttl_seconds: Option<u64>,
     backend_connect_timeout_ms: u64,
-    /// Per-read timeout applied to the backend-side read half (b2c) inside
-    /// `bidirectional_copy`. Zero disables. Semantically: "if the backend
-    /// hasn't sent any bytes for this long during an active read, close the
-    /// connection." Maps the `Proxy.backend_read_timeout_ms` config field
-    /// onto TCP streams, matching the HAProxy `timeout server` / nginx
-    /// `proxy_read_timeout` behaviour. Not applied to splice or fast paths —
-    /// both copy bytes in-kernel / via `copy_bidirectional_with_sizes` and
-    /// have no per-read hook. Those paths rely on `tcp_idle_timeout_seconds`.
-    backend_read_timeout_ms: u64,
-    /// Per-write timeout applied to the backend-side write half (c2b) inside
-    /// `bidirectional_copy`. Zero disables. Fires when the backend socket's
-    /// send buffer stops draining — typically a stalled or overloaded
-    /// backend that stops reading from its socket. Same path-applicability
-    /// caveats as `backend_read_timeout_ms`.
-    backend_write_timeout_ms: u64,
     tcp_idle_timeout_seconds: u64,
     /// Hard cap on Phase 2 (half-close drain). Applies even when the session
     /// idle timeout is disabled, preventing a stalled peer from wedging the
@@ -995,8 +980,6 @@ async fn handle_tcp_connection_inner(
             dns_override: proxy.dns_override.clone(),
             dns_cache_ttl_seconds: proxy.dns_cache_ttl_seconds,
             backend_connect_timeout_ms: proxy.backend_connect_timeout_ms,
-            backend_read_timeout_ms: proxy.backend_read_timeout_ms,
-            backend_write_timeout_ms: proxy.backend_write_timeout_ms,
             tcp_idle_timeout_seconds: proxy
                 .tcp_idle_timeout_seconds
                 .unwrap_or(global_tcp_idle_timeout),
@@ -1044,16 +1027,6 @@ async fn handle_tcp_connection_inner(
         };
         let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
             Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
-        } else {
-            None
-        };
-        let backend_read_timeout = if params.backend_read_timeout_ms > 0 {
-            Some(Duration::from_millis(params.backend_read_timeout_ms))
-        } else {
-            None
-        };
-        let backend_write_timeout = if params.backend_write_timeout_ms > 0 {
-            Some(Duration::from_millis(params.backend_write_timeout_ms))
         } else {
             None
         };
@@ -1119,8 +1092,8 @@ async fn handle_tcp_connection_inner(
             backend_stream,
             idle_timeout,
             half_close_cap,
-            backend_read_timeout,
-            backend_write_timeout,
+            None,
+            None,
             buf_size,
         )
         .await;
@@ -1172,16 +1145,6 @@ async fn handle_tcp_connection_inner(
     };
     let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
         Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
-    } else {
-        None
-    };
-    let backend_read_timeout = if params.backend_read_timeout_ms > 0 {
-        Some(Duration::from_millis(params.backend_read_timeout_ms))
-    } else {
-        None
-    };
-    let backend_write_timeout = if params.backend_write_timeout_ms > 0 {
-        Some(Duration::from_millis(params.backend_write_timeout_ms))
     } else {
         None
     };
@@ -1448,8 +1411,8 @@ async fn handle_tcp_connection_inner(
                     bs,
                     idle_timeout,
                     half_close_cap,
-                    backend_read_timeout,
-                    backend_write_timeout,
+                    None,
+                    None,
                     buf_size,
                 )
                 .await
@@ -1482,8 +1445,8 @@ async fn handle_tcp_connection_inner(
                                     bs_back,
                                     idle_timeout,
                                     half_close_cap,
-                                    backend_read_timeout,
-                                    backend_write_timeout,
+                                    None,
+                                    None,
                                     buf_size,
                                 )
                                 .await
@@ -1517,8 +1480,8 @@ async fn handle_tcp_connection_inner(
                             bs,
                             idle_timeout,
                             half_close_cap,
-                            backend_read_timeout,
-                            backend_write_timeout,
+                            None,
+                            None,
                             buf_size,
                         )
                         .await
@@ -1531,8 +1494,8 @@ async fn handle_tcp_connection_inner(
                         bs,
                         idle_timeout,
                         half_close_cap,
-                        backend_read_timeout,
-                        backend_write_timeout,
+                        None,
+                        None,
                         buf_size,
                     )
                     .await
@@ -1549,8 +1512,8 @@ async fn handle_tcp_connection_inner(
                     bs,
                     idle_timeout,
                     half_close_cap,
-                    backend_read_timeout,
-                    backend_write_timeout,
+                    None,
+                    None,
                     buf_size,
                 )
                 .await
@@ -1590,8 +1553,8 @@ async fn handle_tcp_connection_inner(
                         bs,
                         idle_timeout,
                         half_close_cap,
-                        backend_read_timeout,
-                        backend_write_timeout,
+                        None,
+                        None,
                         buf_size,
                     )
                     .await
@@ -1818,12 +1781,21 @@ where
     loop {
         // Per-read timeout: when set, a single `read()` that blocks longer than
         // the configured duration surfaces as an `ErrorKind::TimedOut` error —
-        // classified downstream as `ReadWriteTimeout`. This is the natural
-        // `backend_read_timeout_ms` semantic for raw TCP streams: "abort the
-        // connection if the peer stops sending for too long". Different from
-        // the bidirectional `idle_timeout`, which only fires when BOTH
-        // directions are quiet — here, any single direction going quiet past
-        // its timeout closes the session.
+        // classified downstream as `ReadWriteTimeout`. Different from the
+        // bidirectional `idle_timeout`, which only fires when BOTH directions
+        // are quiet — here, any single direction going quiet past its timeout
+        // closes the session.
+        //
+        // NOTE: the production TCP code path currently passes `None` for both
+        // `read_timeout` and `write_timeout`. Wiring the proxy schema's
+        // `backend_read_timeout_ms` / `backend_write_timeout_ms` (default
+        // 30 000 ms each) into this helper trips P1/P2 issues flagged by
+        // Codex on PR #454: a wall-clock timeout on a single `read()` /
+        // `write_all()` misclassifies normal request-upload silence and
+        // slow-but-progressing writes as stalls. The eventual fix is
+        // inactivity-based (HAProxy `timeout server` semantics with progress
+        // reset); the parameters remain on this helper so the unit tests can
+        // exercise the future direction.
         let n = match read_timeout {
             Some(t) => match tokio::time::timeout(t, reader.read(&mut buf)).await {
                 Ok(Ok(n)) => n,
