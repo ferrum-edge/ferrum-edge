@@ -39,8 +39,8 @@ use tracing::{debug, error, warn};
 use crate::config::PoolConfig;
 use crate::config::types::{BackendProtocol, Proxy};
 use crate::dns::DnsCache;
-use crate::tls::backend::BackendTlsConfigBuilder;
 use crate::tls::TlsPolicy;
+use crate::tls::backend::BackendTlsConfigBuilder;
 
 /// Sum type for gRPC request bodies: either pre-buffered or streaming from the
 /// client. This allows a single pool type (`SendRequest<GrpcBody>`) to handle
@@ -573,7 +573,11 @@ impl GrpcConnectionPool {
         let mut tls_config = BackendTlsConfigBuilder {
             proxy,
             policy: self.tls_policy.as_deref(),
-            global_ca: self.global_env_config.tls_ca_bundle_path.as_deref().map(Path::new),
+            global_ca: self
+                .global_env_config
+                .tls_ca_bundle_path
+                .as_deref()
+                .map(Path::new),
             global_no_verify: self.global_env_config.tls_no_verify,
             global_client_cert: self
                 .global_env_config
@@ -588,7 +592,9 @@ impl GrpcConnectionPool {
             crls: &self.crls,
         }
         .build_rustls()
-        .map_err(|e| GrpcProxyError::Internal(format!("Failed to build backend TLS config: {}", e)))?;
+        .map_err(|e| {
+            GrpcProxyError::Internal(format!("Failed to build backend TLS config: {}", e))
+        })?;
 
         tls_config.alpn_protocols = vec![b"h2".to_vec()];
 

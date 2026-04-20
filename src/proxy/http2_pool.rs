@@ -20,8 +20,8 @@ use tracing::{debug, warn};
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::DnsCache;
-use crate::tls::backend::BackendTlsConfigBuilder;
 use crate::tls::TlsPolicy;
+use crate::tls::backend::BackendTlsConfigBuilder;
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -473,7 +473,11 @@ impl Http2ConnectionPool {
         let mut tls_config = BackendTlsConfigBuilder {
             proxy,
             policy: self.tls_policy.as_deref(),
-            global_ca: self.global_env_config.tls_ca_bundle_path.as_deref().map(Path::new),
+            global_ca: self
+                .global_env_config
+                .tls_ca_bundle_path
+                .as_deref()
+                .map(Path::new),
             global_no_verify: self.global_env_config.tls_no_verify,
             global_client_cert: self
                 .global_env_config
@@ -887,8 +891,10 @@ impl std::fmt::Display for BackendUnavailableSource {
 /// Typed source for `Http2PoolError::Internal`.
 #[derive(Debug)]
 pub enum InternalSource {
+    #[allow(dead_code)]
     /// Filesystem read / PEM parse failure.
     Io(std::io::Error),
+    #[allow(dead_code)]
     /// rustls configuration error (invalid cert chain, bad key, etc.).
     Rustls(rustls::Error),
     /// A string-only error from an upstream helper that doesn't expose a

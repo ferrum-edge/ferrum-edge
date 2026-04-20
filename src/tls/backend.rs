@@ -22,8 +22,6 @@ pub enum TlsError {
     Pem(String),
     #[error("rustls: {0}")]
     Rustls(String),
-    #[error("reqwest: {0}")]
-    Reqwest(String),
 }
 
 /// Build the backend trust store using the CA chain resolution from CLAUDE.md:
@@ -76,30 +74,71 @@ impl<'a> BackendTlsConfigBuilder<'a> {
         let builder = backend_client_config_builder(self.policy)
             .map_err(|e| TlsError::Rustls(format!("Failed to apply backend TLS policy: {}", e)))?;
         let client_auth = self.load_client_auth()?;
-
-        if self.skip_verification() {
-            let dangerous = builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerifier));
-            return match client_auth {
-                Some((certs, key)) => dangerous
-                    .with_client_auth_cert(certs, key)
-                    .map_err(|e| {
-                        TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))
-                    }),
-                None => Ok(dangerous.with_no_client_auth()),
-            };
-        }
-
         let verifier = self.build_server_verifier()?;
         let builder = builder.with_webpki_verifier(verifier);
-
-        match client_auth {
+        let mut client_config = match client_auth {
             Some((certs, key)) => builder.with_client_auth_cert(certs, key).map_err(|e| {
                 TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))
             }),
             None => Ok(builder.with_no_client_auth()),
+        }?;
+
+        if self.skip_verification() {
+            client_config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(NoVerifier));
         }
+
+        Ok(client_config)
+    }
+
+    pub fn build_rustls_quic(&self) -> Result<ClientConfig, TlsError> {
+        let builder = backend_client_config_builder(self.policy)
+            .map_err(|e| TlsError::Rustls(format!("Failed to apply backend TLS policy: {}", e)))?;
+        let client_auth = self.load_client_auth()?;
+        let skip_verification = self.skip_verification();
+        let ca_path = self.custom_ca_path();
+        let mut root_store = if ca_path.is_some() {
+            RootCertStore::empty()
+        } else {
+            RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        };
+
+        if !skip_verification && let Some(ca_path) = ca_path {
+            let certs = load_cert_chain(ca_path)?;
+            let (added, ignored) = root_store.add_parsable_certificates(certs);
+            if added == 0 {
+                return Err(TlsError::Rustls(format!(
+                    "No valid CA certificates found in {}",
+                    ca_path.display()
+                )));
+            }
+            if ignored > 0 {
+                tracing::warn!(
+                    "Ignored {} invalid CA certificate(s) while loading {}",
+                    ignored,
+                    ca_path.display()
+                );
+            }
+        }
+
+        let verifier = build_server_verifier_with_crls(root_store, self.crls)
+            .map_err(|e| TlsError::Rustls(format!("Failed to build server verifier: {}", e)))?;
+        let builder = builder.with_webpki_verifier(verifier);
+        let mut client_config = match client_auth {
+            Some((certs, key)) => builder.with_client_auth_cert(certs, key).map_err(|e| {
+                TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))
+            }),
+            None => Ok(builder.with_no_client_auth()),
+        }?;
+
+        if skip_verification {
+            client_config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(NoVerifier));
+        }
+
+        Ok(client_config)
     }
 
     pub fn build_reqwest(&self) -> Result<ClientBuilder, TlsError> {
@@ -152,12 +191,10 @@ impl<'a> BackendTlsConfigBuilder<'a> {
 
         match (cert_path, key_path) {
             (Some(_), None) => Err(TlsError::Pem(
-                "backend TLS client certificate is set but the private key is missing"
-                    .to_string(),
+                "backend TLS client certificate is set but the private key is missing".to_string(),
             )),
             (None, Some(_)) => Err(TlsError::Pem(
-                "backend TLS client private key is set but the certificate is missing"
-                    .to_string(),
+                "backend TLS client private key is set but the certificate is missing".to_string(),
             )),
             (None, None) => Ok(None),
             (Some(cert_path), Some(key_path)) => {

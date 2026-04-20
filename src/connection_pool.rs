@@ -402,7 +402,7 @@ impl ConnectionPool {
                 .map(Path::new),
             crls: &self.crls,
         }
-        .build_rustls()
+        .build_rustls_quic()
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))?;
 
         // HTTP/3 requires ALPN protocol "h3"
