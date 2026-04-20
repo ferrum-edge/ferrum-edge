@@ -13,6 +13,10 @@ use super::conf_file::ConfFile;
 use std::collections::{HashMap, HashSet};
 use std::env;
 
+#[macro_use]
+#[path = "env_config_macro.rs"]
+mod env_config_macro;
+
 /// The operating mode of the gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatingMode {
