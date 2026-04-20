@@ -3,6 +3,7 @@
 //! This module contains infrastructure that plugins share, keeping plugin
 //! implementation files focused on their core logic.
 
+pub mod auth_flow;
 pub mod aws_sigv4;
 pub mod batching_logger;
 pub mod body_transform;

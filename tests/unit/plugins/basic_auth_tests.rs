@@ -113,7 +113,8 @@ async fn test_basic_auth_missing_header() {
     let mut ctx = make_ctx();
     // No authorization header
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_none());
 }
 
 #[tokio::test]

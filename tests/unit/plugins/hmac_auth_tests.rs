@@ -182,7 +182,8 @@ async fn test_missing_authorization_header() {
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_none());
 }
 
 // ── 4. Invalid auth format (not starting with "hmac ") ──────────────

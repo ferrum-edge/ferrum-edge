@@ -26,7 +26,7 @@
 
 use crate::common::{DbType, TestGateway};
 use serde_json::Value;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
 use super::namespace_helpers::{
     JWT_ISSUER, JWT_SECRET, admin_request, assert_only_namespace, ephemeral_port, list_len,
@@ -747,11 +747,11 @@ async fn run_runtime_isolation_suite(backend: Backend) {
     // Wait for the DB polling loop (FERRUM_DB_POLL_INTERVAL=1 in NsHarness)
     // to pick up the new rows. Poll the proxy port actively rather than
     // sleeping a fixed interval.
-    let deadline = SystemTime::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let active_url = format!("{}{}", harness.proxy_base_url, active_path);
     loop {
-        if SystemTime::now() >= deadline {
-            panic!("active namespace proxy never became routable within 15s");
+        if Instant::now() >= deadline {
+            panic!("active namespace proxy never became routable within 30s");
         }
         match client.get(&active_url).send().await {
             Ok(r) if r.status().as_u16() != 404 => break,

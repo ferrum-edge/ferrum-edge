@@ -16,12 +16,12 @@
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, dangerous::insecure_decode, decode};
 use serde_json::Value;
-use std::collections::HashMap;
 use tracing::debug;
 
 use crate::consumer_index::ConsumerIndex;
 
-use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
+use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::{RequestContext, strip_auth_scheme};
 
 /// Unsafe validation that skips signature verification, used only to extract
 /// claims before looking up the consumer's secret for proper verification.
@@ -70,98 +70,66 @@ impl JwtAuth {
 }
 
 #[async_trait]
-impl Plugin for JwtAuth {
-    fn name(&self) -> &str {
+impl AuthMechanism for JwtAuth {
+    fn mechanism_name(&self) -> &str {
         "jwt_auth"
     }
 
-    fn is_auth_plugin(&self) -> bool {
-        true
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        match self.extract_token(ctx) {
+            Some(token) => ExtractedCredential::BearerToken(token),
+            None => ExtractedCredential::Missing,
+        }
     }
 
-    fn priority(&self) -> u16 {
-        super::priority::JWT_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
-    }
-
-    async fn authenticate(
+    async fn verify(
         &self,
-        ctx: &mut RequestContext,
+        credential: ExtractedCredential,
         consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        let token = match self.extract_token(ctx) {
-            Some(t) => t,
-            None => {
-                debug!("jwt_auth: no token found");
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Missing JWT token"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
+    ) -> VerifyOutcome {
+        let ExtractedCredential::BearerToken(token) = credential else {
+            return VerifyOutcome::NotApplicable;
         };
 
         // O(1) lookup: decode claims without verification to extract identity,
         // then look up the consumer by identity and verify with their secret only.
         let claims = match decode_claims_only(&token) {
-            Some(c) => c,
+            Some(claims) => claims,
             None => {
                 debug!("jwt_auth: failed to decode JWT structure");
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid JWT token"}"#.into(),
-                    headers: HashMap::new(),
-                };
+                return VerifyOutcome::Invalid(r#"{"error":"Invalid JWT token"}"#.into());
             }
         };
 
         let identity = match claims
             .get(&self.consumer_claim_field)
-            .and_then(|v| v.as_str())
+            .and_then(|value| value.as_str())
         {
-            Some(id) => id,
+            Some(identity) => identity,
             None => {
                 debug!(
                     "jwt_auth: JWT missing identity claim '{}'",
                     self.consumer_claim_field
                 );
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"JWT missing identity claim"}"#.into(),
-                    headers: HashMap::new(),
-                };
+                return VerifyOutcome::Invalid(r#"{"error":"JWT missing identity claim"}"#.into());
             }
         };
 
-        // O(1) consumer lookup by identity (sub claim or configured field)
         let consumer = match consumer_index.find_by_identity(identity) {
-            Some(c) => c,
+            Some(consumer) => consumer,
             None => {
                 debug!("jwt_auth: no consumer found for identity '{}'", identity);
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid JWT token"}"#.into(),
-                    headers: HashMap::new(),
-                };
+                return VerifyOutcome::ConsumerNotFound(r#"{"error":"Invalid JWT token"}"#.into());
             }
         };
 
-        // Try all JWT secrets for this consumer (supports multiple credentials
-        // per type for zero-downtime rotation). First successful decode wins.
         let jwt_entries = consumer.credential_entries("jwt");
         if jwt_entries.is_empty() {
             debug!(
                 "jwt_auth: consumer '{}' has no JWT secret configured",
                 consumer.username
             );
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Invalid JWT token"}"#.into(),
-                headers: HashMap::new(),
-            };
+            return VerifyOutcome::VerificationFailed(r#"{"error":"Invalid JWT token"}"#.into());
         }
 
         let mut validation = Validation::new(Algorithm::HS256);
@@ -169,23 +137,23 @@ impl Plugin for JwtAuth {
         validation.required_spec_claims.clear();
 
         for jwt_cred in &jwt_entries {
-            if let Some(secret) = jwt_cred.get("secret").and_then(|s| s.as_str()) {
+            if let Some(secret) = jwt_cred.get("secret").and_then(|secret| secret.as_str()) {
                 let key = DecodingKey::from_secret(secret.as_bytes());
                 if decode::<serde_json::Value>(&token, &key, &validation).is_ok() {
-                    if ctx.identified_consumer.is_none() {
-                        debug!("jwt_auth: identified consumer '{}'", consumer.username);
-                        ctx.identified_consumer = Some(consumer);
-                    }
-                    return PluginResult::Continue;
+                    return VerifyOutcome::consumer(consumer);
                 }
             }
         }
 
         debug!("jwt_auth: signature verification failed for all secrets");
-        PluginResult::Reject {
-            status_code: 401,
-            body: r#"{"error":"Invalid JWT token"}"#.into(),
-            headers: HashMap::new(),
-        }
+        VerifyOutcome::VerificationFailed(r#"{"error":"Invalid JWT token"}"#.into())
     }
 }
+
+auth_flow::impl_auth_plugin!(
+    JwtAuth,
+    "jwt_auth",
+    super::priority::JWT_AUTH,
+    crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    auth_flow::run_auth
+);

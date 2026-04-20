@@ -32,7 +32,6 @@ use base64::Engine;
 use dashmap::DashMap;
 use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -40,7 +39,8 @@ use tracing::{debug, warn};
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::PluginHttpClient;
-use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
+use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::{RequestContext, strip_auth_scheme};
 
 pub struct LdapAuth {
     ldap_url: String,
@@ -598,190 +598,157 @@ fn extract_cn_from_dn(dn: &str) -> Option<&str> {
 }
 
 #[async_trait]
-impl Plugin for LdapAuth {
-    fn name(&self) -> &str {
+impl AuthMechanism for LdapAuth {
+    fn mechanism_name(&self) -> &str {
         "ldap_auth"
     }
 
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
-    fn priority(&self) -> u16 {
-        super::priority::LDAP_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
-    }
-
-    fn warmup_hostnames(&self) -> Vec<String> {
-        self.ldap_hostname
-            .as_ref()
-            .map(|h| vec![h.clone()])
-            .unwrap_or_default()
-    }
-
-    async fn authenticate(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        // Extract Basic auth credentials
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         let auth_header = match ctx.headers.get("authorization") {
-            Some(h) => h.clone(),
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Missing Authorization header"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
+            Some(header) => header,
+            None => return ExtractedCredential::Missing,
         };
 
-        let encoded = match strip_auth_scheme(&auth_header, "Basic") {
+        let encoded = match strip_auth_scheme(auth_header, "Basic") {
             Some(encoded) => encoded,
             None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid Basic auth format"}"#.into(),
-                    headers: HashMap::new(),
-                };
+                return ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Invalid Basic auth format"}"#.into(),
+                );
             }
         };
 
         let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
-            Ok(d) => d,
+            Ok(decoded) => decoded,
             Err(_) => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid base64 in Basic auth"}"#.into(),
-                    headers: HashMap::new(),
-                };
+                return ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Invalid base64 in Basic auth"}"#.into(),
+                );
             }
         };
 
         let credential_str = match String::from_utf8(decoded) {
-            Ok(s) => s,
+            Ok(credentials) => credentials,
             Err(_) => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid UTF-8 in Basic auth"}"#.into(),
-                    headers: HashMap::new(),
-                };
+                return ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Invalid UTF-8 in Basic auth"}"#.into(),
+                );
             }
         };
 
         let parts: Vec<&str> = credential_str.splitn(2, ':').collect();
         if parts.len() != 2 {
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Invalid Basic auth format"}"#.into(),
-                headers: HashMap::new(),
-            };
+            return ExtractedCredential::InvalidFormat(
+                r#"{"error":"Invalid Basic auth format"}"#.into(),
+            );
         }
 
-        let username = parts[0];
-        let password = parts[1];
-
-        if username.is_empty() {
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Username must not be empty"}"#.into(),
-                headers: HashMap::new(),
-            };
+        if parts[0].is_empty() {
+            return ExtractedCredential::InvalidFormat(
+                r#"{"error":"Username must not be empty"}"#.into(),
+            );
         }
 
-        // RFC 4513 §5.1.2: an LDAP simple bind with an empty password is treated
-        // as an "unauthenticated bind" — many directories (notably Active
-        // Directory) accept it and return success without verifying the user.
-        // This would let any caller authenticate as any username they pass in
-        // the Basic auth header. Reject empty passwords before they reach the
-        // LDAP server.
-        if password.is_empty() {
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Password must not be empty"}"#.into(),
-                headers: HashMap::new(),
-            };
+        if parts[1].is_empty() {
+            return ExtractedCredential::InvalidFormat(
+                r#"{"error":"Password must not be empty"}"#.into(),
+            );
         }
+
+        ExtractedCredential::BasicAuth {
+            username: parts[0].to_string(),
+            password: parts[1].to_string(),
+        }
+    }
+
+    async fn verify(
+        &self,
+        credential: ExtractedCredential,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        let ExtractedCredential::BasicAuth { username, password } = credential else {
+            return VerifyOutcome::NotApplicable;
+        };
 
         // Check cache first
-        if self.check_cache(username, password) {
+        if self.check_cache(&username, &password) {
             debug!("ldap_auth: cache hit for user '{}'", username);
-            self.set_identity(ctx, username, consumer_index);
-            return PluginResult::Continue;
+            return self.identity_outcome(&username, consumer_index);
         }
 
         // Authenticate against LDAP
-        let user_dn = match self.authenticate_user(username, password).await {
+        let user_dn = match self.authenticate_user(&username, &password).await {
             Ok(dn) => dn,
             Err(e) => {
                 warn!("{}", e);
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"LDAP authentication failed"}"#.into(),
-                    headers: HashMap::new(),
-                };
+                return VerifyOutcome::Invalid(r#"{"error":"LDAP authentication failed"}"#.into());
             }
         };
 
         // Check group membership if required
         if !self.required_groups.is_empty() {
-            match self.check_group_membership(&user_dn, username).await {
+            match self.check_group_membership(&user_dn, &username).await {
                 Ok(true) => {}
                 Ok(false) => {
                     warn!(
                         "ldap_auth: user '{}' is not a member of any required group",
                         username
                     );
-                    return PluginResult::Reject {
-                        status_code: 403,
-                        body: r#"{"error":"User is not a member of any required group"}"#.into(),
-                        headers: HashMap::new(),
-                    };
+                    return VerifyOutcome::Forbidden(
+                        r#"{"error":"User is not a member of any required group"}"#.into(),
+                    );
                 }
                 Err(e) => {
                     warn!("{}", e);
-                    return PluginResult::Reject {
-                        status_code: 500,
-                        body: r#"{"error":"LDAP group membership check failed"}"#.into(),
-                        headers: HashMap::new(),
-                    };
+                    return VerifyOutcome::Internal(
+                        r#"{"error":"LDAP group membership check failed"}"#.into(),
+                    );
                 }
             }
         }
 
         // Cache successful auth
-        self.set_cache(username, password);
+        self.set_cache(&username, &password);
 
         debug!("ldap_auth: authenticated user '{}'", username);
-        self.set_identity(ctx, username, consumer_index);
-        PluginResult::Continue
+        self.identity_outcome(&username, consumer_index)
     }
 }
 
-impl LdapAuth {
-    /// Set the identity on the request context. If consumer_mapping is enabled,
-    /// attempt to find a matching gateway Consumer. Always set authenticated_identity.
-    fn set_identity(
-        &self,
-        ctx: &mut RequestContext,
-        username: &str,
-        consumer_index: &ConsumerIndex,
-    ) {
-        ctx.authenticated_identity = Some(username.to_string());
-        ctx.authenticated_identity_header = Some(username.to_string());
+auth_flow::impl_auth_plugin!(
+    LdapAuth,
+    "ldap_auth",
+    super::priority::LDAP_AUTH,
+    crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    auth_flow::run_auth_external_identity;
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.ldap_hostname
+            .as_ref()
+            .map(|h| vec![h.clone()])
+            .unwrap_or_default()
+    }
+);
 
-        if self.consumer_mapping
-            && let Some(consumer) = consumer_index.find_by_identity(username)
-            && ctx.identified_consumer.is_none()
-        {
+impl LdapAuth {
+    /// Build the auth result for a successfully authenticated LDAP user.
+    fn identity_outcome(&self, username: &str, consumer_index: &ConsumerIndex) -> VerifyOutcome {
+        let consumer = if self.consumer_mapping {
+            consumer_index.find_by_identity(username)
+        } else {
+            None
+        };
+
+        if let Some(ref consumer) = consumer {
             debug!(
                 "ldap_auth: mapped LDAP user '{}' to consumer '{}'",
                 username, consumer.username
             );
-            ctx.identified_consumer = Some(consumer);
         }
+
+        VerifyOutcome::success(
+            consumer,
+            Some(username.to_string()),
+            Some(username.to_string()),
+        )
     }
 }

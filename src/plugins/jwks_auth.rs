@@ -2,7 +2,6 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -10,10 +9,11 @@ use url::Url;
 
 use crate::consumer_index::ConsumerIndex;
 
+use super::RequestContext;
 use super::utils::PluginHttpClient;
+use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::utils::jwks_cache::get_or_create_jwks_store;
 use super::utils::jwks_store::JwksKeyStore;
-use super::{Plugin, PluginResult, RequestContext};
 
 /// Default JWKS refresh interval: 15 minutes.
 const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
@@ -257,14 +257,54 @@ impl JwksAuth {
         }
     }
 
-    fn extract_bearer_token(ctx: &RequestContext) -> Option<String> {
-        ctx.headers.get("authorization").and_then(|v| {
-            if v.starts_with("Bearer ") || v.starts_with("bearer ") {
-                Some(v[7..].to_string())
-            } else {
-                None
+    fn resolve_identity(
+        &self,
+        claims: &Value,
+        provider: &JwksProvider,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        let effective_identity_claim = provider
+            .consumer_identity_claim
+            .as_deref()
+            .unwrap_or(&self.consumer_identity_claim);
+        let effective_header_claim = provider
+            .consumer_header_claim
+            .as_deref()
+            .unwrap_or(&self.consumer_header_claim);
+
+        let identity = extract_claim_string(claims, effective_identity_claim);
+        let header_value = if effective_header_claim == effective_identity_claim {
+            identity.clone()
+        } else {
+            extract_claim_string(claims, effective_header_claim).or_else(|| identity.clone())
+        };
+
+        let consumer = if let Some(ref id) = identity {
+            match consumer_index.find_by_identity(id) {
+                Some(consumer) => {
+                    debug!(
+                        "jwks_auth: identified consumer '{}' via claim '{}'='{}'",
+                        consumer.username, effective_identity_claim, id
+                    );
+                    Some(consumer)
+                }
+                None => {
+                    debug!(
+                        "jwks_auth: no consumer found for '{}'='{}' — using external identity",
+                        effective_identity_claim, id
+                    );
+                    None
+                }
             }
-        })
+        } else {
+            warn!(
+                "jwks_auth: token valid but claim '{}' not present",
+                effective_identity_claim
+            );
+            None
+        };
+
+        VerifyOutcome::success(consumer, identity, header_value)
     }
 
     /// Try to validate a token against all configured providers.
@@ -346,113 +386,62 @@ impl JwksAuth {
 }
 
 #[async_trait]
-impl Plugin for JwksAuth {
-    fn name(&self) -> &str {
+impl AuthMechanism for JwksAuth {
+    fn mechanism_name(&self) -> &str {
         "jwks_auth"
     }
 
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
-    fn priority(&self) -> u16 {
-        super::priority::JWKS_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
-    }
-
-    async fn authenticate(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        let token = match Self::extract_bearer_token(ctx) {
-            Some(t) => t,
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Missing Bearer token"}"#.into(),
-                    headers: HashMap::new(),
-                };
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        match ctx.headers.get("authorization") {
+            None => ExtractedCredential::Missing,
+            Some(value) if value.starts_with("Bearer ") || value.starts_with("bearer ") => {
+                ExtractedCredential::BearerToken(value[7..].to_string())
             }
+            Some(_) => ExtractedCredential::InvalidFormat(
+                r#"{"error":"Missing Bearer token"}"#.to_string(),
+            ),
+        }
+    }
+
+    async fn verify(
+        &self,
+        credential: ExtractedCredential,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        let ExtractedCredential::BearerToken(token) = credential else {
+            return VerifyOutcome::NotApplicable;
         };
 
-        // 1. Validate JWT against configured providers
         let (claims, provider_idx) = match self.validate_token(&token).await {
             Ok(result) => result,
             Err((status, body)) => {
-                return PluginResult::Reject {
-                    status_code: status,
-                    body: body.into(),
-                    headers: HashMap::new(),
+                return if status == 403 {
+                    VerifyOutcome::Forbidden(body.to_string())
+                } else {
+                    VerifyOutcome::InvalidFormat(body.to_string())
                 };
             }
         };
 
         let provider = &self.providers[provider_idx];
-
-        // 2. Check required_scopes / required_roles
         if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
-            return PluginResult::Reject {
-                status_code: status,
-                body,
-                headers: HashMap::new(),
+            return if status == 403 {
+                VerifyOutcome::Forbidden(body)
+            } else {
+                VerifyOutcome::Invalid(body)
             };
         }
 
-        // 3. Extract consumer identity claim (per-provider override → global default)
-        let effective_identity_claim = provider
-            .consumer_identity_claim
-            .as_deref()
-            .unwrap_or(&self.consumer_identity_claim);
-        let effective_header_claim = provider
-            .consumer_header_claim
-            .as_deref()
-            .unwrap_or(&self.consumer_header_claim);
-
-        let identity = extract_claim_string(&claims, effective_identity_claim);
-        let header_value = if effective_header_claim == effective_identity_claim {
-            identity.clone()
-        } else {
-            extract_claim_string(&claims, effective_header_claim).or_else(|| identity.clone())
-        };
-
-        // 4. Set authenticated identity on context (always, even without Consumer)
-        if let Some(ref id) = identity {
-            ctx.authenticated_identity = Some(id.clone());
-        }
-        if let Some(ref hv) = header_value {
-            ctx.authenticated_identity_header = Some(hv.clone());
-        }
-
-        // 5. Optionally look up Consumer in index (for ACL plugin compat)
-        if let Some(ref id) = identity {
-            if let Some(consumer) = consumer_index.find_by_identity(id) {
-                if ctx.identified_consumer.is_none() {
-                    debug!(
-                        "jwks_auth: identified consumer '{}' via claim '{}'='{}'",
-                        consumer.username, effective_identity_claim, id
-                    );
-                    ctx.identified_consumer = Some(consumer);
-                }
-            } else {
-                debug!(
-                    "jwks_auth: no consumer found for '{}'='{}' — using external identity",
-                    effective_identity_claim, id
-                );
-            }
-        } else {
-            warn!(
-                "jwks_auth: token valid but claim '{}' not present",
-                effective_identity_claim
-            );
-        }
-
-        PluginResult::Continue
+        self.resolve_identity(&claims, provider, consumer_index)
     }
+}
 
+auth_flow::impl_auth_plugin!(
+    JwksAuth,
+    "jwks_auth",
+    super::priority::JWKS_AUTH,
+    crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    auth_flow::run_auth_external_identity;
     fn warmup_hostnames(&self) -> Vec<String> {
         let mut hosts = Vec::new();
         for prov in &self.providers {
@@ -476,7 +465,7 @@ impl Plugin for JwksAuth {
         }
         uris
     }
-}
+);
 
 // ---------------------------------------------------------------------------
 // Helpers

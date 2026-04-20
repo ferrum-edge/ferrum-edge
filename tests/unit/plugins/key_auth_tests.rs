@@ -58,9 +58,11 @@ async fn test_key_auth_plugin_missing_key() {
     // Test failed authentication with missing key
     let mut invalid_ctx = create_test_context();
     invalid_ctx.headers.remove("X-API-Key");
+    invalid_ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut invalid_ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_continue(result);
+    assert!(invalid_ctx.identified_consumer.is_none());
 }
 
 #[tokio::test]
@@ -183,7 +185,8 @@ async fn test_key_auth_missing_query_param() {
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_none());
 }
 
 #[tokio::test]

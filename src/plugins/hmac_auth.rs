@@ -16,10 +16,12 @@ use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use sha2::{Sha256, Sha512};
-use std::collections::HashMap;
 use tracing::{debug, warn};
 
-use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
+use super::utils::auth_flow::{
+    self, AuthMechanism, ExtractedCredential, VerifyOutcome, constant_time_eq,
+};
+use super::{RequestContext, strip_auth_scheme};
 use crate::consumer_index::ConsumerIndex;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -52,18 +54,6 @@ impl HmacAuth {
         }
     }
 
-    /// Constant-time comparison of two byte slices to prevent timing attacks.
-    fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-        if a.len() != b.len() {
-            return false;
-        }
-        let mut result: u8 = 0;
-        for (x, y) in a.iter().zip(b.iter()) {
-            result |= x ^ y;
-        }
-        result == 0
-    }
-
     /// Validate that the Date header is within the allowed clock skew window.
     fn validate_date(&self, date_str: &str) -> bool {
         if date_str.is_empty() {
@@ -92,50 +82,22 @@ impl HmacAuth {
 }
 
 #[async_trait]
-impl Plugin for HmacAuth {
-    fn name(&self) -> &str {
+impl AuthMechanism for HmacAuth {
+    fn mechanism_name(&self) -> &str {
         "hmac_auth"
     }
 
-    fn is_auth_plugin(&self) -> bool {
-        true
-    }
-
-    fn priority(&self) -> u16 {
-        super::priority::HMAC_AUTH
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
-    }
-
-    async fn authenticate(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
-        let auth_header = match ctx.headers.get("authorization") {
-            Some(h) => h.clone(),
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Missing Authorization header"}"#.to_string(),
-                    headers: HashMap::new(),
-                };
-            }
+    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
+        let Some(auth_header) = ctx.headers.get("authorization") else {
+            return ExtractedCredential::Missing;
         };
 
-        // Parse: hmac username="...", algorithm="...", signature="..."
-        let params_str = match strip_auth_scheme(&auth_header, "hmac") {
-            Some(params) => params,
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid HMAC authorization format"}"#.to_string(),
-                    headers: HashMap::new(),
-                };
-            }
+        let Some(params_str) = strip_auth_scheme(auth_header, "hmac") else {
+            return ExtractedCredential::InvalidFormat(
+                r#"{"error":"Invalid HMAC authorization format"}"#.to_string(),
+            );
         };
+
         let mut username = None;
         let mut algorithm = None;
         let mut signature = None;
@@ -154,98 +116,100 @@ impl Plugin for HmacAuth {
             }
         }
 
-        let username = match username {
-            Some(u) => u,
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Missing username in HMAC authorization"}"#.to_string(),
-                    headers: HashMap::new(),
-                };
-            }
+        let Some(username) = username else {
+            return ExtractedCredential::InvalidFormat(
+                r#"{"error":"Missing username in HMAC authorization"}"#.to_string(),
+            );
         };
 
         let algorithm = algorithm
             .unwrap_or_else(|| "hmac-sha256".to_string())
             .to_ascii_lowercase();
         if !matches!(algorithm.as_str(), "hmac-sha256" | "hmac-sha512") {
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Unsupported HMAC algorithm"}"#.to_string(),
-                headers: HashMap::new(),
-            };
+            return ExtractedCredential::InvalidFormat(
+                r#"{"error":"Unsupported HMAC algorithm"}"#.to_string(),
+            );
         }
 
-        let signature = match signature {
-            Some(s) => s,
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Missing signature in HMAC authorization"}"#.to_string(),
-                    headers: HashMap::new(),
-                };
-            }
+        let Some(signature) = signature else {
+            return ExtractedCredential::InvalidFormat(
+                r#"{"error":"Missing signature in HMAC authorization"}"#.to_string(),
+            );
         };
 
-        // Validate Date header for replay protection
-        let date = ctx.headers.get("date").cloned().unwrap_or_default();
+        ExtractedCredential::HmacAuth {
+            username,
+            algorithm,
+            signature,
+            date: ctx.headers.get("date").cloned().unwrap_or_default(),
+            method: ctx.method.clone(),
+            path: ctx.path.clone(),
+        }
+    }
+
+    async fn verify(
+        &self,
+        credential: ExtractedCredential,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        let ExtractedCredential::HmacAuth {
+            username,
+            algorithm,
+            signature,
+            date,
+            method,
+            path,
+        } = credential
+        else {
+            return VerifyOutcome::NotApplicable;
+        };
+
         if !self.validate_date(&date) {
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Missing or expired Date header"}"#.to_string(),
-                headers: HashMap::new(),
-            };
+            return VerifyOutcome::Invalid(
+                r#"{"error":"Missing or expired Date header"}"#.to_string(),
+            );
         }
 
-        // Look up consumer by username
         let consumer = match consumer_index.find_by_identity(&username) {
-            Some(c) => c,
+            Some(consumer) => consumer,
             None => {
                 debug!("hmac_auth: consumer '{}' not found", username);
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid credentials"}"#.to_string(),
-                    headers: HashMap::new(),
-                };
+                return VerifyOutcome::ConsumerNotFound(
+                    r#"{"error":"Invalid credentials"}"#.to_string(),
+                );
             }
         };
 
-        // Try all HMAC secrets for this consumer (supports multiple credentials
-        // per type for zero-downtime rotation). First matching signature wins.
         let hmac_entries = consumer.credential_entries("hmac_auth");
         if hmac_entries.is_empty() {
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Invalid credentials"}"#.to_string(),
-                headers: HashMap::new(),
-            };
+            return VerifyOutcome::VerificationFailed(
+                r#"{"error":"Invalid credentials"}"#.to_string(),
+            );
         }
 
-        // Build the signing string: METHOD\nPATH\nDATE
-        let signing_string = format!("{}\n{}\n{}", ctx.method, ctx.path, date);
+        let signing_string = format!("{}\n{}\n{}", method, path, date);
 
         for hmac_cred in &hmac_entries {
-            if let Some(secret) = hmac_cred.get("secret").and_then(|s| s.as_str())
+            if let Some(secret) = hmac_cred.get("secret").and_then(|secret| secret.as_str())
                 && let Some(expected_mac) =
                     Self::compute_hmac(secret.as_bytes(), signing_string.as_bytes(), &algorithm)
             {
                 let expected_sig = base64::engine::general_purpose::STANDARD.encode(&expected_mac);
-                // Constant-time comparison to prevent timing attacks
-                if Self::constant_time_eq(signature.as_bytes(), expected_sig.as_bytes()) {
-                    if ctx.identified_consumer.is_none() {
-                        debug!("hmac_auth: identified consumer '{}'", consumer.username);
-                        ctx.identified_consumer = Some(consumer);
-                    }
-                    return PluginResult::Continue;
+                if constant_time_eq(signature.as_bytes(), expected_sig.as_bytes()) {
+                    return VerifyOutcome::consumer(consumer);
                 }
             }
         }
 
         debug!("hmac_auth: signature mismatch for user '{}'", username);
-        PluginResult::Reject {
-            status_code: 401,
-            body: r#"{"error":"Invalid signature"}"#.to_string(),
-            headers: HashMap::new(),
-        }
+        VerifyOutcome::VerificationFailed(r#"{"error":"Invalid signature"}"#.to_string())
     }
 }
+
+auth_flow::impl_auth_plugin!(
+    HmacAuth,
+    "hmac_auth",
+    super::priority::HMAC_AUTH,
+    crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    auth_flow::run_auth
+);

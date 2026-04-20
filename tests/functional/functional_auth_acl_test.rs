@@ -1039,7 +1039,11 @@ async fn test_auth_acl_comprehensive() {
         .expect("Request failed");
     assert_eq!(resp.status(), 401, "Missing API key should return 401");
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("Missing API key"));
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|err| err.contains("Authentication required"))
+    );
     println!("✓ Missing API key rejected with 401");
 
     // Test 4: Key Auth — different consumer (bob)

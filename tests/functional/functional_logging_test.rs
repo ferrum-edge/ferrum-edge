@@ -525,11 +525,12 @@ async fn test_logging_rejected_request_has_rejection_phase() {
     // Wait for DB poll
     tokio::time::sleep(Duration::from_secs(4)).await;
 
-    // Send request WITHOUT an API key — should be rejected by key_auth
-    println!("Sending unauthenticated request to /auth-test/data ...");
+    // Send request with an INVALID API key — should be rejected by key_auth
+    println!("Sending invalid-auth request to /auth-test/data ...");
     let proxy_resp = client
         .get(format!("{}/auth-test/data", harness.proxy_base_url))
         .header("User-Agent", "reject-test-agent/1.0")
+        .header("X-Api-Key", "wrong-key")
         .send()
         .await
         .expect("Request failed");
@@ -538,7 +539,7 @@ async fn test_logging_rejected_request_has_rejection_phase() {
     println!("Response status: {}", status);
     assert!(
         status == 401 || status == 403,
-        "Unauthenticated request should be rejected with 401 or 403, got {}",
+        "Invalid request should be rejected with 401 or 403, got {}",
         status
     );
 
