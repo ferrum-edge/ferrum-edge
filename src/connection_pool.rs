@@ -16,9 +16,11 @@ use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::tls::TlsPolicy;
+use crate::tls::backend::BackendTlsConfigBuilder;
 use anyhow::Result;
 use dashmap::DashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -158,25 +160,35 @@ impl ConnectionPool {
         // Create the custom DNS resolver wrapping our DnsCache
         let dns_resolver = Arc::new(DnsCacheResolver::new(self.dns_cache.clone()));
 
-        // Determine whether to skip server cert verification.
-        // CA trust chain: proxy CA → global CA → webpki/system roots.
-        let skip_verify =
-            !proxy.resolved_tls.verify_server_cert || self.global_mtls_config.tls_no_verify;
-
-        let mut client_builder = reqwest::Client::builder()
-            .dns_resolver(dns_resolver)
-            .connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms))
-            .timeout(Duration::from_millis(proxy.backend_read_timeout_ms))
-            .tcp_nodelay(true)
-            .danger_accept_invalid_certs(skip_verify)
-            .pool_max_idle_per_host(config.max_idle_per_host)
-            .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds));
-
-        // Build a custom rustls ClientConfig with the TLS policy's cipher suites,
-        // protocol versions, and key exchange groups — ensuring outbound connections
-        // enforce the same TLS settings as inbound listeners.
-        let tls_config = self.build_reqwest_tls_config(proxy)?;
-        client_builder = client_builder.use_preconfigured_tls(tls_config);
+        let mut client_builder = BackendTlsConfigBuilder {
+            proxy,
+            policy: self.tls_policy.as_deref(),
+            global_ca: self
+                .global_mtls_config
+                .tls_ca_bundle_path
+                .as_deref()
+                .map(Path::new),
+            global_no_verify: self.global_mtls_config.tls_no_verify,
+            global_client_cert: self
+                .global_mtls_config
+                .backend_tls_client_cert_path
+                .as_deref()
+                .map(Path::new),
+            global_client_key: self
+                .global_mtls_config
+                .backend_tls_client_key_path
+                .as_deref()
+                .map(Path::new),
+            crls: &self.crls,
+        }
+        .build_reqwest()
+        .map_err(|e| anyhow::anyhow!("Failed to build reqwest backend TLS config: {}", e))?
+        .dns_resolver(dns_resolver)
+        .connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms))
+        .timeout(Duration::from_millis(proxy.backend_read_timeout_ms))
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds));
 
         // Enable TCP keep-alive if configured (detects dead backend connections)
         if config.enable_http_keep_alive {
@@ -215,98 +227,6 @@ impl ConnectionPool {
 
         let client = client_builder.build()?;
         Ok(client)
-    }
-
-    /// Build a rustls `ClientConfig` for reqwest using the TLS policy's cipher suites,
-    /// protocol versions, and key exchange groups. Also configures root certificates,
-    /// client mTLS certificates, and certificate verification per-proxy settings.
-    fn build_reqwest_tls_config(&self, proxy: &Proxy) -> Result<rustls::ClientConfig> {
-        use crate::tls::NoVerifier;
-
-        // Build root certificate store:
-        // - Custom CA configured -> empty store + only that CA (no public roots)
-        // - No CA configured -> webpki/system roots as default fallback
-        let ca_path = proxy
-            .resolved_tls
-            .server_ca_cert_path
-            .as_ref()
-            .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
-
-        let mut root_store = if ca_path.is_some() {
-            rustls::RootCertStore::empty()
-        } else {
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
-        };
-
-        // Load custom CA bundle (proxy-level takes priority over global)
-        if !self.global_mtls_config.tls_no_verify
-            && let Some(ca_bundle_path) = ca_path
-        {
-            let ca_data = std::fs::read(ca_bundle_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e)
-            })?;
-            let certs = rustls_pemfile::certs(&mut &ca_data[..])
-                .filter_map(|r| r.ok())
-                .collect::<Vec<_>>();
-            let (added, _) = root_store.add_parsable_certificates(certs);
-            if added > 0 {
-                tracing::debug!(
-                    "Added {} CA certificates from {} for reqwest backend",
-                    added,
-                    ca_bundle_path
-                );
-            }
-        }
-
-        // Build ClientConfig with TLS policy (cipher suites, protocol versions, kx groups)
-        let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)?;
-        let builder = crate::tls::backend_client_config_builder(self.tls_policy.as_deref())?
-            .with_webpki_verifier(verifier);
-
-        // Add client certificate for mTLS (proxy-specific overrides take priority)
-        let cert_path = proxy.resolved_tls.client_cert_path.as_ref().or(self
-            .global_mtls_config
-            .backend_tls_client_cert_path
-            .as_ref());
-        let key_path = proxy
-            .resolved_tls
-            .client_key_path
-            .as_ref()
-            .or(self.global_mtls_config.backend_tls_client_key_path.as_ref());
-
-        let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-            let cert_data = std::fs::read(cert_path).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to read client certificate from {}: {}",
-                    cert_path,
-                    e
-                )
-            })?;
-            let key_data = std::fs::read(key_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read client key from {}: {}", key_path, e)
-            })?;
-            let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
-                .filter_map(|r| r.ok())
-                .collect();
-            let key = rustls_pemfile::private_key(&mut &key_data[..])
-                .map_err(|e| anyhow::anyhow!("Failed to parse client key: {}", e))?
-                .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
-            builder
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| anyhow::anyhow!("Failed to set client auth cert: {}", e))?
-        } else {
-            builder.with_no_client_auth()
-        };
-
-        // Disable server certificate verification if configured (testing only)
-        if !proxy.resolved_tls.verify_server_cert || self.global_mtls_config.tls_no_verify {
-            tracing::warn!("Backend TLS certificate verification DISABLED (testing mode)");
-            client_config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(NoVerifier));
-        }
-
-        Ok(client_config)
     }
 
     /// Create pool key for caching clients.

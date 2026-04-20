@@ -355,7 +355,8 @@ async fn test_backend_mtls_partial_config() {
     // Create test certificate file
     let (cert_file, _) = create_test_cert_files().expect("Failed to create test cert files");
 
-    // Create environment config with only cert (missing key) - should not apply mTLS
+    // Create environment config with only cert (missing key) - the shared
+    // backend TLS builder should now reject this explicitly.
     let env_config = create_test_env_config_with_mtls(
         Some(cert_file.path().to_string_lossy().to_string()),
         None,
@@ -374,16 +375,15 @@ async fn test_backend_mtls_partial_config() {
     // Create proxy without mTLS config
     let proxy = create_test_mtls_proxy();
 
-    // Test that we can create a client (should not apply mTLS due to missing key)
+    // Partial backend mTLS config is invalid and should fail fast.
     let result = pool.get_client(&proxy).await;
 
     match result {
-        Ok(_client) => {
-            println!("✅ Client created without mTLS (partial config ignored)");
-        }
+        Ok(_client) => panic!("Expected partial backend mTLS config to fail"),
         Err(e) => {
-            panic!(
-                "Unexpected error creating client with partial mTLS config: {}",
+            assert!(
+                e.to_string().contains("private key is missing"),
+                "Expected missing private key error, got: {}",
                 e
             );
         }

@@ -423,6 +423,8 @@ async fn test_http3_proxy_state_creation() {
             None,
             false,
             None,
+            None,
+            None,
             300,
             300, // tcp_half_close_max_wait_seconds
             10_000,
@@ -639,6 +641,8 @@ async fn test_http3_full_integration() {
             circuit_breaker_cache.clone(),
             None,
             false,
+            None,
+            None,
             None,
             300,
             300, // tcp_half_close_max_wait_seconds
