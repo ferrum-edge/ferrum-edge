@@ -18,5 +18,5 @@ mod registry;
 #[cfg(feature = "secrets-vault")]
 mod vault;
 
-#[cfg_attr(not(test), allow(unused_imports))]
+#[allow(unused_imports)]
 pub use registry::{ResolvedEnvSecrets, ResolvedSecret, resolve_all_env_secrets, resolve_secret};

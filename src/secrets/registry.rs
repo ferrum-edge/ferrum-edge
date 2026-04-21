@@ -75,9 +75,9 @@ pub(crate) trait SecretBackend: Sync + Send {
     fn suffix(&self) -> Option<&'static str> {
         None
     }
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     fn resolve_ref(&self, key: &str) -> Option<String>;
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     fn source(&self, reference: &str) -> String;
     fn log_loaded(&self) -> bool {
         self.name() != "environment"
@@ -122,7 +122,7 @@ pub(crate) trait SecretBackend: Sync + Send {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 struct DirectEnvBackend;
 struct FileBackend;
 
@@ -135,7 +135,7 @@ struct GcpBackend;
 #[cfg(feature = "secrets-azure")]
 struct AzureBackend;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 static DIRECT_ENV_BACKEND: DirectEnvBackend = DirectEnvBackend;
 static FILE_BACKEND: FileBackend = FileBackend;
 #[cfg(feature = "secrets-vault")]
@@ -147,7 +147,7 @@ static GCP_BACKEND: GcpBackend = GcpBackend;
 #[cfg(feature = "secrets-azure")]
 static AZURE_BACKEND: AzureBackend = AzureBackend;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 fn all_backends() -> Vec<&'static dyn SecretBackend> {
     #[allow(unused_mut)]
     let mut backends: Vec<&'static dyn SecretBackend> = vec![&DIRECT_ENV_BACKEND, &FILE_BACKEND];
@@ -177,12 +177,18 @@ fn startup_backends() -> Vec<&'static dyn SecretBackend> {
 }
 
 fn suffix_backends() -> Vec<&'static dyn SecretBackend> {
-    let mut backends: Vec<&'static dyn SecretBackend> = Vec::new();
+    #[allow(unused_mut)]
+    let mut backends: Vec<&'static dyn SecretBackend> = vec![&FILE_BACKEND];
     #[cfg(feature = "secrets-azure")]
-    backends.push(&AZURE_BACKEND);
+    backends.insert(0, &AZURE_BACKEND);
     #[cfg(feature = "secrets-vault")]
-    backends.push(&VAULT_BACKEND);
-    backends.push(&FILE_BACKEND);
+    backends.insert(
+        #[cfg(feature = "secrets-azure")]
+        1,
+        #[cfg(not(feature = "secrets-azure"))]
+        0,
+        &VAULT_BACKEND,
+    );
     #[cfg(feature = "secrets-aws")]
     backends.push(&AWS_BACKEND);
     #[cfg(feature = "secrets-gcp")]
@@ -190,7 +196,7 @@ fn suffix_backends() -> Vec<&'static dyn SecretBackend> {
     backends
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 fn timeout_error(key: &str, backend_name: &str, timeout: Duration) -> String {
     format!(
         "Timeout resolving {} from {} after {}s",
@@ -342,7 +348,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     Ok(results)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 /// Resolve a single secret key across all configured backends.
 ///
 /// Startup uses `resolve_all_env_secrets()` for bulk env injection; this helper
@@ -438,7 +444,18 @@ impl SecretBackend for FileBackend {
     }
 
     async fn resolve_one(&self, reference: &str, key: &str) -> Result<String, String> {
-        file::read_secret(reference, key)
+        let reference = reference.to_string();
+        let key = key.to_string();
+        let key_for_error = key.clone();
+
+        tokio::task::spawn_blocking(move || file::read_secret(&reference, &key))
+            .await
+            .map_err(|err| {
+                format!(
+                    "Blocking file secret read task failed for {}: {}",
+                    key_for_error, err
+                )
+            })?
     }
 }
 
