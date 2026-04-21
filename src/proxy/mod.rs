@@ -6536,7 +6536,11 @@ async fn handle_proxy_request_inner(
             // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
             let deferred_proxy_id = proxy.id.clone();
             let deferred_backend_url = strip_query_params(&backend_url).to_string();
-            let read_timeout_ms = proxy.backend_read_timeout_ms;
+            let read_timeout_ms = if proxy.backend_read_timeout_ms > 0 {
+                proxy.backend_read_timeout_ms
+            } else {
+                30_000
+            };
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000)).await;
                 let completed = metrics.completed();
@@ -8148,38 +8152,59 @@ async fn proxy_to_backend_http2(
 
     let backend_req = Request::from_parts(parts, body);
 
-    // Send to backend with read timeout
-    let read_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
-    let response = match tokio::time::timeout(read_timeout, sender.send_request(backend_req)).await
-    {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
-            error!(proxy_id = %proxy.id, error = %e, "HTTP/2 backend request failed");
-            return retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::Buffered(
-                    r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: true,
-                backend_resolved_ip: resolved_ip,
-                error_class: Some(retry::ErrorClass::ProtocolError),
-            };
+    // Send to backend with read timeout (0 = no timeout)
+    let h2_send_fut = sender.send_request(backend_req);
+    let response = if proxy.backend_read_timeout_ms > 0 {
+        let read_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        match tokio::time::timeout(read_timeout, h2_send_fut).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                error!(proxy_id = %proxy.id, error = %e, "HTTP/2 backend request failed");
+                return retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ProtocolError),
+                };
+            }
+            Err(_) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    "HTTP/2: read timeout ({}ms) waiting for backend response",
+                    proxy.backend_read_timeout_ms
+                );
+                return retry::BackendResponse {
+                    status_code: 504,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                };
+            }
         }
-        Err(_) => {
-            warn!(
-                proxy_id = %proxy.id,
-                "HTTP/2: read timeout ({}ms) waiting for backend response",
-                proxy.backend_read_timeout_ms
-            );
-            return retry::BackendResponse {
-                status_code: 504,
-                body: ResponseBody::Buffered(r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()),
-                headers: HashMap::new(),
-                connection_error: true,
-                backend_resolved_ip: resolved_ip,
-                error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-            };
+    } else {
+        match h2_send_fut.await {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!(proxy_id = %proxy.id, error = %e, "HTTP/2 backend request failed");
+                return retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ProtocolError),
+                };
+            }
         }
     };
 

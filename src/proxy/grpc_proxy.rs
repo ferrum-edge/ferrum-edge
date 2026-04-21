@@ -869,8 +869,9 @@ pub async fn proxy_grpc_request_streaming(
     // as a safety net against indefinitely stalled backends. Slow uploads
     // without deadlines should be bounded.
     let effective_timeout_ms = match parse_grpc_timeout_ms(&headers) {
-        Some(grpc_ms) => grpc_ms,
-        None => proxy.backend_read_timeout_ms,
+        Some(grpc_ms) => Some(grpc_ms),
+        None if proxy.backend_read_timeout_ms > 0 => Some(proxy.backend_read_timeout_ms),
+        None => None,
     };
 
     let uri: hyper::Uri = backend_url
@@ -883,25 +884,32 @@ pub async fn proxy_grpc_request_streaming(
     *backend_req.headers_mut() = headers;
 
     let mut sender = grpc_pool.get_sender(proxy).await?;
-    let read_timeout = Duration::from_millis(effective_timeout_ms);
-    let response = tokio::time::timeout(read_timeout, sender.send_request(backend_req))
-        .await
-        .map_err(|_| {
-            warn!(
-                "gRPC: timeout ({}ms) waiting for streaming RPC completion",
-                effective_timeout_ms
-            );
-            GrpcProxyError::BackendTimeout(format!(
-                "gRPC streaming RPC timeout after {}ms",
-                effective_timeout_ms
-            ))
-        })?
-        .map_err(|e| {
-            // Check if the failure was caused by the request body exceeding the
-            // size limit. The GrpcBody::Streaming error triggers an h2 stream
-            // reset which surfaces here as a send_request error. Return
-            // ResourceExhausted instead of BackendUnavailable so clients get
-            // the correct gRPC status code.
+    let response = if let Some(timeout_ms) = effective_timeout_ms {
+        let read_timeout = Duration::from_millis(timeout_ms);
+        tokio::time::timeout(read_timeout, sender.send_request(backend_req))
+            .await
+            .map_err(|_| {
+                warn!(
+                    "gRPC: timeout ({}ms) waiting for streaming RPC completion",
+                    timeout_ms
+                );
+                GrpcProxyError::BackendTimeout(format!(
+                    "gRPC streaming RPC timeout after {}ms",
+                    timeout_ms
+                ))
+            })?
+            .map_err(|e| {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return GrpcProxyError::ResourceExhausted(format!(
+                        "gRPC request payload size exceeds maximum of {} bytes",
+                        max_grpc_recv_size_bytes
+                    ));
+                }
+                error!("gRPC backend request failed (streaming body): {}", e);
+                GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
+            })?
+    } else {
+        sender.send_request(backend_req).await.map_err(|e| {
             if body_size_exceeded.load(Ordering::Acquire) {
                 return GrpcProxyError::ResourceExhausted(format!(
                     "gRPC request payload size exceeds maximum of {} bytes",
@@ -910,7 +918,8 @@ pub async fn proxy_grpc_request_streaming(
             }
             error!("gRPC backend request failed (streaming body): {}", e);
             GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
-        })?;
+        })?
+    };
 
     // Check if the request body already exceeded the limit before response
     // headers arrived. If so, fail immediately with a clear error.
@@ -1022,34 +1031,46 @@ pub(crate) async fn proxy_grpc_request_core(
     // Parse gRPC deadline AFTER proxy_headers merge so that before_proxy plugins
     // that add/replace/remove grpc-timeout are reflected in the effective timeout.
     // Cap by the proxy's backend_read_timeout_ms so client deadlines propagate
-    // without exceeding the operator-configured maximum.
+    // without exceeding the operator-configured maximum. When backend_read_timeout_ms
+    // is 0 (disabled), the gRPC deadline is used uncapped; with no deadline either,
+    // there is no timeout.
     let effective_timeout_ms = match parse_grpc_timeout_ms(&headers) {
-        Some(grpc_ms) => grpc_ms.min(proxy.backend_read_timeout_ms),
-        None => proxy.backend_read_timeout_ms,
+        Some(grpc_ms) if proxy.backend_read_timeout_ms > 0 => {
+            Some(grpc_ms.min(proxy.backend_read_timeout_ms))
+        }
+        Some(grpc_ms) => Some(grpc_ms),
+        None if proxy.backend_read_timeout_ms > 0 => Some(proxy.backend_read_timeout_ms),
+        None => None,
     };
 
     let mut backend_req = Request::new(GrpcBody::Buffered(Full::new(body_bytes)));
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;
-    let read_timeout = Duration::from_millis(effective_timeout_ms);
-    let response = tokio::time::timeout(read_timeout, sender.send_request(backend_req))
-        .await
-        .map_err(|_| {
-            warn!(
-                "gRPC: read timeout ({}ms) waiting for backend response",
-                effective_timeout_ms
-            );
-            GrpcProxyError::BackendTimeout(format!("Read timeout after {}ms", effective_timeout_ms))
-        })?
-        .map_err(|e| {
-            error!("gRPC: backend request failed: {}", e);
-            if e.is_timeout() {
-                GrpcProxyError::BackendTimeout(format!("Backend timeout: {}", e))
-            } else {
-                GrpcProxyError::BackendUnavailable(format!("Backend error: {}", e))
-            }
-        })?;
+    let send_fut = sender.send_request(backend_req);
+    let map_send_err = |e: hyper::Error| {
+        error!("gRPC: backend request failed: {}", e);
+        if e.is_timeout() {
+            GrpcProxyError::BackendTimeout(format!("Backend timeout: {}", e))
+        } else {
+            GrpcProxyError::BackendUnavailable(format!("Backend error: {}", e))
+        }
+    };
+    let response = if let Some(timeout_ms) = effective_timeout_ms {
+        let read_timeout = Duration::from_millis(timeout_ms);
+        tokio::time::timeout(read_timeout, send_fut)
+            .await
+            .map_err(|_| {
+                warn!(
+                    "gRPC: read timeout ({}ms) waiting for backend response",
+                    timeout_ms
+                );
+                GrpcProxyError::BackendTimeout(format!("Read timeout after {}ms", timeout_ms))
+            })?
+            .map_err(map_send_err)?
+    } else {
+        send_fut.await.map_err(map_send_err)?
+    };
 
     // Extract response status and headers, stripping hop-by-hop headers per RFC 9110 §7.6.1.
     let status = response.status().as_u16();
@@ -1110,18 +1131,19 @@ pub(crate) async fn proxy_grpc_request_core(
         }
     };
 
-    tokio::time::timeout(read_timeout, body_collection)
-        .await
-        .map_err(|_| {
-            warn!(
-                "gRPC: read timeout ({}ms) while collecting response body",
-                proxy.backend_read_timeout_ms
-            );
-            GrpcProxyError::BackendTimeout(format!(
-                "Body read timeout after {}ms",
-                proxy.backend_read_timeout_ms
-            ))
-        })?;
+    if let Some(timeout_ms) = effective_timeout_ms {
+        tokio::time::timeout(Duration::from_millis(timeout_ms), body_collection)
+            .await
+            .map_err(|_| {
+                warn!(
+                    "gRPC: read timeout ({}ms) while collecting response body",
+                    timeout_ms
+                );
+                GrpcProxyError::BackendTimeout(format!("Body read timeout after {}ms", timeout_ms))
+            })?;
+    } else {
+        body_collection.await;
+    }
 
     Ok(GrpcResponseKind::Buffered(GrpcResponse {
         status,

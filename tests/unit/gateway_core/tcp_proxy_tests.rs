@@ -790,16 +790,11 @@ impl AsyncWrite for NeverWriteStream {
 }
 
 /// backend_read_timeout fires when the backend stops producing bytes — even
-/// with idle_timeout disabled. This is the raw `timeout server` semantic
-/// that HAProxy/nginx expose; maps the `backend_read_timeout_ms` config
-/// field onto TCP streams. `first_failure` must be attributed to
-/// `BackendToClient` (the b2c direction reads from backend), with
-/// `ReadWriteTimeout` class so downstream logging surfaces an
-/// `IdleTimeout` disconnect cause.
+/// with idle_timeout disabled. The inactivity watchdog polls per-direction
+/// watermarks once per second, so a configured 1500ms timeout fires within
+/// ~2.5s (timeout + one watchdog tick).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_backend_read_timeout_fires_on_silent_backend() {
-    // Client: silent but alive (emulates the classic wedge — both peers
-    // happy to wait forever). Backend: never produces bytes.
     let client = NeverReadStream;
     let backend = NeverReadStream;
 
@@ -807,22 +802,22 @@ async fn test_backend_read_timeout_fires_on_silent_backend() {
     let result = bidirectional_copy_for_test_with_timeouts(
         client,
         backend,
-        None,                             // idle_timeout disabled
-        None,                             // half_close_cap disabled
-        Some(Duration::from_millis(200)), // backend_read_timeout
-        None,                             // backend_write_timeout
+        None,
+        None,
+        Some(Duration::from_millis(1500)),
+        None,
         8 * 1024,
     )
     .await;
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed < Duration::from_secs(2),
-        "backend_read_timeout must fire promptly; elapsed = {:?}",
+        elapsed < Duration::from_secs(4),
+        "backend_read_timeout must fire within timeout + watchdog tick; elapsed = {:?}",
         elapsed
     );
     assert!(
-        elapsed >= Duration::from_millis(150),
+        elapsed >= Duration::from_millis(1000),
         "backend_read_timeout should not fire before the configured duration; elapsed = {:?}",
         elapsed
     );
@@ -839,8 +834,8 @@ async fn test_backend_read_timeout_fires_on_silent_backend() {
     assert_eq!(*class, ErrorClass::ReadWriteTimeout);
     assert_eq!(*side, Some(StreamIoSide::Read));
     assert!(
-        msg.contains("read timeout"),
-        "failure message should reflect a read timeout, got: {}",
+        msg.contains("backend read inactivity"),
+        "failure message should reflect inactivity, got: {}",
         msg
     );
     assert_eq!(
@@ -855,8 +850,6 @@ async fn test_backend_read_timeout_fires_on_silent_backend() {
 /// `ClientToBackend` (c2b direction writes to backend) on the write side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_backend_write_timeout_fires_on_stuck_backend() {
-    // Client: produces bytes forever. Backend: accepts no writes (send
-    // buffer permanently stuck) but is silent on reads.
     let client = NeverWriteStream;
     let backend = NeverWriteStream;
 
@@ -866,16 +859,16 @@ async fn test_backend_write_timeout_fires_on_stuck_backend() {
         backend,
         None,
         None,
-        None,                             // backend_read_timeout
-        Some(Duration::from_millis(200)), // backend_write_timeout
+        None,
+        Some(Duration::from_millis(1500)),
         8 * 1024,
     )
     .await;
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed < Duration::from_secs(2),
-        "backend_write_timeout must fire promptly; elapsed = {:?}",
+        elapsed < Duration::from_secs(4),
+        "backend_write_timeout must fire within timeout + watchdog tick; elapsed = {:?}",
         elapsed
     );
 
@@ -891,8 +884,8 @@ async fn test_backend_write_timeout_fires_on_stuck_backend() {
     assert_eq!(*class, ErrorClass::ReadWriteTimeout);
     assert_eq!(*side, Some(StreamIoSide::Write));
     assert!(
-        msg.contains("write timeout"),
-        "failure message should reflect a write timeout, got: {}",
+        msg.contains("backend write inactivity"),
+        "failure message should reflect inactivity, got: {}",
         msg
     );
 }
@@ -900,9 +893,7 @@ async fn test_backend_write_timeout_fires_on_stuck_backend() {
 /// When backend timeouts are enabled but no traffic flows, the read timeout
 /// (applied to the b2c direction) fires before the write timeout — because
 /// the c2b direction needs bytes from the client to attempt a backend write.
-/// With a silent client+backend, only b2c's backend read is actively
-/// waiting. This anchors the directional routing: backend_read_timeout →
-/// b2c read; backend_write_timeout → c2b write.
+/// With a silent client+backend, only b2c's backend read watermark goes stale.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_backend_read_timeout_only_applies_to_backend_side() {
     let client = NeverReadStream;
@@ -913,8 +904,8 @@ async fn test_backend_read_timeout_only_applies_to_backend_side() {
         backend,
         None,
         None,
-        Some(Duration::from_millis(200)), // backend_read: fires
-        Some(Duration::from_secs(60)),    // backend_write: long (should NOT fire)
+        Some(Duration::from_millis(1500)),
+        Some(Duration::from_secs(60)),
         8 * 1024,
     )
     .await;
@@ -923,4 +914,84 @@ async fn test_backend_read_timeout_only_applies_to_backend_side() {
     assert_eq!(*dir, Direction::BackendToClient);
     assert_eq!(*class, ErrorClass::ReadWriteTimeout);
     assert_eq!(*side, Some(StreamIoSide::Read));
+}
+
+/// Setting backend_read_timeout to 0 (Duration::ZERO) disables the
+/// per-direction inactivity check. With both read and idle timeouts
+/// disabled, the session stays open until explicitly terminated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_backend_timeout_zero_disables_check() {
+    let client = NeverReadStream;
+    let backend = NeverReadStream;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        bidirectional_copy_for_test_with_timeouts(
+            client,
+            backend,
+            None,
+            None,
+            Some(Duration::ZERO),
+            Some(Duration::ZERO),
+            8 * 1024,
+        ),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "with timeout=0 (disabled), copy should not terminate on its own"
+    );
+}
+
+/// A slow-but-progressing writer keeps the write watermark fresh, so the
+/// write inactivity timeout should NOT fire even though individual writes
+/// are slow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_slow_progressing_write_does_not_fire_timeout() {
+    let (client, mut client_peer) = tokio::io::duplex(64 * 1024);
+    let (backend, mut backend_peer) = tokio::io::duplex(256);
+
+    // Client sends data continuously.
+    tokio::spawn(async move {
+        let data = vec![0xABu8; 128];
+        loop {
+            if client_peer.write_all(&data).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
+    // Backend drains slowly — reads small chunks with delays.
+    tokio::spawn(async move {
+        let mut buf = [0u8; 32];
+        loop {
+            match backend_peer.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        bidirectional_copy_for_test_with_timeouts(
+            client,
+            backend,
+            None,
+            None,
+            None,
+            Some(Duration::from_millis(1500)),
+            8 * 1024,
+        ),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "slow-but-progressing write should keep watermark fresh; copy should not terminate"
+    );
 }

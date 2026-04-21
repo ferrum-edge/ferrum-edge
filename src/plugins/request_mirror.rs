@@ -249,12 +249,16 @@ impl Plugin for RequestMirror {
             None
         };
 
-        // Use the proxy's backend_read_timeout_ms for the mirror request timeout,
-        // so shadow requests respect the same timeout budget as the real backend call.
         let mirror_timeout = ctx
             .matched_proxy
             .as_ref()
-            .map(|p| Duration::from_millis(p.backend_read_timeout_ms))
+            .map(|p| {
+                if p.backend_read_timeout_ms > 0 {
+                    Duration::from_millis(p.backend_read_timeout_ms)
+                } else {
+                    Duration::from_secs(60)
+                }
+            })
             .unwrap_or(Duration::from_secs(60));
 
         // Create a watch channel for the spawned task to send mirror response

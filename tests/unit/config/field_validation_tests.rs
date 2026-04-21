@@ -281,6 +281,14 @@ fn test_proxy_timeout_too_large_rejected() {
 }
 
 #[test]
+fn test_proxy_backend_rw_timeout_zero_allowed() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_read_timeout_ms = 0;
+    proxy.backend_write_timeout_ms = 0;
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
 fn test_proxy_pool_timeout_validated() {
     let mut proxy = make_proxy("test", "/api");
     proxy.pool_idle_timeout_seconds = Some(0);

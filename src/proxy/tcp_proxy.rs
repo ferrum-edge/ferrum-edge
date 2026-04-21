@@ -734,6 +734,8 @@ struct TcpConnParams {
     dns_override: Option<String>,
     dns_cache_ttl_seconds: Option<u64>,
     backend_connect_timeout_ms: u64,
+    backend_read_timeout_ms: u64,
+    backend_write_timeout_ms: u64,
     tcp_idle_timeout_seconds: u64,
     /// Hard cap on Phase 2 (half-close drain). Applies even when the session
     /// idle timeout is disabled, preventing a stalled peer from wedging the
@@ -944,6 +946,8 @@ async fn handle_tcp_connection_inner(
             dns_override: proxy.dns_override.clone(),
             dns_cache_ttl_seconds: proxy.dns_cache_ttl_seconds,
             backend_connect_timeout_ms: proxy.backend_connect_timeout_ms,
+            backend_read_timeout_ms: proxy.backend_read_timeout_ms,
+            backend_write_timeout_ms: proxy.backend_write_timeout_ms,
             tcp_idle_timeout_seconds: proxy
                 .tcp_idle_timeout_seconds
                 .unwrap_or(global_tcp_idle_timeout),
@@ -991,6 +995,16 @@ async fn handle_tcp_connection_inner(
         };
         let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
             Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
+        } else {
+            None
+        };
+        let backend_read_timeout = if params.backend_read_timeout_ms > 0 {
+            Some(Duration::from_millis(params.backend_read_timeout_ms))
+        } else {
+            None
+        };
+        let backend_write_timeout = if params.backend_write_timeout_ms > 0 {
+            Some(Duration::from_millis(params.backend_write_timeout_ms))
         } else {
             None
         };
@@ -1056,8 +1070,8 @@ async fn handle_tcp_connection_inner(
             backend_stream,
             idle_timeout,
             half_close_cap,
-            None,
-            None,
+            backend_read_timeout,
+            backend_write_timeout,
             buf_size,
         )
         .await;
@@ -1109,6 +1123,16 @@ async fn handle_tcp_connection_inner(
     };
     let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
         Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
+    } else {
+        None
+    };
+    let backend_read_timeout = if params.backend_read_timeout_ms > 0 {
+        Some(Duration::from_millis(params.backend_read_timeout_ms))
+    } else {
+        None
+    };
+    let backend_write_timeout = if params.backend_write_timeout_ms > 0 {
+        Some(Duration::from_millis(params.backend_write_timeout_ms))
     } else {
         None
     };
@@ -1375,8 +1399,8 @@ async fn handle_tcp_connection_inner(
                     bs,
                     idle_timeout,
                     half_close_cap,
-                    None,
-                    None,
+                    backend_read_timeout,
+                    backend_write_timeout,
                     buf_size,
                 )
                 .await
@@ -1409,8 +1433,8 @@ async fn handle_tcp_connection_inner(
                                     bs_back,
                                     idle_timeout,
                                     half_close_cap,
-                                    None,
-                                    None,
+                                    backend_read_timeout,
+                                    backend_write_timeout,
                                     buf_size,
                                 )
                                 .await
@@ -1444,8 +1468,8 @@ async fn handle_tcp_connection_inner(
                             bs,
                             idle_timeout,
                             half_close_cap,
-                            None,
-                            None,
+                            backend_read_timeout,
+                            backend_write_timeout,
                             buf_size,
                         )
                         .await
@@ -1458,8 +1482,8 @@ async fn handle_tcp_connection_inner(
                         bs,
                         idle_timeout,
                         half_close_cap,
-                        None,
-                        None,
+                        backend_read_timeout,
+                        backend_write_timeout,
                         buf_size,
                     )
                     .await
@@ -1476,8 +1500,8 @@ async fn handle_tcp_connection_inner(
                     bs,
                     idle_timeout,
                     half_close_cap,
-                    None,
-                    None,
+                    backend_read_timeout,
+                    backend_write_timeout,
                     buf_size,
                 )
                 .await
@@ -1517,8 +1541,8 @@ async fn handle_tcp_connection_inner(
                         bs,
                         idle_timeout,
                         half_close_cap,
-                        None,
-                        None,
+                        backend_read_timeout,
+                        backend_write_timeout,
                         buf_size,
                     )
                     .await
@@ -1717,25 +1741,30 @@ const BIDIRECTIONAL_DRAIN_GRACE: Duration = Duration::from_millis(100);
 /// the correct socket (frontend vs backend).
 ///
 /// **Idle-timer refresh pattern (two-phase):**
-/// `last_activity` is stored **before** `write_all` (post-read, pre-write)
-/// AND **after** `write_all` (post-write). The pre-write refresh is
+/// `last_activity` is stored **before** the write (post-read, pre-write)
+/// AND **after** the write (post-write). The pre-write refresh is
 /// critical — without it, a successful read followed by a backpressured
-/// write could park inside `write_all` longer than `idle_timeout`, and
+/// write could park inside the write longer than `idle_timeout`, and
 /// the `bidirectional_copy` watchdog (which polls `last_activity` once per
 /// second) would see the stale timestamp and falsely fire an idle timeout
 /// even though bytes were just read from the source. The post-write
-/// refresh additionally credits the direction for write progress. Do not
-/// collapse these into a single store — the scenario Codex P1 flagged
-/// (backpressure masquerading as inactivity) is exactly what the pre-write
-/// store prevents.
+/// refresh additionally credits the direction for write progress.
+///
+/// `read_watermark` / `write_watermark` are per-direction inactivity
+/// timestamps checked by the Phase 1 watchdog for `backend_read_timeout` /
+/// `backend_write_timeout`. Each successful read refreshes `read_watermark`;
+/// each write that makes partial progress refreshes `write_watermark`.
+/// The watermarks are NOT enforced here — they are polled by the
+/// `bidirectional_copy` watchdog tick, which fires the appropriate
+/// timeout when staleness exceeds the configured threshold.
 async fn copy_one_direction<R, W>(
     mut reader: R,
     mut writer: W,
     buf_size: usize,
-    read_timeout: Option<Duration>,
-    write_timeout: Option<Duration>,
     bytes: Arc<AtomicU64>,
     last_activity: Option<Arc<AtomicU64>>,
+    read_watermark: Option<Arc<AtomicU64>>,
+    write_watermark: Option<Arc<AtomicU64>>,
 ) -> Result<(), (StreamIoSide, std::io::Error)>
 where
     R: AsyncRead + Unpin,
@@ -1743,67 +1772,43 @@ where
 {
     let mut buf = vec![0u8; buf_size.max(4096)];
     loop {
-        // Per-read timeout: when set, a single `read()` that blocks longer than
-        // the configured duration surfaces as an `ErrorKind::TimedOut` error —
-        // classified downstream as `ReadWriteTimeout`. Different from the
-        // bidirectional `idle_timeout`, which only fires when BOTH directions
-        // are quiet — here, any single direction going quiet past its timeout
-        // closes the session.
-        //
-        // NOTE: the production TCP code path currently passes `None` for both
-        // `read_timeout` and `write_timeout`. Wiring the proxy schema's
-        // `backend_read_timeout_ms` / `backend_write_timeout_ms` (default
-        // 30 000 ms each) into this helper trips P1/P2 issues flagged by
-        // Codex on PR #454: a wall-clock timeout on a single `read()` /
-        // `write_all()` misclassifies normal request-upload silence and
-        // slow-but-progressing writes as stalls. The eventual fix is
-        // inactivity-based (HAProxy `timeout server` semantics with progress
-        // reset); the parameters remain on this helper so the unit tests can
-        // exercise the future direction.
-        let n = match read_timeout {
-            Some(t) => match tokio::time::timeout(t, reader.read(&mut buf)).await {
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => return Err((StreamIoSide::Read, e)),
-                Err(_) => {
-                    return Err((
-                        StreamIoSide::Read,
-                        std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout exceeded"),
-                    ));
-                }
-            },
-            None => match reader.read(&mut buf).await {
-                Ok(n) => n,
-                Err(e) => return Err((StreamIoSide::Read, e)),
-            },
+        let n = match reader.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => return Err((StreamIoSide::Read, e)),
         };
         if n == 0 {
-            // Clean EOF — shut down the writer side so the peer observes a
-            // half-close. Ignore shutdown errors (peer may already be gone).
             let _ = writer.shutdown().await;
             return Ok(());
         }
+        if let Some(ref wm) = read_watermark {
+            wm.store(coarse_now_ms(), Ordering::Relaxed);
+        }
         // Refresh the idle timestamp before the (potentially blocking) write so
-        // that a backpressured destination — which can park `write_all` longer
-        // than the idle timeout while bytes are genuinely flowing from the
-        // source — does not masquerade as inactivity and trip the watchdog.
+        // that a backpressured destination does not masquerade as inactivity.
         if let Some(ref la) = last_activity {
             la.store(coarse_now_ms(), Ordering::Relaxed);
         }
-        match write_timeout {
-            Some(t) => match tokio::time::timeout(t, writer.write_all(&buf[..n])).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err((StreamIoSide::Write, e)),
-                Err(_) => {
+        // Chunked write loop: each partial write refreshes the write watermark
+        // so a slow-but-progressing backend keeps the inactivity watchdog happy.
+        let mut written = 0;
+        while written < n {
+            match writer.write(&buf[written..n]).await {
+                Ok(0) => {
                     return Err((
                         StreamIoSide::Write,
-                        std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout exceeded"),
+                        std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "write returned 0 bytes",
+                        ),
                     ));
                 }
-            },
-            None => {
-                if let Err(e) = writer.write_all(&buf[..n]).await {
-                    return Err((StreamIoSide::Write, e));
+                Ok(nw) => {
+                    written += nw;
+                    if let Some(ref wm) = write_watermark {
+                        wm.store(coarse_now_ms(), Ordering::Relaxed);
+                    }
                 }
+                Err(e) => return Err((StreamIoSide::Write, e)),
             }
         }
         bytes.fetch_add(n as u64, Ordering::Relaxed);
@@ -1903,10 +1908,21 @@ where
     let c2b_bytes = Arc::new(AtomicU64::new(0));
     let b2c_bytes = Arc::new(AtomicU64::new(0));
 
+    let now = coarse_now_ms();
     let last_activity = match idle_timeout {
-        Some(t) if !t.is_zero() => Some(Arc::new(AtomicU64::new(coarse_now_ms()))),
+        Some(t) if !t.is_zero() => Some(Arc::new(AtomicU64::new(now))),
         _ => None,
     };
+
+    // Per-direction inactivity watermarks for backend_read_timeout /
+    // backend_write_timeout. Initialized to session start so a freshly
+    // established connection is not immediately stale.
+    let b2c_read_watermark = backend_read_timeout
+        .filter(|d| !d.is_zero())
+        .map(|_| Arc::new(AtomicU64::new(now)));
+    let c2b_write_watermark = backend_write_timeout
+        .filter(|d| !d.is_zero())
+        .map(|_| Arc::new(AtomicU64::new(now)));
 
     let (client_read, client_write) = tokio::io::split(client);
     let (backend_read, backend_write) = tokio::io::split(backend);
@@ -1916,35 +1932,42 @@ where
     let la_c2b = last_activity.clone();
     let la_b2c = last_activity.clone();
 
-    // Per-direction timeouts:
-    // * c2b reads from CLIENT (no client-read timeout config) and writes to
-    //   BACKEND (`backend_write_timeout` — enforce when backend's socket send
-    //   buffer stops draining for too long).
-    // * b2c reads from BACKEND (`backend_read_timeout` — enforce when backend
-    //   goes silent) and writes to CLIENT (no client-write timeout config).
+    // Per-direction layout:
+    // * c2b reads from CLIENT and writes to BACKEND — the write watermark
+    //   tracks `backend_write_timeout` (c2b_write_watermark).
+    // * b2c reads from BACKEND and writes to CLIENT — the read watermark
+    //   tracks `backend_read_timeout` (b2c_read_watermark).
     let c2b_fut = copy_one_direction(
         client_read,
         backend_write,
         buf_size,
-        None,
-        backend_write_timeout,
         c2b_bytes_task,
         la_c2b,
+        None,
+        c2b_write_watermark.clone(),
     );
     let b2c_fut = copy_one_direction(
         backend_read,
         client_write,
         buf_size,
-        backend_read_timeout,
-        None,
         b2c_bytes_task,
         la_b2c,
+        b2c_read_watermark.clone(),
+        None,
     );
     tokio::pin!(c2b_fut);
     tokio::pin!(b2c_fut);
 
     let idle_timeout_active = last_activity.is_some();
     let timeout_ms = idle_timeout.map(|t| t.as_millis() as u64).unwrap_or(0);
+    let backend_read_timeout_ms = backend_read_timeout
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let backend_write_timeout_ms = backend_write_timeout
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let any_watchdog_active =
+        idle_timeout_active || b2c_read_watermark.is_some() || c2b_write_watermark.is_some();
 
     // Phase 1: race the two directions (plus optional idle check).
     let mut first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>, String)> = None;
@@ -1998,21 +2021,44 @@ where
                 }
                 break;
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
-                if let Some(ref la) = last_activity {
-                    let last = la.load(Ordering::Relaxed);
-                    if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                        // Idle timeout — treat as "unknown" direction since
-                        // neither half produced an error. Use ReadWriteTimeout
-                        // class so disconnect_cause downstream is IdleTimeout.
-                        first_failure = Some((
-                            Direction::Unknown,
-                            ErrorClass::ReadWriteTimeout,
-                            None,
-                            "idle timeout".to_string(),
-                        ));
-                        break;
-                    }
+            _ = tokio::time::sleep(Duration::from_secs(1)), if any_watchdog_active => {
+                let now = coarse_now_ms();
+                // Per-direction inactivity checks (backend_read_timeout /
+                // backend_write_timeout). Checked before the bidirectional
+                // idle timeout so a stale single direction is caught even
+                // when the other direction is still active.
+                if let Some(ref wm) = b2c_read_watermark
+                    && now.saturating_sub(wm.load(Ordering::Relaxed)) >= backend_read_timeout_ms
+                {
+                    first_failure = Some((
+                        Direction::BackendToClient,
+                        ErrorClass::ReadWriteTimeout,
+                        Some(StreamIoSide::Read),
+                        "backend read inactivity timeout".to_string(),
+                    ));
+                    break;
+                }
+                if let Some(ref wm) = c2b_write_watermark
+                    && now.saturating_sub(wm.load(Ordering::Relaxed)) >= backend_write_timeout_ms
+                {
+                    first_failure = Some((
+                        Direction::ClientToBackend,
+                        ErrorClass::ReadWriteTimeout,
+                        Some(StreamIoSide::Write),
+                        "backend write inactivity timeout".to_string(),
+                    ));
+                    break;
+                }
+                if let Some(ref la) = last_activity
+                    && now.saturating_sub(la.load(Ordering::Relaxed)) >= timeout_ms
+                {
+                    first_failure = Some((
+                        Direction::Unknown,
+                        ErrorClass::ReadWriteTimeout,
+                        None,
+                        "idle timeout".to_string(),
+                    ));
+                    break;
                 }
             }
         }

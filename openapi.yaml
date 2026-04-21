@@ -1475,13 +1475,15 @@ components:
         backend_read_timeout_ms:
           type: integer
           format: uint64
+          minimum: 0
           default: 30000
-          description: Backend response timeout in milliseconds
+          description: Backend read timeout in milliseconds. For HTTP/gRPC proxies, this is the response timeout. For TCP proxies, this is a per-direction inactivity timeout on the backend read path. 0 = disabled.
         backend_write_timeout_ms:
           type: integer
           format: uint64
+          minimum: 0
           default: 30000
-          description: Backend write timeout in milliseconds
+          description: Backend write timeout in milliseconds. For TCP proxies, this is a per-direction inactivity timeout on the backend write path. 0 = disabled.
         backend_tls_client_cert_path:
           type: [string, "null"]
           maxLength: 4096

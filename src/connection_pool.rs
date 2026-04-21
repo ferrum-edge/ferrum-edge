@@ -67,10 +67,14 @@ impl ReqwestPoolManager {
         .map_err(|e| anyhow::anyhow!("Failed to build reqwest backend TLS config: {}", e))?
         .dns_resolver(dns_resolver)
         .connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms))
-        .timeout(Duration::from_millis(proxy.backend_read_timeout_ms))
         .tcp_nodelay(true)
         .pool_max_idle_per_host(config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds));
+
+        if proxy.backend_read_timeout_ms > 0 {
+            client_builder =
+                client_builder.timeout(Duration::from_millis(proxy.backend_read_timeout_ms));
+        }
 
         if config.enable_http_keep_alive {
             client_builder =

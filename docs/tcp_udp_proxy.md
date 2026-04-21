@@ -359,11 +359,16 @@ proxies:
 
 ## TCP Backend Timeouts
 
-`backend_read_timeout_ms` and `backend_write_timeout_ms` only apply to **HTTP** and **gRPC** backend pools — not to raw TCP / TCP+TLS proxies. The TCP relay uses `tcp_idle_timeout_seconds` (bidirectional) and the OS TCP keep-alive for stalled-session detection.
+`backend_read_timeout_ms` and `backend_write_timeout_ms` apply to TCP proxies as **per-direction inactivity timeouts**. They are enforced by a watchdog that polls per-direction watermarks once per second:
 
-The two HTTP-shaped fields default to 30,000 ms in the proxy schema (and the SQL CHECK constraint requires `> 0`), which is appropriate for HTTP request/response cycles but wrong for long-lived TCP workloads where one-directional silence is normal (database keep-alives, message-broker streams, SSH/IMAP passthrough). Wiring those defaults onto raw TCP would tear down healthy connections after 30 s of read or write inactivity. Until the per-direction enforcement is rewritten as an inactivity-based watchdog (HAProxy-style `timeout server` semantics, where the timer pauses while the other direction is making progress), the TCP code path passes `None` to the relay's per-direction timeout slots and relies on `tcp_idle_timeout_seconds`.
+- **`backend_read_timeout_ms`**: fires when the backend stops producing bytes (b2c direction goes stale). The watermark is refreshed on every successful read from the backend.
+- **`backend_write_timeout_ms`**: fires when progress stalls writing to the backend (c2b direction goes stale). The watermark is refreshed on every partial `write()` that accepts bytes, so a slow-but-progressing backend keeps the watermark fresh.
 
-The `bidirectional_copy` helper accepts per-direction `backend_read_timeout` and `backend_write_timeout` arguments and unit tests cover them — that infrastructure is in place for the future inactivity-based wiring.
+Both default to 30,000 ms. Set to **`0` to disable** per-direction enforcement for long-lived TCP workloads (database keep-alives, message-broker streams, SSH/IMAP passthrough). When disabled, the TCP relay relies solely on `tcp_idle_timeout_seconds` (bidirectional) and the OS TCP keep-alive.
+
+**Watchdog granularity**: The 1-second poll tick means a configured 5,000 ms timeout fires within ~6 s (timeout + one tick). Production timeouts are typically >= 5 s where 1 s drift is acceptable.
+
+**Splice/kTLS paths**: The per-direction inactivity timeouts only apply to the `bidirectional_copy` userspace relay path. The Linux `splice(2)`, io_uring splice, and kTLS-accelerated splice paths have no per-read hook and continue to rely on `tcp_idle_timeout_seconds`.
 
 ## UDP Session Management
 
