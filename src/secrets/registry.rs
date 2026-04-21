@@ -51,6 +51,22 @@ pub struct ResolvedEnvSecrets {
     pub vars: Vec<(String, String)>,
     /// Suffixed source keys (e.g., `FERRUM_X_FILE`) to remove from the environment.
     pub source_keys_to_remove: Vec<String>,
+    /// `(base_key, backend display name)` pairs to log once tracing is initialized.
+    pub loaded_sources: Vec<(String, &'static str)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum BackendKind {
+    DirectEnv,
+    File,
+    #[cfg(feature = "secrets-vault")]
+    Vault,
+    #[cfg(feature = "secrets-aws")]
+    Aws,
+    #[cfg(feature = "secrets-gcp")]
+    Gcp,
+    #[cfg(feature = "secrets-azure")]
+    Azure,
 }
 
 #[derive(Clone)]
@@ -58,7 +74,7 @@ pub(crate) struct PendingSecret {
     base_key: String,
     reference: String,
     suffixed_key: String,
-    backend: &'static dyn SecretBackend,
+    backend_kind: BackendKind,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +86,7 @@ pub(crate) struct ResolvedPendingSecret {
 
 #[async_trait]
 pub(crate) trait SecretBackend: Sync + Send {
+    fn kind(&self) -> BackendKind;
     fn name(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
     fn suffix(&self) -> Option<&'static str> {
@@ -259,8 +276,7 @@ fn match_suffix(raw_key: &str) -> Option<(&'static dyn SecretBackend, &str)> {
 }
 
 pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
-    let mut to_resolve: HashMap<String, Vec<(String, String, &'static dyn SecretBackend)>> =
-        HashMap::new();
+    let mut to_resolve: HashMap<String, Vec<(String, String, BackendKind)>> = HashMap::new();
 
     for (raw_key, value) in std::env::vars() {
         if !raw_key.starts_with(FERRUM_PREFIX) {
@@ -273,7 +289,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             to_resolve.entry(base_key.to_string()).or_default().push((
                 raw_key.clone(),
                 value,
-                backend,
+                backend.kind(),
             ));
         }
     }
@@ -307,7 +323,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             base_key: base_key.clone(),
             reference: reference.clone(),
             suffixed_key: suffixed_key.clone(),
-            backend: *backend,
+            backend_kind: *backend,
         });
     }
 
@@ -316,17 +332,13 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     let mut results = ResolvedEnvSecrets {
         vars: Vec::new(),
         source_keys_to_remove: Vec::new(),
+        loaded_sources: Vec::new(),
     };
 
     for backend in startup_backends() {
         let backend_pending: Vec<PendingSecret> = pending
             .iter()
-            .filter(|s| {
-                std::ptr::addr_eq(
-                    s.backend as *const dyn SecretBackend,
-                    backend as *const dyn SecretBackend,
-                )
-            })
+            .filter(|s| s.backend_kind == backend.kind())
             .cloned()
             .collect();
         if backend_pending.is_empty() {
@@ -338,7 +350,9 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             .await?;
         for item in resolved {
             if backend.log_loaded() {
-                info!("Loaded {} from {}", item.base_key, backend.display_name());
+                results
+                    .loaded_sources
+                    .push((item.base_key.clone(), backend.display_name()));
             }
             results.vars.push((item.base_key, item.value));
             results.source_keys_to_remove.push(item.suffixed_key);
@@ -391,6 +405,10 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
 
 #[async_trait]
 impl SecretBackend for DirectEnvBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::DirectEnv
+    }
+
     fn name(&self) -> &'static str {
         "direct"
     }
@@ -423,6 +441,10 @@ impl SecretBackend for DirectEnvBackend {
 
 #[async_trait]
 impl SecretBackend for FileBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::File
+    }
+
     fn name(&self) -> &'static str {
         "file"
     }
@@ -462,6 +484,10 @@ impl SecretBackend for FileBackend {
 #[cfg(feature = "secrets-vault")]
 #[async_trait]
 impl SecretBackend for VaultBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Vault
+    }
+
     fn name(&self) -> &'static str {
         "vault"
     }
@@ -506,6 +532,10 @@ impl SecretBackend for VaultBackend {
 #[cfg(feature = "secrets-aws")]
 #[async_trait]
 impl SecretBackend for AwsBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Aws
+    }
+
     fn name(&self) -> &'static str {
         "aws"
     }
@@ -550,6 +580,10 @@ impl SecretBackend for AwsBackend {
 #[cfg(feature = "secrets-gcp")]
 #[async_trait]
 impl SecretBackend for GcpBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Gcp
+    }
+
     fn name(&self) -> &'static str {
         "gcp"
     }
@@ -594,6 +628,10 @@ impl SecretBackend for GcpBackend {
 #[cfg(feature = "secrets-azure")]
 #[async_trait]
 impl SecretBackend for AzureBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Azure
+    }
+
     fn name(&self) -> &'static str {
         "azure"
     }
@@ -638,6 +676,7 @@ impl SecretBackend for AzureBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn match_suffix_file() {
@@ -706,5 +745,15 @@ mod tests {
         assert!(match_suffix("FERRUM_DB_URL_file").is_none());
         assert!(match_suffix("FERRUM_DB_URL_vault").is_none());
         assert!(match_suffix("FERRUM_DB_URL_aws").is_none());
+    }
+
+    #[test]
+    fn startup_backends_have_distinct_kinds() {
+        let kinds: Vec<BackendKind> = startup_backends()
+            .iter()
+            .map(|backend| backend.kind())
+            .collect();
+        let unique: HashSet<BackendKind> = kinds.iter().copied().collect();
+        assert_eq!(kinds.len(), unique.len());
     }
 }
