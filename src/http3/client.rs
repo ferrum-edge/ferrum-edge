@@ -181,9 +181,12 @@ impl PoolManager for Http3PoolManager {
         Http3ConnectionPool::write_pool_key_with_host(buf, host, port, proxy, shard);
     }
 
+    // HTTP/3 request paths establish new connections through
+    // `GenericPool::create_or_get_existing_owned()` because QUIC setup needs
+    // per-call TLS and H3 config objects that are not part of the manager.
     async fn create(&self, _key: &str, _proxy: &Proxy) -> Result<Self::Connection> {
         Err(anyhow::anyhow!(
-            "Http3ConnectionPool requires an explicit TLS config closure"
+            "Http3ConnectionPool uses GenericPool::create_or_get_existing_owned for creation"
         ))
     }
 
@@ -301,6 +304,8 @@ impl Http3ConnectionPool {
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3SendRequest, anyhow::Error> {
+        // H3 is the one pool that needs extra creation context beyond the
+        // `Proxy`, so it uses the shared shell's explicit creation closure.
         self.pool
             .create_or_get_existing_owned(key, |_| {
                 let tls_config = tls_config.clone();

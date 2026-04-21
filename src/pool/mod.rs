@@ -1,12 +1,12 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore};
 
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
@@ -28,6 +28,11 @@ pub trait PoolManager: Send + Sync + 'static {
 
     fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String);
 
+    /// Default cache-miss creation hook used by `GenericPool::get()`.
+    ///
+    /// Most pools can establish a connection from the pool key plus `Proxy`
+    /// alone. Specialized pools that need extra per-call creation context can
+    /// use `GenericPool::create_or_get_existing_owned()` instead.
     async fn create(&self, key: &str, proxy: &Proxy) -> Result<Self::Connection>;
 
     fn is_healthy(&self, conn: &Self::Connection) -> bool;
@@ -68,11 +73,13 @@ pub struct GenericPool<M: PoolManager> {
     cfg: Arc<PoolConfig>,
     cleanup_interval: Duration,
     inflight: Arc<Semaphore>,
-    pending_creations: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    pending_creations: Arc<DashMap<String, Arc<Notify>>>,
 }
 
 impl<M: PoolManager> GenericPool<M> {
     pub fn new(manager: Arc<M>, cfg: PoolConfig, cleanup_interval: Duration) -> Arc<Self> {
+        // Cold-path connection establishment is bounded per pool so a burst of
+        // cache misses cannot fan out into unbounded concurrent dials.
         let inflight_limit = std::thread::available_parallelism()
             .map(|parallelism| parallelism.get().clamp(4, 256))
             .unwrap_or(32);
@@ -82,7 +89,7 @@ impl<M: PoolManager> GenericPool<M> {
             cfg: Arc::new(cfg),
             cleanup_interval,
             inflight: Arc::new(Semaphore::new(inflight_limit)),
-            pending_creations: Arc::new(Mutex::new(HashMap::new())),
+            pending_creations: Arc::new(DashMap::new()),
         });
         pool.clone().spawn_cleanup();
         pool
@@ -172,23 +179,6 @@ impl<M: PoolManager> GenericPool<M> {
         .await
     }
 
-    #[allow(dead_code)]
-    pub async fn create_or_get_existing(
-        &self,
-        proxy: &Proxy,
-        host: &str,
-        port: u16,
-        shard: usize,
-    ) -> Result<M::Connection> {
-        let build_manager = Arc::clone(&self.manager);
-        let create_manager = Arc::clone(&self.manager);
-        self.create_or_get_existing_with(
-            |buf| build_manager.build_key(proxy, host, port, shard, buf),
-            |key| async move { create_manager.create(&key, proxy).await },
-        )
-        .await
-    }
-
     pub async fn get_with<F, C, Fut>(&self, build_key: F, create: C) -> Result<M::Connection>
     where
         F: FnOnce(&mut String),
@@ -205,33 +195,16 @@ impl<M: PoolManager> GenericPool<M> {
         }
     }
 
-    #[allow(dead_code)]
-    pub async fn create_or_get_existing_with<F, C, Fut>(
-        &self,
-        build_key: F,
-        create: C,
-    ) -> Result<M::Connection>
-    where
-        F: FnOnce(&mut String),
-        C: FnOnce(String) -> Fut,
-        Fut: std::future::Future<Output = Result<M::Connection>>,
-    {
-        let key = KEY_BUF.with(|buf| {
-            let mut buf = buf.borrow_mut();
-            build_key(&mut buf);
-            buf.to_string()
-        });
-        self.create_or_get_existing_owned(key, create).await
-    }
-
-    pub async fn create_or_get_existing_owned<C, Fut>(
+    /// Specialized cache-miss path for pools that need extra per-call
+    /// connection-establishment context in addition to the `Proxy`.
+    pub async fn create_or_get_existing_owned<C, Fut, E>(
         &self,
         key: String,
         create: C,
-    ) -> Result<M::Connection>
+    ) -> std::result::Result<M::Connection, E>
     where
         C: FnOnce(String) -> Fut,
-        Fut: std::future::Future<Output = Result<M::Connection>>,
+        Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
     {
         let mut create = Some(create);
 
@@ -240,8 +213,11 @@ impl<M: PoolManager> GenericPool<M> {
                 return Ok(conn);
             }
 
-            let (notify, is_creator) = self.register_pending_creation(&key).await;
+            let (notify, is_creator) = self.register_pending_creation(&key);
             if !is_creator {
+                // A notifier can fire before a newly registered waiter polls
+                // `notified()`. That race is intentional: the loop always
+                // re-checks both the cache and the pending-creation map.
                 notify.notified().await;
                 continue;
             }
@@ -254,45 +230,43 @@ impl<M: PoolManager> GenericPool<M> {
                         .expect("create closure should only be consumed by the creator"),
                 )
                 .await;
-            self.finish_pending_creation(&key, notify).await;
+            self.finish_pending_creation(&key, notify);
             return result;
         }
     }
 
-    async fn register_pending_creation(&self, key: &str) -> (Arc<Notify>, bool) {
-        let mut pending = self.pending_creations.lock().await;
-        if let Some(notify) = pending.get(key) {
-            (notify.clone(), false)
-        } else {
-            let notify = Arc::new(Notify::new());
-            pending.insert(key.to_owned(), notify.clone());
-            (notify, true)
+    fn register_pending_creation(&self, key: &str) -> (Arc<Notify>, bool) {
+        match self.pending_creations.entry(key.to_owned()) {
+            Entry::Occupied(existing) => (existing.get().clone(), false),
+            Entry::Vacant(vacant) => {
+                let notify = Arc::new(Notify::new());
+                vacant.insert(notify.clone());
+                (notify, true)
+            }
         }
     }
 
-    async fn finish_pending_creation(&self, key: &str, notify: Arc<Notify>) {
-        let mut pending = self.pending_creations.lock().await;
-        if pending
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, &notify))
-        {
-            pending.remove(key);
-        }
-        drop(pending);
+    fn finish_pending_creation(&self, key: &str, notify: Arc<Notify>) {
+        self.pending_creations
+            .remove_if(key, |_, current| Arc::ptr_eq(current, &notify));
         notify.notify_waiters();
     }
 
-    async fn create_after_recheck<C, Fut>(&self, key: String, create: C) -> Result<M::Connection>
+    async fn create_after_recheck<C, Fut, E>(
+        &self,
+        key: String,
+        create: C,
+    ) -> std::result::Result<M::Connection, E>
     where
         C: FnOnce(String) -> Fut,
-        Fut: std::future::Future<Output = Result<M::Connection>>,
+        Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
     {
         let _permit = self
             .inflight
             .clone()
             .acquire_owned()
             .await
-            .map_err(|err| anyhow!("pool creation semaphore closed: {}", err))?;
+            .expect("pool creation semaphore should remain open while the pool is alive");
 
         if let Some(conn) = self.cached(&key) {
             return Ok(conn);
@@ -389,10 +363,12 @@ mod tests {
 
     #[derive(Default)]
     struct TestManager {
+        attempts: AtomicUsize,
         creates: AtomicUsize,
         destroys: AtomicUsize,
         healthy: AtomicBool,
         unhealthy_checks_remaining: AtomicUsize,
+        fail_creates_remaining: AtomicUsize,
         create_delay: Duration,
     }
 
@@ -409,6 +385,16 @@ mod tests {
         async fn create(&self, key: &str, _proxy: &Proxy) -> Result<Self::Connection> {
             if !self.create_delay.is_zero() {
                 tokio::time::sleep(self.create_delay).await;
+            }
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            if self
+                .fail_creates_remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    (remaining > 0).then_some(remaining - 1)
+                })
+                .is_ok()
+            {
+                anyhow::bail!("synthetic create failure for {key}");
             }
             let generation = self.creates.fetch_add(1, Ordering::Relaxed) + 1;
             Ok(format!("{key}|gen={generation}"))
@@ -545,6 +531,54 @@ mod tests {
 
         assert_eq!(manager.creates.load(Ordering::Relaxed), 1);
         assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[tokio::test]
+    async fn generic_pool_clears_pending_state_after_create_failure() {
+        let manager = Arc::new(TestManager {
+            healthy: AtomicBool::new(true),
+            fail_creates_remaining: AtomicUsize::new(1),
+            create_delay: Duration::from_millis(25),
+            ..Default::default()
+        });
+        let pool = GenericPool::new(
+            manager.clone(),
+            PoolConfig::default(),
+            Duration::from_secs(60),
+        );
+        let proxy = test_proxy();
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            let proxy = proxy.clone();
+            tasks.push(tokio::spawn(async move {
+                pool.get(&proxy, "backend.example.com", 443, 0).await
+            }));
+        }
+
+        let mut saw_error = false;
+        let mut saw_success = false;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => saw_success = true,
+                Err(_) => saw_error = true,
+            }
+        }
+
+        assert!(saw_error);
+        assert!(saw_success);
+        assert!(pool.pending_creations.is_empty());
+        assert_eq!(manager.attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(manager.creates.load(Ordering::Relaxed), 1);
+
+        let conn = pool
+            .get(&proxy, "backend.example.com", 443, 0)
+            .await
+            .unwrap();
+        assert!(conn.contains("gen=1"));
+        assert!(pool.pending_creations.is_empty());
+        assert_eq!(manager.attempts.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

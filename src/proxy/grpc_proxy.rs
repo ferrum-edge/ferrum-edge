@@ -160,10 +160,14 @@ fn grpc_pool_key_owned(proxy: &Proxy) -> String {
     buf
 }
 
-fn map_pool_error(err: anyhow::Error) -> GrpcProxyError {
-    match err.downcast::<GrpcProxyError>() {
-        Ok(err) => err,
-        Err(err) => GrpcProxyError::Internal(err.to_string()),
+fn write_grpc_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
+    buf.truncate(base_len);
+    buf.push('#');
+    if shard < 10 {
+        buf.push((b'0' + shard as u8) as char);
+    } else {
+        use std::fmt::Write;
+        let _ = write!(buf, "{shard}");
     }
 }
 
@@ -263,14 +267,7 @@ impl GrpcConnectionPool {
     /// Append a shard suffix in-place by truncating to `base_len` first.
     /// Avoids clearing and rewriting the base key on every shard iteration.
     fn write_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
-        buf.truncate(base_len);
-        buf.push('#');
-        if shard < 10 {
-            buf.push((b'0' + shard as u8) as char);
-        } else {
-            use std::fmt::Write;
-            let _ = write!(buf, "{shard}");
-        }
+        write_grpc_shard_key_inplace(buf, base_len, shard);
     }
 
     pub async fn get_sender(
@@ -329,7 +326,8 @@ impl GrpcConnectionPool {
         match self
             .pool
             .create_or_get_existing_owned(selected_key, |key| async move {
-                manager.create(&key, proxy).await
+                let _ = key;
+                manager.create_connection(proxy).await
             })
             .await
         {
@@ -342,7 +340,7 @@ impl GrpcConnectionPool {
                         return Ok(sender);
                     }
                 }
-                Err(map_pool_error(err))
+                Err(err)
             }
         }
     }
@@ -586,7 +584,7 @@ impl PoolManager for GrpcPoolManager {
     fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
         write_grpc_pool_key(buf, host, port, proxy);
         let base_len = buf.len();
-        GrpcConnectionPool::write_shard_key_inplace(buf, base_len, shard);
+        write_grpc_shard_key_inplace(buf, base_len, shard);
     }
 
     async fn create(&self, _key: &str, proxy: &Proxy) -> Result<http2::SendRequest<GrpcBody>> {

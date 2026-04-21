@@ -60,13 +60,14 @@ fn pool_key_owned(proxy: &Proxy) -> String {
     buf
 }
 
-fn map_pool_error(err: anyhow::Error) -> Http2PoolError {
-    match err.downcast::<Http2PoolError>() {
-        Ok(err) => err,
-        Err(err) => Http2PoolError::Internal {
-            message: err.to_string(),
-            source: Some(InternalSource::Message(err.to_string())),
-        },
+fn write_http2_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
+    buf.truncate(base_len);
+    buf.push('#');
+    if shard < 10 {
+        buf.push((b'0' + shard as u8) as char);
+    } else {
+        use std::fmt::Write;
+        let _ = write!(buf, "{shard}");
     }
 }
 
@@ -81,7 +82,10 @@ struct Http2PoolManager {
 }
 
 impl Http2PoolManager {
-    async fn create_connection(&self, proxy: &Proxy) -> Result<http2::SendRequest<Incoming>> {
+    async fn create_connection(
+        &self,
+        proxy: &Proxy,
+    ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
@@ -191,7 +195,7 @@ impl Http2PoolManager {
         }
     }
 
-    fn get_tls_config(&self, proxy: &Proxy) -> Result<Arc<rustls::ClientConfig>> {
+    fn get_tls_config(&self, proxy: &Proxy) -> Result<Arc<rustls::ClientConfig>, Http2PoolError> {
         self.tls_configs
             .get_or_try_build(pool_key_owned(proxy), || {
                 let mut tls_config = BackendTlsConfigBuilder {
@@ -233,7 +237,6 @@ impl Http2PoolManager {
                 tls_config.alpn_protocols = vec![b"h2".to_vec()];
                 Ok::<rustls::ClientConfig, Http2PoolError>(tls_config)
             })
-            .map_err(anyhow::Error::from)
     }
 
     async fn create_tls_connection(
@@ -242,11 +245,11 @@ impl Http2PoolManager {
         host: &str,
         proxy: &Proxy,
         pool_config: &PoolConfig,
-    ) -> Result<http2::SendRequest<Incoming>> {
+    ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
-        let tls_config = self.get_tls_config(proxy).map_err(map_pool_error)?;
+        let tls_config = self.get_tls_config(proxy)?;
         let connector = TlsConnector::from(tls_config);
         let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
             Http2PoolError::BackendUnavailable {
@@ -291,11 +294,13 @@ impl PoolManager for Http2PoolManager {
     fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
         write_http2_pool_key(buf, host, port, proxy);
         let base_len = buf.len();
-        Http2ConnectionPool::write_shard_key_inplace(buf, base_len, shard);
+        write_http2_shard_key_inplace(buf, base_len, shard);
     }
 
     async fn create(&self, _key: &str, proxy: &Proxy) -> Result<http2::SendRequest<Incoming>> {
-        self.create_connection(proxy).await
+        self.create_connection(proxy)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     fn is_healthy(&self, conn: &Self::Connection) -> bool {
@@ -372,14 +377,7 @@ impl Http2ConnectionPool {
     }
 
     fn write_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
-        buf.truncate(base_len);
-        buf.push('#');
-        if shard < 10 {
-            buf.push((b'0' + shard as u8) as char);
-        } else {
-            use std::fmt::Write;
-            let _ = write!(buf, "{shard}");
-        }
+        write_http2_shard_key_inplace(buf, base_len, shard);
     }
 
     pub async fn get_sender(
@@ -437,7 +435,8 @@ impl Http2ConnectionPool {
         let sender = match self
             .pool
             .create_or_get_existing_owned(selected_key, |key| async move {
-                manager.create(&key, proxy).await
+                let _ = key;
+                manager.create_connection(proxy).await
             })
             .await
         {
@@ -450,7 +449,7 @@ impl Http2ConnectionPool {
                         return Ok(sender);
                     }
                 }
-                return Err(map_pool_error(err));
+                return Err(err);
             }
         };
         Ok(sender)
