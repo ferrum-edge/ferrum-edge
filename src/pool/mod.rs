@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Semaphore, watch};
 
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
@@ -67,13 +67,67 @@ enum LookupOutcome<C> {
     Unhealthy(String),
 }
 
+struct PendingCreation {
+    completion_tx: watch::Sender<bool>,
+}
+
+impl PendingCreation {
+    fn new() -> Self {
+        let (completion_tx, _completion_rx) = watch::channel(false);
+        Self { completion_tx }
+    }
+
+    async fn wait(&self) {
+        let mut completion = self.completion_tx.subscribe();
+        if *completion.borrow() {
+            return;
+        }
+
+        let _ = completion.changed().await;
+    }
+
+    fn finish(&self) {
+        self.completion_tx.send_replace(true);
+    }
+}
+
+struct PendingCreationGuard<'a, M: PoolManager> {
+    pool: &'a GenericPool<M>,
+    key: String,
+    pending: Option<Arc<PendingCreation>>,
+}
+
+impl<'a, M: PoolManager> PendingCreationGuard<'a, M> {
+    fn new(pool: &'a GenericPool<M>, key: String, pending: Arc<PendingCreation>) -> Self {
+        Self {
+            pool,
+            key,
+            pending: Some(pending),
+        }
+    }
+
+    fn finish(mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.pool.finish_pending_creation(&self.key, pending);
+        }
+    }
+}
+
+impl<M: PoolManager> Drop for PendingCreationGuard<'_, M> {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.pool.finish_pending_creation(&self.key, pending);
+        }
+    }
+}
+
 pub struct GenericPool<M: PoolManager> {
     manager: Arc<M>,
     entries: Arc<DashMap<String, PoolEntry<M::Connection>>>,
     cfg: Arc<PoolConfig>,
     cleanup_interval: Duration,
     inflight: Arc<Semaphore>,
-    pending_creations: Arc<DashMap<String, Arc<Notify>>>,
+    pending_creations: Arc<DashMap<String, Arc<PendingCreation>>>,
 }
 
 impl<M: PoolManager> GenericPool<M> {
@@ -213,15 +267,16 @@ impl<M: PoolManager> GenericPool<M> {
                 return Ok(conn);
             }
 
-            let (notify, is_creator) = self.register_pending_creation(&key);
+            let (pending, is_creator) = self.register_pending_creation(&key);
             if !is_creator {
-                // A notifier can fire before a newly registered waiter polls
-                // `notified()`. That race is intentional: the loop always
-                // re-checks both the cache and the pending-creation map.
-                notify.notified().await;
+                // `watch` stores a durable completion bit, so even a waiter
+                // that subscribes after the creator finishes will observe the
+                // completed state and loop back without hanging.
+                pending.wait().await;
                 continue;
             }
 
+            let pending_guard = PendingCreationGuard::new(self, key.clone(), pending);
             let result = self
                 .create_after_recheck(
                     key.clone(),
@@ -230,26 +285,26 @@ impl<M: PoolManager> GenericPool<M> {
                         .expect("create closure should only be consumed by the creator"),
                 )
                 .await;
-            self.finish_pending_creation(&key, notify);
+            pending_guard.finish();
             return result;
         }
     }
 
-    fn register_pending_creation(&self, key: &str) -> (Arc<Notify>, bool) {
+    fn register_pending_creation(&self, key: &str) -> (Arc<PendingCreation>, bool) {
         match self.pending_creations.entry(key.to_owned()) {
             Entry::Occupied(existing) => (existing.get().clone(), false),
             Entry::Vacant(vacant) => {
-                let notify = Arc::new(Notify::new());
-                vacant.insert(notify.clone());
-                (notify, true)
+                let pending = Arc::new(PendingCreation::new());
+                vacant.insert(pending.clone());
+                (pending, true)
             }
         }
     }
 
-    fn finish_pending_creation(&self, key: &str, notify: Arc<Notify>) {
+    fn finish_pending_creation(&self, key: &str, pending: Arc<PendingCreation>) {
         self.pending_creations
-            .remove_if(key, |_, current| Arc::ptr_eq(current, &notify));
-        notify.notify_waiters();
+            .remove_if(key, |_, current| Arc::ptr_eq(current, &pending));
+        pending.finish();
     }
 
     async fn create_after_recheck<C, Fut, E>(
@@ -360,6 +415,7 @@ mod tests {
     use crate::config::types::{AuthMode, BackendProtocol, BackendTlsConfig, ResponseBodyMode};
     use chrono::Utc;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use tokio::sync::Notify;
 
     #[derive(Default)]
     struct TestManager {
@@ -474,6 +530,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_creation_wait_handles_late_subscribers() {
+        let pending = PendingCreation::new();
+        pending.finish();
+
+        tokio::time::timeout(Duration::from_millis(50), pending.wait())
+            .await
+            .expect("completed pending creation should not block late waiters");
+    }
+
+    #[tokio::test]
     async fn generic_pool_reuses_cached_connection() {
         let manager = Arc::new(TestManager {
             healthy: AtomicBool::new(true),
@@ -579,6 +645,75 @@ mod tests {
         assert!(conn.contains("gen=1"));
         assert!(pool.pending_creations.is_empty());
         assert_eq!(manager.attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn generic_pool_clears_pending_state_when_creator_is_cancelled() {
+        let manager = Arc::new(TestManager {
+            healthy: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let pool = GenericPool::new(manager, PoolConfig::default(), Duration::from_secs(60));
+        let key = "backend.example.com|443|0".to_string();
+        let creator_started = Arc::new(Notify::new());
+        let creator_blocked = Arc::new(Notify::new());
+
+        let creator = {
+            let pool = pool.clone();
+            let key = key.clone();
+            let creator_started = creator_started.clone();
+            let creator_blocked = creator_blocked.clone();
+            tokio::spawn(async move {
+                pool.create_or_get_existing_owned(key, move |_key| {
+                    let creator_started = creator_started.clone();
+                    let creator_blocked = creator_blocked.clone();
+                    async move {
+                        creator_started.notify_waiters();
+                        creator_blocked.notified().await;
+                        Ok::<_, anyhow::Error>("creator-cancelled".to_string())
+                    }
+                })
+                .await
+            })
+        };
+
+        creator_started.notified().await;
+
+        let waiter = {
+            let pool = pool.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                pool.create_or_get_existing_owned(key, move |_key| async move {
+                    Ok::<_, anyhow::Error>("recovered-after-cancel".to_string())
+                })
+                .await
+                .unwrap()
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(pending) = pool.pending_creations.get(&key) {
+                    if Arc::strong_count(pending.value()) >= 3 {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiter should join the in-flight creation");
+
+        creator.abort();
+        assert!(creator.await.unwrap_err().is_cancelled());
+
+        let waiter_result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should be retried after creator cancellation")
+            .unwrap();
+        assert_eq!(waiter_result, "recovered-after-cancel");
+        assert!(pool.pending_creations.is_empty());
+        assert_eq!(pool.cached(&key).as_deref(), Some("recovered-after-cancel"));
     }
 
     #[tokio::test]
