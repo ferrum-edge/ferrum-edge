@@ -8811,14 +8811,48 @@ mod tests {
     use http::header::HeaderValue;
 
     #[test]
-    fn collect_response_headers_preserves_backend_forwarding_rules() {
+    fn collect_response_headers_filters_hop_by_hop_headers() {
+        let mut source = reqwest::header::HeaderMap::new();
+        source.insert("connection", HeaderValue::from_static("keep-alive"));
+        source.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+
+        let mut target = HashMap::new();
+        collect_response_headers(&source, &mut target);
+
+        assert!(!target.contains_key("connection"));
+        assert!(!target.contains_key("transfer-encoding"));
+    }
+
+    #[test]
+    fn collect_response_headers_joins_set_cookie_with_newlines() {
+        let mut source = reqwest::header::HeaderMap::new();
+        source.append("set-cookie", HeaderValue::from_static("session=a"));
+        source.append("set-cookie", HeaderValue::from_static("theme=dark"));
+
+        let mut target = HashMap::new();
+        collect_response_headers(&source, &mut target);
+
+        assert_eq!(
+            target.get("set-cookie").map(String::as_str),
+            Some("session=a\ntheme=dark")
+        );
+    }
+
+    #[test]
+    fn collect_response_headers_folds_non_cookie_headers_with_commas() {
         let mut source = reqwest::header::HeaderMap::new();
         source.append("x-test", HeaderValue::from_static("one"));
         source.append("x-test", HeaderValue::from_static("two"));
-        source.append("set-cookie", HeaderValue::from_static("session=a"));
-        source.append("set-cookie", HeaderValue::from_static("theme=dark"));
-        source.insert("connection", HeaderValue::from_static("keep-alive"));
-        source.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+
+        let mut target = HashMap::new();
+        collect_response_headers(&source, &mut target);
+
+        assert_eq!(target.get("x-test").map(String::as_str), Some("one, two"));
+    }
+
+    #[test]
+    fn collect_response_headers_skips_invalid_utf8_values() {
+        let mut source = reqwest::header::HeaderMap::new();
         source.insert(
             "x-non-utf8",
             HeaderValue::from_bytes(&[0x80, 0x81]).expect("valid raw header value"),
@@ -8827,13 +8861,6 @@ mod tests {
         let mut target = HashMap::new();
         collect_response_headers(&source, &mut target);
 
-        assert_eq!(target.get("x-test").map(String::as_str), Some("one, two"));
-        assert_eq!(
-            target.get("set-cookie").map(String::as_str),
-            Some("session=a\ntheme=dark")
-        );
-        assert!(!target.contains_key("connection"));
-        assert!(!target.contains_key("transfer-encoding"));
         assert!(!target.contains_key("x-non-utf8"));
     }
 
