@@ -3,7 +3,7 @@
 //! These tests mutate process-global environment variables, so they MUST run
 //! serially. We use the same ENV_LOCK pattern as env_config_tests.
 
-use ferrum_edge::secrets::resolve_secret;
+use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_secret};
 use std::io::Write;
 use std::sync::Mutex;
 use tempfile::NamedTempFile;
@@ -90,6 +90,31 @@ fn test_resolve_secret_both_env_and_file_errors() {
             let err = result.unwrap_err();
             assert!(err.contains("Multiple secret sources"));
             assert!(err.contains("FERRUM_TEST_SECRET_D"));
+        },
+    );
+}
+
+#[test]
+fn test_resolve_all_env_secrets_both_env_and_file_errors() {
+    let mut tmp = NamedTempFile::new().unwrap();
+    writeln!(tmp, "file-value").unwrap();
+    let path = tmp.path().to_str().unwrap().to_string();
+
+    with_env_vars_async(
+        &[
+            ("FERRUM_TEST_SECRET_STARTUP_CONFLICT", "env-value"),
+            ("FERRUM_TEST_SECRET_STARTUP_CONFLICT_FILE", &path),
+        ],
+        || async {
+            let result = resolve_all_env_secrets().await;
+            let err = match result {
+                Ok(_) => panic!("expected startup secret conflict to fail"),
+                Err(err) => err,
+            };
+            assert!(err.contains("Multiple secret sources"));
+            assert!(err.contains("FERRUM_TEST_SECRET_STARTUP_CONFLICT"));
+            assert!(err.contains("direct env var"));
+            assert!(err.contains("FERRUM_TEST_SECRET_STARTUP_CONFLICT_FILE"));
         },
     );
 }

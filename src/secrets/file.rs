@@ -8,6 +8,8 @@ use std::env;
 
 /// Check if the `{key}_FILE` env var is set and non-empty.
 /// Returns the file path if so.
+/// Used by the registry's single-key `resolve_secret()` path and its tests.
+#[allow(dead_code)]
 pub fn resolve_ref(key: &str) -> Option<String> {
     let file_key = format!("{}_FILE", key);
     env::var(&file_key).ok().filter(|s| !s.is_empty())

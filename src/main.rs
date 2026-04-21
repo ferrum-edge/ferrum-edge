@@ -45,7 +45,7 @@ mod tls_offload;
 use clap::Parser;
 use config::{EnvConfig, OperatingMode};
 use tracing::{Level, Metadata, error, info};
-use tracing_appender::non_blocking::NonBlocking;
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -97,9 +97,9 @@ impl<'a> MakeWriter<'a> for SeverityWriter {
 /// Startup sequence:
 /// 1. Parse CLI arguments (if any — no args falls through to legacy env-var mode)
 /// 2. Install rustls crypto provider (ring backend)
-/// 3. Initialize structured JSON logging
-/// 4. Resolve external secrets (Vault, AWS, Azure, GCP, env, file) using a
-///    single-threaded runtime — env var mutations are unsafe with multiple threads
+/// 3. Resolve external secrets (Vault, AWS, Azure, GCP, env, file) using a
+///    temporary runtime that is dropped before env mutation
+/// 4. Initialize structured JSON logging
 /// 5. Parse environment configuration (`EnvConfig::from_env()`)
 /// 6. Build the multi-threaded tokio runtime with configured worker/blocking threads
 /// 7. Dispatch to the appropriate operating mode (database, file, cp, dp, migrate)
@@ -172,38 +172,16 @@ fn main() {
     }
 }
 
-/// Runs logging init, secret resolution, env-config parsing, and the
-/// gateway runtime. Returns the process exit code.
-///
-/// All `tracing_appender::non_blocking::WorkerGuard`s are local here, so
-/// any path out of this function (early return on error or fall-through on
-/// success) runs their `Drop` impls and flushes any buffered events before
-/// `main()` calls `std::process::exit()`. This is the invariant that lets
-/// error-level events actually reach stderr instead of being abandoned in
-/// the non-blocking writer's channel at process termination.
-fn run_gateway(cli: &cli::Cli) -> i32 {
-    // Initialize tracing/logging with non-blocking writers. The default
-    // tracing-subscriber fmt layer writes synchronously, acquiring a mutex
-    // lock on every log event. Under high concurrency this creates contention
-    // across tokio worker threads. `tracing_appender::non_blocking` sends
-    // events through a channel to a dedicated writer thread, making the
-    // hot-path log call a fast channel send instead of a blocking I/O write.
-    //
-    // Two independent appenders are constructed so `SeverityWriter` can
-    // route `ERROR` events to stderr and everything else to stdout. The
-    // `_stdout_guard` / `_stderr_guard` bindings keep each worker thread
-    // alive for the duration of this function; they drop at function
-    // return (including the error-return branches below), which flushes
-    // remaining events to their respective sinks.
+fn init_logging() -> (WorkerGuard, WorkerGuard) {
     let log_buffer_capacity: usize =
         config::conf_file::resolve_ferrum_var("FERRUM_LOG_BUFFER_CAPACITY")
             .and_then(|v| v.parse().ok())
             .unwrap_or(128_000);
-    let (stdout_writer, _stdout_guard) =
+    let (stdout_writer, stdout_guard) =
         tracing_appender::non_blocking::NonBlockingBuilder::default()
             .buffered_lines_limit(log_buffer_capacity)
             .finish(std::io::stdout());
-    let (stderr_writer, _stderr_guard) =
+    let (stderr_writer, stderr_guard) =
         tracing_appender::non_blocking::NonBlockingBuilder::default()
             .buffered_lines_limit(log_buffer_capacity)
             .finish(std::io::stderr());
@@ -220,10 +198,26 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         })
         .init();
 
+    (stdout_guard, stderr_guard)
+}
+
+/// Runs startup secret resolution, logging init, env-config parsing, and the
+/// gateway runtime. Returns the process exit code.
+///
+/// All `tracing_appender::non_blocking::WorkerGuard`s are local here, so
+/// any path out of this function (early return on error or fall-through on
+/// success) runs their `Drop` impls and flushes any buffered events before
+/// `main()` calls `std::process::exit()`. This is the invariant that lets
+/// error-level events actually reach stderr instead of being abandoned in
+/// the non-blocking writer's channel at process termination. Normal startup
+/// resolves secrets before those logging threads exist so the temporary
+/// runtime can fully shut down before unsafe env mutation.
+fn run_gateway(cli: &cli::Cli) -> i32 {
     // Handle validate subcommand: load config, validate, exit.
     // Runs after crypto + logging init so TLS cert checks and tracing work,
     // but before secret resolution and the multi-threaded runtime.
     if matches!(&cli.command, Some(cli::Command::Validate(_))) {
+        let (_stdout_guard, _stderr_guard) = init_logging();
         match cli::execute_validate() {
             Ok(()) => return 0,
             Err(e) => {
@@ -233,46 +227,51 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         }
     }
 
-    info!(
-        "Ferrum Edge v{} ({}) starting...",
-        env!("CARGO_PKG_VERSION"),
-        env!("TARGET")
-    );
-
-    // Resolve secrets using a single-threaded runtime so that subsequent
-    // env var mutations are safe — no concurrent threads exist yet.
-    {
+    // Resolve secrets before initializing non-blocking logging so the
+    // temporary runtime can shut down completely before env mutation.
+    let resolved = {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("Failed to create secret resolution runtime");
 
         match rt.block_on(secrets::resolve_all_env_secrets()) {
-            Ok(resolved) => {
-                // SAFETY: The single-threaded tokio runtime above is the only
-                // runtime. No worker threads or concurrent env var readers exist.
-                // We set the resolved values and remove the suffixed source keys
-                // before any multi-threaded runtime starts.
-                unsafe {
-                    for (base_key, value) in &resolved.vars {
-                        std::env::set_var(base_key, value);
-                    }
-                    for suffixed_key in &resolved.source_keys_to_remove {
-                        std::env::remove_var(suffixed_key);
-                    }
-                }
-                if !resolved.vars.is_empty() {
-                    info!(
-                        "Resolved {} env var(s) from external secret sources",
-                        resolved.vars.len()
-                    );
-                }
-            }
+            Ok(resolved) => resolved,
             Err(e) => {
-                error!("Secret resolution error: {}", e);
+                eprintln!("Secret resolution error: {}", e);
                 return 1;
             }
         }
+    };
+
+    // SAFETY: Secret resolution completed before non-blocking logging or the
+    // main multi-threaded runtime were created, and the temporary runtime
+    // above has already been dropped. We mutate the environment before any
+    // later startup stage can spawn additional worker threads.
+    unsafe {
+        for (base_key, value) in &resolved.vars {
+            std::env::set_var(base_key, value);
+        }
+        for suffixed_key in &resolved.source_keys_to_remove {
+            std::env::remove_var(suffixed_key);
+        }
+    }
+
+    let (_stdout_guard, _stderr_guard) = init_logging();
+
+    info!(
+        "Ferrum Edge v{} ({}) starting...",
+        env!("CARGO_PKG_VERSION"),
+        env!("TARGET")
+    );
+    for (base_key, backend_name) in &resolved.loaded_sources {
+        info!("Loaded {} from {}", base_key, backend_name);
+    }
+    if !resolved.vars.is_empty() {
+        info!(
+            "Resolved {} env var(s) from external secret sources",
+            resolved.vars.len()
+        );
     }
 
     // Load environment config (now includes any resolved secrets)
