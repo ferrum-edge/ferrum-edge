@@ -200,6 +200,12 @@ impl<'a> ValidationPipeline<'a> {
         self
     }
 
+    /// Execute each validation step in insertion order.
+    ///
+    /// `Collect` steps append into the returned vector until a fatal action
+    /// (`FatalCount` or `FatalStatic`) fires. At that point the pipeline bails
+    /// immediately and any previously collected warnings/errors are discarded in
+    /// favor of the fatal summary, matching the original call-site behavior.
     pub(crate) fn run(self) -> Result<Vec<String>, anyhow::Error> {
         let ValidationPipeline { config, steps } = self;
         let mut collected_errors = Vec::new();
@@ -326,6 +332,10 @@ fn handle_validation_errors(
     errors: Vec<String>,
     collected_errors: &mut Vec<String>,
 ) -> Result<(), anyhow::Error> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+
     match action {
         ValidationAction::Collect => {
             collected_errors.extend(errors);
@@ -338,6 +348,10 @@ fn handle_validation_errors(
             Ok(())
         }
         ValidationAction::FatalCount(template) => {
+            debug_assert!(
+                template.contains("{}"),
+                "FatalCount template must include a '{{}}' placeholder"
+            );
             for message in &errors {
                 error!("{}", message);
             }
@@ -350,5 +364,90 @@ fn handle_validation_errors(
             }
             anyhow::bail!(summary.to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ValidationAction, handle_validation_errors};
+
+    #[test]
+    fn collect_action_accumulates_errors() {
+        let mut collected = vec!["existing".to_string()];
+
+        handle_validation_errors(
+            ValidationAction::Collect,
+            vec!["first".to_string(), "second".to_string()],
+            &mut collected,
+        )
+        .unwrap();
+
+        assert_eq!(collected, vec!["existing", "first", "second"]);
+    }
+
+    #[test]
+    fn warn_action_does_not_collect_or_fail() {
+        let mut collected = vec!["existing".to_string()];
+
+        handle_validation_errors(
+            ValidationAction::Warn,
+            vec!["warning".to_string()],
+            &mut collected,
+        )
+        .unwrap();
+
+        assert_eq!(collected, vec!["existing"]);
+    }
+
+    #[test]
+    fn fatal_count_action_formats_error_count() {
+        let mut collected = Vec::new();
+
+        let err = handle_validation_errors(
+            ValidationAction::FatalCount("Validation failed with {} errors"),
+            vec!["a".to_string(), "b".to_string()],
+            &mut collected,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Validation failed with 2 errors");
+        assert!(collected.is_empty());
+    }
+
+    #[test]
+    fn fatal_static_action_returns_verbatim_summary() {
+        let mut collected = Vec::new();
+
+        let err = handle_validation_errors(
+            ValidationAction::FatalStatic("Static summary"),
+            vec!["a".to_string()],
+            &mut collected,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Static summary");
+        assert!(collected.is_empty());
+    }
+
+    #[test]
+    fn empty_error_list_is_a_noop_for_all_actions() {
+        let mut collected = vec!["existing".to_string()];
+
+        handle_validation_errors(ValidationAction::Collect, Vec::new(), &mut collected).unwrap();
+        handle_validation_errors(ValidationAction::Warn, Vec::new(), &mut collected).unwrap();
+        handle_validation_errors(
+            ValidationAction::FatalCount("unused {}"),
+            Vec::new(),
+            &mut collected,
+        )
+        .unwrap();
+        handle_validation_errors(
+            ValidationAction::FatalStatic("unused"),
+            Vec::new(),
+            &mut collected,
+        )
+        .unwrap();
+
+        assert_eq!(collected, vec!["existing"]);
     }
 }
