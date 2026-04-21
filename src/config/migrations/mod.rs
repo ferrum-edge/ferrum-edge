@@ -1,3 +1,4 @@
+pub(crate) mod sql_dialect;
 pub mod v001_initial_schema;
 
 use chrono::Utc;
