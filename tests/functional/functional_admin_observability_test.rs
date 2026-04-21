@@ -67,7 +67,7 @@ fn file_config_yaml(backend_port: u16) -> String {
 proxies:
   - id: "slow-proxy"
     listen_path: "/slow"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -315,7 +315,7 @@ async fn test_namespaces_distinct_sorted() {
         let proxy = json!({
             "id": format!("obs-proxy-{ns}"),
             "listen_path": path,
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": 9999,
             "strip_listen_path": true,

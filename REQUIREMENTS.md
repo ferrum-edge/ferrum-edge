@@ -132,7 +132,7 @@ All operational parameters MUST be configurable via environment variables.
 
 This defines how the gateway processes requests on the Proxy Traffic listeners.
 
-*   **Protocol Handling:** MUST accept incoming HTTP/1.1 and HTTP/2 and HTTP/3 requests. MUST be capable of proxying requests to backend services using `http`, `https`, `ws` (WebSocket), `wss` (Secure WebSocket), and `grpc` (over HTTP/2), as specified in the matched `Proxy` resource's `backend_protocol`.
+*   **Protocol Handling:** MUST accept incoming HTTP/1.1 and HTTP/2 and HTTP/3 requests. MUST be capable of proxying requests to backend services using `http`, `https`, `ws` (WebSocket), `wss` (Secure WebSocket), and `grpc` (over HTTP/2), as specified in the matched `Proxy` resource's `backend_scheme`.
 *   **Routing Implementation:**
     *   MUST use **longest prefix matching** to select the appropriate `Proxy` resource. The matching is performed on the incoming request's URI path against the `Proxy.listen_path` values of all active Proxy resources.
     *   Given the requirement for unique `Proxy.listen_path` values, there will be at most one longest match.
@@ -180,7 +180,7 @@ Define Rust structs (using `serde` for serialization/deserialization) for the co
     *   `id`: Unique identifier (Type depends on storage: e.g., `i64` for DB ID, `String` for UUID).
     *   `name`: `Option<String>`.
     *   `listen_path`: `String`. **Value MUST be unique across all configured Proxy resources.** Used for longest prefix matching.
-    *   `backend_protocol`: Enum (`Http`, `Https`, `Ws`, `Wss`, `Grpc`).
+    *   `backend_scheme`: Enum (`Http`, `Https`, `Ws`, `Wss`, `Grpc`).
     *   `backend_host`: `String`.
     *   `backend_port`: `u16`.
     *   `backend_path`: `Option<String>`.

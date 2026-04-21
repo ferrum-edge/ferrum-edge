@@ -82,7 +82,7 @@ async fn functional_dns_cache_localhost_hostname() {
 proxies:
   - id: "localhost-proxy"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: {backend_port}
     strip_listen_path: false
@@ -132,14 +132,14 @@ async fn functional_dns_cache_unresolvable_hostname_is_isolated() {
 proxies:
   - id: "broken-dns-proxy"
     listen_path: "/broken"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "this-host-does-not-exist-k5k5k5k5k5.invalid"
     backend_port: 80
     strip_listen_path: false
 
   - id: "good-proxy"
     listen_path: "/good"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {good_port}
     strip_listen_path: false
@@ -205,7 +205,7 @@ async fn functional_dns_cache_per_proxy_ttl_override_accepted() {
 proxies:
   - id: "ttl-override-proxy"
     listen_path: "/ttl"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: {backend_port}
     dns_cache_ttl_seconds: 5
@@ -260,7 +260,7 @@ async fn functional_dns_cache_env_vars_accepted() {
 proxies:
   - id: "env-tuned-proxy"
     listen_path: "/env"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: {backend_port}
     strip_listen_path: false

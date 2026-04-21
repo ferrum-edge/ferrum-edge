@@ -11,7 +11,7 @@ proxies:
     # container to exit on startup with nothing visible to the bench
     # harness. Omit the field entirely.
     listen_port: 5001
-    backend_protocol: tcp_tls
+    backend_scheme: tcps
     backend_host: "127.0.0.1"
     backend_port: 3444
     frontend_tls: true
@@ -25,7 +25,7 @@ proxies:
   - id: "tcp-tls-e2e-health"
     name: "Health"
     listen_path: "/health"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 3010
     strip_listen_path: false

@@ -21,7 +21,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::ProxyState;
 
@@ -33,7 +33,9 @@ fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         name: Some(format!("gRPC Test Proxy {}", id)),
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
-        backend_protocol: BackendProtocol::Grpc,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "127.0.0.1".to_string(),
         backend_port,
         backend_path: None,

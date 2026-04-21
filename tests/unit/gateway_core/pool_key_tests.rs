@@ -8,7 +8,7 @@
 use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
-    AuthMode, BackendProtocol, BackendTlsConfig, Proxy, ResponseBodyMode,
+    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
 };
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -25,7 +25,9 @@ fn minimal_proxy() -> Proxy {
         name: None,
         hosts: vec![],
         listen_path: Some("/test".to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "backend.example.com".to_string(),
         backend_port: 8080,
         backend_path: None,
@@ -124,7 +126,7 @@ async fn connection_pool_key_direct_backend_format() {
         key.starts_with("d=backend.example.com:8080|"),
         "key should start with d= prefix: {key}"
     );
-    // BackendProtocol::Http = 0
+    // BackendScheme::Http = 0
     assert!(key.contains("|0|"), "key should contain protocol 0: {key}");
     // No DNS override, no CA, no mTLS, verify=true (1)
     assert!(
@@ -229,9 +231,9 @@ async fn connection_pool_key_pipe_delimiter_count() {
 async fn connection_pool_key_different_protocols_differ() {
     let pool = pool_with_defaults();
     let mut p1 = minimal_proxy();
-    p1.backend_protocol = BackendProtocol::Http;
+    p1.backend_scheme = Some(BackendScheme::Http);
     let mut p2 = minimal_proxy();
-    p2.backend_protocol = BackendProtocol::Https;
+    p2.backend_scheme = Some(BackendScheme::Https);
     assert_ne!(
         pool.pool_key_for_warmup(&p1),
         pool.pool_key_for_warmup(&p2),
@@ -478,9 +480,9 @@ fn h2_pool_key_no_protocol_field() {
     // H2 pool is always TLS, so there's no protocol field in the key
     // (unlike ConnectionPool which includes backend_protocol)
     let mut p1 = minimal_proxy();
-    p1.backend_protocol = BackendProtocol::Http;
+    p1.backend_scheme = Some(BackendScheme::Http);
     let mut p2 = minimal_proxy();
-    p2.backend_protocol = BackendProtocol::Https;
+    p2.backend_scheme = Some(BackendScheme::Https);
     assert_eq!(
         Http2ConnectionPool::pool_key_for_warmup(&p1),
         Http2ConnectionPool::pool_key_for_warmup(&p2),
@@ -773,9 +775,9 @@ fn h3_pool_key_pipe_delimiter_count() {
 fn h3_pool_key_no_protocol_field() {
     // H3 pool key does not include backend_protocol (always QUIC/TLS)
     let mut p1 = minimal_proxy();
-    p1.backend_protocol = BackendProtocol::Http;
+    p1.backend_scheme = Some(BackendScheme::Http);
     let mut p2 = minimal_proxy();
-    p2.backend_protocol = BackendProtocol::Https;
+    p2.backend_scheme = Some(BackendScheme::Https);
     assert_eq!(
         Http3ConnectionPool::pool_key(&p1, 0),
         Http3ConnectionPool::pool_key(&p2, 0),

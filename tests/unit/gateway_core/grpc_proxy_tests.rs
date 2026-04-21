@@ -1,5 +1,5 @@
 use chrono::Utc;
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, Proxy};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
 use ferrum_edge::proxy::build_backend_url;
 use ferrum_edge::proxy::grpc_proxy;
 
@@ -10,7 +10,9 @@ fn test_proxy() -> Proxy {
         name: Some("gRPC Test Proxy".into()),
         hosts: vec![],
         listen_path: Some("/grpc".to_string()),
-        backend_protocol: BackendProtocol::Grpc,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "grpc-backend.example.com".into(),
         backend_port: 50051,
         backend_path: None,
@@ -122,7 +124,8 @@ fn test_build_backend_url_grpc_uses_http_scheme() {
 #[test]
 fn test_build_backend_url_grpcs_uses_https_scheme() {
     let mut proxy = test_proxy();
-    proxy.backend_protocol = BackendProtocol::Grpcs;
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Https, false));
     let url = build_backend_url(
         &proxy,
         "/grpc/my.Service/MyMethod",
@@ -213,20 +216,18 @@ fn test_grpc_error_response_resource_exhausted() {
     assert_eq!(resp.headers().get("grpc-status").unwrap(), "8");
 }
 
-// --- BackendProtocol display and deserialization ---
+// --- BackendScheme display and deserialization ---
+//
+// Post-refactor, gRPC is no longer a backend_scheme — it is detected
+// per-request via the content-type header. A gRPC proxy is configured with
+// scheme `http` (plaintext) or `https` (TLS) and content-type routing picks
+// the gRPC dispatch path. The old `grpc`/`grpcs` scheme strings are only
+// accepted by the DB loader's `parse_scheme` for legacy DB migration.
 
 #[test]
-fn test_backend_protocol_grpcs_display() {
-    assert_eq!(BackendProtocol::Grpcs.to_string(), "grpcs");
-    assert_eq!(BackendProtocol::Grpc.to_string(), "grpc");
-}
-
-#[test]
-fn test_backend_protocol_grpcs_deserialize() {
-    let grpcs: BackendProtocol = serde_json::from_str("\"grpcs\"").unwrap();
-    assert_eq!(grpcs, BackendProtocol::Grpcs);
-    let grpc: BackendProtocol = serde_json::from_str("\"grpc\"").unwrap();
-    assert_eq!(grpc, BackendProtocol::Grpc);
+fn test_backend_scheme_display() {
+    assert_eq!(BackendScheme::Https.to_string(), "https");
+    assert_eq!(BackendScheme::Http.to_string(), "http");
 }
 
 // --- Response header capacity hint ---

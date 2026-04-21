@@ -2,7 +2,7 @@
 
 use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, Proxy};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 
@@ -13,7 +13,9 @@ fn create_test_proxy() -> Proxy {
         name: None,
         hosts: vec![],
         listen_path: Some("/test".to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "localhost".to_string(),
         backend_port: 3000,
         backend_path: None,
@@ -249,10 +251,10 @@ async fn test_different_protocols_produce_different_pool_keys() {
     );
 
     let mut proxy_http = create_test_proxy();
-    proxy_http.backend_protocol = BackendProtocol::Http;
+    proxy_http.backend_scheme = Some(BackendScheme::Http);
 
     let mut proxy_https = create_test_proxy();
-    proxy_https.backend_protocol = BackendProtocol::Https;
+    proxy_https.backend_scheme = Some(BackendScheme::Https);
 
     let _client1 = pool.get_client(&proxy_http).await.unwrap();
     let _client2 = pool.get_client(&proxy_https).await.unwrap();
@@ -363,7 +365,7 @@ async fn test_pool_websocket_protocol_creates_client() {
     );
 
     let mut proxy = create_test_proxy();
-    proxy.backend_protocol = BackendProtocol::Ws;
+    proxy.backend_scheme = Some(BackendScheme::Http);
 
     let client = pool.get_client(&proxy).await;
     assert!(

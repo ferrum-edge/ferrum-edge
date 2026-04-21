@@ -1,5 +1,5 @@
 use ferrum_edge::config::file_loader::{load_config_from_file, reload_config_from_file};
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, PluginScope};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, PluginScope};
 use std::io::Write;
 use tempfile::NamedTempFile;
 
@@ -13,7 +13,7 @@ fn test_load_yaml_config() {
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3000
 consumers: []
@@ -38,7 +38,7 @@ fn test_load_json_config() {
   "proxies": [{
     "id": "proxy-1",
     "listen_path": "/api/v1",
-    "backend_protocol": "http",
+    "backend_scheme": "http",
     "backend_host": "localhost",
     "backend_port": 3000
   }],
@@ -63,12 +63,12 @@ fn test_duplicate_listen_path_rejected() {
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3000
   - id: "proxy-2"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3001
 consumers: []
@@ -98,7 +98,7 @@ proxies:
   - id: "proxy-httpbin"
     name: "HTTPBin Proxy"
     listen_path: "/httpbin"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "httpbin.org"
     backend_port: 443
     strip_listen_path: true
@@ -116,7 +116,7 @@ proxies:
 
   - id: "proxy-multi-auth"
     listen_path: "/multi-auth"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3002
     auth_mode: multi
@@ -171,7 +171,7 @@ plugin_configs:
     assert_eq!(config.proxies.len(), 2);
     assert_eq!(config.proxies[0].id, "proxy-httpbin");
     assert_eq!(config.proxies[0].name, Some("HTTPBin Proxy".to_string()));
-    assert_eq!(config.proxies[0].backend_protocol, BackendProtocol::Https);
+    assert_eq!(config.proxies[0].backend_scheme, Some(BackendScheme::Https));
     assert_eq!(config.proxies[0].backend_port, 443);
     assert!(config.proxies[0].strip_listen_path);
     assert!(!config.proxies[0].preserve_host_header);
@@ -233,34 +233,36 @@ fn test_load_shared_example_config_fixture() {
 }
 
 // ============================================================================
-// Backend Protocol Tests
+// Backend Scheme Tests
 // ============================================================================
+//
+// After the BackendProtocol -> BackendScheme refactor, the wire format only
+// accepts canonical schemes (http, https, tcp, tcps, udp, dtls). Former
+// protocol values (ws, wss, grpc, grpcs) are detected per-request from the
+// incoming traffic (`HttpFlavor`). H3 is opt-in via `backend_prefer_h3`.
+// Serde rejects unknown enum values, so legacy aliases are no longer accepted
+// via file loading (the db_loader `parse_scheme` still tolerates them).
 
 #[test]
-fn test_all_backend_protocols() {
-    let protocols = vec![
-        ("http", BackendProtocol::Http),
-        ("https", BackendProtocol::Https),
-        ("ws", BackendProtocol::Ws),
-        ("wss", BackendProtocol::Wss),
-        ("grpc", BackendProtocol::Grpc),
-        ("grpcs", BackendProtocol::Grpcs),
-        ("h3", BackendProtocol::H3),
+fn test_all_backend_schemes() {
+    let schemes = vec![
+        ("http", BackendScheme::Http),
+        ("https", BackendScheme::Https),
     ];
 
-    for (protocol_str, expected) in protocols {
+    for (scheme_str, expected) in schemes {
         let yaml = format!(
             r#"
 proxies:
   - id: "test-proxy"
     listen_path: "/test"
-    backend_protocol: {}
+    backend_scheme: {}
     backend_host: "localhost"
     backend_port: 8080
 consumers: []
 plugin_configs: []
 "#,
-            protocol_str
+            scheme_str
         );
 
         let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
@@ -274,11 +276,44 @@ plugin_configs: []
         .unwrap();
 
         assert_eq!(
-            config.proxies[0].backend_protocol, expected,
-            "Failed to parse backend_protocol: {}",
-            protocol_str
+            config.proxies[0].backend_scheme,
+            Some(expected),
+            "Failed to parse backend_scheme: {}",
+            scheme_str
         );
     }
+}
+
+#[test]
+fn test_backend_prefer_h3_flag() {
+    let yaml = r#"
+proxies:
+  - id: "test-proxy"
+    listen_path: "/test"
+    backend_scheme: https
+    backend_prefer_h3: true
+    backend_host: "localhost"
+    backend_port: 8443
+consumers: []
+plugin_configs: []
+"#;
+
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
+    )
+    .unwrap();
+
+    assert_eq!(config.proxies[0].backend_scheme, Some(BackendScheme::Https));
+    assert!(config.proxies[0].backend_prefer_h3);
+    assert_eq!(
+        config.proxies[0].dispatch_kind,
+        DispatchKind::HttpsH3Preferred
+    );
 }
 
 // ============================================================================
@@ -291,7 +326,7 @@ fn test_auth_mode_single() {
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3000
     auth_mode: single
@@ -316,7 +351,7 @@ fn test_auth_mode_multi() {
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3000
     auth_mode: multi
@@ -341,7 +376,7 @@ fn test_auth_mode_defaults_to_single() {
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3000
 consumers: []
@@ -525,7 +560,7 @@ fn test_plugin_config_proxy_scope() {
 proxies:
   - id: "proxy-protected"
     listen_path: "/protected"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3000
 consumers: []
@@ -611,7 +646,7 @@ fn test_proxy_with_all_optional_fields() {
 proxies:
   - id: "proxy-full"
     listen_path: "/api"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "example.com"
     backend_port: 443
     name: "Full Featured Proxy"
@@ -674,7 +709,7 @@ fn test_proxy_minimal_optional_fields() {
 proxies:
   - id: "proxy-minimal"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 8080
 consumers: []
@@ -709,7 +744,7 @@ fn test_reload_config_from_file() {
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3000
 consumers: []
@@ -734,12 +769,12 @@ plugin_configs: []
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3000
   - id: "proxy-2"
     listen_path: "/api/v2"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3001
 consumers: []
@@ -781,7 +816,7 @@ fn test_malformed_yaml() {
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: invalid_port_number
 consumers: []
@@ -850,7 +885,7 @@ fn test_unknown_extension_fallback_to_yaml() {
 proxies:
   - id: "proxy-1"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3000
 consumers: []
@@ -874,7 +909,7 @@ fn test_unknown_extension_fallback_to_json() {
   "proxies": [{
     "id": "proxy-1",
     "listen_path": "/api/v1",
-    "backend_protocol": "http",
+    "backend_scheme": "http",
     "backend_host": "localhost",
     "backend_port": 3000
   }],
@@ -903,7 +938,7 @@ fn test_proxy_with_multiple_plugins() {
 proxies:
   - id: "proxy-1"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 8080
     plugins:
@@ -961,7 +996,7 @@ fn test_proxy_with_no_plugins() {
 proxies:
   - id: "proxy-1"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 8080
     plugins: []
@@ -998,13 +1033,13 @@ proxies:
   - id: "prod-proxy"
     namespace: "prod"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3001
   - id: "staging-proxy"
     namespace: "staging"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3002
 consumers: []
@@ -1036,13 +1071,13 @@ proxies:
   - id: "prod-a"
     namespace: "prod"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3001
   - id: "prod-b"
     namespace: "prod"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3002
 consumers: []
@@ -1074,13 +1109,13 @@ fn test_load_config_multi_namespace_shared_listen_port() {
 proxies:
   - id: "prod-tcp"
     namespace: "prod"
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: 3001
     listen_port: 15000
   - id: "staging-tcp"
     namespace: "staging"
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: 3002
     listen_port: 15000

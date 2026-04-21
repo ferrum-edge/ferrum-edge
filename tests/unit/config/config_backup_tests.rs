@@ -19,7 +19,7 @@ fn test_load_config_backup_valid_json() {
             "listen_path": "/api",
             "backend_host": "localhost",
             "backend_port": 3000,
-            "backend_protocol": "http"
+            "backend_scheme": "http"
         }],
         "consumers": [],
         "plugin_configs": [],
@@ -78,7 +78,7 @@ fn test_load_config_backup_stream_proxy_has_no_listen_path() {
             "name": "tcp-test",
             "backend_host": "10.0.0.1",
             "backend_port": 5432,
-            "backend_protocol": "tcp",
+            "backend_scheme": "tcp",
             "listen_port": 9999
         }],
         "consumers": [],
@@ -106,7 +106,7 @@ fn test_load_config_backup_preserves_multiple_resources() {
                 "listen_path": "/one",
                 "backend_host": "host1",
                 "backend_port": 3000,
-                "backend_protocol": "http"
+                "backend_scheme": "http"
             },
             {
                 "id": "p2",
@@ -114,7 +114,7 @@ fn test_load_config_backup_preserves_multiple_resources() {
                 "listen_path": "/two",
                 "backend_host": "host2",
                 "backend_port": 3001,
-                "backend_protocol": "http"
+                "backend_scheme": "http"
             }
         ],
         "consumers": [{

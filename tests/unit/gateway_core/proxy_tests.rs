@@ -1,5 +1,5 @@
 use chrono::Utc;
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::proxy::{build_backend_url, build_backend_url_with_target};
 use ferrum_edge::router_cache::RouterCache;
 
@@ -10,7 +10,9 @@ fn test_proxy() -> Proxy {
         name: Some("Test Proxy".into()),
         hosts: vec![],
         listen_path: Some("/api/v1".to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "backend.example.com".into(),
         backend_port: 3000,
         backend_path: None,

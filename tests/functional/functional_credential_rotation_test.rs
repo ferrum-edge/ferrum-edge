@@ -214,7 +214,7 @@ async fn create_proxy(
         .json(&json!({
             "id": id,
             "listen_path": listen_path,
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -269,7 +269,7 @@ async fn attach_plugins(
         .json(&json!({
             "id": proxy_id,
             "listen_path": listen_path,
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,

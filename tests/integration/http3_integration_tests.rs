@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use ferrum_edge::config::types::{BackendProtocol, GatewayConfig, Proxy};
+use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::config::{EnvConfig, PoolConfig};
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::DnsCache;
@@ -55,7 +55,9 @@ fn create_http3_test_proxy() -> Proxy {
         name: Some("HTTP/3 Test Proxy".to_string()),
         hosts: vec![],
         listen_path: Some("/http3-test".to_string()),
-        backend_protocol: BackendProtocol::H3,
+        backend_scheme: Some(BackendScheme::Https),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Https, false)),
         backend_host: "facebook.com".to_string(),
         backend_port: 443,
         backend_path: Some("/get".to_string()),
@@ -359,7 +361,7 @@ async fn test_http3_backend_connection() {
     }
 
     // Verify proxy configuration
-    assert_eq!(proxy.backend_protocol, BackendProtocol::H3);
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Https));
     assert_eq!(proxy.backend_host, "facebook.com");
     assert_eq!(proxy.backend_port, 443);
 
@@ -382,7 +384,7 @@ async fn test_http3_configuration_loading() {
 
     // Verify proxy configuration
     let proxy = &gateway_config.proxies[0];
-    assert_eq!(proxy.backend_protocol, BackendProtocol::H3);
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Https));
     assert_eq!(proxy.listen_path.as_deref(), Some("/http3-test"));
     assert_eq!(proxy.backend_host, "facebook.com");
 }
@@ -515,8 +517,8 @@ async fn test_http3_proxy_state_creation() {
     let current_config = proxy_state.config.load();
     assert_eq!(current_config.proxies.len(), 1);
     assert_eq!(
-        current_config.proxies[0].backend_protocol,
-        BackendProtocol::H3
+        current_config.proxies[0].backend_scheme,
+        Some(BackendScheme::Https)
     );
 }
 
@@ -559,25 +561,40 @@ async fn test_http3_environment_variables() {
     }
 }
 
-/// Test HTTP/3 protocol enum functionality
+/// Test HTTP/3 backend scheme functionality.
+///
+/// Post-refactor, H3 is not a scheme — an H3 proxy uses `BackendScheme::Https`
+/// plus `backend_prefer_h3: true`. This combination yields
+/// `DispatchKind::HttpsH3Preferred`. The wire format for the scheme field is
+/// plain "https"; the legacy "h3" string is only accepted by the DB loader's
+/// `parse_scheme()` for backward-compatible row parsing.
 #[tokio::test]
-async fn test_http3_protocol_enum() {
-    let protocol = BackendProtocol::H3;
+async fn test_http3_scheme_enum() {
+    let scheme = BackendScheme::Https;
 
-    // Test Display trait
-    assert_eq!(protocol.to_string(), "h3");
+    // Canonical Display
+    assert_eq!(scheme.to_string(), "https");
 
-    // Test PartialEq
-    assert_eq!(protocol, BackendProtocol::H3);
-    assert_ne!(protocol, BackendProtocol::Http);
-    assert_ne!(protocol, BackendProtocol::Https);
+    // PartialEq sanity
+    assert_eq!(scheme, BackendScheme::Https);
+    assert_ne!(scheme, BackendScheme::Http);
 
-    // Test serialization/deserialization (if serde is used)
-    let serialized = serde_json::to_string(&protocol).unwrap();
-    assert_eq!(serialized, "\"h3\"");
+    // Serde uses canonical "https"
+    let serialized = serde_json::to_string(&scheme).unwrap();
+    assert_eq!(serialized, "\"https\"");
 
-    let deserialized: BackendProtocol = serde_json::from_str(&serialized).unwrap();
-    assert_eq!(deserialized, BackendProtocol::H3);
+    let deserialized: BackendScheme = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(deserialized, BackendScheme::Https);
+
+    // DispatchKind from (Https, true) selects the H3-preferred dispatch path.
+    assert_eq!(
+        DispatchKind::from((BackendScheme::Https, true)),
+        DispatchKind::HttpsH3Preferred
+    );
+    assert_eq!(
+        DispatchKind::from((BackendScheme::Https, false)),
+        DispatchKind::HttpsPool
+    );
 }
 
 /// Test HTTP/3 configuration validation
@@ -732,8 +749,8 @@ async fn test_http3_full_integration() {
     let current_config = proxy_state.config.load();
     assert_eq!(current_config.proxies.len(), 1);
     assert_eq!(
-        current_config.proxies[0].backend_protocol,
-        BackendProtocol::H3
+        current_config.proxies[0].backend_scheme,
+        Some(BackendScheme::Https)
     );
 
     // Test HTTP/3 backend connection creation
@@ -774,7 +791,9 @@ async fn test_http3_streaming_decision_logic() {
         name: Some("H3 Streaming".to_string()),
         hosts: vec![],
         listen_path: Some("/h3-stream".to_string()),
-        backend_protocol: BackendProtocol::H3,
+        backend_scheme: Some(BackendScheme::Https),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Https, false)),
         backend_host: "localhost".to_string(),
         backend_port: 443,
         backend_path: None,

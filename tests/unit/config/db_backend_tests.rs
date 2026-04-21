@@ -88,7 +88,7 @@ fn extract_known_ids_with_data() {
         "id": "proxy-1",
         "name": "test-1",
         "listen_path": "/test1",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": 8080
     }))
@@ -97,7 +97,7 @@ fn extract_known_ids_with_data() {
         "id": "proxy-2",
         "name": "test-2",
         "listen_path": "/test2",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": 8081
     }))
@@ -164,7 +164,7 @@ fn incremental_result_not_empty_with_added_proxy() {
     let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(serde_json::json!({
         "id": "p1",
         "listen_path": "/api",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": 8080
     }))

@@ -137,7 +137,7 @@ proxies:
 ### Validation rules
 
 - HTTP-family proxies MUST set at least one of `hosts` or `listen_path`. A proxy with neither is rejected at admission (400 from the admin API, config load failure in file mode).
-- Stream proxies (`tcp`/`tcp_tls`/`udp`/`dtls`) MUST NOT set `listen_path` — they route on `listen_port` only. A populated `listen_path` is rejected.
+- Stream proxies (`tcp`/`tcps`/`udp`/`dtls`) MUST NOT set `listen_path` — they route on `listen_port` only. A populated `listen_path` is rejected.
 - Two host-only proxies whose `hosts` overlap are rejected (409 from admin API).
 
 ## Regex Path Routing

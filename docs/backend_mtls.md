@@ -78,7 +78,7 @@ You can also configure mTLS on a per-proxy basis in your configuration files:
 proxies:
   - id: "secure-api"
     listen_path: "/api"
-    backend_protocol: "https"
+    backend_scheme: "https"
     backend_host: "secure-backend.example.com"
     backend_port: 443
     # Proxy-specific mTLS configuration (overrides global)

@@ -716,7 +716,7 @@ impl RouterCache {
         for proxy in config
             .proxies
             .iter()
-            .filter(|p| !p.backend_protocol.is_stream_proxy())
+            .filter(|p| !p.dispatch_kind.is_stream())
         {
             let arc_proxy = Arc::new(proxy.clone());
 

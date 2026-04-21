@@ -13,10 +13,19 @@ use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
+
+// ALPN negotiation learning cache states. A single `AtomicU8` per pool key
+// records what the backend actually spoke after the first TLS handshake.
+// Using `fetch_max` for atomic writes means any concrete observation wins
+// over `Unknown`; once a backend has been seen to pick h1.1 we keep the
+// decision until the pool entry ages out (sweep by GenericPool cleanup).
+const ALPN_UNKNOWN: u8 = 0;
+const ALPN_IS_HTTP1: u8 = 1;
+const ALPN_IS_HTTP2: u8 = 2;
 
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
@@ -79,13 +88,54 @@ struct Http2PoolManager {
     tls_policy: Option<Arc<TlsPolicy>>,
     crls: crate::tls::CrlList,
     tls_configs: BackendTlsConfigCache,
+    /// Learning cache: pool-key → last-observed ALPN decision (0=Unknown,
+    /// 1=IsHttp1, 2=IsHttp2). Checked before the TLS handshake on subsequent
+    /// requests so a backend that negotiated h1.1 once is not retried through
+    /// this pool — saves one TLS handshake + one failed h2 attempt per miss.
+    /// The DashMap is bounded by the same churn as the connection pool it
+    /// mirrors; entries for stale pool keys are evicted in `remove_stale`.
+    alpn_cache: Arc<DashMap<String, AtomicU8>>,
 }
 
 impl Http2PoolManager {
+    /// Probe the ALPN learning cache for this proxy's pool key. Returns
+    /// early with `BackendSelectedHttp1` when we've previously observed
+    /// the backend negotiating h1.1 — the dispatcher falls back to reqwest
+    /// without touching the network. One `DashMap` read lock + one atomic
+    /// load on the hot path; ~40 ns per lookup.
+    fn alpn_shortcut(&self, proxy: &Proxy) -> Result<(), Http2PoolError> {
+        let key = pool_key_owned(proxy);
+        if let Some(entry) = self.alpn_cache.get(&key)
+            && entry.load(Ordering::Relaxed) == ALPN_IS_HTTP1
+        {
+            return Err(Http2PoolError::BackendSelectedHttp1 { pool_key: key });
+        }
+        Ok(())
+    }
+
+    /// Record the ALPN decision observed on a completed handshake. Writes
+    /// are `Relaxed` because ordering across requests doesn't matter — we
+    /// only need the observation to become visible eventually.
+    fn record_alpn(&self, pool_key: &str, decision: u8) {
+        if let Some(entry) = self.alpn_cache.get(pool_key) {
+            entry.store(decision, Ordering::Relaxed);
+            return;
+        }
+        self.alpn_cache
+            .entry(pool_key.to_owned())
+            .or_insert_with(|| AtomicU8::new(ALPN_UNKNOWN))
+            .store(decision, Ordering::Relaxed);
+    }
+
     async fn create_connection(
         &self,
         proxy: &Proxy,
     ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
+        // Fail fast if the ALPN learning cache has already marked this
+        // backend as h1.1-only. The dispatcher catches this variant and
+        // falls back to reqwest.
+        self.alpn_shortcut(proxy)?;
+
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
@@ -234,7 +284,14 @@ impl Http2PoolManager {
                     Http2PoolError::Internal { message, source }
                 })?;
 
-                tls_config.alpn_protocols = vec![b"h2".to_vec()];
+                // Advertise both `h2` and `http/1.1` — the backend picks.
+                // If it picks h2 we use this pool; if it picks http/1.1 the
+                // caller (create_tls_connection) observes the negotiated
+                // protocol after the handshake and returns
+                // `BackendSelectedHttp1` so the dispatcher can route via
+                // reqwest. Advertising only `h2` would fail the handshake
+                // against h1-only servers with no graceful recovery.
+                tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
                 Ok::<rustls::ClientConfig, Http2PoolError>(tls_config)
             })
     }
@@ -264,6 +321,20 @@ impl Http2PoolManager {
                 source: Some(BackendUnavailableSource::Tls(e)),
             }
         })?;
+
+        // Inspect negotiated ALPN. rustls 0.22+ exposes the chosen protocol
+        // on the client session; `get_ref().1` is the `ClientConnection`.
+        // If the backend picked http/1.1 (or advertised nothing), short-circuit
+        // rather than trying an h2 handshake that will fail anyway. Update
+        // the learning cache so future requests to this backend skip even
+        // the TCP connect attempt on this pool.
+        let pool_key = pool_key_owned(proxy);
+        let negotiated_is_h2 = matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2"));
+        if !negotiated_is_h2 {
+            self.record_alpn(&pool_key, ALPN_IS_HTTP1);
+            return Err(Http2PoolError::BackendSelectedHttp1 { pool_key });
+        }
+        self.record_alpn(&pool_key, ALPN_IS_HTTP2);
 
         let io = TokioIo::new(tls_stream);
         let builder = Self::build_h2_builder(pool_config);
@@ -347,12 +418,31 @@ impl Http2ConnectionPool {
             tls_policy,
             crls,
             tls_configs: BackendTlsConfigCache::new(),
+            alpn_cache: Arc::new(DashMap::new()),
         });
 
         Self {
             pool: GenericPool::new(manager, global_pool_config, cleanup_interval),
             rr_counters: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Cheap check (one DashMap read + one Relaxed atomic load, ~40ns) that
+    /// asks whether the ALPN learning cache has already observed the backend
+    /// pinned by `proxy` negotiating `http/1.1`. When `true`, the dispatcher
+    /// should skip the direct H2 pool entirely and route via reqwest — which
+    /// handles both h1.1 and h2 transparently via its own ALPN negotiation.
+    ///
+    /// Warmup probes at startup populate this cache so the first user request
+    /// doesn't have to pay the "learn the hard way" cost for an h1.1-only
+    /// backend.
+    pub fn is_known_http1_backend(&self, proxy: &Proxy) -> bool {
+        let key = pool_key_owned(proxy);
+        self.pool
+            .manager()
+            .alpn_cache
+            .get(&key)
+            .is_some_and(|entry| entry.load(Ordering::Relaxed) == ALPN_IS_HTTP1)
     }
 
     pub fn pool_size(&self) -> usize {
@@ -471,6 +561,14 @@ impl Http2ConnectionPool {
 pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorClass {
     use crate::retry::ErrorClass;
 
+    // 0. `BackendSelectedHttp1` is an intentional signal to the dispatcher
+    //    — the backend negotiated h1.1 via ALPN and the caller should route
+    //    via reqwest. Classify as ProtocolError so operators see this in
+    //    logs as a policy/config mismatch rather than a transient fault.
+    if matches!(err, Http2PoolError::BackendSelectedHttp1 { .. }) {
+        return ErrorClass::ProtocolError;
+    }
+
     // 1. Walk the typed source chain first — covers io::Error, hyper::Error,
     //    rustls::Error anywhere in the nested chain.
     if let Some(cls) = classify_typed_chain(err) {
@@ -510,9 +608,11 @@ pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorCla
     //    get a meaningful classification. Production paths always populate
     //    a source.
     let message = match err {
-        Http2PoolError::BackendUnavailable { message, .. } => message,
-        Http2PoolError::BackendTimeout { message, .. } => message,
-        Http2PoolError::Internal { message, .. } => message,
+        Http2PoolError::BackendUnavailable { message, .. } => message.as_str(),
+        Http2PoolError::BackendTimeout { message, .. } => message.as_str(),
+        Http2PoolError::Internal { message, .. } => message.as_str(),
+        // Already returned above — keep match exhaustive.
+        Http2PoolError::BackendSelectedHttp1 { .. } => return ErrorClass::ProtocolError,
     };
     let lower = message.to_ascii_lowercase();
 
@@ -547,6 +647,7 @@ pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorCla
             }
         }
         Http2PoolError::Internal { .. } => ErrorClass::ConnectionPoolError,
+        Http2PoolError::BackendSelectedHttp1 { .. } => ErrorClass::ProtocolError,
     }
 }
 
@@ -713,6 +814,13 @@ pub enum Http2PoolError {
         message: String,
         source: Option<InternalSource>,
     },
+    /// TLS ALPN negotiation picked `http/1.1` (or no protocol). The direct
+    /// HTTP/2 pool cannot speak to this backend — the caller should fall
+    /// back to the reqwest path, which handles both h1.1 and h2 via its
+    /// own ALPN negotiation. `pool_key` is returned so the caller can log
+    /// it and the pool can cache the negative result to short-circuit
+    /// future attempts to the same backend.
+    BackendSelectedHttp1 { pool_key: String },
 }
 
 /// Typed source for `Http2PoolError::BackendUnavailable` so classification can
@@ -799,6 +907,11 @@ impl std::fmt::Display for Http2PoolError {
             Self::BackendUnavailable { message, .. } => write!(f, "{}", message),
             Self::BackendTimeout { message, .. } => write!(f, "{}", message),
             Self::Internal { message, .. } => write!(f, "{}", message),
+            Self::BackendSelectedHttp1 { pool_key } => write!(
+                f,
+                "backend negotiated http/1.1 via ALPN (pool key: {}); falling back to reqwest",
+                pool_key
+            ),
         }
     }
 }
@@ -815,6 +928,7 @@ impl std::error::Error for Http2PoolError {
             Self::Internal { source, .. } => source
                 .as_ref()
                 .map(|s| s as &(dyn std::error::Error + 'static)),
+            Self::BackendSelectedHttp1 { .. } => None,
         }
     }
 }
@@ -827,6 +941,10 @@ impl Http2PoolError {
             Self::BackendUnavailable { message, .. } => message,
             Self::BackendTimeout { message, .. } => message,
             Self::Internal { message, .. } => message,
+            // Short static string — this error is a signal, not a user-facing
+            // message. The dispatching caller routes via reqwest on this
+            // variant rather than surfacing the message to clients.
+            Self::BackendSelectedHttp1 { .. } => "backend does not support http/2",
         }
     }
 }

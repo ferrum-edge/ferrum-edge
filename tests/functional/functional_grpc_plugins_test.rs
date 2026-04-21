@@ -248,7 +248,7 @@ fn write_method_router_allow_config(config_path: &std::path::Path, backend_port:
 proxies:
   - id: "grpc-router-proxy"
     listen_path: "/"
-    backend_protocol: grpc
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: false
@@ -283,7 +283,7 @@ fn write_method_router_deny_config(config_path: &std::path::Path, backend_port: 
 proxies:
   - id: "grpc-router-proxy"
     listen_path: "/"
-    backend_protocol: grpc
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: false
@@ -317,7 +317,7 @@ fn write_method_router_ratelimit_config(config_path: &std::path::Path, backend_p
 proxies:
   - id: "grpc-router-proxy"
     listen_path: "/"
-    backend_protocol: grpc
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: false
@@ -365,7 +365,7 @@ fn write_deadline_config(
 proxies:
   - id: "grpc-deadline-proxy"
     listen_path: "/"
-    backend_protocol: grpc
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: false
@@ -399,7 +399,7 @@ fn write_response_size_limit_config(config_path: &std::path::Path, backend_port:
 proxies:
   - id: "grpc-size-limit-proxy"
     listen_path: "/"
-    backend_protocol: grpc
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: false
@@ -877,7 +877,7 @@ async fn test_grpc_plugins_skip_non_grpc_requests() {
 proxies:
   - id: "http-proxy"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true

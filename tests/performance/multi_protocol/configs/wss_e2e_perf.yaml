@@ -6,7 +6,7 @@ proxies:
   - id: "wss-e2e-echo"
     name: "WSS E2E Echo"
     listen_path: "/ws"
-    backend_protocol: wss
+    backend_scheme: https
     backend_host: "127.0.0.1"
     backend_port: 3446
     strip_listen_path: true
@@ -21,7 +21,7 @@ proxies:
   - id: "wss-e2e-health"
     name: "WSS E2E Health"
     listen_path: "/health"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 3010
     strip_listen_path: false

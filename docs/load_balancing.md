@@ -54,7 +54,7 @@ Add an `upstreams` section to your configuration and reference it from a proxy v
 proxies:
   - id: "my-api"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "10.0.1.1"   # fallback if upstream not found
     backend_port: 8080
     strip_listen_path: true
@@ -574,7 +574,7 @@ When a request to a backend target fails, the retry system can automatically ret
 proxies:
   - id: "my-api"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "10.0.1.1"
     backend_port: 8080
     upstream_id: "api-servers"
@@ -611,7 +611,7 @@ The circuit breaker pattern prevents cascading failures by temporarily stopping 
 proxies:
   - id: "my-api"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "10.0.1.1"
     backend_port: 8080
     upstream_id: "api-servers"
@@ -660,7 +660,7 @@ This separation means you can configure the breaker to trip on connection errors
 proxies:
   - id: "api-proxy"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "10.0.1.1"
     backend_port: 8080
     strip_listen_path: true
@@ -681,7 +681,7 @@ proxies:
 
   - id: "static-proxy"
     listen_path: "/static"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "10.0.2.1"
     backend_port: 80
     strip_listen_path: true
@@ -857,7 +857,7 @@ Combine load balancing, health checks, retry, and circuit breaker for maximum re
 proxies:
   - id: "critical-api"
     listen_path: "/critical"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "10.0.1.1"
     backend_port: 8080
     upstream_id: "critical-pool"
@@ -904,14 +904,14 @@ Route different paths to different server pools:
 proxies:
   - id: "api-v1"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "10.0.1.1"
     backend_port: 8080
     upstream_id: "api-v1-pool"
 
   - id: "api-v2"
     listen_path: "/api/v2"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "10.0.2.1"
     backend_port: 8080
     upstream_id: "api-v2-pool"

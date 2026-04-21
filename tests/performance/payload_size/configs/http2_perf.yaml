@@ -5,7 +5,7 @@ proxies:
   - id: "h2-echo"
     name: "HTTP/2 Echo"
     listen_path: "/echo"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "127.0.0.1"
     backend_port: 4443
     strip_listen_path: false
@@ -28,7 +28,7 @@ proxies:
   - id: "h2-sse"
     name: "HTTP/2 SSE"
     listen_path: "/sse"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "127.0.0.1"
     backend_port: 4443
     strip_listen_path: false
@@ -49,7 +49,7 @@ proxies:
   - id: "h2-health"
     name: "Health Check"
     listen_path: "/health"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 4010
     strip_listen_path: false

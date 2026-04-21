@@ -16,8 +16,8 @@ use tonic::transport::{Certificate, Identity, Server};
 
 use ferrum_edge::config::db_loader::IncrementalResult;
 use ferrum_edge::config::types::{
-    AuthMode, BackendProtocol, Consumer, GatewayConfig, LoadBalancerAlgorithm, Proxy, Upstream,
-    UpstreamTarget,
+    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm, Proxy,
+    Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
@@ -39,7 +39,9 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         name: Some(format!("Test Proxy {}", id)),
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "localhost".to_string(),
         backend_port: 3000,
         backend_path: None,

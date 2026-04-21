@@ -77,7 +77,7 @@ async fn test_tcp_logging_sends_to_endpoint() {
 proxies:
   - id: "tcp-log-proxy"
     listen_path: "/tcp-log-test"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -146,7 +146,7 @@ async fn test_udp_logging_sends_to_endpoint() {
 proxies:
   - id: "udp-log-proxy"
     listen_path: "/udp-log-test"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true

@@ -139,7 +139,7 @@ async fn test_ai_prompt_shield_rejects_pii() {
 proxies:
   - id: "ai-proxy"
     listen_path: "/ai"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -230,7 +230,7 @@ async fn test_ai_prompt_shield_allows_clean_request() {
 proxies:
   - id: "ai-proxy"
     listen_path: "/ai"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -314,7 +314,7 @@ async fn test_ai_request_guard_rejects_disallowed_model() {
 proxies:
   - id: "ai-proxy"
     listen_path: "/ai"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -401,7 +401,7 @@ async fn test_ai_request_guard_rejects_excess_tokens() {
 proxies:
   - id: "ai-proxy"
     listen_path: "/ai"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -493,7 +493,7 @@ async fn test_ai_request_guard_allows_valid_request() {
 proxies:
   - id: "ai-proxy"
     listen_path: "/ai"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true

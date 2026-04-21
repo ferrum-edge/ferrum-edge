@@ -605,7 +605,7 @@ async fn test_crl_revoked_backend_cert_rejected() {
 proxies:
   - id: "crl-test"
     listen_path: "/api"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "localhost"
     backend_port: {bp}
     strip_listen_path: true
@@ -705,7 +705,7 @@ async fn test_crl_unrelated_issuer_allows_request() {
 proxies:
   - id: "crl-unrelated"
     listen_path: "/api"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "localhost"
     backend_port: {bp}
     strip_listen_path: true

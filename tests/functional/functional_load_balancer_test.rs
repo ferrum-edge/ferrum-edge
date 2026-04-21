@@ -310,7 +310,7 @@ async fn test_round_robin_load_balancing() {
 proxies:
   - id: "lb-proxy"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30001
     strip_listen_path: true
@@ -417,7 +417,7 @@ async fn test_weighted_round_robin_load_balancing() {
 proxies:
   - id: "lb-wrr-proxy"
     listen_path: "/wrr"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30011
     strip_listen_path: true
@@ -515,7 +515,7 @@ async fn test_consistent_hashing_load_balancing() {
 proxies:
   - id: "lb-hash-proxy"
     listen_path: "/hash"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30021
     strip_listen_path: true
@@ -604,7 +604,7 @@ async fn test_active_health_check_excludes_unhealthy() {
 proxies:
   - id: "lb-health-proxy"
     listen_path: "/health-test"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30031
     strip_listen_path: true
@@ -709,7 +709,7 @@ async fn test_passive_health_check_marks_unhealthy() {
 proxies:
   - id: "lb-passive-proxy"
     listen_path: "/passive"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30041
     strip_listen_path: true
@@ -821,7 +821,7 @@ async fn test_active_health_check_recovery() {
 proxies:
   - id: "lb-recovery-proxy"
     listen_path: "/recovery"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30051
     strip_listen_path: true
@@ -930,7 +930,7 @@ async fn test_config_reload_updates_upstream_targets() {
 proxies:
   - id: "lb-reload-proxy"
     listen_path: "/reload"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30061
     strip_listen_path: true
@@ -1002,7 +1002,7 @@ plugin_configs: []
 proxies:
   - id: "lb-reload-proxy"
     listen_path: "/reload"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30061
     strip_listen_path: true
@@ -1094,7 +1094,7 @@ async fn test_retry_selects_different_target() {
 proxies:
   - id: "lb-retry-proxy"
     listen_path: "/retry"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30171
     strip_listen_path: true
@@ -1189,7 +1189,7 @@ async fn test_all_unhealthy_fallback() {
 proxies:
   - id: "lb-fallback-proxy"
     listen_path: "/fallback"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30081
     strip_listen_path: true
@@ -1285,7 +1285,7 @@ async fn test_multiple_upstreams() {
 proxies:
   - id: "api-proxy"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30091
     strip_listen_path: true
@@ -1293,7 +1293,7 @@ proxies:
 
   - id: "static-proxy"
     listen_path: "/static"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30093
     strip_listen_path: true
@@ -1426,7 +1426,7 @@ async fn test_weighted_round_robin_three_targets() {
 proxies:
   - id: "lb-wrr3-proxy"
     listen_path: "/wrr3"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30101
     strip_listen_path: true
@@ -1531,7 +1531,7 @@ async fn test_combined_active_and_passive_health_checks() {
 proxies:
   - id: "lb-combined-proxy"
     listen_path: "/combined"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30111
     strip_listen_path: true
@@ -1647,7 +1647,7 @@ async fn test_unreachable_target_with_retry() {
 proxies:
   - id: "lb-unreachable-proxy"
     listen_path: "/unreachable"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30121
     strip_listen_path: true
@@ -1742,14 +1742,14 @@ async fn test_single_backend_and_load_balanced_coexist() {
 proxies:
   - id: "direct-proxy"
     listen_path: "/direct"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30131
     strip_listen_path: true
 
   - id: "lb-proxy"
     listen_path: "/balanced"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30131
     strip_listen_path: true
@@ -1902,7 +1902,7 @@ async fn test_least_connections_load_balancing() {
 proxies:
   - id: "lb-lc-proxy"
     listen_path: "/lc"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30201
     strip_listen_path: true
@@ -2025,7 +2025,7 @@ async fn test_random_load_balancing() {
 proxies:
   - id: "lb-rand-proxy"
     listen_path: "/rand"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30211
     strip_listen_path: true
@@ -2133,7 +2133,7 @@ async fn test_active_health_check_tcp_probe() {
 proxies:
   - id: "lb-tcp-probe-proxy"
     listen_path: "/tcp-probe"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30221
     strip_listen_path: true
@@ -2232,7 +2232,7 @@ async fn test_passive_health_check_recovery_timer() {
 proxies:
   - id: "lb-recovery-timer-proxy"
     listen_path: "/recovery-timer"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30231
     strip_listen_path: true
@@ -2374,7 +2374,7 @@ async fn test_active_health_check_custom_status_codes() {
 proxies:
   - id: "lb-custom-codes-proxy"
     listen_path: "/custom-codes"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 30241
     strip_listen_path: true

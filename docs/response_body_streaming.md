@@ -32,7 +32,7 @@ Streaming is the default because it provides better latency and memory character
 proxies:
   - id: "my-api"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "backend-service"
     backend_port: 3000
     response_body_mode: stream  # "stream" (default) or "buffer"
@@ -46,7 +46,7 @@ The field is optional. When omitted, it defaults to `stream`.
 {
   "id": "my-api",
   "listen_path": "/api",
-  "backend_protocol": "http",
+  "backend_scheme": "http",
   "backend_host": "backend-service",
   "backend_port": 3000,
   "response_body_mode": "buffer"
@@ -282,7 +282,7 @@ Use `response_body_mode: stream` (default) when:
 proxies:
   - id: "file-download"
     listen_path: "/files"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "storage-service"
     backend_port: 8080
     response_body_mode: stream  # default, shown for clarity
@@ -294,7 +294,7 @@ proxies:
 proxies:
   - id: "data-api"
     listen_path: "/data"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "data-service"
     backend_port: 3000
     response_body_mode: buffer  # required for body inspection plugins
@@ -309,7 +309,7 @@ proxies:
   # High-throughput proxy — stream for performance
   - id: "public-api"
     listen_path: "/api"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "api.example.com"
     backend_port: 443
     # response_body_mode defaults to stream
@@ -317,7 +317,7 @@ proxies:
   # Auth-protected proxy — buffer for response validation
   - id: "internal-api"
     listen_path: "/internal"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "internal-service"
     backend_port: 3000
     response_body_mode: buffer

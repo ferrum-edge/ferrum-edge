@@ -6,7 +6,7 @@ proxies:
   - id: "grpcs-e2e-bench"
     name: "gRPCs E2E Bench Service"
     listen_path: "/bench.BenchService"
-    backend_protocol: grpcs
+    backend_scheme: https
     backend_host: "127.0.0.1"
     backend_port: 50053
     strip_listen_path: false
@@ -32,7 +32,7 @@ proxies:
   - id: "grpcs-e2e-health"
     name: "gRPCs E2E Health"
     listen_path: "/health"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 3010
     strip_listen_path: false

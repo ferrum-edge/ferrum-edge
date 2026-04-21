@@ -34,20 +34,20 @@ pub struct ProxyBuilder {
 }
 
 impl ProxyBuilder {
-    /// Start a new HTTP proxy with `id`. Defaults: `backend_protocol=http`,
+    /// Start a new HTTP proxy with `id`. Defaults: `backend_scheme=http`,
     /// `strip_listen_path=true`. Callers must still set `listen_path` or at
     /// least one host (HTTP-family proxies need at least one) before
     /// `build()` — the builder does not enforce that.
     pub fn new(id: impl Into<String>) -> Self {
         let mut inner = Map::new();
         inner.insert("id".into(), Value::String(id.into()));
-        inner.insert("backend_protocol".into(), Value::String("http".into()));
+        inner.insert("backend_scheme".into(), Value::String("http".into()));
         inner.insert("strip_listen_path".into(), Value::Bool(true));
         Self { inner }
     }
 
-    /// Start a stream proxy. Caller must still set `backend_protocol`
-    /// (`tcp`, `tcp_tls`, `udp`, or `dtls`) via [`Self::backend_protocol`]
+    /// Start a stream proxy. Caller must still set `backend_scheme`
+    /// (`tcp`, `tcps`, `udp`, or `dtls`) via [`Self::backend_scheme`]
     /// and `listen_port` via [`Self::listen_port`].
     pub fn new_stream(id: impl Into<String>) -> Self {
         let mut inner = Map::new();
@@ -103,9 +103,22 @@ impl ProxyBuilder {
         self
     }
 
-    pub fn backend_protocol(mut self, protocol: impl Into<String>) -> Self {
+    /// Set the proxy's backend scheme (wire + TLS). Accepts a string literal
+    /// matching one of `http`, `https`, `tcp`, `tcps`, `udp`, `dtls`. The
+    /// builder omits the field when this method is not called — the gateway
+    /// then defaults HTTP-family proxies to `https` during normalization.
+    pub fn backend_scheme(mut self, scheme: impl Into<String>) -> Self {
         self.inner
-            .insert("backend_protocol".into(), Value::String(protocol.into()));
+            .insert("backend_scheme".into(), Value::String(scheme.into()));
+        self
+    }
+
+    /// Opt the proxy into preferring HTTP/3 to the backend. Only meaningful
+    /// when `backend_scheme == "https"`; validation rejects `true` with
+    /// other schemes.
+    pub fn backend_prefer_h3(mut self, prefer: bool) -> Self {
+        self.inner
+            .insert("backend_prefer_h3".into(), Value::Bool(prefer));
         self
     }
 
@@ -498,7 +511,7 @@ mod tests {
         assert_eq!(p["listen_path"], "/echo");
         assert_eq!(p["backend_host"], "127.0.0.1");
         assert_eq!(p["backend_port"], 8080);
-        assert_eq!(p["backend_protocol"], "http");
+        assert_eq!(p["backend_scheme"], "http");
         assert_eq!(p["strip_listen_path"], true);
     }
 
@@ -527,12 +540,12 @@ mod tests {
     #[test]
     fn stream_proxy_builder_no_listen_path() {
         let p = ProxyBuilder::new_stream("tcp-proxy")
-            .backend_protocol("tcp")
+            .backend_scheme("tcp")
             .listen_port(7000)
             .backend("127.0.0.1", 7100)
             .build();
         assert_eq!(p["listen_port"], 7000);
-        assert_eq!(p["backend_protocol"], "tcp");
+        assert_eq!(p["backend_scheme"], "tcp");
         assert!(p.get("listen_path").is_none());
     }
 

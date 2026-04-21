@@ -237,7 +237,7 @@ async fn run_crud_and_proxy_tests(
     let proxy_data = json!({
         "id": proxy_id,
         "listen_path": format!("/tls-test-{}", &test_id[..8]),
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": backend_port,
         "strip_listen_path": true,
@@ -386,7 +386,7 @@ async fn run_crud_and_proxy_tests(
     let updated_proxy = json!({
         "id": proxy_id,
         "listen_path": format!("/tls-test-{}", &test_id[..8]),
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": backend_port,
         "strip_listen_path": false,

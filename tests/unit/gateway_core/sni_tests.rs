@@ -121,7 +121,12 @@ fn make_proxy(id: &str, hosts: Vec<&str>) -> ferrum_edge::config::types::Proxy {
         name: None,
         hosts: hosts.into_iter().map(String::from).collect(),
         listen_path: None,
-        backend_protocol: ferrum_edge::config::types::BackendProtocol::Tcp,
+        backend_scheme: Some(ferrum_edge::config::types::BackendScheme::Tcp),
+        backend_prefer_h3: false,
+        dispatch_kind: ferrum_edge::config::types::DispatchKind::from((
+            ferrum_edge::config::types::BackendScheme::Tcp,
+            false,
+        )),
         backend_host: "localhost".into(),
         backend_port: 443,
         backend_path: None,

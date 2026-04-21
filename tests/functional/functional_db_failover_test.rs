@@ -209,7 +209,7 @@ async fn test_db_failover_urls_startup() {
             .json(&json!({
                 "id": "failover-proxy",
                 "listen_path": "/failover",
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "127.0.0.1",
                 "backend_port": 9999,
                 "strip_listen_path": true,
@@ -285,7 +285,7 @@ async fn test_db_config_backup_bootstrap() {
             "proxies": [{
                 "id": "boot",
                 "listen_path": "/boot",
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "127.0.0.1",
                 "backend_port": backend_port,
                 "strip_listen_path": true,
@@ -521,7 +521,7 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
             .json(&json!({
                 "id": "recovery-proxy",
                 "listen_path": "/recovered",
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "127.0.0.1",
                 "backend_port": 9999,
                 "strip_listen_path": true,
@@ -641,7 +641,7 @@ async fn test_db_read_replica_startup() {
             .json(&json!({
                 "id": "replica-test-proxy",
                 "listen_path": "/replica-test",
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "127.0.0.1",
                 "backend_port": 9999,
                 "strip_listen_path": true,

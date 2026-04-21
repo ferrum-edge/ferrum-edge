@@ -63,7 +63,7 @@ async fn test_admin_backup_and_restore() {
     let proxy = json!({
         "id": "backup-proxy-1",
         "listen_path": "/backup-test",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": 9999,
         "strip_listen_path": true,
@@ -212,7 +212,7 @@ async fn test_admin_batch_create() {
             {
                 "id": "batch-proxy-1",
                 "listen_path": "/batch-1",
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": 9001,
                 "strip_listen_path": true,
@@ -220,7 +220,7 @@ async fn test_admin_batch_create() {
             {
                 "id": "batch-proxy-2",
                 "listen_path": "/batch-2",
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": 9002,
                 "strip_listen_path": true,
@@ -228,7 +228,7 @@ async fn test_admin_batch_create() {
             {
                 "id": "batch-proxy-3",
                 "listen_path": "/batch-3",
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": 9003,
                 "strip_listen_path": true,
@@ -431,7 +431,7 @@ async fn test_admin_plugin_config_crud() {
         .json(&json!({
             "id": "plugin-crud-proxy",
             "listen_path": "/plugin-crud",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": 9999,
         }))
@@ -583,7 +583,7 @@ async fn test_admin_proxy_listing_pagination() {
             .json(&json!({
                 "id": format!("page-proxy-{}", i),
                 "listen_path": format!("/page-{}", i),
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": 9000 + i,
             }))

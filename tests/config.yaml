@@ -6,7 +6,7 @@ proxies:
   - id: "proxy-httpbin"
     name: "HTTPBin Proxy"
     listen_path: "/httpbin"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "httpbin.org"
     backend_port: 443
     strip_listen_path: true
@@ -32,7 +32,7 @@ proxies:
   - id: "proxy-jsonplaceholder"
     name: "JSONPlaceholder API"
     listen_path: "/jsonapi"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "jsonplaceholder.typicode.com"
     backend_port: 443
     strip_listen_path: true
@@ -46,7 +46,7 @@ proxies:
   - id: "proxy-websocket"
     name: "WebSocket Echo Test"
     listen_path: "/ws-echo"
-    backend_protocol: ws
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 8080
     strip_listen_path: true
@@ -63,7 +63,7 @@ proxies:
   - id: "proxy-websocket-secure"
     name: "Secure WebSocket Echo Test"
     listen_path: "/wss-echo"
-    backend_protocol: wss
+    backend_scheme: https
     backend_host: "localhost"
     backend_port: 8443
     strip_listen_path: true
@@ -79,7 +79,7 @@ proxies:
   - id: "proxy-protected"
     name: "Protected API"
     listen_path: "/protected"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3001
     strip_listen_path: true
@@ -98,7 +98,7 @@ proxies:
   - id: "proxy-multi-auth"
     name: "Multi-Auth API"
     listen_path: "/multi-auth"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 3002
     strip_listen_path: true

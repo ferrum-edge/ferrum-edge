@@ -1,6 +1,6 @@
 //! Tests for access_control plugin
 
-use ferrum_edge::config::types::{BackendProtocol, Consumer};
+use ferrum_edge::config::types::{BackendScheme, Consumer};
 use ferrum_edge::plugins::{Plugin, access_control::AccessControl};
 use serde_json::json;
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ fn create_stream_context(
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("TCP Proxy".to_string()),
         listen_port: 5432,
-        backend_protocol: BackendProtocol::Tcp,
+        backend_scheme: BackendScheme::Tcp,
         consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
         identified_consumer: consumer,
         authenticated_identity: None,

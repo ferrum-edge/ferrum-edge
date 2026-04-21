@@ -3,7 +3,7 @@
 //! Verifies that each plugin correctly declares which proxy protocols
 //! it supports via the `supported_protocols()` trait method.
 
-use ferrum_edge::config::types::BackendProtocol;
+use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, HTTP_FAMILY_AND_STREAM_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS,
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
@@ -245,7 +245,7 @@ async fn test_ip_restriction_stream_connect_allowed() {
         proxy_id: "test-proxy".to_string(),
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 5432,
-        backend_protocol: BackendProtocol::Tcp,
+        backend_scheme: BackendScheme::Tcp,
         consumer_index: empty_consumer_index(),
         identified_consumer: None,
         authenticated_identity: None,
@@ -272,7 +272,7 @@ async fn test_ip_restriction_stream_connect_denied() {
         proxy_id: "test-proxy".to_string(),
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 5432,
-        backend_protocol: BackendProtocol::Tcp,
+        backend_scheme: BackendScheme::Tcp,
         consumer_index: empty_consumer_index(),
         identified_consumer: None,
         authenticated_identity: None,
@@ -300,7 +300,7 @@ fn make_stream_ctx() -> StreamConnectionContext {
         proxy_id: "test-proxy".to_string(),
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 5432,
-        backend_protocol: BackendProtocol::Tcp,
+        backend_scheme: BackendScheme::Tcp,
         consumer_index: empty_consumer_index(),
         identified_consumer: None,
         authenticated_identity: None,

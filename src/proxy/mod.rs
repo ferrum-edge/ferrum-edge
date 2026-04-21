@@ -66,7 +66,8 @@ use tracing::{debug, error, info, trace, warn};
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::PoolConfig;
 use crate::config::types::{
-    AuthMode, BackendProtocol, GatewayConfig, Proxy, ResponseBodyMode, UpstreamTarget,
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpFlavor, Proxy, ResponseBodyMode,
+    UpstreamTarget,
 };
 use crate::connection_pool::ConnectionPool;
 use crate::consumer_index::ConsumerIndex;
@@ -111,7 +112,7 @@ fn warn_if_h3_backend_tls_policy_incompatible(
     let h3_proxy_ids: Vec<&str> = config
         .proxies
         .iter()
-        .filter(|proxy| proxy.backend_protocol == BackendProtocol::H3)
+        .filter(|proxy| proxy.dispatch_kind == DispatchKind::HttpsH3Preferred)
         .map(|proxy| proxy.id.as_str())
         .collect();
     if h3_proxy_ids.is_empty() {
@@ -161,6 +162,7 @@ pub fn is_h2_websocket_connect<B>(req: &Request<B>) -> bool {
             .is_some_and(|p| p.as_ref().eq_ignore_ascii_case(b"websocket"))
 }
 
+#[allow(dead_code)]
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
     let headers = req.headers();
     let connection = headers.get("connection").and_then(|v| v.to_str().ok());
@@ -944,12 +946,12 @@ impl ProxyState {
         let config = self.config.load_full();
         let concurrency = self.env_config.pool_warmup_concurrency;
 
-        // Build a deduplication set for per-host pools (gRPC, H2, H3) keyed by
-        // the same pool key the pool itself uses, preventing redundant warmups.
-        let mut seen_reqwest = HashSet::new();
-        let mut seen_grpc = HashSet::new();
-        let mut seen_h2 = HashSet::new();
-        let mut seen_h3 = HashSet::new();
+        // Build a deduplication set for per-host pools (H2, H3) keyed by the
+        // same pool key the pool itself uses, preventing redundant warmups.
+        // gRPC is omitted — that pool warms lazily on first gRPC request.
+        let mut seen_reqwest: HashSet<String> = HashSet::new();
+        let mut seen_h2: HashSet<String> = HashSet::new();
+        let mut seen_h3: HashSet<String> = HashSet::new();
 
         // Collect all warmup tasks as boxed futures.
         let mut tasks: Vec<WarmupTask> = Vec::new();
@@ -963,17 +965,17 @@ impl ProxyState {
 
         for proxy in &config.proxies {
             // Skip stream proxies — no persistent connection pools
-            if proxy.backend_protocol.is_stream_proxy() {
+            if proxy.dispatch_kind.is_stream() {
                 continue;
             }
 
-            match proxy.backend_protocol {
-                // ── reqwest pool (HTTP/1.1, HTTPS, WS, WSS) ──
-                // Also covers HTTPS when H2 direct pool is not eligible.
-                BackendProtocol::Http
-                | BackendProtocol::Https
-                | BackendProtocol::Ws
-                | BackendProtocol::Wss => {
+            match proxy.dispatch_kind {
+                // All HTTP-family kinds warm the reqwest pool, which covers
+                // HTTP/1.1 and HTTP/2 over ALPN, plaintext and TLS, plus
+                // WebSocket (wss/ws) — flavor is detected per-request.
+                DispatchKind::HttpPool
+                | DispatchKind::HttpsPool
+                | DispatchKind::HttpsH3Preferred => {
                     self.collect_reqwest_warmup_tasks(
                         proxy,
                         &upstream_map,
@@ -981,8 +983,13 @@ impl ProxyState {
                         &mut tasks,
                     );
 
-                    // If HTTPS with enable_http2, also warm the direct H2 pool
-                    if matches!(proxy.backend_protocol, BackendProtocol::Https) {
+                    // HTTPS-family kinds may go through the direct H2 pool
+                    // when ALPN negotiates `h2` — warm it too. Plaintext HTTP
+                    // stays reqwest-only (no h2c prior-knowledge pre-warmup).
+                    if matches!(
+                        proxy.dispatch_kind,
+                        DispatchKind::HttpsPool | DispatchKind::HttpsH3Preferred
+                    ) {
                         let pool_config =
                             self.connection_pool.global_pool_config().for_proxy(proxy);
                         if pool_config.enable_http2 {
@@ -994,26 +1001,33 @@ impl ProxyState {
                             );
                         }
                     }
+
+                    // Pre-warm the H3 pool only when the operator opted in
+                    // via `backend_prefer_h3`. H3 backends are not universal
+                    // and probing them eagerly wastes QUIC handshakes.
+                    if proxy.dispatch_kind == DispatchKind::HttpsH3Preferred {
+                        self.collect_h3_warmup_tasks(
+                            proxy,
+                            &upstream_map,
+                            &mut seen_h3,
+                            &mut tasks,
+                        );
+                    }
                 }
 
-                // ── gRPC pool (Grpc/Grpcs) ──
-                BackendProtocol::Grpc | BackendProtocol::Grpcs => {
-                    self.collect_grpc_warmup_tasks(
-                        proxy,
-                        &upstream_map,
-                        &mut seen_grpc,
-                        &mut tasks,
-                    );
-                }
-
-                // ── HTTP/3 pool ──
-                BackendProtocol::H3 => {
-                    self.collect_h3_warmup_tasks(proxy, &upstream_map, &mut seen_h3, &mut tasks);
-                }
-
-                // Stream protocols already filtered above
-                _ => {}
+                // Stream kinds already filtered above — exhaustive match for
+                // type-system verification.
+                DispatchKind::TcpRaw
+                | DispatchKind::TcpTls
+                | DispatchKind::UdpRaw
+                | DispatchKind::UdpDtls => {}
             }
+
+            // The gRPC pool is intentionally NOT pre-warmed. gRPC is a
+            // runtime-detected flavor (content-type), so we can't know at
+            // startup which proxies will serve it. The gRPC pool warms lazily
+            // on the first gRPC request — acceptable because the pool's
+            // own TLS handshake sharing keeps repeat warmup cost low.
         }
 
         if tasks.is_empty() {
@@ -1080,8 +1094,12 @@ impl ProxyState {
         seen: &mut std::collections::HashSet<String>,
         tasks: &mut Vec<WarmupTask>,
     ) {
-        let scheme = match proxy.backend_protocol {
-            BackendProtocol::Http | BackendProtocol::Ws => "http",
+        // URL scheme for warmup probe. HTTP family resolves via backend_scheme
+        // (plaintext vs TLS); flavor (gRPC/WebSocket) doesn't affect the
+        // warmup probe. Stream-family proxies don't reach this helper
+        // (the caller filters them out).
+        let scheme = match proxy.backend_scheme {
+            Some(BackendScheme::Http) => "http",
             _ => "https",
         };
 
@@ -1145,6 +1163,11 @@ impl ProxyState {
     }
 
     /// Collect gRPC pool warmup tasks for a proxy, expanding upstream targets.
+    /// Currently unused — gRPC is a runtime-detected flavor post-refactor, so
+    /// the pool warms lazily on first gRPC request rather than at startup.
+    /// Retained for potential future use if we decide to eagerly warm the
+    /// gRPC pool based on e.g. per-proxy hints.
+    #[allow(dead_code)]
     fn collect_grpc_warmup_tasks(
         &self,
         proxy: &Proxy,
@@ -1334,6 +1357,9 @@ impl ProxyState {
 
         // Resolve upstream TLS into each proxy's resolved_tls before applying.
         new_config.resolve_upstream_tls();
+        // Pre-compute each proxy's dispatch_kind for O(1) hot-path dispatch.
+        // Must run before any request reads proxy.dispatch_kind.
+        new_config.resolve_dispatch_kind();
 
         // Validate stream proxy port conflicts before applying any config.
         // In DP mode, warn but don't reject — the DP doesn't control its config
@@ -1570,7 +1596,7 @@ impl ProxyState {
             .added_proxies
             .iter()
             .chain(delta.modified_proxies.iter())
-            .any(|p| p.backend_protocol.is_stream_proxy())
+            .any(|p| p.dispatch_kind.is_stream())
             || !delta.removed_proxy_ids.is_empty();
         if stream_proxies_changed {
             let slm = self.stream_listener_manager.clone();
@@ -1959,9 +1985,10 @@ impl ProxyState {
         let removed_had_stream = if !delta.removed_proxy_ids.is_empty() {
             let removed_set: std::collections::HashSet<&str> =
                 delta.removed_proxy_ids.iter().map(|s| s.as_str()).collect();
-            old_config.proxies.iter().any(|p| {
-                removed_set.contains(p.id.as_str()) && p.backend_protocol.is_stream_proxy()
-            })
+            old_config
+                .proxies
+                .iter()
+                .any(|p| removed_set.contains(p.id.as_str()) && p.dispatch_kind.is_stream())
         } else {
             false
         };
@@ -1969,7 +1996,7 @@ impl ProxyState {
             .added_proxies
             .iter()
             .chain(delta.modified_proxies.iter())
-            .any(|p| p.backend_protocol.is_stream_proxy())
+            .any(|p| p.dispatch_kind.is_stream())
             || removed_had_stream;
         if stream_proxies_changed {
             let failures = self.stream_listener_manager.reconcile().await;
@@ -2655,10 +2682,12 @@ fn build_websocket_backend_url_with_target(
 ) -> String {
     use std::fmt::Write;
 
-    let scheme = match proxy.backend_protocol {
-        BackendProtocol::Ws => "ws",
-        BackendProtocol::Wss => "wss",
-        _ => "ws", // fallback, should not happen
+    // WebSocket URL scheme: TLS intent comes from `backend_scheme`; the
+    // `ws` vs `wss` prefix is purely a function of whether the backend
+    // connection is encrypted.
+    let scheme = match proxy.backend_scheme {
+        Some(BackendScheme::Http) => "ws",
+        _ => "wss",
     };
 
     // Host-only proxies (listen_path == None) have no prefix to strip —
@@ -2730,8 +2759,11 @@ fn build_websocket_tls_connector(
     tls_policy: Option<&TlsPolicy>,
     crls: &crate::tls::CrlList,
 ) -> Result<Option<tokio_tungstenite::Connector>, anyhow::Error> {
-    // Only build a TLS connector for wss:// backends
-    if proxy.backend_protocol != BackendProtocol::Wss {
+    // Only build a TLS connector when the backend scheme is TLS — a plaintext
+    // `ws://` upgrade needs no TLS. WebSocket is a runtime flavor, so the
+    // caller has already filtered to WebSocket requests; here we only decide
+    // encrypted vs plaintext.
+    if !matches!(proxy.backend_scheme, Some(BackendScheme::Https)) {
         return Ok(None);
     }
 
@@ -4664,24 +4696,18 @@ async fn handle_proxy_request_inner(
         return Ok(build_response_from_normalized_reject(reject));
     }
 
-    // Detect request protocol early so we fetch only plugins that support it.
-    // WebSocket and gRPC are detected from headers; everything else is plain HTTP.
+    // Detect request flavor purely from the incoming traffic. WebSocket and
+    // gRPC are no longer pinned by the proxy's scheme — a single `Https`
+    // backend serves all three flavors depending on the request. This is
+    // the decoupling that lets an H3 client hit an H1/H2 backend through
+    // the same proxy config. The `detect_http_flavor` helper is shared with
+    // the H3 frontend so both paths classify requests identically.
     let is_h2_ws = is_h2_websocket_connect(&req);
-    let request_protocol = if (is_websocket_upgrade(&req) || is_h2_ws)
-        && matches!(
-            proxy.backend_protocol,
-            BackendProtocol::Ws | BackendProtocol::Wss
-        ) {
-        ProxyProtocol::WebSocket
-    } else if request_uses_grpc_content_type
-        && matches!(
-            proxy.backend_protocol,
-            BackendProtocol::Grpc | BackendProtocol::Grpcs
-        )
-    {
-        ProxyProtocol::Grpc
-    } else {
-        ProxyProtocol::Http
+    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    let request_protocol = match flavor {
+        HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
+        HttpFlavor::Grpc => ProxyProtocol::Grpc,
+        HttpFlavor::Plain => ProxyProtocol::Http,
     };
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
 
@@ -5047,14 +5073,12 @@ async fn handle_proxy_request_inner(
             }
         };
 
-    // Check if this is a WebSocket upgrade request and the proxy supports WebSocket
-    // This check happens AFTER authentication and authorization plugins have run
-    if request_protocol == ProxyProtocol::WebSocket
-        && matches!(
-            proxy.backend_protocol,
-            BackendProtocol::Ws | BackendProtocol::Wss
-        )
-    {
+    // Check if this is a WebSocket upgrade request. WebSocket is a runtime
+    // flavor in the new scheme-decoupled model — any HTTP-family proxy
+    // (plaintext `http` or TLS `https`) can serve WebSocket upgrades; the
+    // backend wire protocol is `ws://` or `wss://` depending on scheme.
+    // Stream proxies never reach here (the handler only runs for HTTP).
+    if request_protocol == ProxyProtocol::WebSocket && proxy.dispatch_kind.is_http_family() {
         // Cross-Site WebSocket Hijacking (CSWSH) protection per RFC 6455 §10.2.
         // When allowed_ws_origins is non-empty, reject upgrades from unlisted origins.
         if !proxy.allowed_ws_origins.is_empty() {
@@ -5108,13 +5132,11 @@ async fn handle_proxy_request_inner(
         .await;
     }
 
-    // Check if this is a gRPC request and the proxy supports gRPC
-    if is_grpc_request
-        && matches!(
-            proxy.backend_protocol,
-            BackendProtocol::Grpc | BackendProtocol::Grpcs
-        )
-    {
+    // Check if this is a gRPC request. Like WebSocket, gRPC is a runtime
+    // flavor — any HTTP-family proxy can serve gRPC when the client sends
+    // the right content-type. The gRPC pool uses h2c (plaintext HTTP/2) for
+    // `BackendScheme::Http` and TLS+ALPN=h2 for `BackendScheme::Https`.
+    if is_grpc_request && proxy.dispatch_kind.is_http_family() {
         let (grpc_effective_host, grpc_effective_port) = if let Some(ref target) = upstream_target {
             (target.host.as_str(), target.port)
         } else {
@@ -6104,7 +6126,7 @@ async fn handle_proxy_request_inner(
             // the body was never sent, so replaying is correct and safe.
             // The final retry attempt uses streaming if configured.
             let is_last_attempt = attempt >= retry_config.max_retries;
-            result = if matches!(proxy.backend_protocol, BackendProtocol::H3) {
+            result = if proxy.dispatch_kind == DispatchKind::HttpsH3Preferred {
                 proxy_to_backend_http3_retry(
                     &state,
                     &proxy,
@@ -6689,15 +6711,15 @@ pub fn build_backend_url_with_target(
 ) -> String {
     use std::fmt::Write;
 
-    let scheme = match proxy.backend_protocol {
-        BackendProtocol::Http | BackendProtocol::Ws | BackendProtocol::Grpc => "http",
-        BackendProtocol::Https
-        | BackendProtocol::Wss
-        | BackendProtocol::H3
-        | BackendProtocol::Grpcs => "https",
-        // Stream proxies (TCP/UDP) don't use HTTP URL building, but provide a sensible default
-        BackendProtocol::Tcp | BackendProtocol::Udp => "http",
-        BackendProtocol::TcpTls | BackendProtocol::Dtls => "https",
+    // URL scheme is a function of TLS-vs-plaintext only. gRPC and WebSocket
+    // use the same `http`/`https` wire scheme — the flavor only changes the
+    // request's content-type / Upgrade header, not the URL scheme. Stream
+    // kinds never reach this builder but we fall through safely for them.
+    let scheme = match proxy.dispatch_kind {
+        DispatchKind::HttpPool => "http",
+        DispatchKind::HttpsPool | DispatchKind::HttpsH3Preferred => "https",
+        DispatchKind::TcpRaw | DispatchKind::UdpRaw => "http",
+        DispatchKind::TcpTls | DispatchKind::UdpDtls => "https",
     };
 
     let remaining_path = if proxy.strip_listen_path {
@@ -7050,8 +7072,12 @@ async fn proxy_to_backend(
         .ok()
         .map(|ip| ip.to_string());
 
-    // Handle HTTP/3 backend requests — streaming when possible, buffered for retries.
-    if matches!(proxy.backend_protocol, BackendProtocol::H3) {
+    // H3 is attempted only when the operator explicitly opted in via
+    // `backend_prefer_h3: true` on an Https proxy. This is the decoupling
+    // from the old dispatch — H3 is now a transport preference, not a
+    // flavor. gRPC and WebSocket dispatch earlier in this function and
+    // never reach this block, so only Plain-flavor requests can enter.
+    if proxy.dispatch_kind == DispatchKind::HttpsH3Preferred {
         let (mut backend_resp, body_bytes) = proxy_to_backend_http3(
             state,
             proxy,
@@ -7081,17 +7107,25 @@ async fn proxy_to_backend(
         return (resp, body_bytes);
     }
 
-    // Use HTTP/2 multiplexing pool for HTTPS backends with H2 enabled,
+    // Use HTTP/2 multiplexing pool for TLS HTTP-family backends with H2 enabled,
     // but only when body retention is NOT required (i.e., no retries configured).
     // When retries are configured, we fall through to the reqwest path which
     // auto-negotiates HTTP/2 via ALPN on TLS and supports body replay natively.
-    if matches!(proxy.backend_protocol, BackendProtocol::Https) {
+    // The direct H2 pool advertises both `h2` and `http/1.1` in ALPN. The
+    // learning cache (`is_known_http1_backend`) short-circuits backends that
+    // have been observed to pick h1.1, so we don't waste a TLS handshake on a
+    // backend the pool cannot serve.
+    if matches!(
+        proxy.dispatch_kind,
+        DispatchKind::HttpsPool | DispatchKind::HttpsH3Preferred
+    ) {
         let pool_config = state.connection_pool.global_pool_config().for_proxy(proxy);
         if can_use_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
-        ) {
+        ) && !state.http2_pool.is_known_http1_backend(proxy)
+        {
             let request = match client_request_body {
                 ClientRequestBody::Streaming(request) => *request,
                 ClientRequestBody::Buffered(_) => {

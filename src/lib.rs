@@ -42,7 +42,9 @@ pub mod startup;
 pub mod tls;
 pub mod tls_offload;
 
-pub use config::types::{AuthMode, BackendProtocol, BackendTlsConfig, GatewayConfig, Proxy};
+pub use config::types::{
+    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor, Proxy,
+};
 pub use consumer_index::ConsumerIndex;
 pub use load_balancer::LoadBalancerCache;
 pub use plugin_cache::{PluginCache, PluginCapabilities};
@@ -61,7 +63,7 @@ pub mod _test_support {
 
     use hyper::StatusCode;
 
-    use crate::config::types::{AuthMode, BackendProtocol};
+    use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
@@ -185,8 +187,8 @@ pub mod _test_support {
         crate::config::db_loader::diff_removed(known, current)
     }
 
-    pub fn parse_protocol(s: &str) -> BackendProtocol {
-        crate::config::db_loader::parse_protocol(s)
+    pub fn parse_scheme(s: &str) -> BackendScheme {
+        crate::config::db_loader::parse_scheme(s)
     }
 
     pub fn parse_auth_mode(s: &str) -> AuthMode {

@@ -4,7 +4,7 @@
 //! to the backend via per-client sessions. Backend replies are forwarded back
 //! to the original client address. Sessions are cleaned up after an idle timeout.
 //!
-//! **Backend DTLS**: When `backend_protocol` is `Dtls`, backend connections are
+//! **Backend DTLS**: When `backend_scheme` is `Dtls`, backend connections are
 //! wrapped with DTLS 1.2/1.3 encryption using the `dimpl` crate. The proxy TLS
 //! settings (`backend_tls_verify_server_cert`, etc.) control the DTLS handshake.
 //!
@@ -23,7 +23,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
-use crate::config::types::{BackendProtocol, GatewayConfig, Proxy};
+use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
@@ -51,7 +51,7 @@ pub struct UdpProxyMetrics {
 struct UdpSession {
     /// Plain UDP backend socket. `None` when using DTLS (traffic goes through `dtls_conn`).
     backend_socket: Option<Arc<UdpSocket>>,
-    /// DTLS connection wrapping the backend socket (set when `backend_protocol == Dtls`).
+    /// DTLS connection wrapping the backend socket (set when `backend_scheme == Dtls`).
     dtls_conn: Option<Arc<crate::dtls::DtlsConnection>>,
     last_activity: AtomicU64, // epoch millis
     created_at: AtomicU64,    // epoch millis
@@ -92,7 +92,7 @@ struct UdpDisconnectContext<'a> {
     proxy_name: Option<&'a str>,
     client_addr: SocketAddr,
     session: &'a UdpSession,
-    backend_protocol: BackendProtocol,
+    backend_scheme: BackendScheme,
     listen_port: u16,
     disconnected_ms: u64,
     connection_error: Option<String>,
@@ -124,7 +124,7 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         consumer_username: context.session.consumer_username.clone(),
         backend_target: context.session.backend_target.clone(),
         backend_resolved_ip: Some(context.session.backend_resolved_ip.clone()),
-        protocol: context.backend_protocol.to_string(),
+        protocol: context.backend_scheme.to_string(),
         listen_port: context.listen_port,
         duration_ms: context.disconnected_ms.saturating_sub(created_ms) as f64,
         bytes_sent: context.session.bytes_sent.load(Ordering::Relaxed),
@@ -162,7 +162,7 @@ struct DtlsDisconnectContext<'a> {
     consumer_username: Option<String>,
     backend_target: &'a str,
     backend_resolved_ip: Option<&'a str>,
-    backend_protocol: BackendProtocol,
+    backend_scheme: BackendScheme,
     listen_port: u16,
     connected_at: chrono::DateTime<chrono::Utc>,
     disconnected_at: chrono::DateTime<chrono::Utc>,
@@ -184,7 +184,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         consumer_username: context.consumer_username,
         backend_target: context.backend_target.to_string(),
         backend_resolved_ip: context.backend_resolved_ip.map(str::to_string),
-        protocol: context.backend_protocol.to_string(),
+        protocol: context.backend_scheme.to_string(),
         listen_port: context.listen_port,
         duration_ms: (context.disconnected_at - context.connected_at).num_milliseconds() as f64,
         bytes_sent: context.bytes_sent,
@@ -494,17 +494,17 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     // Pre-resolve plugins and proxy metadata for this listener.
     let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Udp);
     let has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
-    let (proxy_name, proxy_namespace, backend_protocol) = {
+    let (proxy_name, proxy_namespace, backend_scheme) = {
         let current = config.load();
         current
             .proxies
             .iter()
             .find(|p| p.id == proxy_id)
-            .map(|p| (p.name.clone(), p.namespace.clone(), p.backend_protocol))
+            .map(|p| (p.name.clone(), p.namespace.clone(), p.effective_scheme()))
             .unwrap_or((
                 None,
                 crate::config::types::default_namespace(),
-                BackendProtocol::Udp,
+                BackendScheme::Udp,
             ))
     };
 
@@ -530,7 +530,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         plugins.clone(),
         proxy_name.clone(),
         proxy_namespace.clone(),
-        backend_protocol,
+        backend_scheme,
         port,
     );
 
@@ -626,7 +626,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &plugins,
                                                     proxy_name.as_deref(),
                                                     &proxy_namespace,
-                                                    backend_protocol,
+                                                    backend_scheme,
                                                     port,
                                                     &circuit_breaker_cache,
                                                     &consumer_index,
@@ -669,7 +669,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &plugins,
                                         proxy_name.as_deref(),
                                         &proxy_namespace,
-                                        backend_protocol,
+                                        backend_scheme,
                                         port,
                                         &circuit_breaker_cache,
                                         &consumer_index,
@@ -749,7 +749,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &plugins,
                     proxy_name.as_deref(),
                     &proxy_namespace,
-                    backend_protocol,
+                    backend_scheme,
                     port,
                     &circuit_breaker_cache,
                     &consumer_index,
@@ -820,7 +820,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &plugins,
                                                     proxy_name.as_deref(),
                                                     &proxy_namespace,
-                                                    backend_protocol,
+                                                    backend_scheme,
                                                     port,
                                                     &circuit_breaker_cache,
                                                     &consumer_index,
@@ -863,7 +863,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &plugins,
                                         proxy_name.as_deref(),
                                         &proxy_namespace,
-                                        backend_protocol,
+                                        backend_scheme,
                                         port,
                                         &circuit_breaker_cache,
                                         &consumer_index,
@@ -912,7 +912,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     &plugins,
                                     proxy_name.as_deref(),
                                     &proxy_namespace,
-                                    backend_protocol,
+                                    backend_scheme,
                                     port,
                                     &circuit_breaker_cache,
                                     &consumer_index,
@@ -973,7 +973,7 @@ async fn process_datagram(
     plugins: &[Arc<dyn Plugin>],
     proxy_name: Option<&str>,
     proxy_namespace: &str,
-    backend_protocol: BackendProtocol,
+    backend_scheme: BackendScheme,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
     consumer_index: &Arc<ConsumerIndex>,
@@ -1024,7 +1024,7 @@ async fn process_datagram(
                 plugins,
                 proxy_name,
                 proxy_namespace,
-                backend_protocol,
+                backend_scheme,
                 listen_port,
                 circuit_breaker_cache,
                 consumer_index,
@@ -1051,7 +1051,7 @@ async fn process_datagram(
             plugins,
             proxy_name,
             proxy_namespace,
-            backend_protocol,
+            backend_scheme,
             listen_port,
             circuit_breaker_cache,
             consumer_index,
@@ -1121,7 +1121,7 @@ async fn lookup_or_create_session(
     plugins: &[Arc<dyn Plugin>],
     proxy_name: Option<&str>,
     proxy_namespace: &str,
-    backend_protocol: BackendProtocol,
+    backend_scheme: BackendScheme,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
     consumer_index: &Arc<ConsumerIndex>,
@@ -1160,7 +1160,7 @@ async fn lookup_or_create_session(
         plugins,
         proxy_name,
         proxy_namespace,
-        backend_protocol,
+        backend_scheme,
         listen_port,
         circuit_breaker_cache,
         consumer_index,
@@ -1193,7 +1193,7 @@ fn spawn_session_cleanup(
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     proxy_name: Option<String>,
     proxy_namespace: String,
-    backend_protocol: BackendProtocol,
+    backend_scheme: BackendScheme,
     listen_port: u16,
 ) {
     let idle_timeout_ms = idle_timeout_seconds * 1000;
@@ -1239,7 +1239,7 @@ fn spawn_session_cleanup(
                                     proxy_name: proxy_name.as_deref(),
                                     client_addr: *addr,
                                     session: &session,
-                                    backend_protocol,
+                                    backend_scheme,
                                     listen_port,
                                     disconnected_ms: now,
                                     connection_error: None,
@@ -1296,17 +1296,17 @@ async fn start_dtls_frontend_listener(
     // Pre-resolve plugins and proxy metadata for this listener.
     let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Udp);
     let has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
-    let (proxy_name, proxy_namespace, backend_protocol) = {
+    let (proxy_name, proxy_namespace, backend_scheme) = {
         let current = config.load();
         current
             .proxies
             .iter()
             .find(|p| p.id == proxy_id)
-            .map(|p| (p.name.clone(), p.namespace.clone(), p.backend_protocol))
+            .map(|p| (p.name.clone(), p.namespace.clone(), p.effective_scheme()))
             .unwrap_or((
                 None,
                 crate::config::types::default_namespace(),
-                BackendProtocol::Dtls,
+                BackendScheme::Dtls,
             ))
     };
 
@@ -1358,7 +1358,7 @@ async fn start_dtls_frontend_listener(
                     proxy_id: proxy_id.clone(),
                     proxy_name: proxy_name.clone(),
                     listen_port: port,
-                    backend_protocol,
+                    backend_scheme,
                     consumer_index: consumer_index.clone(),
                     identified_consumer: None,
                     authenticated_identity: None,
@@ -1464,7 +1464,7 @@ async fn start_dtls_frontend_listener(
                             consumer_username: handler_consumer_username.clone(),
                             backend_target: &result.backend.backend_target,
                             backend_resolved_ip: result.backend.backend_resolved_ip.as_deref(),
-                            backend_protocol,
+                            backend_scheme,
                             listen_port: port,
                             connected_at,
                             disconnected_at,
@@ -1694,7 +1694,7 @@ async fn handle_dtls_client_inner(
     // DNS succeeded — record the resolved IP for logging.
     backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
 
-    // Create backend connection — plain UDP or DTLS depending on backend_protocol.
+    // Create backend connection — plain UDP or DTLS depending on backend_scheme.
     // Frontend DTLS termination can forward to either plain UDP or DTLS backends.
     // Bind ephemeral socket to the correct address family matching the backend.
     let ephemeral_bind: &str = if backend_addr.is_ipv6() {
@@ -1705,7 +1705,7 @@ async fn handle_dtls_client_inner(
     let (backend_udp, backend_dtls): (
         Option<Arc<UdpSocket>>,
         Option<Arc<crate::dtls::DtlsConnection>>,
-    ) = if proxy.backend_protocol == BackendProtocol::Dtls {
+    ) = if proxy.effective_scheme() == BackendScheme::Dtls {
         let socket = match UdpSocket::bind(ephemeral_bind).await {
             Ok(s) => s,
             Err(e) => {
@@ -2019,7 +2019,7 @@ async fn create_session(
     plugins: &[Arc<dyn Plugin>],
     proxy_name: Option<&str>,
     proxy_namespace: &str,
-    backend_protocol: BackendProtocol,
+    backend_scheme: BackendScheme,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
     consumer_index: &Arc<ConsumerIndex>,
@@ -2073,7 +2073,7 @@ async fn create_session(
         proxy_id: proxy_id.to_string(),
         proxy_name: proxy_name.map(|s| s.to_string()),
         listen_port,
-        backend_protocol,
+        backend_scheme,
         consumer_index: consumer_index.clone(),
         identified_consumer: None,
         authenticated_identity: None,
@@ -2155,7 +2155,7 @@ async fn create_session(
         "0.0.0.0:0"
     };
     let (backend_socket, dtls_conn) =
-        if proxy.backend_protocol == BackendProtocol::Dtls && !is_passthrough {
+        if proxy.effective_scheme() == BackendScheme::Dtls && !is_passthrough {
             // DTLS: create a connected socket and perform DTLS handshake via dimpl.
             let socket = match UdpSocket::bind(ephemeral_bind).await {
                 Ok(s) => s,
@@ -2290,7 +2290,7 @@ async fn create_session(
     let reply_plugins = plugins.to_vec();
     let reply_proxy_name = proxy_name.map(str::to_string);
     let reply_proxy_namespace = proxy_namespace.to_string();
-    let reply_backend_protocol = backend_protocol;
+    let reply_backend_scheme = backend_scheme;
     let reply_amplification_factor = proxy.udp_max_response_amplification_factor;
     let reply_adaptive_buffer = adaptive_buffer.clone();
     let reply_has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
@@ -2623,7 +2623,7 @@ async fn create_session(
                                             proxy_name: reply_proxy_name.as_deref(),
                                             client_addr,
                                             session: &reply_session,
-                                            backend_protocol: reply_backend_protocol,
+                                            backend_scheme: reply_backend_scheme,
                                             listen_port: reply_listen_port,
                                             disconnected_ms: now,
                                             connection_error: Some(error_message.clone()),
@@ -2767,7 +2767,7 @@ async fn create_session(
                     proxy_name: reply_proxy_name.as_deref(),
                     client_addr,
                     session: &reply_session,
-                    backend_protocol: reply_backend_protocol,
+                    backend_scheme: reply_backend_scheme,
                     listen_port: reply_listen_port,
                     disconnected_ms,
                     connection_error,
@@ -2844,7 +2844,7 @@ mod tests {
         UdpSession, build_dtls_stream_summary, build_udp_stream_summary,
         emit_udp_stream_disconnect,
     };
-    use crate::config::types::BackendProtocol;
+    use crate::config::types::BackendScheme;
     use crate::plugins::{Plugin, StreamTransactionSummary};
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -2890,7 +2890,7 @@ mod tests {
             consumer_username: Some("alice".to_string()),
             backend_target: "10.0.0.60:7443",
             backend_resolved_ip: Some("10.0.0.60"),
-            backend_protocol: BackendProtocol::Dtls,
+            backend_scheme: BackendScheme::Dtls,
             listen_port: 7443,
             connected_at,
             disconnected_at,
@@ -2955,7 +2955,7 @@ mod tests {
             proxy_name: Some("UDP Proxy"),
             client_addr,
             session: &session,
-            backend_protocol: BackendProtocol::Udp,
+            backend_scheme: BackendScheme::Udp,
             listen_port: 5353,
             disconnected_ms: 1_710_000_001_500,
             connection_error: Some("connection reset by peer".to_string()),
@@ -3016,7 +3016,7 @@ mod tests {
                 proxy_name: Some("UDP Proxy"),
                 client_addr,
                 session: &session,
-                backend_protocol: BackendProtocol::Dtls,
+                backend_scheme: BackendScheme::Dtls,
                 listen_port: 7443,
                 disconnected_ms: 1_710_000_002_000,
                 connection_error: Some(STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED.to_string()),

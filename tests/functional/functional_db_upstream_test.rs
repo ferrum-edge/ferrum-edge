@@ -112,7 +112,7 @@ async fn test_database_mode_upstream_load_balancing() {
     let proxy_data = json!({
         "id": "lb-proxy-db",
         "listen_path": "/lb-api",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "127.0.0.1",
         "backend_port": s1.port,
         "strip_listen_path": true,
@@ -209,7 +209,7 @@ async fn test_database_mode_upstream_load_balancing() {
     let updated_proxy_data = json!({
         "id": "lb-proxy-db",
         "listen_path": "/lb-api",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "127.0.0.1",
         "backend_port": s1.port,
         "strip_listen_path": true,

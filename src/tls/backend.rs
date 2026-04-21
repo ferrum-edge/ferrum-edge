@@ -316,7 +316,7 @@ mod tests {
     use rustls::client::danger::ServerCertVerifier;
     use tempfile::TempDir;
 
-    use crate::config::types::{AuthMode, BackendProtocol, BackendTlsConfig, Proxy};
+    use crate::config::types::{AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy};
 
     static INIT_CRYPTO: Once = Once::new();
 
@@ -429,7 +429,9 @@ mod tests {
             namespace: "ferrum".to_string(),
             hosts: vec!["example.com".to_string()],
             listen_path: Some("/".to_string()),
-            backend_protocol: BackendProtocol::Https,
+            backend_scheme: Some(BackendScheme::Https),
+            backend_prefer_h3: false,
+            dispatch_kind: DispatchKind::from((BackendScheme::Https, false)),
             backend_host: "localhost".to_string(),
             backend_port: 443,
             backend_path: None,

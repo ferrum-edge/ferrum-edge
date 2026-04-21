@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use ferrum_edge::config::PoolConfig;
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, Proxy};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::http2_pool::{Http2ConnectionPool, Http2PoolError};
 use http_body_util::Full;
@@ -30,7 +30,9 @@ fn create_test_proxy() -> Proxy {
         name: None,
         hosts: vec![],
         listen_path: Some("/h2test".to_string()),
-        backend_protocol: BackendProtocol::Https,
+        backend_scheme: Some(BackendScheme::Https),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Https, false)),
         backend_host: "localhost".to_string(),
         backend_port: 3000,
         backend_path: None,
@@ -199,6 +201,12 @@ async fn test_http2_pool_backend_unavailable() {
                 msg
             );
         }
+        Http2PoolError::BackendSelectedHttp1 { pool_key } => {
+            panic!(
+                "Expected BackendUnavailable or BackendTimeout, got BackendSelectedHttp1 for pool_key: {}",
+                pool_key
+            );
+        }
     }
     assert_eq!(
         pool.pool_size(),
@@ -234,6 +242,12 @@ async fn test_http2_pool_backend_timeout() {
         }
         Http2PoolError::Internal { message: msg, .. } => {
             panic!("Expected BackendTimeout, got Internal: {}", msg);
+        }
+        Http2PoolError::BackendSelectedHttp1 { pool_key } => {
+            panic!(
+                "Expected BackendTimeout, got BackendSelectedHttp1 for pool_key: {}",
+                pool_key
+            );
         }
     }
 }

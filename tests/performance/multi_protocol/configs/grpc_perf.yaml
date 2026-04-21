@@ -5,7 +5,7 @@ proxies:
   - id: "grpc-bench"
     name: "gRPC Bench Service"
     listen_path: "/bench.BenchService"
-    backend_protocol: grpc
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 50052
     strip_listen_path: false
@@ -28,7 +28,7 @@ proxies:
   - id: "grpc-health"
     name: "Health Check"
     listen_path: "/health"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 3010
     strip_listen_path: false

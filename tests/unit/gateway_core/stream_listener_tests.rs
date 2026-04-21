@@ -5,7 +5,7 @@
 
 use arc_swap::ArcSwap;
 use ferrum_edge::circuit_breaker::CircuitBreakerCache;
-use ferrum_edge::config::types::{BackendProtocol, GatewayConfig, Proxy};
+use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::load_balancer::LoadBalancerCache;
@@ -19,7 +19,7 @@ use std::time::Duration;
 // Helpers
 // ============================================================================
 
-fn create_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy {
+fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
     Proxy {
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -27,7 +27,9 @@ fn create_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy 
         hosts: vec![],
         // Stream proxies must not set listen_path — they route on listen_port.
         listen_path: None,
-        backend_protocol: protocol,
+        backend_scheme: Some(scheme),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((scheme, false)),
         backend_host: "127.0.0.1".to_string(),
         backend_port: 9999,
         backend_path: None,
@@ -152,7 +154,7 @@ async fn test_reconcile_with_empty_config_returns_no_failures() {
 async fn test_reconcile_starts_tcp_listener() {
     let port = ephemeral_port().await;
     let config = GatewayConfig {
-        proxies: vec![create_stream_proxy("tcp1", BackendProtocol::Tcp, port)],
+        proxies: vec![create_stream_proxy("tcp1", BackendScheme::Tcp, port)],
         ..empty_config()
     };
 
@@ -219,7 +221,7 @@ async fn test_reconcile_starts_tcp_listener() {
 async fn test_reconcile_starts_udp_listener() {
     let port = ephemeral_port().await;
     let config = GatewayConfig {
-        proxies: vec![create_stream_proxy("udp1", BackendProtocol::Udp, port)],
+        proxies: vec![create_stream_proxy("udp1", BackendScheme::Udp, port)],
         ..empty_config()
     };
 
@@ -295,7 +297,7 @@ async fn test_reconcile_detects_port_conflict() {
     let config = GatewayConfig {
         proxies: vec![create_stream_proxy(
             "tcp-conflict",
-            BackendProtocol::Tcp,
+            BackendScheme::Tcp,
             blocked_port,
         )],
         ..empty_config()
@@ -365,7 +367,7 @@ async fn test_reconcile_detects_port_conflict() {
 #[tokio::test]
 async fn test_reconcile_defers_tcp_without_tls_config() {
     let port = ephemeral_port().await;
-    let mut proxy = create_stream_proxy("tcp-tls", BackendProtocol::TcpTls, port);
+    let mut proxy = create_stream_proxy("tcp-tls", BackendScheme::Tcps, port);
     proxy.frontend_tls = true;
 
     let config = GatewayConfig {
@@ -432,7 +434,7 @@ async fn test_reconcile_defers_tcp_without_tls_config() {
 #[tokio::test]
 async fn test_reconcile_defers_udp_without_dtls_config() {
     let port = ephemeral_port().await;
-    let mut proxy = create_stream_proxy("udp-dtls", BackendProtocol::Udp, port);
+    let mut proxy = create_stream_proxy("udp-dtls", BackendScheme::Udp, port);
     proxy.frontend_tls = true;
 
     let config = GatewayConfig {
@@ -505,7 +507,7 @@ async fn test_shutdown_all_releases_ports() {
     let config = GatewayConfig {
         proxies: vec![create_stream_proxy(
             "tcp-shutdown",
-            BackendProtocol::Tcp,
+            BackendScheme::Tcp,
             port,
         )],
         ..empty_config()
@@ -588,7 +590,7 @@ async fn test_wait_until_started_with_empty_config() {
 async fn test_wait_until_started_succeeds_for_tcp() {
     let port = ephemeral_port().await;
     let config = GatewayConfig {
-        proxies: vec![create_stream_proxy("tcp-wait", BackendProtocol::Tcp, port)],
+        proxies: vec![create_stream_proxy("tcp-wait", BackendScheme::Tcp, port)],
         ..empty_config()
     };
 

@@ -58,7 +58,7 @@ fn build_dtls_proxy(backend_host: &str, backend_port: u16, ca_path: Option<Strin
     let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
         "id": "dtls-proxy-test",
         "listen_path": "/",
-        "backend_protocol": "dtls",
+        "backend_scheme": "dtls",
         "backend_host": backend_host,
         "backend_port": backend_port,
         "listen_port": 40123,

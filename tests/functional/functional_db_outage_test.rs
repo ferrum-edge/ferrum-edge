@@ -246,7 +246,7 @@ async fn test_db_outage_proxy_continues_with_plugins() {
         .json(&json!({
             "id": "outage-proxy",
             "listen_path": "/outage-test",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -339,7 +339,7 @@ async fn test_db_outage_proxy_continues_with_plugins() {
         .json(&json!({
             "id": "outage-proxy",
             "listen_path": "/outage-test",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -517,7 +517,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
         .json(&json!({
             "id": "admin-test-proxy",
             "listen_path": "/admin-test",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -572,7 +572,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
         .json(&json!({
             "id": "admin-test-proxy",
             "listen_path": "/admin-test",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -753,7 +753,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
         .json(&json!({
             "id": "should-fail-proxy",
             "listen_path": "/fail",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": 9999,
         }))
@@ -782,7 +782,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
         .json(&json!({
             "id": "admin-test-proxy",
             "listen_path": "/admin-test",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": false,
@@ -989,7 +989,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
         .json(&json!({
             "id": "recovery-proxy",
             "listen_path": "/recovery",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
         }))
@@ -1058,7 +1058,7 @@ async fn test_db_outage_key_auth_continues() {
         .json(&json!({
             "id": "auth-proxy",
             "listen_path": "/auth-test",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -1118,7 +1118,7 @@ async fn test_db_outage_key_auth_continues() {
         .json(&json!({
             "id": "auth-proxy",
             "listen_path": "/auth-test",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -1274,7 +1274,7 @@ async fn test_db_outage_rate_limiting_continues() {
         .json(&json!({
             "id": "rate-proxy",
             "listen_path": "/rate-test",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -1314,7 +1314,7 @@ async fn test_db_outage_rate_limiting_continues() {
         .json(&json!({
             "id": "rate-proxy",
             "listen_path": "/rate-test",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,

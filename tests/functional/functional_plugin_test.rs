@@ -317,7 +317,7 @@ async fn setup_proxy_with_plugins(
             &json!({
                 "id": proxy_id,
                 "listen_path": listen_path,
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,
@@ -340,7 +340,7 @@ async fn setup_proxy_with_plugins(
             &json!({
                 "id": proxy_id,
                 "listen_path": listen_path,
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,
@@ -1449,7 +1449,7 @@ async fn test_plugin_request_transformer_body_rules_bypass_direct_h2_pool() {
             &json!({
                 "id": proxy_id,
                 "listen_path": listen_path,
-                "backend_protocol": "https",
+                "backend_scheme": "https",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,
@@ -1491,7 +1491,7 @@ async fn test_plugin_request_transformer_body_rules_bypass_direct_h2_pool() {
             &json!({
                 "id": proxy_id,
                 "listen_path": listen_path,
-                "backend_protocol": "https",
+                "backend_scheme": "https",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,
@@ -1738,7 +1738,7 @@ async fn test_plugin_chain_multiple_plugins() {
             &json!({
                 "id": proxy_id,
                 "listen_path": listen_path,
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,
@@ -1790,7 +1790,7 @@ async fn test_plugin_chain_multiple_plugins() {
             &json!({
                 "id": proxy_id,
                 "listen_path": listen_path,
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,

@@ -83,6 +83,17 @@ pub(crate) trait AdminResource:
         json!(resource)
     }
 
+    /// Inspect the raw request body *before* it is deserialized into `Self`.
+    /// Return `Err` to reject the request with a 400 Bad Request. Used to
+    /// catch renamed / removed fields that `serde(default)` would otherwise
+    /// silently ignore, so operators get a clean migration error instead of
+    /// a confusingly no-op request.
+    ///
+    /// Default is a no-op. Override on resources that have renamed fields.
+    fn validate_raw_body(_body: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+
     fn prepare_for_update(&mut self, _existing: &Self) {}
 
     fn prepare_for_write(&mut self) -> Result<(), String> {
@@ -690,6 +701,28 @@ impl AdminResource for Proxy {
     const VALIDATION_ERROR_LABEL: &'static str = "proxy fields";
     const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
 
+    /// Reject legacy field names that were renamed in the scheme refactor.
+    /// Without this, `#[serde(default)]` would silently ignore a
+    /// `backend_protocol` key and leave the Proxy with its default scheme,
+    /// so operators upgrading from older tooling would see a confusing
+    /// no-op instead of a clear migration message.
+    fn validate_raw_body(body: &[u8]) -> Result<(), String> {
+        // Only inspect the top-level object — don't pay the cost of a full
+        // JSON walk here. A malformed body will be caught by the real
+        // deserialize below.
+        if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(body)
+            && map.contains_key("backend_protocol")
+        {
+            return Err(
+                "Field 'backend_protocol' was renamed to 'backend_scheme' (6-variant enum: \
+                 http, https, tcp, tcps, udp, dtls). gRPC and WebSocket are now detected at \
+                 runtime from the request; HTTP/3 is opt-in via 'backend_prefer_h3: true'."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     fn id(&self) -> &str {
         &self.id
     }
@@ -735,7 +768,7 @@ impl AdminResource for Proxy {
             }
         }
 
-        if !self.backend_protocol.is_stream_proxy()
+        if !self.dispatch_kind.is_stream()
             && let Some(path) = self.listen_path.as_deref()
             && let Some(pattern) = path.strip_prefix('~')
             && !pattern.is_empty()
@@ -749,12 +782,12 @@ impl AdminResource for Proxy {
             }
         }
 
-        if self.backend_protocol.is_stream_proxy() {
+        if self.dispatch_kind.is_stream() {
             match self.listen_port {
                 None => {
                     return Err(ValidationError::Message(format!(
-                        "Stream proxy (protocol {}) must have a listen_port",
-                        self.backend_protocol
+                        "Stream proxy (scheme {}) must have a listen_port",
+                        self.scheme_display()
                     )));
                 }
                 Some(0) => {
@@ -766,8 +799,8 @@ impl AdminResource for Proxy {
             }
         } else if self.listen_port.is_some() {
             return Err(ValidationError::Message(format!(
-                "HTTP proxy (protocol {}) must not set listen_port",
-                self.backend_protocol
+                "HTTP proxy (scheme {}) must not set listen_port",
+                self.scheme_display()
             )));
         }
 
@@ -816,7 +849,7 @@ impl AdminResource for Proxy {
         resource: &Self,
         exclude_id: Option<&str>,
     ) -> DbResult<Option<String>> {
-        if !resource.backend_protocol.is_stream_proxy() {
+        if !resource.dispatch_kind.is_stream() {
             match db
                 .check_listen_path_unique(
                     namespace,
@@ -847,7 +880,7 @@ impl AdminResource for Proxy {
             }
         }
 
-        if resource.backend_protocol.is_stream_proxy()
+        if resource.dispatch_kind.is_stream()
             && let Some(port) = resource.listen_port
         {
             match db
@@ -903,7 +936,7 @@ impl AdminResource for Proxy {
             Err(error) => return Err(AfterValidateError::Db(error)),
         }
 
-        if resource.backend_protocol.is_stream_proxy()
+        if resource.dispatch_kind.is_stream()
             && let Some(port) = resource.listen_port
             && ctx.mode != "cp"
         {
@@ -919,14 +952,14 @@ impl AdminResource for Proxy {
 
             let port_changed = existing.and_then(|proxy| proxy.listen_port) != Some(port);
             let transport_changed = existing
-                .map(|proxy| proxy.backend_protocol.is_udp() != resource.backend_protocol.is_udp())
+                .map(|proxy| proxy.dispatch_kind.is_udp() != resource.dispatch_kind.is_udp())
                 .unwrap_or(false);
             let should_probe = existing.is_none() || port_changed || transport_changed;
             if should_probe
                 && let Err(error) = check_port_available(
                     port,
                     ctx.stream_bind_address,
-                    resource.backend_protocol.is_udp(),
+                    resource.dispatch_kind.is_udp(),
                 )
                 .await
             {
@@ -1095,6 +1128,13 @@ async fn handle_write<R: AdminResource>(
             ));
         }
     };
+
+    if let Err(message) = R::validate_raw_body(body) {
+        return Ok(super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": message}),
+        ));
+    }
 
     let mut resource: R = match serde_json::from_slice(body) {
         Ok(resource) => resource,

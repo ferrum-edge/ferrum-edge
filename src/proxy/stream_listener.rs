@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
-use crate::config::types::{BackendProtocol, GatewayConfig};
+use crate::config::types::{BackendScheme, GatewayConfig};
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
@@ -28,7 +28,7 @@ struct ListenerHandle {
     shutdown_tx: watch::Sender<bool>,
     _join_handle: JoinHandle<()>,
     listen_port: u16,
-    protocol: BackendProtocol,
+    scheme: BackendScheme,
     frontend_tls: bool,
     passthrough: bool,
     started: Arc<AtomicBool>,
@@ -200,16 +200,16 @@ impl StreamListenerManager {
         let mut listeners = self.listeners.lock().await;
 
         // Collect all desired stream proxies from config
-        let desired: std::collections::HashMap<String, (u16, BackendProtocol, bool, bool)> =
+        let desired: std::collections::HashMap<String, (u16, BackendScheme, bool, bool)> =
             current_config
                 .proxies
                 .iter()
-                .filter(|p| p.backend_protocol.is_stream_proxy())
+                .filter(|p| p.dispatch_kind.is_stream())
                 .filter_map(|p| {
                     p.listen_port.map(|port| {
                         (
                             p.id.clone(),
-                            (port, p.backend_protocol, p.frontend_tls, p.passthrough),
+                            (port, p.effective_scheme(), p.frontend_tls, p.passthrough),
                         )
                     })
                 })
@@ -245,27 +245,27 @@ impl StreamListenerManager {
         #[allow(clippy::type_complexity)]
         let mut effective_desired: std::collections::HashMap<
             String,
-            (u16, BackendProtocol, bool, bool, Option<Vec<String>>),
+            (u16, BackendScheme, bool, bool, Option<Vec<String>>),
         > = std::collections::HashMap::new();
 
-        for (proxy_id, (port, protocol, frontend_tls, passthrough)) in &desired {
+        for (proxy_id, (port, scheme, frontend_tls, passthrough)) in &desired {
             if grouped_proxy_ids.contains(proxy_id.as_str()) {
                 continue; // Handled as part of a group below
             }
             effective_desired.insert(
                 proxy_id.clone(),
-                (*port, *protocol, *frontend_tls, *passthrough, None),
+                (*port, *scheme, *frontend_tls, *passthrough, None),
             );
         }
         for (port, ids) in &passthrough_groups {
             let key = format!("__sni_{}", port);
-            // Use the first proxy's protocol for the listener
-            if let Some((_, protocol, frontend_tls, passthrough)) = desired.get(&ids[0]) {
+            // Use the first proxy's scheme for the listener
+            if let Some((_, scheme, frontend_tls, passthrough)) = desired.get(&ids[0]) {
                 effective_desired.insert(
                     key,
                     (
                         *port,
-                        *protocol,
+                        *scheme,
                         *frontend_tls,
                         *passthrough,
                         Some(ids.clone()),
@@ -281,9 +281,9 @@ impl StreamListenerManager {
                 None => {
                     to_remove.push(key.clone());
                 }
-                Some((port, protocol, frontend_tls, passthrough, _)) => {
+                Some((port, scheme, frontend_tls, passthrough, _)) => {
                     if handle.listen_port != *port
-                        || handle.protocol != *protocol
+                        || handle.scheme != *scheme
                         || handle.frontend_tls != *frontend_tls
                         || handle.passthrough != *passthrough
                     {
@@ -298,7 +298,7 @@ impl StreamListenerManager {
                 info!(
                     listener_key = %key,
                     port = handle.listen_port,
-                    protocol = %handle.protocol,
+                    scheme = %handle.scheme,
                     "Stopping stream listener"
                 );
                 let _ = handle.shutdown_tx.send(true);
@@ -306,7 +306,7 @@ impl StreamListenerManager {
         }
 
         // Start listeners for new or restarted entries
-        for (key, (port, protocol, frontend_tls, passthrough, sni_ids)) in &effective_desired {
+        for (key, (port, scheme, frontend_tls, passthrough, sni_ids)) in &effective_desired {
             if listeners.contains_key(key) {
                 continue;
             }
@@ -318,7 +318,7 @@ impl StreamListenerManager {
             // The mode will call reconcile() again after setting the config.
             // Passthrough proxies never terminate TLS, so they skip this check entirely.
             if *frontend_tls && !*passthrough {
-                if protocol.is_udp() {
+                if scheme.is_udp() {
                     if self.frontend_dtls_cert_key.load().is_none() {
                         info!(
                             proxy_id = %proxy_id,
@@ -343,7 +343,7 @@ impl StreamListenerManager {
             let bind_addr = self.bind_addr;
             let port_val = *port;
             let probe_addr = std::net::SocketAddr::new(bind_addr, port_val);
-            let probe_result = if protocol.is_udp() {
+            let probe_result = if scheme.is_udp() {
                 tokio::net::UdpSocket::bind(probe_addr).await.map(drop)
             } else {
                 tokio::net::TcpListener::bind(probe_addr).await.map(drop)
@@ -372,7 +372,7 @@ impl StreamListenerManager {
             let cb_cache = self.circuit_breaker_cache.clone();
             let started = Arc::new(AtomicBool::new(false));
 
-            let join_handle = if protocol.is_udp() {
+            let join_handle = if scheme.is_udp() {
                 let started_for_listener = started.clone();
                 // UDP or DTLS listener
                 // Passthrough proxies forward raw encrypted datagrams — no DTLS termination.
@@ -525,7 +525,7 @@ impl StreamListenerManager {
                 listener_key = %key,
                 proxy_id = %proxy_id,
                 port = port,
-                protocol = %protocol,
+                scheme = %scheme,
                 "Started stream listener"
             );
 
@@ -535,7 +535,7 @@ impl StreamListenerManager {
                     shutdown_tx,
                     _join_handle: join_handle,
                     listen_port: *port,
-                    protocol: *protocol,
+                    scheme: *scheme,
                     frontend_tls: *frontend_tls,
                     passthrough: *passthrough,
                     started,
@@ -553,16 +553,16 @@ impl StreamListenerManager {
 
         loop {
             let current_config = self.config.load();
-            let desired: Vec<(String, u16, BackendProtocol, bool, bool)> = current_config
+            let desired: Vec<(String, u16, BackendScheme, bool, bool)> = current_config
                 .proxies
                 .iter()
-                .filter(|p| p.backend_protocol.is_stream_proxy())
+                .filter(|p| p.dispatch_kind.is_stream())
                 .filter_map(|p| {
                     p.listen_port.map(|port| {
                         (
                             p.id.clone(),
                             port,
-                            p.backend_protocol,
+                            p.effective_scheme(),
                             p.frontend_tls,
                             p.passthrough,
                         )
@@ -587,7 +587,7 @@ impl StreamListenerManager {
                 let listeners = self.listeners.lock().await;
                 desired
                     .iter()
-                    .all(|(proxy_id, port, protocol, frontend_tls, passthrough)| {
+                    .all(|(proxy_id, port, scheme, frontend_tls, passthrough)| {
                         // For SNI groups, the listener key is "__sni_{port}" not the proxy_id
                         let key =
                             if *passthrough && pt_port_count.get(port).copied().unwrap_or(0) > 1 {
@@ -597,7 +597,7 @@ impl StreamListenerManager {
                             };
                         listeners.get(&key).is_some_and(|handle| {
                             handle.listen_port == *port
-                                && handle.protocol == *protocol
+                                && handle.scheme == *scheme
                                 && handle.frontend_tls == *frontend_tls
                                 && handle.started.load(Ordering::Acquire)
                         })

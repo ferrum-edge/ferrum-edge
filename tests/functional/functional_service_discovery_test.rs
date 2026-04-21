@@ -170,7 +170,7 @@ async fn test_service_discovery_dns_sd_config_parses() {
 proxies:
   - id: "static-proxy"
     listen_path: "/static"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
     strip_listen_path: true
@@ -233,7 +233,7 @@ async fn test_service_discovery_kubernetes_config_parses() {
 proxies:
   - id: "static-proxy"
     listen_path: "/static"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
     strip_listen_path: true
@@ -293,7 +293,7 @@ async fn test_service_discovery_consul_unreachable_does_not_crash_gateway() {
 proxies:
   - id: "static-proxy"
     listen_path: "/static"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
     strip_listen_path: true
@@ -401,7 +401,7 @@ async fn test_service_discovery_consul_stub_routes_to_discovered_target() {
 proxies:
   - id: "sd-proxy"
     listen_path: "/sd"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 1
     strip_listen_path: true

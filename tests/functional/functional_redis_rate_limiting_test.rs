@@ -753,7 +753,7 @@ async fn test_ai_rate_limiter_redis_shared_across_instances() {
 proxies:
   - id: "shared-ai-proxy"
     listen_path: "/shared-ai"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -898,7 +898,7 @@ async fn test_ws_rate_limiting_redis_centralized() {
 proxies:
   - id: "ws-redis-proxy"
     listen_path: "/ws-redis"
-    backend_protocol: ws
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -1029,7 +1029,7 @@ async fn test_ws_rate_limiting_redis_namespaces_instance_connections() {
 proxies:
   - id: "ws-shared-redis-proxy"
     listen_path: "/ws-shared"
-    backend_protocol: ws
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -1143,7 +1143,7 @@ async fn test_rate_limiting_redis_shared_across_instances() {
 proxies:
   - id: "shared-rl-proxy"
     listen_path: "/shared-rl"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -1295,7 +1295,7 @@ proxies:
   - id: "ns-iso-proxy"
     namespace: "{namespace}"
     listen_path: "/ns-iso"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true

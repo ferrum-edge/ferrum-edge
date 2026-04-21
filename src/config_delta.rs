@@ -192,7 +192,7 @@ impl ConfigDelta {
         let mut hosts = Vec::new();
 
         let record = |paths: &mut Vec<String>, hosts: &mut Vec<String>, p: &Proxy| {
-            if p.backend_protocol.is_stream_proxy() {
+            if p.dispatch_kind.is_stream() {
                 return;
             }
             match p.listen_path.as_deref() {
@@ -223,8 +223,8 @@ impl ConfigDelta {
         for p in &self.modified_proxies {
             record(&mut paths, &mut hosts, p);
             if let Some(old_proxy) = old_proxy_map.get(p.id.as_str()) {
-                let routing_changed = old_proxy.backend_protocol.is_stream_proxy()
-                    != p.backend_protocol.is_stream_proxy()
+                let routing_changed = old_proxy.dispatch_kind.is_stream()
+                    != p.dispatch_kind.is_stream()
                     || old_proxy.listen_path != p.listen_path
                     || old_proxy.hosts != p.hosts;
                 if routing_changed {

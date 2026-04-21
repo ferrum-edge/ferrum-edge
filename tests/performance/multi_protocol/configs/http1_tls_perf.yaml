@@ -5,7 +5,7 @@ proxies:
   - id: "h1-tls-echo"
     name: "HTTP/1.1+TLS Echo"
     listen_path: "/echo"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 3001
     strip_listen_path: false
@@ -19,7 +19,7 @@ proxies:
   - id: "h1-tls-health"
     name: "HTTP/1.1+TLS Health Check"
     listen_path: "/health"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 3010
     strip_listen_path: false

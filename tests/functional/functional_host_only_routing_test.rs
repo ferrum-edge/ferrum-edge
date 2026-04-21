@@ -83,7 +83,7 @@ async fn functional_host_only_routing_matches_any_path() {
 proxies:
   - id: "host-only-a"
     hosts: ["a.example.com"]
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_a}
     strip_listen_path: true
@@ -137,14 +137,14 @@ proxies:
   - id: "path-api"
     hosts: ["shared.example.com"]
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_api}
     strip_listen_path: false
 
   - id: "host-only-fallback"
     hosts: ["shared.example.com"]
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_fallback}
     strip_listen_path: true
@@ -196,14 +196,14 @@ async fn functional_host_only_disjoint_hosts_coexist() {
 proxies:
   - id: "host-only-a"
     hosts: ["a.example.com"]
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_a}
     strip_listen_path: true
 
   - id: "host-only-b"
     hosts: ["b.example.com"]
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_b}
     strip_listen_path: true
@@ -252,7 +252,7 @@ async fn functional_host_only_admin_rejects_neither_hosts_nor_listen_path() {
     // 1) Neither hosts nor listen_path → 400
     let body_neither = json!({
         "id": "bad-catch-all",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "127.0.0.1",
         "backend_port": 3000,
     });
@@ -273,7 +273,7 @@ async fn functional_host_only_admin_rejects_neither_hosts_nor_listen_path() {
     let body_stream_with_path = json!({
         "id": "bad-stream",
         "listen_path": "/not-allowed",
-        "backend_protocol": "tcp",
+        "backend_scheme": "tcp",
         "backend_host": "127.0.0.1",
         "backend_port": 5432,
         "listen_port": ephemeral_port().await,
@@ -295,7 +295,7 @@ async fn functional_host_only_admin_rejects_neither_hosts_nor_listen_path() {
     let body_host_only = json!({
         "id": "host-only-ok",
         "hosts": ["ok.example.com"],
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "127.0.0.1",
         "backend_port": 3000,
     });
@@ -316,7 +316,7 @@ async fn functional_host_only_admin_rejects_neither_hosts_nor_listen_path() {
     let body_duplicate = json!({
         "id": "host-only-dup",
         "hosts": ["ok.example.com"],
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "127.0.0.1",
         "backend_port": 3001,
     });

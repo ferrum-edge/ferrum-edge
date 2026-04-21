@@ -673,58 +673,182 @@ fn default_retry_on_connect_failure() -> bool {
     true
 }
 
-/// Backend protocol for a proxy resource.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Wire-level scheme the proxy uses to talk to its backend.
+///
+/// Six variants cover every transport Ferrum Edge supports:
+///
+/// - HTTP family (`Http`, `Https`) covers HTTP/1.1, HTTP/2, HTTP/3, gRPC, and
+///   WebSocket. Which of those is actually spoken is determined per-request
+///   via `HttpFlavor` (content-type / Upgrade / ALPN negotiation) — it is
+///   never pinned in config. A single `Https` proxy transparently serves a
+///   mix of REST, gRPC, and WebSocket traffic on the same backend pool.
+/// - Stream family (`Tcp`, `Tcps`, `Udp`, `Dtls`) are raw L4 proxies selected
+///   by `listen_port`.
+///
+/// `Tcps` follows the `http`/`https`, `ws`/`wss`, pattern (serde name `"tcps"`).
+/// Backward-compatibility aliases for the old 11-variant `BackendProtocol`
+/// enum are accepted on the serde boundary via `#[serde(alias = "...")]`
+/// for operators carrying over YAML/JSON files — values deserialize into the
+/// canonical 6-variant form at load time. Admin API payloads should use the
+/// canonical names.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
-pub enum BackendProtocol {
+pub enum BackendScheme {
     Http,
     Https,
-    Ws,
-    Wss,
-    Grpc,
-    Grpcs,
-    H3,
     Tcp,
-    #[serde(rename = "tcp_tls")]
-    TcpTls,
+    Tcps,
     Udp,
     Dtls,
 }
 
-impl BackendProtocol {
-    /// Returns true if this protocol is a raw stream proxy (TCP/UDP) rather than HTTP-based.
-    pub fn is_stream_proxy(&self) -> bool {
-        matches!(self, Self::Tcp | Self::TcpTls | Self::Udp | Self::Dtls)
+impl BackendScheme {
+    /// True when this is a raw L4 stream proxy (TCP/UDP/TLS/DTLS).
+    ///
+    /// Kept public (and annotated `#[allow(dead_code)]`) because
+    /// `BackendScheme` is re-exported from `lib.rs` for downstream consumers
+    /// (tests, future plugins) even when the gateway itself prefers the
+    /// pre-computed `DispatchKind::is_stream()` on the hot path.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_stream(&self) -> bool {
+        matches!(self, Self::Tcp | Self::Tcps | Self::Udp | Self::Dtls)
     }
 
-    /// Returns true if this protocol uses UDP transport.
+    /// True when this uses HTTP-family transport (HTTP/1.1, HTTP/2, HTTP/3,
+    /// gRPC, WebSocket — determined per-request from `HttpFlavor`).
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_http_family(&self) -> bool {
+        matches!(self, Self::Http | Self::Https)
+    }
+
+    /// True when this uses UDP transport (plaintext or DTLS).
+    #[inline]
     pub fn is_udp(&self) -> bool {
         matches!(self, Self::Udp | Self::Dtls)
     }
 
-    /// Returns true if the backend connection uses TLS/DTLS.
+    /// True when the backend connection uses TLS/DTLS.
+    #[inline]
+    #[allow(dead_code)]
     pub fn is_tls_backend(&self) -> bool {
-        matches!(
-            self,
-            Self::Https | Self::Wss | Self::Grpcs | Self::H3 | Self::TcpTls | Self::Dtls
-        )
+        matches!(self, Self::Https | Self::Tcps | Self::Dtls)
+    }
+
+    /// Canonical serde string for this scheme. Takes `self` by value because
+    /// `BackendScheme: Copy` and clippy's `wrong-self-convention` lint flags
+    /// `to_*` methods that borrow on `Copy` types.
+    #[inline]
+    pub fn to_scheme_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+            Self::Tcp => "tcp",
+            Self::Tcps => "tcps",
+            Self::Udp => "udp",
+            Self::Dtls => "dtls",
+        }
     }
 }
 
-impl std::fmt::Display for BackendProtocol {
+impl std::fmt::Display for BackendScheme {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Http => write!(f, "http"),
-            Self::Https => write!(f, "https"),
-            Self::Ws => write!(f, "ws"),
-            Self::Wss => write!(f, "wss"),
-            Self::Grpc => write!(f, "grpc"),
-            Self::Grpcs => write!(f, "grpcs"),
-            Self::H3 => write!(f, "h3"),
-            Self::Tcp => write!(f, "tcp"),
-            Self::TcpTls => write!(f, "tcp_tls"),
-            Self::Udp => write!(f, "udp"),
-            Self::Dtls => write!(f, "dtls"),
+        f.write_str(self.to_scheme_str())
+    }
+}
+
+/// Per-request HTTP flavor detected from the incoming request. Only
+/// meaningful when the proxy's scheme is HTTP-family (`Http` or `Https`).
+///
+/// Detection is purely runtime — gRPC and WebSocket are no longer pinned
+/// in config. See `detect_http_flavor()` in `src/proxy/mod.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpFlavor {
+    /// Regular HTTP (GET/POST/…) — anything that isn't gRPC or WebSocket.
+    /// Covers HTTP/1.1, HTTP/2, and HTTP/3 bodies.
+    Plain,
+    /// gRPC — identified by `content-type: application/grpc[+proto|+json|...]`.
+    Grpc,
+    /// WebSocket upgrade — HTTP/1.1 `Connection: Upgrade` + `Upgrade: websocket`,
+    /// or HTTP/2 Extended CONNECT (RFC 8441) with `:protocol=websocket`.
+    WebSocket,
+}
+
+/// Pre-computed dispatch classification for a proxy. Populated once at
+/// config-load time in `GatewayConfig::resolve_dispatch_kind()` so the
+/// request hot path is a single match on a 1-byte enum instead of a
+/// cascade of scheme/prefer_h3/capability checks.
+///
+/// Same pattern as `Proxy::resolved_tls` (cached computation, `#[serde(skip)]`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DispatchKind {
+    /// Plaintext HTTP family (scheme = Http). Plain flavor → reqwest; Grpc →
+    /// GrpcPool h2c path; WebSocket → plaintext `ws://` upgrade.
+    #[default]
+    HttpPool,
+    /// TLS HTTP family (scheme = Https, prefer_h3 = false). Plain → reqwest
+    /// or Http2ConnectionPool (ALPN negotiated); Grpc → GrpcPool TLS;
+    /// WebSocket → `wss://` upgrade. No H3 attempt.
+    HttpsPool,
+    /// TLS HTTP family with H3 preferred (scheme = Https, prefer_h3 = true).
+    /// Plain flavor attempts Http3ConnectionPool first then falls back to
+    /// HttpsPool behavior; Grpc / WebSocket degrade to HttpsPool directly
+    /// (H3 gives them nothing).
+    HttpsH3Preferred,
+    /// Raw TCP stream proxy.
+    TcpRaw,
+    /// TCP + TLS stream proxy.
+    TcpTls,
+    /// Raw UDP stream proxy.
+    UdpRaw,
+    /// UDP + DTLS stream proxy.
+    UdpDtls,
+}
+
+impl DispatchKind {
+    #[inline]
+    pub fn is_stream(&self) -> bool {
+        matches!(
+            self,
+            Self::TcpRaw | Self::TcpTls | Self::UdpRaw | Self::UdpDtls
+        )
+    }
+
+    #[inline]
+    pub fn is_http_family(&self) -> bool {
+        matches!(
+            self,
+            Self::HttpPool | Self::HttpsPool | Self::HttpsH3Preferred
+        )
+    }
+
+    #[inline]
+    #[allow(dead_code)] // part of public API, exercised via re-export + tests
+    pub fn is_tls_backend(&self) -> bool {
+        matches!(
+            self,
+            Self::HttpsPool | Self::HttpsH3Preferred | Self::TcpTls | Self::UdpDtls
+        )
+    }
+
+    #[inline]
+    pub fn is_udp(&self) -> bool {
+        matches!(self, Self::UdpRaw | Self::UdpDtls)
+    }
+}
+
+impl From<(BackendScheme, bool)> for DispatchKind {
+    #[inline]
+    fn from((scheme, prefer_h3): (BackendScheme, bool)) -> Self {
+        match scheme {
+            BackendScheme::Http => Self::HttpPool,
+            BackendScheme::Https if prefer_h3 => Self::HttpsH3Preferred,
+            BackendScheme::Https => Self::HttpsPool,
+            BackendScheme::Tcp => Self::TcpRaw,
+            BackendScheme::Tcps => Self::TcpTls,
+            BackendScheme::Udp => Self::UdpRaw,
+            BackendScheme::Dtls => Self::UdpDtls,
         }
     }
 }
@@ -812,7 +936,24 @@ pub struct Proxy {
     ///   `listen_port`.
     #[serde(default)]
     pub listen_path: Option<String>,
-    pub backend_protocol: BackendProtocol,
+    /// Backend wire scheme. Optional on HTTP-family proxies (defaults to
+    /// `Https` during normalization if absent), REQUIRED on stream proxies
+    /// (validation rejects missing scheme when `listen_port` is set).
+    ///
+    /// WebSocket and gRPC are no longer schemes — they are detected per-request
+    /// from the incoming traffic (`HttpFlavor`). HTTP/3 is opt-in via
+    /// `backend_prefer_h3` when the scheme resolves to `Https`.
+    #[serde(default)]
+    pub backend_scheme: Option<BackendScheme>,
+    /// Prefer HTTP/3 when speaking to this backend. Only meaningful when
+    /// scheme resolves to `Https`. Validation rejects `true` with any
+    /// non-`Https` scheme. Default false.
+    #[serde(default)]
+    pub backend_prefer_h3: bool,
+    /// Populated during `normalize_fields()` — O(1) dispatch target used by
+    /// the request hot path. Never serialized. Same pattern as `resolved_tls`.
+    #[serde(skip)]
+    pub dispatch_kind: DispatchKind,
     pub backend_host: String,
     pub backend_port: u16,
     #[serde(default)]
@@ -911,7 +1052,7 @@ pub struct Proxy {
     #[serde(default)]
     pub response_body_mode: ResponseBodyMode,
     /// Port the gateway listens on for this TCP/UDP proxy.
-    /// Required when backend_protocol is Tcp/TcpTls/Udp/Dtls.
+    /// Required when backend_scheme is Tcp/Tcps/Udp/Dtls.
     /// Not used for HTTP-based protocols.
     #[serde(default)]
     pub listen_port: Option<u16>,
@@ -1119,7 +1260,7 @@ impl GatewayConfig {
         let mut by_path: HashMap<&str, Vec<&Proxy>> = HashMap::new();
         let mut host_only: Vec<&Proxy> = Vec::new();
         for proxy in &self.proxies {
-            if proxy.backend_protocol.is_stream_proxy() {
+            if proxy.dispatch_kind.is_stream() {
                 continue;
             }
             match proxy.listen_path.as_deref() {
@@ -1199,7 +1340,7 @@ impl GatewayConfig {
     pub fn validate_regex_listen_paths(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         for proxy in &self.proxies {
-            if proxy.backend_protocol.is_stream_proxy() {
+            if proxy.dispatch_kind.is_stream() {
                 continue;
             }
             let Some(path) = proxy.listen_path.as_deref() else {
@@ -1247,6 +1388,34 @@ impl GatewayConfig {
         }
         for upstream in &mut self.upstreams {
             upstream.normalize_fields();
+        }
+        // Pre-compute dispatch classification for every proxy — O(1) per
+        // proxy at load time, so the request hot path never does any
+        // scheme/prefer_h3 branching.
+        self.resolve_dispatch_kind();
+    }
+
+    /// Resolve each proxy's `dispatch_kind` from `backend_scheme` +
+    /// `backend_prefer_h3`, applying the HTTP-family default when the
+    /// scheme field is absent. Also canonicalizes `backend_scheme` to
+    /// `Some(...)` post-normalization so downstream code (logging, pool
+    /// keys) can read a concrete scheme without re-running defaulting.
+    ///
+    /// Must be called after loading/mutating config and before any proxy
+    /// traffic flows. Invoked automatically by `normalize_fields()`; admin
+    /// mutation handlers and incremental-apply paths must call it too
+    /// (mirrors `resolve_upstream_tls` in that respect).
+    pub fn resolve_dispatch_kind(&mut self) {
+        for proxy in &mut self.proxies {
+            let scheme = proxy.effective_scheme();
+            proxy.dispatch_kind = DispatchKind::from((scheme, proxy.backend_prefer_h3));
+            // Canonicalize the stored field so the rest of the codebase
+            // reads a concrete scheme. Skip for stream proxies whose
+            // scheme is None — validation will reject them, and leaving
+            // the None intact makes the error message clearer.
+            if proxy.backend_scheme.is_none() && !proxy.dispatch_kind.is_stream() {
+                proxy.backend_scheme = Some(scheme);
+            }
         }
     }
 
@@ -1660,12 +1829,13 @@ impl GatewayConfig {
         let mut port_proxies: HashMap<u16, Vec<&str>> = HashMap::new();
 
         for proxy in &self.proxies {
-            if proxy.backend_protocol.is_stream_proxy() {
+            if proxy.dispatch_kind.is_stream() {
                 match proxy.listen_port {
                     None => {
                         errors.push(format!(
-                            "Stream proxy '{}' (protocol {}) must have a listen_port",
-                            proxy.id, proxy.backend_protocol
+                            "Stream proxy '{}' (scheme {}) must have a listen_port",
+                            proxy.id,
+                            proxy.scheme_display()
                         ));
                     }
                     Some(port) if port < 1 => {
@@ -1680,8 +1850,9 @@ impl GatewayConfig {
                 }
             } else if proxy.listen_port.is_some() {
                 errors.push(format!(
-                    "HTTP proxy '{}' (protocol {}) must not set listen_port",
-                    proxy.id, proxy.backend_protocol
+                    "HTTP proxy '{}' (scheme {}) must not set listen_port",
+                    proxy.id,
+                    proxy.scheme_display()
                 ));
             }
         }
@@ -1758,7 +1929,7 @@ impl GatewayConfig {
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         for proxy in &self.proxies {
-            if proxy.backend_protocol.is_stream_proxy()
+            if proxy.dispatch_kind.is_stream()
                 && let Some(port) = proxy.listen_port
                 && reserved_ports.contains(&port)
             {
@@ -2027,6 +2198,38 @@ impl Proxy {
         self.backend_host = self.backend_host.to_ascii_lowercase();
     }
 
+    /// Human-readable scheme for error messages. Returns `"<unset>"` before
+    /// normalization has resolved the default, so errors point operators at
+    /// the missing field without pretending a value exists.
+    pub fn scheme_display(&self) -> &'static str {
+        match self.backend_scheme {
+            Some(s) => s.to_scheme_str(),
+            None => "<unset>",
+        }
+    }
+
+    /// Effective wire scheme — returns the operator-set scheme, or the
+    /// normalization default (`Https` for HTTP family, `Tcp` sentinel for
+    /// stream family when missing — validation will reject the latter).
+    ///
+    /// Called by `GatewayConfig::resolve_dispatch_kind()`; also usable by
+    /// admin API preview logic that needs the effective scheme before the
+    /// full normalize pass has run.
+    #[inline]
+    pub fn effective_scheme(&self) -> BackendScheme {
+        self.backend_scheme.unwrap_or_else(|| {
+            if self.listen_port.is_some() {
+                // Sentinel — validation rejects stream proxies that omit
+                // the scheme, so this value is never actually dispatched on.
+                BackendScheme::Tcp
+            } else {
+                BackendScheme::Https
+            }
+        })
+    }
+}
+
+impl Proxy {
     /// Validate all fields of a proxy for correctness and safe lengths.
     ///
     /// This validates field values only — uniqueness checks (listen_path conflicts,
@@ -2052,13 +2255,18 @@ impl Proxy {
         cert_expiry_warning_days: u64,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        let is_stream_proxy = self.backend_protocol.is_stream_proxy();
+        // `validate_fields_inner` runs on a serde-deserialized Proxy BEFORE
+        // `normalize_fields()` populates `dispatch_kind` (file_loader's
+        // pipeline orders field validation first, normalization second).
+        // Use `effective_scheme()` to apply the same Https-default-for-HTTP
+        // rule at validation time without depending on dispatch_kind.
+        let is_stream_proxy = self.effective_scheme().is_stream();
 
         // Passthrough mode validation
         if self.passthrough {
             if !is_stream_proxy {
                 errors.push(
-                    "passthrough is only supported for stream proxies (tcp, tcp_tls, udp, dtls)"
+                    "passthrough is only supported for stream proxies (tcp, tcps, udp, dtls)"
                         .to_string(),
                 );
             }
@@ -2104,8 +2312,9 @@ impl Proxy {
         if is_stream_proxy {
             if self.listen_path.is_some() {
                 errors.push(format!(
-                    "Stream proxy '{}' (protocol {}) must not set listen_path — stream proxies route on listen_port",
-                    self.id, self.backend_protocol
+                    "Stream proxy '{}' (scheme {}) must not set listen_path — stream proxies route on listen_port",
+                    self.id,
+                    self.scheme_display()
                 ));
             }
         } else {
@@ -2293,31 +2502,54 @@ impl Proxy {
             ));
         }
 
-        // Reject backend TLS fields on non-TLS protocols — cert configs are
+        // Reject backend TLS fields on non-TLS schemes — cert configs are
         // meaningless for plaintext backends and would waste disk I/O and
         // fragment the connection pool.
-        if !self.backend_protocol.is_tls_backend() {
-            let protocol = &self.backend_protocol;
+        //
+        // Uses `effective_scheme()` rather than `dispatch_kind` because the
+        // validation pipeline may run this check BEFORE `normalize_fields()`
+        // populates `dispatch_kind` (file_loader runs field validation first,
+        // then normalization). `effective_scheme()` applies the same
+        // Https-default-for-HTTP-family rule at validation time.
+        let effective = self.effective_scheme();
+        if !effective.is_tls_backend() {
+            let scheme = self.scheme_display();
             if self.backend_tls_client_cert_path.is_some() {
                 errors.push(format!(
-                    "backend_tls_client_cert_path cannot be set when backend_protocol is '{protocol}' — TLS client certs are only used with TLS-enabled protocols (https, wss, grpcs, h3, tcp_tls, dtls)"
+                    "backend_tls_client_cert_path cannot be set when backend_scheme is '{scheme}' — TLS client certs are only used with TLS-enabled schemes (https, tcps, dtls)"
                 ));
             }
             if self.backend_tls_client_key_path.is_some() {
                 errors.push(format!(
-                    "backend_tls_client_key_path cannot be set when backend_protocol is '{protocol}' — TLS client keys are only used with TLS-enabled protocols (https, wss, grpcs, h3, tcp_tls, dtls)"
+                    "backend_tls_client_key_path cannot be set when backend_scheme is '{scheme}' — TLS client keys are only used with TLS-enabled schemes (https, tcps, dtls)"
                 ));
             }
             if self.backend_tls_server_ca_cert_path.is_some() {
                 errors.push(format!(
-                    "backend_tls_server_ca_cert_path cannot be set when backend_protocol is '{protocol}' — CA certs are only used with TLS-enabled protocols (https, wss, grpcs, h3, tcp_tls, dtls)"
+                    "backend_tls_server_ca_cert_path cannot be set when backend_scheme is '{scheme}' — CA certs are only used with TLS-enabled schemes (https, tcps, dtls)"
                 ));
             }
             if !self.backend_tls_verify_server_cert {
                 errors.push(format!(
-                    "backend_tls_verify_server_cert cannot be set to false when backend_protocol is '{protocol}' — there is no TLS to verify on plaintext protocols"
+                    "backend_tls_verify_server_cert cannot be set to false when backend_scheme is '{scheme}' — there is no TLS to verify on plaintext schemes"
                 ));
             }
+        }
+
+        // New cross-field rules for the decoupled scheme/prefer_h3 design.
+        // - Stream proxies must declare an explicit scheme (no HTTP default).
+        // - backend_prefer_h3=true is only meaningful with scheme=https.
+        if self.listen_port.is_some() && self.backend_scheme.is_none() {
+            errors.push(format!(
+                "Stream proxy '{}' must set backend_scheme explicitly (tcp, tcps, udp, dtls) — no default is applied to stream proxies",
+                self.id
+            ));
+        }
+        if self.backend_prefer_h3 && !matches!(self.backend_scheme, Some(BackendScheme::Https)) {
+            errors.push(format!(
+                "backend_prefer_h3=true is only valid when backend_scheme is 'https' (got '{}')",
+                self.scheme_display()
+            ));
         }
 
         // Reject backend TLS fields in passthrough mode — the proxy does not

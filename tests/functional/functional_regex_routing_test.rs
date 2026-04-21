@@ -179,35 +179,35 @@ async fn functional_regex_routing_basic_mixed_routes() {
 proxies:
   - id: "prefix-api"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_a}
     strip_listen_path: false
 
   - id: "prefix-admin"
     listen_path: "/admin"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_b}
     strip_listen_path: false
 
   - id: "regex-users"
     listen_path: "~/users/[^/]+"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_c}
     strip_listen_path: false
 
   - id: "regex-orders"
     listen_path: "~/orders/[0-9]+"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_d}
     strip_listen_path: false
 
   - id: "prefix-health"
     listen_path: "/health-check"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_e}
     strip_listen_path: false
@@ -311,7 +311,7 @@ async fn functional_regex_routing_full_path_anchoring() {
 proxies:
   - id: "regex-users"
     listen_path: "~/users/[^/]+"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_users}
     strip_listen_path: false
@@ -380,7 +380,7 @@ async fn functional_regex_routing_dot_star_suffix_matches_deep_paths() {
 proxies:
   - id: "regex-versioned"
     listen_path: "~/api/v[0-9]+/.*"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_v}
     strip_listen_path: false
@@ -452,14 +452,14 @@ async fn functional_regex_routing_first_match_wins_config_order() {
 proxies:
   - id: "regex-first-specific"
     listen_path: "~/thing/[^/]+"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_first}
     strip_listen_path: false
 
   - id: "regex-second-greedy"
     listen_path: "~/thing/.*"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_second}
     strip_listen_path: false
@@ -522,14 +522,14 @@ async fn functional_regex_routing_prefix_wins_over_regex() {
 proxies:
   - id: "prefix-api"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_prefix}
     strip_listen_path: false
 
   - id: "regex-api-catchall"
     listen_path: "~/api/.*"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {port_regex}
     strip_listen_path: false
@@ -586,7 +586,7 @@ async fn functional_regex_routing_scale_50_regex_routes() {
     let mut yaml = String::from("proxies:\n");
     for (i, (port, _)) in backends.iter().enumerate() {
         yaml.push_str(&format!(
-            "  - id: \"regex-r{:02}\"\n    listen_path: \"~/r{:02}/[^/]+\"\n    backend_protocol: http\n    backend_host: \"127.0.0.1\"\n    backend_port: {}\n    strip_listen_path: false\n\n",
+            "  - id: \"regex-r{:02}\"\n    listen_path: \"~/r{:02}/[^/]+\"\n    backend_scheme: http\n    backend_host: \"127.0.0.1\"\n    backend_port: {}\n    strip_listen_path: false\n\n",
             i, i, port
         ));
     }

@@ -1008,8 +1008,8 @@ mod inner {
                 None => doc! { "namespace": namespace, "listen_path": null },
             };
             filter.insert(
-                "backend_protocol",
-                doc! { "$nin": ["tcp", "tcp_tls", "udp", "dtls"] },
+                "backend_scheme",
+                doc! { "$nin": ["tcp", "tcps", "udp", "dtls"] },
             );
             if let Some(id) = exclude_proxy_id {
                 filter.insert("_id", doc! { "$ne": id });
@@ -1722,7 +1722,12 @@ mod inner {
                 name: Some("My Proxy".to_string()),
                 hosts: vec!["example.com".to_string()],
                 listen_path: Some("/api".to_string()),
-                backend_protocol: crate::config::types::BackendProtocol::Https,
+                backend_scheme: Some(crate::config::types::BackendScheme::Https),
+                backend_prefer_h3: false,
+                dispatch_kind: crate::config::types::DispatchKind::from((
+                    crate::config::types::BackendScheme::Https,
+                    false,
+                )),
                 backend_host: "backend.internal".to_string(),
                 backend_port: 8443,
                 backend_path: Some("/v2".to_string()),
@@ -1882,7 +1887,12 @@ mod inner {
                 name: None,
                 hosts: vec![],
                 listen_path: Some("/".to_string()),
-                backend_protocol: crate::config::types::BackendProtocol::Http,
+                backend_scheme: Some(crate::config::types::BackendScheme::Http),
+                backend_prefer_h3: false,
+                dispatch_kind: crate::config::types::DispatchKind::from((
+                    crate::config::types::BackendScheme::Http,
+                    false,
+                )),
                 backend_host: "localhost".to_string(),
                 backend_port: 80,
                 backend_path: None,
@@ -1950,7 +1960,12 @@ mod inner {
                 listen_port: None, // must NOT appear in the document
                 hosts: vec![],
                 listen_path: Some("/".to_string()),
-                backend_protocol: crate::config::types::BackendProtocol::Http,
+                backend_scheme: Some(crate::config::types::BackendScheme::Http),
+                backend_prefer_h3: false,
+                dispatch_kind: crate::config::types::DispatchKind::from((
+                    crate::config::types::BackendScheme::Http,
+                    false,
+                )),
                 backend_host: "localhost".to_string(),
                 backend_port: 80,
                 backend_path: None,
@@ -2099,7 +2114,12 @@ mod inner {
                 name: None,
                 hosts: vec![],
                 listen_path: Some("/test".to_string()),
-                backend_protocol: crate::config::types::BackendProtocol::Http,
+                backend_scheme: Some(crate::config::types::BackendScheme::Http),
+                backend_prefer_h3: false,
+                dispatch_kind: crate::config::types::DispatchKind::from((
+                    crate::config::types::BackendScheme::Http,
+                    false,
+                )),
                 backend_host: "backend.local".to_string(),
                 backend_port: 8080,
                 backend_path: None,

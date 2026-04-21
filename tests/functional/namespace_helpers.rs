@@ -106,7 +106,7 @@ pub fn sample_proxy(id: &str, listen_path: &str, backend_port: u16) -> Value {
     json!({
         "id": id,
         "listen_path": listen_path,
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "127.0.0.1",
         "backend_port": backend_port,
         "strip_listen_path": true,
@@ -119,7 +119,7 @@ pub fn sample_proxy_with_name(id: &str, name: &str, listen_path: &str, backend_p
         "id": id,
         "name": name,
         "listen_path": listen_path,
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "127.0.0.1",
         "backend_port": backend_port,
         "strip_listen_path": true,
@@ -133,7 +133,7 @@ pub fn sample_proxy_with_name(id: &str, name: &str, listen_path: &str, backend_p
 pub fn sample_stream_proxy(id: &str, listen_port: u16, backend_port: u16) -> Value {
     json!({
         "id": id,
-        "backend_protocol": "tcp",
+        "backend_scheme": "tcp",
         "backend_host": "127.0.0.1",
         "backend_port": backend_port,
         "listen_port": listen_port,
@@ -148,7 +148,7 @@ pub fn sample_host_only_proxy(id: &str, host: &str, backend_port: u16) -> Value 
     json!({
         "id": id,
         "hosts": [host],
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "127.0.0.1",
         "backend_port": backend_port,
         "strip_listen_path": true,

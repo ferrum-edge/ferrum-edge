@@ -3,7 +3,7 @@
 use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::pool_config::{MAX_IDLE_PER_HOST, MIN_IDLE_PER_HOST};
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, Proxy};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
 
 fn create_test_proxy() -> Proxy {
     Proxy {
@@ -12,7 +12,9 @@ fn create_test_proxy() -> Proxy {
         name: None,
         hosts: vec![],
         listen_path: Some("/test".to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "localhost".to_string(),
         backend_port: 3000,
         backend_path: None,

@@ -156,7 +156,7 @@ async fn functional_cli_validate_valid_spec() {
     let spec_path = temp_dir.path().join("config.yaml");
     std::fs::write(
         &spec_path,
-        "proxies:\n  - id: test\n    listen_path: /test\n    backend_protocol: http\n    backend_host: localhost\n    backend_port: 3000\nconsumers: []\nplugin_configs: []\n",
+        "proxies:\n  - id: test\n    listen_path: /test\n    backend_scheme: http\n    backend_host: localhost\n    backend_port: 3000\nconsumers: []\nplugin_configs: []\n",
     )
     .unwrap();
 
@@ -547,7 +547,7 @@ async fn functional_cli_smart_path_discovery_from_cwd() {
             r#"proxies:
   - id: "smart-path-proxy"
     listen_path: "/sp"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
     strip_listen_path: true
@@ -654,7 +654,7 @@ async fn functional_cli_spec_flag_infers_file_mode() {
             r#"proxies:
   - id: "spec-infer-proxy"
     listen_path: "/si"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
     strip_listen_path: true
@@ -759,7 +759,7 @@ async fn functional_cli_precedence_flag_beats_env_var() {
             r#"proxies:
   - id: "flag-wins-proxy"
     listen_path: "/fw"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
     strip_listen_path: true

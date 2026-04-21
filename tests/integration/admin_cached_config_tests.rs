@@ -11,8 +11,8 @@ use ferrum_edge::admin::{
     start_admin_listener,
 };
 use ferrum_edge::config::types::{
-    AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
-    UpstreamTarget,
+    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, PluginConfig, PluginScope,
+    Proxy, Upstream, UpstreamTarget,
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -71,7 +71,9 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         name: Some(format!("Test Proxy {}", id)),
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: host.to_string(),
         backend_port: port,
         backend_path: None,
@@ -1186,8 +1188,8 @@ async fn test_batch_create_consumers_and_proxies() {
             {"id": "c3", "username": "user3", "credentials": {}}
         ],
         "proxies": [
-            {"id": "p1", "listen_path": "/a", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true},
-            {"id": "p2", "listen_path": "/b", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+            {"id": "p1", "listen_path": "/a", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true},
+            {"id": "p2", "listen_path": "/b", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ]
     });
 
@@ -1216,7 +1218,7 @@ async fn test_batch_create_plugin_configs() {
     // First create a proxy for the plugin to reference
     let proxy_batch = json!({
         "proxies": [
-            {"id": "bp1", "listen_path": "/bp1", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+            {"id": "bp1", "listen_path": "/bp1", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ]
     });
     let (status, _) = admin_post(&base_url, "/batch", &token, &proxy_batch).await;
@@ -1247,7 +1249,7 @@ async fn test_batch_create_proxy_and_proxy_plugin_association_same_request() {
             {
                 "id": "assoc-proxy",
                 "listen_path": "/assoc",
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": 8080,
                 "strip_listen_path": true,
@@ -1342,7 +1344,7 @@ async fn test_backup_returns_full_config() {
             {"id": "bu1", "name": "backup_upstream", "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]}
         ],
         "proxies": [
-            {"id": "bp1", "listen_path": "/backup1", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true, "upstream_id": "bu1"}
+            {"id": "bp1", "listen_path": "/backup1", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true, "upstream_id": "bu1"}
         ],
         "plugin_configs": [
             {"id": "bpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
@@ -1404,7 +1406,7 @@ async fn test_backup_resource_filter() {
             {"id": "fu1", "name": "filter_upstream", "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]}
         ],
         "proxies": [
-            {"id": "fp1", "listen_path": "/filter", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+            {"id": "fp1", "listen_path": "/filter", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ],
         "plugin_configs": [
             {"id": "fpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
@@ -1457,7 +1459,7 @@ async fn test_restore_replaces_all_config() {
             {"id": "old_c1", "username": "old_user", "credentials": {}},
         ],
         "proxies": [
-            {"id": "old_p1", "listen_path": "/old", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+            {"id": "old_p1", "listen_path": "/old", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ]
     });
     let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
@@ -1470,8 +1472,8 @@ async fn test_restore_replaces_all_config() {
             {"id": "new_c2", "username": "new_user2", "credentials": {}}
         ],
         "proxies": [
-            {"id": "new_p1", "listen_path": "/new1", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true},
-            {"id": "new_p2", "listen_path": "/new2", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+            {"id": "new_p1", "listen_path": "/new1", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true},
+            {"id": "new_p2", "listen_path": "/new2", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ]
     });
     let (status, body) =
@@ -1509,7 +1511,7 @@ async fn test_backup_then_restore_roundtrip() {
             {"id": "rt_u1", "name": "roundtrip_upstream", "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]}
         ],
         "proxies": [
-            {"id": "rt_p1", "listen_path": "/roundtrip", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+            {"id": "rt_p1", "listen_path": "/roundtrip", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ],
         "plugin_configs": [
             {"id": "rt_pc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
@@ -1558,7 +1560,7 @@ async fn test_backup_then_restore_roundtrip_with_proxy_plugin_association() {
             {
                 "id": "assoc-rt-proxy",
                 "listen_path": "/assoc-rt",
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": 8080,
                 "strip_listen_path": true,
@@ -1635,7 +1637,7 @@ async fn test_batch_create_proxies_persists_hosts() {
                 "id": "hosts_p1",
                 "listen_path": "/hosts-test",
                 "hosts": ["api.example.com", "*.staging.example.com"],
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": 8080,
                 "strip_listen_path": true
@@ -2044,7 +2046,7 @@ async fn test_upstream_delete_referenced_by_proxy_returns_409() {
     let proxy = json!({
         "id": "ref-p1",
         "listen_path": "/ref-test",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": 8080,
         "strip_listen_path": true,
@@ -2081,7 +2083,7 @@ async fn test_create_proxy_returns_503_when_db_unavailable() {
 
     let proxy = json!({
         "listen_path": "/blocked",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": 8080,
     });
@@ -2163,7 +2165,7 @@ async fn test_update_proxy_returns_503_when_db_unavailable() {
     let proxy = json!({
         "id": "any-id",
         "listen_path": "/any",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": 8080,
     });
@@ -2303,7 +2305,7 @@ async fn test_create_proxy_returns_503_when_no_db() {
 
     let proxy = json!({
         "listen_path": "/no-db",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": 8080,
     });
@@ -2362,7 +2364,7 @@ async fn test_db_recovery_allows_writes_after_outage() {
     let proxy = json!({
         "id": "recovery-p1",
         "listen_path": "/recovery",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": 8080,
         "strip_listen_path": true,
@@ -2457,7 +2459,7 @@ async fn test_proxy_crud_create_update_delete() {
         "id": "crud-proxy-1",
         "name": "My Proxy",
         "listen_path": "/crud-proxy",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": 9999,
         "strip_listen_path": true,
@@ -2476,7 +2478,7 @@ async fn test_proxy_crud_create_update_delete() {
         "id": "crud-proxy-1",
         "name": "Updated Proxy",
         "listen_path": "/crud-proxy-updated",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "new-host.example.com",
         "backend_port": 7777,
         "strip_listen_path": false,
@@ -2612,7 +2614,7 @@ async fn test_stream_proxy_admin_shape_preserved_across_get_and_backup() {
 
     let proxy = json!({
         "id": "stream-shape-proxy",
-        "backend_protocol": "tcp",
+        "backend_scheme": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432,
         "listen_port": 19010,
@@ -2719,7 +2721,7 @@ async fn test_batch_create_returns_503_when_db_unavailable() {
 
     let batch = json!({
         "proxies": [
-            {"id": "batch-blocked", "listen_path": "/blocked", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+            {"id": "batch-blocked", "listen_path": "/blocked", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ]
     });
     let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;

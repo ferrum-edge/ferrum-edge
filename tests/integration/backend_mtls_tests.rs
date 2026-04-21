@@ -5,7 +5,7 @@
 use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::env_config::{EnvConfig, OperatingMode};
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, Proxy};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
 use ferrum_edge::connection_pool::ConnectionPool;
 use std::collections::HashMap;
 use std::io::Write;
@@ -19,7 +19,9 @@ fn create_test_mtls_proxy() -> Proxy {
         name: Some("mTLS Test Proxy".to_string()),
         hosts: vec![],
         listen_path: Some("/mtls-test".to_string()),
-        backend_protocol: BackendProtocol::Https,
+        backend_scheme: Some(BackendScheme::Https),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Https, false)),
         backend_host: "mtls-backend.example.com".to_string(),
         backend_port: 443,
         backend_path: None,

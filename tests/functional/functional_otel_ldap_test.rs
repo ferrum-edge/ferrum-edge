@@ -183,7 +183,7 @@ async fn test_otel_tracing_injects_traceparent() {
 proxies:
   - id: "traced-proxy"
     listen_path: "/traced"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -267,7 +267,7 @@ async fn test_otel_tracing_preserves_existing_traceparent() {
 proxies:
   - id: "traced-proxy"
     listen_path: "/traced"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -422,7 +422,7 @@ async fn test_ldap_auth_rejects_when_server_unreachable() {
 proxies:
   - id: "auth-proxy"
     listen_path: "/secure"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -482,7 +482,7 @@ async fn test_ldap_auth_rejects_missing_credentials() {
 proxies:
   - id: "auth-proxy"
     listen_path: "/secure"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true

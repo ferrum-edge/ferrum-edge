@@ -66,7 +66,7 @@ proxies:
   # Both internal proxies share the same auth + rate limit group plugins
   - id: users-api
     listen_path: /api/users
-    backend_protocol: http
+    backend_scheme: http
     backend_host: users-svc
     backend_port: 3000
     plugins:
@@ -75,7 +75,7 @@ proxies:
 
   - id: orders-api
     listen_path: /api/orders
-    backend_protocol: http
+    backend_scheme: http
     backend_host: orders-svc
     backend_port: 3001
     plugins:
@@ -85,7 +85,7 @@ proxies:
   # Public proxy — no group plugins, has its own proxy-scoped CORS
   - id: public-frontend
     listen_path: /public
-    backend_protocol: http
+    backend_scheme: http
     backend_host: frontend-svc
     backend_port: 8080
     plugins:
@@ -696,7 +696,7 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `consumer_username` | String or null | Identified consumer username (gateway Consumer) or external authenticated identity resolved during `on_stream_connect`. Omitted from JSON when null |
 | `backend_target` | String | Backend target (`host:port`); empty if target resolution failed before LB/config lookup |
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
-| `protocol` | String | Protocol string: `tcp`, `tcp_tls`, `udp`, or `dtls` |
+| `protocol` | String | Protocol string: `tcp`, `tcps`, `udp`, or `dtls` |
 | `listen_port` | u16 | Proxy listen port |
 | `duration_ms` | f64 | Connection/session lifetime in milliseconds |
 | `bytes_sent` | u64 | Bytes the gateway **relayed from the client to the backend** (client→backend direction) |
@@ -2962,7 +2962,7 @@ A typical AI gateway proxy combining all seven AI plugins with `ai_federation` f
 ```yaml
 # Proxy config — ai_federation handles provider routing, so backend_host is unused
 listen_path: /v1/chat/completions
-backend_protocol: https
+backend_scheme: https
 backend_host: placeholder.local
 backend_port: 443
 

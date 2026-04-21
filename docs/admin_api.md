@@ -42,7 +42,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "listen_path": "/new-api",
-    "backend_protocol": "http",
+    "backend_scheme": "http",
     "backend_host": "backend",
     "backend_port": 3000,
     "strip_listen_path": true
@@ -55,7 +55,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
 # Update a proxy
 curl -X PUT -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"listen_path": "/new-api", "backend_host": "new-backend", "backend_port": 4000, "backend_protocol": "http"}' \
+  -d '{"listen_path": "/new-api", "backend_host": "new-backend", "backend_port": 4000, "backend_scheme": "http"}' \
   http://localhost:9000/proxies/{proxy_id}
 
 # Delete a proxy
@@ -73,7 +73,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   -d '{
     "listen_path": "",
     "listen_port": 5432,
-    "backend_protocol": "tcp",
+    "backend_scheme": "tcp",
     "backend_host": "db.internal",
     "backend_port": 5432
   }' \

@@ -84,7 +84,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::types::{BackendProtocol, Consumer, Proxy};
+use crate::config::types::{BackendScheme, Consumer, Proxy};
 use crate::consumer_index::ConsumerIndex;
 
 /// Protocol categories that plugins can declare support for.
@@ -813,7 +813,7 @@ pub async fn log_with_mirror(
 
 /// Context for stream proxy (TCP/UDP) plugin hooks.
 ///
-/// Fields like `proxy_id`, `proxy_name`, `listen_port`, and `backend_protocol`
+/// Fields like `proxy_id`, `proxy_name`, `listen_port`, and `backend_scheme`
 /// are available for custom plugins to use in their `on_stream_connect` logic.
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -822,7 +822,11 @@ pub struct StreamConnectionContext {
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub listen_port: u16,
-    pub backend_protocol: BackendProtocol,
+    /// Wire-level scheme the proxy uses to talk to its backend.
+    /// Always one of the stream variants (`Tcp`, `Tcps`, `Udp`, `Dtls`) —
+    /// validation guarantees stream proxies have a scheme set before any
+    /// listener is bound, so this is non-optional.
+    pub backend_scheme: BackendScheme,
     /// Pre-built consumer index shared across stream connections.
     pub consumer_index: Arc<ConsumerIndex>,
     /// Gateway Consumer identified for this stream connection, if any.

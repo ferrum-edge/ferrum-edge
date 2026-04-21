@@ -210,7 +210,7 @@ fn write_config(dir: &TempDir, backend_port: u16) -> std::path::PathBuf {
 proxies:
   - id: "slow-proxy"
     listen_path: "/slow"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true

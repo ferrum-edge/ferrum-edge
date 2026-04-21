@@ -10,7 +10,7 @@ proxies:
     # error, causing the Ferrum container to exit on startup. Omit
     # entirely.
     listen_port: 5004
-    backend_protocol: dtls
+    backend_scheme: dtls
     backend_host: "127.0.0.1"
     backend_port: 3006
     frontend_tls: true
@@ -22,7 +22,7 @@ proxies:
   - id: "udp-dtls-e2e-health"
     name: "Health"
     listen_path: "/health"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 3010
     strip_listen_path: false

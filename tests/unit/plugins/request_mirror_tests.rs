@@ -26,7 +26,7 @@ fn make_ctx_with_proxy() -> RequestContext {
         "listen_path": "/api",
         "backend_host": "backend.local",
         "backend_port": 8080,
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_read_timeout_ms": 30000
     }))
     .unwrap();

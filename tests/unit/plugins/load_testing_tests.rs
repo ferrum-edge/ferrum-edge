@@ -407,7 +407,7 @@ async fn test_triggers_when_key_matches() {
         "listen_path": "/api",
         "backend_host": "backend.local",
         "backend_port": 8080,
-        "backend_protocol": "http"
+        "backend_scheme": "http"
     }))
     .unwrap();
     ctx.matched_proxy = Some(Arc::new(proxy));
@@ -438,7 +438,7 @@ async fn test_triggers_when_key_matches() {
             "listen_path": "/api",
             "backend_host": "backend.local",
             "backend_port": 8080,
-            "backend_protocol": "http"
+            "backend_scheme": "http"
         }))
         .unwrap(),
     ));

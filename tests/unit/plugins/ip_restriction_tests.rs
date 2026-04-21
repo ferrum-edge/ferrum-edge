@@ -15,7 +15,7 @@ fn create_stream_context_with_ip(ip: &str) -> StreamConnectionContext {
         proxy_id: "test-proxy".to_string(),
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 8080,
-        backend_protocol: ferrum_edge::config::types::BackendProtocol::Tcp,
+        backend_scheme: ferrum_edge::config::types::BackendScheme::Tcp,
         consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
         identified_consumer: None,
         authenticated_identity: None,

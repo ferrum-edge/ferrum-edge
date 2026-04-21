@@ -38,7 +38,7 @@ use ferrum_edge::admin::{
     jwt_auth::{JwtConfig, JwtManager},
     start_admin_listener,
 };
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
@@ -74,7 +74,9 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         name: Some(format!("Resilience Proxy {}", id)),
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "127.0.0.1".to_string(),
         backend_port,
         backend_path: None,

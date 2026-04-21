@@ -25,7 +25,7 @@ async fn test_prometheus_metrics_endpoint_returns_data() {
 proxies:
   - id: "test-proxy"
     listen_path: "/test"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -119,7 +119,7 @@ async fn test_prometheus_metrics_reflect_traffic() {
 proxies:
   - id: "traffic-proxy"
     listen_path: "/traffic"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true

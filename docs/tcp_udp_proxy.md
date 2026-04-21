@@ -15,7 +15,7 @@ Ferrum Edge supports raw TCP and UDP stream proxying alongside its HTTP-based pr
 | Protocol | Description |
 |----------|-------------|
 | `tcp` | Plain TCP stream forwarding |
-| `tcp_tls` | TCP with TLS origination to backend (gateway connects to backend over TLS) |
+| `tcps` | TCP with TLS origination to backend (gateway connects to backend over TLS) |
 | `udp` | Plain UDP datagram forwarding with session tracking |
 | `dtls` | UDP with DTLS 1.2/1.3 encryption to backend (auto-negotiated via `dimpl`) |
 
@@ -31,7 +31,7 @@ proxies:
   - id: "postgres-proxy"
     name: "PostgreSQL Proxy"
     listen_port: 5432
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "db.internal"
     backend_port: 5432
     enabled: true
@@ -39,7 +39,7 @@ proxies:
   - id: "secure-redis"
     name: "Redis TLS Proxy"
     listen_port: 6380
-    backend_protocol: tcp_tls
+    backend_scheme: tcps
     backend_host: "redis.internal"
     backend_port: 6379
     frontend_tls: true        # Terminate TLS on incoming connections
@@ -49,7 +49,7 @@ proxies:
   - id: "dns-proxy"
     name: "DNS Proxy"
     listen_port: 5353
-    backend_protocol: udp
+    backend_scheme: udp
     backend_host: "dns.internal"
     backend_port: 53
     udp_idle_timeout_seconds: 30
@@ -58,7 +58,7 @@ proxies:
   - id: "secure-iot"
     name: "IoT DTLS Proxy"
     listen_port: 5684
-    backend_protocol: dtls
+    backend_scheme: dtls
     backend_host: "iot-backend.internal"
     backend_port: 5684
     backend_tls_verify_server_cert: false   # Skip cert verification (testing)
@@ -71,7 +71,7 @@ proxies:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen_port` | `u16` | (required) | Dedicated port for this stream proxy (1024-65535) |
-| `backend_protocol` | `string` | (required) | One of: `tcp`, `tcp_tls`, `udp`, `dtls` |
+| `backend_scheme` | `string` | (required) | One of: `tcp`, `tcps`, `udp`, `dtls` |
 | `frontend_tls` | `bool` | `false` | Terminate TLS (TCP) or DTLS (UDP) on incoming connections |
 | `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
@@ -90,8 +90,8 @@ All combinations of frontend and backend encryption are supported:
 |---------------|------------------|-------------------|
 | `tcp` | Plain TCP | Plain TCP |
 | `tcp` + `frontend_tls: true` | TLS | Plain TCP |
-| `tcp_tls` | Plain TCP | TLS |
-| `tcp_tls` + `frontend_tls: true` | TLS | TLS (full e2e) |
+| `tcps` | Plain TCP | TLS |
+| `tcps` + `frontend_tls: true` | TLS | TLS (full e2e) |
 
 ### UDP Encryption Matrix
 
@@ -120,7 +120,7 @@ Set `passthrough: true` to forward encrypted client bytes directly to the backen
 proxies:
   - id: "tls-passthrough"
     listen_port: 8444
-    backend_protocol: tcp
+    backend_scheme: tcp
     passthrough: true              # Forward raw encrypted bytes
     backend_host: "backend.internal"
     backend_port: 443
@@ -133,7 +133,7 @@ proxies:
   # Route TLS traffic for api.example.com to the API backend
   - id: "tls-api"
     listen_port: 8444
-    backend_protocol: tcp
+    backend_scheme: tcp
     passthrough: true
     hosts: ["api.example.com"]
     backend_host: "api-backend.internal"
@@ -142,7 +142,7 @@ proxies:
   # Route TLS traffic for *.db.example.com to the database backend
   - id: "tls-db"
     listen_port: 8444
-    backend_protocol: tcp
+    backend_scheme: tcp
     passthrough: true
     hosts: ["*.db.example.com"]
     backend_host: "db-backend.internal"
@@ -151,7 +151,7 @@ proxies:
   # Catch-all: any other SNI goes to the default backend
   - id: "tls-default"
     listen_port: 8444
-    backend_protocol: tcp
+    backend_scheme: tcp
     passthrough: true
     hosts: []
     backend_host: "default-backend.internal"
@@ -160,7 +160,7 @@ proxies:
 
 **Constraints:**
 - `passthrough` and `frontend_tls` are mutually exclusive
-- Only valid on stream proxies (`tcp`, `tcp_tls`, `udp`, `dtls`)
+- Only valid on stream proxies (`tcp`, `tcps`, `udp`, `dtls`)
 - Backend TLS fields (`backend_tls_client_cert_path`, etc.) cannot be set — the proxy does not originate its own TLS
 - Plugins that require decrypted content cannot run; connection-level plugins (IP restriction, rate limiting, logging, throttle) still operate normally
 - SNI hostname is available in `StreamConnectionContext.sni_hostname` and `StreamTransactionSummary.sni_hostname` for logging plugins
@@ -179,7 +179,7 @@ Set `frontend_tls: true` to accept TLS connections from clients. The gateway use
 
 ### Backend TLS Origination (TCP)
 
-Use `backend_protocol: tcp_tls` to connect to the backend over TLS. The gateway establishes a TLS connection to the backend, forwarding the client's plaintext traffic encrypted.
+Use `backend_scheme: tcps` to connect to the backend over TLS. The gateway establishes a TLS connection to the backend, forwarding the client's plaintext traffic encrypted.
 
 Backend TLS settings are controlled by the proxy's `backend_tls_*` fields:
 - `backend_tls_verify_server_cert` (default `true`) — verify backend certificate
@@ -194,7 +194,7 @@ Set `frontend_tls: true` on a UDP proxy to accept DTLS-encrypted connections fro
 proxies:
   - id: "secure-iot-frontend"
     listen_port: 5684
-    backend_protocol: udp          # Plain UDP to backend
+    backend_scheme: udp          # Plain UDP to backend
     backend_host: "iot.internal"
     backend_port: 5684
     frontend_tls: true             # Accept DTLS from clients
@@ -210,7 +210,7 @@ FERRUM_DTLS_KEY_PATH=/path/to/dtls-key.pem
 
 ### Backend DTLS Origination (UDP)
 
-Use `backend_protocol: dtls` to encrypt UDP datagrams to the backend using DTLS 1.2/1.3 (auto-negotiated). The gateway accepts plain UDP from clients and establishes a DTLS session per client to the backend.
+Use `backend_scheme: dtls` to encrypt UDP datagrams to the backend using DTLS 1.2/1.3 (auto-negotiated). The gateway accepts plain UDP from clients and establishes a DTLS session per client to the backend.
 
 DTLS uses the same `backend_tls_*` proxy fields as TCP TLS:
 
@@ -218,7 +218,7 @@ DTLS uses the same `backend_tls_*` proxy fields as TCP TLS:
 proxies:
   - id: "secure-udp-backend"
     listen_port: 5685
-    backend_protocol: dtls
+    backend_scheme: dtls
     backend_host: "backend.internal"
     backend_port: 5684
     backend_tls_verify_server_cert: false     # Skip verification (testing)
@@ -229,13 +229,13 @@ proxies:
 
 ### Full DTLS (Frontend + Backend)
 
-Combine `frontend_tls: true` with `backend_protocol: dtls` for end-to-end DTLS encryption:
+Combine `frontend_tls: true` with `backend_scheme: dtls` for end-to-end DTLS encryption:
 
 ```yaml
 proxies:
   - id: "full-dtls-proxy"
     listen_port: 5686
-    backend_protocol: dtls           # DTLS to backend
+    backend_scheme: dtls           # DTLS to backend
     backend_host: "secure-backend.internal"
     backend_port: 5684
     frontend_tls: true               # DTLS from clients
@@ -294,7 +294,7 @@ upstreams:
 proxies:
   - id: "postgres-proxy"
     listen_port: 5432
-    backend_protocol: tcp
+    backend_scheme: tcp
     upstream_id: "postgres-cluster"
 ```
 
@@ -344,14 +344,14 @@ TCP connections are monitored for idle activity. When no data is transferred in 
 proxies:
   - id: "db-proxy"
     listen_port: 5432
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "db.internal"
     backend_port: 5432
     tcp_idle_timeout_seconds: 600   # 10 min for long-lived DB connections
 
   - id: "cache-proxy"
     listen_port: 6379
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "redis.internal"
     backend_port: 6379
     tcp_idle_timeout_seconds: 30    # 30 sec for short-lived cache connections

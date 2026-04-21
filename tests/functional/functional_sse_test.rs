@@ -113,7 +113,7 @@ async fn setup_sse_config() -> (TempDir, String, u16) {
 proxies:
   - id: "sse-proxy"
     listen_path: "/sse"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true

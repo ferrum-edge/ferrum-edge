@@ -68,7 +68,7 @@ Each resource in the arrays uses the same schema as the individual `POST` endpoi
     {
       "name": "service-a",
       "listen_path": "/api/service-a",
-      "backend_protocol": "http",
+      "backend_scheme": "http",
       "backend_host": "svc-a.internal",
       "backend_port": 8080
     }
@@ -137,7 +137,7 @@ Create consumers, proxies, and plugin configs in a single request:
       "id": "proxy-1",
       "name": "svc-1",
       "listen_path": "/svc/1",
-      "backend_protocol": "http",
+      "backend_scheme": "http",
       "backend_host": "localhost",
       "backend_port": 9090
     },
@@ -145,7 +145,7 @@ Create consumers, proxies, and plugin configs in a single request:
       "id": "proxy-2",
       "name": "svc-2",
       "listen_path": "/svc/2",
-      "backend_protocol": "http",
+      "backend_scheme": "http",
       "backend_host": "localhost",
       "backend_port": 9090
     }
@@ -222,7 +222,7 @@ curl -X POST http://localhost:9000/batch \
         "id": "payments-proxy",
         "name": "payments-api",
         "listen_path": "/api/payments",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "payments-service.internal",
         "backend_port": 8080
       }
@@ -288,7 +288,7 @@ curl -X POST http://localhost:9000/batch \
       {
         "name": "user-service",
         "listen_path": "/api/users",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "upstream_id": "user-svc-upstream"
       }
     ]
@@ -335,7 +335,7 @@ for i in range(0, len(tenants), CHUNK_SIZE):
             "id": proxy_id,
             "name": consumer_name,
             "listen_path": f"/tenant/{consumer_name}",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": t["backend_host"],
             "backend_port": int(t["backend_port"]),
         })

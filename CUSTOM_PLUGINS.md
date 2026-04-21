@@ -506,7 +506,7 @@ impl Plugin for MyStreamPlugin {
         &self,
         ctx: &mut StreamConnectionContext,
     ) -> PluginResult {
-        // ctx.client_ip, ctx.proxy_id, ctx.listen_port, ctx.backend_protocol
+        // ctx.client_ip, ctx.proxy_id, ctx.listen_port, ctx.backend_scheme
         // ctx.tls_client_cert_der (available for TCP+TLS after handshake)
         // ctx.metadata — shared between connect and disconnect
         ctx.metadata.insert("connected_at".to_string(), "...".to_string());
@@ -685,7 +685,7 @@ pub struct StreamConnectionContext {
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub listen_port: u16,
-    pub backend_protocol: BackendProtocol,
+    pub backend_scheme: BackendScheme,
     pub consumer_index: Arc<ConsumerIndex>,
     pub identified_consumer: Option<Consumer>,
     pub authenticated_identity: Option<String>,

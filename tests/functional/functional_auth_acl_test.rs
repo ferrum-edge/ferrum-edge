@@ -429,7 +429,7 @@ async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
             &json!({
                 "id": id,
                 "listen_path": path,
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,
@@ -501,7 +501,7 @@ async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
         &json!({
             "id": "proxy-jwks-acl-external-allow",
             "listen_path": "/jwks-acl-external-allow",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -522,7 +522,7 @@ async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
         &json!({
             "id": "proxy-jwks-acl-external-deny",
             "listen_path": "/jwks-acl-external-deny",
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -725,7 +725,7 @@ async fn test_auth_acl_comprehensive() {
             &json!({
                 "id": id,
                 "listen_path": path,
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,
@@ -925,7 +925,7 @@ async fn test_auth_acl_comprehensive() {
             .json(&json!({
                 "id": id,
                 "listen_path": path,
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,
@@ -969,7 +969,7 @@ async fn test_auth_acl_comprehensive() {
             .json(&json!({
                 "id": id,
                 "listen_path": path,
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,

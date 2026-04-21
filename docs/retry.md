@@ -54,7 +54,7 @@ Add a `retry` block to any proxy to enable retries:
 proxies:
   - id: "my-api"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "10.0.1.1"
     backend_port: 8080
     retry:
@@ -164,7 +164,7 @@ When a proxy has both `retry` and `upstream_id` configured, retries automaticall
 proxies:
   - id: "my-api"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "10.0.1.1"
     backend_port: 8080
     upstream_id: "api-servers"

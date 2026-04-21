@@ -279,7 +279,7 @@ proxies:
   - id: "my-api"
     name: "My Backend API"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "backend-service"
     backend_port: 3000
     strip_listen_path: true
@@ -325,14 +325,14 @@ proxies:
   # TCP proxy with TLS origination to backend
   - id: "postgres-proxy"
     listen_port: 5432
-    backend_protocol: tcp_tls
+    backend_scheme: tcps
     backend_host: "db.internal"
     backend_port: 5432
 
   # UDP proxy with DTLS encryption to backend
   - id: "iot-proxy"
     listen_port: 5684
-    backend_protocol: dtls
+    backend_scheme: dtls
     backend_host: "iot-backend.internal"
     backend_port: 5684
     backend_tls_verify_server_cert: false
@@ -341,7 +341,7 @@ proxies:
   # Full DTLS e2e: DTLS client → gateway → DTLS backend
   - id: "secure-iot"
     listen_port: 5685
-    backend_protocol: dtls
+    backend_scheme: dtls
     backend_host: "secure-iot.internal"
     backend_port: 5684
     frontend_tls: true

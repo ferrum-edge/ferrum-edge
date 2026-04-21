@@ -5,7 +5,8 @@ proxies:
   - id: "h3-echo"
     name: "HTTP/3 Echo"
     listen_path: "/echo"
-    backend_protocol: h3
+    backend_scheme: https
+    backend_prefer_h3: true
     backend_host: "127.0.0.1"
     backend_port: 4445
     strip_listen_path: false
@@ -20,7 +21,7 @@ proxies:
   - id: "h3-health"
     name: "Health Check"
     listen_path: "/health"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 4010
     strip_listen_path: false

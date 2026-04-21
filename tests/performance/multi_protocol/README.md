@@ -91,7 +91,7 @@ Options:
 
 ## Configuration
 
-Gateway configs are in `configs/`. Each protocol has its own YAML file that configures the appropriate `backend_protocol` and ports.
+Gateway configs are in `configs/`. Each protocol has its own YAML file that configures the appropriate `backend_scheme` and ports.
 
 Key environment variables set by the test runner:
 

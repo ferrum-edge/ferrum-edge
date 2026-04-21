@@ -249,7 +249,7 @@ The test uses SQLite with the following schema (automatically created):
 **proxies table**
 - `id` (TEXT PRIMARY KEY): Unique proxy identifier
 - `listen_path` (TEXT NOT NULL UNIQUE): Path the proxy listens on
-- `backend_protocol` (TEXT): Backend protocol (http/https)
+- `backend_scheme` (TEXT): Backend protocol (http/https)
 - `backend_host` (TEXT): Backend hostname
 - `backend_port` (INTEGER): Backend port number
 - `strip_listen_path` (INTEGER): Whether to strip listen path from requests

@@ -18,7 +18,7 @@ use crate::circuit_breaker::CircuitBreakerCache;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::BackendTlsConfigBuilder;
 
-use crate::config::types::{BackendProtocol, GatewayConfig, Proxy};
+use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
@@ -456,24 +456,24 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     );
 
     // Pre-capture proxy metadata for plugin context (static for this listener's lifetime).
-    let (proxy_name, proxy_namespace, backend_protocol) = {
+    let (proxy_name, proxy_namespace, backend_scheme) = {
         let current_config = config.load();
         current_config
             .proxies
             .iter()
             .find(|p| *p.id == *proxy_id)
-            .map(|p| (p.name.clone(), p.namespace.clone(), p.backend_protocol))
+            .map(|p| (p.name.clone(), p.namespace.clone(), p.effective_scheme()))
             .unwrap_or((
                 None,
                 crate::config::types::default_namespace(),
-                BackendProtocol::Tcp,
+                BackendScheme::Tcp,
             ))
     };
 
     // Pre-resolve plugins for this proxy's protocol (TCP).
     let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Tcp);
 
-    // Pre-build backend TLS config if this proxy uses TcpTls backend protocol.
+    // Pre-build backend TLS config if this proxy uses Tcps (TCP+TLS) backend scheme.
     // This avoids reading certificate files from disk on every connection.
     let backend_tls_cache: Option<Arc<CachedBackendTlsConfig>> = {
         let current_config = config.load();
@@ -481,7 +481,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
             .proxies
             .iter()
             .find(|p| *p.id == *proxy_id)
-            .filter(|p| p.backend_protocol == BackendProtocol::TcpTls)
+            .filter(|p| p.dispatch_kind == crate::config::types::DispatchKind::TcpTls)
             .map(|proxy| {
                 CachedBackendTlsConfig::build(
                     proxy,
@@ -559,7 +559,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         proxy_id: proxy_id.to_string(),
                         proxy_name: proxy_name.clone(),
                         listen_port: port,
-                        backend_protocol,
+                        backend_scheme,
                         consumer_index,
                         identified_consumer: None,
                         authenticated_identity: None,
@@ -695,7 +695,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             consumer_username,
                             backend_target: result.backend.backend_target,
                             backend_resolved_ip: result.backend.backend_resolved_ip,
-                            protocol: backend_protocol.to_string(),
+                            protocol: backend_scheme.to_string(),
                             listen_port: port,
                             duration_ms,
                             bytes_sent: bytes_in,
@@ -730,7 +730,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
 struct TcpConnParams {
     backend_host: String,
     backend_port: u16,
-    backend_protocol: BackendProtocol,
+    backend_scheme: BackendScheme,
     dns_override: Option<String>,
     dns_cache_ttl_seconds: Option<u64>,
     backend_connect_timeout_ms: u64,
@@ -940,7 +940,7 @@ async fn handle_tcp_connection_inner(
         let params = TcpConnParams {
             backend_host,
             backend_port,
-            backend_protocol: proxy.backend_protocol,
+            backend_scheme: proxy.effective_scheme(),
             dns_override: proxy.dns_override.clone(),
             dns_cache_ttl_seconds: proxy.dns_cache_ttl_seconds,
             backend_connect_timeout_ms: proxy.backend_connect_timeout_ms,
@@ -1100,7 +1100,7 @@ async fn handle_tcp_connection_inner(
         });
     }
 
-    let is_backend_tls = params.backend_protocol == BackendProtocol::TcpTls;
+    let is_backend_tls = params.backend_scheme == BackendScheme::Tcps;
     let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
     let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
         Some(Duration::from_secs(params.tcp_idle_timeout_seconds))

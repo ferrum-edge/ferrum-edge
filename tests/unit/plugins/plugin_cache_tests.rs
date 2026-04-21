@@ -3,7 +3,8 @@
 use chrono::Utc;
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{
-    AuthMode, BackendProtocol, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
+    PluginScope, Proxy,
 };
 use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
 use serde_json::json;
@@ -56,7 +57,9 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
         name: Some(format!("Proxy {}", id)),
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "localhost".to_string(),
         backend_port: 3000,
         backend_path: None,

@@ -1,5 +1,5 @@
 use chrono::Utc;
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, Proxy, ResponseBodyMode};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
 use ferrum_edge::proxy::body::ProxyBody;
 use http_body::Body;
 
@@ -10,7 +10,9 @@ fn test_proxy() -> Proxy {
         name: Some("Test Proxy".into()),
         hosts: vec![],
         listen_path: Some("/api".to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "localhost".into(),
         backend_port: 3000,
         backend_path: None,
@@ -106,7 +108,7 @@ fn test_proxy_yaml_default_response_body_mode() {
     let yaml = r#"
         id: test
         listen_path: /api
-        backend_protocol: http
+        backend_scheme: http
         backend_host: localhost
         backend_port: 3000
     "#;
@@ -119,7 +121,7 @@ fn test_proxy_yaml_buffer_response_body_mode() {
     let yaml = r#"
         id: test
         listen_path: /api
-        backend_protocol: http
+        backend_scheme: http
         backend_host: localhost
         backend_port: 3000
         response_body_mode: buffer
@@ -133,7 +135,7 @@ fn test_proxy_yaml_stream_response_body_mode() {
     let yaml = r#"
         id: test
         listen_path: /api
-        backend_protocol: http
+        backend_scheme: http
         backend_host: localhost
         backend_port: 3000
         response_body_mode: stream

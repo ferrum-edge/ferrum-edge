@@ -6,7 +6,7 @@ proxies:
   - id: "proxy-health"
     name: "Health Check Proxy"
     listen_path: "/health"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 3001
     strip_listen_path: false
@@ -22,7 +22,7 @@ proxies:
   - id: "proxy-users"
     name: "Users API Proxy"
     listen_path: "/api/users"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 3001
     strip_listen_path: false
@@ -38,7 +38,7 @@ proxies:
   - id: "proxy-data"
     name: "Data API Proxy"
     listen_path: "/api/data"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 3001
     strip_listen_path: false

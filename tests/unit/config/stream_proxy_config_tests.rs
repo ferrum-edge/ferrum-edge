@@ -2,18 +2,20 @@
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    ActiveHealthCheck, AuthMode, BackendProtocol, GatewayConfig, HealthProbeType,
+    ActiveHealthCheck, AuthMode, BackendScheme, DispatchKind, GatewayConfig, HealthProbeType,
     MAX_TCP_IDLE_TIMEOUT, Proxy,
 };
 
-fn make_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy {
+fn make_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
     Proxy {
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
         listen_path: None,
-        backend_protocol: protocol,
+        backend_scheme: Some(scheme),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((scheme, false)),
         backend_host: "localhost".into(),
         backend_port: 5432,
         backend_path: None,
@@ -68,7 +70,9 @@ fn make_http_proxy(id: &str, listen_path: &str) -> Proxy {
         name: None,
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "localhost".into(),
         backend_port: 3000,
         backend_path: None,
@@ -128,70 +132,65 @@ fn test_config(proxies: Vec<Proxy>) -> GatewayConfig {
     }
 }
 
-// --- BackendProtocol helper method tests ---
+// --- BackendScheme helper method tests ---
 
 #[test]
-fn test_is_stream_proxy() {
-    assert!(BackendProtocol::Tcp.is_stream_proxy());
-    assert!(BackendProtocol::TcpTls.is_stream_proxy());
-    assert!(BackendProtocol::Udp.is_stream_proxy());
-    assert!(BackendProtocol::Dtls.is_stream_proxy());
-    assert!(!BackendProtocol::Http.is_stream_proxy());
-    assert!(!BackendProtocol::Https.is_stream_proxy());
-    assert!(!BackendProtocol::Ws.is_stream_proxy());
-    assert!(!BackendProtocol::Wss.is_stream_proxy());
-    assert!(!BackendProtocol::Grpc.is_stream_proxy());
-    assert!(!BackendProtocol::Grpcs.is_stream_proxy());
-    assert!(!BackendProtocol::H3.is_stream_proxy());
+fn test_is_stream() {
+    assert!(BackendScheme::Tcp.is_stream());
+    assert!(BackendScheme::Tcps.is_stream());
+    assert!(BackendScheme::Udp.is_stream());
+    assert!(BackendScheme::Dtls.is_stream());
+    assert!(!BackendScheme::Http.is_stream());
+    assert!(!BackendScheme::Https.is_stream());
 }
 
 #[test]
 fn test_is_udp() {
-    assert!(BackendProtocol::Udp.is_udp());
-    assert!(BackendProtocol::Dtls.is_udp());
-    assert!(!BackendProtocol::Tcp.is_udp());
-    assert!(!BackendProtocol::TcpTls.is_udp());
-    assert!(!BackendProtocol::Http.is_udp());
+    assert!(BackendScheme::Udp.is_udp());
+    assert!(BackendScheme::Dtls.is_udp());
+    assert!(!BackendScheme::Tcp.is_udp());
+    assert!(!BackendScheme::Tcps.is_udp());
+    assert!(!BackendScheme::Http.is_udp());
 }
 
 #[test]
 fn test_is_tls_backend() {
-    assert!(BackendProtocol::TcpTls.is_tls_backend());
-    assert!(BackendProtocol::Dtls.is_tls_backend());
-    assert!(!BackendProtocol::Tcp.is_tls_backend());
-    assert!(!BackendProtocol::Udp.is_tls_backend());
-    assert!(!BackendProtocol::Http.is_tls_backend());
+    assert!(BackendScheme::Tcps.is_tls_backend());
+    assert!(BackendScheme::Dtls.is_tls_backend());
+    assert!(!BackendScheme::Tcp.is_tls_backend());
+    assert!(!BackendScheme::Udp.is_tls_backend());
+    assert!(!BackendScheme::Http.is_tls_backend());
 }
 
-// --- BackendProtocol serialization tests ---
+// --- BackendScheme serialization tests ---
 
 #[test]
-fn test_backend_protocol_display() {
-    assert_eq!(BackendProtocol::Tcp.to_string(), "tcp");
-    assert_eq!(BackendProtocol::TcpTls.to_string(), "tcp_tls");
-    assert_eq!(BackendProtocol::Udp.to_string(), "udp");
-    assert_eq!(BackendProtocol::Dtls.to_string(), "dtls");
+fn test_backend_scheme_display() {
+    assert_eq!(BackendScheme::Tcp.to_string(), "tcp");
+    assert_eq!(BackendScheme::Tcps.to_string(), "tcps");
+    assert_eq!(BackendScheme::Udp.to_string(), "udp");
+    assert_eq!(BackendScheme::Dtls.to_string(), "dtls");
 }
 
 #[test]
-fn test_backend_protocol_serde_roundtrip() {
-    for proto in [
-        BackendProtocol::Tcp,
-        BackendProtocol::TcpTls,
-        BackendProtocol::Udp,
-        BackendProtocol::Dtls,
+fn test_backend_scheme_serde_roundtrip() {
+    for scheme in [
+        BackendScheme::Tcp,
+        BackendScheme::Tcps,
+        BackendScheme::Udp,
+        BackendScheme::Dtls,
     ] {
-        let json = serde_json::to_string(&proto).unwrap();
-        let parsed: BackendProtocol = serde_json::from_str(&json).unwrap();
-        assert_eq!(proto, parsed);
+        let json = serde_json::to_string(&scheme).unwrap();
+        let parsed: BackendScheme = serde_json::from_str(&json).unwrap();
+        assert_eq!(scheme, parsed);
     }
 }
 
 #[test]
-fn test_tcp_tls_serde_rename() {
-    let json = r#""tcp_tls""#;
-    let proto: BackendProtocol = serde_json::from_str(json).unwrap();
-    assert_eq!(proto, BackendProtocol::TcpTls);
+fn test_tcps_serde_name() {
+    let json = r#""tcps""#;
+    let scheme: BackendScheme = serde_json::from_str(json).unwrap();
+    assert_eq!(scheme, BackendScheme::Tcps);
 }
 
 // --- Stream proxy validation tests ---
@@ -199,15 +198,15 @@ fn test_tcp_tls_serde_rename() {
 #[test]
 fn test_validate_stream_proxy_valid() {
     let config = test_config(vec![
-        make_stream_proxy("tcp1", BackendProtocol::Tcp, 5432),
-        make_stream_proxy("udp1", BackendProtocol::Udp, 5353),
+        make_stream_proxy("tcp1", BackendScheme::Tcp, 5432),
+        make_stream_proxy("udp1", BackendScheme::Udp, 5353),
     ]);
     assert!(config.validate_stream_proxies().is_ok());
 }
 
 #[test]
 fn test_validate_stream_proxy_missing_listen_port() {
-    let mut proxy = make_stream_proxy("tcp1", BackendProtocol::Tcp, 5432);
+    let mut proxy = make_stream_proxy("tcp1", BackendScheme::Tcp, 5432);
     proxy.listen_port = None;
     let config = test_config(vec![proxy]);
     let err = config.validate_stream_proxies().unwrap_err();
@@ -218,8 +217,8 @@ fn test_validate_stream_proxy_missing_listen_port() {
 #[test]
 fn test_validate_stream_proxy_duplicate_port() {
     let config = test_config(vec![
-        make_stream_proxy("tcp1", BackendProtocol::Tcp, 5432),
-        make_stream_proxy("tcp2", BackendProtocol::TcpTls, 5432),
+        make_stream_proxy("tcp1", BackendScheme::Tcp, 5432),
+        make_stream_proxy("tcp2", BackendScheme::Tcps, 5432),
     ]);
     let err = config.validate_stream_proxies().unwrap_err();
     assert_eq!(err.len(), 1);
@@ -240,8 +239,8 @@ fn test_validate_http_proxy_with_listen_port_rejected() {
 fn test_validate_mixed_http_and_stream_proxies() {
     let config = test_config(vec![
         make_http_proxy("http1", "/api"),
-        make_stream_proxy("tcp1", BackendProtocol::Tcp, 5432),
-        make_stream_proxy("udp1", BackendProtocol::Udp, 5353),
+        make_stream_proxy("tcp1", BackendScheme::Tcp, 5432),
+        make_stream_proxy("udp1", BackendScheme::Udp, 5353),
     ]);
     assert!(config.validate_stream_proxies().is_ok());
 }
@@ -252,8 +251,8 @@ fn test_validate_mixed_http_and_stream_proxies() {
 fn test_validate_stream_proxy_no_gateway_port_conflicts() {
     let reserved: std::collections::HashSet<u16> = [8000, 8443, 9000, 9443].into();
     let config = test_config(vec![
-        make_stream_proxy("tcp1", BackendProtocol::Tcp, 5432),
-        make_stream_proxy("udp1", BackendProtocol::Udp, 5353),
+        make_stream_proxy("tcp1", BackendScheme::Tcp, 5432),
+        make_stream_proxy("udp1", BackendScheme::Udp, 5353),
     ]);
     assert!(
         config
@@ -265,7 +264,7 @@ fn test_validate_stream_proxy_no_gateway_port_conflicts() {
 #[test]
 fn test_validate_stream_proxy_conflicts_with_proxy_http_port() {
     let reserved: std::collections::HashSet<u16> = [8000, 8443, 9000, 9443].into();
-    let config = test_config(vec![make_stream_proxy("tcp1", BackendProtocol::Tcp, 8000)]);
+    let config = test_config(vec![make_stream_proxy("tcp1", BackendScheme::Tcp, 8000)]);
     let err = config
         .validate_stream_proxy_port_conflicts(&reserved)
         .unwrap_err();
@@ -277,7 +276,7 @@ fn test_validate_stream_proxy_conflicts_with_proxy_http_port() {
 #[test]
 fn test_validate_stream_proxy_conflicts_with_admin_port() {
     let reserved: std::collections::HashSet<u16> = [8000, 8443, 9000, 9443].into();
-    let config = test_config(vec![make_stream_proxy("udp1", BackendProtocol::Udp, 9000)]);
+    let config = test_config(vec![make_stream_proxy("udp1", BackendScheme::Udp, 9000)]);
     let err = config
         .validate_stream_proxy_port_conflicts(&reserved)
         .unwrap_err();
@@ -289,8 +288,8 @@ fn test_validate_stream_proxy_conflicts_with_admin_port() {
 fn test_validate_stream_proxy_multiple_gateway_conflicts() {
     let reserved: std::collections::HashSet<u16> = [8000, 8443, 9000, 9443].into();
     let config = test_config(vec![
-        make_stream_proxy("tcp1", BackendProtocol::Tcp, 8000),
-        make_stream_proxy("tcp2", BackendProtocol::TcpTls, 9443),
+        make_stream_proxy("tcp1", BackendScheme::Tcp, 8000),
+        make_stream_proxy("tcp2", BackendScheme::Tcps, 9443),
     ]);
     let err = config
         .validate_stream_proxy_port_conflicts(&reserved)
@@ -320,7 +319,7 @@ fn test_validate_http_proxy_ignored_for_port_conflicts() {
 fn test_tcp_proxy_yaml_deserialization() {
     let yaml = r#"
 id: "tcp-proxy-1"
-backend_protocol: tcp
+backend_scheme: tcp
 backend_host: "db.example.com"
 backend_port: 5432
 listen_port: 15432
@@ -328,7 +327,7 @@ frontend_tls: true
 udp_idle_timeout_seconds: 30
 "#;
     let proxy: Proxy = serde_yaml::from_str(yaml).unwrap();
-    assert_eq!(proxy.backend_protocol, BackendProtocol::Tcp);
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
     assert_eq!(proxy.listen_path, None);
     assert_eq!(proxy.listen_port, Some(15432));
     assert!(proxy.frontend_tls);
@@ -339,14 +338,14 @@ udp_idle_timeout_seconds: 30
 fn test_udp_proxy_json_deserialization() {
     let json = r#"{
         "id": "udp-proxy-1",
-        "backend_protocol": "udp",
+        "backend_scheme": "udp",
         "backend_host": "dns.example.com",
         "backend_port": 53,
         "listen_port": 10053,
         "udp_idle_timeout_seconds": 120
     }"#;
     let proxy: Proxy = serde_json::from_str(json).unwrap();
-    assert_eq!(proxy.backend_protocol, BackendProtocol::Udp);
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Udp));
     assert_eq!(proxy.listen_path, None);
     assert_eq!(proxy.listen_port, Some(10053));
     assert_eq!(proxy.udp_idle_timeout_seconds, 120);
@@ -357,7 +356,7 @@ fn test_udp_proxy_json_deserialization() {
 fn test_stream_proxy_defaults() {
     let json = r#"{
         "id": "tcp1",
-        "backend_protocol": "tcp",
+        "backend_scheme": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432
     }"#;
@@ -374,7 +373,7 @@ fn test_stream_proxy_defaults() {
 fn test_tcp_idle_timeout_default_is_none() {
     let json = r#"{
         "id": "tcp1",
-        "backend_protocol": "tcp",
+        "backend_scheme": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432
     }"#;
@@ -386,7 +385,7 @@ fn test_tcp_idle_timeout_default_is_none() {
 fn test_tcp_idle_timeout_explicit_value() {
     let json = r#"{
         "id": "tcp2",
-        "backend_protocol": "tcp",
+        "backend_scheme": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432,
         "tcp_idle_timeout_seconds": 600
@@ -399,7 +398,7 @@ fn test_tcp_idle_timeout_explicit_value() {
 fn test_tcp_idle_timeout_zero_is_disabled() {
     let json = r#"{
         "id": "tcp3",
-        "backend_protocol": "tcp",
+        "backend_scheme": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432,
         "tcp_idle_timeout_seconds": 0
@@ -421,7 +420,7 @@ fn test_tcp_idle_timeout_max_is_valid() {
     let json = format!(
         r#"{{
         "id": "tcp4",
-        "backend_protocol": "tcp",
+        "backend_scheme": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432,
         "tcp_idle_timeout_seconds": {}
@@ -444,7 +443,7 @@ fn test_tcp_idle_timeout_over_max_is_rejected() {
     let json = format!(
         r#"{{
         "id": "tcp5",
-        "backend_protocol": "tcp",
+        "backend_scheme": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432,
         "tcp_idle_timeout_seconds": {}
@@ -507,7 +506,7 @@ fn test_active_health_check_udp_probe_payload() {
 fn test_passthrough_default_false() {
     let yaml = r#"
 id: "tcp-pass-1"
-backend_protocol: tcp
+backend_scheme: tcp
 backend_host: "db.example.com"
 backend_port: 5432
 listen_port: 15432
@@ -518,7 +517,7 @@ listen_port: 15432
 
 #[test]
 fn test_passthrough_valid_tcp() {
-    let mut proxy = make_stream_proxy("tcp-pass", BackendProtocol::Tcp, 15432);
+    let mut proxy = make_stream_proxy("tcp-pass", BackendScheme::Tcp, 15432);
     proxy.passthrough = true;
     proxy.frontend_tls = false;
     assert!(proxy.validate_fields().is_ok());
@@ -526,7 +525,7 @@ fn test_passthrough_valid_tcp() {
 
 #[test]
 fn test_passthrough_valid_udp() {
-    let mut proxy = make_stream_proxy("udp-pass", BackendProtocol::Udp, 10053);
+    let mut proxy = make_stream_proxy("udp-pass", BackendScheme::Udp, 10053);
     proxy.passthrough = true;
     proxy.frontend_tls = false;
     assert!(proxy.validate_fields().is_ok());
@@ -548,7 +547,7 @@ fn test_passthrough_rejected_on_http_proxy() {
 
 #[test]
 fn test_passthrough_and_frontend_tls_mutually_exclusive() {
-    let mut proxy = make_stream_proxy("tcp-both", BackendProtocol::Tcp, 15432);
+    let mut proxy = make_stream_proxy("tcp-both", BackendScheme::Tcp, 15432);
     proxy.passthrough = true;
     proxy.frontend_tls = true;
     let result = proxy.validate_fields();
@@ -563,7 +562,7 @@ fn test_passthrough_and_frontend_tls_mutually_exclusive() {
 
 #[test]
 fn test_passthrough_rejects_backend_tls_fields() {
-    let mut proxy = make_stream_proxy("tcp-pass-tls", BackendProtocol::TcpTls, 15432);
+    let mut proxy = make_stream_proxy("tcp-pass-tls", BackendScheme::Tcps, 15432);
     proxy.passthrough = true;
     proxy.backend_tls_client_cert_path = Some("/tmp/cert.pem".to_string());
     proxy.backend_tls_client_key_path = Some("/tmp/key.pem".to_string());
@@ -579,7 +578,7 @@ fn test_passthrough_rejects_backend_tls_fields() {
 fn test_passthrough_yaml_deserialization() {
     let yaml = r#"
 id: "tcp-pass-yaml"
-backend_protocol: tcp
+backend_scheme: tcp
 backend_host: "db.internal"
 backend_port: 5432
 listen_port: 15432
@@ -588,18 +587,18 @@ passthrough: true
     let proxy: Proxy = serde_yaml::from_str(yaml).unwrap();
     assert!(proxy.passthrough);
     assert!(!proxy.frontend_tls);
-    assert_eq!(proxy.backend_protocol, BackendProtocol::Tcp);
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
 }
 
 // --- SNI-based port sharing tests ---
 
 #[test]
 fn test_passthrough_port_sharing_allowed() {
-    let mut p1 = make_stream_proxy("pt-a", BackendProtocol::Tcp, 8444);
+    let mut p1 = make_stream_proxy("pt-a", BackendScheme::Tcp, 8444);
     p1.passthrough = true;
     p1.hosts = vec!["a.example.com".to_string()];
 
-    let mut p2 = make_stream_proxy("pt-b", BackendProtocol::Tcp, 8444);
+    let mut p2 = make_stream_proxy("pt-b", BackendScheme::Tcp, 8444);
     p2.passthrough = true;
     p2.hosts = vec!["b.example.com".to_string()];
 
@@ -609,11 +608,11 @@ fn test_passthrough_port_sharing_allowed() {
 
 #[test]
 fn test_passthrough_port_sharing_with_catchall() {
-    let mut p1 = make_stream_proxy("pt-specific", BackendProtocol::Tcp, 8444);
+    let mut p1 = make_stream_proxy("pt-specific", BackendScheme::Tcp, 8444);
     p1.passthrough = true;
     p1.hosts = vec!["specific.example.com".to_string()];
 
-    let mut p2 = make_stream_proxy("pt-catchall", BackendProtocol::Tcp, 8444);
+    let mut p2 = make_stream_proxy("pt-catchall", BackendScheme::Tcp, 8444);
     p2.passthrough = true;
     p2.hosts = vec![]; // catch-all
 
@@ -627,11 +626,11 @@ fn test_passthrough_port_sharing_with_catchall() {
 
 #[test]
 fn test_passthrough_port_sharing_rejected_for_non_passthrough() {
-    let mut p1 = make_stream_proxy("pt", BackendProtocol::Tcp, 8444);
+    let mut p1 = make_stream_proxy("pt", BackendScheme::Tcp, 8444);
     p1.passthrough = true;
     p1.hosts = vec!["a.example.com".to_string()];
 
-    let p2 = make_stream_proxy("non-pt", BackendProtocol::Tcp, 8444);
+    let p2 = make_stream_proxy("non-pt", BackendScheme::Tcp, 8444);
     // p2.passthrough is false by default
 
     let config = test_config(vec![p1, p2]);
@@ -647,11 +646,11 @@ fn test_passthrough_port_sharing_rejected_for_non_passthrough() {
 
 #[test]
 fn test_passthrough_port_sharing_overlapping_hosts_rejected() {
-    let mut p1 = make_stream_proxy("pt-a", BackendProtocol::Tcp, 8444);
+    let mut p1 = make_stream_proxy("pt-a", BackendScheme::Tcp, 8444);
     p1.passthrough = true;
     p1.hosts = vec!["shared.example.com".to_string()];
 
-    let mut p2 = make_stream_proxy("pt-b", BackendProtocol::Tcp, 8444);
+    let mut p2 = make_stream_proxy("pt-b", BackendScheme::Tcp, 8444);
     p2.passthrough = true;
     p2.hosts = vec!["shared.example.com".to_string()]; // overlaps with p1
 
@@ -664,11 +663,11 @@ fn test_passthrough_port_sharing_overlapping_hosts_rejected() {
 
 #[test]
 fn test_passthrough_port_sharing_wildcard_hosts() {
-    let mut p1 = make_stream_proxy("pt-wild", BackendProtocol::Tcp, 8444);
+    let mut p1 = make_stream_proxy("pt-wild", BackendScheme::Tcp, 8444);
     p1.passthrough = true;
     p1.hosts = vec!["*.example.com".to_string()];
 
-    let mut p2 = make_stream_proxy("pt-other", BackendProtocol::Tcp, 8444);
+    let mut p2 = make_stream_proxy("pt-other", BackendScheme::Tcp, 8444);
     p2.passthrough = true;
     p2.hosts = vec!["other.org".to_string()];
 
@@ -678,11 +677,11 @@ fn test_passthrough_port_sharing_wildcard_hosts() {
 
 #[test]
 fn test_passthrough_port_sharing_two_catchalls_rejected() {
-    let mut p1 = make_stream_proxy("pt-a", BackendProtocol::Tcp, 8444);
+    let mut p1 = make_stream_proxy("pt-a", BackendScheme::Tcp, 8444);
     p1.passthrough = true;
     p1.hosts = vec![];
 
-    let mut p2 = make_stream_proxy("pt-b", BackendProtocol::Tcp, 8444);
+    let mut p2 = make_stream_proxy("pt-b", BackendScheme::Tcp, 8444);
     p2.passthrough = true;
     p2.hosts = vec![];
 

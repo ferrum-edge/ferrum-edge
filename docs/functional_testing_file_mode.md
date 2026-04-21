@@ -177,7 +177,7 @@ cargo test --test functional_file_mode_test -- --ignored --nocapture
 proxies:
   - id: "proxy-id"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "backend.example.com"
     backend_port: 3000
     # Optional fields
@@ -300,7 +300,7 @@ fn test_new_feature() {
 proxies:
   - id: "proxy-1"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "localhost"
     backend_port: 8080
 consumers: []

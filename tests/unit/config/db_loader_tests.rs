@@ -1,7 +1,7 @@
 use ferrum_edge::_test_support::{
-    DbPoolConfig, db_append_connect_timeout, db_diff_removed, parse_auth_mode, parse_protocol,
+    DbPoolConfig, db_append_connect_timeout, db_diff_removed, parse_auth_mode, parse_scheme,
 };
-use ferrum_edge::config::types::{AuthMode, BackendProtocol};
+use ferrum_edge::config::types::{AuthMode, BackendScheme};
 use std::collections::HashSet;
 
 // ── append_connect_timeout ───────────────────────────────────────────────────
@@ -116,36 +116,38 @@ fn test_diff_removed_mixed_additions_and_deletions() {
     assert_eq!(removed, vec!["a", "c"]);
 }
 
-// ── parse_protocol ───────────────────────────────────────────────────────────
+// ── parse_scheme ─────────────────────────────────────────────────────────────
 
 #[test]
-fn test_parse_protocol_known_values() {
-    assert!(matches!(parse_protocol("http"), BackendProtocol::Http));
-    assert!(matches!(parse_protocol("https"), BackendProtocol::Https));
-    assert!(matches!(parse_protocol("ws"), BackendProtocol::Ws));
-    assert!(matches!(parse_protocol("wss"), BackendProtocol::Wss));
-    assert!(matches!(parse_protocol("grpc"), BackendProtocol::Grpc));
-    assert!(matches!(parse_protocol("grpcs"), BackendProtocol::Grpcs));
-    assert!(matches!(parse_protocol("h3"), BackendProtocol::H3));
-    assert!(matches!(parse_protocol("tcp"), BackendProtocol::Tcp));
-    assert!(matches!(parse_protocol("tcp_tls"), BackendProtocol::TcpTls));
-    assert!(matches!(parse_protocol("udp"), BackendProtocol::Udp));
-    assert!(matches!(parse_protocol("dtls"), BackendProtocol::Dtls));
+fn test_parse_scheme_known_values() {
+    assert!(matches!(parse_scheme("http"), BackendScheme::Http));
+    assert!(matches!(parse_scheme("https"), BackendScheme::Https));
+    assert!(matches!(parse_scheme("ws"), BackendScheme::Http));
+    assert!(matches!(parse_scheme("wss"), BackendScheme::Https));
+    assert!(matches!(parse_scheme("grpc"), BackendScheme::Http));
+    assert!(matches!(parse_scheme("grpcs"), BackendScheme::Https));
+    assert!(matches!(parse_scheme("h3"), BackendScheme::Https));
+    assert!(matches!(parse_scheme("tcp"), BackendScheme::Tcp));
+    assert!(matches!(parse_scheme("tcps"), BackendScheme::Tcps));
+    assert!(matches!(parse_scheme("tcp_tls"), BackendScheme::Tcps));
+    assert!(matches!(parse_scheme("udp"), BackendScheme::Udp));
+    assert!(matches!(parse_scheme("dtls"), BackendScheme::Dtls));
 }
 
 #[test]
-fn test_parse_protocol_case_insensitive() {
-    assert!(matches!(parse_protocol("HTTPS"), BackendProtocol::Https));
-    assert!(matches!(parse_protocol("Grpc"), BackendProtocol::Grpc));
-    assert!(matches!(parse_protocol("H3"), BackendProtocol::H3));
-    assert!(matches!(parse_protocol("TCP_TLS"), BackendProtocol::TcpTls));
+fn test_parse_scheme_case_insensitive() {
+    assert!(matches!(parse_scheme("HTTPS"), BackendScheme::Https));
+    assert!(matches!(parse_scheme("Grpc"), BackendScheme::Http));
+    assert!(matches!(parse_scheme("H3"), BackendScheme::Https));
+    assert!(matches!(parse_scheme("TCP_TLS"), BackendScheme::Tcps));
+    assert!(matches!(parse_scheme("TCPS"), BackendScheme::Tcps));
 }
 
 #[test]
-fn test_parse_protocol_unknown_defaults_to_http() {
-    assert!(matches!(parse_protocol("ftp"), BackendProtocol::Http));
-    assert!(matches!(parse_protocol(""), BackendProtocol::Http));
-    assert!(matches!(parse_protocol("nonsense"), BackendProtocol::Http));
+fn test_parse_scheme_unknown_defaults_to_http() {
+    assert!(matches!(parse_scheme("ftp"), BackendScheme::Http));
+    assert!(matches!(parse_scheme(""), BackendScheme::Http));
+    assert!(matches!(parse_scheme("nonsense"), BackendScheme::Http));
 }
 
 // ── parse_auth_mode ──────────────────────────────────────────────────────────

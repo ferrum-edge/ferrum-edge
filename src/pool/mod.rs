@@ -412,7 +412,9 @@ impl<M: PoolManager> GenericPool<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::{AuthMode, BackendProtocol, BackendTlsConfig, ResponseBodyMode};
+    use crate::config::types::{
+        AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
+    };
     use chrono::Utc;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::Notify;
@@ -482,7 +484,9 @@ mod tests {
             name: None,
             hosts: vec![],
             listen_path: Some("/pool".to_string()),
-            backend_protocol: BackendProtocol::Http,
+            backend_scheme: Some(BackendScheme::Http),
+            backend_prefer_h3: false,
+            dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
             backend_host: "backend.example.com".to_string(),
             backend_port: 8080,
             backend_path: None,

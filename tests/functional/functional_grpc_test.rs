@@ -174,21 +174,21 @@ fn write_grpc_config(config_path: &std::path::Path, backend_port: u16) {
 proxies:
   - id: "grpc-echo-proxy"
     listen_path: "/grpc"
-    backend_protocol: grpc
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: true
 
   - id: "grpc-nostrip-proxy"
     listen_path: "/grpc-full"
-    backend_protocol: grpc
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: false
 
   - id: "grpc-unavailable-proxy"
     listen_path: "/grpc-down"
-    backend_protocol: grpc
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 19999
     strip_listen_path: true
@@ -211,7 +211,7 @@ fn write_grpc_auth_config(config_path: &std::path::Path, backend_port: u16) {
 proxies:
   - id: "grpc-secured-proxy"
     listen_path: "/grpc-secure"
-    backend_protocol: grpc
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: true
@@ -250,7 +250,7 @@ fn write_grpc_method_filter_config(config_path: &std::path::Path, backend_port: 
 proxies:
   - id: "grpc-method-filter-proxy"
     listen_path: "/grpc-method-filter"
-    backend_protocol: grpc
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: true

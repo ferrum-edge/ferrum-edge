@@ -361,7 +361,7 @@ async fn test_frontend_mtls_valid_client_cert() {
 proxies:
   - id: "t1"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {bp}
     strip_listen_path: true
@@ -428,7 +428,7 @@ async fn test_frontend_mtls_no_client_cert_rejected() {
 proxies:
   - id: "t2"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {bp}
     strip_listen_path: true
@@ -496,7 +496,7 @@ async fn test_frontend_mtls_wrong_ca_rejected() {
 proxies:
   - id: "t3"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {bp}
     strip_listen_path: true
@@ -560,7 +560,7 @@ async fn test_backend_tls_ca_verification_trusted() {
 proxies:
   - id: "t4"
     listen_path: "/api"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "localhost"
     backend_port: {bp}
     strip_listen_path: true
@@ -627,7 +627,7 @@ async fn test_backend_tls_ca_verification_untrusted() {
 proxies:
   - id: "t5"
     listen_path: "/api"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "localhost"
     backend_port: {bp}
     strip_listen_path: true
@@ -697,7 +697,7 @@ async fn test_backend_mtls_gateway_presents_client_cert() {
 proxies:
   - id: "t6"
     listen_path: "/api"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "localhost"
     backend_port: {bp}
     strip_listen_path: true
@@ -766,7 +766,7 @@ async fn test_backend_mtls_gateway_no_client_cert_rejected() {
 proxies:
   - id: "t7"
     listen_path: "/api"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "localhost"
     backend_port: {bp}
     strip_listen_path: true
@@ -836,7 +836,7 @@ async fn test_backend_mtls_global_env_vars() {
 proxies:
   - id: "t8"
     listen_path: "/api"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "localhost"
     backend_port: {bp}
     strip_listen_path: true
@@ -907,7 +907,7 @@ async fn test_admin_mtls_authorized_client() {
 proxies:
   - id: "t9"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {bp}
     strip_listen_path: true
@@ -974,7 +974,7 @@ async fn test_admin_mtls_unauthorized_client_rejected() {
 proxies:
   - id: "t10"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {bp}
     strip_listen_path: true
@@ -1044,7 +1044,7 @@ async fn test_tcp_frontend_mtls_valid_client() {
 proxies:
   - id: "t11"
     listen_port: {pp}
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: {bp}
     frontend_tls: true
@@ -1130,7 +1130,7 @@ async fn test_tcp_frontend_mtls_no_client_cert_rejected() {
 proxies:
   - id: "t12"
     listen_port: {pp}
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: {bp}
     frontend_tls: true
@@ -1212,7 +1212,7 @@ async fn test_backend_tls_global_ca_bundle() {
 proxies:
   - id: "t13"
     listen_path: "/api"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "localhost"
     backend_port: {bp}
     strip_listen_path: true

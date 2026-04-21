@@ -159,7 +159,7 @@ fn build_yaml_with_n_proxies(n: usize, backend_port: u16) -> String {
         use std::fmt::Write as _;
         let _ = write!(
             out,
-            "  - id: \"p{i:03}\"\n    listen_path: \"/p{i:03}\"\n    backend_protocol: http\n    backend_host: \"127.0.0.1\"\n    backend_port: {backend_port}\n    strip_listen_path: true\n",
+            "  - id: \"p{i:03}\"\n    listen_path: \"/p{i:03}\"\n    backend_scheme: http\n    backend_host: \"127.0.0.1\"\n    backend_port: {backend_port}\n    strip_listen_path: true\n",
             i = i,
             backend_port = backend_port
         );

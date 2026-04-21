@@ -228,7 +228,7 @@ fn build_config(echo_port: u16, with_host: bool) -> String {
         "proxies:\n\
          \x20 - id: \"echo-http\"\n\
          \x20   listen_path: \"/\"\n\
-         \x20   backend_protocol: http\n\
+         \x20   backend_scheme: http\n\
          \x20   backend_host: \"127.0.0.1\"\n\
          \x20   backend_port: {echo_port}\n\
          \x20   strip_listen_path: false\n\

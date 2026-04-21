@@ -317,7 +317,7 @@ async fn create_batch(
         all_proxies.push(json!({
             "id": proxy_id,
             "listen_path": listen_path,
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "127.0.0.1",
             "backend_port": backend_port,
             "strip_listen_path": true,

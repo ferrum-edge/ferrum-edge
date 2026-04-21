@@ -631,7 +631,7 @@ async fn provision_resources(
         all_proxies.push(json!({
             "id": format!("proxy-{}", i),
             "listen_path": format!("/svc/{}", i),
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "127.0.0.1",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -880,7 +880,7 @@ async fn provision_resources(
         open_proxies.push(json!({
             "id": format!("open-proxy-{}", i),
             "listen_path": path,
-            "backend_protocol": "http",
+            "backend_scheme": "http",
             "backend_host": "127.0.0.1",
             "backend_port": backend_port,
             "strip_listen_path": true,
@@ -1475,7 +1475,7 @@ async fn run_admin_mutation_phase(
                 .json(&json!({
                     "id": &temp_id,
                     "listen_path": &temp_path,
-                    "backend_protocol": "http",
+                    "backend_scheme": "http",
                     "backend_host": "127.0.0.1",
                     "backend_port": backend_port,
                     "strip_listen_path": true,
@@ -1521,7 +1521,7 @@ async fn run_admin_mutation_phase(
                 .json(&json!({
                     "id": format!("proxy-{}", update_idx),
                     "listen_path": format!("/svc/{}", update_idx),
-                    "backend_protocol": "http",
+                    "backend_scheme": "http",
                     "backend_host": "127.0.0.1",
                     "backend_port": backend_port,
                     "strip_listen_path": true,

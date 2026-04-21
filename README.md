@@ -212,7 +212,7 @@ Operational note: all logging flows through a **non-blocking writer** (channel �
 proxies:
   - id: "my-api"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "backend-service"
     backend_port: 3000
     strip_listen_path: true
@@ -252,7 +252,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies
 # Create a proxy
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"listen_path": "/api", "backend_protocol": "http", "backend_host": "backend", "backend_port": 3000}' \
+  -d '{"listen_path": "/api", "backend_scheme": "http", "backend_host": "backend", "backend_port": 3000}' \
   http://localhost:9000/proxies
 
 # Backup / Restore
@@ -318,13 +318,13 @@ See [docs/routing.md](docs/routing.md) for detailed routing behavior.
 
 | Protocol | Config | Notes |
 |----------|--------|-------|
-| **HTTP/1.1** | `backend_protocol: http` / `https` | Default, with connection pooling |
-| **HTTP/2** | ALPN-negotiated on TLS | Automatic via `pool_enable_http2: true` |
-| **HTTP/3** | `FERRUM_ENABLE_HTTP3=true` | QUIC on HTTPS port, requires TLS |
-| **WebSocket** | `backend_protocol: ws` / `wss` | Transparent HTTP upgrade + bidirectional proxy |
-| **gRPC** | `backend_protocol: grpc` / `grpcs` | HTTP/2 with trailer support, all auth plugins work |
-| **TCP** | `backend_protocol: tcp` / `tcp_tls` | Dedicated-port stream proxy |
-| **UDP** | `backend_protocol: udp` / `dtls` | Datagram proxy with session tracking |
+| **HTTP/1.1** | `backend_scheme: http` / `https` | Default, with connection pooling |
+| **HTTP/2** | ALPN-negotiated on `https` | Automatic via `pool_enable_http2: true`; learning cache falls back to HTTP/1.1 when the backend picks h1 |
+| **HTTP/3** | `backend_scheme: https` + `backend_prefer_h3: true` | Opts the proxy into trying QUIC first with HTTP/2 fallback. Any client version (H1/H2/H3) can target an H3-preferred backend. |
+| **WebSocket** | Runtime-detected from `Upgrade: websocket` on any HTTP-family proxy | `backend_scheme: http` → `ws://` upstream; `https` → `wss://` |
+| **gRPC** | Runtime-detected from `content-type: application/grpc*` on any HTTP-family proxy | HTTP/2 with trailer support on both `http` (h2c) and `https` (ALPN) schemes |
+| **TCP** | `backend_scheme: tcp` / `tcps` | Dedicated-port stream proxy (plaintext or TLS) |
+| **UDP** | `backend_scheme: udp` / `dtls` | Datagram proxy with session tracking (plaintext or DTLS) |
 
 See [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) for TCP/UDP/DTLS proxy configuration.
 

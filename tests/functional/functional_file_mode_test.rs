@@ -77,7 +77,7 @@ async fn test_file_mode_basic_request_routing() {
 proxies:
   - id: "echo-proxy"
     listen_path: "/echo"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
     strip_listen_path: true
@@ -127,7 +127,7 @@ async fn test_file_mode_config_reload_on_sighup() {
 proxies:
   - id: "proxy-initial"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
 
@@ -158,12 +158,12 @@ plugin_configs: []
 proxies:
   - id: "proxy-initial"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
   - id: "proxy-new"
     listen_path: "/api/v2"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
 
@@ -228,14 +228,14 @@ async fn test_file_mode_multiple_backends() {
 proxies:
   - id: "backend1"
     listen_path: "/api/backend1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {p1}
     strip_listen_path: true
 
   - id: "backend2"
     listen_path: "/api/backend2"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {p2}
     strip_listen_path: true
@@ -278,7 +278,7 @@ async fn test_file_mode_consumer_identity_headers_forwarded() {
 proxies:
   - id: "auth-proxy"
     listen_path: "/auth-api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
     strip_listen_path: true
@@ -373,14 +373,14 @@ proxies:
   - id: "prod-proxy"
     namespace: "prod"
     listen_path: "/prod"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
     strip_listen_path: true
   - id: "staging-proxy"
     namespace: "staging"
     listen_path: "/staging"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {echo_port}
     strip_listen_path: true

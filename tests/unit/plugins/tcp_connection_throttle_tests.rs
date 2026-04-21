@@ -1,4 +1,4 @@
-use ferrum_edge::config::types::{BackendProtocol, Consumer};
+use ferrum_edge::config::types::{BackendScheme, Consumer};
 use ferrum_edge::plugins::tcp_connection_throttle::TcpConnectionThrottle;
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
@@ -26,7 +26,7 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
         proxy_id: proxy_id.to_string(),
         proxy_name: Some(format!("TCP Proxy {proxy_id}")),
         listen_port: 5432,
-        backend_protocol: BackendProtocol::Tcp,
+        backend_scheme: BackendScheme::Tcp,
         consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
         identified_consumer: consumer.map(|c| Arc::new(make_consumer(c))),
         authenticated_identity: None,

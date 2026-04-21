@@ -311,7 +311,7 @@ async fn test_tcp_proxy_plain_bidirectional() {
 proxies:
   - id: "tcp-echo"
     listen_port: {proxy_port}
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
 
@@ -389,7 +389,7 @@ async fn test_tcp_proxy_frontend_tls_termination() {
 proxies:
   - id: "tcp-tls-frontend"
     listen_port: {proxy_port}
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     frontend_tls: true
@@ -455,7 +455,7 @@ async fn test_tcp_proxy_backend_tls_origination() {
 proxies:
   - id: "tcp-tls-backend"
     listen_port: {proxy_port}
-    backend_protocol: tcp_tls
+    backend_scheme: tcps
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     backend_tls_verify_server_cert: false
@@ -518,7 +518,7 @@ async fn test_tcp_proxy_full_tls() {
 proxies:
   - id: "tcp-full-tls"
     listen_port: {proxy_port}
-    backend_protocol: tcp_tls
+    backend_scheme: tcps
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     frontend_tls: true
@@ -586,7 +586,7 @@ async fn test_tcp_proxy_idle_timeout() {
 proxies:
   - id: "tcp-idle-timeout"
     listen_port: {proxy_port}
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     tcp_idle_timeout_seconds: 2
@@ -656,7 +656,7 @@ async fn test_tcp_proxy_backend_unreachable() {
 proxies:
   - id: "tcp-unreachable"
     listen_port: {proxy_port}
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: 19899
     backend_connect_timeout_ms: 1000

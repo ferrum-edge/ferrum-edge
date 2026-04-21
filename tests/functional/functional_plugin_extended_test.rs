@@ -202,7 +202,7 @@ async fn setup_proxy_with_plugins(
             &json!({
                 "id": proxy_id,
                 "listen_path": listen_path,
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,
@@ -223,7 +223,7 @@ async fn setup_proxy_with_plugins(
             &json!({
                 "id": proxy_id,
                 "listen_path": listen_path,
-                "backend_protocol": "http",
+                "backend_scheme": "http",
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,

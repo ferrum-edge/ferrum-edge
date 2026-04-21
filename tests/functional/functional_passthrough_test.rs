@@ -204,7 +204,7 @@ async fn test_tcp_passthrough_plain_echo() {
                 r#"
 proxies:
   - id: "tcp-passthrough"
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     listen_port: {stream_port}
@@ -261,7 +261,7 @@ async fn test_tcp_tls_passthrough_forwards_encrypted_data() {
                 r#"
 proxies:
   - id: "tls-passthrough"
-    backend_protocol: tcp
+    backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     listen_port: {stream_port}

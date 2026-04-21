@@ -1,6 +1,6 @@
 use chrono::Utc;
 use ferrum_edge::RouterCache;
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::config_delta::AffectedRoutes;
 use ferrum_edge::proxy::build_backend_url;
 
@@ -21,7 +21,9 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
         name: Some(format!("Test {}", id)),
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "backend.example.com".into(),
         backend_port: 3000,
         backend_path: None,
@@ -310,7 +312,8 @@ fn test_e2e_multiple_proxies_different_backends() {
 #[test]
 fn test_e2e_https_backend_protocol() {
     let mut proxy = test_proxy("secure", "/api");
-    proxy.backend_protocol = BackendProtocol::Https;
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Https, false));
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 
@@ -322,7 +325,7 @@ fn test_e2e_https_backend_protocol() {
 #[test]
 fn test_e2e_websocket_protocol() {
     let mut proxy = test_proxy("ws", "/ws");
-    proxy.backend_protocol = BackendProtocol::Ws;
+    proxy.backend_scheme = Some(BackendScheme::Http);
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 
@@ -334,7 +337,7 @@ fn test_e2e_websocket_protocol() {
 #[test]
 fn test_e2e_grpc_protocol() {
     let mut proxy = test_proxy("grpc", "/grpc");
-    proxy.backend_protocol = BackendProtocol::Grpc;
+    proxy.backend_scheme = Some(BackendScheme::Http);
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 

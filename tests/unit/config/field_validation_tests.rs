@@ -1,7 +1,7 @@
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    ActiveHealthCheck, AuthMode, BackendProtocol, BackoffStrategy, CircuitBreakerConfig,
-    ConsulConfig, Consumer, GatewayConfig, HealthCheckConfig, KubernetesConfig,
+    ActiveHealthCheck, AuthMode, BackendScheme, BackoffStrategy, CircuitBreakerConfig,
+    ConsulConfig, Consumer, DispatchKind, GatewayConfig, HealthCheckConfig, KubernetesConfig,
     LoadBalancerAlgorithm, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_PATH_LENGTH,
     MAX_CREDENTIAL_VALUE_LENGTH, MAX_CREDENTIALS_SIZE, MAX_FILE_PATH_LENGTH, MAX_HOSTS_PER_PROXY,
     MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP3_CONNECTIONS_PER_BACKEND, MAX_LISTEN_PATH_LENGTH,
@@ -20,7 +20,9 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         name: None,
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "localhost".into(),
         backend_port: 3000,
         backend_path: None,
@@ -207,7 +209,8 @@ fn test_stream_proxy_requires_listen_path_none() {
     // Stream proxies route on listen_port and must have listen_path == None.
     // A populated listen_path is now a hard error (breaking change).
     let mut proxy = make_proxy("test", "/ignored");
-    proxy.backend_protocol = BackendProtocol::Tcp;
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Tcp, false));
     proxy.listen_port = Some(5432);
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
@@ -231,7 +234,8 @@ fn test_stream_proxy_rejects_empty_string_listen_path() {
     // Empty-string listen_path is invalid input — stream proxies must use
     // None, not "". This catches mis-written fixtures loudly.
     let mut proxy = make_proxy("test", "");
-    proxy.backend_protocol = BackendProtocol::Tcp;
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Tcp, false));
     proxy.listen_port = Some(5432);
     let result = proxy.validate_fields();
     assert!(
@@ -1072,7 +1076,8 @@ fn test_proxy_tls_valid_cert_files_pass() {
         .to_string();
 
     let mut proxy = make_proxy("test", "/api");
-    proxy.backend_protocol = BackendProtocol::Https;
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Https, false));
     proxy.backend_tls_client_cert_path = Some(cert_path.clone());
     proxy.backend_tls_client_key_path = Some(key_path);
     proxy.backend_tls_server_ca_cert_path = Some(cert_path);
@@ -1124,16 +1129,12 @@ fn test_proxy_tls_fields_rejected_on_plaintext_backend() {
             .any(|e| e.contains("backend_tls_verify_server_cert") && e.contains("http"))
     );
 
-    // Other plaintext protocols: ws, grpc, tcp, udp
-    for protocol in [
-        BackendProtocol::Ws,
-        BackendProtocol::Grpc,
-        BackendProtocol::Tcp,
-        BackendProtocol::Udp,
-    ] {
+    // Other plaintext schemes: http (covers former ws/grpc), tcp, udp
+    for scheme in [BackendScheme::Http, BackendScheme::Tcp, BackendScheme::Udp] {
         let mut proxy = make_proxy("test", "/api");
-        proxy.backend_protocol = protocol;
-        if proxy.backend_protocol.is_stream_proxy() {
+        proxy.backend_scheme = Some(scheme);
+        proxy.dispatch_kind = DispatchKind::from((scheme, false));
+        if scheme.is_stream() {
             proxy.listen_port = Some(19000);
         }
         proxy.backend_tls_client_cert_path = Some(cert_path.clone());
@@ -1143,26 +1144,30 @@ fn test_proxy_tls_fields_rejected_on_plaintext_backend() {
             errs.iter()
                 .any(|e| e.contains("backend_tls_client_cert_path")),
             "Expected rejection for {:?}",
-            proxy.backend_protocol
+            proxy.backend_scheme
         );
     }
 
-    // TLS protocols should allow cert fields
-    for protocol in [
-        BackendProtocol::Https,
-        BackendProtocol::Wss,
-        BackendProtocol::Grpcs,
-        BackendProtocol::H3,
-    ] {
+    // TLS schemes should allow cert fields. Https covers former wss/grpcs;
+    // Https + prefer_h3 covers former H3. Stream TLS variants are validated
+    // in stream_proxy_config_tests.rs.
+    let tls_variants: [(BackendScheme, bool); 2] = [
+        (BackendScheme::Https, false),
+        (BackendScheme::Https, true), // H3
+    ];
+    for (scheme, prefer_h3) in tls_variants {
         let mut proxy = make_proxy("test", "/api");
-        proxy.backend_protocol = protocol;
+        proxy.backend_scheme = Some(scheme);
+        proxy.backend_prefer_h3 = prefer_h3;
+        proxy.dispatch_kind = DispatchKind::from((scheme, prefer_h3));
         proxy.backend_tls_client_cert_path = Some(cert_path.clone());
         proxy.backend_tls_client_key_path = Some(key_path.clone());
         proxy.backend_tls_server_ca_cert_path = Some(cert_path.clone());
         assert!(
             proxy.validate_fields().is_ok(),
-            "Should pass for {:?}",
-            proxy.backend_protocol
+            "Should pass for scheme={:?} prefer_h3={}",
+            proxy.backend_scheme,
+            prefer_h3
         );
     }
 }

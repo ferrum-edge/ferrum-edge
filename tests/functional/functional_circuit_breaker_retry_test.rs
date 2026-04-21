@@ -107,7 +107,7 @@ async fn test_circuit_breaker_opens_and_recovers() {
     let proxy_data = json!({
         "id": "proxy-cb",
         "listen_path": "/cb",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": backend_port,
         "strip_listen_path": true,
@@ -213,7 +213,7 @@ async fn test_retry_on_backend_failure() {
     let proxy_data = json!({
         "id": "proxy-retry",
         "listen_path": "/retry",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": backend_port,
         "strip_listen_path": true,
@@ -274,7 +274,7 @@ async fn test_retry_succeeds_on_second_attempt() {
     let proxy_data = json!({
         "id": "proxy-retry-recover",
         "listen_path": "/retry-recover",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": backend_port,
         "strip_listen_path": true,
@@ -349,7 +349,7 @@ async fn test_retry_on_connect_failure() {
     let proxy_data = json!({
         "id": "proxy-retry-connect",
         "listen_path": "/retry-connect",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": dead_port,
         "strip_listen_path": true,

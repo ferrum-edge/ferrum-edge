@@ -47,7 +47,7 @@ async fn test_database_mode_comprehensive() {
     let proxy_data = json!({
         "id": "test-proxy-1",
         "listen_path": "/test-path",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": backend.port,
         "strip_listen_path": true,
@@ -121,7 +121,7 @@ async fn test_database_mode_comprehensive() {
     let updated_proxy_data = json!({
         "id": "test-proxy-1",
         "listen_path": "/test-path",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": backend.port,
         "strip_listen_path": false, // Changed
@@ -324,7 +324,7 @@ async fn test_database_mode_comprehensive() {
     let proxy_data = json!({
         "id": "test-proxy-2",
         "listen_path": "/another-path",
-        "backend_protocol": "http",
+        "backend_scheme": "http",
         "backend_host": "localhost",
         "backend_port": backend.port,
         "strip_listen_path": true,

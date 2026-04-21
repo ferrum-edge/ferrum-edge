@@ -4,7 +4,7 @@ proxies:
   - id: "udp-echo"
     name: "UDP Echo Proxy"
     listen_port: 5003
-    backend_protocol: udp
+    backend_scheme: udp
     backend_host: "127.0.0.1"
     backend_port: 3005
     udp_idle_timeout_seconds: 30
@@ -14,7 +14,7 @@ proxies:
   - id: "udp-health"
     name: "Health Check"
     listen_path: "/health"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 3010
     strip_listen_path: false

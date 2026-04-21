@@ -22,7 +22,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
-use crate::config::types::{Proxy, UpstreamTarget};
+use crate::config::types::{DispatchKind, HttpFlavor, Proxy, UpstreamTarget};
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
 use crate::proxy::{
     ProxyState, apply_after_proxy_hooks_to_rejection, plugin_result_into_reject_parts,
@@ -488,6 +488,15 @@ async fn handle_h3_request(
     // Store raw headers for deferred materialization.
     ctx.set_raw_headers(req.headers().clone());
 
+    // Detect the HTTP flavor (Plain / gRPC / WebSocket) once from the incoming
+    // H3 request. WebSocket over H3 requires Extended CONNECT (RFC 9220) and is
+    // not currently supported by this listener; gRPC over H3 is legal but the
+    // backend-side decoupling below intentionally does not dispatch it via the
+    // H3 pool (the pool only speaks QUIC → QUIC backends). Keeping the flavor
+    // around lets the dispatch guard emit a precise 502 instead of forwarding
+    // non-Plain traffic to an H3 backend that does not expect it.
+    let http_flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+
     // Validate URL length (path + query string)
     if state.max_url_length_bytes > 0 {
         let url_len = path.len()
@@ -713,6 +722,53 @@ async fn handle_h3_request(
     };
 
     ctx.matched_proxy = Some(Arc::clone(&proxy));
+
+    // ====================================================================
+    // H3 BACKEND DISPATCH GUARD (phase-1 decoupling)
+    // TODO(decouple-phase-2): delete this entire block once the main agent
+    // introduces the unified `dispatch_backend` helper. At that point all
+    // four combinations below delegate into that helper instead of the
+    // H3-only pool, and this guard disappears. See `src/proxy/mod.rs` for
+    // the forthcoming dispatch_backend signature.
+    //
+    // CURRENT CONTRACT:
+    //   - HttpsH3Preferred + Plain → H3 pool (preserved below unchanged).
+    //   - HttpsH3Preferred + Grpc/WebSocket → 502 (H3 frontend cannot
+    //       transparently serve gRPC-over-H3 or WebSocket-over-H3; falling
+    //       back to H1/H2 backend dispatch requires the unified helper).
+    //   - HttpsPool / HttpPool (any flavor) → 502 (the H3 frontend must
+    //       not blindly dispatch plaintext or HttpsPool-only proxies through
+    //       the H3 pool; the backend may not speak QUIC at all).
+    //   - Stream kinds → unreachable (router never lands stream traffic here).
+    //
+    // Do NOT add a panic for the stream arms — the 502 placeholder is safer
+    // for the unreachable case since we still have an async QUIC stream
+    // open and the operator deserves a response instead of a crashed task.
+    let h3_backend_supported = match proxy.dispatch_kind {
+        DispatchKind::HttpsH3Preferred => matches!(http_flavor, HttpFlavor::Plain),
+        DispatchKind::HttpPool | DispatchKind::HttpsPool => false,
+        DispatchKind::TcpRaw
+        | DispatchKind::TcpTls
+        | DispatchKind::UdpRaw
+        | DispatchKind::UdpDtls => false,
+    };
+    if !h3_backend_supported {
+        warn!(
+            proxy_id = %proxy.id,
+            dispatch_kind = ?proxy.dispatch_kind,
+            flavor = ?http_flavor,
+            "HTTP/3 frontend cannot dispatch this proxy yet (decouple-phase-1 placeholder); returning 502"
+        );
+        record_request(&state, 502);
+        send_h3_response(
+            &mut stream,
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Bad Gateway: HTTP/3 frontend dispatch to this backend scheme is not yet implemented. Enable backend_prefer_h3 on https proxies to use the H3 pool, or have clients target the H1/H2 listener for other backends."}"#,
+        )
+        .await?;
+        return Ok(());
+    }
+    // ====================================================================
 
     // Per-proxy HTTP method filtering (checked before plugins to save work)
     if let Some(ref allowed) = proxy.allowed_methods

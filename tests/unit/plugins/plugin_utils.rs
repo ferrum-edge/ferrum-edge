@@ -1,7 +1,9 @@
 //! Common test utilities for plugin tests
 
 use chrono::Utc;
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, Consumer, Proxy, default_namespace};
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, Consumer, DispatchKind, Proxy, default_namespace,
+};
 use ferrum_edge::plugins::{PluginResult, RequestContext};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -67,7 +69,9 @@ pub fn create_test_proxy() -> Proxy {
         name: Some("Test Proxy".to_string()),
         hosts: vec![],
         listen_path: Some("/test".to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
+        backend_prefer_h3: false,
+        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
         backend_host: "localhost".to_string(),
         backend_port: 3000,
         backend_path: None,

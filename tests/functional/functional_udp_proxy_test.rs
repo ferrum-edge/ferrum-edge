@@ -118,7 +118,7 @@ async fn test_udp_proxy_plain_datagram_forwarding() {
 proxies:
   - id: "udp-echo"
     listen_port: {proxy_port}
-    backend_protocol: udp
+    backend_scheme: udp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     udp_idle_timeout_seconds: 30
@@ -193,7 +193,7 @@ async fn test_udp_proxy_multiple_clients() {
 proxies:
   - id: "udp-multi-client"
     listen_port: {proxy_port}
-    backend_protocol: udp
+    backend_scheme: udp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
 
@@ -264,7 +264,7 @@ async fn test_udp_proxy_session_timeout() {
 proxies:
   - id: "udp-timeout"
     listen_port: {proxy_port}
-    backend_protocol: udp
+    backend_scheme: udp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     udp_idle_timeout_seconds: 5
@@ -340,7 +340,7 @@ async fn test_udp_proxy_large_datagram() {
 proxies:
   - id: "udp-large"
     listen_port: {proxy_port}
-    backend_protocol: udp
+    backend_scheme: udp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
 
@@ -389,7 +389,7 @@ plugin_configs: []
 /// Architecture: client (plain UDP) → gateway (DTLS client) → DTLS echo server
 ///
 /// The gateway accepts plain UDP on the frontend and establishes a DTLS session
-/// to the backend when `backend_protocol: dtls` is configured.
+/// to the backend when `backend_scheme: dtls` is configured.
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_dtls_backend() {
@@ -409,7 +409,7 @@ async fn test_udp_proxy_dtls_backend() {
 proxies:
   - id: "dtls-proxy"
     listen_port: {proxy_port}
-    backend_protocol: dtls
+    backend_scheme: dtls
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     backend_tls_verify_server_cert: false
@@ -478,7 +478,7 @@ async fn test_udp_proxy_dtls_backend_multiple_clients() {
 proxies:
   - id: "dtls-multi"
     listen_port: {proxy_port}
-    backend_protocol: dtls
+    backend_scheme: dtls
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     backend_tls_verify_server_cert: false
@@ -551,7 +551,7 @@ async fn test_udp_proxy_frontend_dtls_termination() {
 proxies:
   - id: "frontend-dtls"
     listen_port: {proxy_port}
-    backend_protocol: udp
+    backend_scheme: udp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     frontend_tls: true
@@ -634,7 +634,7 @@ async fn test_udp_proxy_full_dtls_e2e() {
 proxies:
   - id: "full-dtls"
     listen_port: {proxy_port}
-    backend_protocol: dtls
+    backend_scheme: dtls
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     backend_tls_verify_server_cert: false

@@ -205,7 +205,7 @@ async fn test_serverless_function_terminate_mode() {
 proxies:
   - id: "serverless-proxy"
     listen_path: "/fn"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
@@ -292,7 +292,7 @@ async fn test_request_mirror_sends_copy() {
 proxies:
   - id: "mirror-proxy"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
