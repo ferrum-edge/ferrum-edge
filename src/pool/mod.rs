@@ -693,10 +693,10 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(pending) = pool.pending_creations.get(&key) {
-                    if Arc::strong_count(pending.value()) >= 3 {
-                        break;
-                    }
+                if let Some(pending) = pool.pending_creations.get(&key)
+                    && Arc::strong_count(pending.value()) >= 3
+                {
+                    break;
                 }
                 tokio::task::yield_now().await;
             }
