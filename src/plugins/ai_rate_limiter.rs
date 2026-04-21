@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, warn};
 
+use super::utils::ai_providers::{
+    AiProvider, detect_response_provider, extract_response_usage, parse_ai_provider,
+};
 use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome,
 };
@@ -176,147 +179,12 @@ impl AiRateLimiter {
 
     fn extract_token_count(&self, body: &[u8]) -> Option<u64> {
         let json: Value = serde_json::from_slice(body).ok()?;
-        let (prompt, completion, total) = if self.provider != "auto" {
-            self.extract_by_provider(&json)?
+        let usage = if self.provider != "auto" {
+            extract_response_usage(&json, parse_ai_provider(&self.provider)?)
         } else {
-            self.auto_extract(&json)?
+            extract_response_usage(&json, detect_response_provider(&json)?)
         };
-
-        match self.count_mode.as_str() {
-            "prompt_tokens" => prompt.or(Some(0)),
-            "completion_tokens" => completion.or(Some(0)),
-            _ => total.or_else(|| match (prompt, completion) {
-                (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
-                (Some(prompt), None) => Some(prompt),
-                (None, Some(completion)) => Some(completion),
-                _ => None,
-            }),
-        }
-    }
-
-    fn extract_by_provider(&self, json: &Value) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
-        match self.provider.as_str() {
-            "openai" | "mistral" => Some(Self::extract_openai(json)),
-            "anthropic" => Some(Self::extract_anthropic(json)),
-            "google" => Some(Self::extract_google(json)),
-            "cohere" => Some(Self::extract_cohere(json)),
-            "bedrock" => Some(Self::extract_bedrock(json)),
-            _ => None,
-        }
-    }
-
-    fn auto_extract(&self, json: &Value) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
-        if json
-            .get("usageMetadata")
-            .and_then(|usage| usage.get("promptTokenCount"))
-            .is_some()
-        {
-            return Some(Self::extract_google(json));
-        }
-        if json
-            .get("usage")
-            .and_then(|usage| usage.get("input_tokens"))
-            .is_some()
-        {
-            return Some(Self::extract_anthropic(json));
-        }
-        if json
-            .get("meta")
-            .and_then(|meta| meta.get("tokens"))
-            .is_some()
-        {
-            return Some(Self::extract_cohere(json));
-        }
-        if json
-            .get("usage")
-            .and_then(|usage| usage.get("inputTokens"))
-            .is_some()
-        {
-            return Some(Self::extract_bedrock(json));
-        }
-        if json
-            .get("usage")
-            .and_then(|usage| usage.get("prompt_tokens"))
-            .is_some()
-        {
-            return Some(Self::extract_openai(json));
-        }
-        None
-    }
-
-    fn extract_openai(json: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
-        let usage = json.get("usage");
-        (
-            usage
-                .and_then(|value| value.get("prompt_tokens"))
-                .and_then(|value| value.as_u64()),
-            usage
-                .and_then(|value| value.get("completion_tokens"))
-                .and_then(|value| value.as_u64()),
-            usage
-                .and_then(|value| value.get("total_tokens"))
-                .and_then(|value| value.as_u64()),
-        )
-    }
-
-    fn extract_anthropic(json: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
-        let usage = json.get("usage");
-        let prompt = usage
-            .and_then(|value| value.get("input_tokens"))
-            .and_then(|value| value.as_u64());
-        let completion = usage
-            .and_then(|value| value.get("output_tokens"))
-            .and_then(|value| value.as_u64());
-        let total = match (prompt, completion) {
-            (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
-            _ => None,
-        };
-        (prompt, completion, total)
-    }
-
-    fn extract_google(json: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
-        let usage = json.get("usageMetadata");
-        (
-            usage
-                .and_then(|value| value.get("promptTokenCount"))
-                .and_then(|value| value.as_u64()),
-            usage
-                .and_then(|value| value.get("candidatesTokenCount"))
-                .and_then(|value| value.as_u64()),
-            usage
-                .and_then(|value| value.get("totalTokenCount"))
-                .and_then(|value| value.as_u64()),
-        )
-    }
-
-    fn extract_cohere(json: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
-        let tokens = json.get("meta").and_then(|meta| meta.get("tokens"));
-        let prompt = tokens
-            .and_then(|value| value.get("input_tokens"))
-            .and_then(|value| value.as_u64());
-        let completion = tokens
-            .and_then(|value| value.get("output_tokens"))
-            .and_then(|value| value.as_u64());
-        let total = match (prompt, completion) {
-            (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
-            _ => None,
-        };
-        (prompt, completion, total)
-    }
-
-    fn extract_bedrock(json: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
-        let usage = json.get("usage");
-        (
-            usage
-                .and_then(|value| value.get("inputTokens"))
-                .and_then(|value| value.as_u64()),
-            usage
-                .and_then(|value| value.get("outputTokens"))
-                .and_then(|value| value.as_u64()),
-            usage
-                .and_then(|value| value.get("totalTokens"))
-                .and_then(|value| value.as_u64()),
-        )
+        usage.total_for_mode(&self.count_mode)
     }
 
     fn extract_token_count_from_sse(&self, body: &[u8]) -> Option<u64> {
@@ -347,16 +215,20 @@ impl AiRateLimiter {
                 && usage.is_object()
                 && !usage.as_object().is_some_and(|object| object.is_empty())
             {
-                let (prompt, completion, total) = if self.provider != "auto" {
-                    self.extract_by_provider(&json)
-                        .unwrap_or_else(|| Self::extract_openai(&json))
+                let usage = if self.provider != "auto" {
+                    extract_response_usage(
+                        &json,
+                        parse_ai_provider(&self.provider).unwrap_or(AiProvider::OpenAi),
+                    )
                 } else {
-                    self.auto_extract(&json)
-                        .unwrap_or_else(|| Self::extract_openai(&json))
+                    extract_response_usage(
+                        &json,
+                        detect_response_provider(&json).unwrap_or(AiProvider::OpenAi),
+                    )
                 };
-                prompt_tokens = prompt;
-                completion_tokens = completion;
-                total_tokens = total;
+                prompt_tokens = usage.prompt_tokens;
+                completion_tokens = usage.completion_tokens;
+                total_tokens = usage.total_tokens;
             }
 
             if json.get("type").and_then(|value| value.as_str()) == Some("message_start")

@@ -24,41 +24,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::debug;
 
+use super::utils::ai_providers::{
+    AiProvider, AiTokenUsage, detect_response_provider, detect_sse_provider,
+    extract_response_usage, parse_ai_provider,
+};
 use super::{Plugin, PluginResult, RequestContext};
-
-/// Detected or configured LLM provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Provider {
-    OpenAi,
-    Anthropic,
-    Google,
-    Cohere,
-    Mistral,
-    Bedrock,
-}
-
-impl Provider {
-    fn as_str(self) -> &'static str {
-        match self {
-            Provider::OpenAi => "openai",
-            Provider::Anthropic => "anthropic",
-            Provider::Google => "google",
-            Provider::Cohere => "cohere",
-            Provider::Mistral => "mistral",
-            Provider::Bedrock => "bedrock",
-        }
-    }
-}
-
-/// Extracted token usage data from an LLM response.
-#[derive(Debug, Default)]
-struct TokenUsage {
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    total_tokens: Option<u64>,
-    model: Option<String>,
-    provider: Option<Provider>,
-}
 
 pub struct AiTokenMetrics {
     provider: String,
@@ -114,202 +84,6 @@ impl AiTokenMetrics {
         })
     }
 
-    /// Auto-detect the provider from the JSON response structure.
-    fn detect_provider(json: &Value) -> Option<Provider> {
-        // Google Gemini: usageMetadata.promptTokenCount
-        if json
-            .get("usageMetadata")
-            .and_then(|u| u.get("promptTokenCount"))
-            .is_some()
-        {
-            return Some(Provider::Google);
-        }
-
-        // Anthropic: usage.input_tokens
-        if json
-            .get("usage")
-            .and_then(|u| u.get("input_tokens"))
-            .is_some()
-        {
-            return Some(Provider::Anthropic);
-        }
-
-        // Cohere: meta.tokens
-        if json.get("meta").and_then(|m| m.get("tokens")).is_some() {
-            return Some(Provider::Cohere);
-        }
-
-        // Bedrock: usage.inputTokens
-        if json
-            .get("usage")
-            .and_then(|u| u.get("inputTokens"))
-            .is_some()
-        {
-            return Some(Provider::Bedrock);
-        }
-
-        // OpenAI (and compatible: Mistral, Groq, Together, Azure): usage.prompt_tokens
-        if json
-            .get("usage")
-            .and_then(|u| u.get("prompt_tokens"))
-            .is_some()
-        {
-            return Some(Provider::OpenAi);
-        }
-
-        None
-    }
-
-    /// Parse the configured provider string into a Provider enum.
-    fn parse_configured_provider(provider: &str) -> Option<Provider> {
-        match provider {
-            "openai" => Some(Provider::OpenAi),
-            "anthropic" => Some(Provider::Anthropic),
-            "google" => Some(Provider::Google),
-            "cohere" => Some(Provider::Cohere),
-            "mistral" => Some(Provider::Mistral),
-            "bedrock" => Some(Provider::Bedrock),
-            _ => None,
-        }
-    }
-
-    /// Extract token usage from the JSON response based on the provider.
-    fn extract_tokens(json: &Value, provider: Provider) -> TokenUsage {
-        match provider {
-            Provider::OpenAi | Provider::Mistral => Self::extract_openai(json, provider),
-            Provider::Anthropic => Self::extract_anthropic(json),
-            Provider::Google => Self::extract_google(json),
-            Provider::Cohere => Self::extract_cohere(json),
-            Provider::Bedrock => Self::extract_bedrock(json),
-        }
-    }
-
-    fn extract_openai(json: &Value, provider: Provider) -> TokenUsage {
-        let usage = json.get("usage");
-        let prompt = usage
-            .and_then(|u| u.get("prompt_tokens"))
-            .and_then(|v| v.as_u64());
-        let completion = usage
-            .and_then(|u| u.get("completion_tokens"))
-            .and_then(|v| v.as_u64());
-        let total = usage
-            .and_then(|u| u.get("total_tokens"))
-            .and_then(|v| v.as_u64())
-            .or_else(|| match (prompt, completion) {
-                (Some(p), Some(c)) => Some(p.saturating_add(c)),
-                _ => None,
-            });
-        let model = json.get("model").and_then(|v| v.as_str()).map(String::from);
-
-        TokenUsage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: total,
-            model,
-            provider: Some(provider),
-        }
-    }
-
-    fn extract_anthropic(json: &Value) -> TokenUsage {
-        let usage = json.get("usage");
-        let prompt = usage
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(|v| v.as_u64());
-        let completion = usage
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(|v| v.as_u64());
-        let total = match (prompt, completion) {
-            (Some(p), Some(c)) => Some(p.saturating_add(c)),
-            _ => None,
-        };
-        let model = json.get("model").and_then(|v| v.as_str()).map(String::from);
-
-        TokenUsage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: total,
-            model,
-            provider: Some(Provider::Anthropic),
-        }
-    }
-
-    fn extract_google(json: &Value) -> TokenUsage {
-        let usage = json.get("usageMetadata");
-        let prompt = usage
-            .and_then(|u| u.get("promptTokenCount"))
-            .and_then(|v| v.as_u64());
-        let completion = usage
-            .and_then(|u| u.get("candidatesTokenCount"))
-            .and_then(|v| v.as_u64());
-        let total = usage
-            .and_then(|u| u.get("totalTokenCount"))
-            .and_then(|v| v.as_u64())
-            .or_else(|| match (prompt, completion) {
-                (Some(p), Some(c)) => Some(p.saturating_add(c)),
-                _ => None,
-            });
-        let model = json
-            .get("modelVersion")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        TokenUsage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: total,
-            model,
-            provider: Some(Provider::Google),
-        }
-    }
-
-    fn extract_cohere(json: &Value) -> TokenUsage {
-        let tokens = json.get("meta").and_then(|m| m.get("tokens"));
-        let prompt = tokens
-            .and_then(|t| t.get("input_tokens"))
-            .and_then(|v| v.as_u64());
-        let completion = tokens
-            .and_then(|t| t.get("output_tokens"))
-            .and_then(|v| v.as_u64());
-        let total = match (prompt, completion) {
-            (Some(p), Some(c)) => Some(p.saturating_add(c)),
-            _ => None,
-        };
-        let model = json.get("model").and_then(|v| v.as_str()).map(String::from);
-
-        TokenUsage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: total,
-            model,
-            provider: Some(Provider::Cohere),
-        }
-    }
-
-    fn extract_bedrock(json: &Value) -> TokenUsage {
-        let usage = json.get("usage");
-        let prompt = usage
-            .and_then(|u| u.get("inputTokens"))
-            .and_then(|v| v.as_u64());
-        let completion = usage
-            .and_then(|u| u.get("outputTokens"))
-            .and_then(|v| v.as_u64());
-        let total = usage
-            .and_then(|u| u.get("totalTokens"))
-            .and_then(|v| v.as_u64())
-            .or_else(|| match (prompt, completion) {
-                (Some(p), Some(c)) => Some(p.saturating_add(c)),
-                _ => None,
-            });
-
-        TokenUsage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: total,
-            model: None,
-            provider: Some(Provider::Bedrock),
-        }
-    }
-
     /// Parse an SSE (text/event-stream) response body to extract token usage.
     ///
     /// SSE responses consist of `data: {...}\n\n` lines. The plugin scans for:
@@ -317,12 +91,12 @@ impl AiTokenMetrics {
     /// - **Usage data**: extracted from the final chunk that contains a `usage` object
     ///   (OpenAI sends this when `stream_options.include_usage: true`)
     /// - **Anthropic streaming**: looks for `message_delta` events with `usage`
-    fn extract_from_sse(&self, body: &[u8]) -> Option<TokenUsage> {
+    fn extract_from_sse(&self, body: &[u8]) -> Option<AiTokenUsage> {
         let body_str = std::str::from_utf8(body).ok()?;
 
         let mut model: Option<String> = None;
-        let mut final_usage: Option<TokenUsage> = None;
-        let mut detected_provider: Option<Provider> = None;
+        let mut final_usage: Option<AiTokenUsage> = None;
+        let mut detected_provider: Option<AiProvider> = None;
 
         for line in body_str.lines() {
             let data = if let Some(stripped) = line.strip_prefix("data: ") {
@@ -351,9 +125,9 @@ impl AiTokenMetrics {
             // Auto-detect provider from first parseable chunk
             if detected_provider.is_none() {
                 if self.provider == "auto" {
-                    detected_provider = Self::detect_sse_provider(&json);
+                    detected_provider = detect_sse_provider(&json);
                 } else {
-                    detected_provider = Self::parse_configured_provider(&self.provider);
+                    detected_provider = parse_ai_provider(&self.provider);
                 }
             }
 
@@ -363,8 +137,8 @@ impl AiTokenMetrics {
                 && usage.is_object()
                 && !usage.as_object().is_some_and(|o| o.is_empty())
             {
-                let provider = detected_provider.unwrap_or(Provider::OpenAi);
-                let mut extracted = Self::extract_tokens(&json, provider);
+                let provider = detected_provider.unwrap_or(AiProvider::OpenAi);
+                let mut extracted = extract_response_usage(&json, provider);
                 if extracted.model.is_none() {
                     extracted.model = model.clone();
                 }
@@ -381,12 +155,12 @@ impl AiTokenMetrics {
                     .and_then(|v| v.as_u64());
                 // message_delta only has output_tokens; input_tokens come from message_start
                 if output_tokens.is_some() {
-                    let mut u = TokenUsage {
+                    let mut u = AiTokenUsage {
                         prompt_tokens: None,
                         completion_tokens: output_tokens,
                         total_tokens: None,
                         model: model.clone(),
-                        provider: Some(Provider::Anthropic),
+                        provider: Some(AiProvider::Anthropic),
                     };
                     // Try to merge with any previously seen input_tokens
                     if let Some(ref prev) = final_usage {
@@ -409,7 +183,7 @@ impl AiTokenMetrics {
                     .and_then(|u| u.get("input_tokens"))
                     .and_then(|v| v.as_u64());
                 if input_tokens.is_some() {
-                    let u = TokenUsage {
+                    let u = AiTokenUsage {
                         prompt_tokens: input_tokens,
                         completion_tokens: None,
                         total_tokens: None,
@@ -418,7 +192,7 @@ impl AiTokenMetrics {
                             .and_then(|v| v.as_str())
                             .map(String::from)
                             .or_else(|| model.clone()),
-                        provider: Some(Provider::Anthropic),
+                        provider: Some(AiProvider::Anthropic),
                     };
                     final_usage = Some(u);
                 }
@@ -427,36 +201,8 @@ impl AiTokenMetrics {
 
         final_usage
     }
-
-    /// Detect provider from an SSE chunk's JSON structure.
-    fn detect_sse_provider(json: &Value) -> Option<Provider> {
-        // Anthropic SSE: has "type" field like "message_start", "content_block_delta", etc.
-        if json.get("type").and_then(|t| t.as_str()).is_some_and(|t| {
-            t.starts_with("message") || t.starts_with("content_block") || t == "ping"
-        }) {
-            return Some(Provider::Anthropic);
-        }
-
-        // OpenAI SSE: has "object" field like "chat.completion.chunk"
-        if json
-            .get("object")
-            .and_then(|o| o.as_str())
-            .is_some_and(|o| o.contains("chat.completion"))
-        {
-            return Some(Provider::OpenAi);
-        }
-
-        // Google Gemini SSE: has "candidates" array
-        if json.get("candidates").is_some() {
-            return Some(Provider::Google);
-        }
-
-        // Fall back to full detection
-        Self::detect_provider(json)
-    }
-
     /// Write extracted token usage into the request context metadata.
-    fn write_metadata(&self, metadata: &mut HashMap<String, String>, usage: &TokenUsage) {
+    fn write_metadata(&self, metadata: &mut HashMap<String, String>, usage: &AiTokenUsage) {
         let prefix = &self.metadata_prefix;
 
         if let Some(provider) = usage.provider {
@@ -591,7 +337,7 @@ impl Plugin for AiTokenMetrics {
 
         // Determine the provider
         let provider = if self.provider == "auto" {
-            match Self::detect_provider(&json) {
+            match detect_response_provider(&json) {
                 Some(p) => p,
                 None => {
                     debug!("ai_token_metrics: could not auto-detect provider from response");
@@ -599,7 +345,7 @@ impl Plugin for AiTokenMetrics {
                 }
             }
         } else {
-            match Self::parse_configured_provider(&self.provider) {
+            match parse_ai_provider(&self.provider) {
                 Some(p) => p,
                 None => {
                     debug!(
@@ -612,7 +358,7 @@ impl Plugin for AiTokenMetrics {
         };
 
         // Extract token usage and write to metadata
-        let usage = Self::extract_tokens(&json, provider);
+        let usage = extract_response_usage(&json, provider);
         self.write_metadata(&mut ctx.metadata, &usage);
 
         PluginResult::Continue
