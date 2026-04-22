@@ -1919,8 +1919,13 @@ where
 
     // Per-direction inactivity watermarks. Stored on the stack alongside the
     // futures they protect — zero heap allocation, zero pointer chase.
+    // Read watermark starts at `now` — a silent backend is immediately stale.
+    // Write watermark starts at u64::MAX (sentinel) so the check is inert
+    // until the first write actually progresses. Without the sentinel, push-
+    // only traffic (backend→client, client silent) would falsely fire the
+    // write timeout because no c2b write ever refreshes the watermark.
     let b2c_read_wm_storage = AtomicU64::new(now);
-    let c2b_write_wm_storage = AtomicU64::new(now);
+    let c2b_write_wm_storage = AtomicU64::new(u64::MAX);
     let read_wm_active = backend_read_timeout.is_some_and(|d| !d.is_zero());
     let write_wm_active = backend_write_timeout.is_some_and(|d| !d.is_zero());
     let b2c_read_watermark: Option<&AtomicU64> = if read_wm_active {
@@ -2098,6 +2103,8 @@ where
                 timeout_ms,
                 half_close_cap,
                 Direction::ClientToBackend,
+                c2b_write_watermark,
+                backend_write_timeout_ms,
             )
             .await;
         } else {
@@ -2134,6 +2141,8 @@ where
                 timeout_ms,
                 half_close_cap,
                 Direction::BackendToClient,
+                b2c_read_watermark,
+                backend_read_timeout_ms,
             )
             .await;
         } else {
@@ -2171,19 +2180,9 @@ where
 
 /// Drain one direction of the bidirectional copy during the clean-EOF half-close
 /// phase. Returns `Some(first_failure_tuple)` when the drain ends in an error,
-/// an idle timeout, or the half-close hard cap. Returns `None` when the drain
-/// completes cleanly.
-///
-/// Bounds:
-/// * `idle_timeout_active`: if set, fires `ReadWriteTimeout` when the shared
-///   `last_activity` watermark is older than `timeout_ms`.
-/// * `half_close_cap`: if set, fires `ReadWriteTimeout` after this elapsed
-///   wall-clock time in Phase 2 *regardless of idle state*. This is the
-///   safety net that applies even when `idle_timeout_active == false`.
-///
-/// Both bounds emit `Direction::Unknown` / `ReadWriteTimeout` so
-/// `disconnect_cause_for_failure` maps them to `IdleTimeout` — they are
-/// semantically timeouts from the caller's perspective.
+/// an idle timeout, a per-direction inactivity timeout, or the half-close hard
+/// cap. Returns `None` when the drain completes cleanly.
+#[allow(clippy::too_many_arguments)]
 async fn drain_half_close_copy<F>(
     drain_fut: &mut F,
     last_activity: Option<&AtomicU64>,
@@ -2191,10 +2190,14 @@ async fn drain_half_close_copy<F>(
     timeout_ms: u64,
     half_close_cap: Option<Duration>,
     direction: Direction,
+    direction_watermark: Option<&AtomicU64>,
+    direction_timeout_ms: u64,
 ) -> Option<(Direction, ErrorClass, Option<StreamIoSide>, String)>
 where
     F: std::future::Future<Output = Result<(), (StreamIoSide, std::io::Error)>> + Unpin,
 {
+    let any_timer_active =
+        idle_timeout_active || direction_watermark.is_some() || half_close_cap.is_some();
     let phase2_start = Instant::now();
     loop {
         tokio::select! {
@@ -2215,9 +2218,30 @@ where
                 }
                 return None;
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
+            _ = tokio::time::sleep(Duration::from_secs(1)), if any_timer_active => {
+                let now = coarse_now_ms();
+                if let Some(wm) = direction_watermark
+                    && now.saturating_sub(wm.load(Ordering::Relaxed)) >= direction_timeout_ms
+                {
+                    let side = match direction {
+                        Direction::BackendToClient => Some(StreamIoSide::Read),
+                        Direction::ClientToBackend => Some(StreamIoSide::Write),
+                        Direction::Unknown => None,
+                    };
+                    let label = match direction {
+                        Direction::BackendToClient => "backend read inactivity timeout",
+                        Direction::ClientToBackend => "backend write inactivity timeout",
+                        Direction::Unknown => "backend inactivity timeout",
+                    };
+                    return Some((
+                        direction,
+                        ErrorClass::ReadWriteTimeout,
+                        side,
+                        label.to_string(),
+                    ));
+                }
                 if let Some(la) = last_activity
-                    && coarse_now_ms().saturating_sub(la.load(Ordering::Relaxed)) >= timeout_ms
+                    && now.saturating_sub(la.load(Ordering::Relaxed)) >= timeout_ms
                 {
                     return Some((
                         Direction::Unknown,
@@ -2237,24 +2261,14 @@ where
                     ));
                 }
             }
-            // Separate branch so the hard cap fires even when the idle
-            // timeout is disabled. `half_close_cap == None` → this arm is
-            // inert (the `if let Some(cap)` guards `select!`'s condition).
-            _ = sleep_for_cap(half_close_cap), if half_close_cap.is_some() && !idle_timeout_active => {
-                return Some((
-                    Direction::Unknown,
-                    ErrorClass::ReadWriteTimeout,
-                    None,
-                    "tcp half-close max wait exceeded".to_string(),
-                ));
-            }
         }
     }
 }
 
 /// Wait the full `half_close_cap` duration or return immediately when `None`.
-/// Used as a safety-net branch in Phase 2's `select!` so the hard cap fires
-/// even when the idle timeout is disabled.
+/// Used as a safety-net branch in the splice-path Phase 2 `select!` so the
+/// hard cap fires even when the idle timeout is disabled.
+#[cfg(target_os = "linux")]
 async fn sleep_for_cap(half_close_cap: Option<Duration>) {
     match half_close_cap {
         Some(d) => tokio::time::sleep(d).await,
