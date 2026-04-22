@@ -249,17 +249,13 @@ impl Plugin for RequestMirror {
             None
         };
 
-        let mirror_timeout = ctx
-            .matched_proxy
-            .as_ref()
-            .map(|p| {
-                if p.backend_read_timeout_ms > 0 {
-                    Duration::from_millis(p.backend_read_timeout_ms)
-                } else {
-                    Duration::from_secs(60)
-                }
-            })
-            .unwrap_or(Duration::from_secs(60));
+        let mirror_timeout = ctx.matched_proxy.as_ref().and_then(|p| {
+            if p.backend_read_timeout_ms > 0 {
+                Some(Duration::from_millis(p.backend_read_timeout_ms))
+            } else {
+                None
+            }
+        });
 
         // Create a watch channel for the spawned task to send mirror response
         // metadata back. The proxy handler collects the result via
@@ -289,8 +285,9 @@ impl Plugin for RequestMirror {
                 ),
             };
 
-            // Override the client-level timeout with the proxy's backend timeout.
-            req_builder = req_builder.timeout(mirror_timeout);
+            if let Some(t) = mirror_timeout {
+                req_builder = req_builder.timeout(t);
+            }
 
             // Forward all headers from the original (transformed) request
             for (key, value) in &mirror_headers {

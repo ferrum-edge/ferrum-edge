@@ -6534,33 +6534,33 @@ async fn handle_proxy_request_inner(
 
             // Spawn a lightweight deferred task to log the final streaming latency.
             // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
-            let deferred_proxy_id = proxy.id.clone();
-            let deferred_backend_url = strip_query_params(&backend_url).to_string();
-            let read_timeout_ms = if proxy.backend_read_timeout_ms > 0 {
-                proxy.backend_read_timeout_ms
-            } else {
-                30_000
-            };
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000)).await;
-                let completed = metrics.completed();
-                let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
-                if completed {
-                    debug!(
-                        proxy_id = %deferred_proxy_id,
-                        backend_url = %deferred_backend_url,
-                        backend_total_ms = total_ms,
-                        "Streaming response completed"
-                    );
-                } else {
-                    warn!(
-                        proxy_id = %deferred_proxy_id,
-                        backend_url = %deferred_backend_url,
-                        backend_last_frame_ms = total_ms,
-                        "Streaming response incomplete (client disconnect or timeout)"
-                    );
-                }
-            });
+            // Skipped when read timeout is disabled (0) — no meaningful deadline to check.
+            if proxy.backend_read_timeout_ms > 0 {
+                let deferred_proxy_id = proxy.id.clone();
+                let deferred_backend_url = strip_query_params(&backend_url).to_string();
+                let read_timeout_ms = proxy.backend_read_timeout_ms;
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000))
+                        .await;
+                    let completed = metrics.completed();
+                    let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
+                    if completed {
+                        debug!(
+                            proxy_id = %deferred_proxy_id,
+                            backend_url = %deferred_backend_url,
+                            backend_total_ms = total_ms,
+                            "Streaming response completed"
+                        );
+                    } else {
+                        warn!(
+                            proxy_id = %deferred_proxy_id,
+                            backend_url = %deferred_backend_url,
+                            backend_last_frame_ms = total_ms,
+                            "Streaming response incomplete (client disconnect or timeout)"
+                        );
+                    }
+                });
+            }
 
             tracked_body
         }
