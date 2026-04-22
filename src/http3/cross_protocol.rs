@@ -9,17 +9,38 @@
 //!
 //! ## Buffering policy
 //!
-//! - **Request body — buffered, size-bounded.** The H3 recv half is drained
-//!   into a single `Vec<u8>` up to `max_request_body_size_bytes`. This is
-//!   the same trade-off nginx/traefik make for cross-protocol bridges
-//!   because streaming the H3 recv stream through `reqwest::Body::wrap_stream`
-//!   demands a `'static` stream, which cannot safely capture the `&mut`
-//!   borrow that the H3 listener already holds on the shared request
-//!   stream. Upload bodies past the configured ceiling are rejected with
-//!   413. The existing H3-preferred fast path (HttpsH3Preferred + Plain)
-//!   stays fully streamed — this fallback only kicks in for the
-//!   cross-protocol case where operators have already accepted a buffered
-//!   request body in exchange for protocol flexibility.
+//! Mirrors the H1/H2 proxy path's plugin-driven decision (see
+//! `ClientRequestBody::Streaming|Buffered` in `src/proxy/mod.rs`): stream
+//! the request body by default, buffer only when a plugin explicitly
+//! demands the body pre-before_proxy or when the caller has already
+//! pre-buffered it upstream.
+//!
+//! - **Plain flavor — request body streamed via an mpsc bridge.**
+//!   `reqwest::Body::wrap_stream` requires a `'static + Send + Sync`
+//!   stream, which cannot directly hold a `&mut RequestStream` borrow.
+//!   The bridge uses a `tokio::sync::mpsc` channel: one task (inlined via
+//!   `tokio::join!`) reads `RequestStream::recv_data()` and pushes `Bytes`
+//!   chunks into the Sender; the `Receiver` is wrapped via
+//!   `stream::unfold` and handed to `Body::wrap_stream` (the Receiver
+//!   owns its own state and is `'static`). Backpressure is provided by
+//!   the bounded channel (capacity sized to
+//!   `FERRUM_H3_REQUEST_BODY_CHANNEL_CAPACITY`, default 8). When the H3
+//!   recv half is drained OR the backend cancels, both sides unwind
+//!   cleanly without a dangling task. If the caller pre-buffered the
+//!   body (plugin phase already collected it), the buffered bytes are
+//!   passed to reqwest directly via `Body::from(Vec<u8>)` — one
+//!   allocation, no bridge.
+//!
+//! - **gRPC flavor — request body buffered.** The gRPC pool's
+//!   `proxy_grpc_request_from_bytes` API takes `Bytes` for retry-safe
+//!   framing and trailer handling. Streaming gRPC request bodies through
+//!   the bridge would require a new `GrpcBody` variant in the pool; kept
+//!   buffered for now because unary gRPC bodies are small and this is a
+//!   cross-protocol fallback path.
+//!
+//! - **Size limits.** `max_request_body_size_bytes` is enforced inline in
+//!   the streaming reader (413 if exceeded mid-stream) and by
+//!   `drain_h3_body` on the buffered gRPC path.
 //!
 //! - **Response body — streamed frame-by-frame with coalescing.** Identical
 //!   coalescing configuration (`http3_coalesce_min_bytes`,
@@ -51,6 +72,8 @@
 //! client-disconnected flag, and error classifications.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -125,60 +148,6 @@ where
 {
     let backend_start = Instant::now();
 
-    // WebSocket short-circuits before touching the body — saves a body drain
-    // and avoids a pointless reqwest round-trip.
-    if flavor == HttpFlavor::WebSocket {
-        warn!(
-            proxy_id = %proxy.id,
-            "WebSocket over HTTP/3 (RFC 9220 Extended CONNECT) is not supported; returning 501"
-        );
-        return write_error(
-            stream,
-            StatusCode::NOT_IMPLEMENTED,
-            r#"{"error":"WebSocket over HTTP/3 is not supported. Send the upgrade over HTTP/1.1 or HTTP/2."}"#,
-            backend_start,
-            0,
-        )
-        .await;
-    }
-
-    // Drain the request body into Vec<u8> with a size limit. See module
-    // docs for why this is buffered rather than streamed.
-    let body = if let Some(buffered) = prebuffered_body {
-        buffered
-    } else {
-        match drain_h3_body(stream, state.max_request_body_size_bytes).await {
-            Ok(Some(body)) => body,
-            Ok(None) => {
-                return write_error(
-                    stream,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    r#"{"error":"Request body exceeds maximum size"}"#,
-                    backend_start,
-                    0,
-                )
-                .await;
-            }
-            Err(e) => {
-                warn!(
-                    proxy_id = %proxy.id,
-                    error = %e,
-                    "cross-protocol H3: failed to drain request body"
-                );
-                return write_error(
-                    stream,
-                    StatusCode::BAD_REQUEST,
-                    r#"{"error":"Request body read error"}"#,
-                    backend_start,
-                    0,
-                )
-                .await;
-            }
-        }
-    };
-
-    let request_bytes = body.len() as u64;
-
     match flavor {
         HttpFlavor::Plain => {
             dispatch_plain(
@@ -190,10 +159,9 @@ where
                 backend_url,
                 upstream_target,
                 cb_target_key,
-                body,
+                prebuffered_body,
                 client_ip,
                 backend_start,
-                request_bytes,
             )
             .await
         }
@@ -207,13 +175,25 @@ where
                 backend_url,
                 upstream_target,
                 cb_target_key,
-                body,
+                prebuffered_body,
                 backend_start,
-                request_bytes,
             )
             .await
         }
-        HttpFlavor::WebSocket => unreachable!("WebSocket short-circuited above"),
+        HttpFlavor::WebSocket => {
+            warn!(
+                proxy_id = %proxy.id,
+                "WebSocket over HTTP/3 (RFC 9220 Extended CONNECT) is not supported; returning 501"
+            );
+            write_error(
+                stream,
+                StatusCode::NOT_IMPLEMENTED,
+                r#"{"error":"WebSocket over HTTP/3 is not supported. Send the upgrade over HTTP/1.1 or HTTP/2."}"#,
+                backend_start,
+                0,
+            )
+            .await
+        }
     }
 }
 
@@ -231,10 +211,9 @@ async fn dispatch_plain<S>(
     backend_url: &str,
     upstream_target: Option<&UpstreamTarget>,
     cb_target_key: Option<&str>,
-    body: Vec<u8>,
+    prebuffered_body: Option<Vec<u8>>,
     client_ip: &str,
     backend_start: Instant,
-    request_bytes: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -260,7 +239,7 @@ where
                 StatusCode::BAD_GATEWAY,
                 r#"{"error":"Bad Gateway"}"#,
                 backend_start,
-                request_bytes,
+                0,
             )
             .await;
         }
@@ -274,7 +253,7 @@ where
                 StatusCode::METHOD_NOT_ALLOWED,
                 r#"{"error":"Method Not Allowed"}"#,
                 backend_start,
-                request_bytes,
+                0,
             )
             .await;
         }
@@ -317,7 +296,84 @@ where
         .header("x-forwarded-for", client_ip)
         .header("x-forwarded-proto", "https");
 
-    let response = match req_builder.body(body).send().await {
+    // Request body dispatch — streams by default, buffers only when the
+    // caller pre-buffered (plugin phase already collected the body). This
+    // mirrors `ClientRequestBody::{Streaming, Buffered}` in the H1/H2 path
+    // (src/proxy/mod.rs:231).
+    let max_req_bytes = state.max_request_body_size_bytes;
+    let (send_result, request_bytes) = match prebuffered_body {
+        Some(buffered) => {
+            // Fast path — body is already in memory. One allocation passed
+            // to reqwest; no mpsc, no bridge.
+            let n = buffered.len() as u64;
+            let send_future = req_builder.body(buffered).send();
+            (send_future.await, n)
+        }
+        None => {
+            // Streaming path — wire the H3 recv half to reqwest via a
+            // bounded mpsc channel. Reader + send() are driven concurrently
+            // with `tokio::join!` so the body flows end-to-end without any
+            // intermediate Vec<u8>. See module doc comment for design
+            // rationale.
+            let capacity = state.env_config.http3_request_body_channel_capacity;
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(capacity);
+            // Receiver is 'static (owns its own state) — satisfies the
+            // `Body::wrap_stream` bound without capturing the &mut borrow.
+            let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            });
+            let req_body = reqwest::Body::wrap_stream(body_stream);
+            let send_future = req_builder.body(req_body).send();
+
+            let bytes_read = Arc::new(AtomicU64::new(0));
+            let reader_bytes = Arc::clone(&bytes_read);
+            let reader_future = async {
+                let mut total: usize = 0;
+                loop {
+                    match stream.recv_data().await {
+                        Ok(Some(chunk)) => {
+                            let data = chunk.chunk();
+                            if max_req_bytes > 0 && total + data.len() > max_req_bytes {
+                                let _ = tx
+                                    .send(Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "request body exceeds max_request_body_size_bytes",
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            total += data.len();
+                            reader_bytes.store(total as u64, Ordering::Relaxed);
+                            // Bytes::copy_from_slice is unavoidable here —
+                            // h3's `chunk.chunk()` returns &[u8] borrowed
+                            // from the Bytes holder it won't release to us.
+                            if tx.send(Ok(Bytes::copy_from_slice(data))).await.is_err() {
+                                // Receiver dropped (backend closed body
+                                // stream early or send_future finished) —
+                                // stop reading.
+                                return;
+                            }
+                        }
+                        Ok(None) => return, // clean EOF; tx drops on exit
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(std::io::Error::other(format!(
+                                    "H3 recv_data failed: {}",
+                                    e
+                                ))))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let (_, send_result) = tokio::join!(reader_future, send_future);
+            (send_result, bytes_read.load(Ordering::Relaxed))
+        }
+    };
+
+    let response = match send_result {
         Ok(r) => r,
         Err(e) => {
             let error_class = crate::retry::classify_reqwest_error(&e);
@@ -424,9 +480,8 @@ async fn dispatch_grpc<S>(
     backend_url: &str,
     upstream_target: Option<&UpstreamTarget>,
     cb_target_key: Option<&str>,
-    body: Vec<u8>,
+    prebuffered_body: Option<Vec<u8>>,
     backend_start: Instant,
-    request_bytes: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -439,11 +494,50 @@ where
                 StatusCode::METHOD_NOT_ALLOWED,
                 r#"{"error":"Method Not Allowed"}"#,
                 backend_start,
-                request_bytes,
+                0,
             )
             .await;
         }
     };
+
+    // gRPC request body: the pool API takes `Bytes` for retry-safe framing
+    // and trailer handling. Buffer the H3 recv half here (unary gRPC bodies
+    // are small; streaming gRPC request bodies over the cross-protocol
+    // bridge would require a new GrpcBody variant in GrpcConnectionPool —
+    // future optimization).
+    let body = if let Some(buffered) = prebuffered_body {
+        buffered
+    } else {
+        match drain_h3_body(stream, state.max_request_body_size_bytes).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                return write_error(
+                    stream,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"Request body exceeds maximum size"}"#,
+                    backend_start,
+                    0,
+                )
+                .await;
+            }
+            Err(e) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    error = %e,
+                    "cross-protocol H3→gRPC: request body read failed"
+                );
+                return write_error(
+                    stream,
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"Request body read error"}"#,
+                    backend_start,
+                    0,
+                )
+                .await;
+            }
+        }
+    };
+    let request_bytes = body.len() as u64;
 
     let mut hmap = HeaderMap::new();
     for (k, v) in proxy_headers {
