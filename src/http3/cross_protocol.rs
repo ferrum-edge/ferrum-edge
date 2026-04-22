@@ -31,12 +31,17 @@
 //!   passed to reqwest directly via `Body::from(Vec<u8>)` — one
 //!   allocation, no bridge.
 //!
-//! - **gRPC flavor — request body buffered.** The gRPC pool's
-//!   `proxy_grpc_request_from_bytes` API takes `Bytes` for retry-safe
-//!   framing and trailer handling. Streaming gRPC request bodies through
-//!   the bridge would require a new `GrpcBody` variant in the pool; kept
-//!   buffered for now because unary gRPC bodies are small and this is a
-//!   cross-protocol fallback path.
+//! - **gRPC flavor — request body buffered, response streamed when safe.**
+//!   The gRPC pool's `proxy_grpc_request_from_bytes` API takes `Bytes` for
+//!   retry-safe framing and trailer handling, so the request body is
+//!   collected up-front (unary gRPC request bodies are small and this is a
+//!   cross-protocol fallback path). The RESPONSE is streamed whenever no
+//!   retry is configured AND no plugin forces response-body buffering;
+//!   server-streaming / bidi gRPC RPCs flow frame-by-frame through the
+//!   bridge rather than accumulating fully in memory before the first byte
+//!   reaches the H3 client. When retries or body-buffering plugins are
+//!   configured, the response is buffered so the retry/plugin layer can
+//!   inspect it before forwarding.
 //!
 //! - **Size limits.** The Plain path enforces `max_request_body_size_bytes`
 //!   inline in the streaming reader (413 on overflow mid-stream — a shared
@@ -186,6 +191,7 @@ where
                 upstream_target,
                 cb_target_key,
                 prebuffered_body,
+                client_ip,
                 backend_start,
             )
             .await
@@ -277,7 +283,13 @@ where
 
     // Forward headers. Host is rewritten to the effective backend unless
     // `preserve_host_header` is set — matches `proxy_to_backend_retry`'s
-    // policy. Hop-by-hop headers per RFC 9110 §7.6.1 are stripped.
+    // policy. Hop-by-hop headers per RFC 9110 §7.6.1 are stripped. The
+    // standard forwarding headers (X-Forwarded-*, Via, Forwarded) are
+    // emitted after this loop so we can honor any existing XFF value
+    // the client sent while guaranteeing the gateway appends its own
+    // resolved client IP — identical to the H1/H2 path.
+    let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
+    let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
     for (k, v) in proxy_headers {
         match k.as_str() {
             "host" => {
@@ -287,6 +299,9 @@ where
                     req_builder = req_builder.header("Host", effective_host);
                 }
             }
+            // Skipped: hop-by-hop (RFC 9110 §7.6.1) and the forwarding
+            // headers we re-synthesize below so a client-sent value cannot
+            // override the gateway's canonical view.
             "connection"
             | "content-length"
             | "transfer-encoding"
@@ -295,16 +310,37 @@ where
             | "trailer"
             | "proxy-authorization"
             | "proxy-connection"
-            | "upgrade" => {}
+            | "upgrade"
+            | "x-forwarded-for"
+            | "x-forwarded-proto"
+            | "x-forwarded-host"
+            | "via"
+            | "forwarded" => {}
             _ => {
                 req_builder = req_builder.header(k, v);
             }
         }
     }
 
-    req_builder = req_builder
-        .header("x-forwarded-for", client_ip)
-        .header("x-forwarded-proto", "https");
+    // Standard forwarding header set — mirrors `proxy_to_backend_retry` in
+    // `src/proxy/mod.rs` so backends see identical forwarding metadata
+    // regardless of whether the client arrived via H1/H2 or H3. H3 clients
+    // always arrive over TLS so proto is always "https".
+    let xff_val = crate::proxy::build_xff_value(original_xff, client_ip);
+    req_builder = req_builder.header("X-Forwarded-For", xff_val);
+    req_builder = req_builder.header("X-Forwarded-Proto", "https");
+    if let Some(host) = original_host_header {
+        req_builder = req_builder.header("X-Forwarded-Host", host);
+    }
+    if let Some(ref via) = state.via_header_http3 {
+        req_builder = req_builder.header("Via", via.as_str());
+    }
+    if state.add_forwarded_header {
+        req_builder = req_builder.header(
+            "Forwarded",
+            crate::proxy::build_forwarded_value(client_ip, "https", original_host_header),
+        );
+    }
 
     // Request body dispatch — streams by default, buffers only when the
     // caller pre-buffered (plugin phase already collected the body). This
@@ -520,6 +556,7 @@ async fn dispatch_grpc<S>(
     upstream_target: Option<&UpstreamTarget>,
     cb_target_key: Option<&str>,
     prebuffered_body: Option<Vec<u8>>,
+    client_ip: &str,
     backend_start: Instant,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -580,8 +617,23 @@ where
     };
     let request_bytes = body.len() as u64;
 
+    // Build the backend-facing header map. Mirrors the H1/H2 gRPC path in
+    // `src/proxy/mod.rs::proxy_grpc_request_core` so gRPC backends behind
+    // an H3 frontend see the same forwarding metadata (X-Forwarded-For,
+    // -Proto, -Host, Via, Forwarded) as they would over H1/H2.
+    let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
+    let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
     let mut hmap = HeaderMap::new();
     for (k, v) in proxy_headers {
+        let k_lower = k.as_str();
+        // Skip the forwarding headers we re-synthesize below so a
+        // client-sent value cannot override the gateway's canonical view.
+        if matches!(
+            k_lower,
+            "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" | "via" | "forwarded"
+        ) {
+            continue;
+        }
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
             HeaderValue::from_str(v),
@@ -589,7 +641,40 @@ where
             hmap.append(name, val);
         }
     }
+    let xff_val = crate::proxy::build_xff_value(original_xff, client_ip);
+    if let Ok(val) = HeaderValue::from_str(&xff_val) {
+        hmap.insert("x-forwarded-for", val);
+    }
+    if let Ok(val) = HeaderValue::from_str("https") {
+        hmap.insert("x-forwarded-proto", val);
+    }
+    if let Some(host) = original_host_header
+        && let Ok(val) = HeaderValue::from_str(host)
+    {
+        hmap.insert("x-forwarded-host", val);
+    }
+    if let Some(ref via) = state.via_header_http3
+        && let Ok(val) = HeaderValue::from_str(via)
+    {
+        hmap.insert("via", val);
+    }
+    if state.add_forwarded_header {
+        let fwd = crate::proxy::build_forwarded_value(client_ip, "https", original_host_header);
+        if let Ok(val) = HeaderValue::from_str(&fwd) {
+            hmap.insert("forwarded", val);
+        }
+    }
 
+    // Stream the response when no retry is configured and no plugin needs
+    // the response body buffered. Retries force buffering because the retry
+    // layer must inspect status/body to decide; buffering plugins force
+    // buffering because they need the full body for validation/transform.
+    // Without this, server-streaming / bidi gRPC responses would accumulate
+    // fully in memory before the first byte flows to the H3 client.
+    let stream_grpc_response = proxy.retry.is_none()
+        && !state
+            .plugin_cache
+            .requires_response_body_buffering(&proxy.id);
     let body_bytes = Bytes::from(body);
     let result = proxy_grpc_request_from_bytes(
         hyper_method,
@@ -600,6 +685,7 @@ where
         &state.grpc_pool,
         &state.dns_cache,
         proxy_headers,
+        stream_grpc_response,
     )
     .await;
 

@@ -792,8 +792,19 @@ pub async fn proxy_grpc_request(
 
 /// Proxy a gRPC request using pre-collected body bytes.
 ///
-/// Used for retry attempts where the request body has already been buffered.
-/// Always uses buffered mode — retries must be able to inspect the response.
+/// Used for retry attempts where the request body has already been buffered,
+/// and by the HTTP/3 cross-protocol bridge where the body was drained from
+/// an H3 recv stream before dispatching. When `stream_response` is `true`,
+/// the response `Incoming` body is returned live (frame-by-frame streaming,
+/// trailers arrive as a terminal frame); otherwise the response is fully
+/// buffered and trailers are extracted up-front.
+///
+/// Retries MUST pass `stream_response = false` — the response must be
+/// fully collected so the retry layer can inspect status/body before
+/// deciding whether to retry. The cross-protocol bridge passes `true` when
+/// no retries are configured and no plugin requires response-body
+/// buffering, so server-streaming/bidi gRPC responses flow to the client
+/// without accumulating in memory.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request_from_bytes(
     method: hyper::Method,
@@ -804,8 +815,8 @@ pub async fn proxy_grpc_request_from_bytes(
     grpc_pool: &GrpcConnectionPool,
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
+    stream_response: bool,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
-    // Retries always use buffered mode so the response can be inspected
     proxy_grpc_request_core(
         method,
         headers,
@@ -815,7 +826,7 @@ pub async fn proxy_grpc_request_from_bytes(
         grpc_pool,
         dns_cache,
         proxy_headers,
-        false,
+        stream_response,
     )
     .await
 }

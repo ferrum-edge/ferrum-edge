@@ -87,7 +87,7 @@ Mirrors the H1/H2 proxy path's plugin-driven decision (see `ClientRequestBody::{
 
 If the caller pre-buffered the body (a plugin collected it during `before_proxy`), the bridge is skipped and the `Vec<u8>` is handed to reqwest directly — one allocation, no channel overhead.
 
-**Grpc flavor — request body buffered.** `proxy_grpc_request_from_bytes()` takes `Bytes` for retry-safe framing and trailer handling. Streaming gRPC request bodies through the cross-protocol bridge would require a new `GrpcBody` variant in `GrpcConnectionPool`; deferred because unary gRPC bodies are small and this is a cross-protocol fallback path. Tracked as future optimization.
+**Grpc flavor — request body buffered, response streamed when safe.** `proxy_grpc_request_from_bytes()` takes `Bytes` for retry-safe framing and trailer handling, so the request body is collected up-front (unary gRPC request bodies are small and this is a cross-protocol fallback path; streaming gRPC request bodies through the bridge would require a new `GrpcBody` variant in `GrpcConnectionPool` and is tracked as future optimization). The RESPONSE is streamed whenever no retry is configured AND no plugin forces response-body buffering — server-streaming / bidi gRPC RPCs flow frame-by-frame through the bridge rather than accumulating fully in memory before the first byte reaches the H3 client. When retries or body-buffering plugins are configured, the response is buffered so the retry/plugin layer can inspect it before forwarding.
 
 **Response body — always streamed with coalescing.** See below.
 

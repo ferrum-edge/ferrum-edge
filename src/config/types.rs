@@ -2566,9 +2566,13 @@ impl Proxy {
                 self.id
             ));
         }
-        if self.backend_prefer_h3 && !matches!(self.backend_scheme, Some(BackendScheme::Https)) {
+        // backend_prefer_h3 is valid whenever the effective scheme resolves
+        // to HTTPS — either explicitly set, or the HTTP-family default when
+        // backend_scheme is omitted. Reject only when a non-HTTPS stream or
+        // plaintext scheme is explicitly declared.
+        if self.backend_prefer_h3 && !matches!(self.effective_scheme(), BackendScheme::Https) {
             errors.push(format!(
-                "backend_prefer_h3=true is only valid when backend_scheme is 'https' (got '{}')",
+                "backend_prefer_h3=true is only valid when backend_scheme resolves to 'https' (got '{}')",
                 self.scheme_display()
             ));
         }

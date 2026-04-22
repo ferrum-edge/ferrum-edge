@@ -322,7 +322,7 @@ fn parse_hyper_method(method: &str) -> Result<hyper::Method, ()> {
 
 /// Build X-Forwarded-For header value by appending the client IP to the existing value.
 /// Uses pre-allocated buffer instead of `format!()` to avoid format machinery overhead.
-fn build_xff_value(existing_xff: Option<&str>, client_ip: &str) -> String {
+pub(crate) fn build_xff_value(existing_xff: Option<&str>, client_ip: &str) -> String {
     match existing_xff {
         Some(xff) => {
             let mut val = String::with_capacity(xff.len() + 2 + client_ip.len());
@@ -5405,6 +5405,7 @@ async fn handle_proxy_request_inner(
                     &state.grpc_pool,
                     &state.dns_cache,
                     proxy_headers,
+                    false, // retries always buffer so the response can be inspected
                 )
                 .await;
             }

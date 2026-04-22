@@ -311,6 +311,7 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
         &pool,
         &dns,
         &proxy_headers,
+        false,
     )
     .await;
     assert!(

@@ -316,6 +316,77 @@ plugin_configs: []
     );
 }
 
+#[test]
+fn test_backend_prefer_h3_without_explicit_scheme_defaults_to_https() {
+    // HTTP-family proxies default to https when backend_scheme is omitted —
+    // backend_prefer_h3 should remain valid under that default rather than
+    // being rejected as "only valid with backend_scheme = https".
+    let yaml = r#"
+proxies:
+  - id: "prefer-h3-default-https"
+    listen_path: "/v1"
+    backend_prefer_h3: true
+    backend_host: "localhost"
+    backend_port: 8443
+consumers: []
+plugin_configs: []
+"#;
+
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
+    )
+    .expect("backend_prefer_h3 with default scheme should load");
+
+    // Normalization should resolve dispatch_kind to HttpsH3Preferred.
+    assert!(config.proxies[0].backend_prefer_h3);
+    assert_eq!(
+        config.proxies[0].dispatch_kind,
+        DispatchKind::HttpsH3Preferred
+    );
+}
+
+#[test]
+fn test_backend_prefer_h3_rejected_for_plaintext_http() {
+    // A plaintext http scheme must still reject backend_prefer_h3 (QUIC
+    // requires TLS). Guards against regressing the Finding #5 fix into
+    // "allow prefer_h3 for any HTTP-family scheme".
+    let yaml = r#"
+proxies:
+  - id: "prefer-h3-plaintext"
+    listen_path: "/v1"
+    backend_scheme: http
+    backend_prefer_h3: true
+    backend_host: "localhost"
+    backend_port: 8080
+consumers: []
+plugin_configs: []
+"#;
+
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    // The file loader surfaces field-validation failures with the count
+    // rather than the detailed message (the per-proxy detail goes to logs).
+    // Loading must fail — that's the contract: prefer_h3 over plaintext
+    // http does not silently degrade into HTTP/1.1 + HTTP/2.
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
+    )
+    .expect_err("backend_prefer_h3 with plaintext http should reject");
+    assert!(
+        err.to_string().contains("invalid field"),
+        "error should surface field-validation failure: {}",
+        err
+    );
+}
+
 // ============================================================================
 // Auth Mode Tests
 // ============================================================================
