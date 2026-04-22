@@ -101,6 +101,7 @@ use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use tracing::{debug, error, warn};
 
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
+use crate::plugins::{Plugin, PluginResult, RequestContext};
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome;
 use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
@@ -144,6 +145,16 @@ impl CoalesceConfig {
 /// Entry point — routes the cross-protocol dispatch by flavor. Called from
 /// the H3 server when `proxy.dispatch_kind` is not `HttpsH3Preferred` OR
 /// the flavor is not Plain.
+///
+/// `ctx` / `plugins` / `sticky_cookie_needed` are threaded through so the
+/// bridge can run the same plugin pipeline as the native H3 path:
+/// `apply_request_body_plugins` + `on_final_request_body` on the
+/// prebuffered request body (transform + validate), `after_proxy` on the
+/// backend response headers (modify / reject), `inject_sticky_cookie`
+/// (sticky LB cookie), and `on_response_body` + `on_final_response_body`
+/// on the buffered gRPC response body. Without these, H3 clients on
+/// non-H3 backends would silently skip body validators, response
+/// transformers, sticky sessions, etc.
 #[allow(clippy::too_many_arguments)]
 pub async fn run<S>(
     state: &ProxyState,
@@ -157,11 +168,46 @@ pub async fn run<S>(
     flavor: HttpFlavor,
     prebuffered_body: Option<Vec<u8>>,
     client_ip: &str,
+    ctx: &mut RequestContext,
+    plugins: &[Arc<dyn Plugin>],
+    sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
 {
     let backend_start = Instant::now();
+
+    // If an earlier plugin phase pre-buffered the request body, run the
+    // post-before_proxy body-transform + body-validation hooks on it
+    // before we send to the backend. Mirrors the H1/H2 path's behavior in
+    // `proxy_to_backend_retry` / `proxy_grpc_request_core`. An empty body
+    // or plugins that don't opt in are zero-cost — see
+    // `apply_request_body_plugins`.
+    let prebuffered_body = match prebuffered_body {
+        Some(body) if !plugins.is_empty() => {
+            let transformed =
+                crate::proxy::apply_request_body_plugins(plugins, proxy_headers, body).await;
+            // Run validators. Reject = emit a trailers-only gRPC error
+            // (Grpc flavor) or a plain JSON error (everything else) and
+            // return early WITHOUT dispatching to the backend.
+            match crate::proxy::run_final_request_body_hooks(plugins, proxy_headers, &transformed)
+                .await
+            {
+                PluginResult::Continue => Some(transformed),
+                reject => {
+                    return write_final_body_reject(
+                        stream,
+                        flavor,
+                        reject,
+                        backend_start,
+                        transformed.len() as u64,
+                    )
+                    .await;
+                }
+            }
+        }
+        other => other,
+    };
 
     match flavor {
         HttpFlavor::Plain => {
@@ -177,6 +223,9 @@ where
                 prebuffered_body,
                 client_ip,
                 backend_start,
+                ctx,
+                plugins,
+                sticky_cookie_needed,
             )
             .await
         }
@@ -193,6 +242,9 @@ where
                 prebuffered_body,
                 client_ip,
                 backend_start,
+                ctx,
+                plugins,
+                sticky_cookie_needed,
             )
             .await
         }
@@ -230,6 +282,9 @@ async fn dispatch_plain<S>(
     prebuffered_body: Option<Vec<u8>>,
     client_ip: &str,
     backend_start: Instant,
+    ctx: &mut RequestContext,
+    plugins: &[Arc<dyn Plugin>],
+    sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -280,6 +335,14 @@ where
         .unwrap_or(proxy.backend_host.as_str());
 
     let mut req_builder = client.request(req_method, backend_url);
+
+    // Honor `backend_read_timeout_ms` so the H3 cross-protocol bridge
+    // obeys the same per-proxy timeout policy as the main H1/H2 path
+    // (src/proxy/mod.rs::proxy_to_backend_retry). `0` means "disabled" —
+    // skip the override so reqwest's default (no timeout) applies.
+    if proxy.backend_read_timeout_ms > 0 {
+        req_builder = req_builder.timeout(Duration::from_millis(proxy.backend_read_timeout_ms));
+    }
 
     // Forward headers. Host is rewritten to the effective backend unless
     // `preserve_host_header` is set — matches `proxy_to_backend_retry`'s
@@ -358,9 +421,12 @@ where
         None => {
             // Streaming path — wire the H3 recv half to reqwest via a
             // bounded mpsc channel. Reader + send() are driven concurrently
-            // with `tokio::join!` so the body flows end-to-end without any
-            // intermediate Vec<u8>. See module doc comment for design
-            // rationale.
+            // via `tokio::select!` (biased toward `send_future`) so the
+            // body flows end-to-end without any intermediate Vec<u8>, AND
+            // a backend that produces an early response (413, 401, etc.)
+            // short-circuits the reader instead of stranding it in
+            // `recv_data()` waiting for upload bytes the backend no longer
+            // wants. See module doc comment for design rationale.
             let capacity = state.env_config.http3_request_body_channel_capacity;
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(capacity);
             // Receiver is 'static (owns its own state) — satisfies the
@@ -374,8 +440,9 @@ where
             let bytes_read = Arc::new(AtomicU64::new(0));
             let reader_bytes = Arc::clone(&bytes_read);
             // Signals that the reader detected an oversized request body and
-            // aborted the bridge. Used after `join!` to emit 413 rather than
-            // the generic 502 that a reqwest stream error would produce.
+            // aborted the bridge. Used after the select loop to emit 413
+            // rather than the generic 502 that a reqwest stream error
+            // would produce.
             let oversized = Arc::new(AtomicBool::new(false));
             let reader_oversized = Arc::clone(&oversized);
             let reader_future = async {
@@ -420,7 +487,32 @@ where
                 }
             };
 
-            let (_, send_result) = tokio::join!(reader_future, send_future);
+            // `select!` with `biased` polls `send_future` first on every
+            // wakeup. If the backend returns a final response before the
+            // client has finished uploading (e.g., auth reject, early
+            // validation 413), we break out of the loop and drop
+            // `reader_future` — its `tx` is dropped, which drops the mpsc
+            // receiver, which signals reqwest's body stream to end, which
+            // cleanly completes the request. No stranded task on
+            // `recv_data()`. If the reader completes first (normal
+            // upload), we continue polling `send_future` with the reader
+            // disabled via the `!reader_done` guard.
+            //
+            // The select loop is scoped in a block so both pinned futures
+            // (which borrow `stream`) are dropped before the oversized
+            // branch below needs `&mut stream` again for `write_error`.
+            let send_result = {
+                tokio::pin!(send_future);
+                tokio::pin!(reader_future);
+                let mut reader_done = false;
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut send_future => break result,
+                        _ = &mut reader_future, if !reader_done => { reader_done = true; }
+                    }
+                }
+            };
             let request_bytes = bytes_read.load(Ordering::Relaxed);
             // Oversized request body: emit 413 directly, skipping the
             // generic backend-error branch below (which would surface the
@@ -482,7 +574,7 @@ where
     };
 
     let status = response.status().as_u16();
-    let response_headers = collect_reqwest_response_headers(&response);
+    let mut response_headers = collect_reqwest_response_headers(&response);
 
     // Content-Length fast-path limit (mirrors the H3 pool path).
     if state.max_response_body_size_bytes > 0
@@ -509,6 +601,45 @@ where
         )
         .await;
     }
+
+    // Run `after_proxy` hooks so response-transformer, CORS, compression-
+    // advertise, and other hooks that modify response headers see the
+    // cross-protocol path. A rejection here cancels the backend response
+    // and writes the reject body instead — matches
+    // `run_after_proxy_hooks` semantics in `proxy/mod.rs`.
+    if !plugins.is_empty()
+        && let Some(reject) =
+            crate::proxy::run_after_proxy_hooks(plugins, ctx, status, &mut response_headers).await
+    {
+        record_backend_outcome(
+            state,
+            proxy,
+            upstream_target,
+            cb_target_key,
+            reject.status_code,
+            false,
+            backend_start.elapsed(),
+        );
+        return write_reject_with_headers(
+            stream,
+            StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &reject.body,
+            &reject.headers,
+            backend_start,
+            request_bytes,
+        )
+        .await;
+    }
+
+    // Sticky session cookie injection — only runs if the LB selected a
+    // sticky target.
+    crate::http3::server::inject_sticky_cookie(
+        state,
+        proxy,
+        upstream_target,
+        sticky_cookie_needed,
+        &mut response_headers,
+    );
 
     // Send response headers, then stream the body with coalescing.
     send_response_headers(stream, status, &response_headers).await?;
@@ -558,6 +689,9 @@ async fn dispatch_grpc<S>(
     prebuffered_body: Option<Vec<u8>>,
     client_ip: &str,
     backend_start: Instant,
+    ctx: &mut RequestContext,
+    plugins: &[Arc<dyn Plugin>],
+    sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -699,16 +833,76 @@ where
     .await;
 
     match result {
-        Ok(GrpcResponseKind::Buffered(resp)) => {
-            // Buffered variant: pool extracted trailers up front. Stream
-            // body in a single send_data (gRPC unary responses are small),
-            // then emit trailers.
+        Ok(GrpcResponseKind::Buffered(mut resp)) => {
+            // Buffered variant: pool extracted trailers up front. Run the
+            // full response-hook pipeline (after_proxy, sticky cookie,
+            // on_response_body, on_final_response_body) on the buffered
+            // body — the main gRPC path does the same, so H3 gRPC buffered
+            // responses now behave identically.
+            if !plugins.is_empty()
+                && let Some(reject) = crate::proxy::run_after_proxy_hooks(
+                    plugins,
+                    ctx,
+                    resp.status,
+                    &mut resp.headers,
+                )
+                .await
+            {
+                record_backend_outcome(
+                    state,
+                    proxy,
+                    upstream_target,
+                    cb_target_key,
+                    reject.status_code,
+                    false,
+                    backend_start.elapsed(),
+                );
+                return write_reject_with_headers(
+                    stream,
+                    StatusCode::from_u16(reject.status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &reject.body,
+                    &reject.headers,
+                    backend_start,
+                    request_bytes,
+                )
+                .await;
+            }
+            crate::http3::server::inject_sticky_cookie(
+                state,
+                proxy,
+                upstream_target,
+                sticky_cookie_needed,
+                &mut resp.headers,
+            );
+            // Run on_response_body / on_final_response_body on the
+            // collected body (gRPC buffered responses are small — unary
+            // RPCs). Plugins can transform the body here (e.g., gRPC-Web
+            // framing, response_transformer).
+            let mut body = resp.body;
+            for plugin in plugins.iter() {
+                plugin
+                    .on_response_body(ctx, resp.status, &resp.headers, &body)
+                    .await;
+                if let Some(transformed) = plugin
+                    .transform_response_body(&body, content_type_of(&resp.headers), &resp.headers)
+                    .await
+                {
+                    body = transformed;
+                }
+            }
+            for plugin in plugins.iter() {
+                plugin
+                    .on_final_response_body(ctx, resp.status, &resp.headers, &body)
+                    .await;
+            }
+
             send_response_headers(stream, resp.status, &resp.headers).await?;
-            let bytes_total = resp.body.len() as u64;
+            let bytes_total = body.len() as u64;
             let mut body_completed = true;
             let mut client_disconnected = false;
-            if !resp.body.is_empty()
-                && let Err(e) = stream.send_data(Bytes::from(resp.body)).await
+            if !body.is_empty()
+                && let Err(e) = stream.send_data(Bytes::from(body)).await
             {
                 debug!("cross-protocol H3 gRPC body send_data failed: {}", e);
                 client_disconnected = true;
@@ -751,10 +945,50 @@ where
                 backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
             })
         }
-        Ok(GrpcResponseKind::Streaming(streaming)) => {
-            // Streaming variant: pool returned a live hyper Incoming. Read
-            // frames, coalesce DATA into H3 send_data, and emit trailers
-            // via send_trailers when the body ends cleanly.
+        Ok(GrpcResponseKind::Streaming(mut streaming)) => {
+            // Streaming variant: pool returned a live hyper Incoming. Run
+            // after_proxy + sticky cookie on headers BEFORE streaming
+            // begins — body-level hooks (`on_response_body`,
+            // `on_final_response_body`) cannot run on streaming gRPC
+            // responses because we don't hold the full body; the main
+            // proxy path has the same limitation.
+            if !plugins.is_empty()
+                && let Some(reject) = crate::proxy::run_after_proxy_hooks(
+                    plugins,
+                    ctx,
+                    streaming.status,
+                    &mut streaming.headers,
+                )
+                .await
+            {
+                record_backend_outcome(
+                    state,
+                    proxy,
+                    upstream_target,
+                    cb_target_key,
+                    reject.status_code,
+                    false,
+                    backend_start.elapsed(),
+                );
+                return write_reject_with_headers(
+                    stream,
+                    StatusCode::from_u16(reject.status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &reject.body,
+                    &reject.headers,
+                    backend_start,
+                    request_bytes,
+                )
+                .await;
+            }
+            crate::http3::server::inject_sticky_cookie(
+                state,
+                proxy,
+                upstream_target,
+                sticky_cookie_needed,
+                &mut streaming.headers,
+            );
+
             send_response_headers(stream, streaming.status, &streaming.headers).await?;
             let coalesce = CoalesceConfig::from_state(state);
             let max_resp_bytes = state.max_response_body_size_bytes;
@@ -795,9 +1029,34 @@ where
             })
         }
         Err(err) => {
+            // Preserve DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED / INTERNAL
+            // semantics from the main gRPC path rather than collapsing
+            // every failure to UNAVAILABLE. Also call the shared
+            // `classify_grpc_proxy_error` so `body_error_class` on the
+            // outcome matches what the H1/H2 gRPC path would emit for
+            // the same failure mode (timeout vs connect-refused vs TLS).
+            let error_class = crate::retry::classify_grpc_proxy_error(&err);
+            let (grpc_status_code, grpc_message): (u32, &str) = match &err {
+                grpc_proxy::GrpcProxyError::BackendTimeout(_) => (
+                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Backend deadline exceeded",
+                ),
+                grpc_proxy::GrpcProxyError::ResourceExhausted(_) => (
+                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                    "Request payload exceeded backend limit",
+                ),
+                grpc_proxy::GrpcProxyError::Internal(_) => {
+                    (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
+                }
+                grpc_proxy::GrpcProxyError::BackendUnavailable(_) => {
+                    (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
+                }
+            };
             warn!(
                 proxy_id = %proxy.id,
                 error = %err,
+                class = ?error_class,
+                grpc_status = grpc_status_code,
                 "cross-protocol H3→gRPC backend call failed"
             );
             record_backend_outcome(
@@ -809,19 +1068,16 @@ where
                 true,
                 backend_start.elapsed(),
             );
-            // Trailers-only gRPC error — HTTP 200 + grpc-status UNAVAILABLE
-            // rather than an HTTP 502 JSON payload, so clients see a valid
-            // gRPC transport error.
             let mut outcome = write_grpc_error(
                 stream,
-                grpc_proxy::grpc_status::UNAVAILABLE,
-                "Service unavailable",
+                grpc_status_code,
+                grpc_message,
                 backend_start,
                 request_bytes,
             )
             .await?;
             outcome.connection_error = true;
-            outcome.error_class = Some(ErrorClass::ConnectionRefused);
+            outcome.error_class = Some(error_class);
             Ok(outcome)
         }
     }
@@ -1244,6 +1500,111 @@ where
         body_error_class: None,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+/// Write a plugin-driven rejection response (dynamic body + custom
+/// headers). Used when `after_proxy` or `on_final_request_body` returns
+/// `PluginResult::Reject` — the plugin's body/headers win over the
+/// backend's response.
+async fn write_reject_with_headers<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+    backend_start: Instant,
+    request_bytes: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let mut resp_builder = Response::builder().status(status);
+    let mut has_content_type = false;
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("content-type") {
+            has_content_type = true;
+        }
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            resp_builder = resp_builder.header(name, val);
+        }
+    }
+    if !has_content_type {
+        resp_builder = resp_builder.header(hyper::header::CONTENT_TYPE, "application/json");
+    }
+    let resp = resp_builder
+        .body(())
+        .map_err(|e| anyhow::anyhow!("Failed to build H3 reject response: {}", e))?;
+    stream.send_response(resp).await?;
+    let len = body.len() as u64;
+    if !body.is_empty() {
+        let _ = stream.send_data(Bytes::copy_from_slice(body)).await;
+    }
+    let _ = stream.finish().await;
+    Ok(CrossProtocolOutcome {
+        response_status: status.as_u16(),
+        bytes_streamed: len,
+        request_bytes,
+        body_completed: true,
+        client_disconnected: false,
+        connection_error: false,
+        error_class: None,
+        body_error_class: None,
+        backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Handle a `PluginResult::Reject` from `on_final_request_body` by
+/// emitting the right wire format for the flavor: trailers-only gRPC for
+/// Grpc, HTTP + headers for Plain, 501 is never reached (WebSocket is
+/// rejected upstream).
+async fn write_final_body_reject<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    flavor: HttpFlavor,
+    reject: PluginResult,
+    backend_start: Instant,
+    request_bytes: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let parts = crate::proxy::plugin_result_into_reject_parts(reject)
+        .expect("reject result should convert to rejection parts");
+    let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
+    if matches!(flavor, HttpFlavor::Grpc) {
+        // Map the HTTP status the plugin chose to a gRPC status. Reuse the
+        // H3 listener's mapper for consistency.
+        let grpc_status = crate::http3::server::h3_http_status_to_grpc_status(http_status);
+        let grpc_message = std::str::from_utf8(&parts.body)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| http_status.canonical_reason().unwrap_or("Request rejected"));
+        write_grpc_error(
+            stream,
+            grpc_status,
+            grpc_message,
+            backend_start,
+            request_bytes,
+        )
+        .await
+    } else {
+        write_reject_with_headers(
+            stream,
+            http_status,
+            &parts.body,
+            &parts.headers,
+            backend_start,
+            request_bytes,
+        )
+        .await
+    }
+}
+
+/// Borrow the `content-type` value for body-transform plugin dispatch
+/// without re-allocating.
+fn content_type_of(headers: &HashMap<String, String>) -> Option<&str> {
+    headers.get("content-type").map(|s| s.as_str())
 }
 
 /// Write a trailers-only gRPC error response (HTTP 200 + grpc-status +

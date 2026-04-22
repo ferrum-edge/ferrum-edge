@@ -66,12 +66,17 @@ For every dispatch case that is **not** `HttpsH3Preferred + Plain`, the H3 liste
 
 Flow:
 
-1. **Plugin phases + LB + circuit breaker** already ran in the H3 listener; the bridge receives the resolved `backend_url`, `upstream_target`, `cb_target_key`, and already-processed `proxy_headers`.
-2. **Request dispatch** — Plain flavor opens a reqwest request with a streaming body (see [buffering policy](#buffering-policy)); Grpc flavor calls `proxy_grpc_request_from_bytes()` with a buffered `Bytes`.
-3. **Response write** — response headers are mapped onto `http::Response<()>` and sent via `stream.send_response()`. The body is streamed into `stream.send_data()` with the same coalescing window the native H3 writer uses (see [Coalescing](#coalescing-and-frame-cadence)).
-4. **gRPC trailers** — forwarded via `stream.send_trailers()` so `grpc-status` / `grpc-message` survive the cross-protocol hop. See [gRPC trailers](#grpc-trailers-over-h3).
-5. **Outcome** — `record_backend_outcome()` updates the circuit breaker, passive health, and least-latency LB signals exactly as the H1/H2 path does.
-6. **Transaction summary** — the H3 listener builds the same `TransactionSummary` shape that the native H3 path emits and calls `log_with_mirror()`, so log plugins (http_logging, statsd, prometheus, …) see a consistent record regardless of dispatch kind.
+1. **Pre-dispatch plugin phases + LB + circuit breaker** already ran in the H3 listener; the bridge receives the resolved `backend_url`, `upstream_target`, `cb_target_key`, the already-processed `proxy_headers`, the prebuffered request body (if any plugin phase collected it), plus `&mut ctx`, the pre-resolved plugin list, and the sticky-cookie flag so the bridge can run the response-side hook pipeline.
+2. **`on_final_request_body`** — when the caller prebuffered the body, the bridge runs `apply_request_body_plugins` (transforms) then `run_final_request_body_hooks` (validators). A reject here short-circuits without ever calling the backend — Plain emits a JSON error, Grpc emits a trailers-only gRPC error.
+3. **Request dispatch** — Plain flavor opens a reqwest request with a streaming body (see [buffering policy](#buffering-policy)) and honors `backend_read_timeout_ms`; Grpc flavor calls `proxy_grpc_request_from_bytes()` with a buffered `Bytes` and streams the response when no retry / body-buffering plugin forces buffering.
+4. **`after_proxy` + sticky cookie** — once response headers arrive, the bridge runs `run_after_proxy_hooks` so response-transformer, CORS-response, compression-advertise, etc. see the cross-protocol path. A reject aborts the backend response and writes the plugin's body instead. Then `inject_sticky_cookie` adds the LB sticky-session cookie when the selection requested it.
+5. **`on_response_body` + `on_final_response_body`** — run on the collected gRPC buffered body (unary RPCs) so response-transformer and body-validator can modify / validate it before it flows to the client. Streaming responses (Plain, server-streaming gRPC) skip these hooks because the full body isn't in memory — same limitation as the H1/H2 streaming path.
+6. **Response write** — response headers are mapped onto `http::Response<()>` and sent via `stream.send_response()`. The body is streamed into `stream.send_data()` with the same coalescing window the native H3 writer uses (see [Coalescing](#coalescing-and-frame-cadence)).
+7. **gRPC trailers** — forwarded via `stream.send_trailers()` so `grpc-status` / `grpc-message` survive the cross-protocol hop. See [gRPC trailers](#grpc-trailers-over-h3). Backend failures map to DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED / UNAVAILABLE / INTERNAL based on `GrpcProxyError` variant — not collapsed to UNAVAILABLE.
+8. **Outcome** — `record_backend_outcome()` updates the circuit breaker, passive health, and least-latency LB signals exactly as the H1/H2 path does.
+9. **Transaction summary** — the H3 listener builds the same `TransactionSummary` shape that the native H3 path emits and calls `log_with_mirror()`, so log plugins (http_logging, statsd, prometheus, …) see a consistent record regardless of dispatch kind.
+
+**Early-response cancellation**: in the streaming-request path, the bridge drives the H3 recv reader and `reqwest::send()` concurrently via `tokio::select!` biased toward the send future. If the backend produces a final response before the client finishes uploading (auth reject, early 413, etc.), the bridge breaks out and drops the reader — no stranded task on `recv_data()`.
 
 ## Buffering policy
 

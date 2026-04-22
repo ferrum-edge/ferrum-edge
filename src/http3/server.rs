@@ -1201,6 +1201,13 @@ async fn handle_h3_request(
         }
 
         let prebuffered = prebuffered_body_data.take();
+        // Pass the pre-resolved plugin list + mutable context so the
+        // bridge can run the same after_proxy / on_final_request_body /
+        // on_response_body / on_final_response_body / sticky-cookie
+        // pipeline as the native H3 path. Without these, H3 clients on
+        // non-H3 backends silently skip the response-transform /
+        // body-validator / sticky-session phases.
+        let client_ip_owned = ctx.client_ip.clone();
         let outcome = crate::http3::cross_protocol::run(
             &state,
             &proxy,
@@ -1212,7 +1219,10 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             http_flavor,
             prebuffered,
-            &ctx.client_ip,
+            &client_ip_owned,
+            &mut ctx,
+            &plugins,
+            sticky_cookie_needed,
         )
         .await?;
 
@@ -2275,7 +2285,7 @@ fn build_h3_backend_headers(
 /// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
 /// Inject a sticky-session `Set-Cookie` header when the LB strategy is cookie-based
 /// and the cookie was not present in the original request.
-fn inject_sticky_cookie(
+pub(crate) fn inject_sticky_cookie(
     state: &ProxyState,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
@@ -2932,7 +2942,7 @@ fn sanitize_grpc_message(message: &str) -> String {
 /// to avoid promoting the original across module boundaries — this is a
 /// pure, trivial mapping and the H3 server needs a local version anyway
 /// because it's called from the admission path, not the dispatch path.
-fn h3_http_status_to_grpc_status(status: StatusCode) -> u32 {
+pub(crate) fn h3_http_status_to_grpc_status(status: StatusCode) -> u32 {
     use crate::proxy::grpc_proxy::grpc_status;
     match status {
         StatusCode::BAD_REQUEST => grpc_status::INVALID_ARGUMENT,
