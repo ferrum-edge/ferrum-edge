@@ -38,9 +38,19 @@
 //!   buffered for now because unary gRPC bodies are small and this is a
 //!   cross-protocol fallback path.
 //!
-//! - **Size limits.** `max_request_body_size_bytes` is enforced inline in
-//!   the streaming reader (413 if exceeded mid-stream) and by
-//!   `drain_h3_body` on the buffered gRPC path.
+//! - **Size limits.** The Plain path enforces `max_request_body_size_bytes`
+//!   inline in the streaming reader (413 on overflow mid-stream — a shared
+//!   `AtomicBool` signals the post-join branch so the reqwest stream error
+//!   isn't misclassified as 502). The gRPC path enforces
+//!   `max_grpc_recv_size_bytes` inside `drain_h3_body` so H3 gRPC matches
+//!   the H1/H2 gRPC ceiling (a single `https` proxy serves any HTTP
+//!   version uniformly rather than diverging by frontend).
+//!
+//! - **Error responses are flavor-aware.** Plain failures emit HTTP error
+//!   payloads (502 JSON, 413 JSON, etc.). gRPC failures emit trailers-only
+//!   gRPC responses (HTTP 200 + `grpc-status` + `grpc-message` in the
+//!   header block) so gRPC clients see `UNAVAILABLE`/`RESOURCE_EXHAUSTED`/
+//!   `INVALID_ARGUMENT`/`UNIMPLEMENTED` rather than a transport error.
 //!
 //! - **Response body — streamed frame-by-frame with coalescing.** Identical
 //!   coalescing configuration (`http3_coalesce_min_bytes`,
@@ -73,7 +83,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -88,7 +98,7 @@ use tracing::{debug, error, warn};
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome;
-use crate::proxy::grpc_proxy::{GrpcResponseKind, proxy_grpc_request_from_bytes};
+use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
 use crate::retry::ErrorClass;
 
 /// Outcome reported back to the H3 listener so it can update request
@@ -327,6 +337,11 @@ where
 
             let bytes_read = Arc::new(AtomicU64::new(0));
             let reader_bytes = Arc::clone(&bytes_read);
+            // Signals that the reader detected an oversized request body and
+            // aborted the bridge. Used after `join!` to emit 413 rather than
+            // the generic 502 that a reqwest stream error would produce.
+            let oversized = Arc::new(AtomicBool::new(false));
+            let reader_oversized = Arc::clone(&oversized);
             let reader_future = async {
                 let mut total: usize = 0;
                 loop {
@@ -334,6 +349,7 @@ where
                         Ok(Some(chunk)) => {
                             let data = chunk.chunk();
                             if max_req_bytes > 0 && total + data.len() > max_req_bytes {
+                                reader_oversized.store(true, Ordering::Relaxed);
                                 let _ = tx
                                     .send(Err(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
@@ -369,7 +385,30 @@ where
             };
 
             let (_, send_result) = tokio::join!(reader_future, send_future);
-            (send_result, bytes_read.load(Ordering::Relaxed))
+            let request_bytes = bytes_read.load(Ordering::Relaxed);
+            // Oversized request body: emit 413 directly, skipping the
+            // generic backend-error branch below (which would surface the
+            // reqwest stream error as 502).
+            if oversized.load(Ordering::Relaxed) {
+                record_backend_outcome(
+                    state,
+                    proxy,
+                    upstream_target,
+                    cb_target_key,
+                    413,
+                    false,
+                    backend_start.elapsed(),
+                );
+                return write_error(
+                    stream,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"Request body exceeds maximum size"}"#,
+                    backend_start,
+                    request_bytes,
+                )
+                .await;
+            }
+            (send_result, request_bytes)
         }
     };
 
@@ -489,10 +528,10 @@ where
     let hyper_method = match hyper::Method::from_bytes(method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
-            return write_error(
+            return write_grpc_error(
                 stream,
-                StatusCode::METHOD_NOT_ALLOWED,
-                r#"{"error":"Method Not Allowed"}"#,
+                grpc_proxy::grpc_status::UNIMPLEMENTED,
+                "Method Not Allowed",
                 backend_start,
                 0,
             )
@@ -504,17 +543,19 @@ where
     // and trailer handling. Buffer the H3 recv half here (unary gRPC bodies
     // are small; streaming gRPC request bodies over the cross-protocol
     // bridge would require a new GrpcBody variant in GrpcConnectionPool —
-    // future optimization).
+    // future optimization). Size ceiling uses `max_grpc_recv_size_bytes`
+    // (not `max_request_body_size_bytes`) so H3 gRPC matches the H1/H2 gRPC
+    // limit — an `https` proxy serves any client HTTP version uniformly.
     let body = if let Some(buffered) = prebuffered_body {
         buffered
     } else {
-        match drain_h3_body(stream, state.max_request_body_size_bytes).await {
+        match drain_h3_body(stream, state.max_grpc_recv_size_bytes).await {
             Ok(Some(b)) => b,
             Ok(None) => {
-                return write_error(
+                return write_grpc_error(
                     stream,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    r#"{"error":"Request body exceeds maximum size"}"#,
+                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                    "Request body exceeds maximum size",
                     backend_start,
                     0,
                 )
@@ -526,10 +567,10 @@ where
                     error = %e,
                     "cross-protocol H3→gRPC: request body read failed"
                 );
-                return write_error(
+                return write_grpc_error(
                     stream,
-                    StatusCode::BAD_REQUEST,
-                    r#"{"error":"Request body read error"}"#,
+                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    "Request body read error",
                     backend_start,
                     0,
                 )
@@ -673,15 +714,19 @@ where
                 true,
                 backend_start.elapsed(),
             );
-            let mut outcome = write_error(
+            // Trailers-only gRPC error — HTTP 200 + grpc-status UNAVAILABLE
+            // rather than an HTTP 502 JSON payload, so clients see a valid
+            // gRPC transport error.
+            let mut outcome = write_grpc_error(
                 stream,
-                StatusCode::BAD_GATEWAY,
-                r#"{"error":"Bad Gateway"}"#,
+                grpc_proxy::grpc_status::UNAVAILABLE,
+                "Service unavailable",
                 backend_start,
                 request_bytes,
             )
             .await?;
             outcome.connection_error = true;
+            outcome.error_class = Some(ErrorClass::ConnectionRefused);
             Ok(outcome)
         }
     }
@@ -1034,7 +1079,20 @@ where
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_builder = Response::builder().status(status_code);
     for (k, v) in headers {
-        if let (Ok(name), Ok(val)) = (
+        if k == "set-cookie" {
+            // Multiple Set-Cookie values are stored newline-separated by
+            // `collect_reqwest_response_headers` to avoid RFC-violating
+            // comma folding. Newlines are invalid inside a single
+            // HeaderValue, so split and emit each cookie as its own header
+            // line — mirrors the H1/H2 path in `src/proxy/mod.rs`.
+            if let Ok(name) = HeaderName::from_bytes(k.as_bytes()) {
+                for cookie_val in v.split('\n') {
+                    if let Ok(val) = HeaderValue::from_str(cookie_val) {
+                        resp_builder = resp_builder.header(name.clone(), val);
+                    }
+                }
+            }
+        } else if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
             HeaderValue::from_str(v),
         ) {
@@ -1071,6 +1129,42 @@ where
     Ok(CrossProtocolOutcome {
         response_status: status.as_u16(),
         bytes_streamed: len,
+        request_bytes,
+        body_completed: true,
+        client_disconnected: false,
+        connection_error: false,
+        error_class: None,
+        body_error_class: None,
+        backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Write a trailers-only gRPC error response (HTTP 200 + grpc-status +
+/// grpc-message as response headers, empty body). Used for
+/// gRPC-flavor bridge failures so the client receives a valid gRPC error
+/// instead of a raw HTTP error payload.
+async fn write_grpc_error<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    grpc_status: u32,
+    grpc_message: &str,
+    backend_start: Instant,
+    request_bytes: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/grpc")
+        .header("grpc-status", grpc_status.to_string())
+        .header("grpc-message", grpc_message)
+        .body(())
+        .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC error response: {}", e))?;
+    stream.send_response(resp).await?;
+    let _ = stream.finish().await;
+    Ok(CrossProtocolOutcome {
+        response_status: 200,
+        bytes_streamed: 0,
         request_bytes,
         body_completed: true,
         client_disconnected: false,
