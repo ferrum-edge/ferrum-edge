@@ -365,7 +365,7 @@ The Proxy struct routes differently per wire scheme. The required-ness of `hosts
 
 **gRPC and WebSocket are runtime flavors, not schemes.** Any HTTP-family proxy (plaintext `http` or TLS `https`) serves gRPC when the request's `content-type` starts with `application/grpc`, or WebSocket when the request carries an `Upgrade: websocket` header (H1) or H2 Extended CONNECT. See `crate::proxy::backend_dispatch::detect_http_flavor()` for the detection helper — it is called from the main handler and the H3 frontend so both paths classify identically.
 
-**HTTP/3 is decoupled from the frontend.** An H3 client can hit any `https` backend: the gateway dispatches Plain/gRPC/WebSocket via reqwest / H2 pool / WebSocket upgrade just like H1/H2 clients do, and only attempts the H3 backend pool when the proxy is configured with `backend_prefer_h3: true` (pre-computed as `DispatchKind::HttpsH3Preferred`). The old `BackendProtocol::H3` semantics (H3 frontend → H3 backend required) no longer apply.
+**HTTP/3 is decoupled from the frontend.** An H3 client can hit any `https` backend: the gateway dispatches Plain/gRPC via reqwest / H2 pool just like H1/H2 clients do, and only attempts the H3 backend pool when the proxy is configured with `backend_prefer_h3: true` (pre-computed as `DispatchKind::HttpsH3Preferred`). The old `BackendProtocol::H3` semantics (H3 frontend → H3 backend required) no longer apply. WebSocket upgrades arriving on the H3 listener return 501 — RFC 9220 Extended CONNECT is not supported by common clients or backends. See [docs/http3.md](docs/http3.md) for the full dispatch model, buffering policy, and WebSocket-over-H3 rationale.
 
 **ALPN negotiation is honored on TLS backends.** The direct HTTP/2 pool advertises `h2` + `http/1.1` and falls back to reqwest when the backend picks `http/1.1` (via `Http2PoolError::BackendSelectedHttp1`). A learning cache (`is_known_http1_backend`) short-circuits repeat attempts on known-h1 backends with O(1) cost on the hot path.
 
@@ -1173,6 +1173,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | `100` | Max request body size (MiB) for `POST /restore` |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | QUIC connections per HTTP/3 backend (distributes frame processing) |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | HTTP/3 connection pool idle eviction timeout |
+| `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | `8` | Bounded mpsc depth for the H3→non-H3 cross-protocol request-body bridge (see `src/http3/cross_protocol.rs`). Caps in-flight request-body memory to ~`capacity × average_h3_chunk_size` during streaming uploads. Range: 1–1024. |
 | `FERRUM_POOL_WARMUP_ENABLED` | `true` | Pre-establish backend connections at startup after DNS warmup. Skipped for TCP/UDP |
 | `FERRUM_POOL_WARMUP_CONCURRENCY` | `500` | Maximum concurrent connection warmup attempts at startup |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Cleanup sweep interval for HTTP, gRPC, HTTP/2, HTTP/3 pools |

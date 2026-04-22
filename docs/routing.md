@@ -2,6 +2,17 @@
 
 Ferrum Edge routes incoming requests to backend proxies using a combination of **host matching**, **path prefix matching**, and **regex path matching**. This document describes the full routing algorithm, priority rules, and caching behavior.
 
+## Protocol family selection
+
+Routing is the first half of the request path; protocol dispatch is the second. Once a proxy is matched, the gateway inspects two inputs to decide how to reach the backend:
+
+- **`proxy.backend_scheme`** (`http`, `https`, `tcp`, `tcps`, `udp`, `dtls`) — the wire transport. HTTP family proxies (`http`, `https`) default to `https` when omitted. Stream family proxies must set a scheme explicitly.
+- **Runtime `HttpFlavor`** — `Plain`, `Grpc`, or `WebSocket`, classified per-request by `detect_http_flavor()` from the request's content-type and upgrade headers.
+
+The gateway does **not** pin gRPC or WebSocket in config — a single `https` proxy transparently serves a mix of REST, gRPC, and WebSocket traffic on the same backend pool. This is the decoupling introduced alongside the `BackendScheme` refactor; older `BackendProtocol::{Grpcs, Wss, H3}` config values no longer exist.
+
+HTTP/3 clients work against any `backend_scheme` — see [docs/http3.md](http3.md) for the dispatch model, the cross-protocol bridge, and why WebSocket upgrades on the H3 listener return 501.
+
 ## Routing Algorithm
 
 When a request arrives, the gateway extracts the **host** (from the `Host` header or HTTP/2 `:authority` pseudo-header, lowercased, port stripped) and the **request path** (from the URI).

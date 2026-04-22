@@ -1461,6 +1461,22 @@ components:
             Prefer HTTP/3 when speaking to this backend. Only meaningful
             when `backend_scheme` resolves to `https`. Validation rejects
             `true` with any non-`https` scheme.
+
+
+            HTTP/3 frontend traffic works against ANY `backend_scheme` —
+            the gateway bridges non-H3 backends via the H1/H2 reqwest /
+            HTTP/2 / gRPC infrastructure transparently. `backend_prefer_h3:
+            true` only controls whether the gateway *tries* QUIC to the
+            backend first; an HTTP/3 client can still hit a plain `https`
+            backend without this flag. See `docs/http3.md` for the full
+            dispatch model.
+
+
+            **WebSocket requests arriving over HTTP/3** are rejected with
+            501 regardless of this flag. H3 Extended CONNECT for
+            WebSocket (RFC 9220) is not widely deployed by clients or
+            backends; operators should send WebSocket upgrades over
+            HTTP/1.1 or HTTP/2.
         backend_host:
           type: [string, "null"]
           description: >-
@@ -1677,6 +1693,14 @@ components:
             When non-empty, WebSocket upgrade requests must include an Origin header matching
             one of these values (case-insensitive comparison). Empty array (default) means
             no origin check. Protects against Cross-Site WebSocket Hijacking (CSWSH).
+
+            WebSocket over HTTP/1.1 (`Upgrade: websocket`) and HTTP/2 (RFC
+            8441 Extended CONNECT) are both supported. WebSocket over
+            HTTP/3 (RFC 9220 Extended CONNECT) is NOT supported —
+            requests arriving as WS upgrades on the H3 listener receive
+            a 501 Not Implemented response. See `docs/http3.md` for
+            rationale; operators should have clients issue WebSocket
+            upgrades over H1/H2.
         circuit_breaker:
           oneOf:
             - $ref: "#/components/schemas/CircuitBreakerConfig"
