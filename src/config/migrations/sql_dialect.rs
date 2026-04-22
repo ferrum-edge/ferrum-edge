@@ -272,8 +272,8 @@ impl V001SqlBuilder {
                 CONSTRAINT chk_proxies_backend_port CHECK (backend_port >= 0 AND backend_port <= 65535),
                 CONSTRAINT chk_proxies_listen_port CHECK (listen_port IS NULL OR (listen_port >= 1 AND listen_port <= 65535)),
                 CONSTRAINT chk_proxies_connect_timeout CHECK (backend_connect_timeout_ms > 0),
-                CONSTRAINT chk_proxies_read_timeout CHECK (backend_read_timeout_ms > 0),
-                CONSTRAINT chk_proxies_write_timeout CHECK (backend_write_timeout_ms > 0)
+                CONSTRAINT chk_proxies_read_timeout CHECK (backend_read_timeout_ms >= 0),
+                CONSTRAINT chk_proxies_write_timeout CHECK (backend_write_timeout_ms >= 0)
             )
             "#
         } else {
@@ -330,8 +330,8 @@ impl V001SqlBuilder {
                 CHECK (backend_port >= 0 AND backend_port <= 65535),
                 CHECK (listen_port IS NULL OR (listen_port >= 1 AND listen_port <= 65535)),
                 CHECK (backend_connect_timeout_ms > 0),
-                CHECK (backend_read_timeout_ms > 0),
-                CHECK (backend_write_timeout_ms > 0)
+                CHECK (backend_read_timeout_ms >= 0),
+                CHECK (backend_write_timeout_ms >= 0)
             )
             "#
         }

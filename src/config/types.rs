@@ -2179,7 +2179,7 @@ impl Proxy {
         if let Err(e) = validate_u64_range(
             "backend_read_timeout_ms",
             self.backend_read_timeout_ms,
-            1,
+            0,
             MAX_TIMEOUT_MS,
         ) {
             errors.push(e);
@@ -2187,7 +2187,7 @@ impl Proxy {
         if let Err(e) = validate_u64_range(
             "backend_write_timeout_ms",
             self.backend_write_timeout_ms,
-            1,
+            0,
             MAX_TIMEOUT_MS,
         ) {
             errors.push(e);

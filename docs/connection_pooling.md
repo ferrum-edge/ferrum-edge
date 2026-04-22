@@ -103,6 +103,29 @@ This is the single most important pool setting for performance and reliability. 
 - HTTP read timeout should be **2-3x** the HTTP/2 timeout
 - TCP keep-alive should be **1.2-1.5x** the HTTP/2 interval
 
+### Policy Fields and Cross-Proxy Sharing
+
+The pool is keyed on **connection identity** (backend host/port, protocol, DNS override, TLS trust, mTLS credentials) and intentionally excludes policy fields like timeouts, pool sizes, and keep-alive intervals. This keeps memory and connection count bounded — proxies that all point at the same backend share one underlying client.
+
+A side effect is that **policy values baked into the shared client are first-wins**: whichever proxy populates the pool entry first sets the value for every sibling proxy reusing it. Two cases to know about:
+
+| Field | Per-proxy override respected? | Why |
+|---|---|---|
+| `backend_read_timeout_ms` | **Yes** — always the requesting proxy's value | Applied per-request via `RequestBuilder::timeout()` at dispatch time, not baked into the shared client. |
+| `backend_connect_timeout_ms` | **No** — first-wins across sibling proxies | The HTTP client library does not expose a per-request connect-timeout override. The value is set at client construction time. |
+
+**Impact of the connect-timeout limitation** is bounded to paths that actually open a new connection:
+- First request to a backend after process start (cold pool)
+- Concurrent demand exceeds `pool_max_idle_per_host` (pool scaling)
+- A pooled connection gets evicted (idle timeout, backend RST/FIN, keepalive failure)
+- DNS re-resolution after `pool_max_lifetime`
+
+In steady-state with keep-alive, `connect_timeout` rarely fires, so most deployments never observe the sharing.
+
+**If you need per-proxy connect timeouts**, force separate pool entries by making the pool key unique for each proxy — for example, set a distinct `dns_override` on each. That forces a dedicated client per proxy at the cost of extra file descriptors and DNS warmup.
+
+**Upstream fix** is tracked in [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) (per-request connect timeout). Once that lands, the gateway will move `backend_connect_timeout_ms` to dispatch time and the first-wins behaviour will go away.
+
 ## Protocol-Specific Recommendations
 
 ### HTTP/HTTPS APIs

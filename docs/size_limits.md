@@ -133,8 +133,8 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | `backend_path` | 2048 chars | Backend path prefix |
 | `hosts` | 100 entries, 253 chars each | Hostname list with format validation |
 | `backend_connect_timeout_ms` | 1–86,400,000 | Connect timeout (max 24 hours) |
-| `backend_read_timeout_ms` | 1–86,400,000 | Read timeout (max 24 hours) |
-| `backend_write_timeout_ms` | 1–86,400,000 | Write timeout (max 24 hours) |
+| `backend_read_timeout_ms` | 0–86,400,000 | Read timeout (0 = disabled, max 24 hours) |
+| `backend_write_timeout_ms` | 0–86,400,000 | Write timeout (0 = disabled, max 24 hours) |
 | `dns_override` | 255 chars | DNS resolution override |
 | `dns_cache_ttl_seconds` | 1–86,400 | DNS cache TTL (max 24 hours) |
 | `pool_idle_timeout_seconds` | 1–3,600 | Connection pool idle timeout (max 1 hour) |
