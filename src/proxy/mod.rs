@@ -8154,23 +8154,27 @@ async fn proxy_to_backend_http2(
 
     // Send to backend with read timeout (0 = no timeout)
     let h2_send_fut = sender.send_request(backend_req);
+    let map_h2_err = {
+        let resolved_ip = resolved_ip.clone();
+        move |e: hyper::Error| {
+            error!(proxy_id = %proxy.id, error = %e, "HTTP/2 backend request failed");
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: true,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ProtocolError),
+            }
+        }
+    };
     let response = if proxy.backend_read_timeout_ms > 0 {
         let read_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
         match tokio::time::timeout(read_timeout, h2_send_fut).await {
             Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                error!(proxy_id = %proxy.id, error = %e, "HTTP/2 backend request failed");
-                return retry::BackendResponse {
-                    status_code: 502,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: true,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(retry::ErrorClass::ProtocolError),
-                };
-            }
+            Ok(Err(e)) => return map_h2_err(e),
             Err(_) => {
                 warn!(
                     proxy_id = %proxy.id,
@@ -8192,19 +8196,7 @@ async fn proxy_to_backend_http2(
     } else {
         match h2_send_fut.await {
             Ok(resp) => resp,
-            Err(e) => {
-                error!(proxy_id = %proxy.id, error = %e, "HTTP/2 backend request failed");
-                return retry::BackendResponse {
-                    status_code: 502,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: true,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(retry::ErrorClass::ProtocolError),
-                };
-            }
+            Err(e) => return map_h2_err(e),
         }
     };
 
