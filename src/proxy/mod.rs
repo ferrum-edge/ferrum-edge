@@ -6779,7 +6779,7 @@ pub fn build_backend_url_with_target(
 /// The body bytes were collected and retained on the first attempt so they
 /// can be replayed on connection-failure retries without data loss.
 #[allow(clippy::too_many_arguments)]
-async fn proxy_to_backend_retry(
+pub(crate) async fn proxy_to_backend_retry(
     state: &ProxyState,
     proxy: &Proxy,
     backend_url: &str,

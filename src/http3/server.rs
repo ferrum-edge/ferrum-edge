@@ -723,53 +723,6 @@ async fn handle_h3_request(
 
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
-    // ====================================================================
-    // H3 BACKEND DISPATCH GUARD (phase-1 decoupling)
-    // TODO(decouple-phase-2): delete this entire block once the main agent
-    // introduces the unified `dispatch_backend` helper. At that point all
-    // four combinations below delegate into that helper instead of the
-    // H3-only pool, and this guard disappears. See `src/proxy/mod.rs` for
-    // the forthcoming dispatch_backend signature.
-    //
-    // CURRENT CONTRACT:
-    //   - HttpsH3Preferred + Plain → H3 pool (preserved below unchanged).
-    //   - HttpsH3Preferred + Grpc/WebSocket → 502 (H3 frontend cannot
-    //       transparently serve gRPC-over-H3 or WebSocket-over-H3; falling
-    //       back to H1/H2 backend dispatch requires the unified helper).
-    //   - HttpsPool / HttpPool (any flavor) → 502 (the H3 frontend must
-    //       not blindly dispatch plaintext or HttpsPool-only proxies through
-    //       the H3 pool; the backend may not speak QUIC at all).
-    //   - Stream kinds → unreachable (router never lands stream traffic here).
-    //
-    // Do NOT add a panic for the stream arms — the 502 placeholder is safer
-    // for the unreachable case since we still have an async QUIC stream
-    // open and the operator deserves a response instead of a crashed task.
-    let h3_backend_supported = match proxy.dispatch_kind {
-        DispatchKind::HttpsH3Preferred => matches!(http_flavor, HttpFlavor::Plain),
-        DispatchKind::HttpPool | DispatchKind::HttpsPool => false,
-        DispatchKind::TcpRaw
-        | DispatchKind::TcpTls
-        | DispatchKind::UdpRaw
-        | DispatchKind::UdpDtls => false,
-    };
-    if !h3_backend_supported {
-        warn!(
-            proxy_id = %proxy.id,
-            dispatch_kind = ?proxy.dispatch_kind,
-            flavor = ?http_flavor,
-            "HTTP/3 frontend cannot dispatch this proxy yet (decouple-phase-1 placeholder); returning 502"
-        );
-        record_request(&state, 502);
-        send_h3_response(
-            &mut stream,
-            StatusCode::BAD_GATEWAY,
-            r#"{"error":"Bad Gateway: HTTP/3 frontend dispatch to this backend scheme is not yet implemented. Enable backend_prefer_h3 on https proxies to use the H3 pool, or have clients target the H1/H2 listener for other backends."}"#,
-        )
-        .await?;
-        return Ok(());
-    }
-    // ====================================================================
-
     // Per-proxy HTTP method filtering (checked before plugins to save work)
     if let Some(ref allowed) = proxy.allowed_methods
         && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
@@ -1125,6 +1078,102 @@ async fn handle_h3_request(
     //   4. Streaming response path (buffered response path needs retries = needs buffered body)
     let can_stream_request_body =
         !needs_request_buffering && !needs_response_buffering && prebuffered_body_data.is_none();
+
+    // ========================================================================
+    // Cross-protocol bridge: H3 client → non-H3 backend.
+    //
+    // The native H3 pool path (below this block) only fires when the operator
+    // opted into H3 backend dispatch (`backend_prefer_h3: true`) AND the
+    // request flavor benefits from H3 (Plain). Every other combination —
+    // HttpsPool, HttpPool, or gRPC/WebSocket on H3-preferred — falls through
+    // the `crate::http3::cross_protocol::run` bridge, which reuses the same
+    // reqwest / HTTP/2 / gRPC backend infrastructure the H1/H2 proxy path
+    // uses. Response bodies are streamed with the same coalescing window
+    // (`http3_coalesce_*` env vars) so QUIC frame cadence is identical
+    // across paths. See `src/http3/cross_protocol.rs` for the buffering
+    // policy (request buffered, response streamed) and why that matches
+    // the rest of the codebase's two-tier buffering logic.
+    let use_native_h3_pool =
+        proxy.dispatch_kind == DispatchKind::HttpsH3Preferred && http_flavor == HttpFlavor::Plain;
+    if !use_native_h3_pool {
+        // Track connection for least-connections LB before dispatching.
+        if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
+            state
+                .load_balancer_cache
+                .record_connection_start(upstream_id, target);
+        }
+
+        let prebuffered = prebuffered_body_data.take();
+        let outcome = crate::http3::cross_protocol::run(
+            &state,
+            &proxy,
+            &mut stream,
+            &method,
+            &proxy_headers,
+            &backend_url,
+            upstream_target.as_deref(),
+            cb_target_key.as_deref(),
+            http_flavor,
+            prebuffered,
+            &ctx.client_ip,
+        )
+        .await?;
+
+        record_request(&state, outcome.response_status);
+
+        // Build the same TransactionSummary shape the native H3 pool path
+        // emits so log plugins see a consistent record across dispatch
+        // kinds. `latency_backend_total_ms` is populated (not -1.0) because
+        // the bridge returns once the response is fully delivered — no
+        // deferred completion signal is needed.
+        let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+        let plugin_external_io_ms = ctx
+            .plugin_http_call_ns
+            .load(std::sync::atomic::Ordering::Relaxed) as f64
+            / 1_000_000.0;
+        let gateway_processing_ms = total_ms - outcome.backend_total_ms;
+        let summary = TransactionSummary {
+            namespace: proxy.namespace.clone(),
+            timestamp_received: ctx.timestamp_received.to_rfc3339(),
+            client_ip: ctx.client_ip.clone(),
+            consumer_username: ctx.effective_identity().map(str::to_owned),
+            http_method: method.to_string(),
+            request_path: path.clone(),
+            matched_proxy_id: Some(proxy.id.clone()),
+            matched_proxy_name: proxy.name.clone(),
+            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+            backend_resolved_ip: backend_resolved_ip.clone(),
+            response_status_code: outcome.response_status,
+            latency_total_ms: total_ms,
+            latency_gateway_processing_ms: gateway_processing_ms,
+            latency_backend_ttfb_ms: outcome.backend_total_ms,
+            latency_backend_total_ms: outcome.backend_total_ms,
+            latency_plugin_execution_ms: plugin_execution_ms,
+            latency_plugin_external_io_ms: plugin_external_io_ms,
+            latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms).max(0.0),
+            request_user_agent: proxy_headers.get("user-agent").cloned(),
+            response_streamed: true,
+            client_disconnected: outcome.client_disconnected,
+            body_error_class: outcome.body_error_class,
+            body_completed: outcome.body_completed,
+            bytes_streamed_to_client: outcome.bytes_streamed,
+            request_bytes: outcome.request_bytes,
+            response_bytes: outcome.bytes_streamed,
+            error_class: outcome.error_class,
+            mirror: false,
+            metadata: ctx.metadata.clone(),
+        };
+        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+
+        // End connection tracking for least-connections LB.
+        if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
+            state
+                .load_balancer_cache
+                .record_connection_end(upstream_id, target);
+        }
+        return Ok(());
+    }
 
     if can_stream_request_body {
         // ===== STREAMING REQUEST + RESPONSE PATH =====

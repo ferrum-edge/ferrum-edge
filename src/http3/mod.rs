@@ -2,4 +2,5 @@
 
 pub mod client;
 pub mod config;
+pub mod cross_protocol;
 pub mod server;
