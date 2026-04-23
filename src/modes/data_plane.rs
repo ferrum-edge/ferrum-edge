@@ -72,6 +72,7 @@ pub async fn run(
         env_config.clone(),
         Some(tls_policy.clone()),
     )?;
+    proxy_state.start_backend_capability_refresh_task(Some(shutdown_tx.subscribe()));
 
     // Start per-IP request counter cleanup (removes stale zero-count entries)
     proxy_state.start_per_ip_cleanup_task();

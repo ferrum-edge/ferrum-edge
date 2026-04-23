@@ -95,7 +95,7 @@ pub(crate) fn check_legacy_proxy_fields(body: &[u8]) -> Result<(), String> {
             return Err(format!(
                 "Proxy{}: field 'backend_protocol' was renamed to 'backend_scheme' (6-variant enum: \
                  http, https, tcp, tcps, udp, dtls). gRPC and WebSocket are now detected at \
-                 runtime from the request; HTTP/3 is opt-in via 'backend_prefer_h3: true'.",
+                 runtime from the request; HTTPS backends are classified at startup for HTTP/1.1, HTTP/2, and HTTP/3 support.",
                 id_hint
             ));
         }

@@ -360,27 +360,6 @@ impl Http3ConnectionPool {
         Ok(())
     }
 
-    /// Pre-establish a QUIC connection to an explicit host/port target.
-    ///
-    /// Used at startup to warm pool entries for upstream targets where the
-    /// backend host/port differs from the proxy's configured backend.
-    pub async fn warmup_connection_to_target(
-        &self,
-        host: &str,
-        port: u16,
-        tls_config: &Arc<rustls::ClientConfig>,
-    ) -> Result<(), anyhow::Error> {
-        let key = Self::pool_key_for_target(host, port, 0);
-        if self.pool.cached(&key).is_some() {
-            return Ok(());
-        }
-        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let _ = self
-            .create_or_get_target_sender(key, host, port, tls_config.clone(), h3_config)
-            .await?;
-        Ok(())
-    }
-
     /// Send an HTTP/3 request, reusing a cached QUIC connection if available.
     ///
     /// Round-robins across `connections_per_backend` connections to distribute

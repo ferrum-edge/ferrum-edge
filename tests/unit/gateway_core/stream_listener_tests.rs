@@ -28,8 +28,7 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         // Stream proxies must not set listen_path — they route on listen_port.
         listen_path: None,
         backend_scheme: Some(scheme),
-        backend_prefer_h3: false,
-        dispatch_kind: DispatchKind::from((scheme, false)),
+        dispatch_kind: DispatchKind::from(scheme),
         backend_host: "127.0.0.1".to_string(),
         backend_port: 9999,
         backend_path: None,

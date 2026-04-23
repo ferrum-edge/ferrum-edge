@@ -332,6 +332,7 @@ pub async fn run(
     if env_config.pool_warmup_enabled {
         proxy_state.warmup_connection_pools().await;
     }
+    proxy_state.start_backend_capability_refresh_task(Some(shutdown_tx.subscribe()));
 
     // Start per-IP request counter cleanup (removes stale zero-count entries)
     proxy_state.start_per_ip_cleanup_task();

@@ -56,8 +56,7 @@ fn create_http3_test_proxy() -> Proxy {
         hosts: vec![],
         listen_path: Some("/http3-test".to_string()),
         backend_scheme: Some(BackendScheme::Https),
-        backend_prefer_h3: false,
-        dispatch_kind: DispatchKind::from((BackendScheme::Https, false)),
+        dispatch_kind: DispatchKind::from(BackendScheme::Https),
         backend_host: "facebook.com".to_string(),
         backend_port: 443,
         backend_path: Some("/get".to_string()),
@@ -461,6 +460,9 @@ async fn test_http3_proxy_state_creation() {
             Arc::new(ferrum_edge::config::EnvConfig::default()),
             ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
         )),
+        backend_capabilities: Arc::new(
+            ferrum_edge::proxy::backend_capabilities::BackendCapabilityRegistry::new(),
+        ),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new()),
@@ -563,10 +565,10 @@ async fn test_http3_environment_variables() {
 
 /// Test HTTP/3 backend scheme functionality.
 ///
-/// Post-refactor, H3 is not a scheme — an H3 proxy uses `BackendScheme::Https`
-/// plus `backend_prefer_h3: true`. This combination yields
-/// `DispatchKind::HttpsH3Preferred`. The wire format for the scheme field is
-/// plain "https"; the legacy "h3" string is only accepted by the DB loader's
+/// Post-refactor, H3 is not a scheme — backend H3 selection is runtime
+/// capability-driven and `BackendScheme::Https` always maps to
+/// `DispatchKind::HttpsPool`. The wire format for the scheme field is plain
+/// "https"; the legacy "h3" string is only accepted by the DB loader's
 /// `parse_scheme()` for backward-compatible row parsing.
 #[tokio::test]
 async fn test_http3_scheme_enum() {
@@ -586,13 +588,10 @@ async fn test_http3_scheme_enum() {
     let deserialized: BackendScheme = serde_json::from_str(&serialized).unwrap();
     assert_eq!(deserialized, BackendScheme::Https);
 
-    // DispatchKind from (Https, true) selects the H3-preferred dispatch path.
+    // Backend H3 selection is now capability-driven; HTTPS always resolves
+    // to the same dispatch kind and runtime classification chooses H3 later.
     assert_eq!(
-        DispatchKind::from((BackendScheme::Https, true)),
-        DispatchKind::HttpsH3Preferred
-    );
-    assert_eq!(
-        DispatchKind::from((BackendScheme::Https, false)),
+        DispatchKind::from(BackendScheme::Https),
         DispatchKind::HttpsPool
     );
 }
@@ -693,6 +692,9 @@ async fn test_http3_full_integration() {
             Arc::new(ferrum_edge::config::EnvConfig::default()),
             ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
         )),
+        backend_capabilities: Arc::new(
+            ferrum_edge::proxy::backend_capabilities::BackendCapabilityRegistry::new(),
+        ),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new()),
@@ -792,8 +794,7 @@ async fn test_http3_streaming_decision_logic() {
         hosts: vec![],
         listen_path: Some("/h3-stream".to_string()),
         backend_scheme: Some(BackendScheme::Https),
-        backend_prefer_h3: false,
-        dispatch_kind: DispatchKind::from((BackendScheme::Https, false)),
+        dispatch_kind: DispatchKind::from(BackendScheme::Https),
         backend_host: "localhost".to_string(),
         backend_port: 443,
         backend_path: None,

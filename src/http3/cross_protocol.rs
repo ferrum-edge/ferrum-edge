@@ -1,11 +1,11 @@
 //! HTTP/3 frontend → non-H3 backend dispatch with streaming responses +
 //! coalescing.
 //!
-//! When an HTTP/3 client lands on a proxy whose backend cannot be reached
-//! via QUIC — either because the operator didn't opt in
-//! (`backend_prefer_h3 = false`) or because the request is gRPC/WebSocket
-//! that doesn't benefit from H3 — the H3 server bridges the request to the
-//! same HTTP/1.1 + HTTP/2 backend infrastructure the main proxy path uses.
+//! When an HTTP/3 client lands on a proxy whose backend is not currently
+//! classified as H3-capable — or because the request is gRPC/WebSocket that
+//! doesn't benefit from the native backend H3 pool — the H3 server bridges
+//! the request to the same HTTP/1.1 + HTTP/2 backend infrastructure the main
+//! proxy path uses.
 //!
 //! ## Buffering policy
 //!
@@ -271,8 +271,8 @@ fn strip_query_from_backend_url(url: &str) -> String {
 }
 
 /// Entry point — routes the cross-protocol dispatch by flavor. Called from
-/// the H3 server when `proxy.dispatch_kind` is not `HttpsH3Preferred` OR
-/// the flavor is not Plain.
+/// the H3 server when the concrete backend target is not classified as
+/// H3-capable or the flavor is not Plain.
 ///
 /// `ctx` / `plugins` / `sticky_cookie_needed` are threaded through so the
 /// bridge can run the same plugin pipeline as the native H3 path:

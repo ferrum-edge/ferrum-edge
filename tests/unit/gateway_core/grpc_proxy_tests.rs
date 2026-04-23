@@ -11,8 +11,7 @@ fn test_proxy() -> Proxy {
         hosts: vec![],
         listen_path: Some("/grpc".to_string()),
         backend_scheme: Some(BackendScheme::Http),
-        backend_prefer_h3: false,
-        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
+        dispatch_kind: DispatchKind::from(BackendScheme::Http),
         backend_host: "grpc-backend.example.com".into(),
         backend_port: 50051,
         backend_path: None,
@@ -125,7 +124,7 @@ fn test_build_backend_url_grpc_uses_http_scheme() {
 fn test_build_backend_url_grpcs_uses_https_scheme() {
     let mut proxy = test_proxy();
     proxy.backend_scheme = Some(BackendScheme::Https);
-    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Https, false));
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Https);
     let url = build_backend_url(
         &proxy,
         "/grpc/my.Service/MyMethod",

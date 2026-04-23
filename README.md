@@ -319,8 +319,8 @@ See [docs/routing.md](docs/routing.md) for detailed routing behavior.
 | Protocol | Config | Notes |
 |----------|--------|-------|
 | **HTTP/1.1** | `backend_scheme: http` / `https` | Default, with connection pooling |
-| **HTTP/2** | ALPN-negotiated on `https` | Automatic via `pool_enable_http2: true`; learning cache falls back to HTTP/1.1 when the backend picks h1 |
-| **HTTP/3** | `backend_scheme: https` + `backend_prefer_h3: true` | Opts the proxy into trying QUIC first with HTTP/2 fallback. Any client version (H1/H2/H3) can target an H3-preferred backend. |
+| **HTTP/2** | ALPN-negotiated on `https` | Automatic via `pool_enable_http2: true`; startup capability classification decides when the direct H2 pool is used |
+| **HTTP/3** | `backend_scheme: https` | Startup capability classification probes HTTPS backends for H3 support and plain HTTP traffic uses QUIC automatically when supported |
 | **WebSocket** | Runtime-detected from `Upgrade: websocket` on any HTTP-family proxy | `backend_scheme: http` → `ws://` upstream; `https` → `wss://` |
 | **gRPC** | Runtime-detected from `content-type: application/grpc*` on any HTTP-family proxy | HTTP/2 with trailer support on both `http` (h2c) and `https` (ALPN) schemes |
 | **TCP** | `backend_scheme: tcp` / `tcps` | Dedicated-port stream proxy (plaintext or TLS) |

@@ -9,10 +9,12 @@ use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
+    UpstreamTarget,
 };
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::http3::client::Http3ConnectionPool;
+use ferrum_edge::proxy::backend_capabilities::{capability_key, capability_key_for_proxy_target};
 use ferrum_edge::proxy::http2_pool::Http2ConnectionPool;
 use std::sync::Arc;
 
@@ -26,8 +28,7 @@ fn minimal_proxy() -> Proxy {
         hosts: vec![],
         listen_path: Some("/test".to_string()),
         backend_scheme: Some(BackendScheme::Http),
-        backend_prefer_h3: false,
-        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
+        dispatch_kind: DispatchKind::from(BackendScheme::Http),
         backend_host: "backend.example.com".to_string(),
         backend_port: 8080,
         backend_path: None,
@@ -941,4 +942,48 @@ async fn all_three_pools_use_pipe_delimiter() {
             "{name} key should not have excessive empty fields: {key}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Backend capability registry key tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn backend_capability_key_uses_target_host_and_port() {
+    let proxy = minimal_proxy();
+    let target = UpstreamTarget {
+        host: "target.backend.internal".to_string(),
+        port: 9443,
+        weight: 1,
+        tags: Default::default(),
+        path: None,
+    };
+
+    let key = capability_key_for_proxy_target(&proxy, Some(&target));
+
+    assert!(
+        key.starts_with("http|target.backend.internal|9443|"),
+        "capability key should be keyed by the real backend target identity: {key}"
+    );
+}
+
+#[test]
+fn backend_capability_key_includes_tls_identity_fields() {
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.resolved_tls.server_ca_cert_path = Some("/ca/a.pem".to_string());
+    p1.resolved_tls.client_cert_path = Some("/mtls/client.pem".to_string());
+    p1.resolved_tls.client_key_path = Some("/mtls/client.key".to_string());
+
+    let mut p2 = p1.clone();
+    p2.resolved_tls.client_key_path = Some("/mtls/other.key".to_string());
+
+    let key1 = capability_key(&p1);
+    let key2 = capability_key(&p2);
+
+    assert_ne!(
+        key1, key2,
+        "capability key must distinguish different TLS identities"
+    );
 }

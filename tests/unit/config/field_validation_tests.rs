@@ -21,8 +21,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
         backend_scheme: Some(BackendScheme::Http),
-        backend_prefer_h3: false,
-        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
+        dispatch_kind: DispatchKind::from(BackendScheme::Http),
         backend_host: "localhost".into(),
         backend_port: 3000,
         backend_path: None,
@@ -210,7 +209,7 @@ fn test_stream_proxy_requires_listen_path_none() {
     // A populated listen_path is now a hard error (breaking change).
     let mut proxy = make_proxy("test", "/ignored");
     proxy.backend_scheme = Some(BackendScheme::Tcp);
-    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Tcp, false));
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
     proxy.listen_port = Some(5432);
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
@@ -235,7 +234,7 @@ fn test_stream_proxy_rejects_empty_string_listen_path() {
     // None, not "". This catches mis-written fixtures loudly.
     let mut proxy = make_proxy("test", "");
     proxy.backend_scheme = Some(BackendScheme::Tcp);
-    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Tcp, false));
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
     proxy.listen_port = Some(5432);
     let result = proxy.validate_fields();
     assert!(
@@ -1085,7 +1084,7 @@ fn test_proxy_tls_valid_cert_files_pass() {
 
     let mut proxy = make_proxy("test", "/api");
     proxy.backend_scheme = Some(BackendScheme::Https);
-    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Https, false));
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Https);
     proxy.backend_tls_client_cert_path = Some(cert_path.clone());
     proxy.backend_tls_client_key_path = Some(key_path);
     proxy.backend_tls_server_ca_cert_path = Some(cert_path);
@@ -1141,7 +1140,7 @@ fn test_proxy_tls_fields_rejected_on_plaintext_backend() {
     for scheme in [BackendScheme::Http, BackendScheme::Tcp, BackendScheme::Udp] {
         let mut proxy = make_proxy("test", "/api");
         proxy.backend_scheme = Some(scheme);
-        proxy.dispatch_kind = DispatchKind::from((scheme, false));
+        proxy.dispatch_kind = DispatchKind::from(scheme);
         if scheme.is_stream() {
             proxy.listen_port = Some(19000);
         }
@@ -1156,28 +1155,20 @@ fn test_proxy_tls_fields_rejected_on_plaintext_backend() {
         );
     }
 
-    // TLS schemes should allow cert fields. Https covers former wss/grpcs;
-    // Https + prefer_h3 covers former H3. Stream TLS variants are validated
-    // in stream_proxy_config_tests.rs.
-    let tls_variants: [(BackendScheme, bool); 2] = [
-        (BackendScheme::Https, false),
-        (BackendScheme::Https, true), // H3
-    ];
-    for (scheme, prefer_h3) in tls_variants {
-        let mut proxy = make_proxy("test", "/api");
-        proxy.backend_scheme = Some(scheme);
-        proxy.backend_prefer_h3 = prefer_h3;
-        proxy.dispatch_kind = DispatchKind::from((scheme, prefer_h3));
-        proxy.backend_tls_client_cert_path = Some(cert_path.clone());
-        proxy.backend_tls_client_key_path = Some(key_path.clone());
-        proxy.backend_tls_server_ca_cert_path = Some(cert_path.clone());
-        assert!(
-            proxy.validate_fields().is_ok(),
-            "Should pass for scheme={:?} prefer_h3={}",
-            proxy.backend_scheme,
-            prefer_h3
-        );
-    }
+    // TLS schemes should allow cert fields. Https covers former wss/grpcs/h3.
+    // Stream TLS variants are validated in stream_proxy_config_tests.rs.
+    let scheme = BackendScheme::Https;
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_scheme = Some(scheme);
+    proxy.dispatch_kind = DispatchKind::from(scheme);
+    proxy.backend_tls_client_cert_path = Some(cert_path.clone());
+    proxy.backend_tls_client_key_path = Some(key_path.clone());
+    proxy.backend_tls_server_ca_cert_path = Some(cert_path.clone());
+    assert!(
+        proxy.validate_fields().is_ok(),
+        "Should pass for scheme={:?}",
+        proxy.backend_scheme,
+    );
 }
 
 // ---- Allowed methods validation tests ----

@@ -738,7 +738,7 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, backend_prefer_h3, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&proxy.id)
         .bind(&proxy.namespace)
@@ -746,7 +746,6 @@ impl DatabaseStore {
         .bind(&hosts_json)
         .bind(&proxy.listen_path)
         .bind(proxy.effective_scheme().to_scheme_str())
-        .bind(if proxy.backend_prefer_h3 { 1i32 } else { 0 })
         .bind(&proxy.backend_host)
         .bind(proxy.backend_port as i32)
         .bind(&proxy.backend_path)
@@ -830,13 +829,12 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_prefer_h3=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, updated_at=? WHERE id=?")
         )
         .bind(&proxy.name)
         .bind(&hosts_json)
         .bind(&proxy.listen_path)
         .bind(proxy.effective_scheme().to_scheme_str())
-        .bind(if proxy.backend_prefer_h3 { 1i32 } else { 0 })
         .bind(&proxy.backend_host)
         .bind(proxy.backend_port as i32)
         .bind(&proxy.backend_path)
@@ -2454,7 +2452,7 @@ impl DatabaseStore {
         attach_plugins: bool,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let insert_sql = self.q("INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, backend_prefer_h3, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let insert_sql = self.q("INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
@@ -2482,7 +2480,6 @@ impl DatabaseStore {
                 .bind(&hosts_json)
                 .bind(&proxy.listen_path)
                 .bind(proxy.effective_scheme().to_scheme_str())
-                .bind(if proxy.backend_prefer_h3 { 1i32 } else { 0 })
                 .bind(&proxy.backend_host)
                 .bind(proxy.backend_port as i32)
                 .bind(&proxy.backend_path)
@@ -3607,8 +3604,9 @@ pub(crate) fn diff_removed(known: &HashSet<String>, current: &HashSet<String>) -
 /// - `dtls`                 → `Dtls`
 ///
 /// Unrecognized values fall back to `Http` (the safest plaintext default).
-/// The `h3` legacy alias is specifically meant to be paired with
-/// `parse_legacy_h3_hint()` which returns the `backend_prefer_h3` flag.
+/// The `h3` legacy alias now canonicalizes directly to `Https`; backend H3
+/// selection is handled by the runtime capability registry instead of a
+/// separate config flag.
 pub(crate) fn parse_scheme(s: &str) -> BackendScheme {
     match s.to_lowercase().as_str() {
         "https" | "wss" | "grpcs" | "h3" => BackendScheme::Https,
@@ -3619,13 +3617,6 @@ pub(crate) fn parse_scheme(s: &str) -> BackendScheme {
         "dtls" => BackendScheme::Dtls,
         _ => BackendScheme::Http,
     }
-}
-
-/// Returns `true` when the stored value is the legacy `h3` alias —
-/// signals that `backend_prefer_h3` should be inferred to `true` when
-/// rows predate the `backend_prefer_h3` column.
-pub(crate) fn parse_legacy_h3_hint(s: &str) -> bool {
-    s.eq_ignore_ascii_case("h3")
 }
 
 pub(crate) fn parse_auth_mode(s: &str) -> AuthMode {
@@ -3657,13 +3648,6 @@ fn row_to_proxy(
         })?,
     };
     let backend_scheme = parse_scheme(&scheme_str);
-    // `backend_prefer_h3` is stored as INTEGER (0/1). If the column is
-    // absent (older schema) fall back to the legacy `h3` alias on
-    // `backend_protocol` so existing dev rows keep their H3 intent.
-    let backend_prefer_h3 = match row.try_get::<i32, _>("backend_prefer_h3") {
-        Ok(v) => v != 0,
-        Err(_) => parse_legacy_h3_hint(&scheme_str),
-    };
     let auth_mode_str: String = row
         .try_get("auth_mode")
         .map_err(|e| anyhow::anyhow!("Proxy {}: failed to read auth_mode: {}", pid, e))?;
@@ -3693,12 +3677,11 @@ fn row_to_proxy(
         // safe for the expected nullable case and fails fast on real errors.
         listen_path: row.try_get::<Option<String>, _>("listen_path")?,
         backend_scheme: Some(backend_scheme),
-        backend_prefer_h3,
         // `dispatch_kind` is populated by `GatewayConfig::normalize_fields()`
         // once the full config is loaded. Seed it here from the row values so
         // single-row reads (e.g., `get_proxy`) still return a usable Proxy
         // even when no normalization pass runs.
-        dispatch_kind: DispatchKind::from((backend_scheme, backend_prefer_h3)),
+        dispatch_kind: DispatchKind::from(backend_scheme),
         backend_host: row.try_get("backend_host")?,
         backend_port: row
             .try_get::<i32, _>("backend_port")

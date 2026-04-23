@@ -777,7 +777,7 @@ pub enum HttpFlavor {
 /// Pre-computed dispatch classification for a proxy. Populated once at
 /// config-load time in `GatewayConfig::resolve_dispatch_kind()` so the
 /// request hot path is a single match on a 1-byte enum instead of a
-/// cascade of scheme/prefer_h3/capability checks.
+/// cascade of scheme/capability checks.
 ///
 /// Same pattern as `Proxy::resolved_tls` (cached computation, `#[serde(skip)]`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -786,15 +786,10 @@ pub enum DispatchKind {
     /// GrpcPool h2c path; WebSocket → plaintext `ws://` upgrade.
     #[default]
     HttpPool,
-    /// TLS HTTP family (scheme = Https, prefer_h3 = false). Plain → reqwest
-    /// or Http2ConnectionPool (ALPN negotiated); Grpc → GrpcPool TLS;
-    /// WebSocket → `wss://` upgrade. No H3 attempt.
+    /// TLS HTTP family (scheme = Https). Plain → reqwest, Http2ConnectionPool,
+    /// or Http3ConnectionPool based on the backend capability registry; Grpc →
+    /// GrpcPool TLS; WebSocket → `wss://` upgrade.
     HttpsPool,
-    /// TLS HTTP family with H3 preferred (scheme = Https, prefer_h3 = true).
-    /// Plain flavor attempts Http3ConnectionPool first then falls back to
-    /// HttpsPool behavior; Grpc / WebSocket degrade to HttpsPool directly
-    /// (H3 gives them nothing).
-    HttpsH3Preferred,
     /// Raw TCP stream proxy.
     TcpRaw,
     /// TCP + TLS stream proxy.
@@ -816,19 +811,13 @@ impl DispatchKind {
 
     #[inline]
     pub fn is_http_family(&self) -> bool {
-        matches!(
-            self,
-            Self::HttpPool | Self::HttpsPool | Self::HttpsH3Preferred
-        )
+        matches!(self, Self::HttpPool | Self::HttpsPool)
     }
 
     #[inline]
     #[allow(dead_code)] // part of public API, exercised via re-export + tests
     pub fn is_tls_backend(&self) -> bool {
-        matches!(
-            self,
-            Self::HttpsPool | Self::HttpsH3Preferred | Self::TcpTls | Self::UdpDtls
-        )
+        matches!(self, Self::HttpsPool | Self::TcpTls | Self::UdpDtls)
     }
 
     #[inline]
@@ -837,12 +826,11 @@ impl DispatchKind {
     }
 }
 
-impl From<(BackendScheme, bool)> for DispatchKind {
+impl From<BackendScheme> for DispatchKind {
     #[inline]
-    fn from((scheme, prefer_h3): (BackendScheme, bool)) -> Self {
+    fn from(scheme: BackendScheme) -> Self {
         match scheme {
             BackendScheme::Http => Self::HttpPool,
-            BackendScheme::Https if prefer_h3 => Self::HttpsH3Preferred,
             BackendScheme::Https => Self::HttpsPool,
             BackendScheme::Tcp => Self::TcpRaw,
             BackendScheme::Tcps => Self::TcpTls,
@@ -940,15 +928,10 @@ pub struct Proxy {
     /// (validation rejects missing scheme when `listen_port` is set).
     ///
     /// WebSocket and gRPC are no longer schemes — they are detected per-request
-    /// from the incoming traffic (`HttpFlavor`). HTTP/3 is opt-in via
-    /// `backend_prefer_h3` when the scheme resolves to `Https`.
+    /// from the incoming traffic (`HttpFlavor`). HTTP/3 is learned per backend
+    /// by the capability registry when the scheme resolves to `Https`.
     #[serde(default)]
     pub backend_scheme: Option<BackendScheme>,
-    /// Prefer HTTP/3 when speaking to this backend. Only meaningful when
-    /// scheme resolves to `Https`. Validation rejects `true` with any
-    /// non-`Https` scheme. Default false.
-    #[serde(default)]
-    pub backend_prefer_h3: bool,
     /// Populated during `normalize_fields()` — O(1) dispatch target used by
     /// the request hot path. Never serialized. Same pattern as `resolved_tls`.
     #[serde(skip)]
@@ -1390,15 +1373,15 @@ impl GatewayConfig {
         }
         // Pre-compute dispatch classification for every proxy — O(1) per
         // proxy at load time, so the request hot path never does any
-        // scheme/prefer_h3 branching.
+        // scheme branching.
         self.resolve_dispatch_kind();
     }
 
-    /// Resolve each proxy's `dispatch_kind` from `backend_scheme` +
-    /// `backend_prefer_h3`, applying the HTTP-family default when the
-    /// scheme field is absent. Also canonicalizes `backend_scheme` to
-    /// `Some(...)` post-normalization so downstream code (logging, pool
-    /// keys) can read a concrete scheme without re-running defaulting.
+    /// Resolve each proxy's `dispatch_kind` from `backend_scheme`, applying
+    /// the HTTP-family default when the scheme field is absent. Also
+    /// canonicalizes `backend_scheme` to `Some(...)` post-normalization so
+    /// downstream code (logging, pool keys) can read a concrete scheme
+    /// without re-running defaulting.
     ///
     /// Must be called after loading/mutating config and before any proxy
     /// traffic flows. Invoked automatically by `normalize_fields()`; admin
@@ -2182,7 +2165,7 @@ impl Proxy {
     /// stored backend scheme when HTTP-family defaults apply.
     fn resolve_dispatch_kind_fields(&mut self) {
         let scheme = self.effective_scheme();
-        self.dispatch_kind = DispatchKind::from((scheme, self.backend_prefer_h3));
+        self.dispatch_kind = DispatchKind::from(scheme);
         // Canonicalize the stored field for HTTP-family proxies so logging,
         // pool keys, and incremental serialization read a concrete scheme.
         // Stream proxies without an explicit scheme are deliberately left
@@ -2194,10 +2177,9 @@ impl Proxy {
 
     /// Normalize proxy fields to their canonical in-memory form.
     ///
-    /// Also populates `dispatch_kind` from `backend_scheme` +
-    /// `backend_prefer_h3` so per-proxy call sites (admin CRUD validation,
-    /// incremental config apply, single-row DB reads) get a correct
-    /// dispatch classification without depending on the
+    /// Also populates `dispatch_kind` from `backend_scheme` so per-proxy call
+    /// sites (admin CRUD validation, incremental config apply, single-row DB
+    /// reads) get a correct dispatch classification without depending on the
     /// `GatewayConfig::resolve_dispatch_kind` batch pass.
     pub fn normalize_fields(&mut self) {
         for host in &mut self.hosts {
@@ -2549,23 +2531,11 @@ impl Proxy {
             }
         }
 
-        // New cross-field rules for the decoupled scheme/prefer_h3 design.
-        // - Stream proxies must declare an explicit scheme (no HTTP default).
-        // - backend_prefer_h3=true is only meaningful with scheme=https.
+        // Stream proxies must declare an explicit scheme (no HTTP default).
         if self.listen_port.is_some() && self.backend_scheme.is_none() {
             errors.push(format!(
                 "Stream proxy '{}' must set backend_scheme explicitly (tcp, tcps, udp, dtls) — no default is applied to stream proxies",
                 self.id
-            ));
-        }
-        // backend_prefer_h3 is valid whenever the effective scheme resolves
-        // to HTTPS — either explicitly set, or the HTTP-family default when
-        // backend_scheme is omitted. Reject only when a non-HTTPS stream or
-        // plaintext scheme is explicitly declared.
-        if self.backend_prefer_h3 && !matches!(self.effective_scheme(), BackendScheme::Https) {
-            errors.push(format!(
-                "backend_prefer_h3=true is only valid when backend_scheme resolves to 'https' (got '{}')",
-                self.scheme_display()
             ));
         }
 

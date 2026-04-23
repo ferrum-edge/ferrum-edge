@@ -31,14 +31,14 @@ FERRUM_FRONTEND_TLS_KEY_PATH=/path/to/key.pem
 
 ## Dispatch model
 
-Every H3 request goes through the same plugin lifecycle as H1/H2 (route match → `on_request_received` → `authenticate` → `authorize` → `before_proxy`), runs circuit-breaker and load-balancer decisions, then branches on the matched proxy's pre-computed `DispatchKind`:
+Every H3 request goes through the same plugin lifecycle as H1/H2 (route match → `on_request_received` → `authenticate` → `authorize` → `before_proxy`), runs circuit-breaker and load-balancer decisions, then branches on the matched proxy's pre-computed `DispatchKind` plus the startup-refreshed backend capability registry:
 
-| `proxy.dispatch_kind` | Request flavor | Backend path |
+| Dispatch input | Request flavor | Backend path |
 |---|---|---|
-| `HttpsH3Preferred` | `Plain` | **Native H3 pool** (quinn/h3 → QUIC upstream) |
-| `HttpsH3Preferred` | `Grpc` | Cross-protocol bridge → `GrpcConnectionPool` (HTTP/2 + trailers) |
-| `HttpsH3Preferred` | `WebSocket` | 501 — see [WebSocket over HTTP/3](#websocket-over-http3--not-supported) |
-| `HttpsPool` | any | Cross-protocol bridge → reqwest (`Plain`) / gRPC pool (`Grpc`) / 501 (`WebSocket`) |
+| `HttpsPool` + target classified as `h3` | `Plain` | **Native H3 pool** (quinn/h3 → QUIC upstream) |
+| `HttpsPool` + target not classified as `h3` | `Plain` | Cross-protocol bridge → reqwest / direct H2 as needed |
+| `HttpsPool` | `Grpc` | Cross-protocol bridge → `GrpcConnectionPool` (HTTP/2 + trailers) |
+| `HttpsPool` | `WebSocket` | 501 — see [WebSocket over HTTP/3](#websocket-over-http3--not-supported) |
 | `HttpPool` | any | Cross-protocol bridge → plaintext reqwest (`Plain`) / gRPC h2c (`Grpc`) / 501 (`WebSocket`) |
 | `TcpRaw` / `TcpTls` / `UdpRaw` / `UdpDtls` | — | Never routed here (stream proxies route on `listen_port`) |
 
@@ -50,19 +50,19 @@ The `HttpFlavor` is computed once per request by `detect_http_flavor()` in `src/
 
 ## Native H3 fast path
 
-When the matched proxy has `backend_scheme: https` + `backend_prefer_h3: true` AND the request flavor is `Plain`, the gateway keeps the request entirely on QUIC:
+When the matched proxy has `backend_scheme: https`, the concrete backend target has already been classified as H3-capable, and the request flavor is `Plain`, the gateway keeps the request entirely on QUIC:
 
 - Request body: streamed frame-by-frame via `Http3ConnectionPool::request_streaming_body()`, reading from `RequestStream::recv_data()` on the frontend and `send_data()` on the backend-side stream. No buffering.
 - Response body: streamed back via `CoalescingH3Body` / `DirectH3Body` with the coalesce knobs below.
 - Zero copies of the body to userspace at either end; h3's chunks are `Bytes` pass-throughs.
 
-Use this path when the backend is known to speak QUIC and the operator has explicitly opted into it. Without `backend_prefer_h3: true`, the gateway assumes the backend does not speak QUIC and routes via the cross-protocol bridge instead — this prevents the common failure mode of pointing H3 frontend traffic at an HTTP/2-only backend and seeing opaque QUIC connect errors.
+Use this path when the backend is known to speak QUIC. When startup or background refresh has not classified the target as H3-capable, the gateway routes via the cross-protocol bridge instead — this prevents the common failure mode of pointing H3 frontend traffic at an HTTP/2-only backend and seeing opaque QUIC connect errors on live requests.
 
 ## Cross-protocol bridge
 
 Module: [src/http3/cross_protocol.rs](../src/http3/cross_protocol.rs).
 
-For every dispatch case that is **not** `HttpsH3Preferred + Plain`, the H3 listener delegates to `cross_protocol::run()`, which reuses the same backend infrastructure as the H1/H2 proxy path — `state.connection_pool` (reqwest) for Plain flavor and `state.grpc_pool` (hyper H2 direct) for Grpc flavor. This is the decoupling that lets a single `https://backend` serve H1, H2, and H3 clients uniformly.
+For every dispatch case that is **not** `Plain + target classified as h3`, the H3 listener delegates to `cross_protocol::run()`, which reuses the same backend infrastructure as the H1/H2 proxy path — `state.connection_pool` (reqwest) for Plain flavor and `state.grpc_pool` (hyper H2 direct) for Grpc flavor. This is the decoupling that lets a single `https://backend` serve H1, H2, and H3 clients uniformly.
 
 Flow:
 

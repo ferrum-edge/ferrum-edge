@@ -113,15 +113,6 @@ impl ProxyBuilder {
         self
     }
 
-    /// Opt the proxy into preferring HTTP/3 to the backend. Only meaningful
-    /// when `backend_scheme == "https"`; validation rejects `true` with
-    /// other schemes.
-    pub fn backend_prefer_h3(mut self, prefer: bool) -> Self {
-        self.inner
-            .insert("backend_prefer_h3".into(), Value::Bool(prefer));
-        self
-    }
-
     pub fn backend_path(mut self, path: impl Into<String>) -> Self {
         self.inner
             .insert("backend_path".into(), Value::String(path.into()));
