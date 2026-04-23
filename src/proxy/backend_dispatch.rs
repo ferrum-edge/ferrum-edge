@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::load_balancer::{HashOnStrategy, HealthContext, LoadBalancerCache};
 use crate::proxy::ProxyState;
+use crate::proxy::is_valid_websocket_key;
 
 // ---------------------------------------------------------------------------
 // Runtime HTTP flavor detection
@@ -103,19 +104,6 @@ fn is_http1_websocket_upgrade<B>(req: &Request<B>) -> bool {
         .and_then(|v| v.to_str().ok())
         == Some("13");
     key_ok && version_ok
-}
-
-/// RFC 6455 §4.1 — the key is a base64-encoded 16-byte nonce (exactly 24
-/// base64 characters including `==` padding). Duplicated from `proxy/mod.rs`
-/// to keep this helper self-contained; both copies stay in sync because they
-/// decode and check byte length.
-#[inline]
-fn is_valid_websocket_key(key: &str) -> bool {
-    use base64::Engine;
-    key.len() == 24
-        && base64::engine::general_purpose::STANDARD
-            .decode(key)
-            .is_ok_and(|bytes| bytes.len() == 16)
 }
 
 /// Result of upstream target selection.

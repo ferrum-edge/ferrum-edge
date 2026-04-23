@@ -1201,7 +1201,9 @@ async fn handle_h3_request(
     // (`http3_coalesce_*` env vars) so QUIC frame cadence is identical
     // across paths. See `src/http3/cross_protocol.rs` for the buffering
     // policy (request buffered, response streamed) and why that matches
-    // the rest of the codebase's two-tier buffering logic.
+    // the rest of the codebase's two-tier buffering logic. gRPC on
+    // `HttpsH3Preferred` still uses this bridge because the native H3 pool
+    // is plain-HTTP only today.
     let use_native_h3_pool =
         proxy.dispatch_kind == DispatchKind::HttpsH3Preferred && http_flavor == HttpFlavor::Plain;
     if !use_native_h3_pool {
@@ -1240,26 +1242,27 @@ async fn handle_h3_request(
         // non-H3 backends silently skip the response-transform /
         // body-validator / sticky-session phases.
         let client_ip_owned = ctx.client_ip.clone();
-        let outcome = crate::http3::cross_protocol::run(
-            &state,
-            &proxy,
-            &mut stream,
-            &method,
-            &proxy_headers,
-            &path,
-            &query_string,
-            &backend_url,
-            lb_hash_key.as_deref(),
-            upstream_target.as_deref(),
-            cb_target_key.as_deref(),
-            http_flavor,
-            prebuffered,
-            &client_ip_owned,
-            &mut ctx,
-            &plugins,
-            sticky_cookie_needed,
-        )
-        .await?;
+        let outcome =
+            crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest {
+                state: &state,
+                proxy: &proxy,
+                stream: &mut stream,
+                method: &method,
+                proxy_headers: &proxy_headers,
+                path: &path,
+                query_string: &query_string,
+                backend_url: &backend_url,
+                lb_hash_key: lb_hash_key.as_deref(),
+                upstream_target: upstream_target.as_deref(),
+                cb_target_key: cb_target_key.as_deref(),
+                flavor: http_flavor,
+                prebuffered_body: prebuffered,
+                client_ip: &client_ip_owned,
+                ctx: &mut ctx,
+                plugins: &plugins,
+                sticky_cookie_needed,
+            })
+            .await?;
 
         record_request(&state, outcome.response_status);
 

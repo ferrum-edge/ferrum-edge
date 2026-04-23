@@ -101,6 +101,7 @@ use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use tracing::{debug, error, warn};
 
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
+use crate::http3::server::h3_http_status_to_grpc_status;
 use crate::plugins::{Plugin, PluginResult, RequestContext};
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome;
@@ -142,6 +143,29 @@ impl CoalesceConfig {
             flush_interval: Duration::from_micros(state.env_config.http3_flush_interval_micros),
         }
     }
+}
+
+pub(crate) struct CrossProtocolRequest<'a, S>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    pub state: &'a ProxyState,
+    pub proxy: &'a Proxy,
+    pub stream: &'a mut RequestStream<S, Bytes>,
+    pub method: &'a str,
+    pub proxy_headers: &'a HashMap<String, String>,
+    pub path: &'a str,
+    pub query_string: &'a str,
+    pub backend_url: &'a str,
+    pub lb_hash_key: Option<&'a str>,
+    pub upstream_target: Option<&'a UpstreamTarget>,
+    pub cb_target_key: Option<&'a str>,
+    pub flavor: HttpFlavor,
+    pub prebuffered_body: Option<Vec<u8>>,
+    pub client_ip: &'a str,
+    pub ctx: &'a mut RequestContext,
+    pub plugins: &'a [Arc<dyn Plugin>],
+    pub sticky_cookie_needed: bool,
 }
 
 fn record_cross_protocol_connection_start(
@@ -260,29 +284,31 @@ fn strip_query_from_backend_url(url: &str) -> String {
 /// `on_final_response_body`) on plain and gRPC responses when buffering is
 /// active. Without these, H3 clients on non-H3 backends would silently skip
 /// body validators, response transformers, sticky sessions, etc.
-#[allow(clippy::too_many_arguments)]
-pub async fn run<S>(
-    state: &ProxyState,
-    proxy: &Proxy,
-    stream: &mut RequestStream<S, Bytes>,
-    method: &str,
-    proxy_headers: &HashMap<String, String>,
-    path: &str,
-    query_string: &str,
-    backend_url: &str,
-    lb_hash_key: Option<&str>,
-    upstream_target: Option<&UpstreamTarget>,
-    cb_target_key: Option<&str>,
-    flavor: HttpFlavor,
-    prebuffered_body: Option<Vec<u8>>,
-    client_ip: &str,
-    ctx: &mut RequestContext,
-    plugins: &[Arc<dyn Plugin>],
-    sticky_cookie_needed: bool,
+pub(crate) async fn run<S>(
+    request: CrossProtocolRequest<'_, S>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    let CrossProtocolRequest {
+        state,
+        proxy,
+        stream,
+        method,
+        proxy_headers,
+        path,
+        query_string,
+        backend_url,
+        lb_hash_key,
+        upstream_target,
+        cb_target_key,
+        flavor,
+        prebuffered_body,
+        client_ip,
+        ctx,
+        plugins,
+        sticky_cookie_needed,
+    } = request;
     let backend_start = Instant::now();
     let raw_prebuffered_body_bytes = prebuffered_body
         .as_ref()
@@ -1027,8 +1053,13 @@ where
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        let reject = crate::proxy::plugin_result_into_reject_parts(reject)
-                            .expect("reject result should convert to rejection parts");
+                        let Some(reject) = crate::proxy::plugin_result_into_reject_parts(reject)
+                        else {
+                            warn!(
+                                "plugin reject arm returned a non-reject result in on_response_body"
+                            );
+                            continue;
+                        };
                         response_status = reject.status_code;
                         response_headers.clear();
                         response_headers
@@ -1065,8 +1096,13 @@ where
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        let reject = crate::proxy::plugin_result_into_reject_parts(reject)
-                            .expect("reject result should convert to rejection parts");
+                        let Some(reject) = crate::proxy::plugin_result_into_reject_parts(reject)
+                        else {
+                            warn!(
+                                "plugin reject arm returned a non-reject result in on_final_response_body"
+                            );
+                            continue;
+                        };
                         response_status = reject.status_code;
                         response_headers.clear();
                         response_headers
@@ -1733,8 +1769,10 @@ fn apply_buffered_grpc_plugin_reject(
     response_body: &mut Vec<u8>,
     response_trailers: &mut HashMap<String, String>,
 ) {
-    let reject = crate::proxy::plugin_result_into_reject_parts(reject)
-        .expect("reject result should convert to rejection parts");
+    let Some(reject) = crate::proxy::plugin_result_into_reject_parts(reject) else {
+        warn!("buffered gRPC reject helper received a non-reject plugin result");
+        return;
+    };
     let normalized = normalize_h3_grpc_reject(
         StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
         &reject.body,
@@ -2247,8 +2285,28 @@ async fn write_final_body_reject<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    let parts = crate::proxy::plugin_result_into_reject_parts(reject)
-        .expect("reject result should convert to rejection parts");
+    let Some(parts) = crate::proxy::plugin_result_into_reject_parts(reject) else {
+        warn!("final body reject helper received a non-reject plugin result");
+        return if matches!(flavor, HttpFlavor::Grpc) {
+            write_grpc_error(
+                stream,
+                h3_http_status_to_grpc_status(StatusCode::BAD_GATEWAY),
+                "Plugin rejection normalization failed",
+                backend_start,
+                request_bytes,
+            )
+            .await
+        } else {
+            write_error(
+                stream,
+                StatusCode::BAD_GATEWAY,
+                "{\"error\":\"Plugin rejection normalization failed\"}",
+                backend_start,
+                request_bytes,
+            )
+            .await
+        };
+    };
     let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
     if matches!(flavor, HttpFlavor::Grpc) {
         let normalized = normalize_h3_grpc_reject(http_status, &parts.body, &parts.headers);
