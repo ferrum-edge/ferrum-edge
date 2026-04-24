@@ -30,7 +30,6 @@
 //!   threshold — same semantics as the standalone wrapper.
 
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -227,12 +226,25 @@ async fn relay_with_profile(
     profile: NetworkProfile,
     _state: Arc<ProxyState>,
 ) {
-    let backend_addr: SocketAddr = match format!("{target_host}:{target_port}").parse() {
-        Ok(a) => a,
-        Err(_) => return,
-    };
-    let Ok(backend) = TcpStream::connect(backend_addr).await else {
-        return;
+    // `TcpStream::connect` accepts anything implementing `ToSocketAddrs`,
+    // which includes `&str` and resolves DNS — so `localhost`, IPv6
+    // literals, and bracketed `[::1]:port` all just work, instead of
+    // `SocketAddr::from_str` which only parses numeric addresses and
+    // silently dropped any test that passed a hostname.
+    let target = format!("{target_host}:{target_port}");
+    let backend = match TcpStream::connect(target.as_str()).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Surface the failure on stderr so tests don't see a
+            // mystery hang. Without this the middleman accepts the
+            // client connection but never relays, which presents as a
+            // misleading client-side read timeout.
+            eprintln!(
+                "[NetworkSimProxy] connect to {target} failed: {e}; \
+                 relay aborting (client will see EOF)"
+            );
+            return;
+        }
     };
 
     // Wrap BOTH sides identically. If the test only wants client→backend

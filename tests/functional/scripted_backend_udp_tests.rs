@@ -233,6 +233,39 @@ impl GatewayFixture {
             format!("{err}\n{out}")
         }
     }
+
+    /// Send `SIGTERM` and wait for the gateway to exit cleanly. The
+    /// `tracing_appender::non_blocking` `WorkerGuard` is dropped during
+    /// the gateway's normal shutdown path, which flushes any
+    /// outstanding log lines through Rust's stdout/stderr writers
+    /// (block-buffered when piped to a file). Tests that grep the
+    /// captured logs for events that fire late in the test's life
+    /// (e.g. a second session creation) must call this before reading
+    /// or risk a stale-buffer false negative.
+    ///
+    /// `libc` is gated to Linux in this crate's `Cargo.toml`, so we
+    /// shell out to `/bin/kill` to stay portable to macOS dev boxes
+    /// that run the same `#[ignore]` functional tests.
+    fn graceful_shutdown(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+        // Bound the wait so a hung gateway can't stall the test
+        // forever; SIGKILL after the deadline as a final fallback.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 impl Drop for GatewayFixture {
@@ -328,28 +361,39 @@ plugin_configs: []
         received.len()
     );
 
-    // Flush time for the gateway's non-blocking log appender — events
-    // emit on a background thread and can trail the read. 500 ms is
-    // well beyond the `tracing_appender::non_blocking` drain interval.
+    // Give the gateway a beat to finish its post-reply work — the
+    // `recv_datagram_with_timeout` returns as soon as the client
+    // receives reply2, but the gateway's `create_udp_session` log
+    // (which we grep for below) is emitted after the inbound branch
+    // forwards the datagram, on a separate task. Without this short
+    // wait the log can lag SIGTERM and never reach the appender.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Primary signal: gateway logs the "UDP session expired (idle
-    // timeout)" line when the cleanup task reaps an idle session. The
-    // cleanup task runs every `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`
-    // and reaps sessions whose `last_activity` is older than
-    // `udp_idle_timeout_seconds`.
+    // ferrum-edge's stdout is block-buffered when piped to a file
+    // (which `Stdio::from(File)` does). Send SIGTERM and wait for the
+    // gateway to exit — its `WorkerGuard`s drop on the way out and
+    // flush the tracing appender through to disk.
+    let mut fx = fx;
+    fx.graceful_shutdown();
+
+    // Coverage strategy: a regression where the cleanup task fires
+    // but doesn't actually evict the session would still let
+    // datagram 2 through (reused session ⇒ same backend leg ⇒
+    // backend sees both datagrams). The two log-based assertions
+    // below close that gap:
     //
-    // Paired with "both datagrams arrived at the backend" this proves:
-    //   (a) the gateway set up the first session and forwarded msg1;
-    //   (b) the cleanup task fired and removed the session;
-    //   (c) msg2 arrived post-cleanup and was forwarded.
+    //   * "UDP session expired (idle timeout)" proves the cleanup
+    //     task's eviction path executed at all.
+    //   * Two "New UDP session created" lines prove the gateway
+    //     actually allocated a fresh backend session for datagram 2,
+    //     not just claimed to evict and then reused the original.
     //
-    // A "2 × New UDP session created" assertion would be stricter, but
-    // empirically the debug log for the SECOND session sometimes
-    // arrives after the tracing_appender flush window closes on CI
-    // (the receiver has the reply bytes so the test advanced past
-    // send2 well before the background log task emitted). Rely on
-    // the more reliable signal.
+    // We deliberately do NOT assert on the backend-observed source
+    // address: when the gateway drops a UDP socket and immediately
+    // binds another, the kernel often hands back the same ephemeral
+    // port (no SO_REUSEADDR pressure on a single-process test box),
+    // so `unique_sources` is `1` even on a perfectly working session
+    // recreation. The log signals avoid that false negative.
     let logs = fx.captured_stderr();
     let saw_expire = logs.contains("UDP session expired") || logs.contains("idle timeout");
     assert!(
@@ -359,9 +403,11 @@ plugin_configs: []
     );
     let created_count = logs.matches("New UDP session created").count();
     assert!(
-        created_count >= 1,
-        "expected ≥1 'New UDP session created' line in gateway logs; got \
-         {created_count}. Logs:\n{logs}"
+        created_count >= 2,
+        "expected ≥2 'New UDP session created' lines (one per \
+         datagram, post-cleanup); got {created_count}. A regression \
+         where cleanup fires but reuses the existing session would \
+         show only 1. Logs:\n{logs}"
     );
 }
 

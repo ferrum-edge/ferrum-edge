@@ -55,6 +55,16 @@ struct UdpSession {
     dtls_conn: Option<Arc<crate::dtls::DtlsConnection>>,
     last_activity: AtomicU64, // epoch millis
     created_at: AtomicU64,    // epoch millis
+    /// Set to `true` by the idle-cleanup task immediately before the
+    /// session is removed from the session map. The recv-loop
+    /// `last_client` fast path checks this flag and falls through to
+    /// `lookup_or_create_session` when it sees an expired session, so
+    /// a cached `Arc<UdpSession>` that survived the map removal can't
+    /// keep routing traffic through an orphaned backend leg. Without
+    /// this gate the fast path serves stale sessions for as long as
+    /// the cache holds them, which silently bypasses the configured
+    /// `udp_idle_timeout_seconds`.
+    expired: std::sync::atomic::AtomicBool,
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
     /// Size of the last client→backend datagram for amplification factor checking.
@@ -1006,36 +1016,19 @@ async fn process_datagram(
     }
 
     // Fast path: check last-client cache before hitting DashMap.
-    let session = if let Some((cached_addr, ref cached_session)) = *last_client {
-        if cached_addr == client_addr {
-            cached_session.clone()
-        } else {
-            lookup_or_create_session(
-                client_addr,
-                proxy_id,
-                config,
-                dns_cache,
-                lb_cache,
-                frontend_socket,
-                sessions,
-                metrics,
-                tls_no_verify,
-                max_sessions,
-                plugins,
-                proxy_name,
-                proxy_namespace,
-                backend_scheme,
-                listen_port,
-                circuit_breaker_cache,
-                consumer_index,
-                crls,
-                data,
-                sni_proxy_ids,
-                adaptive_buffer,
-                udp_gso_enabled,
-            )
-            .await?
-        }
+    // Skip the cache when the cached session has been flagged expired
+    // by the idle-cleanup task — that path removes the session from
+    // the map but the recv-loop's `Arc` keeps it alive, so without
+    // this check we'd keep forwarding through a session the cleanup
+    // task already declared dead and the configured
+    // `udp_idle_timeout_seconds` would be quietly ignored.
+    let session = if let Some((cached_addr, ref cached_session)) = *last_client
+        && cached_addr == client_addr
+        && !cached_session
+            .expired
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        cached_session.clone()
     } else {
         lookup_or_create_session(
             client_addr,
@@ -1216,6 +1209,14 @@ fn spawn_session_cleanup(
 
                     for addr in &expired {
                         if let Some((_, session)) = sessions.remove(addr) {
+                            // Mark the session expired BEFORE we let go of
+                            // any reference. The recv-loop fast path may
+                            // hold a `last_client` Arc to this session
+                            // that survives the map removal; the flag is
+                            // how that path notices it must re-create.
+                            session
+                                .expired
+                                .store(true, std::sync::atomic::Ordering::Release);
                             // Close DTLS connection if active
                             if let Some(ref dtls) = session.dtls_conn {
                                 let _ = dtls.close().await;
@@ -2257,6 +2258,7 @@ async fn create_session(
         dtls_conn: dtls_conn.clone(),
         last_activity: AtomicU64::new(now),
         created_at: AtomicU64::new(now),
+        expired: std::sync::atomic::AtomicBool::new(false),
         bytes_sent: AtomicU64::new(0),
         bytes_received: AtomicU64::new(0),
         last_request_size: AtomicU64::new(0),
@@ -2860,6 +2862,7 @@ mod tests {
             dtls_conn: None,
             last_activity: AtomicU64::new(1_710_000_000_500),
             created_at: AtomicU64::new(1_710_000_000_000),
+            expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(128),
             bytes_received: AtomicU64::new(256),
             last_request_size: AtomicU64::new(64),
