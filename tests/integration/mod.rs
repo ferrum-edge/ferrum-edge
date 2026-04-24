@@ -8,4 +8,5 @@ mod dtls_integration_tests;
 mod grpc_proxy_tests;
 mod http2_pool_tests;
 mod http3_integration_tests;
+mod scripted_backend_smoke_tests;
 // websocket_gateway_test is a standalone binary (has fn main), not a test module

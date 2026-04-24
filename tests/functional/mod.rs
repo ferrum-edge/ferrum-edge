@@ -50,3 +50,4 @@ mod functional_udp_proxy_test;
 mod functional_websocket_test;
 mod functional_ws_plugins_test;
 mod namespace_helpers;
+mod scripted_backend_tests;

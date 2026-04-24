@@ -24,3 +24,4 @@
 
 mod common;
 mod functional;
+mod scaffolding;
