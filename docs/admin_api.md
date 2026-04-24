@@ -349,3 +349,102 @@ curl http://localhost:9000/charges?format=json
 ```
 
 **Multi-node deployments**: Each gateway node accumulates charges independently in memory. In CP/DP topologies, scrape `/charges` from every DP node and aggregate externally. See [plugins.md](plugins.md#api_chargeback) for Prometheus scrape configuration examples.
+
+## Backend Capability Registry
+
+Ferrum Edge classifies each HTTP-family backend target's protocol support (HTTP/1.1, HTTP/2 over TLS, HTTP/3, gRPC-over-TLS, h2c) at startup and on a periodic background refresh (`FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS`, default 24h). The hot path consults this registry to decide whether to route plain HTTPS traffic through the native H3 pool, the direct HTTP/2 pool, or the generic reqwest path without per-request probing. See [CLAUDE.md — Backend Capability Registry](../CLAUDE.md) and [docs/http3.md](http3.md) for the underlying design.
+
+Two JWT-authenticated endpoints let operators inspect and force-refresh the registry at runtime.
+
+### `GET /backend-capabilities`
+
+Returns every cached entry keyed by the deduplicated backend-target identity the registry uses internally (scheme + host + port + `dns_override` + CA + mTLS cert + mTLS key + verify flag).
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/backend-capabilities
+```
+
+Response:
+
+```json
+{
+  "entries": [
+    {
+      "key": "https|api.example.internal|443||/etc/ferrum/ca.pem|||1",
+      "plain_http": {
+        "h1": "supported",
+        "h2_tls": "supported",
+        "h3": "supported"
+      },
+      "grpc_transport": {
+        "h2_tls": "supported",
+        "h2c": "unknown"
+      },
+      "last_probe_at_unix_secs": 1714003200,
+      "last_probe_error": null
+    },
+    {
+      "key": "https|legacy.example.internal|443||||0",
+      "plain_http": {
+        "h1": "supported",
+        "h2_tls": "unsupported",
+        "h3": "unsupported"
+      },
+      "grpc_transport": {
+        "h2_tls": "unsupported",
+        "h2c": "unknown"
+      },
+      "last_probe_at_unix_secs": 1714003200,
+      "last_probe_error": "H2/TLS downgraded after ALPN-negotiated HTTP/1.1 on request path"
+    }
+  ]
+}
+```
+
+Field semantics:
+
+- **`key`** — stable identity used by the router to look up the entry. Safe to match across responses to detect churn.
+- **`plain_http.{h1, h2_tls, h3}`** — whether the native dispatch path for plain HTTP traffic may use HTTP/1.1 (always true for reachable HTTPS backends), the direct HTTP/2 pool (`h2_tls`), or the native HTTP/3 pool (`h3`). Values: `"supported"`, `"unsupported"`, or `"unknown"` (not yet probed). `"unknown"` and `"unsupported"` both cause the hot path to fall back through the reqwest HTTP/1.1+HTTP/2 client.
+- **`grpc_transport.{h2_tls, h2c}`** — same semantics for gRPC. `h2c` is native gRPC over plaintext HTTP/2 prior-knowledge; rarely deployed.
+- **`last_probe_at_unix_secs`** — epoch seconds of the most recent probe or live-traffic downgrade. Updates on every refresh AND on each live `mark_h2_tls_unsupported` / `mark_h3_unsupported` invocation.
+- **`last_probe_error`** — human-readable error string set when the last classification update came from a live-traffic downgrade (ALPN mismatch, QUIC failure) or from a genuine probe failure (TLS config error, connection error on an HTTPS backend). `null` when the most recent update classified the backend cleanly. Expected-unsupported outcomes (h2c on plaintext HTTP, H3 on most HTTPS backends) do NOT populate this field — only genuine errors / live downgrades do.
+
+Use cases:
+
+- **Routing-decision debugging**: "Why did this H3-capable backend just fall back to reqwest?" → check `last_probe_error`.
+- **Protocol-rollout monitoring**: poll after enabling H3 on a backend fleet to verify every target flipped to `h3: "supported"`.
+- **Stale-cache auditing**: verify `last_probe_at_unix_secs` is within your expected refresh interval.
+
+### `POST /backend-capabilities/refresh`
+
+Force an immediate, synchronous classification pass over every HTTP-family backend in the current config. Blocks until every probe completes (bounded by `FERRUM_POOL_WARMUP_CONCURRENCY` parallelism + per-probe timeout).
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9000/backend-capabilities/refresh
+```
+
+Response:
+
+```json
+{
+  "status": "refreshed"
+}
+```
+
+Use after:
+
+- Deliberately toggling a backend's H3 / H2 support without waiting for the 24h timer.
+- Rotating backend TLS material that the previous probe didn't see.
+- Manually resolving an incident where the cache is known stale (e.g., backend came back online after a QUIC failure downgraded `h3` to `unsupported`).
+
+Because this endpoint is **synchronous**, callers can assert on the post-refresh state by immediately issuing `GET /backend-capabilities` afterward. Request body is ignored; no fields are required.
+
+### No payload data exposed
+
+The registry stores only protocol classifications and probe timestamps — never request bodies, credentials, TLS keys, or anything resembling user payload. Both endpoints are safe to expose in any environment where admin JWTs are issued.
+
+### Related environment variables
+
+- `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` — periodic refresh cadence (default `86400`).
+- `FERRUM_POOL_WARMUP_ENABLED` — when `true`, the initial classification runs synchronously during startup; when `false`, the gateway issues the first refresh in the background and reports ready before it completes (DP mode always gates readiness on first-refresh completion regardless).
+- `FERRUM_POOL_WARMUP_CONCURRENCY` — parallelism cap for both startup and refresh probe passes.

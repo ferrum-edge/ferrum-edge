@@ -14,10 +14,11 @@
 //! pointing at the backend; tests assert on the capability registry's
 //! protocol classification + subsequent dispatch path.
 //!
-//! The registry introspection endpoint (`GET /backend-capabilities` and
-//! `POST /backend-capabilities/refresh`) is enabled via
-//! `FERRUM_EXPOSE_CAPABILITY_REGISTRY=true`, which is a test-only flag
-//! explicitly disabled in production deployments.
+//! The registry introspection endpoints (`GET /backend-capabilities` and
+//! `POST /backend-capabilities/refresh`) are permanently exposed under
+//! the standard admin JWT auth path — see `docs/admin_api.md` +
+//! `openapi.yaml`. These tests exercise them over the same admin port
+//! operators use in production.
 
 #![allow(clippy::bool_assert_comparison)]
 
@@ -211,7 +212,6 @@ async fn spawn_h3_harness_with_explicit_https_port(
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
         .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env("FERRUM_EXPOSE_CAPABILITY_REGISTRY", "true")
         .env(
             "FERRUM_POOL_WARMUP_ENABLED",
             if pool_warmup_enabled { "true" } else { "false" },
@@ -773,7 +773,6 @@ async fn h3_pool_key_separates_by_dns_override() {
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
         .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env("FERRUM_EXPOSE_CAPABILITY_REGISTRY", "true")
         .env("FERRUM_POOL_WARMUP_ENABLED", "true")
         .spawn()
         .await

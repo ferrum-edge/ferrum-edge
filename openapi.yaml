@@ -54,6 +54,10 @@ tags:
     description: Full configuration backup and restore for disaster recovery and migration
   - name: Namespaces
     description: Multi-tenant namespace discovery
+  - name: Monitoring
+    description: CP/DP cluster status and operational introspection
+  - name: Backend Capabilities
+    description: Inspect and force-refresh the per-backend-target protocol classification cache (H1/H2/H3/h2c/gRPC)
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
@@ -289,6 +293,123 @@ paths:
                       last_config_received_at: "2025-01-15T10:30:00Z"
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  # ── Backend Capabilities ────────────────────────────────────────────
+  /backend-capabilities:
+    get:
+      operationId: getBackendCapabilities
+      summary: List cached backend protocol classifications
+      description: |
+        Returns every entry in the backend capability registry. Each
+        entry describes what transports a particular upstream target
+        supports — HTTP/1.1, HTTP/2 over TLS, HTTP/3, gRPC over h2 TLS,
+        gRPC over h2c — keyed by deduplicated target identity (scheme,
+        host, port, `dns_override`, CA, mTLS cert, mTLS key, verify).
+
+        The registry drives the hot-path routing decision for plain
+        HTTPS traffic (native H3 pool vs. direct H2 pool vs. reqwest
+        fallback) without per-request probing. Entries are populated at
+        startup, refreshed on `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS`
+        (default 24h), and eagerly downgraded on live failures — see
+        `docs/admin_api.md#backend-capability-registry` for the full model.
+
+        The endpoint exposes **only** protocol classifications and probe
+        timestamps — no credentials, payloads, or TLS private material.
+      tags: [Backend Capabilities]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Registry snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackendCapabilitiesResponse"
+              examples:
+                h3_capable_plus_h1_only:
+                  summary: Two backends — one h3-capable, one ALPN-downgraded to h1
+                  value:
+                    entries:
+                      - key: "https|api.example.internal|443||/etc/ferrum/ca.pem|||1"
+                        plain_http:
+                          h1: supported
+                          h2_tls: supported
+                          h3: supported
+                        grpc_transport:
+                          h2_tls: supported
+                          h2c: unknown
+                        last_probe_at_unix_secs: 1714003200
+                        last_probe_error: null
+                      - key: "https|legacy.example.internal|443||||0"
+                        plain_http:
+                          h1: supported
+                          h2_tls: unsupported
+                          h3: unsupported
+                        grpc_transport:
+                          h2_tls: unsupported
+                          h2c: unknown
+                        last_probe_at_unix_secs: 1714003200
+                        last_probe_error: "H2/TLS downgraded after ALPN-negotiated HTTP/1.1 on request path"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Proxy state unavailable in this mode (e.g., CP without proxy serving)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /backend-capabilities/refresh:
+    post:
+      operationId: refreshBackendCapabilities
+      summary: Force an immediate capability classification pass
+      description: |
+        Synchronously re-probes every HTTP-family backend in the current
+        gateway config and replaces each registry entry with the new
+        classification. Blocks until every probe completes, so callers
+        can issue `GET /backend-capabilities` immediately afterward to
+        observe the post-refresh state.
+
+        Use cases:
+        - Protocol rollouts (e.g., freshly enabled HTTP/3 on a fleet).
+        - Recovery after a live downgrade (`mark_h3_unsupported` /
+          `mark_h2_tls_unsupported`) once the backend is healthy again.
+        - Rotated TLS material that the previous probe didn't see.
+
+        Probe parallelism is bounded by `FERRUM_POOL_WARMUP_CONCURRENCY`;
+        per-probe timeout follows the proxy's `backend_connect_timeout_ms`
+        (clamped to 5s). Request body is ignored.
+      tags: [Backend Capabilities]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Refresh completed; registry now reflects the latest probe results
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [refreshed]
+              example:
+                status: refreshed
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Proxy state unavailable in this mode
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
 
   # ── Batch ────────────────────────────────────────────────────────────
   /batch:
@@ -5904,3 +6025,78 @@ components:
         message:
           type: string
           description: Informational message
+
+    # ── Backend Capabilities ─────────────────────────────────────────
+    ProtocolSupport:
+      type: string
+      enum: [unknown, supported, unsupported]
+      description: |
+        Per-backend per-protocol classification state.
+
+        - `supported` — registry has confirmed the backend speaks this
+          protocol; the hot path is free to use the native dispatch pool.
+        - `unsupported` — registry has confirmed the backend does NOT
+          speak this protocol (e.g., ALPN-negotiated HTTP/1.1 when the
+          pool tried h2); the hot path skips the native pool.
+        - `unknown` — no probe has run yet, or the last probe timed out.
+          Hot-path behavior is identical to `unsupported` (fall back to
+          reqwest), but the next scheduled refresh will retry.
+
+    BackendCapabilityEntry:
+      type: object
+      required: [key, plain_http, grpc_transport, last_probe_at_unix_secs]
+      properties:
+        key:
+          type: string
+          description: |
+            Deduplicated backend-target identity key:
+            `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|verify`.
+            Stable across responses for the same target; safe to match
+            for churn detection.
+        plain_http:
+          type: object
+          description: Transport support for plain HTTP (non-gRPC, non-WebSocket) traffic.
+          required: [h1, h2_tls, h3]
+          properties:
+            h1:
+              $ref: "#/components/schemas/ProtocolSupport"
+            h2_tls:
+              $ref: "#/components/schemas/ProtocolSupport"
+            h3:
+              $ref: "#/components/schemas/ProtocolSupport"
+        grpc_transport:
+          type: object
+          description: Transport support for gRPC traffic detected via `content-type`.
+          required: [h2_tls, h2c]
+          properties:
+            h2_tls:
+              $ref: "#/components/schemas/ProtocolSupport"
+            h2c:
+              $ref: "#/components/schemas/ProtocolSupport"
+        last_probe_at_unix_secs:
+          type: integer
+          format: int64
+          description: |
+            Epoch seconds of the most recent classification update.
+            Refreshed by periodic probes AND by live-traffic downgrades
+            (`mark_h2_tls_unsupported`, `mark_h3_unsupported`).
+        last_probe_error:
+          type: string
+          nullable: true
+          description: |
+            Human-readable error from the most recent probe or live
+            downgrade. `null` when the latest update classified the
+            target cleanly. Expected-unsupported outcomes (h2c on
+            plaintext, H3 on most HTTPS backends) do NOT populate this
+            field — only real connection / TLS-config errors and
+            in-flight live downgrades.
+
+    BackendCapabilitiesResponse:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          description: Every registry entry keyed by backend-target identity.
+          items:
+            $ref: "#/components/schemas/BackendCapabilityEntry"

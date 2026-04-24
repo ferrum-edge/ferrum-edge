@@ -330,6 +330,8 @@ The next periodic refresh re-probes and restores `Supported` if the backend reco
 
 **Probe outcomes for expected-unsupported cases** (h2c on plaintext HTTP, H3 on most HTTPS backends): classified as `Unsupported` with a `debug!` log — not appended to `last_probe_error`. Only genuine connection/TLS-config failures on HTTPS backends populate the error string so operators don't chase phantom errors every refresh cycle.
 
+**Admin introspection** (JWT-authenticated, always exposed): `GET /backend-capabilities` returns the full registry snapshot (`BackendCapabilityRegistry::snapshot()`); `POST /backend-capabilities/refresh` forces a synchronous classification pass. Operators use these for routing-decision debugging, protocol-rollout monitoring, and post-incident recovery (force-refresh after a live downgrade). Payloads carry only classifications + probe timestamps — no credentials or request bodies — so they're safe to leave permanently enabled. See [docs/admin_api.md](docs/admin_api.md#backend-capability-registry) + `openapi.yaml` for the full schema; Phase-3 scripted-backend tests assert on these endpoints.
+
 ### Health Check Architecture (two-layer)
 
 - **Active probes** (periodic): shared per-upstream in `HealthChecker.active_unhealthy_targets: DashMap<"upstream_id::host:port", u64>`. Failure marks unhealthy for ALL proxies using that upstream (target is genuinely down).
