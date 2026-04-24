@@ -67,46 +67,50 @@ impl GrpcResponse {
         raw.parse().ok()
     }
 
-    /// Returns the effective gRPC status for the response, applying the
-    /// HTTP-to-gRPC status-mapping that compliant gRPC stacks (tonic,
-    /// grpc-go) perform at the client. This mirrors grpc-go's
-    /// `HTTPStatusConvert` plus the wire-protocol rule for HTTP-200
-    /// responses without trailers:
+    /// Returns the effective gRPC status for the response, following the
+    /// canonical HTTP-to-gRPC mapping from
+    /// <https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md>:
     ///
     /// * If `grpc-status` is present (in trailers OR in Trailers-Only
     ///   initial headers) → return that value verbatim.
-    /// * Else if the HTTP status is a non-200 code, apply the gRPC
-    ///   HTTP-status mapping (400 → INTERNAL(13), 401 → UNAUTHENTICATED
-    ///   (16), 403 → PERMISSION_DENIED(7), 404 → UNIMPLEMENTED(12),
-    ///   429/502/503/504 → UNAVAILABLE(14), anything else → UNKNOWN(2)).
-    /// * Else if the HTTP status is 200 (the wire was well-formed HTTP
-    ///   but the backend closed without sending trailers), return
-    ///   INTERNAL(13) — "server closed the stream without sending
-    ///   trailers".
-    /// * Else if `http_status == 0` (the test client synthesized a
-    ///   response because the headers future failed / timed out), return
-    ///   UNAVAILABLE(14) — transport-level failure, no HTTP response.
+    /// * Else apply the HTTP-to-gRPC code table (400 → INTERNAL(13),
+    ///   401 → UNAUTHENTICATED(16), 403 → PERMISSION_DENIED(7),
+    ///   404 → UNIMPLEMENTED(12), 429/502/503/504 → UNAVAILABLE(14)).
+    /// * Every other HTTP status — including the anomalous
+    ///   `HTTP 200 + no grpc-status` case — maps to UNKNOWN(2), per the
+    ///   "Every other code" default row in the mapping doc.
+    /// * `http_status == 0` (the test client synthesized a response
+    ///   because the headers future errored / timed out) → UNAVAILABLE(14):
+    ///   transport-level failure, no HTTP response received.
+    ///
+    /// The `HTTP 200 + missing grpc-status` case deserves a note: the
+    /// wire protocol says a server MUST send `grpc-status`, and
+    /// real-world Rust / Go implementations diverge on what to
+    /// synthesize when it's absent — tonic and some grpc-go paths use
+    /// INTERNAL(13), others use UNKNOWN(2). We follow the mapping doc's
+    /// "every other code ⇒ UNKNOWN" default because it's the
+    /// spec-canonical rule and keeps the helper honest about the
+    /// ambiguity (missing trailer is "we don't know what happened at
+    /// the server", not specifically "server had an internal error").
     ///
     /// Use this in tests that care about the *semantic* outcome of an
     /// RPC rather than the literal bytes on the wire. [`Self::grpc_status`]
     /// returns `None` for any case where the backend (or gateway) did not
     /// emit an explicit `grpc-status`; `effective_grpc_status` fills in
-    /// the code a real client would observe, *including* HTTP fallback
-    /// cases like 503 that the previous blanket "missing ⇒ 13" rule
-    /// would have masked.
+    /// the code a spec-compliant client would observe.
     pub fn effective_grpc_status(&self) -> u32 {
         if let Some(s) = self.grpc_status() {
             return s;
         }
         match self.http_status {
             0 => 14,                     // UNAVAILABLE — transport/connection failure, no HTTP response.
-            200 => 13, // INTERNAL — "server closed the stream without sending trailers".
-            400 => 13, // INTERNAL
-            401 => 16, // UNAUTHENTICATED
-            403 => 7,  // PERMISSION_DENIED
-            404 => 12, // UNIMPLEMENTED
+            400 => 13,                   // INTERNAL
+            401 => 16,                   // UNAUTHENTICATED
+            403 => 7,                    // PERMISSION_DENIED
+            404 => 12,                   // UNIMPLEMENTED
             429 | 502 | 503 | 504 => 14, // UNAVAILABLE
-            _ => 2,    // UNKNOWN
+            // Every other code (including 200 + missing grpc-status) ⇒ UNKNOWN.
+            _ => 2,
         }
     }
 
@@ -540,11 +544,14 @@ mod tests {
     }
 
     #[test]
-    fn effective_grpc_status_fills_internal_for_http_200_missing_trailers() {
+    fn effective_grpc_status_fills_unknown_for_http_200_missing_trailers() {
+        // Per the HTTP-to-gRPC mapping doc's "every other code ⇒ UNKNOWN"
+        // default. Rust/Go clients diverge here (tonic/some-grpc-go use
+        // INTERNAL), so we follow the spec-canonical rule.
         assert_eq!(
             response(200, None, None).effective_grpc_status(),
-            13,
-            "http 200 + no grpc-status ⇒ INTERNAL (server closed stream without trailers)"
+            2,
+            "http 200 + no grpc-status ⇒ UNKNOWN per mapping doc"
         );
     }
 

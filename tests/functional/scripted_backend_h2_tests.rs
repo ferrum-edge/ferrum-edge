@@ -212,10 +212,27 @@ async fn h2_goaway_mid_request_handled_gracefully() {
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .expect("gateway port");
     let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let rpc_started = Instant::now();
     let response = client
         .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
         .await
         .expect("response surfaced");
+    let rpc_elapsed = rpc_started.elapsed();
+
+    // "Must not hang" is the core property of this test. `GrpcClient::unary`
+    // synthesizes `stream_error: "response timed out"` after its internal
+    // 20s budget, so the structural `has_error` predicate below would
+    // trivially pass on a gateway hang — the client's timeout masks the
+    // regression. Bound the elapsed time FIRST so a hang fails the test
+    // before `has_error` gets a chance to swallow it. A correctly-behaving
+    // gateway classifies the GOAWAY and responds in milliseconds; three
+    // seconds is a generous CI-tolerant ceiling.
+    assert!(
+        rpc_elapsed < Duration::from_secs(3),
+        "gateway appears to have hung on pre-headers GOAWAY — RPC took \
+         {rpc_elapsed:?} (client timeout is 20s). The point of this test \
+         is to verify the gateway does NOT deadlock."
+    );
 
     // The gateway responds with a well-formed gRPC error (not a hang).
     // HTTP status may be 200 with trailers, or non-200 if the gateway
@@ -311,10 +328,23 @@ async fn h2_stream_reset_classified_as_protocol_error() {
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .expect("gateway port");
     let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let rpc_started = Instant::now();
     let response = client
         .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
         .await
         .expect("response surfaced");
+    let rpc_elapsed = rpc_started.elapsed();
+
+    // See the GOAWAY test for the rationale: `stream_error: "response
+    // timed out"` from the client's 20s internal budget would otherwise
+    // paper over a gateway hang via the `reset_observed` predicate's
+    // `stream_error.is_some()` arm. Bound elapsed first.
+    assert!(
+        rpc_elapsed < Duration::from_secs(3),
+        "gateway appears to have hung on RST_STREAM — RPC took \
+         {rpc_elapsed:?} (client timeout is 20s). RST_STREAM after headers \
+         should be surfaced promptly, not hung."
+    );
 
     // RST_STREAM after headers means the gateway must emit a gRPC error
     // (non-OK status) or a stream-level error. Either proves the reset
@@ -363,18 +393,21 @@ async fn h2_stream_reset_classified_as_protocol_error() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Test 3 — gRPC backend omits trailers → client sees a well-formed gRPC
-// INTERNAL-style error, not a hang.
+// Test 3 — gRPC backend omits trailers → client sees a well-formed
+//          non-OK status, not a hang.
 // ────────────────────────────────────────────────────────────────────────────
 //
 // Backend responds with headers + a DATA frame (end_stream=true) but no
-// `grpc-status` trailer. A compliant gRPC stack treats the missing status
-// as INTERNAL (13). The gateway must pass this through deterministically —
-// either as a synthesized INTERNAL trailer or surfaced via grpc-status
-// in the response headers.
+// `grpc-status` trailer. The `effective_grpc_status()` helper maps this
+// to UNKNOWN (2) per the canonical HTTP-to-gRPC mapping doc ("every
+// other code ⇒ UNKNOWN"). The gateway must pass this through
+// deterministically — either by synthesizing a non-OK trailer itself
+// or by forwarding the backend's missing-trailer response so the
+// client's spec-following synthesis kicks in. The critical regression
+// guard is that the effective status is NOT OK (0).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn grpc_trailers_missing_produces_internal_status() {
+async fn grpc_trailers_missing_produces_non_ok_status() {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
@@ -408,25 +441,43 @@ async fn grpc_trailers_missing_produces_internal_status() {
         response
     );
 
-    // The core INTERNAL guarantee. Two wire shapes are legal here, and
-    // `effective_grpc_status()` collapses them to the same semantic value
-    // that a real gRPC client (tonic, grpc-go) would observe:
+    // The core guarantee: the gateway must NOT surface `grpc-status: 0`
+    // (OK) when the backend closed without sending trailers. Two wire
+    // shapes collapse to the same semantic outcome via
+    // `effective_grpc_status()`:
     //
-    //   * gateway synthesizes `grpc-status: 13` in the trailers (or in
-    //     Trailers-Only headers) — current implementation does NOT do
-    //     this, but a future hardening could;
     //   * gateway forwards the backend's missing-trailer response as-is,
-    //     and the *client-side* rule "missing status ⇒ INTERNAL (13)"
-    //     kicks in — this is today's behavior.
+    //     and the client-side `effective_grpc_status` rule returns
+    //     UNKNOWN (2) per the HTTP-to-gRPC mapping doc — this is today's
+    //     gateway behavior;
+    //   * a future gateway hardening could synthesize a specific
+    //     `grpc-status` trailer (UNKNOWN / INTERNAL / UNAVAILABLE), and
+    //     the helper would return that verbatim.
     //
-    // Either way, the effective status is 13. A gateway regression that
-    // spuriously synthesized `grpc-status: 0` (OK) on missing trailers
-    // would fail this assertion, which is the behavior this test is
-    // meant to guard.
+    // Both satisfy the regression guard below — the helper returns a
+    // non-zero status in all spec-compliant cases, and a gateway
+    // regression that surfaced `grpc-status: 0` would be caught because
+    // `grpc_status()` would return `Some(0)` and the helper would pass
+    // it through unchanged.
+    let effective = response.effective_grpc_status();
+    assert_ne!(
+        effective,
+        0,
+        "gateway incorrectly surfaced grpc-status=OK despite missing backend trailers; \
+         http={} grpc-status={:?} headers={:?} trailers={:?}",
+        response.http_status,
+        response.grpc_status(),
+        response.headers,
+        response.trailers,
+    );
+    // Pin the current expected value (UNKNOWN per the mapping doc) so a
+    // drift in gateway behavior surfaces explicitly instead of silently
+    // flipping between non-zero codes.
     assert_eq!(
-        response.effective_grpc_status(),
-        13,
-        "gateway did not surface INTERNAL for missing backend trailers; \
+        effective,
+        2,
+        "gateway did not surface UNKNOWN(2) for HTTP 200 + missing trailers \
+         (per the HTTP-to-gRPC mapping doc); \
          http={} grpc-status={:?} headers={:?} trailers={:?}",
         response.http_status,
         response.grpc_status(),
