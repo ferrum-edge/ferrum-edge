@@ -393,6 +393,13 @@ async fn run_tls_script(
                     .extend_from_slice(&buf[..read]);
             }
             TcpStep::ReadUntil(needle) => {
+                // An empty needle would cause `windows(0)` to panic. Fail
+                // loudly with a deterministic script error instead.
+                if needle.is_empty() {
+                    return Err(StepError::InvalidScript(
+                        "ReadUntil needle must be non-empty".into(),
+                    ));
+                }
                 let mut acc = std::mem::take(&mut leftover);
                 let find = |bytes: &[u8]| -> Option<usize> {
                     bytes

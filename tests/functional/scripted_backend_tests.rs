@@ -47,49 +47,64 @@ fn require_logs(harness: &GatewayHarness) -> String {
 // (distinct from `ScriptedTcpBackend::RefuseNextConnect`, which accepts and
 // drops — that path emits FIN/RST, not a connect-time refusal, and so does
 // not exercise the gateway's `ConnectionRefused` classifier).
+//
+// CLAUDE.md warns about the bind-drop-rebind race: under parallel test load
+// another process can bind the port in the gap between our drop and the
+// gateway's connect, which turns the gateway's 502 into some other status
+// and makes the test flaky. Retry the full setup (fresh port + fresh
+// harness) when the expected 502 + refused-class signal doesn't land.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn backend_refuses_connect_maps_to_502_with_connection_refused() {
-    // Real ECONNREFUSED: no listener on this port.
-    let backend_port = unbound_port().await.expect("unbound port");
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_failure: Option<String> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Real ECONNREFUSED: no listener on this port.
+        let backend_port = unbound_port().await.expect("unbound port");
+        let yaml = file_mode_yaml_for_backend(backend_port);
+        let harness = GatewayHarness::builder()
+            .file_config(yaml)
+            .log_level("info")
+            .capture_output()
+            .spawn()
+            .await
+            .expect("spawn gateway");
 
-    let yaml = file_mode_yaml_for_backend(backend_port);
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .spawn()
-        .await
-        .expect("spawn gateway");
+        let client = harness.http_client().expect("client");
+        let resp = client
+            .get(&harness.proxy_url("/api/anything"))
+            .await
+            .expect("gateway returns a response");
+        if resp.status != StatusCode::BAD_GATEWAY {
+            last_failure = Some(format!(
+                "attempt {attempt}/{MAX_ATTEMPTS}: expected 502, got {} (port may have been rebound)",
+                resp.status
+            ));
+            continue;
+        }
 
-    let client = harness.http_client().expect("client");
-    let resp = client
-        .get(&harness.proxy_url("/api/anything"))
-        .await
-        .expect("gateway returns a response");
-    assert_eq!(
-        resp.status,
-        StatusCode::BAD_GATEWAY,
-        "expected 502, got {} body={:?}",
-        resp.status,
-        resp.body_text()
-    );
-
-    let logs = require_logs(&harness);
-    // `connect_failure` is the gateway's `error_kind` for reqwest errors
-    // where `is_connect() == true` — exactly the ECONNREFUSED case we're
-    // exercising. It's distinct from `request_error` (RST after accept),
-    // `read_timeout`, and body-error classes, so asserting on it proves
-    // the gateway took the connect-failure path rather than some other
-    // fallback. `ConnectionRefused`/"refused" are belt-and-suspenders for
-    // future gateway log surface changes that might expose the `io::Error`
-    // kind directly.
-    let has_refused_class = logs.contains("connect_failure")
-        || logs.contains("ConnectionRefused")
-        || logs.contains("Connection refused");
-    assert!(
-        has_refused_class,
-        "expected connect-failure/refused signal in gateway logs; got:\n{logs}"
+        let logs = require_logs(&harness);
+        // `connect_failure` is the gateway's `error_kind` for reqwest
+        // errors where `is_connect() == true` — exactly the ECONNREFUSED
+        // case. Distinct from `request_error` (RST after accept),
+        // `read_timeout`, and body-error classes, so asserting on it
+        // proves the gateway took the connect-failure path rather than
+        // some other fallback. `ConnectionRefused`/"Connection refused"
+        // are belt-and-suspenders for future log-surface changes.
+        let has_refused_class = logs.contains("connect_failure")
+            || logs.contains("ConnectionRefused")
+            || logs.contains("Connection refused");
+        if !has_refused_class {
+            last_failure = Some(format!(
+                "attempt {attempt}/{MAX_ATTEMPTS}: expected refused-class signal in logs:\n{logs}"
+            ));
+            continue;
+        }
+        return; // pass
+    }
+    panic!(
+        "backend_refuses_connect test failed across {MAX_ATTEMPTS} attempts; last failure: {}",
+        last_failure.unwrap_or_else(|| "unknown".into())
     );
 }
 

@@ -96,7 +96,15 @@ pub enum ExecutionMode {
 #[derive(Debug)]
 pub enum StepError {
     Io(io::Error),
-    ShortRead { expected: usize, actual: usize },
+    ShortRead {
+        expected: usize,
+        actual: usize,
+    },
+    /// The script contained an input that can't be executed deterministically
+    /// (e.g., `ReadUntil` with an empty needle — `windows(0)` would panic).
+    /// Surfaced via `step_errors` so malformed scripts fail predictably
+    /// instead of hanging or panicking the per-connection task.
+    InvalidScript(String),
 }
 
 impl std::fmt::Display for StepError {
@@ -106,6 +114,7 @@ impl std::fmt::Display for StepError {
             StepError::ShortRead { expected, actual } => {
                 write!(f, "short read: expected {expected}, got {actual}")
             }
+            StepError::InvalidScript(msg) => write!(f, "invalid script: {msg}"),
         }
     }
 }
@@ -401,6 +410,15 @@ async fn run_script(
                     .extend_from_slice(&buf[..read]);
             }
             TcpStep::ReadUntil(needle) => {
+                // An empty needle has no deterministic semantics (would
+                // either match at every offset or never) and also makes
+                // `find_subsequence`/`windows(0)` misbehave. Fail loudly
+                // so malformed scripts don't cause opaque hangs.
+                if needle.is_empty() {
+                    return Err(StepError::InvalidScript(
+                        "ReadUntil needle must be non-empty".into(),
+                    ));
+                }
                 let mut acc = std::mem::take(&mut leftover);
                 let mut boundary = find_subsequence(&acc, &needle).map(|p| p + needle.len());
                 let mut buf = [0u8; 4096];
@@ -517,6 +535,34 @@ mod tests {
         assert_eq!(resp, b"OK\n");
         let received = backend.received_bytes().await;
         assert!(received.ends_with(b"\r\n\r\n"));
+    }
+
+    /// Regression test: an empty `ReadUntil` needle used to cause
+    /// `windows(0)` inside the interpreter to misbehave (TLS path
+    /// panicked; TCP path hung in an unbreakable loop since
+    /// `find_subsequence` always returned `None`). The interpreter now
+    /// rejects the step up front with a deterministic
+    /// `StepError::InvalidScript` surfaced through `step_errors`.
+    #[tokio::test]
+    async fn empty_read_until_needle_is_rejected_deterministically() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedTcpBackend::builder(reservation.into_listener())
+            .step(TcpStep::ReadUntil(Vec::new()))
+            .spawn()
+            .expect("spawn");
+
+        // Trigger an accepted connection so the interpreter runs the step.
+        let _client = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let errs = backend.step_errors().await;
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("ReadUntil") && e.contains("non-empty")),
+            "expected InvalidScript(empty-needle) in step_errors; got {errs:?}"
+        );
     }
 
     #[tokio::test]
