@@ -306,7 +306,13 @@ impl ScriptedTlsBackend {
         self.state.received_bytes.lock().await.clone()
     }
 
+    /// Whether `received_bytes()` contains `needle`. An empty needle
+    /// returns `true` (matches the TCP variant); avoids the `windows(0)`
+    /// panic path.
     pub async fn received_contains(&self, needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
         let buf = self.received_bytes().await;
         buf.windows(needle.len()).any(|w| w == needle)
     }
@@ -555,5 +561,22 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let alpn = backend.last_alpn().await;
         assert_eq!(alpn.as_deref(), Some(&b"http/1.1"[..]));
+    }
+
+    /// Regression test: mirror of the TCP variant. `received_contains(b"")`
+    /// must not panic via `windows(0)`.
+    #[tokio::test]
+    async fn received_contains_empty_needle_returns_true_without_panicking() {
+        let ca = TestCa::new("tls-empty-needle").expect("ca");
+        let (cert_pem, key_pem) = ca.valid().expect("leaf");
+        let reservation = reserve_port().await.expect("port");
+        let backend = ScriptedTlsBackend::builder(
+            reservation.into_listener(),
+            TlsConfig::new(cert_pem, key_pem),
+        )
+        .step(TcpStep::Drop)
+        .spawn()
+        .expect("spawn tls");
+        assert!(backend.received_contains(b"").await);
     }
 }

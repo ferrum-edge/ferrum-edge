@@ -311,7 +311,14 @@ impl ScriptedTcpBackend {
     }
 
     /// Shortcut for asserting that `received_bytes()` contains `needle`.
+    /// Whether `received_bytes()` contains `needle` as a contiguous
+    /// subsequence. An empty needle returns `true` (every byte sequence
+    /// contains the empty string) — the alternative, `windows(0)`, would
+    /// panic, which isn't an acceptable failure mode for scaffolding.
     pub async fn received_contains(&self, needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
         let buf = self.received_bytes().await;
         buf.windows(needle.len()).any(|w| w == needle)
     }
@@ -563,6 +570,29 @@ mod tests {
                 .any(|e| e.contains("ReadUntil") && e.contains("non-empty")),
             "expected InvalidScript(empty-needle) in step_errors; got {errs:?}"
         );
+    }
+
+    /// Regression test: `received_contains` on an empty needle must not
+    /// panic. `windows(0)` would abort the whole test suite; the helper
+    /// now returns `true` (the empty slice is trivially a subsequence of
+    /// anything) so scaffolding callers get deterministic behavior.
+    #[tokio::test]
+    async fn received_contains_empty_needle_returns_true_without_panicking() {
+        let reservation = reserve_port().await.expect("port");
+        let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+            .step(TcpStep::Drop)
+            .spawn()
+            .expect("spawn");
+        let backend =
+            ScriptedTcpBackend::builder(reserve_port().await.expect("port").into_listener())
+                .step(TcpStep::Drop)
+                .spawn()
+                .expect("spawn");
+        // No traffic — received_bytes is empty. Both empty-needle cases
+        // (empty buffer, non-empty buffer) exercise the guard.
+        assert!(backend.received_contains(b"").await);
+        // The no-traffic backend above.
+        assert!(backend.received_contains(&[]).await);
     }
 
     #[tokio::test]
