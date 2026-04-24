@@ -63,7 +63,15 @@ fn spawn_gateway(
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         // UDP session create / expire fire at `debug!`. Tests that grep
         // the logs for those signals must run the gateway at debug.
+        //
+        // `main.rs` builds its `EnvFilter` via `try_from_default_env()`,
+        // which prefers `RUST_LOG` over `FERRUM_LOG_LEVEL`. An inherited
+        // `RUST_LOG=warn` (or similar) in the test runner's environment
+        // would suppress the debug lines we grep for, so set both — the
+        // `RUST_LOG` value wins and guarantees the debug target is on
+        // regardless of the parent env.
         .env("FERRUM_LOG_LEVEL", "debug")
+        .env("RUST_LOG", "ferrum_edge=debug")
         // Phase-4 tests care about session cleanup; tick fast so tests
         // don't need to wait the 10s production default.
         .env("FERRUM_UDP_CLEANUP_INTERVAL_SECONDS", "1")
