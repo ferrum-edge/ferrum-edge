@@ -54,11 +54,12 @@ pub mod ports;
 
 // Curated re-exports so a test's imports fit on one line.
 pub use backends::{
-    ExecutionMode, Http1Request, HttpStep, RequestMatcher, ScriptedHttp1Backend,
-    ScriptedTcpBackend, ScriptedTlsBackend, TcpStep, TlsConfig,
+    ConnectionSettings, ExecutionMode, GrpcStep, H2Step, Http1Request, HttpStep, MatchHeaders,
+    MatchRpc, ReceivedStream, RequestMatcher, ScriptedGrpcBackend, ScriptedH2Backend,
+    ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend, TcpStep, TlsConfig,
 };
 pub use certs::TestCa;
-pub use clients::{ClientResponse, Http1Client};
+pub use clients::{ClientResponse, GrpcClient, GrpcResponse, Http1Client, Http2Client};
 pub use harness::{GatewayHarness, GatewayHarnessBuilder, HarnessMode};
 pub use ports::{PortReservation, reserve_port, reserve_port_pair, unbound_port};
 
