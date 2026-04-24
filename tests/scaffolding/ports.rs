@@ -31,7 +31,7 @@
 
 use std::io;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 
 /// Maximum number of bind attempts before giving up.
 ///
@@ -112,6 +112,71 @@ pub async fn reserve_port_pair() -> io::Result<(PortReservation, PortReservation
     let first = reserve_port().await?;
     let second = reserve_port().await?;
     Ok((first, second))
+}
+
+/// A UDP port held by a live `UdpSocket` on `127.0.0.1`. Mirror of
+/// [`PortReservation`] for the datagram-oriented backends in Phase 4.
+///
+/// TCP's bind-drop-rebind race also exists for UDP — holding the socket
+/// until the backend is ready avoids it. Drop the socket to release the
+/// port.
+pub struct UdpPortReservation {
+    /// The reserved local port.
+    pub port: u16,
+    socket: UdpSocket,
+}
+
+impl UdpPortReservation {
+    /// Consume this reservation and return the held socket. The caller
+    /// owns it from here on; dropping frees the port.
+    pub fn into_socket(self) -> UdpSocket {
+        self.socket
+    }
+
+    /// Release the socket (freeing the port) and return just the port
+    /// number. Use only when handing the port to a subprocess that will
+    /// itself bind — another process may steal the port in the interim.
+    pub fn drop_and_take_port(self) -> u16 {
+        let port = self.port;
+        drop(self.socket);
+        port
+    }
+
+    /// Return the `SocketAddr` without releasing the socket.
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.socket.local_addr()
+    }
+}
+
+/// Bind `127.0.0.1:0` on UDP and return the live socket. Retry semantics
+/// mirror [`reserve_port`].
+pub async fn reserve_udp_port() -> io::Result<UdpPortReservation> {
+    let mut last_err: Option<io::Error> = None;
+    for attempt in 0..MAX_RESERVE_ATTEMPTS {
+        match UdpSocket::bind("127.0.0.1:0").await {
+            Ok(socket) => {
+                let port = socket.local_addr()?.port();
+                return Ok(UdpPortReservation { port, socket });
+            }
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(10 * (attempt + 1) as u64)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "exhausted UDP port reservation retries",
+        )
+    }))
+}
+
+/// Reserve and immediately release a UDP port. Useful for handing the
+/// port to a subprocess (like the gateway) that will itself bind. Has
+/// the same bind-drop-rebind race caveat as [`unbound_port`] for TCP.
+pub async fn unbound_udp_port() -> io::Result<u16> {
+    Ok(reserve_udp_port().await?.drop_and_take_port())
 }
 
 /// Reserve and immediately release a port. Connects to the returned port

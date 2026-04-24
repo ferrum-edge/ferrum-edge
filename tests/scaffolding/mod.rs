@@ -50,17 +50,23 @@ pub mod backends;
 pub mod certs;
 pub mod clients;
 pub mod harness;
+pub mod network;
 pub mod ports;
 
 // Curated re-exports so a test's imports fit on one line.
 pub use backends::{
-    ExecutionMode, Http1Request, HttpStep, RequestMatcher, ScriptedHttp1Backend,
-    ScriptedTcpBackend, ScriptedTlsBackend, TcpStep, TlsConfig,
+    DatagramMatcher, DtlsConfig, ExecutionMode, Http1Request, HttpStep, RecordedDatagram,
+    RequestMatcher, ScriptedDtlsBackend, ScriptedHttp1Backend, ScriptedTcpBackend,
+    ScriptedTlsBackend, ScriptedUdpBackend, TcpStep, TlsConfig, UdpStep,
 };
 pub use certs::TestCa;
-pub use clients::{ClientResponse, Http1Client};
+pub use clients::{ClientResponse, DtlsClient, Http1Client, UdpClient};
 pub use harness::{GatewayHarness, GatewayHarnessBuilder, HarnessMode};
-pub use ports::{PortReservation, reserve_port, reserve_port_pair, unbound_port};
+pub use network::{BandwidthLimitedStream, DelayedStream, TruncatedStream};
+pub use ports::{
+    PortReservation, UdpPortReservation, reserve_port, reserve_port_pair, reserve_udp_port,
+    unbound_port, unbound_udp_port,
+};
 
 // Small helpers that several acceptance tests reuse.
 
