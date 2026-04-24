@@ -68,17 +68,46 @@ impl GrpcResponse {
     }
 
     /// Returns the effective gRPC status for the response, applying the
-    /// gRPC wire-protocol rule that a missing `grpc-status` (in neither
-    /// trailers nor Trailers-Only headers) is treated as `INTERNAL` (13)
-    /// by compliant gRPC stacks (tonic, grpc-go).
+    /// HTTP-to-gRPC status-mapping that compliant gRPC stacks (tonic,
+    /// grpc-go) perform at the client. This mirrors grpc-go's
+    /// `HTTPStatusConvert` plus the wire-protocol rule for HTTP-200
+    /// responses without trailers:
     ///
-    /// Use this in tests that care about the *semantic* outcome of an RPC
-    /// rather than the literal bytes on the wire. [`Self::grpc_status`]
-    /// returns `None` when the status header/trailer is absent;
-    /// `effective_grpc_status` fills in the synthetic `INTERNAL` that a
-    /// real client would observe.
+    /// * If `grpc-status` is present (in trailers OR in Trailers-Only
+    ///   initial headers) → return that value verbatim.
+    /// * Else if the HTTP status is a non-200 code, apply the gRPC
+    ///   HTTP-status mapping (400 → INTERNAL(13), 401 → UNAUTHENTICATED
+    ///   (16), 403 → PERMISSION_DENIED(7), 404 → UNIMPLEMENTED(12),
+    ///   429/502/503/504 → UNAVAILABLE(14), anything else → UNKNOWN(2)).
+    /// * Else if the HTTP status is 200 (the wire was well-formed HTTP
+    ///   but the backend closed without sending trailers), return
+    ///   INTERNAL(13) — "server closed the stream without sending
+    ///   trailers".
+    /// * Else if `http_status == 0` (the test client synthesized a
+    ///   response because the headers future failed / timed out), return
+    ///   UNAVAILABLE(14) — transport-level failure, no HTTP response.
+    ///
+    /// Use this in tests that care about the *semantic* outcome of an
+    /// RPC rather than the literal bytes on the wire. [`Self::grpc_status`]
+    /// returns `None` for any case where the backend (or gateway) did not
+    /// emit an explicit `grpc-status`; `effective_grpc_status` fills in
+    /// the code a real client would observe, *including* HTTP fallback
+    /// cases like 503 that the previous blanket "missing ⇒ 13" rule
+    /// would have masked.
     pub fn effective_grpc_status(&self) -> u32 {
-        self.grpc_status().unwrap_or(13 /* INTERNAL */)
+        if let Some(s) = self.grpc_status() {
+            return s;
+        }
+        match self.http_status {
+            0 => 14,                     // UNAVAILABLE — transport/connection failure, no HTTP response.
+            200 => 13, // INTERNAL — "server closed the stream without sending trailers".
+            400 => 13, // INTERNAL
+            401 => 16, // UNAUTHENTICATED
+            403 => 7,  // PERMISSION_DENIED
+            404 => 12, // UNIMPLEMENTED
+            429 | 502 | 503 | 504 => 14, // UNAVAILABLE
+            _ => 2,    // UNKNOWN
+        }
     }
 
     /// Shorthand: parse `grpc-message` from trailers, falling back to
@@ -117,8 +146,10 @@ impl GrpcClient {
     }
 
     /// h2-over-TLS client. `root_pem` is an optional CA PEM the client
-    /// will trust; if `None`, the system roots plus webpki defaults are
-    /// used.
+    /// will trust; if `None`, the Mozilla/webpki root bundle (same set
+    /// hyper/reqwest use by default) is loaded so the client can verify
+    /// any publicly-trusted certificate out of the box. For private CAs
+    /// (e.g. the `TestCa` fixture), pass the CA's PEM in `root_pem`.
     pub fn tls(target: impl Into<String>, root_pem: Option<String>) -> Self {
         Self {
             target: target.into(),
@@ -244,33 +275,55 @@ impl GrpcClient {
         let headers = response.headers().clone();
         let (_parts, mut body_stream) = response.into_parts();
 
-        let mut raw_frames = Vec::new();
-        let mut stream_error = None;
-        loop {
-            match body_stream.data().await {
-                Some(Ok(chunk)) => {
-                    let _ = body_stream.flow_control().release_capacity(chunk.len());
-                    raw_frames.push(chunk);
-                }
-                Some(Err(e)) => {
-                    stream_error = Some(format!("body error: {e}"));
-                    break;
-                }
-                None => break,
-            }
-        }
-
-        let trailers = if stream_error.is_none() {
-            match body_stream.trailers().await {
-                Ok(t) => t,
-                Err(e) => {
-                    stream_error = Some(format!("trailers error: {e}"));
-                    None
+        // Bound body + trailer collection separately from `response_fut` so
+        // a backend that sends headers and then stalls (e.g. a scripted
+        // fixture that hangs mid-stream) cannot hang the test indefinitely.
+        // The 20s envelope matches the `response_fut` timeout above.
+        let body_trailers_fut = async {
+            let mut raw_frames = Vec::new();
+            let mut stream_error: Option<String> = None;
+            loop {
+                match body_stream.data().await {
+                    Some(Ok(chunk)) => {
+                        let _ = body_stream.flow_control().release_capacity(chunk.len());
+                        raw_frames.push(chunk);
+                    }
+                    Some(Err(e)) => {
+                        stream_error = Some(format!("body error: {e}"));
+                        break;
+                    }
+                    None => break,
                 }
             }
-        } else {
-            None
+            let trailers = if stream_error.is_none() {
+                match body_stream.trailers().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        stream_error = Some(format!("trailers error: {e}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            (raw_frames, trailers, stream_error)
         };
+
+        let (raw_frames, trailers, stream_error) =
+            match tokio::time::timeout(Duration::from_secs(20), body_trailers_fut).await {
+                Ok(collected) => collected,
+                Err(_) => {
+                    conn_task.abort();
+                    return Ok(GrpcResponse {
+                        http_status,
+                        headers,
+                        messages: Vec::new(),
+                        raw_body_frames: Vec::new(),
+                        trailers: None,
+                        stream_error: Some("body/trailers read timed out".into()),
+                    });
+                }
+            };
 
         let messages = decode_grpc_messages(&raw_frames);
         // Don't care if conn_task errors; the important state is above.
@@ -343,6 +396,15 @@ async fn tls_connect(
             for cert in certs(&mut reader).filter_map(|c| c.ok()) {
                 root.add(cert)?;
             }
+        } else {
+            // Match the documented `GrpcClient::tls(_, None)` contract:
+            // fall back to the Mozilla/webpki root bundle so a verified
+            // handshake against a publicly-trusted certificate succeeds
+            // without the caller passing a PEM. Without this, the
+            // `RootCertStore` stayed empty and every verified handshake
+            // failed with UnknownIssuer — the cause the PR-486 review
+            // flagged.
+            root.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
         builder.with_root_certificates(root).with_no_client_auth()
     };
@@ -433,5 +495,124 @@ mod tests {
         let msgs = decode_grpc_messages(&[a, b]);
         assert_eq!(msgs.len(), 1);
         assert_eq!(&msgs[0][..], b"abc");
+    }
+
+    fn response(
+        http_status: u16,
+        grpc_status_header: Option<&str>,
+        grpc_status_trailer: Option<&str>,
+    ) -> GrpcResponse {
+        let mut headers = HeaderMap::new();
+        if let Some(v) = grpc_status_header {
+            headers.insert("grpc-status", v.parse().unwrap());
+        }
+        let trailers = grpc_status_trailer.map(|v| {
+            let mut t = HeaderMap::new();
+            t.insert("grpc-status", v.parse().unwrap());
+            t
+        });
+        GrpcResponse {
+            http_status,
+            headers,
+            messages: Vec::new(),
+            raw_body_frames: Vec::new(),
+            trailers,
+            stream_error: None,
+        }
+    }
+
+    #[test]
+    fn effective_grpc_status_returns_trailer_value_verbatim_when_present() {
+        assert_eq!(
+            response(200, None, Some("7")).effective_grpc_status(),
+            7,
+            "explicit grpc-status trailer must win over fallback"
+        );
+    }
+
+    #[test]
+    fn effective_grpc_status_reads_trailers_only_header_before_fallback() {
+        assert_eq!(
+            response(200, Some("4"), None).effective_grpc_status(),
+            4,
+            "Trailers-Only grpc-status in initial headers must win"
+        );
+    }
+
+    #[test]
+    fn effective_grpc_status_fills_internal_for_http_200_missing_trailers() {
+        assert_eq!(
+            response(200, None, None).effective_grpc_status(),
+            13,
+            "http 200 + no grpc-status ⇒ INTERNAL (server closed stream without trailers)"
+        );
+    }
+
+    #[test]
+    fn effective_grpc_status_maps_http_fallback_status_codes() {
+        // 400 → INTERNAL, 401 → UNAUTHENTICATED, 403 → PERMISSION_DENIED,
+        // 404 → UNIMPLEMENTED, 429/502/503/504 → UNAVAILABLE, other → UNKNOWN.
+        // Regression guard: the earlier blanket "missing ⇒ 13" collapsed all
+        // of these to 13 and would have masked wrongly-classified outcomes.
+        assert_eq!(response(400, None, None).effective_grpc_status(), 13);
+        assert_eq!(response(401, None, None).effective_grpc_status(), 16);
+        assert_eq!(response(403, None, None).effective_grpc_status(), 7);
+        assert_eq!(response(404, None, None).effective_grpc_status(), 12);
+        assert_eq!(response(429, None, None).effective_grpc_status(), 14);
+        assert_eq!(response(502, None, None).effective_grpc_status(), 14);
+        assert_eq!(response(503, None, None).effective_grpc_status(), 14);
+        assert_eq!(response(504, None, None).effective_grpc_status(), 14);
+        assert_eq!(response(418, None, None).effective_grpc_status(), 2);
+    }
+
+    #[test]
+    fn effective_grpc_status_reports_unavailable_for_transport_level_failure() {
+        // http_status == 0 is the client's synthesized "no response" shape
+        // (response_fut errored or timed out); a real gRPC stack would
+        // surface that as UNAVAILABLE, not INTERNAL.
+        assert_eq!(response(0, None, None).effective_grpc_status(), 14);
+    }
+
+    #[tokio::test]
+    async fn tls_connect_with_none_root_pem_loads_webpki_roots_and_verifies_publicly_trusted_cert()
+    {
+        // Regression guard for the review-flagged docs/implementation mismatch:
+        // `GrpcClient::tls(_, None)` must load the Mozilla/webpki bundle so a
+        // verified handshake against a publicly-trusted cert succeeds out of
+        // the box. Before the fix, `RootCertStore` stayed empty and verification
+        // failed with UnknownIssuer.
+        //
+        // We smoke-test by reaching `tls.cloudflare.com:443` (a stable,
+        // publicly-trusted endpoint). If DNS / network is unavailable, skip —
+        // we don't want to fail CI on flaky infra when the unit under test
+        // is the cert-store wiring, not network reachability.
+        if tokio::net::lookup_host("tls.cloudflare.com:443")
+            .await
+            .is_err()
+        {
+            eprintln!("skipping: DNS unavailable for tls.cloudflare.com");
+            return;
+        }
+        let timeout = tokio::time::timeout(
+            Duration::from_secs(10),
+            tls_connect("tls.cloudflare.com", 443, None, false),
+        )
+        .await;
+        match timeout {
+            Ok(Ok(_stream)) => { /* verified handshake succeeded */ }
+            Ok(Err(e)) => {
+                let msg = format!("{e}");
+                // Only surface TLS-trust failures as test failures; tolerate
+                // transient network errors (timeouts, resets).
+                if msg.contains("UnknownIssuer") || msg.contains("invalid peer certificate") {
+                    panic!(
+                        "tls(None) did not load public roots — UnknownIssuer \
+                         regressed: {msg}"
+                    );
+                }
+                eprintln!("tls_connect returned transient network error: {msg}");
+            }
+            Err(_) => eprintln!("tls_connect timed out; network unavailable"),
+        }
     }
 }
