@@ -267,35 +267,67 @@ impl Http3ConnectionPool {
     ) {
         use std::fmt::Write;
         buf.clear();
+        // Key shape:
+        //   host|port|index|dns_override|ca|mtls_cert|mtls_key|verify
+        //
+        // This must cover every dimension that affects QUIC connection
+        // identity *and* matches the backend-capability registry key for
+        // the same target (see `backend_capabilities::write_capability_key`).
+        // Dropping `dns_override` or either mTLS path would let one proxy's
+        // probed QUIC connection be reused for another proxy whose
+        // resolver / cert material differs — the exact wrong-backend /
+        // wrong-identity bug the reviewer flagged.
         let _ = write!(
             buf,
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|",
             host,
             port,
             index,
+            proxy.dns_override.as_deref().unwrap_or_default(),
+        );
+        buf.push_str(
             proxy
                 .resolved_tls
                 .server_ca_cert_path
                 .as_deref()
                 .unwrap_or_default(),
+        );
+        buf.push('|');
+        buf.push_str(
             proxy
                 .resolved_tls
                 .client_cert_path
                 .as_deref()
                 .unwrap_or_default(),
-            proxy.resolved_tls.verify_server_cert as u8,
         );
+        buf.push('|');
+        buf.push_str(
+            proxy
+                .resolved_tls
+                .client_key_path
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        buf.push('|');
+        buf.push(if proxy.resolved_tls.verify_server_cert {
+            '1'
+        } else {
+            '0'
+        });
     }
 
-    pub fn pool_key_for_target(host: &str, port: u16, index: usize) -> String {
-        // Target keys are used by the retry path where host:port come from
-        // upstream targets. TLS config is inherited from the proxy that
-        // originated the request, but all requests through this path share
-        // the same proxy TLS settings, so host|port|index is sufficient
-        // for uniqueness within a single retry sequence.
-        let mut key = String::with_capacity(64);
-        use std::fmt::Write;
-        let _ = write!(key, "{}|{}|{}", host, port, index);
+    /// Pool key for the retry / upstream-target path.
+    ///
+    /// Takes `&Proxy` (not just host/port) so the key includes every
+    /// dimension that affects QUIC connection identity —
+    /// `dns_override`, CA, mTLS cert/key, verify flag — matching the
+    /// backend-capability registry key for the same target. Without this,
+    /// a capability probed through one proxy's resolver / cert material
+    /// could be served by a pooled QUIC connection originated by a
+    /// different proxy.
+    pub fn pool_key_for_target(proxy: &Proxy, host: &str, port: u16, index: usize) -> String {
+        let mut key = String::with_capacity(128);
+        Self::write_pool_key_with_host(&mut key, host, port, proxy, index);
         key
     }
 
@@ -323,6 +355,7 @@ impl Http3ConnectionPool {
     async fn create_or_get_target_sender(
         &self,
         key: String,
+        proxy: &Proxy,
         host: &str,
         port: u16,
         tls_config: Arc<rustls::ClientConfig>,
@@ -333,8 +366,14 @@ impl Http3ConnectionPool {
                 let tls_config = tls_config.clone();
                 let h3_config = h3_config.clone();
                 async move {
-                    self.create_connection_to_target(host, port, &tls_config, Some(&h3_config))
-                        .await
+                    self.create_connection_to_target(
+                        proxy,
+                        host,
+                        port,
+                        &tls_config,
+                        Some(&h3_config),
+                    )
+                    .await
                 }
             })
             .await
@@ -480,7 +519,7 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = Self::pool_key_for_target(target_host, target_port, start);
+        let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
 
         // Try cached connection on the selected index first
         if let Some(mut sr) = self.pool.cached(&key) {
@@ -497,8 +536,12 @@ impl Http3ConnectionPool {
                     // Try other cached indices before creating a new connection
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key =
-                            Self::pool_key_for_target(target_host, target_port, fallback_index);
+                        let fallback_key = Self::pool_key_for_target(
+                            proxy,
+                            target_host,
+                            target_port,
+                            fallback_index,
+                        );
                         if let Some(mut fallback_sr) = self.pool.cached(&fallback_key) {
                             match Self::do_request(
                                 &mut fallback_sr,
@@ -525,7 +568,14 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
-            .create_or_get_target_sender(key, target_host, target_port, tls_config, h3_config)
+            .create_or_get_target_sender(
+                key,
+                proxy,
+                target_host,
+                target_port,
+                tls_config,
+                h3_config,
+            )
             .await?;
         let mut sr_for_request = sr.clone();
 
@@ -614,9 +664,14 @@ impl Http3ConnectionPool {
     /// using a shared endpoint.
     ///
     /// Used by `request_with_target` for load-balanced retries where the target
-    /// differs from `proxy.backend_host`/`proxy.backend_port`.
+    /// differs from `proxy.backend_host`/`proxy.backend_port`. Honors the
+    /// proxy's `dns_override` / `dns_cache_ttl_seconds` so retries resolve
+    /// through the same path the capability probe used — otherwise a
+    /// proxy pinning a specific IP via `dns_override` would silently dial
+    /// the default DNS answer for the load-balanced target instead.
     async fn create_connection_to_target(
         &self,
+        proxy: &Proxy,
         host: &str,
         port: u16,
         tls_config: &Arc<rustls::ClientConfig>,
@@ -647,7 +702,14 @@ impl Http3ConnectionPool {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
 
-        let addr = resolve_backend_addr_cached(host, port, &self.dns_cache, None, None).await?;
+        let addr = resolve_backend_addr_cached(
+            host,
+            port,
+            &self.dns_cache,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await?;
 
         let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
 
@@ -1138,7 +1200,7 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = Self::pool_key_for_target(target_host, target_port, start);
+        let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
 
         if let Some(mut sr) = self.pool.cached(&key) {
             match Self::do_request_streaming_body(
@@ -1167,7 +1229,14 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
-            .create_or_get_target_sender(key, target_host, target_port, tls_config, h3_config)
+            .create_or_get_target_sender(
+                key,
+                proxy,
+                target_host,
+                target_port,
+                tls_config,
+                h3_config,
+            )
             .await?;
         let mut sr_for_request = sr.clone();
 
@@ -1204,7 +1273,7 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = Self::pool_key_for_target(target_host, target_port, start);
+        let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
         let mut frontend_body = Some(frontend_body);
 
         if let Some(mut sr) = self.pool.cached(&key) {
@@ -1237,7 +1306,14 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
-            .create_or_get_target_sender(key, target_host, target_port, tls_config, h3_config)
+            .create_or_get_target_sender(
+                key,
+                proxy,
+                target_host,
+                target_port,
+                tls_config,
+                h3_config,
+            )
             .await?;
         let mut sr_for_request = sr.clone();
 
@@ -1369,7 +1445,7 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = Self::pool_key_for_target(target_host, target_port, start);
+        let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
 
         if let Some(mut sr) = self.pool.cached(&key) {
             match Self::do_request_streaming(
@@ -1392,8 +1468,12 @@ impl Http3ConnectionPool {
 
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key =
-                            Self::pool_key_for_target(target_host, target_port, fallback_index);
+                        let fallback_key = Self::pool_key_for_target(
+                            proxy,
+                            target_host,
+                            target_port,
+                            fallback_index,
+                        );
                         if let Some(mut fallback_sr) = self.pool.cached(&fallback_key) {
                             match Self::do_request_streaming(
                                 &mut fallback_sr,
@@ -1419,7 +1499,14 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
-            .create_or_get_target_sender(key, target_host, target_port, tls_config, h3_config)
+            .create_or_get_target_sender(
+                key,
+                proxy,
+                target_host,
+                target_port,
+                tls_config,
+                h3_config,
+            )
             .await?;
         let mut sr_for_request = sr.clone();
 

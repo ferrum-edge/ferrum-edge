@@ -295,7 +295,7 @@ Shared shell in `src/pool/mod.rs`; per-pool key formats below. Key must include 
 - **HTTP** (`connection_pool.rs`): `{dest}|{proto}|{dns_override}|{ca}|{mtls_cert}|{verify}` — `dest` is `u={upstream_id}` or `d={host}:{port}`
 - **gRPC** (`proxy/grpc_proxy.rs`): `{host}|{port}|{tls}|{dns_override}|{ca}|{mtls_cert}|{verify}` + shard `#N` — `tls` from `matches!(backend_scheme, Some(BackendScheme::Https))`; gRPC pool entered at runtime by content-type, not by scheme
 - **HTTP/2** (`proxy/http2_pool.rs`): `{host}|{port}|{dns_override}|{ca}|{mtls_cert}|{verify}` + shard `#N` (always TLS)
-- **HTTP/3** (`http3/client.rs`): `{host}|{port}|{index}|{ca}|{mtls_cert}|{verify}`
+- **HTTP/3** (`http3/client.rs`): `{host}|{port}|{index}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{verify}` — matches `backend_capabilities::capability_key` so probe classification and QUIC reuse stay aligned. `pool_key_for_target(proxy, host, port, idx)` takes `&Proxy` for the same reason.
 
 Rules: never add policy fields (timeouts, pool sizes, keepalives); empty/default strings are free; keep `|` delimiter.
 

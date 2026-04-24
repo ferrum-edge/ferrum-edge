@@ -310,6 +310,29 @@ pub(crate) fn supports_native_http3_backend(
             .is_some_and(|record| record.plain_http.h3.is_supported())
 }
 
+/// Is this H3 backend response the kind that should downgrade the cached
+/// H3 capability to `Unsupported`? Only connection / protocol-level
+/// failures — not 4xx/5xx application responses, not client disconnects,
+/// not payload-size errors.
+fn is_h3_transport_failure(resp: &retry::BackendResponse) -> bool {
+    if !resp.connection_error {
+        return false;
+    }
+    matches!(
+        resp.error_class,
+        Some(retry::ErrorClass::ConnectionRefused)
+            | Some(retry::ErrorClass::ConnectionTimeout)
+            | Some(retry::ErrorClass::ConnectionReset)
+            | Some(retry::ErrorClass::ConnectionClosed)
+            | Some(retry::ErrorClass::TlsError)
+            | Some(retry::ErrorClass::ProtocolError)
+            | Some(retry::ErrorClass::DnsLookupError)
+            | Some(retry::ErrorClass::PortExhaustion)
+            | Some(retry::ErrorClass::ConnectionPoolError)
+            | Some(retry::ErrorClass::ReadWriteTimeout)
+    )
+}
+
 fn supports_direct_http2_backend(
     state: &ProxyState,
     proxy: &Proxy,
@@ -6375,7 +6398,8 @@ async fn handle_proxy_request_inner(
             // the body was never sent, so replaying is correct and safe.
             // The final retry attempt uses streaming if configured.
             let is_last_attempt = attempt >= retry_config.max_retries;
-            result = if supports_native_http3_backend(&state, &proxy, current_target.as_deref()) {
+            let tried_h3 = supports_native_http3_backend(&state, &proxy, current_target.as_deref());
+            result = if tried_h3 {
                 proxy_to_backend_http3_retry(
                     &state,
                     &proxy,
@@ -6403,6 +6427,16 @@ async fn handle_proxy_request_inner(
                 )
                 .await
             };
+            // If H3 was attempted and produced a transport-level failure,
+            // downgrade the cached capability so the next retry iteration
+            // (and subsequent requests) skip the H3 pool and route via
+            // reqwest instead of repeatedly 502-ing against a backend
+            // whose QUIC support rolled back between refresh cycles.
+            if tried_h3 && is_h3_transport_failure(&result) {
+                state
+                    .backend_capabilities
+                    .mark_h3_unsupported(&proxy, current_target.as_deref());
+            }
         }
         (result, current_cb_target_key)
     } else {
@@ -7340,14 +7374,31 @@ async fn proxy_to_backend(
     // classification has already proved that this concrete backend target
     // supports H3. gRPC and WebSocket dispatch earlier in the handler and
     // never reach this block, so only Plain-flavor requests can enter.
+    //
+    // `client_request_body` becomes `mut` here so that if the H3 attempt
+    // fails with a transport / protocol error AND the body is replayable
+    // (already buffered in memory), we can downgrade the cached H3
+    // capability and fall through to reqwest on this same request instead
+    // of returning 502 while the cache still says "Supported". Streaming
+    // bodies aren't replayable, so we only rescue this request when it
+    // was already buffered upstream.
+    let mut client_request_body = client_request_body;
     if supports_native_http3_backend(state, proxy, upstream_target) {
+        let replayable_body: Option<Vec<u8>> = match &client_request_body {
+            ClientRequestBody::Buffered(body) => Some(body.clone()),
+            ClientRequestBody::Streaming(_) => None,
+        };
+        let body_for_h3 = std::mem::replace(
+            &mut client_request_body,
+            ClientRequestBody::Buffered(Vec::new()),
+        );
         let (mut backend_resp, body_bytes) = proxy_to_backend_http3(
             state,
             proxy,
             backend_url,
             method,
             headers,
-            client_request_body,
+            body_for_h3,
             plugins,
             upstream_target,
             client_ip,
@@ -7368,7 +7419,36 @@ async fn proxy_to_backend(
             backend_resolved_ip: resolved_ip.clone().or(backend_resp.backend_resolved_ip),
             ..backend_resp
         };
-        return (resp, body_bytes);
+
+        if is_h3_transport_failure(&resp) {
+            // Downgrade the cached H3 classification so subsequent requests
+            // skip the H3 pool immediately instead of repeatedly 502-ing
+            // until the 24 h periodic refresh re-probes. The next periodic
+            // refresh restores `Supported` if the backend recovers.
+            state
+                .backend_capabilities
+                .mark_h3_unsupported(proxy, upstream_target);
+
+            if let Some(body) = replayable_body {
+                warn!(
+                    proxy_id = %proxy.id,
+                    error_class = ?resp.error_class,
+                    "H3 backend transport failed; downgraded cached capability and falling back to reqwest for this request"
+                );
+                // Restore the body and fall through to the reqwest / H2
+                // path below.
+                client_request_body = ClientRequestBody::Buffered(body);
+            } else {
+                debug!(
+                    proxy_id = %proxy.id,
+                    error_class = ?resp.error_class,
+                    "H3 backend transport failed; downgraded cached capability, cannot replay streaming body"
+                );
+                return (resp, body_bytes);
+            }
+        } else {
+            return (resp, body_bytes);
+        }
     }
 
     // Use the direct HTTP/2 pool only when the capability registry has already

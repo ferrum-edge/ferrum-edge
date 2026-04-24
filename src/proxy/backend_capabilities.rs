@@ -159,6 +159,30 @@ impl BackendCapabilityRegistry {
             .or_insert_with(|| Arc::new(record));
     }
 
+    /// Downgrade the cached H3 classification for a backend target to
+    /// `Unsupported` after an observed H3 connection / protocol failure.
+    /// No-op when the target has no cached record (the next periodic refresh
+    /// will classify it from scratch).
+    ///
+    /// Called from the proxy hot path after a 502 with a connection-class
+    /// error from the native H3 backend pool, so subsequent requests skip
+    /// the H3 pool and route via the cross-protocol bridge instead of
+    /// repeatedly failing against a backend whose QUIC listener rolled back
+    /// between refresh cycles.
+    pub fn mark_h3_unsupported(&self, proxy: &Proxy, target: Option<&UpstreamTarget>) {
+        let key = capability_key_for_proxy_target(proxy, target);
+        if let Some(mut entry) = self.entries.get_mut(&key)
+            && !matches!(entry.plain_http.h3, ProtocolSupport::Unsupported)
+        {
+            let mut new_record = (**entry).clone();
+            new_record.plain_http.h3 = ProtocolSupport::Unsupported;
+            new_record.last_probe_at_unix_secs = now_unix_secs();
+            new_record.last_probe_error =
+                Some("H3 downgraded after connection/protocol failure on request path".to_string());
+            *entry = Arc::new(new_record);
+        }
+    }
+
     pub fn retain_keys(&self, active_keys: &std::collections::HashSet<String>) {
         self.entries.retain(|key, _| active_keys.contains(key));
     }
@@ -443,6 +467,52 @@ mod tests {
 
         assert!(registry.get(&proxy, None).is_none());
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_mark_h3_unsupported_downgrades_supported_entry() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = minimal_proxy();
+        let key = capability_key(&proxy);
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h3 = ProtocolSupport::Supported;
+        record.plain_http.h2_tls = ProtocolSupport::Supported;
+        registry.upsert(key, record);
+
+        registry.mark_h3_unsupported(&proxy, None);
+
+        let fetched = registry.get(&proxy, None).expect("entry must exist");
+        assert_eq!(fetched.plain_http.h3, ProtocolSupport::Unsupported);
+        assert!(
+            fetched.last_probe_error.is_some(),
+            "downgrade should stamp last_probe_error for operator visibility"
+        );
+        // H2 classification must NOT be affected — only H3 was observed broken.
+        assert!(fetched.plain_http.h2_tls.is_supported());
+    }
+
+    #[test]
+    fn registry_mark_h3_unsupported_is_noop_when_no_cached_entry() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = minimal_proxy();
+        // No upsert — mark_h3_unsupported must not panic or create a phantom entry.
+        registry.mark_h3_unsupported(&proxy, None);
+        assert!(registry.get(&proxy, None).is_none());
+    }
+
+    #[test]
+    fn registry_mark_h3_unsupported_is_idempotent() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = minimal_proxy();
+        let key = capability_key(&proxy);
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h3 = ProtocolSupport::Unsupported;
+        registry.upsert(key, record);
+
+        // Second downgrade should be a cheap no-op — no allocation, no replacement.
+        registry.mark_h3_unsupported(&proxy, None);
+        let fetched = registry.get(&proxy, None).unwrap();
+        assert_eq!(fetched.plain_http.h3, ProtocolSupport::Unsupported);
     }
 
     #[test]
