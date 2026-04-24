@@ -432,10 +432,13 @@ impl GrpcPoolManager {
                 "gRPC: connect timeout ({}ms) to backend {}",
                 proxy.backend_connect_timeout_ms, addr
             );
-            GrpcProxyError::BackendTimeout(format!(
-                "Connect timeout after {}ms to {}",
-                proxy.backend_connect_timeout_ms, addr
-            ))
+            GrpcProxyError::BackendTimeout {
+                kind: GrpcTimeoutKind::Connect,
+                message: format!(
+                    "Connect timeout after {}ms to {}",
+                    proxy.backend_connect_timeout_ms, addr
+                ),
+            }
         })?
         .map_err(|e| {
             if crate::retry::is_port_exhaustion(&e) {
@@ -609,11 +612,31 @@ impl PoolManager for GrpcPoolManager {
     }
 }
 
+/// Which phase of a gRPC backend interaction timed out.
+///
+/// Distinguishes connection establishment from read/write on an already-open
+/// connection so retry and classification logic can branch on the variant
+/// rather than parsing `BackendTimeout`'s human-readable message string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcTimeoutKind {
+    /// Timeout while establishing a TCP connection to the backend. Eligible
+    /// for retry under `retry_on_connect_failure`; classifies as
+    /// [`crate::retry::ErrorClass::ConnectionTimeout`].
+    Connect,
+    /// Timeout while waiting for the backend to respond or while reading the
+    /// response body. Classifies as
+    /// [`crate::retry::ErrorClass::ReadWriteTimeout`].
+    Read,
+}
+
 /// Errors specific to gRPC proxying.
 #[derive(Debug)]
 pub enum GrpcProxyError {
     BackendUnavailable(String),
-    BackendTimeout(String),
+    BackendTimeout {
+        kind: GrpcTimeoutKind,
+        message: String,
+    },
     ResourceExhausted(String),
     Internal(String),
 }
@@ -621,10 +644,10 @@ pub enum GrpcProxyError {
 impl std::fmt::Display for GrpcProxyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BackendUnavailable(msg)
-            | Self::BackendTimeout(msg)
-            | Self::ResourceExhausted(msg)
-            | Self::Internal(msg) => write!(f, "{}", msg),
+            Self::BackendUnavailable(msg) | Self::ResourceExhausted(msg) | Self::Internal(msg) => {
+                write!(f, "{}", msg)
+            }
+            Self::BackendTimeout { message, .. } => write!(f, "{}", message),
         }
     }
 }
@@ -911,10 +934,10 @@ pub async fn proxy_grpc_request_streaming(
                     "gRPC: timeout ({}ms) waiting for streaming RPC completion",
                     timeout_ms
                 );
-                GrpcProxyError::BackendTimeout(format!(
-                    "gRPC streaming RPC timeout after {}ms",
-                    timeout_ms
-                ))
+                GrpcProxyError::BackendTimeout {
+                    kind: GrpcTimeoutKind::Read,
+                    message: format!("gRPC streaming RPC timeout after {}ms", timeout_ms),
+                }
             })?
             .map_err(|e| {
                 if body_size_exceeded.load(Ordering::Acquire) {
@@ -1069,7 +1092,10 @@ pub(crate) async fn proxy_grpc_request_core(
     let map_send_err = |e: hyper::Error| {
         error!("gRPC: backend request failed: {}", e);
         if e.is_timeout() {
-            GrpcProxyError::BackendTimeout(format!("Backend timeout: {}", e))
+            GrpcProxyError::BackendTimeout {
+                kind: GrpcTimeoutKind::Read,
+                message: format!("Backend timeout: {}", e),
+            }
         } else {
             GrpcProxyError::BackendUnavailable(format!("Backend error: {}", e))
         }
@@ -1083,7 +1109,10 @@ pub(crate) async fn proxy_grpc_request_core(
                     "gRPC: read timeout ({}ms) waiting for backend response",
                     timeout_ms
                 );
-                GrpcProxyError::BackendTimeout(format!("Read timeout after {}ms", timeout_ms))
+                GrpcProxyError::BackendTimeout {
+                    kind: GrpcTimeoutKind::Read,
+                    message: format!("Read timeout after {}ms", timeout_ms),
+                }
             })?
             .map_err(map_send_err)?
     } else {
@@ -1157,7 +1186,10 @@ pub(crate) async fn proxy_grpc_request_core(
                     "gRPC: read timeout ({}ms) while collecting response body",
                     timeout_ms
                 );
-                GrpcProxyError::BackendTimeout(format!("Body read timeout after {}ms", timeout_ms))
+                GrpcProxyError::BackendTimeout {
+                    kind: GrpcTimeoutKind::Read,
+                    message: format!("Body read timeout after {}ms", timeout_ms),
+                }
             })?;
     } else {
         body_collection.await;

@@ -1374,15 +1374,14 @@ where
     if grpc_has_retry && let Some(retry_config) = &proxy.retry {
         let mut attempt = 0u32;
         loop {
-            let is_connection_error = match &result {
-                Err(grpc_proxy::GrpcProxyError::BackendUnavailable(_)) => true,
-                Err(grpc_proxy::GrpcProxyError::BackendTimeout(message))
-                    if message.contains("Connect timeout") =>
-                {
-                    true
-                }
-                _ => false,
-            };
+            let is_connection_error = matches!(
+                &result,
+                Err(grpc_proxy::GrpcProxyError::BackendUnavailable(_))
+                    | Err(grpc_proxy::GrpcProxyError::BackendTimeout {
+                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                        ..
+                    })
+            );
             if !is_connection_error
                 || !retry_config.retry_on_connect_failure
                 || attempt >= retry_config.max_retries
@@ -1713,7 +1712,7 @@ where
             // the same failure mode (timeout vs connect-refused vs TLS).
             let error_class = crate::retry::classify_grpc_proxy_error(&err);
             let (grpc_status_code, grpc_message): (u32, &str) = match &err {
-                grpc_proxy::GrpcProxyError::BackendTimeout(_) => (
+                grpc_proxy::GrpcProxyError::BackendTimeout { .. } => (
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Backend deadline exceeded",
                 ),

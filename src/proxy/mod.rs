@@ -5636,13 +5636,14 @@ async fn handle_proxy_request_inner(
 
             loop {
                 // Classify the error and determine if retryable
-                let is_connection_error = match &grpc_result {
-                    Err(GrpcProxyError::BackendUnavailable(_)) => true,
-                    Err(GrpcProxyError::BackendTimeout(msg)) if msg.contains("Connect timeout") => {
-                        true
-                    }
-                    _ => false,
-                };
+                let is_connection_error = matches!(
+                    &grpc_result,
+                    Err(GrpcProxyError::BackendUnavailable(_))
+                        | Err(GrpcProxyError::BackendTimeout {
+                            kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                            ..
+                        })
+                );
                 if grpc_attempt >= retry_config.max_retries
                     || !is_connection_error
                     || !retry_config.retry_on_connect_failure
@@ -6207,7 +6208,7 @@ async fn handle_proxy_request_inner(
                     GrpcProxyError::BackendUnavailable(m) => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
                     }
-                    GrpcProxyError::BackendTimeout(m) => {
+                    GrpcProxyError::BackendTimeout { message: m, .. } => {
                         (grpc_proxy::grpc_status::DEADLINE_EXCEEDED, m.as_str())
                     }
                     GrpcProxyError::ResourceExhausted(m) => {
