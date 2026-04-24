@@ -67,6 +67,20 @@ impl GrpcResponse {
         raw.parse().ok()
     }
 
+    /// Returns the effective gRPC status for the response, applying the
+    /// gRPC wire-protocol rule that a missing `grpc-status` (in neither
+    /// trailers nor Trailers-Only headers) is treated as `INTERNAL` (13)
+    /// by compliant gRPC stacks (tonic, grpc-go).
+    ///
+    /// Use this in tests that care about the *semantic* outcome of an RPC
+    /// rather than the literal bytes on the wire. [`Self::grpc_status`]
+    /// returns `None` when the status header/trailer is absent;
+    /// `effective_grpc_status` fills in the synthetic `INTERNAL` that a
+    /// real client would observe.
+    pub fn effective_grpc_status(&self) -> u32 {
+        self.grpc_status().unwrap_or(13 /* INTERNAL */)
+    }
+
     /// Shorthand: parse `grpc-message` from trailers, falling back to
     /// initial headers (Trailers-Only response).
     pub fn grpc_message(&self) -> Option<&str> {

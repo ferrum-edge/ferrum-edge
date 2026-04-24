@@ -286,33 +286,38 @@ async fn grpc_trailers_missing_produces_internal_status() {
         .await
         .expect("response surfaced");
 
-    // The client got a well-formed response — not a hang. Critically, the
-    // gateway MUST NOT surface grpc-status=OK (0). The client either sees
-    // a non-OK status (synthesized INTERNAL, UNAVAILABLE, etc.) or no
-    // status at all (absent trailers, letting the client's own gRPC
-    // stack synthesize INTERNAL per the spec).
-    //
-    // The current gateway forwards whatever the backend sent, trailers
-    // and all — a missing-trailer case here surfaces as a response with
-    // data but no `grpc-status`. A compliant client library (tonic,
-    // grpcurl) would synthesize INTERNAL from that. We therefore accept
-    // either path as a deterministic outcome: present-and-non-OK, or
-    // absent-entirely. We reject present-and-OK.
-    let grpc_status = response.grpc_status();
-    assert!(
-        !matches!(grpc_status, Some(0)),
-        "gateway incorrectly surfaced grpc-status=OK despite missing backend trailers; \
-         http={} grpc-status={:?} headers={:?} trailers={:?}",
-        response.http_status,
-        grpc_status,
-        response.headers,
-        response.trailers
-    );
-    // And the client didn't hang — we got SOMETHING back.
+    // The client got a well-formed response — not a hang. Assert first
+    // that SOMETHING came back.
     assert!(
         response.http_status > 0,
         "client never received any response (likely a hang); got {:?}",
         response
+    );
+
+    // The core INTERNAL guarantee. Two wire shapes are legal here, and
+    // `effective_grpc_status()` collapses them to the same semantic value
+    // that a real gRPC client (tonic, grpc-go) would observe:
+    //
+    //   * gateway synthesizes `grpc-status: 13` in the trailers (or in
+    //     Trailers-Only headers) — current implementation does NOT do
+    //     this, but a future hardening could;
+    //   * gateway forwards the backend's missing-trailer response as-is,
+    //     and the *client-side* rule "missing status ⇒ INTERNAL (13)"
+    //     kicks in — this is today's behavior.
+    //
+    // Either way, the effective status is 13. A gateway regression that
+    // spuriously synthesized `grpc-status: 0` (OK) on missing trailers
+    // would fail this assertion, which is the behavior this test is
+    // meant to guard.
+    assert_eq!(
+        response.effective_grpc_status(),
+        13,
+        "gateway did not surface INTERNAL for missing backend trailers; \
+         http={} grpc-status={:?} headers={:?} trailers={:?}",
+        response.http_status,
+        response.grpc_status(),
+        response.headers,
+        response.trailers
     );
 }
 
@@ -386,21 +391,32 @@ async fn grpc_deadline_exceeded_propagates_as_deadline_exceeded_not_unavailable(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Test 5 — backend flow-control stall triggers backend_write_timeout_ms.
+// Test 5 — H2 flow-control stall on the gRPC path is bounded by
+//           `backend_read_timeout_ms`.
 // ────────────────────────────────────────────────────────────────────────────
 //
 // Configures the scripted H2 backend with a tiny initial window (1 byte),
-// accepts the RPC headers, then stalls for much longer than the gateway's
-// configured `backend_write_timeout_ms`. The gateway should give up after
-// the configured budget, surface an error to the client, and log a
-// write-timeout / backend-timeout signal.
+// accepts the RPC headers, then stalls. The request body stalls on the wire
+// because the backend never opens the flow-control window, so the gateway
+// never gets response headers either.
+//
+// The gRPC proxy path (`src/proxy/grpc_proxy.rs`) wraps `send_request(...)`
+// in a timeout driven by `backend_read_timeout_ms` (see the
+// `effective_timeout_ms` match at the top of the streaming/buffered
+// dispatch). That single knob covers both the body-upload stall AND the
+// time-to-first-byte wait, which is why this test asserts against it.
+//
+// `backend_write_timeout_ms` is TCP-proxy-only (`src/proxy/tcp_proxy.rs`
+// direction-tracking watchdog); it does NOT apply to the gRPC H2 path and
+// is intentionally omitted from the overrides below so the assertion is
+// load-bearing on the read-timeout knob.
 //
 // Timing tolerance: ±200ms below, +1500ms above — same envelope as the
 // Phase-1 read-timeout test. The watchdog granularity can be multi-second
 // on loaded CI; we accept that spread.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn h2_window_stall_triggers_backend_write_timeout_ms() {
+async fn h2_window_stall_triggers_backend_read_timeout_on_grpc() {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     // Shrink the initial window to one byte so that any request body
@@ -422,14 +438,12 @@ async fn h2_window_stall_triggers_backend_write_timeout_ms() {
         .spawn()
         .expect("spawn backend");
 
-    // The write-timeout knob applies at the stream-proxy layer; for
-    // gRPC we rely on `backend_read_timeout_ms` to cover time-to-first-byte
-    // stalls on top of a frozen window. Use a tight timeout so the test
-    // is fast.
+    // Drive the test off `backend_read_timeout_ms` alone: it is the knob
+    // that the gRPC proxy path actually honors for this stall. Use a
+    // tight timeout so the test is fast.
     let read_timeout_ms: u64 = 800;
     let overrides = json!({
         "backend_read_timeout_ms": read_timeout_ms,
-        "backend_write_timeout_ms": read_timeout_ms,
     });
     let yaml = grpc_file_config(backend_port, overrides);
     let harness = GatewayHarness::builder()
