@@ -110,15 +110,12 @@ pub fn is_port_exhaustion_message(msg: &str) -> bool {
 /// Maps `GrpcProxyError` variants (which carry message strings describing
 /// the failure) into the appropriate `ErrorClass`. Called on the error path only.
 pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -> ErrorClass {
-    use crate::proxy::grpc_proxy::GrpcProxyError;
+    use crate::proxy::grpc_proxy::{GrpcProxyError, GrpcTimeoutKind};
     match e {
-        GrpcProxyError::BackendTimeout(msg) => {
-            if msg.contains("Connect timeout") {
-                ErrorClass::ConnectionTimeout
-            } else {
-                ErrorClass::ReadWriteTimeout
-            }
-        }
+        GrpcProxyError::BackendTimeout { kind, .. } => match kind {
+            GrpcTimeoutKind::Connect => ErrorClass::ConnectionTimeout,
+            GrpcTimeoutKind::Read => ErrorClass::ReadWriteTimeout,
+        },
         GrpcProxyError::BackendUnavailable(msg) => {
             if is_port_exhaustion_message(msg) {
                 ErrorClass::PortExhaustion

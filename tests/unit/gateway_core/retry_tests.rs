@@ -1,7 +1,7 @@
 //! Tests for retry logic module
 
 use ferrum_edge::config::types::{BackoffStrategy, RetryConfig};
-use ferrum_edge::proxy::grpc_proxy::GrpcProxyError;
+use ferrum_edge::proxy::grpc_proxy::{GrpcProxyError, GrpcTimeoutKind};
 use ferrum_edge::retry::{
     BackendResponse, ErrorClass, ResponseBody, classify_body_error, classify_boxed_error,
     classify_grpc_proxy_error, retry_delay, should_retry,
@@ -221,8 +221,10 @@ fn test_connection_failure_still_respects_max_retries() {
 
 #[test]
 fn test_grpc_connect_timeout_classified() {
-    let err =
-        GrpcProxyError::BackendTimeout("Connect timeout after 5000ms to 10.0.0.1:50051".into());
+    let err = GrpcProxyError::BackendTimeout {
+        kind: GrpcTimeoutKind::Connect,
+        message: "Connect timeout after 5000ms to 10.0.0.1:50051".into(),
+    };
     assert_eq!(
         classify_grpc_proxy_error(&err),
         ErrorClass::ConnectionTimeout
@@ -231,7 +233,10 @@ fn test_grpc_connect_timeout_classified() {
 
 #[test]
 fn test_grpc_read_timeout_classified() {
-    let err = GrpcProxyError::BackendTimeout("Read timeout after 30000ms".into());
+    let err = GrpcProxyError::BackendTimeout {
+        kind: GrpcTimeoutKind::Read,
+        message: "Read timeout after 30000ms".into(),
+    };
     assert_eq!(
         classify_grpc_proxy_error(&err),
         ErrorClass::ReadWriteTimeout
@@ -240,7 +245,10 @@ fn test_grpc_read_timeout_classified() {
 
 #[test]
 fn test_grpc_body_read_timeout_classified() {
-    let err = GrpcProxyError::BackendTimeout("Body read timeout after 30000ms".into());
+    let err = GrpcProxyError::BackendTimeout {
+        kind: GrpcTimeoutKind::Read,
+        message: "Body read timeout after 30000ms".into(),
+    };
     assert_eq!(
         classify_grpc_proxy_error(&err),
         ErrorClass::ReadWriteTimeout
