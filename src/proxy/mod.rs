@@ -2272,6 +2272,16 @@ impl ProxyState {
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
         self.config.store(Arc::new(new_config));
 
+        // Trigger a coalesced capability refresh so added/modified HTTPS
+        // backends get classified immediately instead of waiting up to the
+        // periodic interval (default 24 h). Database polling and DP gRPC
+        // delta updates both flow through this path, so a brand-new
+        // H3-only backend would otherwise keep 502-ing via reqwest until
+        // the next periodic tick. The coalescer absorbs bursts so a DB
+        // poll storm or rapid CP push sequence still fans out to at most
+        // one in-flight probe + one queued re-run.
+        self.spawn_backend_capability_refresh();
+
         // Reconcile stream proxy listeners if any stream proxies changed
         let removed_had_stream = if !delta.removed_proxy_ids.is_empty() {
             let removed_set: std::collections::HashSet<&str> =
