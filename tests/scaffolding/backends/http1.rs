@@ -17,12 +17,13 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 /// A single deterministic HTTP/1.1 step.
 #[derive(Debug, Clone)]
@@ -204,12 +205,14 @@ impl ScriptedHttp1BackendBuilder {
                         state_task.accepted.fetch_add(1, Ordering::SeqCst);
                         let state_conn = state_task.clone();
                         let script = steps.clone();
-                        tokio::spawn(async move {
+                        let track = state_conn.clone();
+                        let jh = tokio::spawn(async move {
                             let state_err = state_conn.clone();
                             if let Err(e) = run_http_script(stream, script, state_conn).await {
                                 state_err.step_errors.lock().await.push(e.to_string());
                             }
                         });
+                        track.track_connection(jh.abort_handle());
                     }
                 }
             }
@@ -236,6 +239,18 @@ struct Http1State {
     /// failures (client hung up before response, etc.) would be silently
     /// dropped — see [`ScriptedHttp1Backend::step_errors`].
     step_errors: Mutex<Vec<String>>,
+    /// AbortHandles for in-flight per-connection tasks (see
+    /// `BackendState::connection_aborts` in `tcp.rs` for rationale).
+    connection_aborts: StdMutex<Vec<AbortHandle>>,
+}
+
+impl Http1State {
+    fn track_connection(&self, abort: AbortHandle) {
+        if let Ok(mut guard) = self.connection_aborts.lock() {
+            guard.retain(|h| !h.is_finished());
+            guard.push(abort);
+        }
+    }
 }
 
 /// A running scripted HTTP/1.1 backend. Drop shuts it down.
@@ -315,6 +330,11 @@ impl ScriptedHttp1Backend {
         }
         if let Some(h) = self.handle.take() {
             h.abort();
+        }
+        if let Ok(mut guard) = self.state.connection_aborts.lock() {
+            for abort in guard.drain(..) {
+                abort.abort();
+            }
         }
     }
 }

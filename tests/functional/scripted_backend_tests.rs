@@ -17,7 +17,7 @@ use crate::scaffolding::backends::{
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::reserve_port;
+use crate::scaffolding::ports::{reserve_port, unbound_port};
 use crate::scaffolding::{file_mode_yaml_for_backend, file_mode_yaml_for_backend_with};
 use reqwest::StatusCode;
 use serde_json::json;
@@ -39,22 +39,19 @@ fn require_logs(harness: &GatewayHarness) -> String {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Test 1 — backend refuses the TCP connection → 502 + ConnectionRefused class.
+// Test 1 — backend port with nothing listening → 502 + ConnectionRefused class.
 // ────────────────────────────────────────────────────────────────────────────
 //
-// Fixture: `ScriptedTcpBackend::RefuseNextConnect` accepts-and-drops. The
-// gateway gets FIN on first write and returns 502 to the client. We assert
-// the status and (via captured logs) that the upstream error was classified
-// as a connection error rather than a body error.
+// Fixture: `unbound_port()` reserves a port then drops the listener, so the
+// gateway's connect() returns a real `ECONNREFUSED` from the kernel
+// (distinct from `ScriptedTcpBackend::RefuseNextConnect`, which accepts and
+// drops — that path emits FIN/RST, not a connect-time refusal, and so does
+// not exercise the gateway's `ConnectionRefused` classifier).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn backend_refuses_connect_maps_to_502_with_connection_refused() {
-    let reservation = reserve_port().await.expect("reserve backend port");
-    let backend_port = reservation.port;
-    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
-        .step(TcpStep::RefuseNextConnect)
-        .spawn()
-        .expect("spawn backend");
+    // Real ECONNREFUSED: no listener on this port.
+    let backend_port = unbound_port().await.expect("unbound port");
 
     let yaml = file_mode_yaml_for_backend(backend_port);
     let harness = GatewayHarness::builder()
@@ -79,12 +76,20 @@ async fn backend_refuses_connect_maps_to_502_with_connection_refused() {
     );
 
     let logs = require_logs(&harness);
-    // The gateway's upstream error classifier tags connection-reset/refused
-    // cases with "connection" in the class name (ConnectionError, ConnectionRefused).
-    let has_connection_error = logs.contains("connection") || logs.contains("ConnectionError");
+    // `connect_failure` is the gateway's `error_kind` for reqwest errors
+    // where `is_connect() == true` — exactly the ECONNREFUSED case we're
+    // exercising. It's distinct from `request_error` (RST after accept),
+    // `read_timeout`, and body-error classes, so asserting on it proves
+    // the gateway took the connect-failure path rather than some other
+    // fallback. `ConnectionRefused`/"refused" are belt-and-suspenders for
+    // future gateway log surface changes that might expose the `io::Error`
+    // kind directly.
+    let has_refused_class = logs.contains("connect_failure")
+        || logs.contains("ConnectionRefused")
+        || logs.contains("Connection refused");
     assert!(
-        has_connection_error,
-        "expected connection error class in gateway logs; got:\n{logs}"
+        has_refused_class,
+        "expected connect-failure/refused signal in gateway logs; got:\n{logs}"
     );
 }
 

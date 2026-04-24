@@ -60,7 +60,7 @@ pub use backends::{
 pub use certs::TestCa;
 pub use clients::{ClientResponse, Http1Client};
 pub use harness::{GatewayHarness, GatewayHarnessBuilder, HarnessMode};
-pub use ports::{PortReservation, reserve_port, reserve_port_pair};
+pub use ports::{PortReservation, reserve_port, reserve_port_pair, unbound_port};
 
 // Small helpers that several acceptance tests reuse.
 

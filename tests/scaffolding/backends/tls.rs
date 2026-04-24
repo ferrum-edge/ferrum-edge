@@ -22,12 +22,13 @@ use super::tcp::{ExecutionMode, StepError, TcpStep};
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, private_key};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 /// Static configuration for the TLS handshake.
 #[derive(Clone)]
@@ -157,7 +158,8 @@ impl ScriptedTlsBackendBuilder {
                         let acceptor = acceptor_task.clone();
                         match mode {
                             ExecutionMode::RepeatEachConnection => {
-                                tokio::spawn(async move {
+                                let track = state_conn.clone();
+                                let jh = tokio::spawn(async move {
                                     if handshake_delay > Duration::ZERO {
                                         tokio::time::sleep(handshake_delay).await;
                                     }
@@ -182,10 +184,12 @@ impl ScriptedTlsBackendBuilder {
                                         state_err.step_errors.lock().await.push(e.to_string());
                                     }
                                 });
+                                track.track_connection(jh.abort_handle());
                             }
                             ExecutionMode::Once => {
                                 if conn_index == 0 {
-                                    tokio::spawn(async move {
+                                    let track = state_conn.clone();
+                                    let jh = tokio::spawn(async move {
                                         if handshake_delay > Duration::ZERO {
                                             tokio::time::sleep(handshake_delay).await;
                                         }
@@ -212,6 +216,7 @@ impl ScriptedTlsBackendBuilder {
                                                 .push(e.to_string());
                                         }
                                     });
+                                    track.track_connection(jh.abort_handle());
                                 } else {
                                     drop(tcp);
                                 }
@@ -243,6 +248,18 @@ struct TlsBackendState {
     /// Errors returned by `run_tls_script`. See
     /// [`ScriptedTlsBackend::step_errors`] for rationale.
     step_errors: Mutex<Vec<String>>,
+    /// AbortHandles for in-flight per-connection tasks (see
+    /// `BackendState::connection_aborts` in `tcp.rs` for rationale).
+    connection_aborts: StdMutex<Vec<AbortHandle>>,
+}
+
+impl TlsBackendState {
+    fn track_connection(&self, abort: AbortHandle) {
+        if let Ok(mut guard) = self.connection_aborts.lock() {
+            guard.retain(|h| !h.is_finished());
+            guard.push(abort);
+        }
+    }
 }
 
 /// A running scripted TLS backend. Drop shuts it down.
@@ -316,6 +333,11 @@ impl ScriptedTlsBackend {
         }
         if let Some(h) = self.handle.take() {
             h.abort();
+        }
+        if let Ok(mut guard) = self.state.connection_aborts.lock() {
+            for abort in guard.drain(..) {
+                abort.abort();
+            }
         }
     }
 }

@@ -114,6 +114,21 @@ pub async fn reserve_port_pair() -> io::Result<(PortReservation, PortReservation
     Ok((first, second))
 }
 
+/// Reserve and immediately release a port. Connects to the returned port
+/// produce a genuine `ECONNREFUSED` at the kernel level (nothing is
+/// listening), unlike
+/// [`super::backends::tcp::TcpStep::RefuseNextConnect`] which accepts and
+/// drops — that emits FIN/RST, not a connect-time refusal.
+///
+/// **Race caveat**: There is a brief window after the listener is dropped
+/// and before the caller connects in which another process/test could
+/// grab the port. Callers should expect sporadic test flakes if the host
+/// is saturated with parallel tests; for `#[ignore]`d functional tests
+/// the window is tiny and the risk is acceptable.
+pub async fn unbound_port() -> io::Result<u16> {
+    Ok(reserve_port().await?.drop_and_take_port())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

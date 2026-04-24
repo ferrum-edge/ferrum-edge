@@ -26,12 +26,13 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 /// A single deterministic instruction in a TCP script.
 #[derive(Debug, Clone)]
@@ -191,8 +192,9 @@ impl ScriptedTcpBackendBuilder {
 
                         match mode {
                             ExecutionMode::RepeatEachConnection => {
-                                tokio::spawn(async move {
-                                    let state_err = state_conn.clone();
+                                let state_err = state_conn.clone();
+                                let track = state_conn.clone();
+                                let jh = tokio::spawn(async move {
                                     if let Err(e) =
                                         run_script(stream, script, state_conn).await
                                     {
@@ -203,13 +205,15 @@ impl ScriptedTcpBackendBuilder {
                                             .push(e.to_string());
                                     }
                                 });
+                                track.track_connection(jh.abort_handle());
                             }
                             ExecutionMode::Once => {
                                 // First connection gets the script; subsequent
                                 // connections accept-and-drop.
                                 if conn_index == 0 {
-                                    tokio::spawn(async move {
-                                        let state_err = state_conn.clone();
+                                    let state_err = state_conn.clone();
+                                    let track = state_conn.clone();
+                                    let jh = tokio::spawn(async move {
                                         if let Err(e) =
                                             run_script(stream, script, state_conn).await
                                         {
@@ -220,6 +224,7 @@ impl ScriptedTcpBackendBuilder {
                                                 .push(e.to_string());
                                         }
                                     });
+                                    track.track_connection(jh.abort_handle());
                                 } else {
                                     drop(stream);
                                 }
@@ -249,6 +254,22 @@ struct BackendState {
     /// [`ScriptedTcpBackend::step_errors`] /
     /// [`ScriptedTcpBackend::assert_no_step_errors`].
     step_errors: Mutex<Vec<String>>,
+    /// AbortHandles for every in-flight per-connection task. Drop-time
+    /// teardown aborts all of them so long-running steps (e.g., a
+    /// `TcpStep::Sleep(30s)` still running when the backend is dropped)
+    /// don't leak into later tests.
+    connection_aborts: StdMutex<Vec<AbortHandle>>,
+}
+
+impl BackendState {
+    fn track_connection(&self, abort: AbortHandle) {
+        if let Ok(mut guard) = self.connection_aborts.lock() {
+            // Best-effort compaction: drop finished handles so the Vec
+            // doesn't grow unbounded over the backend's lifetime.
+            guard.retain(|h| !h.is_finished());
+            guard.push(abort);
+        }
+    }
 }
 
 /// A running scripted TCP backend. Dropping the handle shuts it down.
@@ -305,13 +326,20 @@ impl ScriptedTcpBackend {
     }
 
     /// Signal shutdown; the accept loop exits on its next iteration. Safe
-    /// to call multiple times.
+    /// to call multiple times. Also aborts every in-flight per-connection
+    /// task so long-running steps (Sleep, slow writes) don't outlive the
+    /// backend.
     pub fn shutdown(&mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
         if let Some(h) = self.handle.take() {
             h.abort();
+        }
+        if let Ok(mut guard) = self.state.connection_aborts.lock() {
+            for abort in guard.drain(..) {
+                abort.abort();
+            }
         }
     }
 }
@@ -544,6 +572,57 @@ mod tests {
         // The backend drops the socket right after accept; client sees EOF.
         let n = client.read(&mut buf).await.expect("read");
         assert_eq!(n, 0, "expected EOF after drop, got {n} bytes");
+    }
+
+    /// Regression test: dropping the backend aborts in-flight connection
+    /// tasks. Previously only the accept-loop handle was aborted, so a
+    /// long `Sleep` step kept running after the backend was dropped,
+    /// leaking behaviour into later tests.
+    ///
+    /// Observable: after drop, a second connect to the freed port gets
+    /// `ECONNREFUSED` quickly (listener is gone), *and* the first
+    /// client's socket observes EOF shortly after drop (the Sleep-step
+    /// task would otherwise hold the connection open for 10 seconds).
+    #[tokio::test]
+    async fn drop_aborts_in_flight_connection_tasks() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let mut backend = ScriptedTcpBackend::builder(reservation.into_listener())
+            .step(TcpStep::Sleep(Duration::from_secs(10)))
+            .step(TcpStep::Write(b"should-not-fire".to_vec()))
+            .spawn()
+            .expect("spawn");
+
+        // Open the connection so the accept loop hands off to a
+        // per-connection task that enters the 10-second Sleep.
+        let mut client = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        // Give the accept loop time to spawn the per-connection task.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Drop the backend. Without the connection_aborts fix, the
+        // per-connection task continues sleeping for ~10 seconds and
+        // the client's read below would block past our 500ms timeout.
+        backend.shutdown();
+        drop(backend);
+
+        // The in-flight task should be aborted within a few ms. The
+        // client observes EOF on its half of the socket as the runtime
+        // drops the backend side.
+        let mut buf = [0u8; 16];
+        let read_result = tokio::time::timeout(Duration::from_millis(500), client.read(&mut buf))
+            .await
+            .expect("connection did not close within 500ms after backend drop");
+        match read_result {
+            // EOF or an error are both fine — the point is the read
+            // returned promptly instead of blocking on the 10s Sleep.
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!(
+                "unexpected {n} bytes read after backend drop: {:?}",
+                &buf[..n]
+            ),
+        }
     }
 
     /// `run_script` short-reads (peer closed before `ReadExact` filled)
