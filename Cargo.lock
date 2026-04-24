@@ -1862,6 +1862,7 @@ dependencies = [
  "futures",
  "futures-util",
  "google-cloud-secretmanager-v1",
+ "h2 0.4.13",
  "h3",
  "h3-quinn",
  "hex",
