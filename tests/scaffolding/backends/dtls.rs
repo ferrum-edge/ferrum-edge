@@ -120,25 +120,23 @@ impl ScriptedDtlsBackendBuilder {
 
     /// Spawn the backend. Reuses the existing `DtlsServer` — same code the
     /// gateway uses for DTLS frontend termination in production.
+    ///
+    /// We hand the reserved `UdpSocket` directly to
+    /// `DtlsServer::from_socket` rather than dropping it and asking
+    /// `DtlsServer::bind` to re-create its own socket. That closes the
+    /// bind-drop-rebind window the rest of the port-reservation
+    /// contract is built to avoid.
     pub async fn spawn(
         self,
     ) -> Result<ScriptedDtlsBackend, Box<dyn std::error::Error + Send + Sync>> {
-        let local_addr = self.socket.local_addr()?;
-        let port = local_addr.port();
-
-        // `DtlsServer::bind` wants to create its own socket. We release
-        // the reservation just before it rebinds — same pattern the
-        // gateway's functional DTLS tests use. The race window is the
-        // same millisecond-scale slot other Phase-1 tests accept under
-        // the port-reservation contract.
-        drop(self.socket);
+        let port = self.socket.local_addr()?.port();
 
         let frontend_config = FrontendDtlsConfig {
             dimpl_config: self.config.dimpl_config,
             certificate: self.config.certificate,
             client_cert_verifier: None,
         };
-        let server = DtlsServer::bind(local_addr, frontend_config).await?;
+        let server = DtlsServer::from_socket(self.socket, frontend_config);
         let server = Arc::new(server);
 
         let state = Arc::new(DtlsBackendState::default());

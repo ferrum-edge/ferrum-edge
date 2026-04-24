@@ -519,16 +519,24 @@ impl DtlsServer {
         addr: SocketAddr,
         frontend_config: FrontendDtlsConfig,
     ) -> Result<Self, anyhow::Error> {
-        let socket = Arc::new(
-            UdpSocket::bind(addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to bind DTLS server on {}: {}", addr, e))?,
-        );
+        let socket = UdpSocket::bind(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to bind DTLS server on {}: {}", addr, e))?;
+        Ok(Self::from_socket(socket, frontend_config))
+    }
 
+    /// Create a `DtlsServer` from an already-bound `UdpSocket`. Useful when the
+    /// caller has reserved the port via a separate pathway (e.g. test
+    /// scaffolding holding a `UdpSocket` open across the
+    /// reserve-then-construct gap to avoid the bind-drop-rebind race) and
+    /// wants to hand the socket directly to the DTLS server without any
+    /// release/rebind window.
+    pub fn from_socket(socket: UdpSocket, frontend_config: FrontendDtlsConfig) -> Self {
+        let socket = Arc::new(socket);
         let (accept_tx, accept_rx) = mpsc::channel(256);
         let (shutdown_tx, _) = watch::channel(false);
 
-        Ok(Self {
+        Self {
             socket,
             config: frontend_config.dimpl_config,
             certificate: frontend_config.certificate,
@@ -537,7 +545,7 @@ impl DtlsServer {
             accept_rx: tokio::sync::Mutex::new(accept_rx),
             client_cert_verifier: frontend_config.client_cert_verifier,
             shutdown_tx,
-        })
+        }
     }
 
     /// Get the local address this server is bound to.

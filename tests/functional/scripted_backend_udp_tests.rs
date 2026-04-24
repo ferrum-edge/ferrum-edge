@@ -21,7 +21,7 @@
 
 use crate::scaffolding::backends::{DatagramMatcher, ScriptedUdpBackend, UdpStep};
 use crate::scaffolding::clients::{UdpClient, dtls::dtls_client_hello_with_sni};
-use crate::scaffolding::ports::{reserve_udp_port, unbound_udp_port};
+use crate::scaffolding::ports::{reserve_udp_port, unbound_port, unbound_udp_port};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -132,20 +132,22 @@ where
 {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        // Stream listen_port: UDP port for frontend.
+        // Stream listen_port: UDP port for the gateway's UDP/DTLS
+        // frontend — reserve in the UDP namespace.
         let udp_port = match unbound_udp_port().await {
             Ok(p) => p,
             Err(_) => continue,
         };
-        // Admin + proxy HTTP ports for /health + metrics.
-        let admin_port = match unbound_udp_port().await {
-            // unbound_udp_port just picks an ephemeral port number; the
-            // HTTP admin listener will rebind on TCP. The port number
-            // is portable across TCP/UDP.
+        // Admin + proxy HTTP ports are TCP listeners. UDP and TCP
+        // namespaces are independent, so a UDP-free port can still be
+        // held in TCP by another test. Reserve via the TCP helper to
+        // catch the conflict at reserve time rather than at gateway-
+        // bind time.
+        let admin_port = match unbound_port().await {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let proxy_http_port = match unbound_udp_port().await {
+        let proxy_http_port = match unbound_port().await {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -430,25 +432,33 @@ plugin_configs: []
         .recv_batch_with_deadline(200, Duration::from_millis(1500))
         .await;
 
-    // Allow for one or two in-flight datagrams that might slip the
-    // factor check on a lucky scheduler path, but assert the ceiling
-    // is well below 100 (i.e., clamping is active).
-    assert!(
-        received.len() < 20,
-        "amplification factor did not clamp responses: client received \
-         {} datagrams (backend sent 100; factor=1 × 100 req bytes = 100 \
-         allowed, each reply was 200 bytes and should have been dropped)",
-        received.len()
-    );
+    // Every backend reply is 200 bytes. The factor=1 cap allows at
+    // most 1 × 100 = 100 bytes of cumulative reply for this 100-byte
+    // request, so any single 200-byte datagram exceeds the budget on
+    // its own and must be dropped — the ENTIRE batch should be
+    // rejected. A leak of even one oversized datagram represents a
+    // real regression, so assert each datagram fits inside the
+    // configured per-request allowance.
+    let request_bytes = request.len();
+    for (i, d) in received.iter().enumerate() {
+        assert!(
+            d.len() <= request_bytes,
+            "amplification factor leaked: datagram {i} carries {} bytes, \
+             which exceeds the factor=1 × {} request-byte budget. The \
+             gateway should have dropped it",
+            d.len(),
+            request_bytes,
+        );
+    }
 
-    // Also assert total bytes received ≤ 10× sent (belt-and-suspenders
-    // per the plan text).
+    // The cumulative-budget check is the spec's exact wording: total
+    // reply bytes must be ≤ factor × request bytes. Factor=1 here.
     let total_bytes: usize = received.iter().map(|d| d.len()).sum();
-    let sent_bytes = request.len();
     assert!(
-        total_bytes <= sent_bytes * 10,
-        "received {total_bytes} bytes in replies; sent {sent_bytes} \
-         bytes in the request — amplification > 10×"
+        total_bytes <= request_bytes,
+        "amplification factor exceeded: received {total_bytes} reply bytes \
+         for a {request_bytes}-byte request (cap=factor × request = \
+         {request_bytes})",
     );
 
     // Give the backend a moment to drain its send loop.
