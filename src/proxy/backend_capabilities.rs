@@ -222,6 +222,17 @@ impl BackendCapabilityRegistry {
         self.entries.retain(|key, _| active_keys.contains(key));
     }
 
+    /// Snapshot of every registry entry as `(key, record)` pairs. Used by
+    /// the test-only admin `/backend-capabilities` endpoint and by
+    /// introspection tools. Not called on the hot path — allocates one
+    /// `Vec` + clones every `Arc`.
+    pub fn snapshot(&self) -> Vec<(String, Arc<BackendCapabilityRecord>)> {
+        self.entries
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

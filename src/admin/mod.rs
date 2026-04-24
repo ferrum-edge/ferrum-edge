@@ -701,6 +701,18 @@ pub async fn handle_admin_request(
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
+        // Backend capability registry introspection + refresh.
+        //
+        // Gated on `FERRUM_EXPOSE_CAPABILITY_REGISTRY=true` so production
+        // deployments don't accidentally leak internal protocol
+        // classifications. Used by the scripted-backend test framework
+        // (Phase 3) to assert on H3/H2 downgrade behaviour without
+        // flakier log-scraping.
+        (Method::GET, ["backend-capabilities"]) => handle_backend_capabilities_get(&state).await,
+        (Method::POST, ["backend-capabilities", "refresh"]) => {
+            handle_backend_capabilities_refresh(&state).await
+        }
+
         _ => Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "Not Found"}),
@@ -2199,5 +2211,104 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
                 "message": "Cluster status is only available in cp or dp modes",
             }),
         )),
+    }
+}
+
+// ---- Backend Capability Registry (test-only introspection) ----
+
+/// Whether the capability-registry introspection endpoints are enabled.
+/// Checked per-request so operators can flip the flag by restarting the
+/// gateway with a different env value without a code change.
+fn capability_registry_exposed() -> bool {
+    std::env::var("FERRUM_EXPOSE_CAPABILITY_REGISTRY")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn capability_registry_disabled_response() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::NOT_FOUND,
+        &json!({
+            "error": "backend-capabilities endpoint is disabled; set FERRUM_EXPOSE_CAPABILITY_REGISTRY=true to enable"
+        }),
+    )
+}
+
+async fn handle_backend_capabilities_get(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if !capability_registry_exposed() {
+        return Ok(capability_registry_disabled_response());
+    }
+    let proxy_state = match &state.proxy_state {
+        Some(ps) => ps,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "proxy_state unavailable in this mode"}),
+            ));
+        }
+    };
+    let snapshot = proxy_state.backend_capabilities.snapshot();
+    let entries: Vec<serde_json::Value> = snapshot
+        .into_iter()
+        .map(|(key, record)| {
+            json!({
+                "key": key,
+                "plain_http": {
+                    "h1": protocol_support_label(record.plain_http.h1),
+                    "h2_tls": protocol_support_label(record.plain_http.h2_tls),
+                    "h3": protocol_support_label(record.plain_http.h3),
+                },
+                "grpc_transport": {
+                    "h2_tls": protocol_support_label(record.grpc_transport.h2_tls),
+                    "h2c": protocol_support_label(record.grpc_transport.h2c),
+                },
+                "last_probe_at_unix_secs": record.last_probe_at_unix_secs,
+                "last_probe_error": record.last_probe_error.clone(),
+            })
+        })
+        .collect();
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "entries": entries,
+        }),
+    ))
+}
+
+async fn handle_backend_capabilities_refresh(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if !capability_registry_exposed() {
+        return Ok(capability_registry_disabled_response());
+    }
+    let proxy_state = match &state.proxy_state {
+        Some(ps) => ps,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "proxy_state unavailable in this mode"}),
+            ));
+        }
+    };
+    // Run synchronously so the caller can assert on the post-refresh
+    // snapshot immediately. The request handler is already on a tokio
+    // worker task so .await is fine.
+    proxy_state.refresh_backend_capabilities().await;
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({"status": "refreshed"}),
+    ))
+}
+
+fn protocol_support_label(
+    support: crate::proxy::backend_capabilities::ProtocolSupport,
+) -> &'static str {
+    use crate::proxy::backend_capabilities::ProtocolSupport;
+    match support {
+        ProtocolSupport::Unknown => "unknown",
+        ProtocolSupport::Supported => "supported",
+        ProtocolSupport::Unsupported => "unsupported",
     }
 }
