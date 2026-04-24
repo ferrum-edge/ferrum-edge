@@ -554,18 +554,12 @@ pub struct EnvConfig {
     /// Applies to HTTP, gRPC, HTTP/2, and HTTP/3 connection pools.
     pub pool_cleanup_interval_seconds: u64,
 
-    /// TTL (seconds) for negative observations in the direct HTTP/2 pool's
-    /// ALPN learning cache (default: 14400 = 4 hours). When the pool sees
-    /// a backend negotiate `http/1.1`, subsequent requests short-circuit
-    /// to reqwest to avoid a repeat handshake+failure. After this TTL
-    /// expires, the next request re-probes HTTP/2 — so a backend that has
-    /// been upgraded from h1.1 to HTTP/2 will be picked up at most one
-    /// TTL window later. Default of 4 h means at most one wasted h2
-    /// handshake per pool key every 4 h on an h1.1-only backend — near-
-    /// zero cost at scale while still surfacing backend upgrades within a
-    /// reasonable window. Set to 0 to disable expiry (backend observations
-    /// pinned until gateway restart — restores pre-TTL behavior).
-    pub http2_alpn_negative_cache_ttl_secs: u64,
+    /// Interval in seconds between backend capability reprobes (default:
+    /// 86400 = 24 hours). Startup classification runs before pool warmup;
+    /// this interval controls the background refresh that re-checks HTTPS
+    /// backends for HTTP/2 and HTTP/3 support and plaintext HTTP backends
+    /// for h2c support outside the request hot path.
+    pub backend_capability_refresh_interval_secs: u64,
 
     // Router cache
     /// Maximum entries in the router prefix/negative lookup cache (default: 0 = auto).
@@ -1046,7 +1040,7 @@ impl Default for EnvConfig {
             pool_warmup_enabled: true,
             pool_warmup_concurrency: 500,
             pool_cleanup_interval_seconds: 30,
-            http2_alpn_negative_cache_ttl_secs: 14_400,
+            backend_capability_refresh_interval_secs: 86_400,
             router_cache_max_entries: 0, // 0 = auto-scale based on proxy count
             tcp_idle_timeout_seconds: 300,
             tcp_half_close_max_wait_seconds: 300,
@@ -1299,7 +1293,7 @@ impl EnvConfig {
             pool_warmup_enabled: bool = "FERRUM_POOL_WARMUP_ENABLED" => true;
             pool_warmup_concurrency: usize = "FERRUM_POOL_WARMUP_CONCURRENCY" => 500usize, max(1usize);
             pool_cleanup_interval_seconds: u64 = "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS" => 30u64;
-            http2_alpn_negative_cache_ttl_secs: u64 = "FERRUM_HTTP2_ALPN_NEGATIVE_CACHE_TTL_SECS" => 14_400u64;
+            backend_capability_refresh_interval_secs: u64 = "FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS" => 86_400u64;
             router_cache_max_entries: usize = "FERRUM_ROUTER_CACHE_MAX_ENTRIES" => 0usize;
             tcp_idle_timeout_seconds: u64 = "FERRUM_TCP_IDLE_TIMEOUT_SECONDS" => 300u64;
             tcp_half_close_max_wait_seconds: u64 = "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS" => 300u64;
@@ -1615,7 +1609,7 @@ impl EnvConfig {
             pool_warmup_enabled,
             pool_warmup_concurrency,
             pool_cleanup_interval_seconds,
-            http2_alpn_negative_cache_ttl_secs,
+            backend_capability_refresh_interval_secs,
             router_cache_max_entries,
             tcp_idle_timeout_seconds,
             tcp_half_close_max_wait_seconds,

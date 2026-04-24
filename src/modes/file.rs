@@ -150,6 +150,13 @@ pub async fn run(
     if env_config.pool_warmup_enabled {
         proxy_state.warmup_connection_pools().await;
     }
+    // Kick off an initial capability probe when warmup is off — otherwise
+    // the registry stays empty and HTTPS H2/H3 dispatch falls back to
+    // reqwest until the first periodic tick (up to 24 h).
+    proxy_state.start_backend_capability_refresh_task(
+        !env_config.pool_warmup_enabled,
+        Some(shutdown_tx.subscribe()),
+    );
 
     // Start per-IP request counter cleanup (removes stale zero-count entries)
     proxy_state.start_per_ip_cleanup_task();

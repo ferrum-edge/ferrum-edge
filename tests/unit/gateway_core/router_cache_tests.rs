@@ -22,8 +22,7 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
         backend_scheme: Some(BackendScheme::Http),
-        backend_prefer_h3: false,
-        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
+        dispatch_kind: DispatchKind::from(BackendScheme::Http),
         backend_host: "backend.example.com".into(),
         backend_port: 3000,
         backend_path: None,
@@ -313,7 +312,7 @@ fn test_e2e_multiple_proxies_different_backends() {
 fn test_e2e_https_backend_protocol() {
     let mut proxy = test_proxy("secure", "/api");
     proxy.backend_scheme = Some(BackendScheme::Https);
-    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Https, false));
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Https);
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 

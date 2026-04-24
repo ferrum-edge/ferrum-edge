@@ -72,6 +72,11 @@ pub async fn run(
         env_config.clone(),
         Some(tls_policy.clone()),
     )?;
+    // DP starts with an empty config — the initial refresh has nothing
+    // to probe. The first `apply_incremental` / `update_config` call from
+    // the CP gRPC stream will trigger `spawn_backend_capability_refresh`,
+    // which populates the registry before traffic starts flowing.
+    proxy_state.start_backend_capability_refresh_task(false, Some(shutdown_tx.subscribe()));
 
     // Start per-IP request counter cleanup (removes stale zero-count entries)
     proxy_state.start_per_ip_cleanup_task();

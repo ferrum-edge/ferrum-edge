@@ -239,9 +239,10 @@ fn test_load_shared_example_config_fixture() {
 // After the BackendProtocol -> BackendScheme refactor, the wire format only
 // accepts canonical schemes (http, https, tcp, tcps, udp, dtls). Former
 // protocol values (ws, wss, grpc, grpcs) are detected per-request from the
-// incoming traffic (`HttpFlavor`). H3 is opt-in via `backend_prefer_h3`.
-// Serde rejects unknown enum values, so legacy aliases are no longer accepted
-// via file loading (the db_loader `parse_scheme` still tolerates them).
+// incoming traffic (`HttpFlavor`). Backend H3 selection is runtime capability-
+// driven for HTTPS backends. Serde rejects unknown enum values, so legacy
+// aliases are no longer accepted via file loading (the db_loader `parse_scheme`
+// still tolerates them).
 
 #[test]
 fn test_all_backend_schemes() {
@@ -285,13 +286,11 @@ plugin_configs: []
 }
 
 #[test]
-fn test_backend_prefer_h3_flag() {
+fn test_backend_scheme_defaults_to_https_for_http_family_proxy() {
     let yaml = r#"
 proxies:
   - id: "test-proxy"
     listen_path: "/test"
-    backend_scheme: https
-    backend_prefer_h3: true
     backend_host: "localhost"
     backend_port: 8443
 consumers: []
@@ -309,23 +308,16 @@ plugin_configs: []
     .unwrap();
 
     assert_eq!(config.proxies[0].backend_scheme, Some(BackendScheme::Https));
-    assert!(config.proxies[0].backend_prefer_h3);
-    assert_eq!(
-        config.proxies[0].dispatch_kind,
-        DispatchKind::HttpsH3Preferred
-    );
+    assert_eq!(config.proxies[0].dispatch_kind, DispatchKind::HttpsPool);
 }
 
 #[test]
-fn test_backend_prefer_h3_without_explicit_scheme_defaults_to_https() {
-    // HTTP-family proxies default to https when backend_scheme is omitted —
-    // backend_prefer_h3 should remain valid under that default rather than
-    // being rejected as "only valid with backend_scheme = https".
+fn test_legacy_h3_alias_rejected_by_file_loader() {
     let yaml = r#"
 proxies:
-  - id: "prefer-h3-default-https"
+  - id: "legacy-h3-alias"
     listen_path: "/v1"
-    backend_prefer_h3: true
+    backend_scheme: h3
     backend_host: "localhost"
     backend_port: 8443
 consumers: []
@@ -339,50 +331,11 @@ plugin_configs: []
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
         "ferrum",
-    )
-    .expect("backend_prefer_h3 with default scheme should load");
-
-    // Normalization should resolve dispatch_kind to HttpsH3Preferred.
-    assert!(config.proxies[0].backend_prefer_h3);
-    assert_eq!(
-        config.proxies[0].dispatch_kind,
-        DispatchKind::HttpsH3Preferred
     );
-}
-
-#[test]
-fn test_backend_prefer_h3_rejected_for_plaintext_http() {
-    // A plaintext http scheme must still reject backend_prefer_h3 (QUIC
-    // requires TLS). Guards against regressing the Finding #5 fix into
-    // "allow prefer_h3 for any HTTP-family scheme".
-    let yaml = r#"
-proxies:
-  - id: "prefer-h3-plaintext"
-    listen_path: "/v1"
-    backend_scheme: http
-    backend_prefer_h3: true
-    backend_host: "localhost"
-    backend_port: 8080
-consumers: []
-plugin_configs: []
-"#;
-
-    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
-    // The file loader surfaces field-validation failures with the count
-    // rather than the detailed message (the per-proxy detail goes to logs).
-    // Loading must fail — that's the contract: prefer_h3 over plaintext
-    // http does not silently degrade into HTTP/1.1 + HTTP/2.
-    let err = load_config_from_file(
-        file.path().to_str().unwrap(),
-        30,
-        &ferrum_edge::config::BackendAllowIps::Both,
-        "ferrum",
-    )
-    .expect_err("backend_prefer_h3 with plaintext http should reject");
+    let err = config.expect_err("legacy h3 alias should be rejected by serde file loading");
     assert!(
-        err.to_string().contains("invalid field"),
-        "error should surface field-validation failure: {}",
+        err.to_string().contains("unknown variant") || err.to_string().contains("h3"),
+        "error should mention the unsupported legacy alias: {}",
         err
     );
 }

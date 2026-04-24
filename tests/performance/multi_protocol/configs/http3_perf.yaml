@@ -6,7 +6,6 @@ proxies:
     name: "HTTP/3 Echo"
     listen_path: "/echo"
     backend_scheme: https
-    backend_prefer_h3: true
     backend_host: "127.0.0.1"
     backend_port: 3445
     strip_listen_path: false

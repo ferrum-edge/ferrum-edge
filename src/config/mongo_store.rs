@@ -1723,11 +1723,9 @@ mod inner {
                 hosts: vec!["example.com".to_string()],
                 listen_path: Some("/api".to_string()),
                 backend_scheme: Some(crate::config::types::BackendScheme::Https),
-                backend_prefer_h3: false,
-                dispatch_kind: crate::config::types::DispatchKind::from((
+                dispatch_kind: crate::config::types::DispatchKind::from(
                     crate::config::types::BackendScheme::Https,
-                    false,
-                )),
+                ),
                 backend_host: "backend.internal".to_string(),
                 backend_port: 8443,
                 backend_path: Some("/v2".to_string()),
@@ -1888,11 +1886,9 @@ mod inner {
                 hosts: vec![],
                 listen_path: Some("/".to_string()),
                 backend_scheme: Some(crate::config::types::BackendScheme::Http),
-                backend_prefer_h3: false,
-                dispatch_kind: crate::config::types::DispatchKind::from((
+                dispatch_kind: crate::config::types::DispatchKind::from(
                     crate::config::types::BackendScheme::Http,
-                    false,
-                )),
+                ),
                 backend_host: "localhost".to_string(),
                 backend_port: 80,
                 backend_path: None,
@@ -1961,11 +1957,9 @@ mod inner {
                 hosts: vec![],
                 listen_path: Some("/".to_string()),
                 backend_scheme: Some(crate::config::types::BackendScheme::Http),
-                backend_prefer_h3: false,
-                dispatch_kind: crate::config::types::DispatchKind::from((
+                dispatch_kind: crate::config::types::DispatchKind::from(
                     crate::config::types::BackendScheme::Http,
-                    false,
-                )),
+                ),
                 backend_host: "localhost".to_string(),
                 backend_port: 80,
                 backend_path: None,
@@ -2115,11 +2109,9 @@ mod inner {
                 hosts: vec![],
                 listen_path: Some("/test".to_string()),
                 backend_scheme: Some(crate::config::types::BackendScheme::Http),
-                backend_prefer_h3: false,
-                dispatch_kind: crate::config::types::DispatchKind::from((
+                dispatch_kind: crate::config::types::DispatchKind::from(
                     crate::config::types::BackendScheme::Http,
-                    false,
-                )),
+                ),
                 backend_host: "backend.local".to_string(),
                 backend_port: 8080,
                 backend_path: None,

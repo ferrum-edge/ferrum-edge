@@ -15,8 +15,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
         backend_scheme: Some(BackendScheme::Http),
-        backend_prefer_h3: false,
-        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
+        dispatch_kind: DispatchKind::from(BackendScheme::Http),
         backend_host: "localhost".into(),
         backend_port: 3000,
         backend_path: None,
@@ -130,8 +129,7 @@ fn test_unique_listen_paths_valid() {
                 hosts: vec![],
                 listen_path: Some("/api/v1".to_string()),
                 backend_scheme: Some(BackendScheme::Http),
-                backend_prefer_h3: false,
-                dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
+                dispatch_kind: DispatchKind::from(BackendScheme::Http),
                 backend_host: "localhost".into(),
                 backend_port: 3000,
                 backend_path: None,
@@ -184,8 +182,7 @@ fn test_unique_listen_paths_valid() {
                 hosts: vec![],
                 listen_path: Some("/api/v2".to_string()),
                 backend_scheme: Some(BackendScheme::Http),
-                backend_prefer_h3: false,
-                dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
+                dispatch_kind: DispatchKind::from(BackendScheme::Http),
                 backend_host: "localhost".into(),
                 backend_port: 3001,
                 backend_path: None,
@@ -253,8 +250,7 @@ fn test_unique_listen_paths_duplicate() {
                 hosts: vec![],
                 listen_path: Some("/api/v1".to_string()),
                 backend_scheme: Some(BackendScheme::Http),
-                backend_prefer_h3: false,
-                dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
+                dispatch_kind: DispatchKind::from(BackendScheme::Http),
                 backend_host: "localhost".into(),
                 backend_port: 3000,
                 backend_path: None,
@@ -307,8 +303,7 @@ fn test_unique_listen_paths_duplicate() {
                 hosts: vec![],
                 listen_path: Some("/api/v1".to_string()),
                 backend_scheme: Some(BackendScheme::Http),
-                backend_prefer_h3: false,
-                dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
+                dispatch_kind: DispatchKind::from(BackendScheme::Http),
                 backend_host: "localhost".into(),
                 backend_port: 3001,
                 backend_path: None,
@@ -1588,7 +1583,7 @@ fn test_anchor_regex_pattern_wildcard_suffix_preserved() {
 fn test_stream_proxy_tcp_requires_listen_port() {
     let mut proxy = make_proxy("p1", "/tcp");
     proxy.backend_scheme = Some(BackendScheme::Tcp);
-    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Tcp, false));
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
     proxy.listen_port = None;
     let mut config = empty_config();
     config.proxies = vec![proxy];
@@ -1600,7 +1595,7 @@ fn test_stream_proxy_tcp_requires_listen_port() {
 fn test_stream_proxy_tcp_with_listen_port_ok() {
     let mut proxy = make_proxy("p1", "/tcp");
     proxy.backend_scheme = Some(BackendScheme::Tcp);
-    proxy.dispatch_kind = DispatchKind::from((BackendScheme::Tcp, false));
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
     proxy.listen_port = Some(5432);
     let mut config = empty_config();
     config.proxies = vec![proxy];
@@ -1611,11 +1606,11 @@ fn test_stream_proxy_tcp_with_listen_port_ok() {
 fn test_stream_proxy_duplicate_ports() {
     let mut p1 = make_proxy("p1", "/tcp1");
     p1.backend_scheme = Some(BackendScheme::Tcp);
-    p1.dispatch_kind = DispatchKind::from((BackendScheme::Tcp, false));
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
     p1.listen_port = Some(5432);
     let mut p2 = make_proxy("p2", "/tcp2");
     p2.backend_scheme = Some(BackendScheme::Tcp);
-    p2.dispatch_kind = DispatchKind::from((BackendScheme::Tcp, false));
+    p2.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
     p2.listen_port = Some(5432);
     let mut config = empty_config();
     config.proxies = vec![p1, p2];
@@ -1680,11 +1675,11 @@ fn test_restore_payload_rejects_duplicate_listen_paths() {
 fn test_restore_payload_ignores_stream_proxy_listen_path_collisions() {
     let mut p1 = make_proxy("p1", "");
     p1.backend_scheme = Some(BackendScheme::Tcp);
-    p1.dispatch_kind = DispatchKind::from((BackendScheme::Tcp, false));
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
     p1.listen_port = Some(5432);
     let mut p2 = make_proxy("p2", "");
     p2.backend_scheme = Some(BackendScheme::Udp);
-    p2.dispatch_kind = DispatchKind::from((BackendScheme::Udp, false));
+    p2.dispatch_kind = DispatchKind::from(BackendScheme::Udp);
     p2.listen_port = Some(5353);
     let mut config = empty_config();
     config.proxies = vec![p1, p2];
@@ -1914,7 +1909,7 @@ fn test_http_proxy_rejects_empty_string_listen_path() {
 fn test_stream_proxy_with_listen_path_is_rejected() {
     let mut p = make_proxy("stream-with-path", "/nope");
     p.backend_scheme = Some(BackendScheme::Tcp);
-    p.dispatch_kind = DispatchKind::from((BackendScheme::Tcp, false));
+    p.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
     p.listen_port = Some(5432);
     let errs = p.validate_fields().unwrap_err();
     assert!(

@@ -9,10 +9,12 @@ use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
+    UpstreamTarget,
 };
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::http3::client::Http3ConnectionPool;
+use ferrum_edge::proxy::backend_capabilities::{capability_key, capability_key_for_proxy_target};
 use ferrum_edge::proxy::http2_pool::Http2ConnectionPool;
 use std::sync::Arc;
 
@@ -26,8 +28,7 @@ fn minimal_proxy() -> Proxy {
         hosts: vec![],
         listen_path: Some("/test".to_string()),
         backend_scheme: Some(BackendScheme::Http),
-        backend_prefer_h3: false,
-        dispatch_kind: DispatchKind::from((BackendScheme::Http, false)),
+        dispatch_kind: DispatchKind::from(BackendScheme::Http),
         backend_host: "backend.example.com".to_string(),
         backend_port: 8080,
         backend_path: None,
@@ -642,9 +643,10 @@ async fn connection_pool_and_h2_pool_keys_have_same_delimiter() {
 fn h3_pool_key_basic_format() {
     let proxy = minimal_proxy();
     let key = Http3ConnectionPool::pool_key(&proxy, 0);
-    // Format: host|port|index|ca|mtls|verify
+    // Format: host|port|index|dns_override|ca|mtls_cert|mtls_key|verify
+    // (all TLS fields empty by default, verify=true → trailing "1")
     assert_eq!(
-        key, "backend.example.com|8080|0|||1",
+        key, "backend.example.com|8080|0|||||1",
         "basic H3 key format mismatch"
     );
 }
@@ -765,9 +767,10 @@ fn h3_pool_key_pipe_delimiter_count() {
     let proxy = minimal_proxy();
     let key = Http3ConnectionPool::pool_key(&proxy, 0);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
+    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|verify = 8 fields → 7 pipes.
     assert_eq!(
-        pipe_count, 5,
-        "6 fields need 5 pipe delimiters in H3 key, got {pipe_count}: {key}"
+        pipe_count, 7,
+        "8 fields need 7 pipe delimiters in H3 key, got {pipe_count}: {key}"
     );
 }
 
@@ -786,15 +789,36 @@ fn h3_pool_key_no_protocol_field() {
 }
 
 #[test]
-fn h3_pool_key_no_dns_override_field() {
-    // H3 pool key does not include dns_override (unlike H2/HTTP pools)
+fn h3_pool_key_distinguishes_dns_override() {
+    // H3 pool key MUST include `dns_override` so a proxy pinning a specific
+    // resolved IP does not share a QUIC connection with a proxy that
+    // resolves through the default path. Mirrors HTTP and the backend
+    // capability registry key.
     let mut p1 = minimal_proxy();
     p1.dns_override = Some("10.0.0.1".to_string());
     let p2 = minimal_proxy();
-    assert_eq!(
+    assert_ne!(
         Http3ConnectionPool::pool_key(&p1, 0),
         Http3ConnectionPool::pool_key(&p2, 0),
-        "H3 pool key should not include dns_override"
+        "dns_override must separate H3 pool keys"
+    );
+}
+
+#[test]
+fn h3_pool_key_distinguishes_client_key_path() {
+    // The `client_key_path` (mTLS private key) must be part of the H3 pool
+    // key alongside `client_cert_path`, so two proxies presenting different
+    // signed certs — but with the same cert file path or with swapped
+    // cert/key pairings — don't inadvertently share a QUIC connection.
+    let mut p1 = minimal_proxy();
+    p1.resolved_tls.client_cert_path = Some("/mtls/same.pem".to_string());
+    p1.resolved_tls.client_key_path = Some("/mtls/key-a.key".to_string());
+    let mut p2 = p1.clone();
+    p2.resolved_tls.client_key_path = Some("/mtls/key-b.key".to_string());
+    assert_ne!(
+        Http3ConnectionPool::pool_key(&p1, 0),
+        Http3ConnectionPool::pool_key(&p2, 0),
+        "client_key_path must separate H3 pool keys"
     );
 }
 
@@ -829,13 +853,17 @@ fn h3_pool_key_full_tls_config() {
     let mut proxy = minimal_proxy();
     proxy.backend_tls_server_ca_cert_path = Some("/ca/bundle.pem".to_string());
     proxy.backend_tls_client_cert_path = Some("/client/cert.pem".to_string());
+    proxy.backend_tls_client_key_path = Some("/client/key.pem".to_string());
     proxy.backend_tls_verify_server_cert = false;
     proxy.resolved_tls.server_ca_cert_path = Some("/ca/bundle.pem".to_string());
     proxy.resolved_tls.client_cert_path = Some("/client/cert.pem".to_string());
+    proxy.resolved_tls.client_key_path = Some("/client/key.pem".to_string());
     proxy.resolved_tls.verify_server_cert = false;
     let key = Http3ConnectionPool::pool_key(&proxy, 2);
+    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|verify
+    // dns_override is empty here, so we get an empty field between index and CA.
     assert_eq!(
-        key, "backend.example.com|8080|2|/ca/bundle.pem|/client/cert.pem|0",
+        key, "backend.example.com|8080|2||/ca/bundle.pem|/client/cert.pem|/client/key.pem|0",
         "full TLS config H3 key format mismatch"
     );
 }
@@ -845,18 +873,20 @@ fn h3_pool_key_full_tls_config() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn h3_pool_key_for_target_basic_format() {
-    let key = Http3ConnectionPool::pool_key_for_target("upstream.example.com", 443, 0);
-    assert_eq!(
-        key, "upstream.example.com|443|0",
-        "target key should be host|port|index"
+fn h3_pool_key_for_target_starts_with_host_port_index() {
+    let proxy = minimal_proxy();
+    let key = Http3ConnectionPool::pool_key_for_target(&proxy, "upstream.example.com", 443, 0);
+    assert!(
+        key.starts_with("upstream.example.com|443|0|"),
+        "target key should start with host|port|index: {key}"
     );
 }
 
 #[test]
 fn h3_pool_key_for_target_different_index() {
-    let k0 = Http3ConnectionPool::pool_key_for_target("host.com", 443, 0);
-    let k5 = Http3ConnectionPool::pool_key_for_target("host.com", 443, 5);
+    let proxy = minimal_proxy();
+    let k0 = Http3ConnectionPool::pool_key_for_target(&proxy, "host.com", 443, 0);
+    let k5 = Http3ConnectionPool::pool_key_for_target(&proxy, "host.com", 443, 5);
     assert_ne!(
         k0, k5,
         "different indices should produce different target keys"
@@ -865,8 +895,9 @@ fn h3_pool_key_for_target_different_index() {
 
 #[test]
 fn h3_pool_key_for_target_different_hosts() {
-    let k1 = Http3ConnectionPool::pool_key_for_target("host-a.com", 443, 0);
-    let k2 = Http3ConnectionPool::pool_key_for_target("host-b.com", 443, 0);
+    let proxy = minimal_proxy();
+    let k1 = Http3ConnectionPool::pool_key_for_target(&proxy, "host-a.com", 443, 0);
+    let k2 = Http3ConnectionPool::pool_key_for_target(&proxy, "host-b.com", 443, 0);
     assert_ne!(
         k1, k2,
         "different hosts should produce different target keys"
@@ -875,8 +906,9 @@ fn h3_pool_key_for_target_different_hosts() {
 
 #[test]
 fn h3_pool_key_for_target_different_ports() {
-    let k1 = Http3ConnectionPool::pool_key_for_target("host.com", 443, 0);
-    let k2 = Http3ConnectionPool::pool_key_for_target("host.com", 8443, 0);
+    let proxy = minimal_proxy();
+    let k1 = Http3ConnectionPool::pool_key_for_target(&proxy, "host.com", 443, 0);
+    let k2 = Http3ConnectionPool::pool_key_for_target(&proxy, "host.com", 8443, 0);
     assert_ne!(
         k1, k2,
         "different ports should produce different target keys"
@@ -885,32 +917,105 @@ fn h3_pool_key_for_target_different_ports() {
 
 #[test]
 fn h3_pool_key_for_target_pipe_delimiter_count() {
-    let key = Http3ConnectionPool::pool_key_for_target("host.com", 443, 0);
+    let proxy = minimal_proxy();
+    let key = Http3ConnectionPool::pool_key_for_target(&proxy, "host.com", 443, 0);
+    // Shape: host|port|index|dns_override|ca|mtls_cert|mtls_key|verify = 7 pipes.
     let pipe_count = key.chars().filter(|c| *c == '|').count();
     assert_eq!(
-        pipe_count, 2,
-        "3 fields need 2 pipe delimiters in target key, got {pipe_count}: {key}"
+        pipe_count, 7,
+        "8 fields need 7 pipe delimiters in target key, got {pipe_count}: {key}"
     );
 }
 
 #[test]
 fn h3_pool_key_for_target_ipv6() {
-    let key = Http3ConnectionPool::pool_key_for_target("::1", 443, 0);
-    assert_eq!(key, "::1|443|0", "IPv6 target key should be safe");
+    let proxy = minimal_proxy();
+    let key = Http3ConnectionPool::pool_key_for_target(&proxy, "::1", 443, 0);
+    assert!(
+        key.starts_with("::1|443|0|"),
+        "IPv6 target key should be safe: {key}"
+    );
 }
 
 #[test]
-fn h3_pool_key_vs_target_key_differ() {
-    // A proxy key and a target key for the same host:port should differ
-    // because the proxy key has 6 fields (including TLS fields) and the
-    // target key has only 3 fields
+fn h3_pool_key_for_target_separates_distinct_dns_overrides() {
+    // Regression guard: two proxies with different `dns_override` values
+    // pointed at the same load-balanced target must NOT share a pooled
+    // QUIC connection — they resolve to different backend IPs.
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.dns_override = Some("10.0.0.1".to_string());
+
+    let mut p2 = p1.clone();
+    p2.dns_override = Some("10.0.0.2".to_string());
+
+    let k1 = Http3ConnectionPool::pool_key_for_target(&p1, "shared.backend", 443, 0);
+    let k2 = Http3ConnectionPool::pool_key_for_target(&p2, "shared.backend", 443, 0);
+    assert_ne!(k1, k2, "dns_override must separate H3 target pool keys");
+}
+
+#[test]
+fn h3_pool_key_for_target_separates_distinct_mtls_identities() {
+    // Regression guard: two proxies with different mTLS client certs must
+    // NOT share a QUIC connection — the backend sees a different client
+    // identity on each.
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.resolved_tls.client_cert_path = Some("/mtls/tenant-a.pem".to_string());
+    p1.resolved_tls.client_key_path = Some("/mtls/tenant-a.key".to_string());
+
+    let mut p2 = p1.clone();
+    p2.resolved_tls.client_cert_path = Some("/mtls/tenant-b.pem".to_string());
+    p2.resolved_tls.client_key_path = Some("/mtls/tenant-b.key".to_string());
+
+    let k1 = Http3ConnectionPool::pool_key_for_target(&p1, "shared.backend", 443, 0);
+    let k2 = Http3ConnectionPool::pool_key_for_target(&p2, "shared.backend", 443, 0);
+    assert_ne!(
+        k1, k2,
+        "mTLS client identity must separate H3 target pool keys"
+    );
+}
+
+#[test]
+fn h3_pool_key_for_target_separates_verify_toggle() {
+    // Regression guard: a proxy with verify=true must not share a pooled
+    // QUIC connection with a proxy that accepted the cert without
+    // verification.
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.resolved_tls.verify_server_cert = true;
+    let mut p2 = p1.clone();
+    p2.resolved_tls.verify_server_cert = false;
+
+    let k1 = Http3ConnectionPool::pool_key_for_target(&p1, "shared.backend", 443, 0);
+    let k2 = Http3ConnectionPool::pool_key_for_target(&p2, "shared.backend", 443, 0);
+    assert_ne!(
+        k1, k2,
+        "verify_server_cert must separate H3 target pool keys"
+    );
+}
+
+#[test]
+fn h3_pool_key_matches_target_key_when_host_port_match() {
+    // The proxy-level H3 pool key and the target-level H3 pool key must
+    // converge to the same string when the target is the proxy's own
+    // backend_host/backend_port — otherwise the retry path and the
+    // warmup path would create duplicate pool entries for the same
+    // connection identity.
     let proxy = minimal_proxy();
     let proxy_key = Http3ConnectionPool::pool_key(&proxy, 0);
-    let target_key =
-        Http3ConnectionPool::pool_key_for_target(&proxy.backend_host, proxy.backend_port, 0);
-    assert_ne!(
+    let target_key = Http3ConnectionPool::pool_key_for_target(
+        &proxy,
+        &proxy.backend_host,
+        proxy.backend_port,
+        0,
+    );
+    assert_eq!(
         proxy_key, target_key,
-        "proxy key and target key should differ (different field count)"
+        "proxy-level and target-level H3 keys must agree when host/port match"
     );
 }
 
@@ -941,4 +1046,139 @@ async fn all_three_pools_use_pipe_delimiter() {
             "{name} key should not have excessive empty fields: {key}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Backend capability registry key tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn backend_capability_key_uses_target_host_and_port() {
+    let proxy = minimal_proxy();
+    let target = UpstreamTarget {
+        host: "target.backend.internal".to_string(),
+        port: 9443,
+        weight: 1,
+        tags: Default::default(),
+        path: None,
+    };
+
+    let key = capability_key_for_proxy_target(&proxy, Some(&target));
+
+    assert!(
+        key.starts_with("http|target.backend.internal|9443|"),
+        "capability key should be keyed by the real backend target identity: {key}"
+    );
+}
+
+#[test]
+fn backend_capability_key_includes_tls_identity_fields() {
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.resolved_tls.server_ca_cert_path = Some("/ca/a.pem".to_string());
+    p1.resolved_tls.client_cert_path = Some("/mtls/client.pem".to_string());
+    p1.resolved_tls.client_key_path = Some("/mtls/client.key".to_string());
+
+    let mut p2 = p1.clone();
+    p2.resolved_tls.client_key_path = Some("/mtls/other.key".to_string());
+
+    let key1 = capability_key(&p1);
+    let key2 = capability_key(&p2);
+
+    assert_ne!(
+        key1, key2,
+        "capability key must distinguish different TLS identities"
+    );
+}
+
+#[test]
+fn backend_capability_key_separates_distinct_dns_overrides() {
+    // Two otherwise-identical proxies pointed at the same logical backend
+    // must NOT share a capability entry when they pin different resolved
+    // IPs via `dns_override`: the probe result for one resolution target
+    // is not a valid proxy for the other.
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.dns_override = Some("10.0.0.1".to_string());
+
+    let mut p2 = p1.clone();
+    p2.dns_override = Some("10.0.0.2".to_string());
+
+    assert_ne!(
+        capability_key(&p1),
+        capability_key(&p2),
+        "dns_override must segregate capability entries"
+    );
+}
+
+#[test]
+fn backend_capability_key_separates_verify_server_cert_toggles() {
+    // Whether the backend cert is actually validated is part of the
+    // trust chain; probes with and without verification are not
+    // interchangeable observations.
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.resolved_tls.verify_server_cert = true;
+
+    let mut p2 = p1.clone();
+    p2.resolved_tls.verify_server_cert = false;
+
+    assert_ne!(
+        capability_key(&p1),
+        capability_key(&p2),
+        "verify_server_cert must segregate capability entries"
+    );
+}
+
+#[test]
+fn backend_capability_key_reuses_entry_across_equivalent_proxies() {
+    // Two proxies with the same resolved identity (scheme, host, port,
+    // dns_override, TLS fields) must hash to the exact same key so they
+    // share one probe result in the registry.
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.resolved_tls.server_ca_cert_path = Some("/ca/shared.pem".to_string());
+    p1.resolved_tls.verify_server_cert = true;
+
+    let mut p2 = p1.clone();
+    p2.id = "different-proxy-id".to_string();
+    p2.listen_path = Some("/other".to_string());
+    p2.strip_listen_path = !p1.strip_listen_path;
+
+    assert_eq!(
+        capability_key(&p1),
+        capability_key(&p2),
+        "proxy identity / path fields must not leak into the capability key"
+    );
+}
+
+#[test]
+fn backend_capability_key_prefers_upstream_target_over_proxy_backend() {
+    // When an upstream target is supplied, it completely replaces the
+    // proxy's template host/port in the key. Probes are keyed by the
+    // real connection endpoint, not the proxy's fallback values.
+    let proxy = minimal_proxy();
+    let target = UpstreamTarget {
+        host: "lb-member.internal".to_string(),
+        port: 7443,
+        weight: 1,
+        tags: Default::default(),
+        path: None,
+    };
+
+    let key_with_target = capability_key_for_proxy_target(&proxy, Some(&target));
+    let key_without_target = capability_key_for_proxy_target(&proxy, None);
+
+    assert!(
+        key_with_target.starts_with("http|lb-member.internal|7443|"),
+        "upstream target host/port should appear first: {key_with_target}"
+    );
+    assert!(
+        key_without_target.starts_with("http|backend.example.com|8080|"),
+        "proxy backend host/port should appear when no target is supplied: {key_without_target}"
+    );
 }

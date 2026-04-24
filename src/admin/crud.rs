@@ -716,7 +716,7 @@ impl AdminResource for Proxy {
             return Err(
                 "Field 'backend_protocol' was renamed to 'backend_scheme' (6-variant enum: \
                  http, https, tcp, tcps, udp, dtls). gRPC and WebSocket are now detected at \
-                 runtime from the request; HTTP/3 is opt-in via 'backend_prefer_h3: true'."
+                 runtime from the request; HTTPS backends are classified at startup for HTTP/1.1, HTTP/2, and HTTP/3 support."
                     .to_string(),
             );
         }

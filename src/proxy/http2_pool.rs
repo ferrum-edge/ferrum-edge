@@ -11,85 +11,12 @@ use dashmap::DashMap;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
-
-thread_local! {
-    static HTTP2_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(128));
-}
-
-// ALPN negotiation learning cache states. A single `AtomicU8` per pool key
-// records what the backend actually spoke after the first TLS handshake.
-const ALPN_UNKNOWN: u8 = 0;
-const ALPN_IS_HTTP1: u8 = 1;
-const ALPN_IS_HTTP2: u8 = 2;
-
-/// Wall-clock seconds since UNIX_EPOCH. Used as a coarse timestamp for
-/// TTL-expiring ALPN learning cache entries. Cheap — single syscall (or
-/// monotonic cached clock on Linux 2.6.32+).
-#[inline]
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Learning cache entry — decision + when it was last recorded.
-///
-/// Negative observations (`IsHttp1`) expire after
-/// `FERRUM_HTTP2_ALPN_NEGATIVE_CACHE_TTL_SECS` so a backend that was
-/// h1.1-only at some point can be re-probed later if it has been upgraded
-/// to HTTP/2. Without this, a single h1.1 observation would permanently
-/// route around the direct H2 pool for that key until gateway restart.
-/// Positive observations (`IsHttp2`) do not expire — an h2-capable backend
-/// rarely downgrades, and even if it did, the h2 attempt will fail and
-/// fall back to reqwest on the spot (no silent hang).
-struct AlpnEntry {
-    decision: AtomicU8,
-    recorded_at_unix_secs: AtomicU64,
-}
-
-impl AlpnEntry {
-    fn new(decision: u8) -> Self {
-        Self {
-            decision: AtomicU8::new(decision),
-            recorded_at_unix_secs: AtomicU64::new(now_unix_secs()),
-        }
-    }
-
-    /// Read the decision, treating expired `IsHttp1` observations as
-    /// `Unknown` so the caller re-probes. Zero-lock (two atomic loads).
-    fn effective_decision(&self, negative_ttl_secs: u64) -> u8 {
-        let decision = self.decision.load(Ordering::Relaxed);
-        if decision == ALPN_IS_HTTP1 && negative_ttl_secs > 0 {
-            let recorded = self.recorded_at_unix_secs.load(Ordering::Relaxed);
-            let now = now_unix_secs();
-            if now.saturating_sub(recorded) >= negative_ttl_secs {
-                return ALPN_UNKNOWN;
-            }
-        }
-        decision
-    }
-
-    fn record(&self, decision: u8) {
-        self.decision.store(decision, Ordering::Relaxed);
-        self.recorded_at_unix_secs
-            .store(now_unix_secs(), Ordering::Relaxed);
-    }
-}
-
-fn upsert_alpn_entry(cache: &DashMap<String, AlpnEntry>, pool_key: &str, decision: u8) {
-    cache
-        .entry(pool_key.to_owned())
-        .and_modify(|entry| entry.record(decision))
-        .or_insert_with(|| AlpnEntry::new(decision));
-}
 
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
@@ -133,15 +60,6 @@ fn pool_key_owned(proxy: &Proxy) -> String {
     buf
 }
 
-fn with_http2_pool_key<R>(proxy: &Proxy, f: impl FnOnce(&str) -> R) -> R {
-    HTTP2_POOL_KEY_BUF.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        buf.clear();
-        write_http2_pool_key(&mut buf, &proxy.backend_host, proxy.backend_port, proxy);
-        f(buf.as_str())
-    })
-}
-
 fn write_http2_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
     buf.truncate(base_len);
     buf.push('#');
@@ -161,60 +79,13 @@ struct Http2PoolManager {
     tls_policy: Option<Arc<TlsPolicy>>,
     crls: crate::tls::CrlList,
     tls_configs: BackendTlsConfigCache,
-    /// Learning cache: pool-key → (last-observed ALPN decision, timestamp).
-    /// Checked before the TLS handshake on subsequent requests so a backend
-    /// that negotiated h1.1 once is not retried through this pool — saves
-    /// one TLS handshake + one failed h2 attempt per miss. Negative
-    /// (`IsHttp1`) observations expire via TTL so a backend that's been
-    /// upgraded to h2 gets re-probed; see `AlpnEntry::effective_decision`.
-    alpn_cache: Arc<DashMap<String, AlpnEntry>>,
 }
 
 impl Http2PoolManager {
-    /// Probe the ALPN learning cache for this proxy's pool key. Returns
-    /// early with `BackendSelectedHttp1` when we've previously observed
-    /// the backend negotiating h1.1 — the dispatcher falls back to reqwest
-    /// without touching the network. One `DashMap` read lock + two atomic
-    /// loads on the hot path; ~40 ns per lookup.
-    ///
-    /// Stale `IsHttp1` observations (older than
-    /// `http2_alpn_negative_cache_ttl_secs`) are treated as `Unknown` so a
-    /// backend that was upgraded to HTTP/2 gets re-probed at most once
-    /// per TTL window per pool key.
-    fn alpn_shortcut(&self, proxy: &Proxy) -> Result<(), Http2PoolError> {
-        let ttl = self.global_env_config.http2_alpn_negative_cache_ttl_secs;
-        with_http2_pool_key(proxy, |key| {
-            if let Some(entry) = self.alpn_cache.get(key)
-                && entry.effective_decision(ttl) == ALPN_IS_HTTP1
-            {
-                return Err(Http2PoolError::BackendSelectedHttp1 {
-                    pool_key: key.to_owned(),
-                });
-            }
-            Ok(())
-        })
-    }
-
-    /// Record the ALPN decision observed on a completed handshake. Writes
-    /// are `Relaxed` because ordering across requests doesn't matter — we
-    /// only need the observation to become visible eventually.
-    fn record_alpn(&self, pool_key: &str, decision: u8) {
-        if let Some(entry) = self.alpn_cache.get(pool_key) {
-            entry.record(decision);
-            return;
-        }
-        upsert_alpn_entry(&self.alpn_cache, pool_key, decision);
-    }
-
     async fn create_connection(
         &self,
         proxy: &Proxy,
     ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
-        // Fail fast if the ALPN learning cache has already marked this
-        // backend as h1.1-only. The dispatcher catches this variant and
-        // falls back to reqwest.
-        self.alpn_shortcut(proxy)?;
-
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
@@ -365,8 +236,7 @@ impl Http2PoolManager {
 
                 // Advertise both `h2` and `http/1.1` — the backend picks.
                 // If it picks h2 we use this pool; if it picks http/1.1 the
-                // caller (create_tls_connection) observes the negotiated
-                // protocol after the handshake and returns
+                // caller (create_tls_connection) returns
                 // `BackendSelectedHttp1` so the dispatcher can route via
                 // reqwest. Advertising only `h2` would fail the handshake
                 // against h1-only servers with no graceful recovery.
@@ -404,16 +274,14 @@ impl Http2PoolManager {
         // Inspect negotiated ALPN. rustls 0.22+ exposes the chosen protocol
         // on the client session; `get_ref().1` is the `ClientConnection`.
         // If the backend picked http/1.1 (or advertised nothing), short-circuit
-        // rather than trying an h2 handshake that will fail anyway. Update
-        // the learning cache so future requests to this backend skip even
-        // the TCP connect attempt on this pool.
+        // rather than trying an h2 handshake that will fail anyway. Capability
+        // learning happens outside this pool now, so we return the signal but
+        // do not cache it here.
         let pool_key = pool_key_owned(proxy);
         let negotiated_is_h2 = matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2"));
         if !negotiated_is_h2 {
-            self.record_alpn(&pool_key, ALPN_IS_HTTP1);
             return Err(Http2PoolError::BackendSelectedHttp1 { pool_key });
         }
-        self.record_alpn(&pool_key, ALPN_IS_HTTP2);
 
         let io = TokioIo::new(tls_stream);
         let builder = Self::build_h2_builder(pool_config);
@@ -497,7 +365,6 @@ impl Http2ConnectionPool {
             tls_policy,
             crls,
             tls_configs: BackendTlsConfigCache::new(),
-            alpn_cache: Arc::new(DashMap::new()),
         });
 
         Self {
@@ -506,30 +373,11 @@ impl Http2ConnectionPool {
         }
     }
 
-    /// Cheap check (one DashMap read + one Relaxed atomic load, ~40ns) that
-    /// asks whether the ALPN learning cache has already observed the backend
-    /// pinned by `proxy` negotiating `http/1.1`. When `true`, the dispatcher
-    /// should skip the direct H2 pool entirely and route via reqwest — which
-    /// handles both h1.1 and h2 transparently via its own ALPN negotiation.
-    ///
-    /// Warmup probes at startup populate this cache so the first user request
-    /// doesn't have to pay the "learn the hard way" cost for an h1.1-only
-    /// backend.
-    pub fn is_known_http1_backend(&self, proxy: &Proxy) -> bool {
-        let manager = self.pool.manager();
-        let ttl = manager.global_env_config.http2_alpn_negative_cache_ttl_secs;
-        with_http2_pool_key(proxy, |key| {
-            manager
-                .alpn_cache
-                .get(key)
-                .is_some_and(|entry| entry.effective_decision(ttl) == ALPN_IS_HTTP1)
-        })
-    }
-
     pub fn pool_size(&self) -> usize {
         self.pool.pool_size()
     }
 
+    #[allow(dead_code)] // exercised from integration/unit tests
     pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
         pool_key_owned(proxy)
     }
@@ -1027,21 +875,5 @@ impl Http2PoolError {
             // variant rather than surfacing the message to clients.
             Self::BackendSelectedHttp1 { .. } => "backend does not support http/2",
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn upsert_alpn_entry_updates_existing_decision_on_slow_path() {
-        let cache = DashMap::new();
-        cache.insert("backend|443".to_string(), AlpnEntry::new(ALPN_IS_HTTP1));
-
-        upsert_alpn_entry(&cache, "backend|443", ALPN_IS_HTTP2);
-
-        let entry = cache.get("backend|443").expect("entry should exist");
-        assert_eq!(entry.effective_decision(u64::MAX), ALPN_IS_HTTP2);
     }
 }

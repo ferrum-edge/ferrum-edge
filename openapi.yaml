@@ -1452,28 +1452,14 @@ components:
             `https` proxy transparently serves a mix of REST, gRPC, and
             WebSocket traffic on the same backend pool.
 
-            HTTP/3 is opt-in via `backend_prefer_h3: true` (only valid
-            when `backend_scheme` is `https`).
-        backend_prefer_h3:
-          type: boolean
-          default: false
-          description: >-
-            Prefer HTTP/3 when speaking to this backend. Only meaningful
-            when `backend_scheme` resolves to `https`. Validation rejects
-            `true` with any non-`https` scheme.
-
-
-            HTTP/3 frontend traffic works against ANY `backend_scheme` —
-            the gateway bridges non-H3 backends via the H1/H2 reqwest /
-            HTTP/2 / gRPC infrastructure transparently. `backend_prefer_h3:
-            true` only controls whether the gateway *tries* QUIC to the
-            backend first; an HTTP/3 client can still hit a plain `https`
-            backend without this flag. See `docs/http3.md` for the full
-            dispatch model.
+            HTTPS backends are classified at startup for HTTP/1.1,
+            HTTP/2, and HTTP/3 support. Plain HTTP traffic uses the
+            native H3 backend pool automatically when the concrete target
+            is classified as H3-capable.
 
 
             **WebSocket requests arriving over HTTP/3** are rejected with
-            501 regardless of this flag. H3 Extended CONNECT for
+            501 regardless of backend capability. H3 Extended CONNECT for
             WebSocket (RFC 9220) is not widely deployed by clients or
             backends; operators should send WebSocket upgrades over
             HTTP/1.1 or HTTP/2.
@@ -1748,7 +1734,7 @@ components:
           MUST be null/omitted, and `listen_port` MUST be set,
           and `backend_scheme` MUST be set explicitly.
         - Legacy field `backend_protocol` is rejected. Use `backend_scheme`
-          plus (optionally) `backend_prefer_h3: true` for HTTP/3.
+          and let runtime capability classification handle backend HTTP/3.
       allOf:
         - $ref: "#/components/schemas/Proxy"
       required:
@@ -1766,8 +1752,9 @@ components:
         determined per-request (content-type, Upgrade/Connection headers,
         HTTP/2 Extended CONNECT) — it is **never pinned in config**.
         A single `https` proxy transparently serves a mix of REST, gRPC,
-        and WebSocket traffic on the same backend pool. HTTP/3 is opt-in
-        via the sibling `backend_prefer_h3: true`.
+        and WebSocket traffic on the same backend pool. Backend HTTP/3 is
+        selected automatically for plain HTTP traffic when the concrete
+        backend target is classified as H3-capable.
 
         **Stream family** (`tcp`, `tcps`, `udp`, `dtls`) are raw L4
         proxies selected by `listen_port`. `tcps` follows the
@@ -1779,7 +1766,7 @@ components:
         **Legacy note**: In earlier releases this was the 11-variant
         `BackendProtocol` enum including `ws`/`wss`/`grpc`/`grpcs`/`h3`
         plus `tcp_tls`. These are no longer accepted on the admin API —
-        use `backend_scheme` + `backend_prefer_h3` instead.
+        use `backend_scheme` instead.
 
     AuthMode:
       type: string

@@ -573,11 +573,24 @@ pub async fn connect_and_subscribe_with_startup_ready(
                                 .stream_listener_manager
                                 .wait_until_started(Duration::from_secs(10))
                                 .await?;
+                            // Block DP readiness on the first capability
+                            // classification. Without this the `/health`
+                            // endpoint would flip to ready while the
+                            // registry is still empty, so an L4 LB could
+                            // route traffic to an H3-only HTTPS backend
+                            // and the cross-protocol bridge would 502
+                            // until the background refresh landed.
+                            // Subsequent CP snapshots don't take this
+                            // path — `update_config` already spawns a
+                            // coalesced background refresh for them.
+                            proxy_state.refresh_backend_capabilities().await;
                             if let Some(ref startup_ready) = startup_ready {
                                 startup_ready.store(true, Ordering::Relaxed);
                             }
                             initial_snapshot_applied = true;
-                            info!("DP startup complete; /health now reports ready");
+                            info!(
+                                "DP startup complete; backend capabilities classified; /health now reports ready"
+                            );
                         }
                         info!("Full configuration snapshot applied from CP");
                     }

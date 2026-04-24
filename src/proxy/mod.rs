@@ -30,6 +30,7 @@
 //! - **Streaming by default**: Response bodies are streamed unless a plugin requires buffering
 //! - **Atomic config reload**: `update_config()` and `apply_incremental()` swap config atomically
 
+pub mod backend_capabilities;
 pub mod backend_dispatch;
 pub mod body;
 pub mod client_ip;
@@ -86,6 +87,10 @@ use crate::router_cache::RouterCache;
 use crate::service_discovery::ServiceDiscoveryManager;
 use crate::tls::{NoVerifier, TlsPolicy};
 
+use self::backend_capabilities::{
+    BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
+    ProtocolSupport, RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
+};
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::http2_pool::Http2ConnectionPool;
@@ -95,6 +100,48 @@ use self::http2_pool::Http2ConnectionPool;
 /// `&HashMap::new()` — this eliminates those per-rejection allocations.
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
+
+/// Capability probes run during startup and background refresh, so they should
+/// not inherit long per-request connect timeouts that could hold readiness.
+const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
+
+/// Partial outcome of a single H3 capability probe. `probe_h2_tls` writes
+/// directly into `record` (it owns `&mut record`), but `probe_h3` runs in
+/// parallel via `tokio::join!` so it can't simultaneously alias that borrow.
+/// Instead it returns this struct; `apply()` merges the result into the
+/// shared record + error list when the join completes.
+struct H3ProbeOutcome {
+    h3: ProtocolSupport,
+    error: Option<String>,
+}
+
+impl H3ProbeOutcome {
+    fn apply(self, record: &mut BackendCapabilityRecord, errors: &mut Vec<String>) {
+        if !matches!(self.h3, ProtocolSupport::Unknown) {
+            record.plain_http.h3 = self.h3;
+        }
+        if let Some(err) = self.error {
+            errors.push(err);
+        }
+    }
+}
+
+/// Append a probe-error message into `record.last_probe_error` without
+/// stomping an existing error. Used by `probe_h2_tls` which borrows the
+/// record mutably (can't also borrow the outer `errors` vec) — the outer
+/// caller recombines any `last_probe_error` set here with its own `errors`
+/// list.
+fn append_probe_error(record: &mut BackendCapabilityRecord, msg: String) {
+    match record.last_probe_error.as_mut() {
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(&msg);
+        }
+        None => {
+            record.last_probe_error = Some(msg);
+        }
+    }
+}
 
 /// Boxed future type for pool warmup tasks.
 /// Returns `Ok(description)` on success or `Err(message)` on failure.
@@ -132,25 +179,25 @@ fn warn_if_h3_backend_tls_policy_incompatible(
         return;
     };
 
-    let h3_proxy_ids: Vec<&str> = config
+    let h3_candidate_proxy_ids: Vec<&str> = config
         .proxies
         .iter()
-        .filter(|proxy| proxy.dispatch_kind == DispatchKind::HttpsH3Preferred)
+        .filter(|proxy| proxy.dispatch_kind == DispatchKind::HttpsPool)
         .map(|proxy| proxy.id.as_str())
         .collect();
-    if h3_proxy_ids.is_empty() {
+    if h3_candidate_proxy_ids.is_empty() {
         return;
     }
 
     if let Err(err) = crate::tls::validate_backend_tls_policy_for_quic(policy) {
-        let sample = h3_proxy_ids
+        let sample = h3_candidate_proxy_ids
             .iter()
             .take(3)
             .copied()
             .collect::<Vec<_>>()
             .join(", ");
         warn!(
-            h3_proxy_count = h3_proxy_ids.len(),
+            h3_proxy_count = h3_candidate_proxy_ids.len(),
             h3_proxy_sample = %sample,
             "Backend TLS policy is incompatible with HTTP/3/QUIC ({}). H3 backends will fall back to rustls safe defaults for the QUIC builder.",
             err
@@ -249,6 +296,69 @@ pub(crate) fn can_use_direct_http2_pool(
     requires_request_body_buffering: bool,
 ) -> bool {
     enable_http2 && !retain_request_body && !requires_request_body_buffering
+}
+
+pub(crate) fn supports_native_http3_backend(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> bool {
+    proxy.dispatch_kind == DispatchKind::HttpsPool
+        && state
+            .backend_capabilities
+            .get(proxy, upstream_target)
+            .is_some_and(|record| record.plain_http.h3.is_supported())
+}
+
+/// True when an `ErrorClass` represents an H3 / QUIC transport-level
+/// failure that should downgrade the cached H3 capability to
+/// `Unsupported`. Excludes application-layer / client-side errors
+/// (`ClientDisconnect`, `RequestBodyTooLarge`, `ResponseBodyTooLarge`,
+/// `RequestError`) which do not reflect backend QUIC health.
+pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
+    matches!(
+        class,
+        retry::ErrorClass::ConnectionRefused
+            | retry::ErrorClass::ConnectionTimeout
+            | retry::ErrorClass::ConnectionReset
+            | retry::ErrorClass::ConnectionClosed
+            | retry::ErrorClass::TlsError
+            | retry::ErrorClass::ProtocolError
+            | retry::ErrorClass::DnsLookupError
+            | retry::ErrorClass::PortExhaustion
+            | retry::ErrorClass::ConnectionPoolError
+            | retry::ErrorClass::ReadWriteTimeout
+    )
+}
+
+/// Is this H3 backend response the kind that should downgrade the cached
+/// H3 capability to `Unsupported`? Only connection / protocol-level
+/// failures — not 4xx/5xx application responses, not client disconnects,
+/// not payload-size errors.
+/// Classifies an H3 backend response as a transport-level failure based
+/// on `error_class` ALONE — intentionally ignoring `connection_error`.
+///
+/// Rationale: `classify_h3_error` marks GOAWAY / stream reset / other
+/// protocol errors and non-connect read timeouts with
+/// `connection_error=false`, yet they are still H3 transport failures.
+/// Routing the next request through the same native H3 pool would just
+/// repeat them. Only application-layer outcomes (`ClientDisconnect`,
+/// body-size errors, plain `RequestError`) leave the capability
+/// untouched — those reflect the request, not the backend.
+fn is_h3_transport_failure(resp: &retry::BackendResponse) -> bool {
+    resp.error_class.is_some_and(is_h3_transport_error_class)
+}
+
+fn supports_direct_http2_backend(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> bool {
+    proxy.dispatch_kind == DispatchKind::HttpsPool
+        && state
+            .backend_capabilities
+            .get(proxy, upstream_target)
+            .is_some_and(|record| record.plain_http.h2_tls.is_supported())
 }
 
 fn should_fallback_to_reqwest_after_http2_pool_error(err: &http2_pool::Http2PoolError) -> bool {
@@ -533,6 +643,13 @@ pub struct ProxyState {
     pub http2_pool: Arc<Http2ConnectionPool>,
     /// HTTP/3 connection pool for QUIC backends (reuses QUIC connections)
     pub h3_pool: Arc<Http3ConnectionPool>,
+    /// Startup-classified backend protocol capabilities keyed by real backend target identity.
+    pub backend_capabilities: SharedBackendCapabilityRegistry,
+    /// Single-flight guard for the capability refresh task. Coalesces bursts
+    /// of config-reload triggers into at most one in-flight refresh plus one
+    /// queued re-run so rapid `apply_incremental` calls do not spawn N
+    /// duplicate background probes.
+    pub backend_capabilities_refresh: SharedRefreshCoalescer,
     /// Load balancer cache for upstream target selection.
     pub load_balancer_cache: Arc<LoadBalancerCache>,
     /// Health checker for upstream targets.
@@ -679,6 +796,8 @@ impl ProxyState {
             env_config_arc.clone(),
             dns_cache.clone(),
         ));
+        let backend_capabilities = Arc::new(BackendCapabilityRegistry::new());
+        let backend_capabilities_refresh = Arc::new(RefreshCoalescer::new());
         let connection_pool = Arc::new(ConnectionPool::new(
             global_pool_config.clone(),
             env_config,
@@ -901,6 +1020,8 @@ impl ProxyState {
             grpc_pool,
             http2_pool,
             h3_pool,
+            backend_capabilities,
+            backend_capabilities_refresh,
             alt_svc_header,
             via_header_http11,
             via_header_http2,
@@ -982,129 +1103,438 @@ impl ProxyState {
         Err(anyhow::anyhow!("{}", msg.trim_end()))
     }
 
-    /// Pre-establish backend connections for all HTTP-family proxies.
-    ///
-    /// Warms four pool types (reqwest, gRPC, HTTP/2 direct, HTTP/3) after DNS
-    /// warmup completes, so the first request to each backend does not pay
-    /// TCP/TLS/QUIC handshake latency. Stream proxies (TCP/UDP) are skipped
-    /// because they create per-session connections with no persistent pool.
-    ///
-    /// For upstream-backed proxies, every target in the upstream is warmed for
-    /// pools that key by (host, port) — gRPC, HTTP/2 direct, HTTP/3. The
-    /// reqwest pool keys by `upstream_id` so one `get_client()` call covers
-    /// all targets (reqwest handles per-host pooling internally).
-    pub async fn warmup_connection_pools(&self) {
-        use futures_util::stream;
-        use std::collections::HashSet;
-
-        let config = self.config.load_full();
-        let concurrency = self.env_config.pool_warmup_concurrency;
-
-        // Build a deduplication set for per-host pools (H2, H3) keyed by the
-        // same pool key the pool itself uses, preventing redundant warmups.
-        // gRPC is omitted — that pool warms lazily on first gRPC request.
-        let mut seen_reqwest: HashSet<String> = HashSet::new();
-        let mut seen_h2: HashSet<String> = HashSet::new();
-        let mut seen_h3: HashSet<String> = HashSet::new();
-
-        // Collect all warmup tasks as boxed futures.
-        let mut tasks: Vec<WarmupTask> = Vec::new();
-
-        // Helper: build upstream target map for O(1) lookup
+    fn collect_backend_capability_targets(
+        &self,
+        config: &GatewayConfig,
+    ) -> Vec<BackendCapabilityProbeTarget> {
         let upstream_map: HashMap<&str, &crate::config::types::Upstream> = config
             .upstreams
             .iter()
-            .map(|u| (u.id.as_str(), u))
+            .map(|upstream| (upstream.id.as_str(), upstream))
             .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::new();
 
         for proxy in &config.proxies {
-            // Skip stream proxies — no persistent connection pools
-            if proxy.dispatch_kind.is_stream() {
+            if !proxy.dispatch_kind.is_http_family() {
                 continue;
             }
 
-            match proxy.dispatch_kind {
-                // All HTTP-family kinds warm the reqwest pool, which covers
-                // HTTP/1.1 and HTTP/2 over ALPN, plaintext and TLS, plus
-                // WebSocket (wss/ws) — flavor is detected per-request.
-                DispatchKind::HttpPool
-                | DispatchKind::HttpsPool
-                | DispatchKind::HttpsH3Preferred => {
-                    self.collect_reqwest_warmup_tasks(
-                        proxy,
-                        &upstream_map,
-                        &mut seen_reqwest,
-                        &mut tasks,
-                    );
-
-                    // HTTPS-family kinds may go through the direct H2 pool
-                    // when ALPN negotiates `h2` — warm it too. Plaintext HTTP
-                    // stays reqwest-only (no h2c prior-knowledge pre-warmup).
-                    if matches!(
-                        proxy.dispatch_kind,
-                        DispatchKind::HttpsPool | DispatchKind::HttpsH3Preferred
-                    ) {
-                        let pool_config =
-                            self.connection_pool.global_pool_config().for_proxy(proxy);
-                        if pool_config.enable_http2 {
-                            self.collect_h2_warmup_tasks(
-                                proxy,
-                                &upstream_map,
-                                &mut seen_h2,
-                                &mut tasks,
-                            );
-                        }
-                    }
-
-                    // Pre-warm the H3 pool only when the operator opted in
-                    // via `backend_prefer_h3`. H3 backends are not universal
-                    // and probing them eagerly wastes QUIC handshakes.
-                    if proxy.dispatch_kind == DispatchKind::HttpsH3Preferred {
-                        self.collect_h3_warmup_tasks(
-                            proxy,
-                            &upstream_map,
-                            &mut seen_h3,
-                            &mut tasks,
-                        );
+            if let Some(ref upstream_id) = proxy.upstream_id
+                && let Some(upstream) = upstream_map.get(upstream_id.as_str())
+            {
+                for target in &upstream.targets {
+                    let probe_target =
+                        BackendCapabilityProbeTarget::from_proxy(proxy, Some(target));
+                    if seen.insert(probe_target.key.clone()) {
+                        targets.push(probe_target);
                     }
                 }
-
-                // Stream kinds already filtered above — exhaustive match for
-                // type-system verification.
-                DispatchKind::TcpRaw
-                | DispatchKind::TcpTls
-                | DispatchKind::UdpRaw
-                | DispatchKind::UdpDtls => {}
+                continue;
             }
 
-            // The gRPC pool is intentionally NOT pre-warmed. gRPC is a
-            // runtime-detected flavor (content-type), so we can't know at
-            // startup which proxies will serve it. The gRPC pool warms lazily
-            // on the first gRPC request — acceptable because the pool's
-            // own TLS handshake sharing keeps repeat warmup cost low.
+            let probe_target = BackendCapabilityProbeTarget::from_proxy(proxy, None);
+            if seen.insert(probe_target.key.clone()) {
+                targets.push(probe_target);
+            }
         }
 
-        if tasks.is_empty() {
-            debug!("Pool warmup: no HTTP-family backends to warm");
+        self.backend_capabilities.retain_keys(&seen);
+        targets
+    }
+
+    fn build_backend_capability_probe_proxy(proxy: &Proxy) -> Proxy {
+        let mut probe_proxy = proxy.clone();
+        probe_proxy.backend_connect_timeout_ms = probe_proxy
+            .backend_connect_timeout_ms
+            .clamp(1, BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP);
+        probe_proxy
+    }
+
+    async fn probe_backend_capabilities(
+        &self,
+        target: &BackendCapabilityProbeTarget,
+    ) -> BackendCapabilityRecord {
+        let scheme = target.scheme();
+        let mut record = BackendCapabilityRecord::default();
+        // Accumulates *unexpected* probe failures only — connection errors on
+        // TLS backends and TLS-config setup errors. Expected "backend doesn't
+        // speak protocol X" outcomes (e.g., h2c not deployed on a plaintext
+        // backend, QUIC not deployed on a TLS backend) drop to debug and
+        // record a definitive `Unsupported`, which keeps operators from
+        // chasing phantom errors on every refresh cycle.
+        let mut errors = Vec::new();
+        let probe_proxy = Self::build_backend_capability_probe_proxy(&target.proxy);
+        let probe_timeout = Duration::from_millis(probe_proxy.backend_connect_timeout_ms);
+        let host = target.host();
+        let port = target.port();
+
+        match scheme {
+            BackendScheme::Http => {
+                record.plain_http.h1 = ProtocolSupport::Supported;
+                self.probe_h2c(&probe_proxy, probe_timeout, host, port, &mut record)
+                    .await;
+            }
+            BackendScheme::Https => {
+                // Run the H2 and H3 probes concurrently against the same
+                // backend target. They hit independent transports (TCP+TLS
+                // vs. UDP+QUIC), independent pools, and independent rustls
+                // configs, so there's no shared state to serialize on.
+                // Without this, a backend with slow TLS + slow QUIC would
+                // double the per-target wall-clock; `for_each_concurrent`
+                // only parallelizes *across* targets, not within one.
+                let tls_config_result = self
+                    .connection_pool
+                    .get_tls_config_for_backend(&probe_proxy);
+                let h2_fut =
+                    self.probe_h2_tls(&probe_proxy, probe_timeout, host, port, &mut record);
+                let h3_fut = Self::probe_h3(
+                    &self.h3_pool,
+                    &probe_proxy,
+                    probe_timeout,
+                    tls_config_result,
+                    host,
+                    port,
+                );
+                let (_, h3_outcome) = tokio::join!(h2_fut, h3_fut);
+                h3_outcome.apply(&mut record, &mut errors);
+            }
+            BackendScheme::Tcp | BackendScheme::Tcps | BackendScheme::Udp | BackendScheme::Dtls => {
+            }
+        }
+
+        record.last_probe_at_unix_secs = backend_capabilities::now_unix_secs();
+        // `probe_h2_tls` writes its own errors into `record.last_probe_error`
+        // directly (it owns `&mut record` alongside the join!-running H3
+        // future). `probe_h3`'s errors come back via the outcome struct in
+        // `errors`. Merge both sources here.
+        if !errors.is_empty() {
+            let joined = errors.join("; ");
+            match record.last_probe_error.as_mut() {
+                Some(existing) => {
+                    existing.push_str("; ");
+                    existing.push_str(&joined);
+                }
+                None => record.last_probe_error = Some(joined),
+            }
+        }
+        record
+    }
+
+    /// h2c prior-knowledge probe for a plaintext HTTP backend. Borrows
+    /// `record` so the outcome is written directly; genuine errors (none
+    /// expected for h2c — "backend doesn't speak h2c" is the normal case)
+    /// drop to `debug!` and classify as `Unsupported`.
+    async fn probe_h2c(
+        &self,
+        probe_proxy: &Proxy,
+        probe_timeout: Duration,
+        host: &str,
+        port: u16,
+        record: &mut BackendCapabilityRecord,
+    ) {
+        match tokio::time::timeout(probe_timeout, self.grpc_pool.get_sender(probe_proxy)).await {
+            Ok(Ok(_)) => {
+                record.grpc_transport.h2c = ProtocolSupport::Supported;
+            }
+            Ok(Err(err)) => {
+                record.grpc_transport.h2c = ProtocolSupport::Unsupported;
+                debug!(
+                    "h2c probe for {}:{} classified unsupported: {}",
+                    host, port, err
+                );
+            }
+            Err(_) => {
+                debug!(
+                    "h2c probe for {}:{} timed out after {}ms; leaving unknown",
+                    host, port, probe_proxy.backend_connect_timeout_ms
+                );
+            }
+        }
+    }
+
+    /// H2/TLS probe. Borrows `record` so the H2 + H1-fallback outcome is
+    /// written directly; unexpected connection failures are surfaced to the
+    /// caller via `errors` (this is the genuine "can't reach an HTTPS
+    /// backend" signal the operator should see).
+    async fn probe_h2_tls(
+        &self,
+        probe_proxy: &Proxy,
+        probe_timeout: Duration,
+        host: &str,
+        port: u16,
+        record: &mut BackendCapabilityRecord,
+    ) {
+        match tokio::time::timeout(probe_timeout, self.http2_pool.get_sender(probe_proxy)).await {
+            Ok(Ok(_)) => {
+                record.plain_http.h2_tls = ProtocolSupport::Supported;
+                record.grpc_transport.h2_tls = ProtocolSupport::Supported;
+            }
+            Ok(Err(http2_pool::Http2PoolError::BackendSelectedHttp1 { .. })) => {
+                record.plain_http.h1 = ProtocolSupport::Supported;
+                record.plain_http.h2_tls = ProtocolSupport::Unsupported;
+                record.grpc_transport.h2_tls = ProtocolSupport::Unsupported;
+            }
+            Ok(Err(err)) => {
+                // We need to collect this error for `last_probe_error`, but
+                // the outer function writes `errors` and we can't borrow it
+                // through the join! Thread the message via
+                // `record.last_probe_error` directly instead — the outer
+                // function merges this into the combined error string.
+                append_probe_error(
+                    record,
+                    format!("HTTP/2 probe failed for {host}:{port}: {err}"),
+                );
+            }
+            Err(_) => {
+                append_probe_error(
+                    record,
+                    format!(
+                        "HTTP/2 probe timed out for {}:{} after {}ms",
+                        host, port, probe_proxy.backend_connect_timeout_ms
+                    ),
+                );
+            }
+        }
+    }
+
+    /// H3 / QUIC probe. Returns an outcome the caller merges into `record` +
+    /// the outer `errors` vec. Takes `&Arc<Http3ConnectionPool>` plus a
+    /// pre-computed `tls_config_result` so the synchronous TLS-config build
+    /// (a real error case) is folded in without duplicating the timeout
+    /// handling. Written as an associated fn so it can be polled via
+    /// `tokio::join!` alongside `probe_h2_tls` (which borrows `&mut record`)
+    /// without aliasing `self`.
+    async fn probe_h3(
+        h3_pool: &Arc<Http3ConnectionPool>,
+        probe_proxy: &Proxy,
+        probe_timeout: Duration,
+        tls_config_result: Result<Arc<rustls::ClientConfig>, anyhow::Error>,
+        host: &str,
+        port: u16,
+    ) -> H3ProbeOutcome {
+        let tls_config = match tls_config_result {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                return H3ProbeOutcome {
+                    h3: ProtocolSupport::Unknown,
+                    error: Some(format!("HTTP/3 TLS config failed for {host}:{port}: {err}")),
+                };
+            }
+        };
+
+        match tokio::time::timeout(
+            probe_timeout,
+            h3_pool.warmup_connection(probe_proxy, &tls_config),
+        )
+        .await
+        {
+            Ok(Ok(())) => H3ProbeOutcome {
+                h3: ProtocolSupport::Supported,
+                error: None,
+            },
+            Ok(Err(err)) => {
+                debug!(
+                    "HTTP/3 probe for {}:{} classified unsupported: {}",
+                    host, port, err
+                );
+                H3ProbeOutcome {
+                    h3: ProtocolSupport::Unsupported,
+                    error: None,
+                }
+            }
+            Err(_) => {
+                debug!(
+                    "HTTP/3 probe for {}:{} timed out after {}ms; leaving unknown",
+                    host, port, probe_proxy.backend_connect_timeout_ms
+                );
+                H3ProbeOutcome {
+                    h3: ProtocolSupport::Unknown,
+                    error: None,
+                }
+            }
+        }
+    }
+
+    pub async fn refresh_backend_capabilities(&self) {
+        use futures_util::stream;
+
+        let config = self.config.load_full();
+        let targets = self.collect_backend_capability_targets(&config);
+        if targets.is_empty() {
+            debug!("Backend capability refresh: no HTTP-family backends to classify");
             return;
         }
 
-        let total = tasks.len();
+        let concurrency = self.env_config.pool_warmup_concurrency.max(1);
+        let refreshed = Arc::new(AtomicU64::new(0));
+        let h2_supported = Arc::new(AtomicU64::new(0));
+        let h3_supported = Arc::new(AtomicU64::new(0));
+        let h2c_supported = Arc::new(AtomicU64::new(0));
+
+        stream::iter(targets)
+            .for_each_concurrent(concurrency, |target| {
+                let state = self.clone();
+                let refreshed = refreshed.clone();
+                let h2_supported = h2_supported.clone();
+                let h3_supported = h3_supported.clone();
+                let h2c_supported = h2c_supported.clone();
+                async move {
+                    let record = state.probe_backend_capabilities(&target).await;
+                    if record.plain_http.h2_tls.is_supported() {
+                        h2_supported.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if record.plain_http.h3.is_supported() {
+                        h3_supported.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if record.grpc_transport.h2c.is_supported() {
+                        h2c_supported.fetch_add(1, Ordering::Relaxed);
+                    }
+                    state.backend_capabilities.upsert(target.key, record);
+                    refreshed.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .await;
+
         info!(
-            "Pool warmup: establishing {} backend connections (concurrency={})",
-            total, concurrency
+            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={})",
+            refreshed.load(Ordering::Relaxed),
+            h2_supported.load(Ordering::Relaxed),
+            h3_supported.load(Ordering::Relaxed),
+            h2c_supported.load(Ordering::Relaxed),
+        );
+    }
+
+    /// Request a capability refresh in the background, coalescing overlapping
+    /// requests. Callers are fire-and-forget: if a refresh is already running,
+    /// this returns immediately and the in-flight task re-drains `pending`
+    /// after it completes, so config changes that arrived mid-refresh are
+    /// still picked up without spawning N duplicate tasks or orphaning the
+    /// queued request.
+    pub(crate) fn spawn_backend_capability_refresh(&self) {
+        if !self.backend_capabilities_refresh.request() {
+            debug!("Backend capability refresh coalesced into in-flight task");
+            return;
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                while state.backend_capabilities_refresh.take_pending() {
+                    state.refresh_backend_capabilities().await;
+                }
+                // Handoff-safe finish: if a caller set `pending` between
+                // our last `take_pending()` and `try_finish()`, we either
+                // re-acquire the runner role (return `false`, loop back to
+                // drain again) or observe that someone else has become the
+                // runner in the meantime (return `true`, exit).
+                if state.backend_capabilities_refresh.try_finish() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Start the periodic background refresh task.
+    ///
+    /// `run_initial_refresh` controls whether this method kicks off an
+    /// immediate refresh before the first interval tick:
+    /// - Callers that already populated the registry via
+    ///   `warmup_connection_pools().await` should pass `false` (the skip
+    ///   avoids a duplicate probe at startup).
+    /// - Callers that did NOT run warmup (DP mode always, or file/db mode
+    ///   when `FERRUM_POOL_WARMUP_ENABLED=false`) must pass `true` —
+    ///   otherwise the registry stays empty until the first periodic tick
+    ///   (default 24 h), which means `supports_native_http3_backend` /
+    ///   `supports_direct_http2_backend` return `false` for every
+    ///   HTTPS request during that window and H3-only backends see
+    ///   persistent cross-protocol-bridge failures.
+    pub fn start_backend_capability_refresh_task(
+        &self,
+        run_initial_refresh: bool,
+        shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    ) {
+        if run_initial_refresh {
+            self.spawn_backend_capability_refresh();
+        }
+        let state = self.clone();
+        let interval_secs = self
+            .env_config
+            .backend_capability_refresh_interval_secs
+            .max(1);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            // Skip the first immediate tick: either warmup or the explicit
+            // `run_initial_refresh` call above has already kicked off a
+            // probe, or the operator genuinely has no HTTP-family backends
+            // and a no-op tick is harmless. From here on, only the
+            // periodic cadence matters.
+            interval.tick().await;
+
+            match shutdown {
+                Some(mut shutdown_rx) => loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            state.spawn_backend_capability_refresh();
+                        }
+                        _ = shutdown_rx.changed() => break,
+                    }
+                },
+                None => loop {
+                    interval.tick().await;
+                    state.spawn_backend_capability_refresh();
+                },
+            }
+        });
+    }
+
+    /// Pre-establish backend connections for all HTTP-family proxies.
+    ///
+    /// Startup first refreshes the backend capability registry so protocol
+    /// support is learned outside the request hot path. The probes themselves
+    /// warm the gRPC, direct HTTP/2, and HTTP/3 pools for targets that support
+    /// those transports. reqwest clients are then warmed for every HTTP-family
+    /// backend so the fallback/general path is also ready before traffic.
+    pub async fn warmup_connection_pools(&self) {
+        use futures_util::stream;
+
+        self.refresh_backend_capabilities().await;
+
+        let config = self.config.load_full();
+        let concurrency = self.env_config.pool_warmup_concurrency.max(1);
+        let mut seen_reqwest: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut tasks: Vec<WarmupTask> = Vec::new();
+        let upstream_map: HashMap<&str, &crate::config::types::Upstream> = config
+            .upstreams
+            .iter()
+            .map(|upstream| (upstream.id.as_str(), upstream))
+            .collect();
+
+        for proxy in &config.proxies {
+            if !proxy.dispatch_kind.is_http_family() {
+                continue;
+            }
+            self.collect_reqwest_warmup_tasks(proxy, &upstream_map, &mut seen_reqwest, &mut tasks);
+        }
+
+        if tasks.is_empty() {
+            debug!("Pool warmup: no HTTP-family backends to warm via reqwest");
+            return;
+        }
+
+        info!(
+            "Pool warmup: establishing {} reqwest backend connections (concurrency={})",
+            tasks.len(),
+            concurrency
         );
 
         let ok = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(AtomicU64::new(0));
 
-        let ok_ref = ok.clone();
-        let failed_ref = failed.clone();
-
         stream::iter(tasks)
             .for_each_concurrent(concurrency, |task| {
-                let ok = ok_ref.clone();
-                let failed = failed_ref.clone();
+                let ok = ok.clone();
+                let failed = failed.clone();
                 async move {
                     match task.await {
                         Ok(desc) => {
@@ -1124,11 +1554,13 @@ impl ProxyState {
         let failed_count = failed.load(Ordering::Relaxed);
         if failed_count > 0 {
             info!(
-                "Pool warmup complete: {} ok, {} failed out of {} targets",
-                ok_count, failed_count, total
+                "Pool warmup complete: {} ok, {} failed out of {} reqwest targets",
+                ok_count,
+                failed_count,
+                ok_count + failed_count
             );
         } else {
-            info!("Pool warmup complete: all {} targets ok", total);
+            info!("Pool warmup complete: all {} reqwest targets ok", ok_count);
         }
     }
 
@@ -1138,9 +1570,6 @@ impl ProxyState {
     /// a lightweight HEAD request to each unique backend host:port to force
     /// TCP/TLS connection establishment. reqwest caches connections internally
     /// by host:port, so subsequent requests reuse the warmed connection.
-    ///
-    /// For upstream-backed proxies, every target is warmed individually because
-    /// reqwest pools connections per URL host:port.
     fn collect_reqwest_warmup_tasks(
         &self,
         proxy: &Proxy,
@@ -1148,16 +1577,11 @@ impl ProxyState {
         seen: &mut std::collections::HashSet<String>,
         tasks: &mut Vec<WarmupTask>,
     ) {
-        // URL scheme for warmup probe. HTTP family resolves via backend_scheme
-        // (plaintext vs TLS); flavor (gRPC/WebSocket) doesn't affect the
-        // warmup probe. Stream-family proxies don't reach this helper
-        // (the caller filters them out).
         let scheme = match proxy.backend_scheme {
             Some(BackendScheme::Http) => "http",
             _ => "https",
         };
 
-        // Collect (host, port) targets to warm
         let mut targets: Vec<(String, u16)> = Vec::new();
         if let Some(ref upstream_id) = proxy.upstream_id
             && let Some(upstream) = upstream_map.get(upstream_id.as_str())
@@ -1170,13 +1594,8 @@ impl ProxyState {
             targets.push((proxy.backend_host.clone(), proxy.backend_port));
         }
 
-        // First, ensure the reqwest::Client is created and cached (TLS config,
-        // cert parsing, root store). This is shared across all targets.
         let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
-        let client_created = seen.contains(&pool_key);
-        if !client_created {
-            seen.insert(pool_key);
-        }
+        let _ = seen.insert(pool_key);
 
         for (host, port) in targets {
             let dedup_key = format!("reqwest_conn|{}|{}|{}", scheme, host, port);
@@ -1194,10 +1613,6 @@ impl ProxyState {
                     .await
                     .map_err(|e| format!("{}: {}", desc, e))?;
 
-                // Send a HEAD request to force TCP/TLS connection establishment.
-                // The backend will likely return an error (404, 503, etc.) but
-                // the underlying TCP/TLS connection is kept in reqwest's internal
-                // pool for reuse. We ignore the HTTP response status entirely.
                 let url = format!("{}://{}:{}/", scheme, host, port);
                 let result = client
                     .head(&url)
@@ -1208,189 +1623,9 @@ impl ProxyState {
                 match result {
                     Ok(_) => Ok(desc),
                     Err(e) if e.is_connect() || e.is_timeout() => Err(format!("{}: {}", desc, e)),
-                    // Non-connect errors (4xx, 5xx, etc.) are fine — the TCP/TLS
-                    // connection was established and is now pooled.
                     Err(_) => Ok(desc),
                 }
             }));
-        }
-    }
-
-    /// Collect gRPC pool warmup tasks for a proxy, expanding upstream targets.
-    /// Currently unused — gRPC is a runtime-detected flavor post-refactor, so
-    /// the pool warms lazily on first gRPC request rather than at startup.
-    /// Retained for potential future use if we decide to eagerly warm the
-    /// gRPC pool based on e.g. per-proxy hints.
-    #[allow(dead_code)]
-    fn collect_grpc_warmup_tasks(
-        &self,
-        proxy: &Proxy,
-        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
-        seen: &mut std::collections::HashSet<String>,
-        tasks: &mut Vec<WarmupTask>,
-    ) {
-        if let Some(ref upstream_id) = proxy.upstream_id {
-            if let Some(upstream) = upstream_map.get(upstream_id.as_str()) {
-                for target in &upstream.targets {
-                    let mut target_proxy = proxy.clone();
-                    target_proxy.backend_host = target.host.clone();
-                    target_proxy.backend_port = target.port;
-                    let key = grpc_proxy::GrpcConnectionPool::pool_key_for_warmup(&target_proxy);
-                    if seen.insert(key) {
-                        let pool = self.grpc_pool.clone();
-                        tasks.push(Box::pin(async move {
-                            let desc = format!(
-                                "gRPC {}:{}",
-                                target_proxy.backend_host, target_proxy.backend_port
-                            );
-                            pool.get_sender(&target_proxy)
-                                .await
-                                .map(|_| desc.clone())
-                                .map_err(|e| format!("{}: {:?}", desc, e))
-                        }));
-                    }
-                }
-            }
-        } else {
-            let key = grpc_proxy::GrpcConnectionPool::pool_key_for_warmup(proxy);
-            if seen.insert(key) {
-                let pool = self.grpc_pool.clone();
-                let proxy = proxy.clone();
-                tasks.push(Box::pin(async move {
-                    let desc = format!("gRPC {}:{}", proxy.backend_host, proxy.backend_port);
-                    pool.get_sender(&proxy)
-                        .await
-                        .map(|_| desc.clone())
-                        .map_err(|e| format!("{}: {:?}", desc, e))
-                }));
-            }
-        }
-    }
-
-    /// Collect HTTP/2 direct pool warmup tasks for a proxy, expanding upstream targets.
-    fn collect_h2_warmup_tasks(
-        &self,
-        proxy: &Proxy,
-        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
-        seen: &mut std::collections::HashSet<String>,
-        tasks: &mut Vec<WarmupTask>,
-    ) {
-        if let Some(ref upstream_id) = proxy.upstream_id {
-            if let Some(upstream) = upstream_map.get(upstream_id.as_str()) {
-                for target in &upstream.targets {
-                    let mut target_proxy = proxy.clone();
-                    target_proxy.backend_host = target.host.clone();
-                    target_proxy.backend_port = target.port;
-                    let key = Http2ConnectionPool::pool_key_for_warmup(&target_proxy);
-                    if seen.insert(key) {
-                        let pool = self.http2_pool.clone();
-                        tasks.push(Box::pin(async move {
-                            let desc = format!(
-                                "H2 {}:{}",
-                                target_proxy.backend_host, target_proxy.backend_port
-                            );
-                            pool.get_sender(&target_proxy)
-                                .await
-                                .map(|_| desc.clone())
-                                .map_err(|e| format!("{}: {:?}", desc, e))
-                        }));
-                    }
-                }
-            }
-        } else {
-            let key = Http2ConnectionPool::pool_key_for_warmup(proxy);
-            if seen.insert(key) {
-                let pool = self.http2_pool.clone();
-                let proxy = proxy.clone();
-                tasks.push(Box::pin(async move {
-                    let desc = format!("H2 {}:{}", proxy.backend_host, proxy.backend_port);
-                    pool.get_sender(&proxy)
-                        .await
-                        .map(|_| desc.clone())
-                        .map_err(|e| format!("{}: {:?}", desc, e))
-                }));
-            }
-        }
-    }
-
-    /// Collect HTTP/3 pool warmup tasks for a proxy, expanding upstream targets.
-    fn collect_h3_warmup_tasks(
-        &self,
-        proxy: &Proxy,
-        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
-        seen: &mut std::collections::HashSet<String>,
-        tasks: &mut Vec<WarmupTask>,
-    ) {
-        if let Some(ref upstream_id) = proxy.upstream_id {
-            if let Some(upstream) = upstream_map.get(upstream_id.as_str()) {
-                for target in &upstream.targets {
-                    let key = format!(
-                        "h3|{}|{}|{}|{}|{}",
-                        target.host,
-                        target.port,
-                        proxy
-                            .resolved_tls
-                            .server_ca_cert_path
-                            .as_deref()
-                            .unwrap_or_default(),
-                        proxy
-                            .resolved_tls
-                            .client_cert_path
-                            .as_deref()
-                            .unwrap_or_default(),
-                        proxy.resolved_tls.verify_server_cert as u8,
-                    );
-                    if seen.insert(key) {
-                        let pool = self.h3_pool.clone();
-                        let conn_pool = self.connection_pool.clone();
-                        let proxy = proxy.clone();
-                        let host = target.host.clone();
-                        let port = target.port;
-                        tasks.push(Box::pin(async move {
-                            let desc = format!("H3 {}:{}", host, port);
-                            let tls_config = conn_pool
-                                .get_tls_config_for_backend(&proxy)
-                                .map_err(|e| format!("{}: TLS config: {}", desc, e))?;
-                            pool.warmup_connection_to_target(&host, port, &tls_config)
-                                .await
-                                .map(|_| desc.clone())
-                                .map_err(|e| format!("{}: {}", desc, e))
-                        }));
-                    }
-                }
-            }
-        } else {
-            let key = format!(
-                "h3|{}|{}|{}|{}|{}",
-                proxy.backend_host,
-                proxy.backend_port,
-                proxy
-                    .resolved_tls
-                    .server_ca_cert_path
-                    .as_deref()
-                    .unwrap_or_default(),
-                proxy
-                    .resolved_tls
-                    .client_cert_path
-                    .as_deref()
-                    .unwrap_or_default(),
-                proxy.resolved_tls.verify_server_cert as u8,
-            );
-            if seen.insert(key) {
-                let pool = self.h3_pool.clone();
-                let conn_pool = self.connection_pool.clone();
-                let proxy = proxy.clone();
-                tasks.push(Box::pin(async move {
-                    let desc = format!("H3 {}:{}", proxy.backend_host, proxy.backend_port);
-                    let tls_config = conn_pool
-                        .get_tls_config_for_backend(&proxy)
-                        .map_err(|e| format!("{}: TLS config: {}", desc, e))?;
-                    pool.warmup_connection(&proxy, &tls_config)
-                        .await
-                        .map(|_| desc.clone())
-                        .map_err(|e| format!("{}: {}", desc, e))
-                }));
-            }
         }
     }
 
@@ -1493,6 +1728,7 @@ impl ProxyState {
 
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
             self.config.store(Arc::new(new_config));
+            self.spawn_backend_capability_refresh();
 
             // Reconcile stream proxy listeners (TCP/UDP)
             let slm = self.stream_listener_manager.clone();
@@ -1644,6 +1880,7 @@ impl ProxyState {
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
         self.config.store(Arc::new(new_config));
+        self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any proxies changed
         let stream_proxies_changed = delta
@@ -2034,6 +2271,16 @@ impl ProxyState {
         // Store updated config
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
         self.config.store(Arc::new(new_config));
+
+        // Trigger a coalesced capability refresh so added/modified HTTPS
+        // backends get classified immediately instead of waiting up to the
+        // periodic interval (default 24 h). Database polling and DP gRPC
+        // delta updates both flow through this path, so a brand-new
+        // H3-only backend would otherwise keep 502-ing via reqwest until
+        // the next periodic tick. The coalescer absorbs bursts so a DB
+        // poll storm or rapid CP push sequence still fans out to at most
+        // one in-flight probe + one queued re-run.
+        self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any stream proxies changed
         let removed_had_stream = if !delta.removed_proxy_ids.is_empty() {
@@ -6177,7 +6424,8 @@ async fn handle_proxy_request_inner(
             // the body was never sent, so replaying is correct and safe.
             // The final retry attempt uses streaming if configured.
             let is_last_attempt = attempt >= retry_config.max_retries;
-            result = if proxy.dispatch_kind == DispatchKind::HttpsH3Preferred {
+            let tried_h3 = supports_native_http3_backend(&state, &proxy, current_target.as_deref());
+            result = if tried_h3 {
                 proxy_to_backend_http3_retry(
                     &state,
                     &proxy,
@@ -6205,6 +6453,16 @@ async fn handle_proxy_request_inner(
                 )
                 .await
             };
+            // If H3 was attempted and produced a transport-level failure,
+            // downgrade the cached capability so the next retry iteration
+            // (and subsequent requests) skip the H3 pool and route via
+            // reqwest instead of repeatedly 502-ing against a backend
+            // whose QUIC support rolled back between refresh cycles.
+            if tried_h3 && is_h3_transport_failure(&result) {
+                state
+                    .backend_capabilities
+                    .mark_h3_unsupported(&proxy, current_target.as_deref());
+            }
         }
         (result, current_cb_target_key)
     } else {
@@ -6772,7 +7030,7 @@ pub fn build_backend_url_with_target(
     // kinds never reach this builder but we fall through safely for them.
     let scheme = match proxy.dispatch_kind {
         DispatchKind::HttpPool => "http",
-        DispatchKind::HttpsPool | DispatchKind::HttpsH3Preferred => "https",
+        DispatchKind::HttpsPool => "https",
         DispatchKind::TcpRaw | DispatchKind::UdpRaw => "http",
         DispatchKind::TcpTls | DispatchKind::UdpDtls => "https",
     };
@@ -7138,12 +7396,22 @@ async fn proxy_to_backend(
         .ok()
         .map(|ip| ip.to_string());
 
-    // H3 is attempted only when the operator explicitly opted in via
-    // `backend_prefer_h3: true` on an Https proxy. This is the decoupling
-    // from the old dispatch — H3 is now a transport preference, not a
-    // flavor. gRPC and WebSocket dispatch earlier in this function and
+    // Plain HTTPS requests attempt the native H3 pool only when startup
+    // classification has already proved that this concrete backend target
+    // supports H3. gRPC and WebSocket dispatch earlier in the handler and
     // never reach this block, so only Plain-flavor requests can enter.
-    if proxy.dispatch_kind == DispatchKind::HttpsH3Preferred {
+    //
+    // On H3 transport failure we downgrade the cached capability so
+    // subsequent requests skip the native pool immediately — but we do NOT
+    // replay the body via reqwest on the same request. The failed H3
+    // attempt may already have flushed headers / body to the backend
+    // before the reset, timeout, or protocol error surfaced, so replaying
+    // the same body would bypass the operator's retry policy and could
+    // duplicate non-idempotent requests. The outer retry loop (when
+    // `proxy.retry` is configured) is the only place that decides whether
+    // replay is safe per method + `retry_on_methods`. Without retry, the
+    // 502 propagates to the client and the next request uses reqwest.
+    if supports_native_http3_backend(state, proxy, upstream_target) {
         let (mut backend_resp, body_bytes) = proxy_to_backend_http3(
             state,
             proxy,
@@ -7171,21 +7439,24 @@ async fn proxy_to_backend(
             backend_resolved_ip: resolved_ip.clone().or(backend_resp.backend_resolved_ip),
             ..backend_resp
         };
+
+        if is_h3_transport_failure(&resp) {
+            debug!(
+                proxy_id = %proxy.id,
+                error_class = ?resp.error_class,
+                "H3 backend transport failed; downgrading cached capability so subsequent requests route via reqwest"
+            );
+            state
+                .backend_capabilities
+                .mark_h3_unsupported(proxy, upstream_target);
+        }
         return (resp, body_bytes);
     }
 
-    // Use HTTP/2 multiplexing pool for TLS HTTP-family backends with H2 enabled,
-    // but only when body retention is NOT required (i.e., no retries configured).
-    // When retries are configured, we fall through to the reqwest path which
-    // auto-negotiates HTTP/2 via ALPN on TLS and supports body replay natively.
-    // The direct H2 pool advertises both `h2` and `http/1.1` in ALPN. The
-    // learning cache (`is_known_http1_backend`) short-circuits backends that
-    // have been observed to pick h1.1, so we don't waste a TLS handshake on a
-    // backend the pool cannot serve.
-    if matches!(
-        proxy.dispatch_kind,
-        DispatchKind::HttpsPool | DispatchKind::HttpsH3Preferred
-    ) {
+    // Use the direct HTTP/2 pool only when the capability registry has already
+    // classified this concrete backend target as H2-capable and the request
+    // body path is compatible with the hyper sender.
+    if proxy.dispatch_kind == DispatchKind::HttpsPool {
         let pool_config = state.connection_pool.global_pool_config().for_proxy(proxy);
         // Mirror the warmup path: the direct H2 pool must key and dial on the
         // load-balanced target, not the proxy's template backend_host/port.
@@ -7200,7 +7471,7 @@ async fn proxy_to_backend(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
-        ) && !state.http2_pool.is_known_http1_backend(direct_h2_proxy)
+        ) && supports_direct_http2_backend(state, proxy, upstream_target)
         {
             let direct_h2_sender = match state.http2_pool.get_sender(direct_h2_proxy).await {
                 Ok(sender) => Some(sender),
@@ -7209,8 +7480,17 @@ async fn proxy_to_backend(
                         debug!(
                             proxy_id = %proxy.id,
                             error = %e,
-                            "HTTP/2 pool negotiated HTTP/1.1 backend — falling back to reqwest"
+                            "HTTP/2 pool negotiated HTTP/1.1 backend — downgrading cached capability and falling back to reqwest"
                         );
+                        // The per-pool-key ALPN learning cache was removed
+                        // when the capability registry took over classification,
+                        // so without this the next request would repeat the
+                        // direct-H2 handshake + ALPN-fallback cost until the
+                        // 24 h refresh re-probes. Downgrade here so subsequent
+                        // requests go straight to reqwest.
+                        state
+                            .backend_capabilities
+                            .mark_h2_tls_unsupported(proxy, upstream_target);
                         None
                     } else {
                         return (
@@ -9329,5 +9609,95 @@ mod tests {
             &ctx,
             false,
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // H3 transport-failure classifier tests (gates the capability downgrade)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn is_h3_transport_error_class_covers_connection_failures() {
+        for class in [
+            retry::ErrorClass::ConnectionRefused,
+            retry::ErrorClass::ConnectionTimeout,
+            retry::ErrorClass::ConnectionReset,
+            retry::ErrorClass::ConnectionClosed,
+            retry::ErrorClass::TlsError,
+            retry::ErrorClass::ProtocolError,
+            retry::ErrorClass::DnsLookupError,
+            retry::ErrorClass::PortExhaustion,
+            retry::ErrorClass::ConnectionPoolError,
+            retry::ErrorClass::ReadWriteTimeout,
+        ] {
+            assert!(
+                is_h3_transport_error_class(class),
+                "expected {class:?} to be a transport-class failure"
+            );
+        }
+    }
+
+    #[test]
+    fn is_h3_transport_error_class_excludes_application_errors() {
+        // Application-layer errors must NOT downgrade the H3 capability — the
+        // backend is fine, the request itself is bad. Downgrading here would
+        // route subsequent requests via reqwest for no operational reason.
+        for class in [
+            retry::ErrorClass::ClientDisconnect,
+            retry::ErrorClass::RequestBodyTooLarge,
+            retry::ErrorClass::ResponseBodyTooLarge,
+            retry::ErrorClass::RequestError,
+        ] {
+            assert!(
+                !is_h3_transport_error_class(class),
+                "{class:?} must not trigger an H3 downgrade"
+            );
+        }
+    }
+
+    #[test]
+    fn is_h3_transport_failure_ignores_connection_error_flag() {
+        // `classify_h3_error` marks GOAWAY / stream reset / ReadWriteTimeout
+        // with `connection_error=false`, so the downgrade predicate must
+        // NOT require that flag. The decision hinges on `error_class`
+        // alone — any transport-level class downgrades, any application-
+        // layer class does not.
+        let mk = |connection_error: bool, error_class: Option<retry::ErrorClass>| {
+            retry::BackendResponse {
+                status_code: 502,
+                body: retry::ResponseBody::Buffered(Vec::new()),
+                headers: HashMap::new(),
+                connection_error,
+                backend_resolved_ip: None,
+                error_class,
+            }
+        };
+
+        // Connect-class failure with connection_error=true: transport failure.
+        assert!(is_h3_transport_failure(&mk(
+            true,
+            Some(retry::ErrorClass::ConnectionTimeout)
+        )));
+        // ProtocolError (GOAWAY / stream reset) with connection_error=false
+        // MUST still downgrade — this is the P2 bug the review called out.
+        assert!(is_h3_transport_failure(&mk(
+            false,
+            Some(retry::ErrorClass::ProtocolError)
+        )));
+        // ReadWriteTimeout with connection_error=false also downgrades.
+        assert!(is_h3_transport_failure(&mk(
+            false,
+            Some(retry::ErrorClass::ReadWriteTimeout)
+        )));
+        // Missing error_class → not classifiable as transport.
+        assert!(!is_h3_transport_failure(&mk(true, None)));
+        // Application-layer error class: NOT a transport failure.
+        assert!(!is_h3_transport_failure(&mk(
+            true,
+            Some(retry::ErrorClass::ClientDisconnect)
+        )));
+        assert!(!is_h3_transport_failure(&mk(
+            false,
+            Some(retry::ErrorClass::RequestBodyTooLarge)
+        )));
     }
 }
