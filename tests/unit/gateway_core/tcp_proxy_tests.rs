@@ -995,3 +995,300 @@ async fn test_slow_progressing_write_does_not_fire_timeout() {
         "slow-but-progressing write should keep watermark fresh; copy should not terminate"
     );
 }
+
+// ── Graceful shutdown reclassification (write-after-opposite-EOF race) ───────
+//
+// Regression coverage for the TLS close_notify → FIN tail race that was
+// producing 1 spurious error per payload size at 70 KB / 500 KB in the
+// CI benchmark. The bidirectional relay's drain phase used to classify
+// any `BrokenPipe` / `ConnectionReset` on the write side as a transport
+// failure, even when the opposite half had already completed cleanly.
+// These tests lock in the reclassification: write-after-EOF races on
+// the remaining direction become `DisconnectCause::GracefulShutdown`
+// (first_failure = None), and genuine errors are still flagged.
+
+/// Client-side stream that signals EOF immediately on read (simulates a
+/// half-closed client that has sent FIN) and fails every write with
+/// `BrokenPipe` (simulates the client peer having fully closed its socket
+/// by the time we try to deliver the backend response). Ideal fixture for
+/// the close-race scenario: c2b completes Ok(()) on EOF, then b2c hits
+/// the write error against the closed client peer.
+struct EofReadThenBrokenWriter;
+
+impl AsyncRead for EofReadThenBrokenWriter {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Ok(()) with zero bytes filled is the EOF signal for AsyncRead.
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for EofReadThenBrokenWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "simulated write-after-close",
+        )))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Backend-side stream that produces a bounded payload on read (one
+/// successful read followed by EOF) and accepts every write. Used to
+/// drive the b2c direction: it reads bytes from the backend and then
+/// tries to write them to the client, hitting the client's `BrokenPipe`.
+struct ReadOncePayloadStream {
+    payload: Vec<u8>,
+    consumed: bool,
+}
+
+impl ReadOncePayloadStream {
+    fn new(size: usize) -> Self {
+        Self {
+            payload: vec![0xA5u8; size],
+            consumed: false,
+        }
+    }
+}
+
+impl AsyncRead for ReadOncePayloadStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.consumed {
+            // Second call returns EOF so the future terminates cleanly
+            // if nothing else has stopped the copy.
+            return Poll::Ready(Ok(()));
+        }
+        let n = buf.remaining().min(self.payload.len());
+        buf.put_slice(&self.payload[..n]);
+        self.consumed = true;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for ReadOncePayloadStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Regression: when one half of the bidirectional copy finishes with a
+/// clean `Ok(0)` EOF and the remaining half subsequently hits `BrokenPipe`
+/// on its write side (the classic TLS close_notify → FIN tail race), the
+/// connection has shut down gracefully from the proxy's perspective. The
+/// relay must report `first_failure = None` so operators see
+/// `DisconnectCause::GracefulShutdown` instead of a spurious BackendError.
+#[tokio::test]
+async fn test_bidirectional_copy_reclassifies_write_after_eof_as_graceful() {
+    let client = EofReadThenBrokenWriter;
+    let backend = ReadOncePayloadStream::new(512);
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "write-after-EOF-on-opposite-half must reclassify as graceful, got {:?}",
+        result.first_failure
+    );
+}
+
+/// Same reclassification, but triggered by `ConnectionReset` on the write
+/// side instead of `BrokenPipe`. Both errnos map to the same benign
+/// post-EOF tail race (Linux emits ECONNRESET when the peer has sent an
+/// RST after close_notify, macOS/BSD tend to emit EPIPE).
+#[tokio::test]
+async fn test_bidirectional_copy_reclassifies_connection_reset_after_eof_as_graceful() {
+    struct EofReadThenResetWriter;
+
+    impl AsyncRead for EofReadThenResetWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for EofReadThenResetWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "simulated peer reset during close",
+            )))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let client = EofReadThenResetWriter;
+    let backend = ReadOncePayloadStream::new(512);
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "write-side ConnectionReset after opposite EOF must reclassify as graceful, got {:?}",
+        result.first_failure
+    );
+}
+
+/// Negative control: if the first half errors BEFORE any EOF, the
+/// reclassification MUST NOT fire — a read error from the client is a
+/// genuine transport failure. This prevents the graceful-shutdown branch
+/// from masking real errors.
+#[tokio::test]
+async fn test_bidirectional_copy_does_not_reclassify_when_first_half_errors() {
+    let client = ResetOnReadStream;
+    let (backend, _peer) = tokio::io::duplex(1024);
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    let (dir, class, side, _msg) = result
+        .first_failure
+        .as_ref()
+        .expect("client read error must still surface first_failure, not be masked");
+    assert_eq!(
+        *dir,
+        Direction::ClientToBackend,
+        "direction must still be attributed to the erroring half"
+    );
+    assert_eq!(
+        *class,
+        ErrorClass::ConnectionReset,
+        "genuine read-side ConnectionReset must keep its classification"
+    );
+    assert_eq!(
+        *side,
+        Some(StreamIoSide::Read),
+        "read-side failures must never be reclassified as graceful"
+    );
+}
+
+/// Negative control: a read-side failure on the opposite half AFTER the
+/// first half EOF'd must NOT be reclassified as graceful. This is the
+/// "backend RST-after-FIN misbehaviour" case — the backend is actively
+/// misbehaving and operators must see the error on their dashboards.
+#[tokio::test]
+async fn test_bidirectional_copy_does_not_reclassify_read_side_error_after_eof() {
+    // c2b side: client EOFs immediately on read. Writes from c2b go to
+    // backend and succeed so the EOF path (shutdown backend) runs cleanly.
+    struct ClientEofReaderOkWriter;
+    impl AsyncRead for ClientEofReaderOkWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncWrite for ClientEofReaderOkWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // Backend stream: read fails with ConnectionReset (backend RST after
+    // our FIN) — this is NOT graceful, it's a misbehaving backend.
+    let client = ClientEofReaderOkWriter;
+    let backend = ResetOnReadStream;
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    let (dir, class, side, _msg) = result
+        .first_failure
+        .as_ref()
+        .expect("backend read-side ConnectionReset must NOT be reclassified as graceful");
+    assert_eq!(*dir, Direction::BackendToClient);
+    assert_eq!(*class, ErrorClass::ConnectionReset);
+    assert_eq!(
+        *side,
+        Some(StreamIoSide::Read),
+        "read-side errors are genuine transport failures regardless of opposite-half EOF state"
+    );
+}
+
+/// Verify the reclassification does not silently change byte counters.
+/// The c2b direction should report the zero bytes it actually relayed
+/// (client half-closed with no payload), and b2c should report the read
+/// that happened before the write-after-close error (note: the failed
+/// write itself does NOT bump the c2b counter, per `copy_one_direction`'s
+/// post-write `fetch_add` which only runs after a successful chunked write).
+#[tokio::test]
+async fn test_bidirectional_copy_graceful_reclassification_preserves_byte_counts() {
+    let client = EofReadThenBrokenWriter;
+    let backend = ReadOncePayloadStream::new(512);
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "expected graceful reclassification, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(
+        result.bytes_client_to_backend, 0,
+        "client half-closed with no payload"
+    );
+    // The b2c write error aborts before the byte counter is incremented,
+    // so `bytes_backend_to_client` stays 0 — this lock-in catches any
+    // accidental "count partial writes" regression that could inflate
+    // the metric.
+    assert_eq!(
+        result.bytes_backend_to_client, 0,
+        "write-after-close error aborts before counter bump"
+    );
+}

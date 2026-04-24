@@ -32,6 +32,57 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
     crate::retry::classify_boxed_error(error.as_ref())
 }
 
+/// Decide whether a write-side error can be treated as the tail of a graceful
+/// shutdown rather than a genuine transport failure.
+///
+/// When the *opposite* half of a bidirectional relay has already completed
+/// with a clean EOF (`Ok(())` from `copy_one_direction`), the two peers are
+/// in the middle of a normal close dance — TLS `close_notify` followed by
+/// the TCP FIN. A write on the still-live half racing against that FIN can
+/// surface as `EPIPE` (BrokenPipe), `ECONNRESET` (ConnectionReset), or a
+/// zero-byte write — all three map to the same semantic: "the peer's
+/// receive side is already gone, so this byte didn't land, but the session
+/// itself terminated cleanly." Marking these as transport errors inflates
+/// `total_errors` at the edge of every large payload even when the
+/// application layer was satisfied.
+///
+/// Restricted to the `Write` side because a *read* error after opposite-half
+/// EOF (e.g., the backend sending `RST` instead of `FIN` after finishing its
+/// response) is a genuine backend misbehaviour that operators must still
+/// see. Only write-side benign errnos are reclassified.
+fn is_post_eof_benign_write_error(side: StreamIoSide, kind: std::io::ErrorKind) -> bool {
+    matches!(side, StreamIoSide::Write)
+        && matches!(
+            kind,
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::WriteZero
+        )
+}
+
+/// Check whether an already-recorded Phase 1 `first_failure` is the benign
+/// write-after-close pattern that retroactively qualifies for reclassification
+/// once the opposite half's grace-window poll reveals a clean `Ok(())`.
+///
+/// The classified `ErrorClass` is the evidence: `BrokenPipe` maps to
+/// `ConnectionClosed`, `ConnectionReset` stays `ConnectionReset` (see
+/// `classify_boxed_error` in `src/retry.rs`). A Write-side failure with one
+/// of these classes is the same benign pattern as
+/// `is_post_eof_benign_write_error`; the only reason we can't call that
+/// helper directly is that by Phase 2 the raw `io::ErrorKind` has already
+/// been consumed into the classified tuple.
+fn phase1_error_is_post_eof_race(
+    first_failure: &Option<(Direction, ErrorClass, Option<StreamIoSide>, String)>,
+) -> bool {
+    match first_failure {
+        Some((_dir, class, Some(StreamIoSide::Write), _msg)) => matches!(
+            class,
+            ErrorClass::ConnectionClosed | ErrorClass::ConnectionReset
+        ),
+        _ => false,
+    }
+}
+
 // Shared error-message prefixes used at `anyhow::anyhow!` construction sites
 // AND at the `error_message.contains(...)` check sites in
 // `pre_copy_disconnect_cause` / `dtls_disconnect_cause`. Keeping them as
@@ -2121,7 +2172,16 @@ where
             .await;
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    // Phase 1 errored on b2c but c2b completed cleanly in
+                    // the grace window. If the Phase 1 error was a benign
+                    // write-after-close, we now know the opposite half
+                    // EOF'd cleanly — the session shut down gracefully and
+                    // Phase 1's write error was just the close race tail.
+                    if phase1_error_is_post_eof_race(&first_failure) {
+                        first_failure = None;
+                    }
+                }
                 Ok(Err((side, e))) => {
                     if first_failure.is_none() {
                         let msg = format!(
@@ -2159,7 +2219,12 @@ where
             .await;
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    // Symmetric to the c2b grace path — see comment above.
+                    if phase1_error_is_post_eof_race(&first_failure) {
+                        first_failure = None;
+                    }
+                }
                 Ok(Err((side, e))) => {
                     if first_failure.is_none() {
                         let msg = format!(
@@ -2194,6 +2259,14 @@ where
 /// phase. Returns `Some(first_failure_tuple)` when the drain ends in an error,
 /// an idle timeout, a per-direction inactivity timeout, or the half-close hard
 /// cap. Returns `None` when the drain completes cleanly.
+///
+/// Precondition: the *opposite* half of the bidirectional relay has already
+/// completed with a clean EOF (the caller only invokes this function on the
+/// `clean_eof` branch). This is load-bearing for the write-after-close
+/// reclassification below — a benign `EPIPE` / `ECONNRESET` / `WriteZero`
+/// on the remaining direction's write side is the tail of the opposite
+/// peer's TLS close_notify → FIN dance, and should be reported as
+/// graceful shutdown (return `None`) rather than a transport error.
 #[allow(clippy::too_many_arguments)]
 async fn drain_half_close_copy<F>(
     drain_fut: &mut F,
@@ -2216,6 +2289,13 @@ where
             biased;
             result = &mut *drain_fut => {
                 if let Err((side, e)) = result {
+                    // Opposite half already EOF'd cleanly (drain_half_close_copy
+                    // precondition). A benign write-after-close here is the tail
+                    // of graceful shutdown, not a transport failure — return
+                    // `None` so the caller records DisconnectCause::GracefulShutdown.
+                    if is_post_eof_benign_write_error(side, e.kind()) {
+                        return None;
+                    }
                     let msg = e.to_string();
                     let dir_label = match direction {
                         Direction::ClientToBackend => "client→backend",
