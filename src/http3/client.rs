@@ -119,13 +119,33 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
         || msg.contains("stream_id")
         || msg.contains("stream_closed")
         || msg.contains("stream closed")
+        // h3 0.0.8 emits typed `LocalError::Application { code: H3_*, ... }`
+        // variants on protocol violations (e.g. stream finished without
+        // response headers after a GOAWAY) that render with an `H3_` prefix
+        // in the message. Treat any `h3_` token as a protocol error so the
+        // downgrade path fires for the full family of H3 protocol faults
+        // (H3_FRAME_UNEXPECTED, H3_FRAME_ERROR, H3_GENERAL_PROTOCOL_ERROR,
+        // etc.). `h3::` is kept for typed errors that render with the
+        // fully-qualified Rust path.
+        || msg.contains("stream finished")
         || msg.contains("h3::")
+        || msg.contains("h3_")
         || msg.contains("quic")
     {
         ErrorClass::ProtocolError
     } else if msg.contains("reset") {
         ErrorClass::ConnectionReset
-    } else if msg.contains("broken pipe") || msg.contains("closed") {
+    } else if msg.contains("broken pipe")
+        || msg.contains("closed")
+        // h3 0.0.8 renders `ConnectionErrorIncoming::ApplicationClose` as
+        // `"ApplicationClose"` (no trailing 'd') — doesn't match the
+        // `"closed"` substring above, leaving these as RequestError and
+        // bypassing the H3 capability-registry downgrade. The typed chain
+        // doesn't help either: h3's error types don't implement `source()`
+        // so we never reach the quinn::ConnectionError downcast. Match
+        // the h3 spelling explicitly.
+        || msg.contains("applicationclose")
+    {
         ErrorClass::ConnectionClosed
     } else {
         ErrorClass::RequestError
