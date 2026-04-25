@@ -18,12 +18,22 @@ pub struct Http2Client {
 }
 
 impl Http2Client {
-    /// Build a client that accepts **any** TLS certificate and lets ALPN
-    /// pick HTTP/2 when the server advertises it.
+    /// Build a client that accepts **any** TLS certificate and *requires*
+    /// HTTP/2.
+    ///
+    /// Reqwest's default builder lets ALPN downgrade to HTTP/1.1 when the
+    /// server doesn't advertise `h2`, which would silently mask H2-only
+    /// protocol regressions in tests using this helper. Calling
+    /// `http2_prior_knowledge()` disables HTTP/1 entirely on this client,
+    /// so any path that ends up speaking H1 fails the connection
+    /// instead of completing as H1 — the behavior the PR-486 review
+    /// asked for ("require HTTP/2 so protocol regressions fail fast
+    /// instead of downgrading").
     pub fn insecure() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let inner = ClientBuilder::new()
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true)
+            .http2_prior_knowledge()
             .timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self { inner })
@@ -45,8 +55,23 @@ impl Http2Client {
     }
 
     /// `GET <url>`.
+    ///
+    /// Asserts the response actually came back over HTTP/2. The
+    /// `http2_prior_knowledge()` flag on the client builder is supposed
+    /// to make this impossible to violate at the wire level, but the
+    /// runtime check is cheap insurance against a future builder edit
+    /// that would silently let H1 through (the downgrade-mask scenario
+    /// flagged in the PR-486 review).
     pub async fn get(&self, url: &str) -> Result<ClientResponse, reqwest::Error> {
         let resp = self.inner.get(url).send().await?;
+        assert_eq!(
+            resp.version(),
+            reqwest::Version::HTTP_2,
+            "Http2Client downgraded to {:?} — `http2_prior_knowledge()` \
+             should have prevented this; a regression that lets H1 through \
+             would mask H2-only protocol bugs",
+            resp.version()
+        );
         let status = resp.status();
         let headers = resp.headers().clone();
         let body_bytes = resp.bytes().await?;
