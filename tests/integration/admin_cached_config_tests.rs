@@ -8,7 +8,7 @@ use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
-    start_admin_listener,
+    serve_admin_on_listener,
 };
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, PluginConfig, PluginScope,
@@ -193,25 +193,41 @@ fn create_test_gateway_config_with_upstreams() -> GatewayConfig {
 }
 
 /// Start an admin server with the given state on a random port, returns the base URL.
+///
+/// Binds once and moves the pre-bound listener directly into the spawned
+/// task — no `drop(listener)` + re-bind step that another process could
+/// race under parallel test load. Readiness is detected with a TCP probe
+/// rather than a fixed sleep so a slow startup also cannot race the first
+/// request.
 async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Bind to get the actual port
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
-    drop(listener);
 
     let state_clone = state.clone();
     let shutdown_rx_clone = shutdown_rx.clone();
     tokio::spawn(async move {
-        let _ = start_admin_listener(actual_addr, state_clone, shutdown_rx_clone).await;
+        let _ = serve_admin_on_listener(listener, state_clone, shutdown_rx_clone, None).await;
     });
 
-    // Give the server a moment to start
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
+    wait_for_admin_ready(actual_addr).await;
     (format!("http://{}", actual_addr), shutdown_tx)
+}
+
+/// Poll until the admin listener accepts a TCP connection.
+///
+/// 200 attempts × 10 ms = 2 s budget, well above any realistic in-process
+/// startup time but bounded so a stuck listener fails the test fast.
+async fn wait_for_admin_ready(addr: SocketAddr) {
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("admin listener at {} never became ready", addr);
 }
 
 /// Helper: GET request to the admin API, returns (status, body, X-Data-Source header).
