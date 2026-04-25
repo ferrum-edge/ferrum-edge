@@ -59,9 +59,8 @@ pub use backends::{
     H3RecordedRequest, H3Step, H3TlsConfig, Http1Request, HttpStep, MatchHeaders, MatchRpc,
     QuicRefuser, ReceivedStream, RecordedDatagram, RequestMatcher, ScriptedDtlsBackend,
     ScriptedGrpcBackend, ScriptedH2Backend, ScriptedH3Backend, ScriptedHttp1Backend,
-    ScriptedTcpBackend, ScriptedTlsBackend, ScriptedUdpBackend, TcpStep, TlsConfig,
-    UdpSocketReservation, UdpStep, tls_backend_without_quic,
-    tls_backend_without_quic_with_ok_response,
+    ScriptedTcpBackend, ScriptedTlsBackend, ScriptedUdpBackend, TcpStep, TlsConfig, UdpStep,
+    tls_backend_without_quic, tls_backend_without_quic_with_ok_response,
 };
 pub use certs::TestCa;
 pub use clients::{
@@ -74,8 +73,8 @@ pub use network::{
     TruncatedStream,
 };
 pub use ports::{
-    PortReservation, UdpPortReservation, reserve_port, reserve_port_pair, reserve_udp_port,
-    unbound_port, unbound_udp_port,
+    PortReservation, UdpPortReservation, reserve_colocated_tcp_udp, reserve_port,
+    reserve_port_pair, reserve_udp_port, unbound_port, unbound_udp_port,
 };
 
 // Small helpers that several acceptance tests reuse.
