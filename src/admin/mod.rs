@@ -130,7 +130,34 @@ pub async fn start_admin_listener_with_tls(
 ) -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!("Admin API listener started on {}", addr);
+    run_admin_accept_loop(listener, state, shutdown, tls_config).await
+}
 
+/// Run the admin accept loop on a pre-bound `TcpListener`.
+///
+/// In-process counterpart to [`start_admin_listener_with_tls`]. The caller
+/// reserves an ephemeral port (typically via `tests/scaffolding/ports.rs`)
+/// and passes the live listener in, avoiding a bind-drop-rebind race.
+pub async fn start_admin_listener_with_bound_listener(
+    listener: TcpListener,
+    state: AdminState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<(), anyhow::Error> {
+    if let Ok(addr) = listener.local_addr() {
+        info!("Admin API listener (in-process) started on {}", addr);
+    } else {
+        info!("Admin API listener (in-process) started on bound TCP socket");
+    }
+    run_admin_accept_loop(listener, state, shutdown, tls_config).await
+}
+
+async fn run_admin_accept_loop(
+    listener: TcpListener,
+    state: AdminState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<(), anyhow::Error> {
     let mut shutdown_rx = shutdown;
 
     loop {

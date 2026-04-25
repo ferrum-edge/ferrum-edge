@@ -3837,6 +3837,48 @@ pub async fn start_proxy_listener_with_tls(
     start_proxy_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None).await
 }
 
+/// Run the proxy accept loop on a pre-bound `TcpListener`.
+///
+/// This is the in-process entry point used by [`crate::modes::file::serve`]:
+/// the caller (a test harness, typically) reserves an ephemeral TCP port,
+/// passes the live listener in, and the gateway adopts it without rebinding.
+///
+/// Unlike [`start_proxy_listener_with_tls_and_signal`] this path is
+/// deliberately single-listener: SO_REUSEPORT/multi-accept-thread expansion
+/// requires the gateway to bind extra sockets itself, which the binary path
+/// does and the in-process path explicitly skips. Tests don't need 50k+
+/// conn/sec throughput — they need deterministic teardown.
+///
+/// All other policy (overload guard, connection semaphore, TLS handshake,
+/// connection guard) is shared with the binary path.
+pub async fn start_proxy_listener_with_bound_listener(
+    listener: TcpListener,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<(), anyhow::Error> {
+    // Optional connection limit, mirroring the bound-port path. The semaphore
+    // is sized from `max_connections` and shared with the connection guard.
+    let conn_semaphore: Option<Arc<tokio::sync::Semaphore>> =
+        if state.env_config.max_connections > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(
+                state.env_config.max_connections,
+            )))
+        } else {
+            None
+        };
+
+    let local = listener.local_addr().ok();
+    if let Some(addr) = local {
+        info!("Proxy listener (in-process) started on {}", addr);
+    } else {
+        info!("Proxy listener (in-process) started on bound TCP socket");
+    }
+
+    run_accept_loop(listener, state, tls_config, conn_semaphore, shutdown, 0).await;
+    Ok(())
+}
+
 /// Create a bound TCP socket with SO_REUSEADDR and SO_REUSEPORT enabled.
 /// Used by the multi-listener accept architecture where N sockets are bound
 /// to the same address, each with its own accept loop.

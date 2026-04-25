@@ -7,27 +7,125 @@
 //! The admin API is always read-only in this mode (no database to write to).
 //! If `FERRUM_ADMIN_JWT_SECRET` is not set, a random secret is generated —
 //! any externally-crafted JWT will be rejected since nobody knows the secret.
+//!
+//! ## Public entry points
+//!
+//! - [`run`] — the binary entry point. Loads the YAML/JSON config from
+//!   `FERRUM_FILE_CONFIG_PATH`, registers a SIGHUP reload handler, and runs
+//!   forever until shutdown is signalled. This is what `ferrum-edge run`
+//!   ultimately calls into.
+//! - [`serve`] — an in-process entry point that takes an already-built
+//!   `GatewayConfig`, optional pre-bound TCP listeners for the proxy and
+//!   admin ports, and a shutdown receiver. Returns a [`ServeHandles`]
+//!   struct that holds the `ProxyState` and JoinHandles for every spawned
+//!   task. Used by the in-process variant of `tests/scaffolding/harness.rs`
+//!   to spin up a real gateway in ~100ms without invoking a subprocess.
+//!
+//! `serve()` deliberately omits the SIGHUP handler — caller-driven config
+//! updates go through `proxy_state.update_config()` directly.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::file_loader;
+use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 
+/// Pre-bound TCP listeners that callers of [`serve`] can hand to the gateway
+/// instead of letting it bind ports itself.
+///
+/// Each field is independent: leave a slot `None` to disable that listener,
+/// pass `Some` to use the caller's socket.  When a slot is `Some`, the
+/// corresponding port in [`EnvConfig`] is ignored — the listener is adopted
+/// as-is and its already-bound address is what clients connect to.
+///
+/// In-process tests reserve ports via `tests/scaffolding/ports.rs` and pass
+/// the live listeners in here so the gateway adopts the same FD without
+/// re-binding (which would be racy under parallel test load).
+#[derive(Default)]
+pub struct PreboundListeners {
+    /// Plaintext proxy port. `None` disables the plaintext proxy listener.
+    pub proxy_http: Option<TcpListener>,
+    /// TLS proxy port. `None` disables the HTTPS proxy listener even when
+    /// TLS material is configured.
+    pub proxy_https: Option<TcpListener>,
+    /// Plaintext admin port. `None` disables the plaintext admin listener.
+    pub admin_http: Option<TcpListener>,
+    /// TLS admin port. `None` disables the HTTPS admin listener even when
+    /// admin TLS material is configured.
+    pub admin_https: Option<TcpListener>,
+}
+
+/// Handles returned by [`serve`].
+///
+/// The caller can:
+/// 1. Drive requests through the gateway via the bound listeners' addresses.
+/// 2. Read state out of [`ServeHandles::proxy_state`] (e.g. metrics,
+///    capability registry, dispatch kind).
+/// 3. Trigger shutdown by `send`-ing `true` on the [`tokio::sync::watch`]
+///    channel passed to `serve()`.
+/// 4. Await graceful drain by `await`ing [`ServeHandles::join`].
+pub struct ServeHandles {
+    /// Shared proxy state. Tests can read metrics, swap config, etc.
+    pub proxy_state: ProxyState,
+    /// Local addresses each listener is bound to (resolved from the pre-bound
+    /// listener, **not** read from `EnvConfig`).
+    pub bound: BoundAddresses,
+    /// Background task handles. Drop the struct to abandon them, or
+    /// [`Self::join`] to wait for graceful drain.
+    handles: Vec<JoinHandle<()>>,
+    /// Shutdown sender retained so [`Self::join`] can fire shutdown if the
+    /// caller forgets to.
+    drain_seconds: u64,
+}
+
+/// Resolved listener addresses returned by [`serve`].
+#[derive(Default, Clone, Debug)]
+pub struct BoundAddresses {
+    pub proxy_http: Option<SocketAddr>,
+    pub proxy_https: Option<SocketAddr>,
+    pub admin_http: Option<SocketAddr>,
+    pub admin_https: Option<SocketAddr>,
+}
+
+impl ServeHandles {
+    /// Wait for every spawned listener / background task to finish.
+    ///
+    /// Callers must trigger shutdown on the [`tokio::sync::watch::Sender`]
+    /// they passed into [`serve`] before awaiting this future, otherwise
+    /// `join()` will hang waiting for accept loops that never exit.
+    pub async fn join(self) {
+        for handle in self.handles {
+            let _ = handle.await;
+        }
+        if self.drain_seconds > 0 {
+            crate::overload::wait_for_drain(
+                &self.proxy_state.overload,
+                Duration::from_secs(self.drain_seconds),
+            )
+            .await;
+        }
+    }
+}
+
+/// The binary entry point. Loads the YAML/JSON config from
+/// `FERRUM_FILE_CONFIG_PATH`, then dispatches into [`serve`] with a
+/// SIGHUP reload handler installed on top.
 pub async fn run(
     env_config: EnvConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
-    // Log configuration details
     info!(
         "Starting in file mode with log level: {}",
         env_config.log_level
@@ -58,243 +156,24 @@ pub async fn run(
         &env_config.backend_allow_ips,
         &env_config.namespace,
     )?;
-    info!(
-        "File mode: loaded {} proxies, {} consumers",
-        config.proxies.len(),
-        config.consumers.len()
-    );
 
-    // Validate stream proxy ports don't conflict with gateway reserved ports
-    let reserved_ports = env_config.reserved_gateway_ports();
-    if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
-        for msg in &errors {
-            error!("{}", msg);
-        }
-        return Err(anyhow::anyhow!(
-            "Stream proxy port conflicts with gateway reserved ports"
-        ));
-    }
-
-    let dns_cache = DnsCache::new(DnsConfig {
-        global_overrides: env_config.dns_overrides.clone(),
-        resolver_addresses: env_config.dns_resolver_address.clone(),
-        hosts_file_path: env_config.dns_resolver_hosts_file.clone(),
-        dns_order: env_config.dns_order.clone(),
-        ttl_override_seconds: env_config.dns_ttl_override,
-        min_ttl_seconds: env_config.dns_min_ttl,
-        stale_ttl_seconds: env_config.dns_stale_ttl,
-        error_ttl_seconds: env_config.dns_error_ttl,
-        max_cache_size: env_config.dns_cache_max_size,
-        warmup_concurrency: env_config.dns_warmup_concurrency,
-        slow_threshold_ms: env_config.dns_slow_threshold_ms,
-        refresh_threshold_percent: env_config.dns_refresh_threshold_percent,
-        failed_retry_interval_seconds: env_config.dns_failed_retry_interval,
-        try_tcp_on_error: env_config.dns_try_tcp_on_error,
-        num_concurrent_reqs: env_config.dns_num_concurrent_reqs,
-        max_active_requests: env_config.dns_max_active_requests,
-        backend_allow_ips: env_config.backend_allow_ips.clone(),
-    });
-
-    // DNS warmup — resolve all hostnames (proxy backends, upstream targets,
-    // and plugin endpoints) before accepting requests. Hostnames are
-    // deduplicated inside DnsCache::warmup() so shared hostnames across
-    // proxies/plugins only trigger one DNS lookup.
-    let mut hostnames: Vec<_> = config
-        .proxies
-        .iter()
-        .map(|p| {
-            (
-                p.backend_host.clone(),
-                p.dns_override.clone(),
-                p.dns_cache_ttl_seconds,
-            )
-        })
-        .collect();
-
-    // Add upstream target hostnames for load-balanced proxies
-    for upstream in &config.upstreams {
-        for target in &upstream.targets {
-            hostnames.push((target.host.clone(), None, None));
-        }
-    }
-
-    // Build TLS hardening policy from environment (needed for both frontend
-    // and backend TLS — cipher suites, protocol versions, key exchange groups).
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
-    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
-    let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
-    );
-
-    // Build ProxyState first so the plugin cache exists with the shared DNS
-    // cache, then collect plugin hostnames to include in warmup.
-    let proxy_state = ProxyState::new(
-        config,
-        dns_cache.clone(),
+    // Hand off to serve(). It builds ProxyState, spawns listeners, and waits
+    // until shutdown — exactly what run() used to do inline. The only extra
+    // bit is the SIGHUP handler, registered alongside.
+    let handles = serve(
         env_config.clone(),
-        Some(tls_policy.clone()),
-    )?;
+        config,
+        PreboundListeners::default(),
+        shutdown_tx.clone(),
+    )
+    .await?;
 
-    // Collect plugin endpoint hostnames (http_logging, jwks_auth, etc.)
-    let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
-    for host in plugin_hosts {
-        hostnames.push((host, None, None));
-    }
-
-    dns_cache.warmup(hostnames).await;
-
-    // Connection pool warmup — pre-establish backend connections for HTTP-family
-    // proxies so the first request to each backend avoids TCP/TLS/QUIC handshake
-    // latency. Must run after DNS warmup (needs resolved IPs).
-    if env_config.pool_warmup_enabled {
-        proxy_state.warmup_connection_pools().await;
-    }
-    // Kick off an initial capability probe when warmup is off — otherwise
-    // the registry stays empty and HTTPS H2/H3 dispatch falls back to
-    // reqwest until the first periodic tick (up to 24 h).
-    proxy_state.start_backend_capability_refresh_task(
-        !env_config.pool_warmup_enabled,
-        Some(shutdown_tx.subscribe()),
-    );
-
-    // Start per-IP request counter cleanup (removes stale zero-count entries)
-    proxy_state.start_per_ip_cleanup_task();
-
-    // Start background TTL refresh to keep cache warm (with shutdown)
-    let dns_handle =
-        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
-
-    // Start background task to retry failed DNS lookups
-    let _dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
-
-    // Start service discovery background tasks
-    proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
-
-    // Start overload monitor background task
-    let overload_handle = crate::overload::start_monitor(
-        proxy_state.overload.clone(),
-        env_config.overload_config(),
-        env_config.max_connections,
-        env_config.max_requests,
-        shutdown_tx.subscribe(),
-    );
-
-    // Start windowed metrics monitor background task
-    let metrics_handle = crate::metrics::start_metrics_monitor(
-        proxy_state.request_count.clone(),
-        proxy_state.status_counts.clone(),
-        proxy_state.windowed_metrics.clone(),
-        env_config.status_metrics_window_seconds,
-        shutdown_tx.subscribe(),
-    );
-
-    // Validate TLS configuration if provided
-    let tls_config = if let (Some(cert_path), Some(key_path)) = (
-        &env_config.frontend_tls_cert_path,
-        &env_config.frontend_tls_key_path,
-    ) {
-        info!("Loading TLS configuration with client certificate verification...");
-        let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
-        match tls::load_tls_config_with_client_auth(
-            cert_path,
-            key_path,
-            client_ca_bundle_path,
-            env_config.tls_no_verify,
-            &tls_policy,
-            env_config.tls_cert_expiry_warning_days,
-            &crls,
-        ) {
-            Ok(mut config) => {
-                // Enable 0-RTT on the proxy frontend only (not admin).
-                tls::enable_early_data(&mut config, &tls_policy);
-                // Enable kTLS session-secret extraction on the proxy frontend
-                // only (not admin) when kTLS could be used. Rustls gates
-                // `dangerous_extract_secrets()` behind this flag; without it,
-                // the kTLS splice fallback path in tcp_proxy.rs would never
-                // be able to retrieve the session keys.
-                if env_config.ktls_enabled.could_be_enabled() {
-                    tls::enable_secret_extraction_for_ktls(&mut config);
-                }
-                if client_ca_bundle_path.is_some() {
-                    info!(
-                        "TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
-                    );
-                } else {
-                    info!(
-                        "TLS configuration loaded without client certificate verification (HTTPS available)"
-                    );
-                }
-                Some(config)
-            }
-            Err(e) => {
-                error!("TLS configuration validation failed: {}", e);
-                return Err(anyhow::anyhow!("Invalid TLS configuration: {}", e));
-            }
-        }
-    } else {
-        info!("No TLS configuration provided (HTTP only)");
-        None
-    };
-
-    // Set TLS config on stream listener manager for TCP proxies with frontend_tls.
-    // The TLS config is loaded after ProxyState::new(), so we update it here and
-    // re-reconcile to start any deferred frontend_tls listeners.
-    if let Some(ref tls_cfg) = tls_config {
-        proxy_state
-            .stream_listener_manager
-            .set_frontend_tls_config(Some(tls_cfg.clone()));
-    }
-
-    // Set DTLS cert/key for UDP proxies with frontend_tls (DTLS termination).
-    if let (Some(cert_path), Some(key_path)) =
-        (&env_config.dtls_cert_path, &env_config.dtls_key_path)
-    {
-        tls::check_cert_expiry(
-            cert_path,
-            "DTLS frontend cert",
-            env_config.tls_cert_expiry_warning_days,
-        )?;
-        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path {
-            tls::check_cert_expiry(
-                ca_path,
-                "DTLS client CA cert",
-                env_config.tls_cert_expiry_warning_days,
-            )?;
-        }
-        proxy_state
-            .stream_listener_manager
-            .set_frontend_dtls_cert_key(
-                cert_path.clone(),
-                key_path.clone(),
-                env_config.dtls_client_ca_cert_path.clone(),
-            );
-    }
-
-    // Log size limits if non-default
-    if env_config.max_header_size_bytes != 32_768 {
-        info!(
-            "Custom max header size: {} bytes",
-            env_config.max_header_size_bytes
-        );
-    }
-    if env_config.max_request_body_size_bytes != 10_485_760 {
-        info!(
-            "Custom max request body size: {} bytes",
-            env_config.max_request_body_size_bytes
-        );
-    }
-
-    // Listen for SIGHUP to reload config (with shutdown)
-    #[cfg(unix)]
-    let proxy_state_reload = proxy_state.clone();
-    #[cfg(unix)]
+    // SIGHUP-driven config reload (Unix only). On non-Unix this future just
+    // waits on shutdown so the join order is unchanged.
+    let proxy_state_reload = handles.proxy_state.clone();
     let config_path_owned = config_path.to_string();
-    #[cfg(unix)]
     let reload_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
-    #[cfg(unix)]
     let reload_backend_allow_ips = env_config.backend_allow_ips.clone();
-    #[cfg(unix)]
     let reload_namespace = env_config.namespace.clone();
     let mut sighup_shutdown = shutdown_tx.subscribe();
     let sighup_handle = tokio::spawn(async move {
@@ -341,7 +220,212 @@ pub async fn run(
         }
     });
 
-    // Start Admin API (read-only in file mode)
+    // Wait for serve()'s tasks to drain (proxy listeners + background tasks).
+    handles.join().await;
+
+    // SIGHUP listener exits via shutdown_rx — wait for it too with a timeout.
+    let _ = tokio::time::timeout(Duration::from_secs(5), sighup_handle).await;
+
+    Ok(())
+}
+
+/// In-process entry point.
+///
+/// Builds a [`ProxyState`] from `config`, spawns proxy and admin listeners
+/// (using `prebound` listeners where provided, otherwise binding the ports
+/// from `env_config`), and returns a [`ServeHandles`] without blocking.
+///
+/// Unlike [`run`], this function:
+///
+/// - Skips SIGHUP reload (caller drives reloads via
+///   `handles.proxy_state.update_config(...)`).
+/// - Skips the shutdown-signal handler — the caller already owns the
+///   `shutdown_tx`.
+/// - Returns once every listener has bound (or adopted its pre-bound socket)
+///   — the gateway is ready to take traffic before this function returns.
+///
+/// Stream proxy bind failures are still fatal here: this matches `run()`'s
+/// invariants and keeps tests honest about config typos.
+pub async fn serve(
+    env_config: EnvConfig,
+    config: GatewayConfig,
+    mut prebound: PreboundListeners,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> Result<ServeHandles, anyhow::Error> {
+    info!(
+        "file::serve: starting in-process gateway with {} proxies, {} consumers",
+        config.proxies.len(),
+        config.consumers.len()
+    );
+
+    // Validate stream proxy ports don't conflict with gateway reserved ports
+    let reserved_ports = env_config.reserved_gateway_ports();
+    if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        return Err(anyhow::anyhow!(
+            "Stream proxy port conflicts with gateway reserved ports"
+        ));
+    }
+
+    let dns_cache = DnsCache::new(DnsConfig {
+        global_overrides: env_config.dns_overrides.clone(),
+        resolver_addresses: env_config.dns_resolver_address.clone(),
+        hosts_file_path: env_config.dns_resolver_hosts_file.clone(),
+        dns_order: env_config.dns_order.clone(),
+        ttl_override_seconds: env_config.dns_ttl_override,
+        min_ttl_seconds: env_config.dns_min_ttl,
+        stale_ttl_seconds: env_config.dns_stale_ttl,
+        error_ttl_seconds: env_config.dns_error_ttl,
+        max_cache_size: env_config.dns_cache_max_size,
+        warmup_concurrency: env_config.dns_warmup_concurrency,
+        slow_threshold_ms: env_config.dns_slow_threshold_ms,
+        refresh_threshold_percent: env_config.dns_refresh_threshold_percent,
+        failed_retry_interval_seconds: env_config.dns_failed_retry_interval,
+        try_tcp_on_error: env_config.dns_try_tcp_on_error,
+        num_concurrent_reqs: env_config.dns_num_concurrent_reqs,
+        max_active_requests: env_config.dns_max_active_requests,
+        backend_allow_ips: env_config.backend_allow_ips.clone(),
+    });
+
+    // DNS warmup — collect every hostname referenced in the config (proxy
+    // backends, upstream targets, plugin endpoints) so the first request
+    // doesn't pay the resolver round-trip.
+    let mut hostnames: Vec<_> = config
+        .proxies
+        .iter()
+        .map(|p| {
+            (
+                p.backend_host.clone(),
+                p.dns_override.clone(),
+                p.dns_cache_ttl_seconds,
+            )
+        })
+        .collect();
+    for upstream in &config.upstreams {
+        for target in &upstream.targets {
+            hostnames.push((target.host.clone(), None, None));
+        }
+    }
+
+    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
+    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+    let admin_allowed_cidrs = Arc::new(
+        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
+            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
+    );
+
+    let proxy_state = ProxyState::new(
+        config,
+        dns_cache.clone(),
+        env_config.clone(),
+        Some(tls_policy.clone()),
+    )?;
+
+    let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
+    for host in plugin_hosts {
+        hostnames.push((host, None, None));
+    }
+
+    dns_cache.warmup(hostnames).await;
+
+    if env_config.pool_warmup_enabled {
+        proxy_state.warmup_connection_pools().await;
+    }
+    proxy_state.start_backend_capability_refresh_task(
+        !env_config.pool_warmup_enabled,
+        Some(shutdown_tx.subscribe()),
+    );
+
+    proxy_state.start_per_ip_cleanup_task();
+
+    let dns_handle =
+        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
+    let _dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
+
+    proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
+
+    let overload_handle = crate::overload::start_monitor(
+        proxy_state.overload.clone(),
+        env_config.overload_config(),
+        env_config.max_connections,
+        env_config.max_requests,
+        shutdown_tx.subscribe(),
+    );
+
+    let metrics_handle = crate::metrics::start_metrics_monitor(
+        proxy_state.request_count.clone(),
+        proxy_state.status_counts.clone(),
+        proxy_state.windowed_metrics.clone(),
+        env_config.status_metrics_window_seconds,
+        shutdown_tx.subscribe(),
+    );
+
+    // Validate frontend TLS config if provided (paths, expiry, key match).
+    let tls_config = if let (Some(cert_path), Some(key_path)) = (
+        &env_config.frontend_tls_cert_path,
+        &env_config.frontend_tls_key_path,
+    ) {
+        info!("Loading TLS configuration with client certificate verification...");
+        let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
+        match tls::load_tls_config_with_client_auth(
+            cert_path,
+            key_path,
+            client_ca_bundle_path,
+            env_config.tls_no_verify,
+            &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            &crls,
+        ) {
+            Ok(mut config) => {
+                tls::enable_early_data(&mut config, &tls_policy);
+                if env_config.ktls_enabled.could_be_enabled() {
+                    tls::enable_secret_extraction_for_ktls(&mut config);
+                }
+                Some(config)
+            }
+            Err(e) => {
+                error!("TLS configuration validation failed: {}", e);
+                return Err(anyhow::anyhow!("Invalid TLS configuration: {}", e));
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref tls_cfg) = tls_config {
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_tls_config(Some(tls_cfg.clone()));
+    }
+
+    if let (Some(cert_path), Some(key_path)) =
+        (&env_config.dtls_cert_path, &env_config.dtls_key_path)
+    {
+        tls::check_cert_expiry(
+            cert_path,
+            "DTLS frontend cert",
+            env_config.tls_cert_expiry_warning_days,
+        )?;
+        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path {
+            tls::check_cert_expiry(
+                ca_path,
+                "DTLS client CA cert",
+                env_config.tls_cert_expiry_warning_days,
+            )?;
+        }
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_dtls_cert_key(
+                cert_path.clone(),
+                key_path.clone(),
+                env_config.dtls_client_ca_cert_path.clone(),
+            );
+    }
+
+    // Listen for SIGHUP — only meaningful for run(); skipped here.
+    let startup_ready = Arc::new(AtomicBool::new(false));
     let jwt_manager = match create_jwt_manager_from_env() {
         Ok(jm) => jm,
         Err(e) => {
@@ -349,8 +433,6 @@ pub async fn run(
                 "Admin JWT not configured ({}), admin endpoints will reject requests",
                 e
             );
-            // Create a JWT manager with a random secret so externally-crafted
-            // tokens are rejected — no one can predict the secret.
             let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
             crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
                 secret: random_secret,
@@ -358,7 +440,6 @@ pub async fn run(
             })
         }
     };
-    let startup_ready = Arc::new(AtomicBool::new(false));
     let admin_state = AdminState {
         db: None,
         jwt_manager,
@@ -377,28 +458,39 @@ pub async fn run(
         cp_connection_state: None,
     };
 
-    let mut handles = Vec::new();
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    let mut bound = BoundAddresses::default();
 
-    // Admin HTTP listener (disabled when port is 0)
-    if env_config.admin_http_port != 0 {
-        let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
-        let admin_http_state = admin_state.clone();
-        let admin_http_shutdown = shutdown_tx.subscribe();
-        let admin_http_handle = tokio::spawn(async move {
-            info!("Starting admin HTTP listener on {}", admin_http_addr);
+    // ── Admin HTTP listener ──────────────────────────────────────────────
+    if let Some(listener) = prebound.admin_http.take() {
+        bound.admin_http = listener.local_addr().ok();
+        let st = admin_state.clone();
+        let sh = shutdown_tx.subscribe();
+        let h = tokio::spawn(async move {
             if let Err(e) =
-                admin::start_admin_listener(admin_http_addr, admin_http_state, admin_http_shutdown)
-                    .await
+                admin::start_admin_listener_with_bound_listener(listener, st, sh, None).await
             {
                 error!("Admin HTTP listener error: {}", e);
             }
         });
-        handles.push(admin_http_handle);
+        handles.push(h);
+    } else if env_config.admin_http_port != 0 {
+        let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
+        bound.admin_http = Some(admin_http_addr);
+        let st = admin_state.clone();
+        let sh = shutdown_tx.subscribe();
+        let h = tokio::spawn(async move {
+            info!("Starting admin HTTP listener on {}", admin_http_addr);
+            if let Err(e) = admin::start_admin_listener(admin_http_addr, st, sh).await {
+                error!("Admin HTTP listener error: {}", e);
+            }
+        });
+        handles.push(h);
     } else {
         info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
     }
 
-    // Admin HTTPS listener (if TLS is configured for admin)
+    // ── Admin HTTPS listener ─────────────────────────────────────────────
     if let (Some(admin_cert), Some(admin_key)) = (
         &env_config.admin_tls_cert_path,
         &env_config.admin_tls_key_path,
@@ -415,24 +507,39 @@ pub async fn run(
             &crls,
         ) {
             Ok(admin_tls_config) => {
-                let admin_https_addr: SocketAddr =
-                    env_config.admin_socket_addr(env_config.admin_https_port);
-                let admin_https_state = admin_state.clone();
-                let admin_https_shutdown = shutdown_tx.subscribe();
-                let admin_https_handle = tokio::spawn(async move {
-                    info!("Starting admin HTTPS listener on {}", admin_https_addr);
-                    if let Err(e) = admin::start_admin_listener_with_tls(
-                        admin_https_addr,
-                        admin_https_state,
-                        admin_https_shutdown,
-                        Some(admin_tls_config),
-                    )
-                    .await
-                    {
-                        error!("Admin HTTPS listener error: {}", e);
-                    }
-                });
-                handles.push(admin_https_handle);
+                if let Some(listener) = prebound.admin_https.take() {
+                    bound.admin_https = listener.local_addr().ok();
+                    let st = admin_state.clone();
+                    let sh = shutdown_tx.subscribe();
+                    let cfg = Some(admin_tls_config);
+                    let h = tokio::spawn(async move {
+                        if let Err(e) = admin::start_admin_listener_with_bound_listener(
+                            listener, st, sh, cfg,
+                        )
+                        .await
+                        {
+                            error!("Admin HTTPS listener error: {}", e);
+                        }
+                    });
+                    handles.push(h);
+                } else {
+                    let admin_https_addr: SocketAddr =
+                        env_config.admin_socket_addr(env_config.admin_https_port);
+                    bound.admin_https = Some(admin_https_addr);
+                    let st = admin_state.clone();
+                    let sh = shutdown_tx.subscribe();
+                    let cfg = Some(admin_tls_config);
+                    let h = tokio::spawn(async move {
+                        info!("Starting admin HTTPS listener on {}", admin_https_addr);
+                        if let Err(e) =
+                            admin::start_admin_listener_with_tls(admin_https_addr, st, sh, cfg)
+                                .await
+                        {
+                            error!("Admin HTTPS listener error: {}", e);
+                        }
+                    });
+                    handles.push(h);
+                }
             }
             Err(e) => {
                 warn!(
@@ -442,89 +549,124 @@ pub async fn run(
             }
         }
     }
-    if env_config.admin_http_port == 0 && env_config.admin_tls_cert_path.is_none() {
+    if env_config.admin_http_port == 0
+        && env_config.admin_tls_cert_path.is_none()
+        && bound.admin_http.is_none()
+        && bound.admin_https.is_none()
+    {
         warn!(
             "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and no admin TLS configured. The admin API is unreachable."
         );
     }
 
-    // Start separate listeners for HTTP and HTTPS proxy
+    // ── Proxy HTTP listener ──────────────────────────────────────────────
     let mut startup_signals = Vec::new();
 
-    // HTTP listener (disabled when port is 0)
-    if env_config.proxy_http_port != 0 {
+    if let Some(listener) = prebound.proxy_http.take() {
+        bound.proxy_http = listener.local_addr().ok();
+        let st = proxy_state.clone();
+        let sh = shutdown_tx.subscribe();
+        let h = tokio::spawn(async move {
+            if let Err(e) =
+                proxy::start_proxy_listener_with_bound_listener(listener, st, sh, None).await
+            {
+                error!("HTTP proxy listener error: {}", e);
+            }
+        });
+        handles.push(h);
+        // Pre-bound listener is already accepting — no startup signal needed.
+    } else if env_config.proxy_http_port != 0 {
         let http_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_http_port);
-        let http_state = proxy_state.clone();
-        let http_shutdown = shutdown_tx.subscribe();
-        let (http_started_tx, http_started_rx) = tokio::sync::oneshot::channel();
-        let http_handle = tokio::spawn(async move {
+        bound.proxy_http = Some(http_addr);
+        let st = proxy_state.clone();
+        let sh = shutdown_tx.subscribe();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let h = tokio::spawn(async move {
             info!("Starting HTTP proxy listener on {}", http_addr);
             if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
-                http_state,
-                http_shutdown,
+                st,
+                sh,
                 None,
-                Some(http_started_tx),
+                Some(started_tx),
             )
             .await
             {
                 error!("HTTP proxy listener error: {}", e);
             }
         });
-        handles.push(http_handle);
-        startup_signals.push(("HTTP proxy listener".to_string(), http_started_rx));
+        handles.push(h);
+        startup_signals.push(("HTTP proxy listener".to_string(), started_rx));
     } else {
         info!("FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled");
     }
 
-    // HTTPS listener (only if TLS is configured)
-    if let Some(tls_config) = tls_config.clone() {
-        let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
-        let https_state = proxy_state.clone();
-        let https_shutdown = shutdown_tx.subscribe();
-        let (https_started_tx, https_started_rx) = tokio::sync::oneshot::channel();
-        let https_handle = tokio::spawn(async move {
-            info!("Starting HTTPS proxy listener on {}", https_addr);
-            if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
-                https_addr,
-                https_state,
-                https_shutdown,
-                Some(tls_config),
-                Some(https_started_tx),
-            )
-            .await
-            {
-                error!("HTTPS proxy listener error: {}", e);
-            }
-        });
-        handles.push(https_handle);
-        startup_signals.push(("HTTPS proxy listener".to_string(), https_started_rx));
+    // ── Proxy HTTPS listener (TLS) ───────────────────────────────────────
+    if let Some(tls_cfg_arc) = tls_config.clone() {
+        if let Some(listener) = prebound.proxy_https.take() {
+            bound.proxy_https = listener.local_addr().ok();
+            let st = proxy_state.clone();
+            let sh = shutdown_tx.subscribe();
+            let cfg = Some(tls_cfg_arc.clone());
+            let h = tokio::spawn(async move {
+                if let Err(e) =
+                    proxy::start_proxy_listener_with_bound_listener(listener, st, sh, cfg).await
+                {
+                    error!("HTTPS proxy listener error: {}", e);
+                }
+            });
+            handles.push(h);
+        } else {
+            let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
+            bound.proxy_https = Some(https_addr);
+            let st = proxy_state.clone();
+            let sh = shutdown_tx.subscribe();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let cfg = Some(tls_cfg_arc.clone());
+            let h = tokio::spawn(async move {
+                info!("Starting HTTPS proxy listener on {}", https_addr);
+                if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
+                    https_addr,
+                    st,
+                    sh,
+                    cfg,
+                    Some(started_tx),
+                )
+                .await
+                {
+                    error!("HTTPS proxy listener error: {}", e);
+                }
+            });
+            handles.push(h);
+            startup_signals.push(("HTTPS proxy listener".to_string(), started_rx));
+        }
     } else {
         info!("TLS not configured - HTTPS listener disabled");
     }
 
-    // HTTP/3 (QUIC) listener (only if enabled and TLS is configured)
+    // ── HTTP/3 (QUIC) listener ───────────────────────────────────────────
+    // H3 always binds its own UDP socket — no pre-bound variant.
     if env_config.enable_http3 {
-        if let Some(tls_config) = tls_config.clone() {
+        if let Some(tls_cfg_arc) = tls_config.clone() {
             let h3_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
-            let h3_state = proxy_state.clone();
-            let h3_shutdown = shutdown_tx.subscribe();
+            let st = proxy_state.clone();
+            let sh = shutdown_tx.subscribe();
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
             let h3_tls_policy = tls_policy.clone();
             let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
-            let (h3_started_tx, h3_started_rx) = tokio::sync::oneshot::channel();
-            let h3_handle = tokio::spawn(async move {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let h = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
                 if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
                     h3_addr,
-                    h3_state,
-                    h3_shutdown,
-                    tls_config,
+                    st,
+                    sh,
+                    tls_cfg_arc,
                     h3_config,
                     &h3_tls_policy,
                     crate::http3::server::Http3ListenerOptions {
                         client_ca_bundle_path: h3_client_ca,
-                        started_tx: Some(h3_started_tx),
+                        started_tx: Some(started_tx),
                     },
                 )
                 .await
@@ -532,20 +674,14 @@ pub async fn run(
                     error!("HTTP/3 proxy listener error: {}", e);
                 }
             });
-            handles.push(h3_handle);
-            startup_signals.push(("HTTP/3 proxy listener".to_string(), h3_started_rx));
+            handles.push(h);
+            startup_signals.push(("HTTP/3 proxy listener".to_string(), started_rx));
         } else {
             error!("HTTP/3 requires TLS configuration - HTTP/3 listener disabled");
         }
     }
 
-    if env_config.proxy_http_port == 0 && tls_config.is_none() {
-        warn!(
-            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and no TLS configured. Only stream proxies (TCP/UDP) will serve traffic."
-        );
-    }
-
-    // Start stream proxy listeners (TCP/UDP) — bind failures are fatal in file mode.
+    // Stream proxy listeners (TCP/UDP) — fatal if any binds fail in file mode.
     proxy_state.initial_reconcile_stream_listeners().await?;
     wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
     proxy_state
@@ -555,46 +691,22 @@ pub async fn run(
     startup_ready.store(true, Ordering::Relaxed);
     info!("Gateway startup complete; /health now reports ready");
 
-    // Wait for all listeners to complete (these exit when the shutdown signal fires).
-    // If no listener handles were spawned (e.g., all plaintext ports disabled and no
-    // TLS configured), block on the shutdown signal so stream proxies keep running.
-    if handles.is_empty() {
-        let mut wait_shutdown = shutdown_tx.subscribe();
-        while !*wait_shutdown.borrow() {
-            if wait_shutdown.changed().await.is_err() {
-                break;
-            }
-        }
-    } else {
-        for handle in handles {
-            handle.await?;
-        }
-    }
-
-    // Graceful connection drain: wait for in-flight requests to complete.
-    // Accept loops have stopped, so no new connections arrive. Existing
-    // connections see Connection: close (via the draining flag) and complete
-    // their current request-response cycle before disconnecting.
-    let drain_seconds = env_config.shutdown_drain_seconds;
-    if drain_seconds > 0 {
-        crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
-            .await;
-    }
-
-    // Wait for background tasks to drain cleanly, with a timeout to prevent
-    // hanging if a task is stuck.
-    let bg_drain = async {
+    // Background-task handles get folded in here so join() in ServeHandles
+    // waits for them too.
+    handles.push(tokio::spawn(async move {
         let _ = dns_handle.await;
-        let _ = sighup_handle.await;
+    }));
+    handles.push(tokio::spawn(async move {
         let _ = overload_handle.await;
+    }));
+    handles.push(tokio::spawn(async move {
         let _ = metrics_handle.await;
-    };
-    if tokio::time::timeout(Duration::from_secs(5), bg_drain)
-        .await
-        .is_err()
-    {
-        warn!("Background tasks did not drain within 5s, proceeding with shutdown");
-    }
+    }));
 
-    Ok(())
+    Ok(ServeHandles {
+        proxy_state,
+        bound,
+        handles,
+        drain_seconds: env_config.shutdown_drain_seconds,
+    })
 }
