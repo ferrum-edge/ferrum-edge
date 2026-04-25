@@ -143,11 +143,27 @@ async fn rate_limiting_survives_slow_backend() {
     eprintln!(
         "rate_limiting_survives_slow_backend: statuses={statuses:?} oks={oks} rl={rate_limited}"
     );
+    // Both halves of the rate-limiter contract must hold — without the
+    // 200 floor, a broken plugin that rejects every request would also
+    // pass.
     assert!(
         rate_limited >= 1,
         "expected at least one 429; statuses={statuses:?}"
     );
-    // Don't assert the exact pass count — window timing variance is real.
+    assert!(
+        oks >= 1,
+        "expected at least one 200 — a plugin that 429s every request would pass with only the 429 assertion; \
+         statuses={statuses:?}"
+    );
+    // Window timing variance can let a few extra requests through, but
+    // the upper bound is the configured limit. With requests_per_minute=5
+    // and a single test burst within one minute, the 200 count must not
+    // exceed the limit, otherwise the rate limiter is leaking.
+    assert!(
+        oks <= 5,
+        "expected oks <= 5 (requests_per_minute limit); got {oks}; \
+         statuses={statuses:?}"
+    );
     let _ = backend.accepted_connections();
 }
 

@@ -14,10 +14,11 @@
 //! Phase-8 additions (these complement the original tests already in this
 //! file):
 //!
-//! * `fd_pressure_disables_keepalive` — uses `FERRUM_OVERLOAD_FD_KEEPALIVE_THRESHOLD`
+//! * `fd_pressure_disables_keepalive` — uses `FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD`
 //!   to drive the file-descriptor pressure path (independent from connection
-//!   count). Asserts `/overload.actions.disable_keepalive=true` under the
-//!   tight FD ratio.
+//!   count). Linux-only — the macOS getrlimit(RLIMIT_NOFILE) returning
+//!   `RLIM_INFINITY` makes the percentage-based threshold untrippable, so
+//!   the test skips with an explicit message there.
 //! * `request_count_above_threshold_returns_503` — drives `MAX_REQUESTS`
 //!   below pending in-flight work and asserts 503 + the
 //!   `actions.reject_new_requests=true` flag rather than the older 502 /
@@ -27,8 +28,9 @@
 //!   returns a gRPC trailer-only `UNAVAILABLE` instead of a HTTP 503.
 //! * `overload_state_transitions_logged_with_warn_then_info` — asserts the
 //!   gateway logs the `enter overload` event at WARN and `recover from
-//!   overload` event at INFO. Uses the captured-stderr facility on the
-//!   harness.
+//!   overload` event at INFO. Captures both stdout and stderr to a single
+//!   file because the gateway's `SeverityWriter` routes INFO to stdout
+//!   and WARN to stderr.
 //!
 //! Run with:
 //!   cargo build --bin ferrum-edge
@@ -111,16 +113,21 @@ struct OverloadEnv {
     conn_critical: Option<f64>,
     req_pressure: Option<f64>,
     req_critical: Option<f64>,
-    fd_keepalive: Option<f64>,
+    fd_pressure: Option<f64>,
+    fd_critical: Option<f64>,
     shutdown_drain_seconds: Option<u32>,
 }
 
+/// Start the gateway. When `capture_log_path` is `Some`, BOTH stdout and
+/// stderr are redirected to that file. The gateway routes INFO logs to
+/// stdout and WARN/ERROR to stderr (`SeverityWriter` in `main.rs`), so
+/// any test that wants to assert on log-line presence needs both streams.
 fn start_gateway(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
     env: &OverloadEnv,
-    capture_stderr_path: Option<&std::path::Path>,
+    capture_log_path: Option<&std::path::Path>,
 ) -> std::process::Child {
     let binary_path = gateway_binary_path();
 
@@ -154,23 +161,32 @@ fn start_gateway(
     if let Some(v) = env.req_critical {
         cmd.env("FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD", v.to_string());
     }
-    if let Some(v) = env.fd_keepalive {
-        cmd.env("FERRUM_OVERLOAD_FD_KEEPALIVE_THRESHOLD", v.to_string());
+    if let Some(v) = env.fd_pressure {
+        cmd.env("FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD", v.to_string());
+    }
+    if let Some(v) = env.fd_critical {
+        cmd.env("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD", v.to_string());
     }
     if let Some(v) = env.shutdown_drain_seconds {
         cmd.env("FERRUM_SHUTDOWN_DRAIN_SECONDS", v.to_string());
     }
 
-    let stderr = match capture_stderr_path {
+    let (stdout, stderr) = match capture_log_path {
         Some(path) => {
-            let f = std::fs::File::create(path).expect("create stderr file");
-            std::process::Stdio::from(f)
+            // Open the file once for stderr, then dup the file descriptor for
+            // stdout so both streams append into the same file. Each Stdio
+            // wraps an independent File handle but shares the underlying
+            // fd at the kernel level after dup, which gives us interleaved
+            // writes (race-prone but acceptable for functional log assertions).
+            let f1 = std::fs::File::create(path).expect("create log file");
+            let f2 = f1.try_clone().expect("clone log file fd");
+            (std::process::Stdio::from(f1), std::process::Stdio::from(f2))
         }
-        None => std::process::Stdio::null(),
+        None => (std::process::Stdio::null(), std::process::Stdio::null()),
     };
 
     cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(stdout)
         .stderr(stderr)
         .spawn()
         .expect("Failed to start gateway binary")
@@ -220,18 +236,20 @@ async fn start_gateway_with_retry(
     panic!("Gateway did not start after {MAX_ATTEMPTS} attempts");
 }
 
-/// Variant that captures stderr to a file; returns the file path along with
-/// the usual `(child, proxy_port, admin_port)` tuple.
-async fn start_gateway_with_retry_capture_stderr(
+/// Variant that captures stdout AND stderr to a single file; returns the
+/// file path along with the usual `(child, proxy_port, admin_port)` tuple.
+/// Used by tests that need to assert on INFO-level log lines, since the
+/// gateway routes INFO to stdout (see `SeverityWriter` in `main.rs`).
+async fn start_gateway_with_retry_capture_logs(
     config_path: &str,
     env: &OverloadEnv,
-    stderr_path: &std::path::Path,
+    log_path: &std::path::Path,
 ) -> (std::process::Child, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
-        let mut child = start_gateway(config_path, proxy_port, admin_port, env, Some(stderr_path));
+        let mut child = start_gateway(config_path, proxy_port, admin_port, env, Some(log_path));
         if wait_for_gateway(admin_port).await {
             return (child, proxy_port, admin_port);
         }
@@ -927,82 +945,94 @@ async fn test_overload_endpoint_returns_503_under_critical() {
 
 /// Phase-8 Test 7: FD pressure disables keepalive.
 ///
-/// On macOS the FD soft limit reports as `RLIM_INFINITY` (i64::MAX) which
-/// makes `fd_ratio = current / max` numerically zero — so a percentage-
-/// based FD threshold is effectively impossible to trip via `getrlimit`.
-/// The robust cross-platform alternative is to drive connection-count
-/// pressure (which reaches the same `disable_keepalive` flag through the
-/// `disable_keepalive_threshold` for connections).
+/// On macOS the FD soft limit returned by `getrlimit(RLIMIT_NOFILE)` is
+/// `RLIM_INFINITY` (`u64::MAX`) and `count_open_fds()` is unimplemented
+/// (returns 0), so `fd_ratio = current / max ≡ 0` regardless of actual
+/// FD usage. A percentage-based FD threshold is therefore impossible to
+/// trip on macOS, and we skip with an explicit message rather than
+/// silently passing.
 ///
-/// We use a high enough connection burst to flip `disable_keepalive=true`
-/// and verify the response carries `Connection: close` — which is the
-/// load-bearing observable the operator cares about. Tests Test 2
-/// (connection-pressure → disable_keepalive) and Test 4 (request-count
-/// → reject_new_requests) cover the other thresholds; this test
-/// specifically exercises the `Connection: close` propagation onto the
-/// frontend response.
+/// On Linux the gateway counts open FDs from `/proc/self/fd` and reads
+/// the soft limit from `getrlimit`. We set
+/// `FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD=0.0001` so the gateway's
+/// baseline FD usage is enough to trip the threshold, set the
+/// connection-pressure threshold high so it cannot mask the FD
+/// observation, and assert that the FD ratio reported by `/overload`
+/// actually exceeds the threshold and that `disable_keepalive=true`.
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fd_pressure_disables_keepalive() {
+    if !cfg!(target_os = "linux") {
+        eprintln!(
+            "skipping fd_pressure_disables_keepalive: FD pressure relies on \
+             /proc/self/fd + finite RLIMIT_NOFILE, which is Linux-only"
+        );
+        return;
+    }
+
     let temp_dir = TempDir::new().expect("tempdir");
     let (backend_port, stop, _backend) = spawn_slow_backend(2000).await;
     let config_path = write_config(&temp_dir, backend_port);
 
     let env = OverloadEnv {
-        max_connections: Some(8),
+        // Conn pressure stays inert so FD pressure is the only path that
+        // can flip `disable_keepalive`.
+        max_connections: Some(10000),
+        conn_pressure: Some(0.99),
+        conn_critical: Some(0.999),
         check_interval_ms: Some(200),
-        // Low connection-pressure threshold flips disable_keepalive.
-        conn_pressure: Some(0.3),
-        conn_critical: Some(0.99),
+        // Trip the FD threshold on baseline FD usage. Even a fresh
+        // gateway opens dozens of FDs (listeners, pipes, log handles,
+        // pool warmup probes), so 0.0001 is comfortably below the
+        // observed ratio in any reasonable Linux environment.
+        fd_pressure: Some(0.0001),
+        fd_critical: Some(0.999),
         shutdown_drain_seconds: Some(0),
         ..Default::default()
     };
 
-    let (gw, proxy_port, admin_port) =
+    let (gw, _proxy_port, admin_port) =
         start_gateway_with_retry(config_path.to_str().unwrap(), &env).await;
 
-    // Saturate ~6/8 connections.
-    let slow_url = format!("http://127.0.0.1:{proxy_port}/slow");
-    let mut futures = Vec::new();
-    for _ in 0..6 {
-        let url = slow_url.clone();
-        futures.push(tokio::spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(8))
-                .pool_max_idle_per_host(0)
-                .build()
-                .unwrap();
-            client.get(&url).send().await
-        }));
-    }
-
-    // Allow the monitor to flip disable_keepalive.
+    // Allow the monitor at least one full interval to pick up the FD count.
     let mut disabled = false;
+    let mut observed_fd_ratio: f64 = 0.0;
     let mut last_body = serde_json::Value::Null;
     for _ in 0..20 {
         sleep(Duration::from_millis(200)).await;
         let (_, body) = get_overload(admin_port).await;
         last_body = body.clone();
+        let fd_ratio = body
+            .get("pressure")
+            .and_then(|p| p.get("file_descriptors"))
+            .and_then(|f| f.get("ratio"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        observed_fd_ratio = observed_fd_ratio.max(fd_ratio);
         let dk = body
             .get("actions")
             .and_then(|a| a.get("disable_keepalive"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if dk {
+        let conn_ratio = body
+            .get("pressure")
+            .and_then(|p| p.get("connections"))
+            .and_then(|c| c.get("ratio"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        // Make sure connection pressure isn't the actual trigger — we
+        // configured max_connections=10000 specifically to keep
+        // conn_ratio near zero.
+        if dk && fd_ratio >= 0.0001 && conn_ratio < 0.99 {
             disabled = true;
             break;
         }
     }
     assert!(
         disabled,
-        "expected disable_keepalive=true under connection pressure; \
-         last /overload={last_body}"
+        "expected disable_keepalive=true triggered by FD pressure \
+         (max observed FD ratio={observed_fd_ratio}); /overload={last_body}"
     );
-
-    // Drain inflight before teardown.
-    for f in futures {
-        let _ = f.await;
-    }
 
     teardown(gw, stop).await;
 }
@@ -1244,10 +1274,9 @@ async fn overload_state_transitions_logged_with_warn_then_info() {
         ..Default::default()
     };
 
-    let stderr_path = temp_dir.path().join("gateway.stderr.log");
+    let log_path = temp_dir.path().join("gateway.log");
     let (gw, proxy_port, _admin_port) =
-        start_gateway_with_retry_capture_stderr(config_path.to_str().unwrap(), &env, &stderr_path)
-            .await;
+        start_gateway_with_retry_capture_logs(config_path.to_str().unwrap(), &env, &log_path).await;
 
     let slow_url = format!("http://127.0.0.1:{proxy_port}/slow");
     // Drive 10 concurrent slow requests; this saturates max_connections=8.
@@ -1270,40 +1299,46 @@ async fn overload_state_transitions_logged_with_warn_then_info() {
         let _ = f.await;
     }
 
-    // Allow the monitor to flip back to normal after drain.
-    sleep(Duration::from_millis(1500)).await;
+    // Allow the monitor to flip back to normal after drain. We wait
+    // generously here because the recovery transition fires on the next
+    // monitor tick AFTER active_connections drops below the critical
+    // threshold, and we also need the OS to flush the gateway's stderr
+    // buffer to the captured file.
+    sleep(Duration::from_millis(3000)).await;
 
-    // Read the captured stderr.
-    let stderr_contents = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    // Tear down the gateway BEFORE reading stderr so any buffered writes
+    // are flushed by the kernel as the process exits. Reading the file
+    // while the child still owns the stderr fd can miss log lines that
+    // the child has written but not yet flushed (rare on Linux, common
+    // on macOS where stderr can be block-buffered).
+    teardown(gw, stop).await;
+
+    let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
 
     // Look for any "overload"-mentioning line at WARN level and a
-    // recovery line at INFO level. The gateway uses tracing's default
-    // formatter which prints `WARN ferrum_edge::overload` etc., so we
-    // grep on the level prefix.
-    let warned = stderr_contents.lines().any(|ln| {
+    // recovery line at INFO level. The gateway emits structured JSON
+    // logs (via tracing-subscriber) which carry `"level":"WARN"` /
+    // `"level":"INFO"`, so a substring match is reliable. INFO is on
+    // stdout per `SeverityWriter`, hence we capture both streams above.
+    let warned = log_contents.lines().any(|ln| {
         ln.contains("WARN")
             && (ln.to_ascii_lowercase().contains("overload")
                 || ln.to_ascii_lowercase().contains("pressure"))
     });
-    let recovered = stderr_contents.lines().any(|ln| {
+    let recovered = log_contents.lines().any(|ln| {
         ln.contains("INFO")
             && (ln.to_ascii_lowercase().contains("recover")
-                || ln.to_ascii_lowercase().contains("overload")
                 || ln.to_ascii_lowercase().contains("normal"))
     });
 
     assert!(
         warned,
         "expected at least one WARN line mentioning overload/pressure during the burst; \
-         stderr={stderr_contents}"
+         log={log_contents}"
     );
-    if !recovered {
-        eprintln!(
-            "did not see explicit INFO `recover/normal` line — \
-             gateway may have suppressed if state never escalated; \
-             stderr={stderr_contents}"
-        );
-    }
-
-    teardown(gw, stop).await;
+    assert!(
+        recovered,
+        "expected at least one INFO line mentioning recover/normal after the burst drained; \
+         log={log_contents}"
+    );
 }

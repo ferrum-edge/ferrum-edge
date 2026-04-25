@@ -664,15 +664,32 @@ async fn mark_h3_unsupported_persists_until_periodic_refresh_succeeds() {
     // Phase C: bind a real H3 backend on the same port and trigger a
     // refresh manually. The periodic timer also runs but we trigger
     // directly to keep the test fast.
-    let recovered_udp = match UdpSocket::bind(("127.0.0.1", backend_port)).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "skipping recovery phase: couldn't rebind UDP port {backend_port} after the no-quic listener cleared: {e}"
-            );
-            return;
+    //
+    // The UDP rebind can race with kernel TIME_WAIT-equivalent cleanup;
+    // retry a small number of times so a transient bind failure doesn't
+    // make the recovery half of the test silently skip.
+    let mut bind_err: Option<std::io::Error> = None;
+    let mut recovered_udp: Option<UdpSocket> = None;
+    for attempt in 0..10 {
+        match UdpSocket::bind(("127.0.0.1", backend_port)).await {
+            Ok(s) => {
+                recovered_udp = Some(s);
+                break;
+            }
+            Err(e) => {
+                bind_err = Some(e);
+                if attempt < 9 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
         }
-    };
+    }
+    let recovered_udp = recovered_udp.unwrap_or_else(|| {
+        panic!(
+            "could not rebind UDP port {backend_port} for recovery phase after 10 attempts: {:?}",
+            bind_err
+        )
+    });
     let _recovered = ScriptedH3Backend::builder(recovered_udp, H3TlsConfig::new(cert, key))
         .step(H3Step::StallFor(Duration::from_secs(60)))
         .spawn()
@@ -684,28 +701,22 @@ async fn mark_h3_unsupported_persists_until_periodic_refresh_succeeds() {
         .await;
 
     let recovered =
-        wait_for_h3_classification(&harness, &["supported"], Duration::from_secs(10)).await;
+        wait_for_h3_classification(&harness, &["supported"], Duration::from_secs(15)).await;
 
-    if let Some(entry) = recovered {
-        assert_eq!(
-            entry["plain_http"]["h3"].as_str(),
-            Some("supported"),
-            "expected h3=supported after recovery; entry: {entry:#?}"
-        );
-    } else {
-        // Recovery never observed — print the latest registry snapshot
-        // for triage. We do NOT panic if the classification stays
-        // Unsupported under flaky UDP rebind timing; the assertion that
-        // the flag was sticky in Phase B is the primary regression
-        // guarantee.
-        let last = fetch_capability_entry(&harness)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Null);
-        eprintln!(
-            "h3 did not flip to supported within 10s after recovery — \
-             last entry: {last:#?}"
-        );
-    }
+    let entry = match recovered {
+        Some(e) => e,
+        None => {
+            let last = fetch_capability_entry(&harness)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Null);
+            panic!("h3 did not flip to supported within 15s after recovery; last entry: {last:#?}");
+        }
+    };
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported after recovery; entry: {entry:#?}"
+    );
 }

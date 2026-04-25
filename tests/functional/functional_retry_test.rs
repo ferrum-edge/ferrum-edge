@@ -216,24 +216,39 @@ async fn retry_respects_retry_on_methods() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Test 2 — Retry on H3 transport failure routes the next attempt via
-// the cross-protocol bridge (reqwest path).
+// Test 2 — Post-H3-downgrade requests route via the cross-protocol bridge.
 // ────────────────────────────────────────────────────────────────────────────
 //
+// IMPORTANT: this test does NOT assert that within-request retry replays
+// over the bridge. ferrum-edge intentionally does not silently fall
+// through to reqwest after an H3 transport failure inside the same
+// request — the dispatch decision is made once per request, so all
+// in-request retry attempts use the native H3 pool. The 502 from the
+// first request is therefore the expected, documented behavior (see
+// CLAUDE.md "No same-request reqwest fallback after H3 failure"). The
+// retry-policy field is configured here only so the gateway exercises
+// the H3 retry loop; the configured `max_retries` is exhausted at the
+// H3 layer.
+//
 // Setup: H3-capable backend on UDP that closes the connection on the
-// first request. The TCP+TLS side answers OK. Retry policy permits one
-// retry on connection failure.
+// first stream. The TCP+TLS side answers OK. Retry policy is configured
+// so the gateway runs its retry loop (and we observe that retry alone
+// does NOT change dispatch).
 //
-// Expected: after the first H3 attempt fails, the capability registry
-// downgrades h3 to Unsupported. The retry attempt routes via the
-// cross-protocol bridge (TCP+TLS), succeeds, and the test sees a 200.
+// Assertions:
+//   * The first request observably went to H3 (the H3 backend recorded
+//     stream activity), proving dispatch took the native pool.
+//   * The first request returns a 5xx — proving the in-request retry
+//     loop did NOT magically fall back to the bridge.
+//   * After the registry downgrade fires, a SECOND request routes via
+//     the cross-protocol bridge → TCP backend → 200.
 //
-// The H3 backend should have observed exactly one request (the failed
-// attempt). The TCP+TLS backend should have observed at least one
-// connection (the retry).
+// If `mark_h3_unsupported`/registry-downgrade or post-downgrade routing
+// regresses, this test fails. If retry replay across pools were ever
+// added (a behavior change), the first-request assertion would catch it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn retry_on_h3_transport_failure_routes_next_attempt_via_reqwest() {
+async fn post_h3_downgrade_subsequent_requests_route_via_cross_protocol_bridge() {
     let ca = TestCa::new("phase8-retry-h3").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
@@ -311,15 +326,27 @@ async fn retry_on_h3_transport_failure_routes_next_attempt_via_reqwest() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // H3 client request 1: native H3 pool → fails. Tests whether the
-    // retry kicks in within the same request: ferrum-edge's retry loop
-    // dispatches each retry attempt through `dispatch_to_backend`,
-    // which re-evaluates the registry. So if the first attempt
-    // downgrades H3, the retry should route through the bridge.
+    // H3 client request 1: dispatched to the native H3 pool. The H3
+    // backend cancels the stream, the gateway's retry loop exhausts at
+    // the H3 layer (within-request fallback to the bridge is
+    // intentionally not supported), and the response is a 5xx.
     let client = Http3Client::insecure().expect("h3 client");
     let url1 = format!("https://127.0.0.1:{https_port}/api/retry-1");
     let first = client.get(&url1).await.expect("h3 first request");
-    eprintln!("first request: {first:?}");
+    assert!(
+        first.status.as_u16() >= 500 && first.status.as_u16() < 600,
+        "first request should fail at the H3 layer (no within-request bridge fallback); got {first:?}"
+    );
+
+    // The H3 backend MUST have observed the first request — otherwise
+    // dispatch never went through the native pool and this whole test
+    // is meaningless. This catches a regression where dispatch silently
+    // routes to the bridge on the first request.
+    let h3_streams_after_first = h3_backend.received_requests().await.len();
+    assert!(
+        h3_streams_after_first >= 1,
+        "first request should have hit the native H3 pool; H3 backend saw {h3_streams_after_first} streams"
+    );
 
     // Wait for the registry downgrade to land.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -355,11 +382,6 @@ async fn retry_on_h3_transport_failure_routes_next_attempt_via_reqwest() {
         bridge_count >= 1,
         "expected the TCP+TLS bridge backend to handle at least one request after downgrade; got {bridge_count}"
     );
-
-    // Informational: the H3 backend should have observed at least
-    // one stream from the first failed request.
-    let h3_streams = h3_backend.received_requests().await.len();
-    eprintln!("h3_streams={}, bridge_count={}", h3_streams, bridge_count);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
