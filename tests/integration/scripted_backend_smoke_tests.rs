@@ -178,3 +178,175 @@ async fn in_process_harness_routes_request_to_scripted_backend() {
     assert_eq!(resp.status, reqwest::StatusCode::OK);
     assert_eq!(resp.body_text(), "pong");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Regression: env-var overrides must be applied BEFORE the YAML loader runs,
+// otherwise the loader's namespace filter and `BackendAllowIps`-keyed field
+// validation use the wrong values and an in-process test sees a different
+// resource set than the binary-mode gateway would. Two proxies in different
+// namespaces both claim `/api`; an `FERRUM_NAMESPACE=alt` override has to
+// cause the loader to drop the `ferrum` proxy AND keep the `alt` one. If the
+// fix regresses, the loader keeps the `ferrum` proxy (whose backend points
+// at a closed port) and the request returns 502 — or the namespaces collide
+// on `listen_path` and the loader fails outright.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_harness_applies_namespace_override_before_loading_yaml() {
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "GET", "/ping",
+        )))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+
+    // Two proxies, same listen_path, different namespaces. The active
+    // namespace is `alt`, so only the `alt` proxy must survive the loader's
+    // post-parse namespace filter. Loaded together with namespace `ferrum`
+    // (the harness's old default), the cross-resource uniqueness validator
+    // would reject the YAML for duplicate `listen_path: /api`.
+    let yaml = serde_yaml::to_string(&serde_json::json!({
+        "proxies": [
+            {
+                "id": "ferrum-proxy",
+                "namespace": "ferrum",
+                "listen_path": "/api",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                // Bogus port — if the loader keeps this proxy, the request
+                // would route here and we'd see a 502.
+                "backend_port": 1u16,
+                "strip_listen_path": true,
+                "backend_connect_timeout_ms": 500,
+                "backend_read_timeout_ms": 5000,
+                "backend_write_timeout_ms": 5000,
+            },
+            {
+                "id": "alt-proxy",
+                "namespace": "alt",
+                "listen_path": "/api",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": backend_port,
+                "strip_listen_path": true,
+                "backend_connect_timeout_ms": 2000,
+                "backend_read_timeout_ms": 5000,
+                "backend_write_timeout_ms": 5000,
+            },
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    }))
+    .expect("serialize yaml");
+
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .env("FERRUM_NAMESPACE", "alt")
+        .spawn()
+        .await
+        .expect("spawn in-process gateway");
+
+    harness
+        .wait_healthy(Duration::from_secs(5))
+        .await
+        .expect("gateway healthy");
+
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .get(&harness.proxy_url("/api/ping"))
+        .await
+        .expect("response");
+    assert_eq!(
+        resp.status,
+        reqwest::StatusCode::OK,
+        "namespace override should have routed to the alt-namespace proxy; \
+         body was {:?}",
+        resp.body_text(),
+    );
+    assert_eq!(resp.body_text(), "pong");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Regression: a cold in-process harness (warmup off, the default) must NOT
+// trigger the immediate backend-capability probe pass. The h2c probe opens a
+// real TCP/h2c handshake against plaintext HTTP backends, which would
+// consume the first `ExpectRequest` step on a scripted backend or otherwise
+// inflate per-test connection counts. With the fix, the registry stays
+// empty until either the first periodic refresh (24 h default) or an
+// explicit `POST /backend-capabilities/refresh`.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_harness_does_not_probe_backend_when_warmup_disabled() {
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "GET", "/ping",
+        )))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = file_mode_yaml_for_backend(backend_port);
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn in-process gateway");
+
+    harness
+        .wait_healthy(Duration::from_secs(5))
+        .await
+        .expect("gateway healthy");
+
+    // Pre-request: with the cold harness fix, no probe has fired, so the
+    // capability registry should be empty. Any non-empty entry here means
+    // the immediate refresh ran (e.g. `serve()` regressed to passing
+    // `run_initial_refresh = true` regardless of the harness's preference).
+    let snapshot = harness
+        .get_admin_json("/backend-capabilities")
+        .await
+        .expect("backend-capabilities");
+    assert_eq!(
+        snapshot["entries"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(usize::MAX),
+        0,
+        "cold harness must not pre-probe backends; got snapshot {snapshot:?}",
+    );
+
+    // The actual proxy request still works — and since the probe never
+    // fired, the backend's first `ExpectRequest` step lines up with the
+    // test's GET, not with stray h2c handshake bytes.
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .get(&harness.proxy_url("/api/ping"))
+        .await
+        .expect("response");
+    assert_eq!(resp.status, reqwest::StatusCode::OK);
+    assert_eq!(resp.body_text(), "pong");
+}

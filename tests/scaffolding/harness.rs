@@ -305,16 +305,6 @@ async fn try_spawn_in_process(
         f.write_all(yaml.as_bytes())?;
     }
 
-    let config = ferrum_edge::config::file_loader::load_config_from_file(
-        config_path.to_string_lossy().as_ref(),
-        30,
-        &BackendAllowIps::Both,
-        "ferrum",
-    )
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        format!("file_loader failed: {e}").into()
-    })?;
-
     // Build EnvConfig with sensible test defaults. We deliberately leave
     // most fields at their `Default` so the test sees production-like
     // behaviour; only the fields the harness controls are overridden.
@@ -338,12 +328,29 @@ async fn try_spawn_in_process(
         ..EnvConfig::default()
     };
 
-    // Apply caller-provided env-var overrides. Today we only honour the
-    // small subset that maps cleanly to EnvConfig fields used by the
-    // in-process scripted-backend tests; pass an unrecognised key and the
-    // override is silently ignored (binary mode would forward it to the
-    // subprocess). Add new fields as tests need them.
+    // Apply caller-provided env-var overrides BEFORE loading the YAML.
+    // The file loader reads `namespace` (post-load resource filter) and
+    // `backend_allow_ips` (field-level validation in
+    // `validate_all_fields_with_ip_policy`) from these fields, so applying
+    // overrides afterwards would let the wrong namespace's resources slip
+    // through and accept backend IP policies the real gateway would reject.
+    //
+    // Today we only honour the small subset that maps cleanly to EnvConfig
+    // fields used by the in-process scripted-backend tests; pass an
+    // unrecognised key and the override is silently ignored (binary mode
+    // would forward it to the subprocess). Add new fields as tests need
+    // them.
     apply_env_overrides(&mut env_config, &builder.extra_env);
+
+    let config = ferrum_edge::config::file_loader::load_config_from_file(
+        config_path.to_string_lossy().as_ref(),
+        env_config.tls_cert_expiry_warning_days,
+        &env_config.backend_allow_ips,
+        &env_config.namespace,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("file_loader failed: {e}").into()
+    })?;
 
     let jwt_manager = JwtManager::new(JwtConfig {
         secret: builder.jwt_secret.clone(),
@@ -359,6 +366,14 @@ async fn try_spawn_in_process(
         proxy_http: Some(proxy_listener),
         admin_http: Some(admin_listener),
         admin_jwt_manager: Some(jwt_manager),
+        // Cold harness: skip the immediate backend capability probe
+        // unless the caller has explicitly enabled pool warmup.
+        // The probe opens an h2c connection to plaintext HTTP backends
+        // and would consume scripted-backend `ExpectRequest` steps or
+        // perturb per-test connection counts. Warmup-on tests still get
+        // the probe via `warmup_connection_pools()`, which is awaited
+        // before `serve()` returns.
+        skip_initial_capability_refresh: !builder.pool_warmup_enabled,
         ..ServeOptions::default()
     };
 

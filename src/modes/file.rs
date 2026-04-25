@@ -75,6 +75,25 @@ pub struct ServeOptions {
     /// secret/issuer/ttl from environment variables (same as the binary
     /// path does via `create_jwt_manager_from_env`).
     pub admin_jwt_manager: Option<crate::admin::jwt_auth::JwtManager>,
+    /// When `true`, `serve` does not trigger the immediate
+    /// backend-capability probe pass on startup; only the periodic refresh
+    /// loop is started.
+    ///
+    /// The binary leaves this `false`: when warmup is also off, an
+    /// immediate probe is the only thing that populates the registry
+    /// before the first periodic tick (default 24 h), without which
+    /// HTTPS dispatch falls back to reqwest for the entire window.
+    ///
+    /// In-process tests set this `true` to keep the harness "cold". The
+    /// h2c probe that runs against HTTP backends opens a real connection
+    /// to the (often scripted) backend, which would consume the first
+    /// `ExpectRequest` step or perturb per-test connection counts.
+    /// Tests that explicitly need the probe behaviour opt in via
+    /// `pool_warmup_enabled(true)` instead — that path runs warmup first
+    /// (which itself populates the registry) and is awaited before
+    /// `serve()` returns, so the test gets a deterministic snapshot
+    /// rather than racing the background refresh.
+    pub skip_initial_capability_refresh: bool,
 }
 
 /// Handles returned by [`serve`].
@@ -345,10 +364,15 @@ pub async fn serve(
     if env_config.pool_warmup_enabled {
         proxy_state.warmup_connection_pools().await;
     }
-    proxy_state.start_backend_capability_refresh_task(
-        !env_config.pool_warmup_enabled,
-        Some(shutdown_tx.subscribe()),
-    );
+    // Without warmup, the registry is otherwise empty until the first
+    // periodic tick (24 h default) — pass `true` so `start_backend_*`
+    // kicks off an immediate probe pass. In-process tests that want a
+    // truly cold gateway set `skip_initial_capability_refresh` to opt
+    // out of that probe (see `ServeOptions` docs).
+    let run_initial_refresh =
+        !env_config.pool_warmup_enabled && !prebound.skip_initial_capability_refresh;
+    proxy_state
+        .start_backend_capability_refresh_task(run_initial_refresh, Some(shutdown_tx.subscribe()));
 
     proxy_state.start_per_ip_cleanup_task();
 
