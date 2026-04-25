@@ -55,6 +55,17 @@ impl Http3Client {
         &self,
         url: &str,
     ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_with_options(url, GetOptions::default()).await
+    }
+
+    /// Fire a single `GET` with caller-controlled header overrides. Used by
+    /// host-header tests that need to force "only `:authority`" or
+    /// "explicit Host that contradicts `:authority`" wire shapes.
+    pub async fn get_with_options(
+        &self,
+        url: &str,
+        options: GetOptions,
+    ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
         let parsed: http::Uri = url.parse()?;
         let host = parsed.host().ok_or("missing host in url")?.to_string();
         let port = parsed.port_u16().unwrap_or(443);
@@ -82,16 +93,23 @@ impl Http3Client {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
-        // Explicitly set a `host` header alongside the URI's `:authority`.
-        // Some gateway H3 backend paths derive the backend `Host` header
-        // exclusively from the incoming HeaderMap and don't synthesize it
-        // from the pseudo-header — we mirror what production clients do
-        // and send both.
-        let host_header = format!("{host}:{port}");
-        let req = Request::builder()
-            .method(http::Method::GET)
-            .uri(url)
-            .header(http::header::HOST, host_header)
+        let mut req_builder = Request::builder().method(http::Method::GET).uri(url);
+        match &options.host_header {
+            HostHeader::Auto => {
+                // Mirror what production H3 clients (curl, Chromium, Firefox)
+                // typically send — only `:authority`, no explicit Host. The
+                // gateway must synthesize Host from `:authority` for the
+                // forwarded request.
+            }
+            HostHeader::Explicit(value) => {
+                req_builder = req_builder.header(http::header::HOST, value.as_str());
+            }
+            HostHeader::SameAsAuthority => {
+                let host_header = format!("{host}:{port}");
+                req_builder = req_builder.header(http::header::HOST, host_header);
+            }
+        }
+        let req = req_builder
             .body(())
             .map_err(|e| format!("build request: {e}"))?;
         let mut stream =
@@ -169,6 +187,26 @@ impl Http3Response {
     pub fn body_text(&self) -> String {
         String::from_utf8_lossy(&self.body_bytes).to_string()
     }
+}
+
+/// Per-request overrides for `Http3Client::get_with_options`.
+#[derive(Debug, Default, Clone)]
+pub struct GetOptions {
+    pub host_header: HostHeader,
+}
+
+/// Controls how the H3 client emits the inbound `Host` header alongside
+/// the URI's `:authority` pseudo-header.
+#[derive(Debug, Default, Clone)]
+pub enum HostHeader {
+    /// No explicit Host header — only `:authority`. This is what curl,
+    /// Chromium, and Firefox typically emit on H3 requests.
+    #[default]
+    Auto,
+    /// Send an explicit Host header equal to the URI's authority.
+    SameAsAuthority,
+    /// Send an explicit Host header with a caller-supplied value.
+    Explicit(String),
 }
 
 use bytes::Buf;
