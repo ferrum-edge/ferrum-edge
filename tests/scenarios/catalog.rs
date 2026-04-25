@@ -47,11 +47,11 @@ use crate::scaffolding::backends::{
     GrpcStep, H2Step, H3Step, H3TlsConfig, HttpStep, MatchHeaders, MatchRpc, QuicRefuser,
     RequestMatcher, ScriptedGrpcBackend, ScriptedH2Backend, ScriptedH3Backend,
     ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend, ScriptedUdpBackend, TcpStep,
-    TlsConfig, UdpSocketReservation, UdpStep,
+    TlsConfig, UdpStep,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::network::{NetworkSimProxy, NetworkSimProxyBuilder};
-use crate::scaffolding::ports::PortReservation;
+use crate::scaffolding::ports::{PortReservation, UdpPortReservation};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Connection-level
@@ -368,7 +368,7 @@ pub fn h2_window_stall(duration: Duration) -> Vec<H2Step> {
 /// with QUIC `CONNECTION_CLOSE` (`NO_ERROR`). Use as the H3 backend
 /// fixture for capability-registry "mark unsupported" tests.
 pub fn quic_refuse(
-    reservation: UdpSocketReservation,
+    reservation: UdpPortReservation,
     tls: H3TlsConfig,
 ) -> Result<QuicRefuser, Box<dyn std::error::Error + Send + Sync>> {
     QuicRefuser::start(reservation, tls)
