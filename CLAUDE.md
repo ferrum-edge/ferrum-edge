@@ -225,6 +225,7 @@ New test file in `tests/unit/`: create file + add `mod <name>;` to `tests/unit/<
 
 - **`Stdio::null()` for gateway stdout/stderr** unless read. `Stdio::piped()` without reading deadlocks on buffer fill.
 - **Port allocation MUST retry**: bind-drop-rebind races with other parallel tests that can steal the port between drop and gateway bind (gateway fails silently with `Stdio::null()`).
+- **Pool warmup vs backend-hit assertions** — `FERRUM_POOL_WARMUP_ENABLED=true` (production default) makes the gateway issue a `HEAD /` to every backend at startup, which throws off `received_requests().len()` / `accepted_connections()` assertions by exactly one. Set `FERRUM_POOL_WARMUP_ENABLED=false` in any test that counts backend hits. Conversely, tests that depend on the capability registry having a `Supported` entry before traffic flows (H3 native pool, direct H2 pool routing) REQUIRE warmup `true` — without it the first request lands while the registry is still empty. See `tests/scaffolding/harness.rs` rustdoc for the full rule of thumb.
 
 Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_health` failure) OR a `start_gateway_with_retry()` helper. Rules: fresh ports + fresh temp dirs/DBs every retry (reusing killed SQLite can corrupt WAL); backend/echo server holds listener — don't drop+rebind, pass pre-bound `TcpListener` to `start_echo_server_on()`; `wait_for_health` returns `bool`/`Result`, never panic.
 

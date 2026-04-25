@@ -26,6 +26,45 @@
 //! the variant exists to pin the API shape for Phase 2. Tests that want
 //! in-process behaviour will fail loudly rather than silently get binary
 //! mode, which would have masked the missing implementation.
+//!
+//! ## Pool warmup interaction (KNOWN GOTCHA)
+//!
+//! [`FERRUM_POOL_WARMUP_ENABLED`](../../ferrum.conf) defaults to `true`
+//! in production, so the gateway issues a `HEAD /` (or equivalent) against
+//! every configured backend at startup to pre-establish reqwest /
+//! gRPC / direct-H2 / H3 connections. Useful in production; **a footgun in
+//! tests that count backend hits**.
+//!
+//! Concrete failure modes you'll hit if you forget this:
+//!
+//! - **Attempt-count off-by-one.** A test that drives one client request and
+//!   asserts `backend.received_requests().len() == 1` will see `2` because
+//!   the warmup probe landed first.
+//! - **Connection-counter drift.** Tests that assert
+//!   `backend.accepted_connections() == 1` (e.g.
+//!   `h2_direct_pool_reuses_connection_across_requests`) need warmup off
+//!   because the warmup probe consumes the first connection slot.
+//! - **Capability classification timing.** Conversely, tests that depend on
+//!   the capability registry having a `Supported` entry for an HTTPS
+//!   backend before traffic flows REQUIRE warmup on — without it the first
+//!   request lands while the registry is still empty and falls through to
+//!   reqwest. See `initial_refresh_when_warmup_off_classifies_before_traffic`
+//!   in `functional_capability_registry_test.rs` for the explicit case.
+//!
+//! Rule of thumb:
+//!
+//! - Tests that **count backend hits / connections** → set
+//!   `FERRUM_POOL_WARMUP_ENABLED=false` via [`GatewayHarnessBuilder::env`].
+//! - Tests that **assert on capability-registry / H2 ALPN classification
+//!   state** before driving traffic → leave warmup at its default (`true`)
+//!   or set explicitly.
+//! - Tests that don't care about either → leave the default. Warmup is
+//!   cheap.
+//!
+//! The shared [`crate::common::gateway_harness::TestGateway`] default is
+//! currently `false` (so most existing tests don't trip on this); the
+//! in-process harness mode (Phase 2) keeps the same default so migration
+//! is a no-op.
 
 use crate::common::gateway_harness::{DbType, TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::Http1Client;
