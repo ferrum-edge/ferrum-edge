@@ -43,10 +43,7 @@ pub use http2::{
     ConnectionSettings, H2Step, MatchHeaders, ReceivedStream, ScriptedH2Backend,
     ScriptedH2BackendBuilder,
 };
-pub use http3::{
-    H3RecordedRequest, H3Step, H3TlsConfig, ScriptedH3Backend, UdpSocketReservation,
-    reserve_udp_port,
-};
+pub use http3::{H3RecordedRequest, H3Step, H3TlsConfig, ScriptedH3Backend};
 pub use quic_refuser::QuicRefuser;
 pub use tcp::{ExecutionMode, ScriptedTcpBackend, TcpStep};
 pub use tls::{ScriptedTlsBackend, TlsConfig};
