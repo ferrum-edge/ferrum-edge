@@ -50,6 +50,7 @@ pub mod backends;
 pub mod certs;
 pub mod clients;
 pub mod harness;
+pub mod matrix;
 pub mod network;
 pub mod ports;
 
@@ -69,6 +70,7 @@ pub use clients::{
     Http3Response, UdpClient,
 };
 pub use harness::{GatewayHarness, GatewayHarnessBuilder, HarnessMode};
+pub use matrix::{BackendKind, FrontendKind, MatrixBackend, MatrixResponse};
 pub use network::{
     BandwidthLimitedStream, DelayedStream, NetworkProfile, NetworkSimProxy, NetworkSimProxyBuilder,
     TruncatedStream,

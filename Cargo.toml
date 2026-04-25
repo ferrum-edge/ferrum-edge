@@ -196,6 +196,10 @@ futures = "0.3"
 rcgen = "0.14"
 rstest = "0.23"
 time = "0.3"
+# Phase 6 cross-protocol matrix macro: concatenates idents at macro
+# expansion to generate one #[tokio::test] per (frontend, backend)
+# combination. Pure proc-macro, zero runtime cost.
+paste = "1"
 # Scripted-backend Phase 2 — HTTP/2 frame-level control via the `h2` crate's
 # server API. Hyper uses h2 0.4 transitively; pinning it here makes the test
 # framework's dependency explicit.
