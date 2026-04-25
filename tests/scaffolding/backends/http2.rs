@@ -518,18 +518,46 @@ where
     // Channel: driver → script with newly accepted (request, response) pairs.
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<StreamPair>();
     // Channel: script → driver with control commands (GOAWAY, stop).
+    // We hold a `keepalive` clone here so the channel does not close the
+    // moment `run_script` returns — that lets us send an explicit
+    // `Stop` even when the script ended via an early `Err` path that
+    // never reached its own Stop emit.
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<DriverCtrl>();
+    let ctrl_keepalive = ctrl_tx.clone();
 
     let driver = tokio::spawn(connection_driver(conn, stream_tx, ctrl_rx));
+    // Capture the abort handle BEFORE moving `driver` into `timeout` —
+    // if the driver hasn't exited within the deadline below, we need
+    // to abort it explicitly. Dropping the `JoinHandle` would only
+    // detach the task, leaving the connection driver running with the
+    // socket open and leaking FDs across subsequent fixtures (the
+    // PR-486 review's "task leak on script error" finding).
+    let driver_abort = driver.abort_handle();
 
     // Run the script. If it returns an error, stop the driver before
     // surfacing it; if the driver already exited, that's fine.
     let script_result = run_script(&mut stream_rx, ctrl_tx, script, state).await;
 
-    // Always stop the driver on script exit. If the driver already
-    // finished, the receiver is gone and send() returns Err — ignore.
-    // Driver exit is awaited briefly to reap the TCP close.
-    let _ = tokio::time::timeout(Duration::from_millis(500), driver).await;
+    // Tell the driver to stop on EVERY exit path. The happy-path branch
+    // of `run_script` already emits `Stop` itself, but every `return
+    // Err(...)` branch (e.g. `ExpectHeaders` racing the connection
+    // close, misordered scripts) returns without sending it. The
+    // emit here is idempotent: a second `Stop` arriving on the
+    // channel is a no-op because the driver `break`s on the first one.
+    let _ = ctrl_keepalive.send(DriverCtrl::Stop);
+    drop(ctrl_keepalive);
+
+    // Wait for the driver to exit cleanly. The driver's own internal
+    // tail (`poll_closed` with a 200ms cap) bounds this in practice;
+    // the 500ms outer cap is a belt-and-suspenders deadline. On
+    // timeout, abort the JoinHandle explicitly so the task cannot
+    // continue running detached with a live socket.
+    if tokio::time::timeout(Duration::from_millis(500), driver)
+        .await
+        .is_err()
+    {
+        driver_abort.abort();
+    }
     script_result
 }
 

@@ -376,15 +376,45 @@ fn parse_target(t: &str) -> Result<(String, u16), Box<dyn std::error::Error + Se
     Ok((host.to_string(), port))
 }
 
+/// Build the verified-TLS `RootCertStore` for [`GrpcClient::tls`].
+///
+/// * `Some(pem)` → load every certificate from the supplied PEM bundle
+///   and trust only those (no webpki fallback — the caller is being
+///   explicit about which roots to trust).
+/// * `None` → load the Mozilla/webpki root bundle so a verified
+///   handshake against a publicly-trusted certificate succeeds out of
+///   the box. Without this, the `RootCertStore` would stay empty and
+///   every verified handshake would fail with `UnknownIssuer` — the
+///   cause flagged in the PR-486 review.
+///
+/// Extracted from `tls_connect` so the `None` path can be unit-tested
+/// without a public-network handshake (the previous regression test
+/// reached `tls.cloudflare.com:443`, which is non-hermetic in
+/// restricted CI environments).
+fn build_root_cert_store(
+    root_pem: Option<&str>,
+) -> Result<rustls::RootCertStore, Box<dyn std::error::Error + Send + Sync>> {
+    use rustls::RootCertStore;
+    use rustls_pemfile::certs;
+
+    let mut root = RootCertStore::empty();
+    if let Some(pem) = root_pem {
+        let mut reader = pem.as_bytes();
+        for cert in certs(&mut reader).filter_map(|c| c.ok()) {
+            root.add(cert)?;
+        }
+    } else {
+        root.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    Ok(root)
+}
+
 async fn tls_connect(
     host: &str,
     port: u16,
     root_pem: Option<&str>,
     insecure: bool,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
-    use rustls::RootCertStore;
-    use rustls_pemfile::certs;
-
     let provider = rustls::crypto::ring::default_provider();
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()?;
@@ -394,22 +424,7 @@ async fn tls_connect(
             .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier))
             .with_no_client_auth()
     } else {
-        let mut root = RootCertStore::empty();
-        if let Some(pem) = root_pem {
-            let mut reader = pem.as_bytes();
-            for cert in certs(&mut reader).filter_map(|c| c.ok()) {
-                root.add(cert)?;
-            }
-        } else {
-            // Match the documented `GrpcClient::tls(_, None)` contract:
-            // fall back to the Mozilla/webpki root bundle so a verified
-            // handshake against a publicly-trusted certificate succeeds
-            // without the caller passing a PEM. Without this, the
-            // `RootCertStore` stayed empty and every verified handshake
-            // failed with UnknownIssuer — the cause the PR-486 review
-            // flagged.
-            root.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        }
+        let root = build_root_cert_store(root_pem)?;
         builder.with_root_certificates(root).with_no_client_auth()
     };
     config.alpn_protocols = vec![b"h2".to_vec()];
@@ -580,46 +595,46 @@ mod tests {
         assert_eq!(response(0, None, None).effective_grpc_status(), 14);
     }
 
-    #[tokio::test]
-    async fn tls_connect_with_none_root_pem_loads_webpki_roots_and_verifies_publicly_trusted_cert()
-    {
-        // Regression guard for the review-flagged docs/implementation mismatch:
-        // `GrpcClient::tls(_, None)` must load the Mozilla/webpki bundle so a
-        // verified handshake against a publicly-trusted cert succeeds out of
-        // the box. Before the fix, `RootCertStore` stayed empty and verification
-        // failed with UnknownIssuer.
-        //
-        // We smoke-test by reaching `tls.cloudflare.com:443` (a stable,
-        // publicly-trusted endpoint). If DNS / network is unavailable, skip —
-        // we don't want to fail CI on flaky infra when the unit under test
-        // is the cert-store wiring, not network reachability.
-        if tokio::net::lookup_host("tls.cloudflare.com:443")
-            .await
-            .is_err()
-        {
-            eprintln!("skipping: DNS unavailable for tls.cloudflare.com");
-            return;
-        }
-        let timeout = tokio::time::timeout(
-            Duration::from_secs(10),
-            tls_connect("tls.cloudflare.com", 443, None, false),
-        )
-        .await;
-        match timeout {
-            Ok(Ok(_stream)) => { /* verified handshake succeeded */ }
-            Ok(Err(e)) => {
-                let msg = format!("{e}");
-                // Only surface TLS-trust failures as test failures; tolerate
-                // transient network errors (timeouts, resets).
-                if msg.contains("UnknownIssuer") || msg.contains("invalid peer certificate") {
-                    panic!(
-                        "tls(None) did not load public roots — UnknownIssuer \
-                         regressed: {msg}"
-                    );
-                }
-                eprintln!("tls_connect returned transient network error: {msg}");
-            }
-            Err(_) => eprintln!("tls_connect timed out; network unavailable"),
-        }
+    #[test]
+    fn build_root_cert_store_with_none_loads_webpki_bundle() {
+        // Regression guard for the PR-486 review's "docs say webpki
+        // fallback, code returns empty store" finding. The minimal
+        // observable property is that `None` produces a store
+        // populated from `webpki_roots::TLS_SERVER_ROOTS`. A purely
+        // local check — no DNS, no public network, no certificate
+        // intermediation. Replaces the earlier `tls.cloudflare.com:443`
+        // smoke test (P3 review feedback: hermetic tests preferred).
+        let store = build_root_cert_store(None).expect("build store with webpki fallback");
+        assert_eq!(
+            store.roots.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len(),
+            "None must load the full webpki bundle (currently {} roots); \
+             the empty-store regression would set this to 0",
+            webpki_roots::TLS_SERVER_ROOTS.len()
+        );
+        // Sanity: webpki ships well over 100 trust anchors. A single
+        // digit count would indicate a different, equally-broken
+        // regression (partial fill, malformed iteration).
+        assert!(
+            store.roots.len() >= 100,
+            "webpki bundle suspiciously small ({} roots)",
+            store.roots.len()
+        );
+    }
+
+    #[test]
+    fn build_root_cert_store_with_pem_loads_only_supplied_certs() {
+        // Complementary check: an explicit PEM bundle must NOT mix in
+        // the webpki bundle. `Some(...)` is the operator-explicit path
+        // and must trust *only* the supplied roots — that's the
+        // contract documented on `GrpcClient::tls`.
+        let ca = crate::scaffolding::certs::TestCa::new("grpc-client-test")
+            .expect("build TestCa fixture");
+        let store = build_root_cert_store(Some(&ca.cert_pem)).expect("build store from PEM");
+        assert_eq!(
+            store.roots.len(),
+            1,
+            "Some(pem) must trust *only* the supplied root, not mix in webpki"
+        );
     }
 }
