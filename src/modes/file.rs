@@ -123,6 +123,13 @@ pub struct ServeHandles {
     /// — the binary's pre-refactor `run()` had the same 5 s cap, and
     /// rolling-restart / test-teardown ergonomics rely on it.
     background_handles: Vec<JoinHandle<()>>,
+    /// Shutdown subscription. Used by [`Self::join`] to keep the function
+    /// alive in stream-only deployments (no HTTP/HTTPS/admin listeners,
+    /// only TCP/UDP via `stream_listener_manager` whose tasks are not
+    /// tracked in `listener_handles`). Without it, `join()` would return
+    /// after the background-drain timeout and `run()` would exit ~5 s
+    /// after startup even though stream proxies were still serving.
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
     /// `FERRUM_SHUTDOWN_DRAIN_SECONDS` snapshot — bound on the in-flight
     /// request drain that runs between listener exit and background-task
     /// drain.
@@ -154,7 +161,12 @@ impl ServeHandles {
     /// Three phases — match the pre-refactor `run()`:
     ///
     /// 1. Listener handles awaited unbounded. These exit on the shutdown
-    ///    watch channel; once all are gone no new connections arrive.
+    ///    watch channel; once all are gone no new connections arrive. If
+    ///    `listener_handles` is empty (stream-only deployment — TCP/UDP
+    ///    only, plaintext proxy + admin disabled), wait directly on the
+    ///    shutdown channel instead so the function stays alive while
+    ///    `stream_listener_manager`'s tasks (which are not tracked here)
+    ///    keep serving traffic.
     /// 2. In-flight request drain bounded by `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
     ///    Existing connections see `Connection: close` and finish their
     ///    current request-response cycle.
@@ -162,9 +174,23 @@ impl ServeHandles {
     ///    awaited with [`BACKGROUND_DRAIN_TIMEOUT`]. A stuck task logs a
     ///    warning instead of wedging shutdown — without this cap a
     ///    rolling restart could hang on a single misbehaving task.
-    pub async fn join(self) {
-        for handle in self.listener_handles {
-            let _ = handle.await;
+    pub async fn join(mut self) {
+        if self.listener_handles.is_empty() {
+            // Stream-only deployment: there are no JoinHandles to await,
+            // so block on the shutdown watch channel until somebody fires
+            // it. Mirrors the pre-refactor `run()` which had the same
+            // `wait_shutdown.changed().await` loop.
+            while !*self.shutdown_rx.borrow() {
+                if self.shutdown_rx.changed().await.is_err() {
+                    // Sender dropped without sending `true` — treat as
+                    // shutdown.
+                    break;
+                }
+            }
+        } else {
+            for handle in self.listener_handles {
+                let _ = handle.await;
+            }
         }
         if self.drain_seconds > 0 {
             crate::overload::wait_for_drain(
@@ -793,6 +819,7 @@ pub async fn serve(
         bound,
         listener_handles: handles,
         background_handles,
+        shutdown_rx: shutdown_tx.subscribe(),
         drain_seconds: env_config.shutdown_drain_seconds,
     })
 }

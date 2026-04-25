@@ -350,3 +350,97 @@ async fn in_process_harness_does_not_probe_backend_when_warmup_disabled() {
     assert_eq!(resp.status, reqwest::StatusCode::OK);
     assert_eq!(resp.body_text(), "pong");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Regression: when `file::serve` is invoked with no HTTP/HTTPS/admin
+// listeners (stream-only deployment — for example TCP/UDP-only proxies with
+// `FERRUM_PROXY_HTTP_PORT=0` and no admin listeners), `ServeHandles::join`
+// must keep the function alive on the shutdown channel instead of returning
+// after the background-task drain.
+//
+// Pre-refactor `run()` had an explicit `wait_shutdown.changed().await` loop
+// for this case; mixing every handle into one Vec lost it. Without the fix
+// the binary would exit ~5 s after startup despite stream proxies still
+// serving traffic.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_blocks_until_shutdown_when_no_listener_handles() {
+    use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
+    use ferrum_edge::config::types::GatewayConfig;
+    use ferrum_edge::config::{EnvConfig, OperatingMode};
+    use ferrum_edge::modes::file::{self, ServeOptions};
+
+    // Empty config — we don't need any proxy to serve traffic; we just
+    // need `serve()` to bring up zero HTTP/admin listeners and hand back
+    // a `ServeHandles` whose `listener_handles` Vec is empty.
+    let config: GatewayConfig =
+        serde_yaml::from_str("proxies: []\nconsumers: []\nupstreams: []\nplugin_configs: []\n")
+            .expect("parse empty config");
+
+    let env_config = EnvConfig {
+        mode: OperatingMode::File,
+        // All ports 0 → no plaintext listeners spawned.
+        proxy_http_port: 0,
+        proxy_https_port: 0,
+        admin_http_port: 0,
+        admin_https_port: 0,
+        admin_jwt_secret: Some("regression-test-secret-32-chars-min-len".to_string()),
+        admin_jwt_issuer: "regression-test".to_string(),
+        // Skip the in-flight drain entirely so this test isn't gated on
+        // `FERRUM_SHUTDOWN_DRAIN_SECONDS`'s default of 30 s.
+        shutdown_drain_seconds: 0,
+        pool_warmup_enabled: false,
+        max_connections: 0,
+        ..EnvConfig::default()
+    };
+
+    let opts = ServeOptions {
+        // No pre-bound listeners. Combined with the all-zero ports above,
+        // `serve()` must hand back a ServeHandles with empty
+        // `listener_handles`.
+        admin_jwt_manager: Some(JwtManager::new(JwtConfig {
+            secret: env_config.admin_jwt_secret.clone().unwrap(),
+            issuer: env_config.admin_jwt_issuer.clone(),
+            max_ttl_seconds: 3600,
+            algorithm: jsonwebtoken::Algorithm::HS256,
+        })),
+        skip_initial_capability_refresh: true,
+        ..ServeOptions::default()
+    };
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let handles = file::serve(env_config, config, opts, shutdown_tx.clone())
+        .await
+        .expect("serve() must succeed with all-zero ports");
+
+    let join_task = tokio::spawn(async move { handles.join().await });
+
+    // The bug surfaces at exactly the background-drain timeout
+    // (`BACKGROUND_DRAIN_TIMEOUT` = 5 s in `src/modes/file.rs`):
+    // pre-fix, the empty listener loop is a no-op, the drain is skipped
+    // (`shutdown_drain_seconds = 0`), and `join_background_handles` falls
+    // through after its 5 s timeout because the DNS / overload / metrics
+    // tasks never see a shutdown signal. So we have to wait *past* that
+    // 5 s mark to prove `join()` is genuinely blocking on shutdown
+    // (with the fix) rather than just slow to time out (without it).
+    //
+    // 6 s wall-clock is the price of this regression test; lowering it
+    // would require exposing the timeout constant to tests, which is a
+    // worse trade than the slower test.
+    tokio::time::sleep(Duration::from_millis(6_000)).await;
+    assert!(
+        !join_task.is_finished(),
+        "join() returned before shutdown was signalled — stream-only \
+         deployments would exit ~5 s after startup",
+    );
+
+    // Now signal shutdown and confirm `join()` returns promptly. Generous
+    // 2 s timeout — the actual cost is one watch-channel notification
+    // plus the DNS / overload / metrics tasks each observing
+    // `shutdown_rx.changed()`.
+    shutdown_tx.send(true).expect("shutdown_tx send");
+    tokio::time::timeout(Duration::from_secs(2), join_task)
+        .await
+        .expect("join() did not complete within 2 s of shutdown")
+        .expect("join_task panicked");
+}
