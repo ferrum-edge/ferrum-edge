@@ -113,13 +113,27 @@ pub struct ServeHandles {
     /// canonical proxy/admin URLs.
     #[allow(dead_code)] // The binary path drops this immediately; tests read it.
     pub bound: BoundAddresses,
-    /// Background task handles. Drop the struct to abandon them, or
-    /// [`Self::join`] to wait for graceful drain.
-    handles: Vec<JoinHandle<()>>,
-    /// Shutdown sender retained so [`Self::join`] can fire shutdown if the
-    /// caller forgets to.
+    /// Listener task handles (proxy HTTP/HTTPS/H3 + admin HTTP/HTTPS).
+    /// These exit cleanly when the shutdown signal fires, so [`Self::join`]
+    /// awaits them unbounded.
+    listener_handles: Vec<JoinHandle<()>>,
+    /// Background task handles (DNS refresh, overload monitor, metrics).
+    /// [`Self::join`] caps the wait on these at [`BACKGROUND_DRAIN_TIMEOUT`]
+    /// so a stuck task can never wedge graceful shutdown indefinitely
+    /// — the binary's pre-refactor `run()` had the same 5 s cap, and
+    /// rolling-restart / test-teardown ergonomics rely on it.
+    background_handles: Vec<JoinHandle<()>>,
+    /// `FERRUM_SHUTDOWN_DRAIN_SECONDS` snapshot — bound on the in-flight
+    /// request drain that runs between listener exit and background-task
+    /// drain.
     drain_seconds: u64,
 }
+
+/// Hard cap on background-task drain (DNS refresh, overload monitor,
+/// metrics) during shutdown. Mirrors the pre-refactor `run()`'s 5 s
+/// timeout — without it, a stuck background task wedges the whole
+/// shutdown.
+const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolved listener addresses returned by [`serve`].
 #[derive(Default, Clone, Debug)]
@@ -136,8 +150,20 @@ impl ServeHandles {
     /// Callers must trigger shutdown on the [`tokio::sync::watch::Sender`]
     /// they passed into [`serve`] before awaiting this future, otherwise
     /// `join()` will hang waiting for accept loops that never exit.
+    ///
+    /// Three phases — match the pre-refactor `run()`:
+    ///
+    /// 1. Listener handles awaited unbounded. These exit on the shutdown
+    ///    watch channel; once all are gone no new connections arrive.
+    /// 2. In-flight request drain bounded by `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
+    ///    Existing connections see `Connection: close` and finish their
+    ///    current request-response cycle.
+    /// 3. Background tasks (DNS refresh, overload monitor, metrics)
+    ///    awaited with [`BACKGROUND_DRAIN_TIMEOUT`]. A stuck task logs a
+    ///    warning instead of wedging shutdown — without this cap a
+    ///    rolling restart could hang on a single misbehaving task.
     pub async fn join(self) {
-        for handle in self.handles {
+        for handle in self.listener_handles {
             let _ = handle.await;
         }
         if self.drain_seconds > 0 {
@@ -147,6 +173,25 @@ impl ServeHandles {
             )
             .await;
         }
+        join_background_handles(self.background_handles, BACKGROUND_DRAIN_TIMEOUT).await;
+    }
+}
+
+/// Await every handle in `handles`, capped at `timeout`. On timeout we log
+/// a single warning and return — a stuck task is not allowed to wedge
+/// graceful shutdown. Pulled out of [`ServeHandles::join`] so the timeout
+/// behaviour is unit-testable without constructing a `ProxyState`.
+async fn join_background_handles(handles: Vec<JoinHandle<()>>, timeout: Duration) {
+    let drain = async {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    };
+    if tokio::time::timeout(timeout, drain).await.is_err() {
+        warn!(
+            "Background tasks did not drain within {}s, proceeding with shutdown",
+            timeout.as_secs()
+        );
     }
 }
 
@@ -501,6 +546,8 @@ pub async fn serve(
         cp_connection_state: None,
     };
 
+    // Listener handles (proxy/admin HTTP/HTTPS/H3) — `join()` waits on
+    // these unbounded; they exit promptly on the shutdown watch channel.
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
     let mut bound = BoundAddresses::default();
 
@@ -733,22 +780,72 @@ pub async fn serve(
     startup_ready.store(true, Ordering::Relaxed);
     info!("Gateway startup complete; /health now reports ready");
 
-    // Background-task handles get folded in here so join() in ServeHandles
-    // waits for them too.
-    handles.push(tokio::spawn(async move {
-        let _ = dns_handle.await;
-    }));
-    handles.push(tokio::spawn(async move {
-        let _ = overload_handle.await;
-    }));
-    handles.push(tokio::spawn(async move {
-        let _ = metrics_handle.await;
-    }));
+    // Background-task handles tracked separately so `ServeHandles::join`
+    // can apply a hard `BACKGROUND_DRAIN_TIMEOUT` cap to them. The
+    // pre-refactor `run()` did the same with an explicit
+    // `tokio::time::timeout(Duration::from_secs(5), bg_drain)` block —
+    // mixing them in with listener handles loses that bound and lets a
+    // stuck DNS / metrics task wedge shutdown indefinitely.
+    let background_handles: Vec<JoinHandle<()>> = vec![dns_handle, overload_handle, metrics_handle];
 
     Ok(ServeHandles {
         proxy_state,
         bound,
-        handles,
+        listener_handles: handles,
+        background_handles,
         drain_seconds: env_config.shutdown_drain_seconds,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::pending;
+    use std::time::Instant;
+
+    // Regression: a stuck background task must not wedge graceful shutdown.
+    // The pre-refactor `run()` capped the background drain at 5 s; the
+    // codex review flagged that lifting this into `ServeHandles::join` lost
+    // the bound. The helper takes the timeout as a parameter, so this test
+    // uses a 100 ms cap to assert the semantics without burning real
+    // seconds (`tokio::time::pause` would need the `test-util` feature
+    // which isn't enabled here).
+    #[tokio::test]
+    async fn join_background_handles_caps_at_timeout_when_a_handle_hangs() {
+        let well_behaved = tokio::spawn(async {});
+        let stuck = tokio::spawn(async {
+            pending::<()>().await;
+        });
+
+        let started = Instant::now();
+        join_background_handles(vec![well_behaved, stuck], Duration::from_millis(100)).await;
+        let elapsed = started.elapsed();
+
+        // Must complete within ~timeout + slop — never wedge forever.
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "join must wait for the timeout, not return early; got {elapsed:?}",
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "join must not exceed the timeout substantially; got {elapsed:?}",
+        );
+    }
+
+    // Sanity: when every background handle resolves promptly, the helper
+    // returns immediately instead of blocking until the timeout.
+    #[tokio::test]
+    async fn join_background_handles_returns_promptly_when_all_complete() {
+        let h1 = tokio::spawn(async {});
+        let h2 = tokio::spawn(async {});
+
+        let started = Instant::now();
+        join_background_handles(vec![h1, h2], Duration::from_secs(5)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "well-behaved background handles should drain promptly; took {elapsed:?}",
+        );
+    }
 }
