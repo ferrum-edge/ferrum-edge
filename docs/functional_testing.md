@@ -308,6 +308,54 @@ Then start CP/DP modes normally. The database connection will use TLS.
 - **Admin API**: Limited by database query performance
 - **Proxy throughput**: DP performance scales with number of concurrent connections
 
+## In-Process Test Harness
+
+The scripted-backend test harness (`tests/scaffolding/harness.rs`) ships
+two modes:
+
+- **`HarnessMode::Binary`** (default): spawns the built `ferrum-edge`
+  subprocess with `Stdio::null()`. Exercises the full CLI / signal /
+  process-bootstrap path. Required for tests that assert on captured
+  stdout/stderr or rely on kernel-level features that depend on the
+  process having its own runtime (kTLS extraction, io_uring submission
+  queues).
+
+- **`HarnessMode::InProcess`**: runs the gateway as a tokio task in the
+  test process via `ferrum_edge::modes::file::serve()`. Reserves
+  ephemeral ports via `tests/scaffolding/ports.rs`, hands the live
+  `TcpListener`s to `serve()`, and skips subprocess overhead entirely.
+  End-to-end harness setup runs in well under 100 ms versus 2-3 s for
+  binary mode.
+
+### When to prefer which
+
+Default to `mode_in_process()` for unit-of-routing-or-plugin-behaviour
+tests — the whole `ProxyState` is real, the listener is real, and the
+backend (scripted or otherwise) is real. Switch to `mode_binary()` when
+the test must verify:
+
+- Subprocess CLI flag parsing (`ferrum-edge run --settings ...`).
+- SIGHUP-driven config reload.
+- Captured stdout/stderr (in-process mode shares the test process's
+  tracing subscriber).
+- kTLS / io_uring kernel features.
+
+### Caveats specific to in-process mode
+
+- `pool_warmup_enabled` defaults to `false` in both modes (matches
+  `TestGateway`'s pre-existing default). Tests that exercise the
+  capability registry's first probe must opt in via
+  `pool_warmup_enabled(true)`.
+- The file-mode YAML loader's strict-loading rules apply identically —
+  every top-level collection (`consumers`, `upstreams`,
+  `plugin_configs`) must be present in the YAML even if empty.
+  The helpers in `tests/scaffolding/mod.rs`
+  (`file_mode_yaml_for_backend` and friends) include the empty-
+  collection boilerplate.
+- Logs go to whatever `tracing` subscriber the test process has
+  installed. `captured_combined()` returns `Err` in in-process mode —
+  tests that depend on log assertions stay on binary mode.
+
 ## Security Best Practices
 
 1. **JWT Secrets**: Use strong, random secrets for FERRUM_ADMIN_JWT_SECRET and FERRUM_CP_DP_GRPC_JWT_SECRET

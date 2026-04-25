@@ -328,6 +328,8 @@ Tests that merely check the gateway's response are half-tests; we need to know t
 - **Fast tier** (`cargo test --test unit_tests` / `integration_tests`): in-process `ProxyState::new` variant. Runs in seconds. Catches ~80% of gateway logic bugs.
 - **Full tier** (`cargo test --test functional_tests -- --ignored`): binary variant. Validates CLI, config loading, SIGHUP reload, admin API, kernel-level behaviors (splice, kTLS). Runs in minutes. Gate Phase-8 acceptance tests here because they exercise the full runtime.
 
+**Status**: `HarnessMode::InProcess` is now live (PR for `feature/in-process-harness-mode`). It calls `ferrum_edge::modes::file::serve(...)` with pre-bound TCP listeners reserved by `tests/scaffolding/ports.rs`, returning the real `ProxyState` + JoinHandles. End-to-end harness setup runs in <100ms vs. ~2-3s for binary mode (one cargo build + process bootstrap). Tests that don't need log capture, CLI parsing, or kernel-level features (splice/kTLS/io_uring) should default to `mode_in_process()` for a 10-15× speedup. See `tests/scaffolding/harness.rs` rustdoc for the migration checklist and the three caveats (pool warmup default, file-mode YAML strict-loading still applies, captured logs binary-only).
+
 ## What to explicitly NOT build
 
 - **Chaos / property testing frameworks.** Keep scripts data, not randomization. Property tests can be a later Phase-N if needed.
