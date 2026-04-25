@@ -308,6 +308,26 @@ impl GatewayHarness {
         self.gateway.read_combined_captured_output()
     }
 
+    /// Kill the gateway subprocess and read its full captured output.
+    ///
+    /// The default [`Self::captured_combined`] is a snapshot — with
+    /// `tracing-appender`'s non-blocking writer in play, INFO-level lines
+    /// emitted after the last response (notably `stdout_logging`
+    /// `TransactionSummary` JSON) may not have drained to the subprocess
+    /// pipe yet. Stopping the gateway forces the writer to flush before
+    /// the child exits, so this method returns every log line the
+    /// gateway intended to emit during the test.
+    ///
+    /// Use this instead of `captured_combined()` when the assertion
+    /// depends on an access-log / TransactionSummary line and polling
+    /// would otherwise race the flush.
+    pub fn stop_and_collect_logs(&mut self) -> String {
+        self.gateway.shutdown();
+        self.gateway
+            .read_combined_captured_output()
+            .unwrap_or_default()
+    }
+
     /// Read-only view of the gateway's temp dir.
     pub fn temp_path(&self) -> &std::path::Path {
         self.gateway.temp_dir.path()

@@ -196,5 +196,9 @@ futures = "0.3"
 rcgen = "0.14"
 rstest = "0.23"
 time = "0.3"
+# Scripted-backend Phase 2 — HTTP/2 frame-level control via the `h2` crate's
+# server API. Hyper uses h2 0.4 transitively; pinning it here makes the test
+# framework's dependency explicit.
+h2 = "0.4"
 # Simple HTTP server dependencies
 tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }

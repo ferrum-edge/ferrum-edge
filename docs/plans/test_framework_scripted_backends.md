@@ -178,9 +178,9 @@ Deliverables:
 **Phase-2 acceptance tests**:
 - `h2_goaway_mid_request_handled_gracefully` — backend sends GOAWAY after receiving request headers; gateway must surface a clean 502 with `error_class = ProtocolError`, and `mark_h3_unsupported` must NOT fire (H3 is unrelated).
 - `h2_stream_reset_classified_as_protocol_error`.
-- `grpc_trailers_missing_produces_INTERNAL_status`.
+- `grpc_trailers_missing_produces_non_ok_status` (spec-canonical UNKNOWN(2) per the HTTP-to-gRPC mapping doc; rejects a gateway regression that would surface grpc-status=0 on missing trailers).
 - `grpc_deadline_exceeded_propagates_as_DEADLINE_EXCEEDED_not_UNAVAILABLE`.
-- `h2_window_stall_triggers_backend_write_timeout_ms` (when configured).
+- `h2_window_stall_triggers_backend_read_timeout_on_grpc` (gRPC proxy path honors `backend_read_timeout_ms` for body-upload + TTFB stalls; `backend_write_timeout_ms` is TCP-proxy-only).
 
 ### Phase 3 — HTTP/3 scripted backend (~2 weeks, hardest)
 
