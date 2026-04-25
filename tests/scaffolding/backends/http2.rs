@@ -609,13 +609,30 @@ async fn connection_driver<T>(
     .await;
 }
 
+/// State carried between script steps for a single in-flight RPC.
+///
+/// The `stream_index` is the position of `recorded` inside the shared
+/// `state.streams` Vec, captured at the moment of `push` under the lock.
+/// Multiple TCP connections run their own `run_script` task in parallel,
+/// each pushing into the same shared Vec, so reaching for `last_mut()`
+/// after an `await` boundary races: another connection may have pushed
+/// in between, and the trailer/body update would land on the wrong RPC.
+/// Storing the index keeps the update deterministic — it's the fix the
+/// PR-486 review asked for ("update that exact entry").
+struct CurrentStream {
+    recorded: ReceivedStream,
+    body: RecvStream,
+    send: SendResponse<Bytes>,
+    stream_index: usize,
+}
+
 async fn run_script(
     stream_rx: &mut mpsc::UnboundedReceiver<StreamPair>,
     ctrl_tx: mpsc::UnboundedSender<DriverCtrl>,
     script: Vec<H2Step>,
     state: Arc<H2State>,
 ) -> Result<(), String> {
-    let mut current_stream: Option<(ReceivedStream, RecvStream, SendResponse<Bytes>)> = None;
+    let mut current_stream: Option<CurrentStream> = None;
     let mut current_body_sender: Option<h2::SendStream<Bytes>> = None;
 
     for step in script {
@@ -632,9 +649,23 @@ async fn run_script(
                             state.matcher_mismatches.fetch_add(1, Ordering::SeqCst);
                         }
                         state.stream_count.fetch_add(1, Ordering::SeqCst);
-                        state.streams.lock().await.push(received.clone());
+                        // Capture the insertion index inside the lock so it
+                        // matches the slot we just appended — see
+                        // `CurrentStream::stream_index` for the race this
+                        // protects against.
+                        let stream_index = {
+                            let mut streams = state.streams.lock().await;
+                            let idx = streams.len();
+                            streams.push(received.clone());
+                            idx
+                        };
                         let (_parts, body) = req.into_parts();
-                        current_stream = Some((received, body, send));
+                        current_stream = Some(CurrentStream {
+                            recorded: received,
+                            body,
+                            send,
+                            stream_index,
+                        });
                     }
                     None => {
                         return Err(
@@ -644,14 +675,15 @@ async fn run_script(
                 }
             }
             H2Step::DrainRequestBody => {
-                let Some((recorded, body, _)) = current_stream.as_mut() else {
+                let Some(cs) = current_stream.as_mut() else {
                     return Err("DrainRequestBody: no current stream".into());
                 };
+                let stream_index = cs.stream_index;
                 let mut accumulated = Vec::new();
                 loop {
-                    match body.data().await {
+                    match cs.body.data().await {
                         Some(Ok(chunk)) => {
-                            let _ = body.flow_control().release_capacity(chunk.len());
+                            let _ = cs.body.flow_control().release_capacity(chunk.len());
                             accumulated.extend_from_slice(&chunk);
                         }
                         Some(Err(e)) => {
@@ -660,7 +692,7 @@ async fn run_script(
                         None => break,
                     }
                 }
-                match body.trailers().await {
+                match cs.body.trailers().await {
                     Ok(Some(map)) => {
                         let trailers: Vec<(String, String)> = map
                             .iter()
@@ -670,23 +702,28 @@ async fn run_script(
                                     .map(|vs| (k.as_str().to_string(), vs.to_string()))
                             })
                             .collect();
-                        recorded.trailers = trailers.clone();
-                        if let Some(last) = state.streams.lock().await.last_mut() {
-                            last.trailers = trailers;
+                        cs.recorded.trailers = trailers.clone();
+                        // Use the captured `stream_index` rather than
+                        // `last_mut()` so concurrent script tasks across
+                        // multiple TCP connections each update their own
+                        // slot — see the PR-486 review note on `CurrentStream`.
+                        if let Some(entry) = state.streams.lock().await.get_mut(stream_index) {
+                            entry.trailers = trailers;
                         }
                     }
                     Ok(None) => {}
                     Err(e) => return Err(format!("DrainRequestBody: trailers error: {e}")),
                 }
-                recorded.body = accumulated.clone();
-                if let Some(last) = state.streams.lock().await.last_mut() {
-                    last.body = accumulated;
+                cs.recorded.body = accumulated.clone();
+                if let Some(entry) = state.streams.lock().await.get_mut(stream_index) {
+                    entry.body = accumulated;
                 }
             }
             H2Step::RespondHeaders(headers) => {
-                let Some((_recorded, _body, send)) = current_stream.as_mut() else {
+                let Some(cs) = current_stream.as_mut() else {
                     return Err("RespondHeaders: no current stream".into());
                 };
+                let send = &mut cs.send;
                 let status = headers
                     .iter()
                     .find(|(k, _)| *k == ":status")
@@ -753,8 +790,8 @@ async fn run_script(
                     sender.send_reset(reason);
                     current_body_sender = None;
                 }
-                if let Some((_, _, resp)) = current_stream.as_mut() {
-                    resp.send_reset(reason);
+                if let Some(cs) = current_stream.as_mut() {
+                    cs.send.send_reset(reason);
                 }
             }
             H2Step::Sleep(d) | H2Step::StallWindowFor(d) => {
