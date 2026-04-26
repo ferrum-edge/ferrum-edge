@@ -152,7 +152,39 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
     }
 }
 
-/// Whether the received body satisfies the declared content-length.
+/// Drain an H3 response stream into a `Vec<u8>`, tolerating a post-body
+/// graceful `CONNECTION_CLOSE(H3_NO_ERROR)`. See the module-level doc for the
+/// race this handles.
+///
+/// Note: `StreamError::RemoteTerminate { code: H3_NO_ERROR }` (stream-level
+/// reset) is NOT matched by h3's `is_h3_no_error()` — only connection-level
+/// and stream-error-frame codes are. This is intentional: a stream reset means
+/// the server aborted this particular stream, whereas the connection close
+/// we're recovering from affects all streams after the body was fully sent.
+pub(crate) async fn drain_h3_response_body(
+    stream: &mut H3RequestStream,
+    content_length: Option<u64>,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let mut body = Vec::new();
+    loop {
+        match stream.recv_data().await {
+            Ok(Some(chunk)) => body.extend_from_slice(chunk.chunk()),
+            Ok(None) => break,
+            Err(e) => {
+                if e.is_h3_no_error() && is_response_body_complete(&body, content_length) {
+                    debug!(
+                        bytes_received = body.len(),
+                        "H3 recv_data hit graceful CONNECTION_CLOSE after complete body; treating as success"
+                    );
+                    break;
+                }
+                return Err(anyhow::Error::from(e));
+            }
+        }
+    }
+    Ok(body)
+}
+
 fn is_response_body_complete(body: &[u8], content_length: Option<u64>) -> bool {
     match content_length {
         Some(declared) => body.len() as u64 >= declared,
@@ -821,26 +853,7 @@ impl Http3ConnectionPool {
             .get("content-length")
             .and_then(|v| v.parse().ok());
 
-        let mut response_body = Vec::new();
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(chunk)) => response_body.extend_from_slice(chunk.chunk()),
-                Ok(None) => break,
-                Err(e) => {
-                    // RFC 9114 §5.1: a server MAY send CONNECTION_CLOSE(H3_NO_ERROR)
-                    // in the same UDP burst as the stream FIN. On Linux, io_uring can
-                    // deliver the close before the stream-end, so recv_data returns Err
-                    // instead of Ok(None). When the body is already complete, treat as
-                    // successful.
-                    if e.is_h3_no_error()
-                        && is_response_body_complete(&response_body, content_length)
-                    {
-                        break;
-                    }
-                    return Err(anyhow::Error::from(e));
-                }
-            }
-        }
+        let response_body = drain_h3_response_body(&mut stream, content_length).await?;
 
         Ok((status, response_body, response_headers))
     }
@@ -1718,21 +1731,7 @@ impl Http3Client {
             .get("content-length")
             .and_then(|v| v.parse().ok());
 
-        let mut response_body = Vec::new();
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(chunk)) => response_body.extend_from_slice(chunk.chunk()),
-                Ok(None) => break,
-                Err(e) => {
-                    if e.is_h3_no_error()
-                        && is_response_body_complete(&response_body, content_length)
-                    {
-                        break;
-                    }
-                    return Err(anyhow::Error::from(e));
-                }
-            }
-        }
+        let response_body = drain_h3_response_body(&mut stream, content_length).await?;
 
         Ok((status, response_body, response_headers))
     }

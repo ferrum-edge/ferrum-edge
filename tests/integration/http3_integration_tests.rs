@@ -11,9 +11,6 @@ use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::{ConsumerIndex, PluginCache, RouterCache};
 use tracing::info;
 
-#[allow(unused_imports)]
-use crate::scaffolding;
-
 // Initialize rustls crypto provider for tests
 fn init_crypto_provider() {
     // Try to install the crypto provider, but don't panic if it fails
@@ -1160,12 +1157,12 @@ async fn test_http3_connection_performance() {
 }
 
 /// Verify that a buffered H3 response survives a post-response
-/// CONNECTION_CLOSE(H3_NO_ERROR) race. When the backend sends the complete
-/// body and immediately drops the QUIC connection, the fin and the close can
-/// arrive in the same UDP burst. On Linux/io_uring the close surfaces first,
-/// causing recv_data to return Err instead of Ok(None). The fix recognises
-/// that the body is already complete (content-length satisfied) and treats the
-/// graceful close as successful.
+/// CONNECTION_CLOSE(H3_NO_ERROR). The script sends headers + body, waits for
+/// them to propagate, then explicitly closes the connection with H3_NO_ERROR
+/// (0x100) WITHOUT calling stream.finish(). This means the stream has no FIN —
+/// recv_data() MUST hit the Err branch and recover via the graceful-close
+/// predicate. The test is deterministic on all platforms because there is no
+/// FIN to race against.
 #[tokio::test]
 async fn h3_buffered_response_survives_graceful_close_race() {
     use crate::scaffolding::backends::{H3Step, H3TlsConfig, ScriptedH3Backend};
@@ -1188,13 +1185,12 @@ async fn h3_buffered_response_survives_graceful_close_race() {
         .step(H3Step::RespondData(bytes::Bytes::from_static(
             b"ok-from-h3-b",
         )))
-        // Small delay so response data (headers + body) propagates to the client
-        // before the connection drops. Without this, the close races with
-        // recv_response() instead of recv_data() — a different (worse) race.
-        // In production, the response propagation happens over the network RTT;
-        // here we simulate it with a brief stall.
+        // Let response data propagate before closing.
         .step(H3Step::StallFor(std::time::Duration::from_millis(50)))
-        // Script ends → stream.finish() + connection drop → CONNECTION_CLOSE(H3_NO_ERROR)
+        // Explicit graceful close — skips stream.finish(), so no FIN on the
+        // stream. The client's recv_data() will see Err(H3_NO_ERROR) instead
+        // of Ok(None), exercising the fix deterministically.
+        .step(H3Step::CloseConnectionWithCode(0x100))
         .spawn()
         .expect("spawn scripted H3 backend");
 
@@ -1236,6 +1232,11 @@ async fn h3_buffered_response_survives_graceful_close_race() {
     assert_eq!(status, 200);
     assert_eq!(body, b"ok-from-h3-b");
     assert_eq!(backend.accepted_handshakes(), 1);
+    assert_eq!(
+        backend.connection_close_sent(),
+        1,
+        "explicit CloseConnectionWithCode must fire"
+    );
 
     drop(backend);
 }
