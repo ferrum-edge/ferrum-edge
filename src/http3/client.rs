@@ -197,10 +197,23 @@ pub(crate) async fn drain_h3_response_body(
     Ok(body)
 }
 
+pub(crate) fn is_h3_graceful_close_public(e: &h3::error::StreamError) -> bool {
+    is_h3_graceful_close(e)
+}
+
 fn is_h3_graceful_close(e: &h3::error::StreamError) -> bool {
     // h3's RemoteClosing variant (GOAWAY) is #[non_exhaustive] and not
     // matchable from outside the crate; fall back to Display string.
     e.is_h3_no_error() || e.to_string() == "Remote is closing the connection"
+}
+
+pub(crate) fn is_response_body_complete_public(
+    body_len: u64,
+    method: &str,
+    status: u16,
+    content_length: Option<u64>,
+) -> bool {
+    is_response_body_complete_inner(body_len, method, status, content_length)
 }
 
 /// Whether the received body is semantically complete for this response.
@@ -217,11 +230,20 @@ fn is_response_body_complete(
     status: u16,
     content_length: Option<u64>,
 ) -> bool {
+    is_response_body_complete_inner(body.len() as u64, method, status, content_length)
+}
+
+fn is_response_body_complete_inner(
+    body_len: u64,
+    method: &str,
+    status: u16,
+    content_length: Option<u64>,
+) -> bool {
     if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
-        return body.is_empty();
+        return body_len == 0;
     }
     match content_length {
-        Some(declared) => body.len() as u64 == declared,
+        Some(declared) => body_len == declared,
         None => false,
     }
 }

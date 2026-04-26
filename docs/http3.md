@@ -178,19 +178,3 @@ These are enforced separately from hyper's built-in validation because the H3 li
 | `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | Response coalesce time-based flush interval |
 | `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | `32` | Cross-protocol bridge mpsc capacity (range: 1–1024) |
 | `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU (quinn clamps 1200–65527) |
-
-## Known gaps — graceful close on streaming responses
-
-The buffered response path (`drain_h3_response_body` in `src/http3/client.rs` and
-the `proxy_to_backend_http3` consumer in `src/proxy/mod.rs`) tolerates a post-body
-`CONNECTION_CLOSE(H3_NO_ERROR)` that races the stream FIN. The **streaming**
-response paths (`src/http3/server.rs` ~line 1615 and ~2659) have the same
-vulnerability: when Content-Length is known and `total_streamed == content_length`,
-the forwarder could recover instead of classifying the error. Today these paths call
-`classify_http3_error` on any `recv_data` error and break with a body-error-class,
-which can surface as a truncated response even though all bytes were forwarded.
-
-Follow-up: extend the streaming forwarder's error branch with the same
-`is_h3_no_error() && bytes_complete` predicate. The streaming path also needs to
-avoid the false `mark_h3_unsupported` downgrade that `ConnectionClosed` triggers
-via `is_h3_transport_error_class`.
