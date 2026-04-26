@@ -1126,14 +1126,15 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
 
     // Colocated TCP+UDP so the capability probe reaches both transports
     // and classifies h3 = Supported (gateway then takes the native H3 pool).
-    let (tcp_listener, udp_socket, backend_port) = reserve_colocated_tcp_udp()
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
         .await
         .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
 
     // TCP+TLS sidecar for the capability probe (advertises h2+http/1.1).
     // It's never actually hit by the test request — that lands on H3.
     let _tcp_backend = ScriptedTlsBackend::builder(
-        tcp_listener,
+        tcp_res.into_listener(),
         TlsConfig::new(cert.clone(), key.clone())
             .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
     )
@@ -1147,7 +1148,7 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
 
     // Real H3 backend that records the inbound `:authority` + headers.
     // Accept stream, send 200 + 2-byte body.
-    let h3_backend = ScriptedH3Backend::builder(udp_socket, H3TlsConfig::new(cert, key))
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
         .step(H3Step::AcceptStream)
         .step(H3Step::RespondHeaders(vec![
             (":status", "200".to_string()),
