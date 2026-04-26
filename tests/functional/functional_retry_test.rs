@@ -543,3 +543,225 @@ async fn retry_max_retries_zero_means_no_retry() {
         "max_retries=0 must mean exactly one attempt; got {attempts} (baseline={baseline}, post={post_request})"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 5 — Within-request retries stay on the H3 pool.
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Sibling of `post_h3_downgrade_subsequent_requests_route_via_cross_protocol_bridge`.
+// That test asserts the next-REQUEST contract; this one pins the
+// same-request contract: once a request dispatches via the native H3
+// pool, every retry attempt for that request stays on H3, even after
+// `mark_h3_unsupported` downgrades the cached capability.
+//
+// Industry practice (Envoy, NGINX, HAProxy, Cloudflare, GFE) is that
+// retries within a single request stay on the same transport — the
+// failed transport attempt may already have flushed headers / body
+// before the error surfaced, so cross-protocol replay would bypass
+// `proxy.retry.retry_on_methods` and risk duplicating non-idempotent
+// requests. Capability downgrade fires on the first H3 transport
+// failure, but it routes the NEXT request, not this one.
+//
+// Setup:
+//   * H3 backend that accepts the stream and immediately sends
+//     `RESET_STREAM(0x10c)`. The "reset" substring in the gateway's
+//     classifier produces `ConnectionReset` (`connection_error=true`),
+//     which trips `retry_on_connect_failure` so the retry loop fires.
+//   * TCP+TLS backend on the same port that would answer 200 OK if hit
+//     by the cross-protocol bridge. Pre-fix behavior would route
+//     iteration 1+ via reqwest → this backend; post-fix it never gets a
+//     connection during the first request.
+//
+// Retry policy: `max_retries: 2`, `retry_on_connect_failure: true`,
+// `retryable_methods: ["GET"]` — guarantees both retries fire.
+//
+// Assertions:
+//   * Response is 5xx — proves the retry loop never silently fell
+//     through to reqwest (which would have returned 200 from the TCP+TLS
+//     backend).
+//   * The H3 backend recorded ≥ 1 request — proves dispatch went
+//     through the native H3 pool. (We avoid a strict `== 3` here; the
+//     intra-pool reconnect path can short-circuit a retry attempt
+//     before opening a backend stream when the cached connection is
+//     invalidated mid-attempt. The contract this test pins is "no
+//     mid-request bridge fallback", not "exactly N backend streams".)
+//   * The TCP+TLS bridge backend saw 0 connections during the first
+//     request — the load-bearing assertion. Pre-fix would route
+//     iteration 1+ via reqwest after `mark_h3_unsupported` fires,
+//     producing ≥ 1 connection here. Post-fix it stays at 0.
+//   * Registry shows `h3 = unsupported` after the request — proves the
+//     downgrade hook still fires (it just doesn't affect the in-flight
+//     request).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn retry_attempts_within_same_request_stay_on_h3_pool() {
+    let ca = TestCa::new("retry-h3-same-request").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_listener, udp_socket, backend_port) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+
+    // Bridge fallback target — answers 200 OK if reqwest ever routes
+    // here mid-request. We pre-load enough script copies that any
+    // accidental cross-protocol replay would observably succeed (the
+    // assertion below is `accepted_connections() == 0`, so this is
+    // belt-and-braces).
+    let tcp_backend = ScriptedTlsBackend::builder(
+        tcp_listener,
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nbridge".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    // H3 backend: every accepted connection accepts the stream, then
+    // resets it with H3_REQUEST_CANCELLED. The script runs fresh per
+    // accepted connection, so each gateway-level retry that establishes
+    // a new QUIC connection sees the same RST.
+    let h3_backend = ScriptedH3Backend::builder(udp_socket, H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::SendStreamReset(0x10c))
+        .spawn()
+        .expect("spawn h3");
+
+    // Retry policy that DEFINITELY fires on connection-class failures.
+    // The H3 stream RST is classified as `ConnectionReset`
+    // (`connection_error=true`), so `should_retry` returns true for the
+    // configured `max_retries: 2`.
+    let yaml = https_with_retry(
+        backend_port,
+        json!({
+            "max_retries": 2,
+            "retry_on_connect_failure": true,
+            "retryable_methods": ["GET"],
+        }),
+    );
+
+    // Plain HTTP frontend — gateway dispatches to the HTTPS backend via
+    // the native H3 pool because the registry will classify
+    // `h3 = supported` after the warmup probe completes the QUIC
+    // handshake (the H3 script's stream-level RST never fires during
+    // warmup since warmup doesn't open a stream).
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        // Warmup must populate the registry before the first request,
+        // otherwise the request would land while h3 is still Unknown
+        // and dispatch via reqwest — bypassing the code path under
+        // test.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    // Wait for warmup to mark h3 = supported. Without this gate the
+    // request races the probe and may land before classification, in
+    // which case reqwest serves it and the test no longer exercises
+    // the H3 retry path.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut classified_h3 = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(body) = harness.get_admin_json("/backend-capabilities").await {
+            let entries = body["entries"].as_array().cloned().unwrap_or_default();
+            if let Some(e) = entries.first()
+                && e["plain_http"]["h3"].as_str() == Some("supported")
+            {
+                classified_h3 = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        classified_h3,
+        "warmup probe should have classified h3 = supported before the request fires; \
+         without this the test does not exercise the H3 retry path"
+    );
+
+    // Capture baselines (warmup already opened a QUIC connection on the
+    // H3 backend, so the counters are not zero).
+    let h3_streams_baseline = h3_backend.received_requests().await.len();
+    let bridge_baseline = tcp_backend.accepted_connections();
+
+    // The single request that drives the retry loop. With the new
+    // contract, all 3 attempts (initial + 2 retries) must hit H3 — none
+    // are allowed to fall through to the bridge mid-request.
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .get(&harness.proxy_url("/api/single-h3"))
+        .await
+        .expect("send request");
+
+    assert!(
+        resp.status.as_u16() >= 500 && resp.status.as_u16() < 600,
+        "request must end in 5xx — every retry attempt failed at the H3 layer; \
+         a 200 here means a retry leaked into the cross-protocol bridge. \
+         got: {resp:?}"
+    );
+
+    // Allow any in-flight backend bookkeeping to settle before reading
+    // the counters.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let h3_streams_after = h3_backend.received_requests().await.len();
+    let bridge_after = tcp_backend.accepted_connections();
+    let h3_streams = h3_streams_after - h3_streams_baseline;
+    let bridge_hits = bridge_after - bridge_baseline;
+
+    // Load-bearing assertion: the bridge backend MUST NOT have served
+    // any traffic during this single request. Pre-fix, after the first
+    // H3 attempt failed and `mark_h3_unsupported` fired, the per-
+    // iteration `tried_h3` re-check would see Unsupported and route
+    // iteration 1 (and iteration 2) via reqwest → this backend would
+    // record at least one connection. Post-fix, `request_was_h3` is
+    // captured once before the loop and stays true for all retries.
+    assert_eq!(
+        bridge_hits, 0,
+        "TCP+TLS bridge backend must see ZERO connections during a request that \
+         dispatched via H3 — a non-zero value means a retry crossed protocols \
+         mid-request, which the same-request contract forbids. \
+         (h3 streams during request: {h3_streams}, bridge connections: {bridge_hits})"
+    );
+
+    // Sanity: the H3 backend must have observed at least the initial
+    // dispatch. Without this floor a routing regression that never
+    // dispatched via H3 would silently pass the bridge=0 check.
+    assert!(
+        h3_streams >= 1,
+        "H3 backend should have served at least the initial dispatch; got {h3_streams} \
+         streams during request — possible regression that skipped the native pool entirely"
+    );
+
+    // The downgrade hook should have fired on the H3 transport failure
+    // — assert it landed so the NEXT request would route via reqwest.
+    // (This is the contract the sibling test
+    // `post_h3_downgrade_subsequent_requests_route_via_cross_protocol_bridge`
+    // verifies end-to-end; here we just confirm the hook ran.)
+    let downgrade_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut downgrade_observed = false;
+    while std::time::Instant::now() < downgrade_deadline {
+        if let Ok(body) = harness.get_admin_json("/backend-capabilities").await {
+            let entries = body["entries"].as_array().cloned().unwrap_or_default();
+            if let Some(e) = entries.first()
+                && e["plain_http"]["h3"].as_str() == Some("unsupported")
+            {
+                downgrade_observed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        downgrade_observed,
+        "after an H3 transport failure the registry must downgrade h3 to unsupported \
+         so the NEXT request routes via reqwest — without this the lifecycle is broken"
+    );
+}
