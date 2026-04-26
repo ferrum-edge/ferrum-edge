@@ -11,6 +11,9 @@ use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::{ConsumerIndex, PluginCache, RouterCache};
 use tracing::info;
 
+#[allow(unused_imports)]
+use crate::scaffolding;
+
 // Initialize rustls crypto provider for tests
 fn init_crypto_provider() {
     // Try to install the crypto provider, but don't panic if it fails
@@ -1154,4 +1157,85 @@ async fn test_http3_connection_performance() {
     } else {
         info!("HTTP/3 performance test completed successfully");
     }
+}
+
+/// Verify that a buffered H3 response survives a post-response
+/// CONNECTION_CLOSE(H3_NO_ERROR) race. When the backend sends the complete
+/// body and immediately drops the QUIC connection, the fin and the close can
+/// arrive in the same UDP burst. On Linux/io_uring the close surfaces first,
+/// causing recv_data to return Err instead of Ok(None). The fix recognises
+/// that the body is already complete (content-length satisfied) and treats the
+/// graceful close as successful.
+#[tokio::test]
+async fn h3_buffered_response_survives_graceful_close_race() {
+    use crate::scaffolding::backends::{H3Step, H3TlsConfig, ScriptedH3Backend};
+    use crate::scaffolding::certs::TestCa;
+    use crate::scaffolding::ports::reserve_udp_port;
+
+    init_crypto_provider();
+
+    let ca = TestCa::new("h3-close-race").expect("test CA");
+    let (cert, key) = ca.valid().expect("leaf cert");
+
+    let udp = reserve_udp_port().await.expect("reserve udp port");
+    let port = udp.port;
+    let backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(&cert, &key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", "12".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(
+            b"ok-from-h3-b",
+        )))
+        // Small delay so response data (headers + body) propagates to the client
+        // before the connection drops. Without this, the close races with
+        // recv_response() instead of recv_data() — a different (worse) race.
+        // In production, the response propagation happens over the network RTT;
+        // here we simulate it with a brief stall.
+        .step(H3Step::StallFor(std::time::Duration::from_millis(50)))
+        // Script ends → stream.finish() + connection drop → CONNECTION_CLOSE(H3_NO_ERROR)
+        .spawn()
+        .expect("spawn scripted H3 backend");
+
+    // Build a rustls client config that trusts the test CA.
+    let provider = rustls::crypto::ring::default_provider();
+    let mut root_store = rustls::RootCertStore::empty();
+    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+        .filter_map(|c| c.ok())
+        .collect();
+    for cert_der in &ca_certs {
+        root_store.add(cert_der.clone()).expect("add CA cert");
+    }
+    let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let h3_client = ferrum_edge::http3::client::Http3Client::new(Arc::new(client_tls), None)
+        .expect("H3 client");
+
+    let mut proxy = create_http3_test_proxy();
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = port;
+    proxy.backend_tls_verify_server_cert = true;
+
+    let url = format!("https://127.0.0.1:{}/", port);
+    let headers = vec![(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{}", port)).unwrap(),
+    )];
+
+    let (status, body, _headers) = h3_client
+        .request(&proxy, "GET", &url, headers, bytes::Bytes::new())
+        .await
+        .expect("request should succeed despite post-response CONNECTION_CLOSE");
+
+    assert_eq!(status, 200);
+    assert_eq!(body, b"ok-from-h3-b");
+    assert_eq!(backend.accepted_handshakes(), 1);
+
+    drop(backend);
 }

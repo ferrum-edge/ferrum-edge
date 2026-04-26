@@ -152,6 +152,14 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
     }
 }
 
+/// Whether the received body satisfies the declared content-length.
+fn is_response_body_complete(body: &[u8], content_length: Option<u64>) -> bool {
+    match content_length {
+        Some(declared) => body.len() as u64 >= declared,
+        None => false,
+    }
+}
+
 /// Type alias for the h3 send request handle.
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 
@@ -809,9 +817,29 @@ impl Http3ConnectionPool {
             }
         }
 
+        let content_length: Option<u64> = response_headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok());
+
         let mut response_body = Vec::new();
-        while let Some(chunk) = stream.recv_data().await? {
-            response_body.extend_from_slice(chunk.chunk());
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(chunk)) => response_body.extend_from_slice(chunk.chunk()),
+                Ok(None) => break,
+                Err(e) => {
+                    // RFC 9114 §5.1: a server MAY send CONNECTION_CLOSE(H3_NO_ERROR)
+                    // in the same UDP burst as the stream FIN. On Linux, io_uring can
+                    // deliver the close before the stream-end, so recv_data returns Err
+                    // instead of Ok(None). When the body is already complete, treat as
+                    // successful.
+                    if e.is_h3_no_error()
+                        && is_response_body_complete(&response_body, content_length)
+                    {
+                        break;
+                    }
+                    return Err(anyhow::Error::from(e));
+                }
+            }
         }
 
         Ok((status, response_body, response_headers))
@@ -1686,9 +1714,24 @@ impl Http3Client {
         }
 
         // Collect response body
+        let content_length: Option<u64> = response_headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok());
+
         let mut response_body = Vec::new();
-        while let Some(chunk) = stream.recv_data().await? {
-            response_body.extend_from_slice(chunk.chunk());
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(chunk)) => response_body.extend_from_slice(chunk.chunk()),
+                Ok(None) => break,
+                Err(e) => {
+                    if e.is_h3_no_error()
+                        && is_response_body_complete(&response_body, content_length)
+                    {
+                        break;
+                    }
+                    return Err(anyhow::Error::from(e));
+                }
+            }
         }
 
         Ok((status, response_body, response_headers))
