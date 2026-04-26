@@ -123,13 +123,20 @@ pub struct ServeHandles {
     /// — the binary's pre-refactor `run()` had the same 5 s cap, and
     /// rolling-restart / test-teardown ergonomics rely on it.
     background_handles: Vec<JoinHandle<()>>,
-    /// Shutdown subscription. Used by [`Self::join`] to keep the function
-    /// alive in stream-only deployments (no HTTP/HTTPS/admin listeners,
-    /// only TCP/UDP via `stream_listener_manager` whose tasks are not
-    /// tracked in `listener_handles`). Without it, `join()` would return
-    /// after the background-drain timeout and `run()` would exit ~5 s
-    /// after startup even though stream proxies were still serving.
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// Shutdown sender. [`Self::join`] uses it for two things:
+    ///
+    /// 1. **Subscribe** to wait for shutdown when `listener_handles` is
+    ///    empty (stream-only deployment — TCP/UDP only via
+    ///    `stream_listener_manager` whose tasks are not tracked here).
+    ///    Without this, `join()` would return after the background-drain
+    ///    timeout and `run()` would exit ~5 s after startup even though
+    ///    stream proxies were still serving.
+    /// 2. **Send `true`** when one listener task panics, so the remaining
+    ///    listeners observe shutdown via their own subscribers and exit
+    ///    promptly. Without this, an in-flight `handle.await` for a
+    ///    still-serving listener blocks forever — the panic never bubbles
+    ///    up and the binary stays alive with one dead listener.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// `FERRUM_SHUTDOWN_DRAIN_SECONDS` snapshot — bound on the in-flight
     /// request drain that runs between listener exit and background-task
     /// drain.
@@ -181,14 +188,15 @@ impl ServeHandles {
     /// propagates up to `run()` so the binary surfaces a panicked listener
     /// instead of silently exiting with one listener missing — matching
     /// the pre-refactor `handle.await?` semantics.
-    pub async fn join(mut self) -> Result<(), tokio::task::JoinError> {
+    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
         let listener_result = if self.listener_handles.is_empty() {
             // Stream-only deployment: there are no JoinHandles to await,
             // so block on the shutdown watch channel until somebody fires
             // it. Mirrors the pre-refactor `run()` which had the same
             // `wait_shutdown.changed().await` loop.
-            while !*self.shutdown_rx.borrow() {
-                if self.shutdown_rx.changed().await.is_err() {
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            while !*shutdown_rx.borrow() {
+                if shutdown_rx.changed().await.is_err() {
                     // Sender dropped without sending `true` — treat as
                     // shutdown.
                     break;
@@ -196,7 +204,15 @@ impl ServeHandles {
             }
             Ok(())
         } else {
-            await_listener_handles(self.listener_handles).await
+            // Pass a closure that fires shutdown on first panic so
+            // remaining listeners observe it and exit promptly. Without
+            // this, a panicked listener would leave the others stuck on
+            // their accept loops forever and `join()` would never return.
+            let shutdown_tx = self.shutdown_tx.clone();
+            await_listener_handles(self.listener_handles, move || {
+                let _ = shutdown_tx.send(true);
+            })
+            .await
         };
         if self.drain_seconds > 0 {
             crate::overload::wait_for_drain(
@@ -213,17 +229,38 @@ impl ServeHandles {
 /// Await every listener handle. Logs each `JoinError` and returns the
 /// first one so a panicked listener bubbles up to `run()` (instead of
 /// silently leaving the binary running with one fewer accept loop).
+///
+/// Awaits handles **concurrently** via `FuturesUnordered` rather than
+/// sequentially so that:
+///
+/// 1. The first panic is observed even if it happens on a handle later
+///    in the iteration order than a still-serving listener.
+/// 2. On the first panic, `shutdown_on_panic` fires so the still-serving
+///    listeners observe the shutdown watch channel via their own
+///    subscribers and exit promptly. With sequential `for handle in
+///    handles { handle.await }` plus no shutdown trigger, a panicked
+///    listener would leave the remaining ones stuck on their accept
+///    loops forever and the helper would never return.
+///
 /// Pulled out of [`ServeHandles::join`] so the panic-propagation
 /// behaviour is unit-testable without constructing a `ProxyState`.
 async fn await_listener_handles(
     handles: Vec<JoinHandle<()>>,
+    shutdown_on_panic: impl FnOnce(),
 ) -> Result<(), tokio::task::JoinError> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let mut futures: FuturesUnordered<_> = handles.into_iter().collect();
     let mut first_error: Option<tokio::task::JoinError> = None;
-    for handle in handles {
-        if let Err(err) = handle.await {
+    let mut shutdown_on_panic = Some(shutdown_on_panic);
+    while let Some(result) = futures.next().await {
+        if let Err(err) = result {
             error!("Gateway listener task failed: {}", err);
             if first_error.is_none() {
                 first_error = Some(err);
+                if let Some(trigger) = shutdown_on_panic.take() {
+                    trigger();
+                }
             }
         }
     }
@@ -289,6 +326,17 @@ pub async fn run(
         &env_config.namespace,
     )?;
 
+    // Install the SIGHUP handler BEFORE serve() so a HUP arriving during
+    // startup (DNS warmup, pool warmup, listener bind) doesn't take the
+    // default termination action and kill the process. Once the
+    // `Signal` stream is created, tokio overrides the default handler
+    // and queues incoming signals; the reload loop below `recv()`s them
+    // after `serve()` returns. Startup HUPs become "reload after we're
+    // ready" instead of "process gone".
+    #[cfg(unix)]
+    let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .map_err(|e| anyhow::anyhow!("Failed to register SIGHUP handler: {e}"))?;
+
     // Hand off to serve(). It builds ProxyState, spawns listeners, and waits
     // until shutdown — exactly what run() used to do inline. The only extra
     // bit is the SIGHUP handler, registered alongside.
@@ -311,14 +359,11 @@ pub async fn run(
     let sighup_handle = tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sighup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to register SIGHUP handler: {}", e);
-                    return;
-                }
-            };
+            // Use the pre-installed signal stream from above so any HUPs
+            // that arrived during `serve()` startup get processed here
+            // (`tokio::signal::unix::Signal` queues notifications until
+            // `recv()` is awaited).
+            let mut sighup = sighup;
             loop {
                 tokio::select! {
                     _ = sighup.recv() => {
@@ -848,7 +893,7 @@ pub async fn serve(
         bound,
         listener_handles: handles,
         background_handles,
-        shutdown_rx: shutdown_tx.subscribe(),
+        shutdown_tx,
         drain_seconds: env_config.shutdown_drain_seconds,
     })
 }
@@ -919,7 +964,7 @@ mod tests {
         });
         let healthy_late = tokio::spawn(async {});
 
-        let result = await_listener_handles(vec![healthy, panicker, healthy_late]).await;
+        let result = await_listener_handles(vec![healthy, panicker, healthy_late], || {}).await;
         let err = result.expect_err("a listener panicked, await_listener_handles must return Err");
         assert!(
             err.is_panic(),
@@ -928,15 +973,71 @@ mod tests {
     }
 
     // Sanity: when no listener panics, the helper returns Ok and never
-    // synthesises a phantom error. Guards against a regression where
-    // `first_error` accidentally becomes a marker value.
+    // synthesises a phantom error. Also asserts the shutdown trigger is
+    // NOT fired in the happy path — firing on every join would cause
+    // graceful shutdown to also signal itself, which is wasteful.
     #[tokio::test]
-    async fn await_listener_handles_returns_ok_when_all_listeners_complete() {
+    async fn await_listener_handles_returns_ok_and_does_not_signal_when_all_complete() {
         let h1 = tokio::spawn(async {});
         let h2 = tokio::spawn(async {});
+        let triggered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let triggered_clone = triggered.clone();
 
-        await_listener_handles(vec![h1, h2])
-            .await
-            .expect("no listener panicked; helper must return Ok");
+        await_listener_handles(vec![h1, h2], move || {
+            triggered_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .expect("no listener panicked; helper must return Ok");
+        assert!(
+            !triggered.load(std::sync::atomic::Ordering::SeqCst),
+            "shutdown trigger must NOT fire when no listener panicked",
+        );
+    }
+
+    // Regression P1: previously the helper awaited handles sequentially,
+    // so a panicked listener earlier in the list would surface only AFTER
+    // every later listener exited on its own. If any later listener was
+    // still serving, `handle.await` blocked forever and the panic was
+    // never reported. The fix uses `FuturesUnordered` + a shutdown
+    // trigger: the first panic fires `shutdown_on_panic`, which the
+    // remaining listeners observe via the watch channel and exit
+    // promptly. This test models that with two listeners that wait on a
+    // shutdown channel and a third that panics.
+    #[tokio::test]
+    async fn await_listener_handles_signals_shutdown_so_remaining_listeners_can_exit() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let mut listener_a_rx = shutdown_tx.subscribe();
+        let listener_a = tokio::spawn(async move {
+            // Block until the helper triggers shutdown.
+            let _ = listener_a_rx.changed().await;
+        });
+
+        let panicker = tokio::spawn(async {
+            panic!("listener crash");
+        });
+
+        let mut listener_b_rx = shutdown_tx.subscribe();
+        let listener_b = tokio::spawn(async move {
+            let _ = listener_b_rx.changed().await;
+        });
+
+        let trigger_tx = shutdown_tx.clone();
+        let started = Instant::now();
+        let result = await_listener_handles(vec![listener_a, panicker, listener_b], move || {
+            let _ = trigger_tx.send(true);
+        })
+        .await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("panicker should produce an Err");
+        assert!(err.is_panic());
+        // 2 s is generous compared to the actual cost (one watch-channel
+        // notification + two `changed()` wakeups). Without the shutdown
+        // trigger this would block forever.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "helper should drain remaining listeners via shutdown trigger; took {elapsed:?}",
+        );
     }
 }
