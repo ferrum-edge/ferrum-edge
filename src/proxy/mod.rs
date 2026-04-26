@@ -6503,6 +6503,16 @@ async fn handle_proxy_request_inner(
         let mut current_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
+        // Capture the dispatch protocol once at the start of the request so
+        // every retry iteration uses the same transport. Retries within a
+        // single request stay on the protocol the request started with —
+        // capability downgrade affects the NEXT request, never this one.
+        // Cross-protocol fallback within a request would bypass
+        // `proxy.retry.retry_on_methods` and risk duplicating non-idempotent
+        // requests, since the failed transport attempt may have flushed
+        // headers/body to the backend before the error surfaced.
+        let request_was_h3 =
+            supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
         let (mut result, retained_body) = proxy_to_backend(
             &state,
             &proxy,
@@ -6581,8 +6591,10 @@ async fn handle_proxy_request_inner(
             // the body was never sent, so replaying is correct and safe.
             // The final retry attempt uses streaming if configured.
             let is_last_attempt = attempt >= retry_config.max_retries;
-            let tried_h3 = supports_native_http3_backend(&state, &proxy, current_target.as_deref());
-            result = if tried_h3 {
+            // Use the dispatch protocol captured before the loop. Mid-request
+            // transport switching is intentionally NOT supported; see the
+            // `request_was_h3` declaration above.
+            result = if request_was_h3 {
                 proxy_to_backend_http3_retry(
                     &state,
                     &proxy,
@@ -6611,11 +6623,12 @@ async fn handle_proxy_request_inner(
                 .await
             };
             // If H3 was attempted and produced a transport-level failure,
-            // downgrade the cached capability so the next retry iteration
-            // (and subsequent requests) skip the H3 pool and route via
-            // reqwest instead of repeatedly 502-ing against a backend
-            // whose QUIC support rolled back between refresh cycles.
-            if tried_h3 && is_h3_transport_failure(&result) {
+            // downgrade the cached capability so the NEXT request skips the
+            // H3 pool and routes via reqwest instead of repeatedly 502-ing
+            // against a backend whose QUIC support rolled back between refresh
+            // cycles. This downgrade does NOT affect the current retry
+            // iteration — that decision is locked to `request_was_h3`.
+            if request_was_h3 && is_h3_transport_failure(&result) {
                 state
                     .backend_capabilities
                     .mark_h3_unsupported(&proxy, current_target.as_deref());
