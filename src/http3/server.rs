@@ -2419,13 +2419,19 @@ pub(crate) fn inject_sticky_cookie(
     }
 }
 
-fn classify_h3_error(e: &anyhow::Error) -> crate::retry::ErrorClass {
+fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::ErrorClass {
     // Delegate to the shared HTTP/3 classifier, which walks the source chain
     // for typed quinn::ConnectionError / quinn::ConnectError / io::Error
     // variants before falling back to string heuristics. This gives more
     // accurate classifications (e.g., distinguishing ApplicationClosed from
     // a generic "closed" match) than the previous string-only approach.
-    crate::http3::client::classify_http3_error(e.as_ref())
+    //
+    // `H3PoolError` carries the body-on-wire signal alongside the anyhow
+    // chain; classification looks only at the chain. Callers that need to
+    // override `connection_error` based on whether any internal pool
+    // attempt committed the body should consult `e.request_on_wire()`
+    // separately rather than re-deriving it from `error_class`.
+    crate::http3::client::classify_http3_error(e.as_error().as_ref())
 }
 
 /// Outcome of a streaming H3 proxy operation.

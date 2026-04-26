@@ -33,13 +33,23 @@ fn test_h2_pool_typed_io_connection_refused() {
 }
 
 #[test]
-fn test_h2_pool_typed_io_connection_reset() {
+fn test_h2_pool_typed_io_connection_reset_classifies_as_connection_refused() {
+    // The HTTP/2 pool is a pure connection-establishment layer — every
+    // io error it surfaces is pre-wire. A SYN-RST'd connect attempt
+    // produces io::ErrorKind::ConnectionReset, which would normally
+    // classify as `ConnectionReset` (post-wire under the unified
+    // `request_reached_wire` boundary). Inside the H2 pool we collapse
+    // it to `ConnectionRefused` so `retry_on_connect_failure` fires.
     let io_err = io::Error::new(io::ErrorKind::ConnectionReset, "peer hung up");
     let err = Http2PoolError::BackendUnavailable {
         message: "opaque message with no hint".to_string(),
         source: Some(BackendUnavailableSource::Io(io_err)),
     };
-    assert_eq!(classify_http2_pool_error(&err), ErrorClass::ConnectionReset);
+    assert_eq!(
+        classify_http2_pool_error(&err),
+        ErrorClass::ConnectionRefused,
+        "H2 pool RST is connect-phase — must collapse to ConnectionRefused, not ConnectionReset"
+    );
 }
 
 #[test]
@@ -69,17 +79,23 @@ fn test_h2_pool_typed_io_connection_aborted_is_closed() {
 }
 
 #[test]
-fn test_h2_pool_typed_io_read_timeout_is_readwritetimeout() {
-    // Typed io::Error::TimedOut in a NON-BackendTimeout variant — this is a
-    // read/write timeout (e.g., h2 frame read stalled), not a connect timeout.
-    let io_err = io::Error::new(io::ErrorKind::TimedOut, "frame read stalled");
+fn test_h2_pool_typed_io_timeout_in_backend_unavailable_is_connect_timeout() {
+    // The HTTP/2 pool is connect-phase only — it doesn't read frames or
+    // forward requests, it just establishes the connection. So an
+    // io::ErrorKind::TimedOut surfaced via BackendUnavailable is a
+    // connect-phase timeout (e.g., TLS handshake stalled), not a
+    // read/write timeout. Classify as ConnectionTimeout so the unified
+    // `request_reached_wire` boundary correctly treats this as pre-wire
+    // and fires `retry_on_connect_failure`.
+    let io_err = io::Error::new(io::ErrorKind::TimedOut, "tls handshake stalled");
     let err = Http2PoolError::BackendUnavailable {
         message: "".to_string(),
         source: Some(BackendUnavailableSource::Io(io_err)),
     };
     assert_eq!(
         classify_http2_pool_error(&err),
-        ErrorClass::ReadWriteTimeout
+        ErrorClass::ConnectionTimeout,
+        "H2 pool timeouts are connect-phase — must classify as ConnectionTimeout, not ReadWriteTimeout"
     );
 }
 

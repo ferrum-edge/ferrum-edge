@@ -1659,6 +1659,19 @@ impl ProxyState {
 
                 match result {
                     Ok(_) => Ok(desc),
+                    // Pool-warmup classification: this is the startup
+                    // HEAD probe, not a retry decision. We only want to
+                    // surface "couldn't reach the backend at all" as an
+                    // error here; a backend that responds with any HTTP
+                    // status (including 5xx) is reachable enough to keep
+                    // the pool warm. `e.is_connect() || e.is_timeout()`
+                    // is the right predicate for that narrow purpose,
+                    // and intentionally diverges from the unified
+                    // `request_reached_wire` boundary used by the
+                    // request-time retry path — different decision,
+                    // different criteria. Don't "unify" this call to
+                    // the shared classifier without revisiting what the
+                    // warmup probe actually needs to gate.
                     Err(e) if e.is_connect() || e.is_timeout() => Err(format!("{}: {}", desc, e)),
                     Err(_) => Ok(desc),
                 }
@@ -7549,15 +7562,17 @@ pub(crate) async fn proxy_to_backend_retry(
             }
         }
         Err(e) => {
-            let is_connect = e.is_connect();
-            let is_timeout = e.is_timeout();
-            let error_kind = if is_connect {
-                "connect_failure"
-            } else if is_timeout {
-                "read_timeout"
-            } else {
-                "request_error"
-            };
+            let error_class = retry::classify_reqwest_error(&e);
+            if error_class == retry::ErrorClass::PortExhaustion {
+                state.overload.record_port_exhaustion();
+            }
+            // Drive `error_kind` and `connection_error` from `ErrorClass`
+            // (see comment on the corresponding initial-attempt branch in
+            // `proxy_to_backend`). Critically: a connect-class failure on
+            // the retry path must still report `connection_error=true` so
+            // the retry loop sees it and gives `retry_on_connect_failure`
+            // another chance against the next upstream target.
+            let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
@@ -7565,10 +7580,6 @@ pub(crate) async fn proxy_to_backend_retry(
                 error = %e,
                 "Backend retry request failed"
             );
-            let error_class = retry::classify_reqwest_error(&e);
-            if error_class == retry::ErrorClass::PortExhaustion {
-                state.overload.record_port_exhaustion();
-            }
             let error_body = if error_class == retry::ErrorClass::DnsLookupError {
                 r#"{"error":"DNS resolution for backend failed"}"#
             } else {
@@ -7578,7 +7589,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 status_code: 502,
                 body: ResponseBody::Buffered(error_body.as_bytes().to_vec()),
                 headers: HashMap::new(),
-                connection_error: is_connect || is_timeout,
+                connection_error: !retry::request_reached_wire(error_class),
                 backend_resolved_ip: resolved_ip.clone(),
                 error_class: Some(error_class),
             }
@@ -8324,15 +8335,20 @@ async fn proxy_to_backend(
                 );
             }
 
-            let is_connect = e.is_connect();
-            let is_timeout = e.is_timeout();
-            let error_kind = if is_connect {
-                "connect_failure"
-            } else if is_timeout {
-                "read_timeout"
-            } else {
-                "request_error"
-            };
+            let error_class = retry::classify_reqwest_error(&e);
+            if error_class == retry::ErrorClass::PortExhaustion {
+                state.overload.record_port_exhaustion();
+            }
+            // Drive `error_kind` and `connection_error` from the same
+            // `ErrorClass` rather than re-deriving them from
+            // `e.is_connect()` / `e.is_timeout()`. The reqwest predicates
+            // miss TLS-handshake failures, DNS lookup errors that don't
+            // surface as `is_connect()` (e.g. cached failures), and port
+            // exhaustion — every transport-class failure must funnel
+            // through `retry::request_reached_wire` so
+            // `retry_on_connect_failure` fires consistently across reqwest,
+            // direct H2, gRPC, and H3 paths.
+            let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
@@ -8340,10 +8356,6 @@ async fn proxy_to_backend(
                 error = %e,
                 "Backend request failed"
             );
-            let error_class = retry::classify_reqwest_error(&e);
-            if error_class == retry::ErrorClass::PortExhaustion {
-                state.overload.record_port_exhaustion();
-            }
             let error_body = if error_class == retry::ErrorClass::DnsLookupError {
                 r#"{"error":"DNS resolution for backend failed"}"#
             } else {
@@ -8353,7 +8365,7 @@ async fn proxy_to_backend(
                 status_code: 502,
                 body: ResponseBody::Buffered(error_body.as_bytes().to_vec()),
                 headers: HashMap::new(),
-                connection_error: is_connect || is_timeout,
+                connection_error: !retry::request_reached_wire(error_class),
                 backend_resolved_ip: resolved_ip.clone(),
                 error_class: Some(error_class),
             }
@@ -9132,9 +9144,15 @@ async fn proxy_to_backend_http3(
                                     }
                                     Ok(None) => break,
                                     Err(e) => {
-                                        let error_str = e.to_string();
-                                        let (error_kind, is_conn_error, error_class) =
-                                            classify_h3_error(&error_str);
+                                        let (error_kind, error_class) = classify_h3_error(&e);
+                                        // We have already received response
+                                        // headers and started reading the
+                                        // body — the request was on the wire
+                                        // and the backend already processed
+                                        // it. `connection_error=false`
+                                        // unconditionally so a mid-body
+                                        // QUIC failure does not bypass
+                                        // `retry_on_methods`.
                                         error!(
                                             proxy_id = %proxy.id,
                                             backend_url = %backend_url,
@@ -9151,7 +9169,7 @@ async fn proxy_to_backend_http3(
                                                         .to_vec(),
                                                 ),
                                                 headers: HashMap::new(),
-                                                connection_error: is_conn_error,
+                                                connection_error: false,
                                                 backend_resolved_ip: resolved_ip,
                                                 error_class: Some(error_class),
                                             },
@@ -9222,8 +9240,23 @@ async fn proxy_to_backend_http3(
                                 None,
                             )
                         } else {
-                            let (error_kind, is_conn_error, error_class) =
-                                classify_h3_error(&error_str);
+                            // `H3PoolError::request_on_wire()` is the
+                            // authoritative body-on-wire signal: it is set
+                            // to `true` once `send_request().await` succeeds
+                            // on ANY internal pool attempt (sticky across
+                            // cached → fallback → fresh-connect retries),
+                            // and `false` otherwise. The error class adds
+                            // no information beyond it for the
+                            // connection_error decision and can disagree
+                            // — e.g. a connect-phase QUIC reset is genuinely
+                            // pre-wire but the string-heuristic fallback
+                            // can classify it as `ConnectionReset` (which
+                            // `request_reached_wire` treats as post-wire).
+                            // ANDing the class here would silently skip
+                            // `retry_on_connect_failure` for those cases.
+                            // Trust the pool's typed signal.
+                            let is_conn_error = !e.request_on_wire();
+                            let (error_kind, error_class) = classify_h3_error(e.as_ref());
                             error!(
                                 proxy_id = %proxy.id,
                                 backend_url = %backend_url,
@@ -9422,8 +9455,11 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
-                let error_str = e.to_string();
-                let (error_kind, is_conn_error, error_class) = classify_h3_error(&error_str);
+                // Trust the pool's body-on-wire signal — see the
+                // streaming-incoming-body branch above for why we drop
+                // the error-class contribution here.
+                let is_conn_error = !e.request_on_wire();
+                let (error_kind, error_class) = classify_h3_error(e.as_ref());
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -9497,8 +9533,10 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
-                let error_str = e.to_string();
-                let (error_kind, is_conn_error, error_class) = classify_h3_error(&error_str);
+                // Trust the pool's body-on-wire signal — see the streaming
+                // H3 branch above for why we drop the class contribution.
+                let is_conn_error = !e.request_on_wire();
+                let (error_kind, error_class) = classify_h3_error(e.as_ref());
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -9524,50 +9562,26 @@ async fn proxy_to_backend_http3(
     }
 }
 
-/// Classify an HTTP/3/QUIC error string into (error_kind, is_connection_error, ErrorClass).
+/// Classify an HTTP/3/QUIC error into (error_kind_label, ErrorClass).
 ///
-/// Called only on the error path — not hot path.
-fn classify_h3_error(error_str: &str) -> (&'static str, bool, retry::ErrorClass) {
-    let lower = error_str.to_lowercase();
-    if lower.contains("dns") || lower.contains("resolve") || lower.contains("no record found") {
-        ("dns_failure", true, retry::ErrorClass::DnsLookupError)
-    } else if lower.contains("tls")
-        || lower.contains("certificate")
-        || lower.contains("ssl")
-        || lower.contains("handshake")
-        || lower.contains("invalid server name")
-    {
-        ("tls_error", true, retry::ErrorClass::TlsError)
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        if lower.contains("connect") {
-            (
-                "connect_timeout",
-                true,
-                retry::ErrorClass::ConnectionTimeout,
-            )
-        } else {
-            ("read_timeout", false, retry::ErrorClass::ReadWriteTimeout)
-        }
-    } else if lower.contains("refused") {
-        (
-            "connect_failure",
-            true,
-            retry::ErrorClass::ConnectionRefused,
-        )
-    } else if lower.contains("quic connection failed")
-        || lower.contains("connection reset")
-        || lower.contains("reset")
-    {
-        ("connect_failure", true, retry::ErrorClass::ConnectionReset)
-    } else if lower.contains("protocol")
-        || lower.contains("goaway")
-        || lower.contains("h3")
-        || lower.contains("stream")
-    {
-        ("protocol_error", false, retry::ErrorClass::ProtocolError)
-    } else {
-        ("request_error", false, retry::ErrorClass::RequestError)
-    }
+/// Called only on the error path — not hot path. Thin wrapper around
+/// [`crate::http3::client::classify_http3_error`] so the H3 backend
+/// dispatcher and the H3 backend pool agree byte-for-byte on the
+/// classification of the same error chain. The shared classifier already
+/// orders specific QUIC / h3 protocol tokens (`reset_stream`, `goaway`,
+/// `applicationclose`, `h3_*`) BEFORE the bare `"reset"`/`"closed"`
+/// substrings so a stream-level RESET_STREAM is no longer misclassified
+/// as a connection-level `ConnectionReset`. It also avoids the bare
+/// `"stream"` substring match that previously matched `"upstream"` (e.g.
+/// in load-balancer error messages) and mislabeled them as protocol errors.
+///
+/// `connection_error: bool` is NOT returned here — callers derive it via
+/// [`retry::request_reached_wire`] so the boundary between connect-class
+/// failures (eligible for `retry_on_connect_failure`) and post-wire
+/// failures (must respect `retry_on_methods`) lives in exactly one place.
+fn classify_h3_error(err: &(dyn std::error::Error + 'static)) -> (&'static str, retry::ErrorClass) {
+    let class = crate::http3::client::classify_http3_error(err);
+    (retry::error_class_log_kind(class), class)
 }
 
 /// Replay a saved HTTP/3 request to an explicit target (used during retries).
@@ -9716,8 +9730,10 @@ async fn proxy_to_backend_http3_retry(
             }
         }
         Err(e) => {
-            let error_str = e.to_string();
-            let (error_kind, is_conn_error, error_class) = classify_h3_error(&error_str);
+            // Trust the pool's body-on-wire signal — see the streaming
+            // H3 branch above for why we drop the class contribution.
+            let is_conn_error = !e.request_on_wire();
+            let (error_kind, error_class) = classify_h3_error(e.as_ref());
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
@@ -9993,6 +10009,133 @@ mod tests {
             false,
             Some(retry::ErrorClass::RequestBodyTooLarge)
         )));
+    }
+
+    // ── Connection-error classification boundary tests ─────────────────
+    //
+    // These exercise the unified contract: every protocol classifier funnels
+    // through `retry::request_reached_wire`, and the H3 thin wrapper
+    // (`classify_h3_error`) inherits the corrected ordering from
+    // `classify_http3_error` so stream-level RESET_STREAM is no longer
+    // mislabeled `ConnectionReset` and load-balancer "upstream" messages no
+    // longer false-match the bare "stream" substring.
+
+    /// Small helper to invoke the proxy/mod.rs `classify_h3_error` against
+    /// a synthesized `anyhow::Error` carrying a particular message. Mirrors
+    /// the runtime path where the H3 pool wraps quinn / h3 errors in
+    /// anyhow before bubbling them up.
+    fn classify_h3_message(msg: &str) -> retry::ErrorClass {
+        let err: anyhow::Error = anyhow::anyhow!("{}", msg);
+        let (_, class) = super::classify_h3_error(err.as_ref());
+        class
+    }
+
+    #[test]
+    fn classify_h3_error_orders_protocol_tokens_before_bare_reset() {
+        // Pre-fix: `lower.contains("reset")` matched RESET_STREAM (an h3
+        // stream-level abort, not a connection reset) BEFORE the protocol
+        // ordering had a chance to fire. Fixed by aligning with
+        // `classify_http3_error` — these stream-level tokens land as
+        // `ProtocolError`, not `ConnectionReset`.
+        assert_eq!(
+            classify_h3_message("h3 stream RESET_STREAM (code=H3_REQUEST_REJECTED)"),
+            retry::ErrorClass::ProtocolError,
+            "RESET_STREAM is a stream-level abort — must classify as ProtocolError"
+        );
+        assert_eq!(
+            classify_h3_message("stream reset by backend"),
+            retry::ErrorClass::ProtocolError
+        );
+        assert_eq!(
+            classify_h3_message("reset_stream"),
+            retry::ErrorClass::ProtocolError
+        );
+    }
+
+    #[test]
+    fn classify_h3_error_does_not_false_match_upstream_substring() {
+        // Pre-fix: the bare `lower.contains("stream")` substring matched
+        // "upstream", so any load-balancer error mentioning "upstream
+        // target" landed as ProtocolError. The shared classifier removed
+        // the bare "stream" check; "upstream" no longer false-matches.
+        let class = classify_h3_message("upstream target unreachable: connection refused");
+        assert_eq!(
+            class,
+            retry::ErrorClass::ConnectionRefused,
+            "the literal 'upstream' must not steer classification toward ProtocolError"
+        );
+    }
+
+    #[test]
+    fn classify_h3_error_recognizes_application_close() {
+        // h3 0.0.8 renders quinn::ConnectionError::ApplicationClose as the
+        // bare token "ApplicationClose" — without the explicit substring
+        // match in the shared classifier this would have landed as
+        // RequestError (since the bare "closed" substring requires
+        // trailing 'd'). Confirm we now classify it as ConnectionClosed.
+        assert_eq!(
+            classify_h3_message("h3 connection closed: ApplicationClose code=0x100"),
+            retry::ErrorClass::ConnectionClosed
+        );
+    }
+
+    #[test]
+    fn classify_h3_error_recognizes_h3_protocol_codes() {
+        // Any token starting with `H3_` is an h3 protocol error code
+        // (H3_FRAME_UNEXPECTED, H3_FRAME_ERROR, etc.). Must classify as
+        // ProtocolError so the capability registry downgrade fires.
+        assert_eq!(
+            classify_h3_message("LocalError::Application { code: H3_FRAME_UNEXPECTED }"),
+            retry::ErrorClass::ProtocolError
+        );
+        assert_eq!(
+            classify_h3_message("h3::Error: GoAway received"),
+            retry::ErrorClass::ProtocolError
+        );
+    }
+
+    #[test]
+    fn classify_h3_error_distinguishes_connect_vs_read_timeout() {
+        assert_eq!(
+            classify_h3_message("QUIC connect timeout after 5s"),
+            retry::ErrorClass::ConnectionTimeout
+        );
+        assert_eq!(
+            classify_h3_message("recv_data timed out"),
+            retry::ErrorClass::ReadWriteTimeout
+        );
+    }
+
+    #[test]
+    fn classify_h3_error_dns_and_tls_remain_pre_wire() {
+        // DNS / TLS classifications gate `connection_error=true` in the
+        // gateway because the request never went on the wire. Verify the
+        // boundary stays consistent.
+        let dns = classify_h3_message("DNS resolution failed: no record found");
+        assert_eq!(dns, retry::ErrorClass::DnsLookupError);
+        assert!(!retry::request_reached_wire(dns));
+
+        let tls = classify_h3_message("TLS handshake failed: certificate invalid");
+        assert_eq!(tls, retry::ErrorClass::TlsError);
+        assert!(!retry::request_reached_wire(tls));
+    }
+
+    #[test]
+    fn classify_h3_error_protocol_class_reaches_wire() {
+        // Protocol errors happen AFTER the request has been sent, so they
+        // must `request_reached_wire=true` (`connection_error=false`)
+        // — the backend may have processed the request, retries must
+        // respect `retry_on_methods`.
+        let protocol = classify_h3_message("h3_frame_error: GOAWAY");
+        assert_eq!(protocol, retry::ErrorClass::ProtocolError);
+        assert!(retry::request_reached_wire(protocol));
+    }
+
+    #[test]
+    fn classify_h3_error_connect_refused_is_pre_wire() {
+        let class = classify_h3_message("Connection refused: ECONNREFUSED");
+        assert_eq!(class, retry::ErrorClass::ConnectionRefused);
+        assert!(!retry::request_reached_wire(class));
     }
 
     // ── Fix 5: `should_bypass_h2_coalesce_for_large_response` ───────────

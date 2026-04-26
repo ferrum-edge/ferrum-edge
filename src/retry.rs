@@ -73,6 +73,76 @@ impl std::fmt::Display for ErrorClass {
     }
 }
 
+/// Returns `true` if the error class implies the request was committed to the
+/// wire — the request headers (and possibly body bytes) reached the backend's
+/// application layer, so the backend MAY have processed the request.
+///
+/// Returns `false` for connect-class failures where the gateway never managed
+/// to commit the request to the wire (DNS / TLS / connect / handshake / port
+/// exhaustion / pool errors). These are safe to replay regardless of HTTP
+/// method idempotency, so `retry_on_connect_failure` fires for them.
+///
+/// This is the single boundary that drives `BackendResponse::connection_error`:
+/// `connection_error = !request_reached_wire(error_class)`. Every protocol
+/// classifier funnels its `ErrorClass` through this helper rather than
+/// inferring a separate `connection_error: bool` per dispatch path; that
+/// asymmetry is what previously let stream-level RESET_STREAM (an h3
+/// application-layer abort) be misclassified as `ConnectionReset` with
+/// `connection_error=true`, while a true connect-time `ApplicationClose`
+/// landed as `ProtocolError` with `connection_error=false`.
+///
+/// Borderline classes:
+/// - `RequestBodyTooLarge` / `ResponseBodyTooLarge` — gateway-side policy
+///   rejections; not connect failures. Classified as "reached wire" so the
+///   connect-failure retry does NOT fire (the request can't be salvaged by
+///   replaying it on a different backend).
+/// - `ClientDisconnect` — the request reached the gateway but the client
+///   gave up. Classified as "reached wire"; if a caller knows the body was
+///   not committed yet (e.g. H3 streaming-body request when the client
+///   bailed before the body was forwarded) it MAY override
+///   `connection_error=true` explicitly. Default is conservative so we
+///   never accidentally replay non-idempotent requests on a client cancel.
+/// - `RequestError` — catch-all. Classified as "reached wire" because we
+///   cannot prove the request never went on the wire. Errs on the side of
+///   respecting `retryable_methods`.
+pub fn request_reached_wire(error_class: ErrorClass) -> bool {
+    !matches!(
+        error_class,
+        ErrorClass::ConnectionRefused
+            | ErrorClass::ConnectionTimeout
+            | ErrorClass::DnsLookupError
+            | ErrorClass::TlsError
+            | ErrorClass::PortExhaustion
+            | ErrorClass::ConnectionPoolError
+    )
+}
+
+/// Stable short label for an `ErrorClass`, used as the `error_kind` field on
+/// `tracing::error!` log lines emitted by every backend dispatcher (reqwest,
+/// direct H2 pool, gRPC pool, native H3 pool, H3 cross-protocol bridge).
+///
+/// Centralizing the label here means every dispatch path emits the same
+/// short token for the same underlying class — operators can grep one set
+/// of strings across the gateway instead of one per protocol.
+pub fn error_class_log_kind(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::ConnectionRefused => "connect_failure",
+        ErrorClass::ConnectionTimeout => "connect_timeout",
+        ErrorClass::ConnectionReset => "connection_reset",
+        ErrorClass::ConnectionClosed => "connection_closed",
+        ErrorClass::DnsLookupError => "dns_failure",
+        ErrorClass::TlsError => "tls_error",
+        ErrorClass::ReadWriteTimeout => "read_timeout",
+        ErrorClass::ProtocolError => "protocol_error",
+        ErrorClass::PortExhaustion => "port_exhaustion",
+        ErrorClass::ConnectionPoolError => "pool_error",
+        ErrorClass::ClientDisconnect => "client_disconnect",
+        ErrorClass::RequestBodyTooLarge => "request_body_too_large",
+        ErrorClass::ResponseBodyTooLarge => "response_body_too_large",
+        ErrorClass::RequestError => "request_error",
+    }
+}
+
 /// Returns `true` if the error's root cause is EADDRNOTAVAIL, which indicates
 /// ephemeral port exhaustion.
 ///
@@ -231,7 +301,18 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     let source_chain = format!("{:?}", e);
 
     if e.is_connect() {
-        // Dig into the connect error to distinguish timeout, refused, TLS, DNS
+        // Dig into the connect error to distinguish timeout, refused, TLS, DNS.
+        //
+        // CRITICAL: every classification inside this branch is a PRE-WIRE
+        // failure (the TCP / TLS connect itself didn't succeed), so it
+        // MUST map to a class whose `request_reached_wire(class) == false`
+        // — otherwise `connection_error` ends up `false` and
+        // `retry_on_connect_failure` is silently skipped for the failure.
+        // In particular, do NOT map a connect-phase RST to
+        // `ConnectionReset`: that variant is reserved for mid-stream
+        // resets (post-wire), and treating connect-phase resets as
+        // post-wire was the regression Codex flagged. SYN-RST'd
+        // connections are functionally connect-refused.
         if e.is_timeout() {
             return ErrorClass::ConnectionTimeout;
         }
@@ -254,14 +335,23 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
         {
             return ErrorClass::TlsError;
         }
+        // `refused` matches the explicit ECONNREFUSED case; the bare
+        // `reset` substring inside the is_connect() branch handles
+        // SYN-RST'd connect attempts (e.g. a firewall rejecting the
+        // initial SYN with RST). Both collapse to `ConnectionRefused`
+        // because from an application standpoint the connect attempt
+        // failed before any data could be exchanged — the request
+        // never reached the wire. The previous code emitted
+        // `ConnectionReset` here, which under the unified
+        // `request_reached_wire` boundary would mark this as
+        // post-wire and skip `retry_on_connect_failure`.
         if error_str.contains("refused")
             || source_chain.contains("Connection refused")
             || source_chain.contains("ConnectionRefused")
+            || source_chain.contains("reset")
+            || source_chain.contains("ConnectionReset")
         {
             return ErrorClass::ConnectionRefused;
-        }
-        if source_chain.contains("reset") || source_chain.contains("ConnectionReset") {
-            return ErrorClass::ConnectionReset;
         }
         // Generic connect failure
         return ErrorClass::ConnectionRefused;
@@ -271,7 +361,10 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
         return ErrorClass::ReadWriteTimeout;
     }
 
-    // Check for connection reset/closed during request/response
+    // Check for connection reset/closed during request/response.
+    // Reaching this point means `e.is_connect()` was false — the connect
+    // succeeded, so any reset here is mid-stream and post-wire by
+    // construction.
     if source_chain.contains("reset") || source_chain.contains("ConnectionReset") {
         return ErrorClass::ConnectionReset;
     }
@@ -560,9 +653,91 @@ pub fn retry_delay(config: &RetryConfig, attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        can_retry_connection_failures, can_retry_http_statuses, has_effective_http_retries,
+        ErrorClass, can_retry_connection_failures, can_retry_http_statuses, error_class_log_kind,
+        has_effective_http_retries, request_reached_wire,
     };
     use crate::config::types::RetryConfig;
+
+    #[test]
+    fn request_reached_wire_returns_false_for_connect_class_failures() {
+        // These all happen BEFORE the request reaches the backend's application
+        // layer — the body never went on the wire, so retrying with the same
+        // body is safe regardless of method idempotency.
+        for class in [
+            ErrorClass::ConnectionRefused,
+            ErrorClass::ConnectionTimeout,
+            ErrorClass::DnsLookupError,
+            ErrorClass::TlsError,
+            ErrorClass::PortExhaustion,
+            ErrorClass::ConnectionPoolError,
+        ] {
+            assert!(
+                !request_reached_wire(class),
+                "{class:?} must NOT be classified as request_reached_wire \
+                 — connect-class failures bypass retry_on_methods"
+            );
+        }
+    }
+
+    #[test]
+    fn request_reached_wire_returns_true_for_post_wire_classes() {
+        // These all imply the request was sent (or partially sent) and the
+        // backend MAY have processed it. retry_on_connect_failure must NOT
+        // bypass retry_on_methods for these — they could double-execute a
+        // non-idempotent request.
+        for class in [
+            ErrorClass::ConnectionReset,
+            ErrorClass::ConnectionClosed,
+            ErrorClass::ReadWriteTimeout,
+            ErrorClass::ProtocolError,
+            ErrorClass::RequestBodyTooLarge,
+            ErrorClass::ResponseBodyTooLarge,
+            ErrorClass::ClientDisconnect,
+            ErrorClass::RequestError,
+        ] {
+            assert!(
+                request_reached_wire(class),
+                "{class:?} must be classified as request_reached_wire \
+                 — these failure classes happen after request commit and \
+                 must respect retry_on_methods"
+            );
+        }
+    }
+
+    #[test]
+    fn error_class_log_kind_is_stable_for_every_variant() {
+        // Sanity: every variant maps to a non-empty static label and labels
+        // do not collide. Operators grep these strings across protocol logs;
+        // duplicating one would silently merge two distinct failure modes.
+        let labels: Vec<&'static str> = [
+            ErrorClass::ConnectionRefused,
+            ErrorClass::ConnectionTimeout,
+            ErrorClass::ConnectionReset,
+            ErrorClass::ConnectionClosed,
+            ErrorClass::DnsLookupError,
+            ErrorClass::TlsError,
+            ErrorClass::ReadWriteTimeout,
+            ErrorClass::ProtocolError,
+            ErrorClass::PortExhaustion,
+            ErrorClass::ConnectionPoolError,
+            ErrorClass::ClientDisconnect,
+            ErrorClass::RequestBodyTooLarge,
+            ErrorClass::ResponseBodyTooLarge,
+            ErrorClass::RequestError,
+        ]
+        .into_iter()
+        .map(error_class_log_kind)
+        .collect();
+        for label in &labels {
+            assert!(!label.is_empty(), "log kind label must be non-empty");
+        }
+        let unique: std::collections::HashSet<_> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "log kind labels must be unique across all error classes"
+        );
+    }
 
     #[test]
     fn no_op_retry_config_does_not_enable_connection_retries() {

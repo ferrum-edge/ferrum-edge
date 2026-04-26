@@ -488,7 +488,13 @@ fn reqwest_error_response_for_cross_protocol(
         status_code: 502,
         body: crate::retry::ResponseBody::Buffered(error_body.as_bytes().to_vec()),
         headers: HashMap::new(),
-        connection_error: e.is_connect() || e.is_timeout(),
+        // Funnel through `request_reached_wire` instead of
+        // `e.is_connect() || e.is_timeout()` — the predicate-pair misses
+        // TLS-handshake failures and reqwest-level timeouts that landed on
+        // the connect side without surfacing as `is_connect()=true`. Every
+        // dispatch path in the gateway must agree on the wire boundary
+        // (see `retry::request_reached_wire`).
+        connection_error: !crate::retry::request_reached_wire(error_class),
         backend_resolved_ip,
         error_class: Some(error_class),
     }
@@ -1475,6 +1481,25 @@ where
     if grpc_has_retry && let Some(retry_config) = &proxy.retry {
         let mut attempt = 0u32;
         loop {
+            // Local pre-wire predicate for the gRPC retry loop. Both
+            // listed `GrpcProxyError` variants are pre-wire by
+            // construction:
+            //   * `BackendUnavailable` is emitted only when the gRPC
+            //     dispatch never gets past TCP / TLS / h2 / h2c
+            //     handshake (no request frame ever leaves the gateway).
+            //   * `BackendTimeout::Connect` is the connect-timeout
+            //     timer, identical semantics.
+            // Both satisfy `request_reached_wire(class) == false` when
+            // mapped through `classify_grpc_proxy_error`, so this
+            // `matches!` agrees with the unified boundary by
+            // construction — but the agreement is invariant-by-listing,
+            // not invariant-by-derivation. If a future `GrpcProxyError`
+            // variant is added (e.g. a "TLS rejected after handshake"
+            // marker that's still pre-wire), it MUST be added to this
+            // arm AND to `classify_grpc_proxy_error` in lockstep. Run
+            // `cargo check` against the new variant; the surrounding
+            // tests in `tests/unit/gateway_core/grpc_*` will catch a
+            // misclassification mismatch.
             let is_connection_error = matches!(
                 &result,
                 Err(grpc_proxy::GrpcProxyError::BackendUnavailable(_))

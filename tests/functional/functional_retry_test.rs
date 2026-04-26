@@ -501,6 +501,134 @@ async fn retry_does_not_replay_streaming_request_body() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Test — `retry_on_connect_failure` honors pre-wire transport failures even
+// when `retryable_methods=[]` AND `retryable_status_codes=[]`.
+// ────────────────────────────────────────────────────────────────────────────
+//
+// This is the contract the unified `connection_error` classification was
+// introduced to protect: any failure that classifies as pre-wire transport
+// (`request_reached_wire(error_class) == false`) MUST trigger
+// `retry_on_connect_failure` regardless of method/status allowlists. The
+// previous code derived `connection_error` from
+// `e.is_connect() || e.is_timeout()` at the reqwest sites, which mostly
+// agreed with the new contract for connect-class failures but was
+// inconsistent across the H3, gRPC, and direct-H2 paths. The new contract
+// funnels every dispatcher through the same `request_reached_wire` boundary.
+//
+// Setup: bind a TCP listener, drop it BEFORE starting the gateway, then
+// point the gateway at that port. The kernel returns ECONNREFUSED on every
+// connect attempt — the cleanest possible pre-wire transport failure
+// (DnsLookupError / TlsError / handshake races are all unambiguous
+// `request_reached_wire == false` cases too, but ECONNREFUSED is the
+// least timing-sensitive). reqwest classifies it as
+// `ErrorClass::ConnectionRefused`, which `request_reached_wire` maps to
+// `false`, so `connection_error=true` and `retry_on_connect_failure` must
+// fire.
+//
+// We count attempts by tallying the gateway's `"Backend request failed"`
+// log lines (one per attempt) — `accepted_connections()` doesn't apply
+// here because nothing accepts.
+//
+// We use POST as the strictest case — any classification leak that demoted
+// the failure to `connection_error=false` would route the retry decision
+// through `retryable_methods`, which is `[]`, and the retry would not fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn retry_on_connect_failure_fires_with_empty_methods_and_statuses() {
+    // Reserve a port and immediately release it. The kernel will refuse
+    // every subsequent connect attempt to that port (assuming nothing
+    // else binds it in the meantime — vanishingly unlikely on the
+    // localhost-loopback address space the harness uses).
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    drop(reservation);
+
+    let yaml = http_with_retry(
+        backend_port,
+        json!({
+            "max_retries": 3,
+            "retry_on_connect_failure": true,
+            // Zero allowlist on BOTH method and status. This is what
+            // operators set when they want ONLY connect-failure retry —
+            // explicitly opting out of method/status replay so POST
+            // stays safely non-idempotent on application-level errors.
+            "retryable_methods": [],
+            "retryable_status_codes": [],
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        // Disable pool warmup so it doesn't probe the dead backend at
+        // startup and skew the log count.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+
+    // POST is the strictest case — `retryable_methods=[]` would normally
+    // forbid replay. The retry-on-connect-failure path applies regardless
+    // because connect-refused is a pre-wire transport class.
+    let resp = client
+        .request(reqwest::Method::POST, &harness.proxy_url("/api/x"))
+        .body(b"hello".to_vec())
+        .send()
+        .await
+        .expect("post request");
+    assert_eq!(
+        resp.status().as_u16(),
+        502,
+        "gateway must return 502 after exhausting retries; got {resp:?}"
+    );
+
+    // Give the gateway time to flush its log after the final retry attempt.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Each retry attempt logs `"Backend request failed"` (initial) or
+    // `"Backend retry request failed"` — count both. With max_retries=3,
+    // we expect 4 lines total: 1 initial + 3 retries. Anything other
+    // than 4 means the retry boundary regressed.
+    let combined = harness.captured_combined().expect("captured logs");
+    let attempts = combined
+        .lines()
+        .filter(|l| {
+            l.contains("Backend request failed") || l.contains("Backend retry request failed")
+        })
+        .count();
+
+    if attempts != 4 {
+        eprintln!(
+            "--- gateway logs (matching backend-failure lines) ---\n{}",
+            combined
+                .lines()
+                .filter(|l| l.contains("Backend request failed")
+                    || l.contains("Backend retry request failed"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // 1 initial + 3 retries = 4 attempts, full stop. Any classification
+    // leak that demoted the connect-refused failure to
+    // `connection_error=false` would short-circuit the retry (because
+    // `retryable_methods=[]` rejects POST replay) and we'd see exactly
+    // 1 attempt. The reverse — attempts > 4 — would mean the retry loop
+    // exceeded `max_retries`, also a regression.
+    assert_eq!(
+        attempts, 4,
+        "retry_on_connect_failure must fire on pre-wire transport failures \
+         even when retryable_methods=[] and retryable_status_codes=[]; \
+         expected 4 attempts (1 initial + max_retries=3), got {attempts}. \
+         attempts==1 means the unified boundary regressed — connect-refused \
+         was misclassified as connection_error=false and fell through to \
+         method/status retry, which the empty allowlist disables."
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Test 4 — `max_retries: 0` disables retries entirely.
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

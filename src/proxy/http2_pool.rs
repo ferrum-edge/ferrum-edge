@@ -642,28 +642,28 @@ pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorCla
 fn classify_typed_chain(err: &Http2PoolError) -> Option<crate::retry::ErrorClass> {
     use crate::retry::ErrorClass;
 
-    // For the BackendTimeout marker we want to return ConnectionTimeout even
-    // if the chain only contains a synthesized TimedOut io::Error — consult
-    // the variant up-front.
-    let timeout_is_connect = matches!(err, Http2PoolError::BackendTimeout { .. });
+    // The HTTP/2 pool is a pure connection-establishment layer — it
+    // returns a sender that the caller uses for the actual request.
+    // Every error it surfaces happens during DNS / TCP connect / TLS
+    // handshake / h2 handshake, all of which are pre-wire. Pass
+    // `phase_is_connect=true` so io::ErrorKind::TimedOut maps to
+    // `ConnectionTimeout` and io::ErrorKind::ConnectionReset maps to
+    // `ConnectionRefused` (a SYN-RST is functionally equivalent to
+    // ECONNREFUSED — request never reached the wire). Both classes
+    // satisfy `request_reached_wire(class) == false`, so the gateway's
+    // `retry_on_connect_failure` fires correctly.
+    let phase_is_connect = true;
 
     // First hop: inspect the immediate `BackendUnavailableSource` so we can
     // map the `Tls` marker to `TlsError` directly. After that we walk the
     // generic source chain looking for io/hyper/rustls variants.
-    //
-    // Note: once inside `classify_chain_from` we trust typed io::ErrorKind
-    // signals — so `Tls(io::Error { kind: ConnectionReset, ... })` would
-    // classify as ConnectionReset, which is correct (a TLS session that
-    // died mid-stream on a reset *is* a reset, not a handshake failure).
-    // Only generic `Other` / `InvalidData` wrappers fall through to the
-    // TLS marker override below.
     match err {
         Http2PoolError::BackendUnavailable {
             source: Some(BackendUnavailableSource::Tls(io_err)),
             ..
         } => {
             // Let typed ErrorKind win if set, otherwise fall back to TlsError.
-            if let Some(cls) = classify_io_error(io_err, timeout_is_connect) {
+            if let Some(cls) = classify_io_error(io_err, phase_is_connect) {
                 return Some(cls);
             }
             return Some(ErrorClass::TlsError);
@@ -680,7 +680,7 @@ fn classify_typed_chain(err: &Http2PoolError) -> Option<crate::retry::ErrorClass
                 std::error::Error::source(hyper_err as &dyn std::error::Error);
             while let Some(node) = current {
                 if let Some(io_err) = node.downcast_ref::<std::io::Error>()
-                    && let Some(cls) = classify_io_error(io_err, timeout_is_connect)
+                    && let Some(cls) = classify_io_error(io_err, phase_is_connect)
                 {
                     return Some(cls);
                 }
@@ -695,7 +695,7 @@ fn classify_typed_chain(err: &Http2PoolError) -> Option<crate::retry::ErrorClass
     // BackendTimeout, and any Internal::Io / Internal::Rustls paths.
     classify_chain_from(
         std::error::Error::source(err as &dyn std::error::Error),
-        timeout_is_connect,
+        phase_is_connect,
     )
 }
 
@@ -703,13 +703,13 @@ fn classify_typed_chain(err: &Http2PoolError) -> Option<crate::retry::ErrorClass
 /// classification we can pin down from a typed node.
 fn classify_chain_from(
     start: Option<&(dyn std::error::Error + 'static)>,
-    timeout_is_connect: bool,
+    phase_is_connect: bool,
 ) -> Option<crate::retry::ErrorClass> {
     use crate::retry::ErrorClass;
     let mut current = start;
     while let Some(node) = current {
         if let Some(io_err) = node.downcast_ref::<std::io::Error>()
-            && let Some(cls) = classify_io_error(io_err, timeout_is_connect)
+            && let Some(cls) = classify_io_error(io_err, phase_is_connect)
         {
             return Some(cls);
         }
@@ -728,20 +728,30 @@ fn classify_chain_from(
 
 fn classify_io_error(
     io_err: &std::io::Error,
-    timeout_is_connect: bool,
+    phase_is_connect: bool,
 ) -> Option<crate::retry::ErrorClass> {
     use crate::retry::ErrorClass;
     if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
         return Some(ErrorClass::PortExhaustion);
     }
     match io_err.kind() {
-        std::io::ErrorKind::TimedOut => Some(if timeout_is_connect {
+        std::io::ErrorKind::TimedOut => Some(if phase_is_connect {
             ErrorClass::ConnectionTimeout
         } else {
             ErrorClass::ReadWriteTimeout
         }),
         std::io::ErrorKind::ConnectionRefused => Some(ErrorClass::ConnectionRefused),
-        std::io::ErrorKind::ConnectionReset => Some(ErrorClass::ConnectionReset),
+        // Connect-phase RSTs (SYN answered with RST, TLS reset before
+        // handshake completes) must NOT classify as `ConnectionReset`
+        // because the unified `request_reached_wire` boundary treats
+        // that variant as post-wire (mid-stream reset). The H2 pool is
+        // a pure connection-establishment layer, so every io error here
+        // is pre-wire — collapse RSTs into `ConnectionRefused`.
+        std::io::ErrorKind::ConnectionReset => Some(if phase_is_connect {
+            ErrorClass::ConnectionRefused
+        } else {
+            ErrorClass::ConnectionReset
+        }),
         std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
             Some(ErrorClass::ConnectionClosed)
         }
@@ -1077,5 +1087,69 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    /// Codex P1 follow-up: connect-phase resets must classify as
+    /// `ConnectionRefused`, not `ConnectionReset`. The H2 pool is a pure
+    /// connection-establishment layer — every io error it surfaces is
+    /// pre-wire — so a SYN-RST'd connect attempt and a closed-port
+    /// ECONNREFUSED'd connect attempt collapse to the same class. Without
+    /// this, the unified `request_reached_wire(ConnectionReset) == true`
+    /// boundary would treat the failure as post-wire and skip
+    /// `retry_on_connect_failure`.
+    #[test]
+    fn h2_pool_connect_phase_reset_classifies_as_connection_refused() {
+        let err = Http2PoolError::BackendUnavailable {
+            message: "Connection refused: ECONNRESET during connect".to_string(),
+            source: Some(BackendUnavailableSource::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "synthetic connect-phase RST",
+            ))),
+        };
+        assert_eq!(
+            classify_http2_pool_error(&err),
+            crate::retry::ErrorClass::ConnectionRefused,
+            "H2 pool's io::Error(ConnectionReset) is connect-phase only — \
+             must NOT classify as ConnectionReset (which is post-wire). \
+             If this fails, the gateway will skip retry_on_connect_failure \
+             for SYN-RST'd backends."
+        );
+        assert!(
+            !crate::retry::request_reached_wire(classify_http2_pool_error(&err)),
+            "connect-phase RST must be pre-wire so retry_on_connect_failure fires"
+        );
+    }
+
+    #[test]
+    fn h2_pool_connect_phase_timeout_classifies_as_connection_timeout() {
+        let err = Http2PoolError::BackendUnavailable {
+            message: "TLS handshake timed out".to_string(),
+            source: Some(BackendUnavailableSource::Tls(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "synthetic TLS-handshake timeout",
+            ))),
+        };
+        assert_eq!(
+            classify_http2_pool_error(&err),
+            crate::retry::ErrorClass::ConnectionTimeout,
+            "H2 pool TLS-handshake timeout is connect-phase — must NOT \
+             classify as ReadWriteTimeout (which is post-wire)"
+        );
+    }
+
+    #[test]
+    fn h2_pool_typed_connection_refused_still_classifies_correctly() {
+        // Sanity: ConnectionRefused stays ConnectionRefused.
+        let err = Http2PoolError::BackendUnavailable {
+            message: "Connection refused".to_string(),
+            source: Some(BackendUnavailableSource::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "ECONNREFUSED",
+            ))),
+        };
+        assert_eq!(
+            classify_http2_pool_error(&err),
+            crate::retry::ErrorClass::ConnectionRefused
+        );
     }
 }

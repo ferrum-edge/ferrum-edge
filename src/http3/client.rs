@@ -159,6 +159,143 @@ type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes
 pub type H3RequestStream =
     h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
 
+/// Error returned by [`Http3ConnectionPool`] when an HTTP/3 request fails.
+///
+/// Carries the underlying [`anyhow::Error`] alongside `request_on_wire`, a
+/// sticky boolean tracking whether the request was committed to the
+/// backend's application layer on ANY attempt within this pool call —
+/// including internal cached-then-fallback retries. Once `request_on_wire`
+/// is `true`, gateway-level retries must respect `retry_on_methods` because
+/// the backend may have processed the request; replaying it could cause
+/// non-idempotent double-execution.
+///
+/// Set to `true` as soon as `send_request().await` succeeds (the QUIC
+/// stream is opened and request headers are committed) — regardless of
+/// whether `send_data` / `finish` / `recv_response` succeeds afterwards.
+/// The pool's internal retry chain promotes the flag forward so a later
+/// failed-connect attempt cannot mask the earlier wire commitment.
+///
+/// Constructors:
+/// - [`H3PoolError::pre_wire`] — request never reached the backend (DNS,
+///   TLS, connect, h3 session creation, or `send_request` itself failed).
+/// - [`H3PoolError::post_wire`] — request was at least partially sent;
+///   any failure here loses idempotency safety.
+/// - [`H3PoolError::promote_on_wire_if`] — conditionally promote a stored
+///   error to `request_on_wire=true` (no-op when the condition is false).
+///   Used by the pool's internal retry chain to surface the "any attempt
+///   committed" semantics: each fresh-connect setup `?` exit threads
+///   `any_request_on_wire` through this method so a previous post-wire
+///   attempt's commitment is preserved across the final error.
+#[derive(Debug)]
+pub struct H3PoolError {
+    inner: anyhow::Error,
+    request_on_wire: bool,
+}
+
+impl H3PoolError {
+    /// Construct an error for a failure that occurred BEFORE the request
+    /// reached the backend's application layer (DNS / TLS / handshake /
+    /// `send_request` itself failed). Safe to retry regardless of
+    /// idempotency.
+    pub fn pre_wire(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            inner: error.into(),
+            request_on_wire: false,
+        }
+    }
+
+    /// Construct an error for a failure that occurred AFTER the H3 stream
+    /// was opened (request headers were committed). Even if the body is
+    /// only partially sent, the backend may have processed the request,
+    /// so retries must respect `retry_on_methods`.
+    pub fn post_wire(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            inner: error.into(),
+            request_on_wire: true,
+        }
+    }
+
+    /// Borrow the underlying error for downcast / display / `tracing` use.
+    pub fn as_error(&self) -> &anyhow::Error {
+        &self.inner
+    }
+
+    /// Returns `true` if the request was committed to the wire on any
+    /// attempt covered by this error. Drives `BackendResponse::connection_error`
+    /// at the gateway: `connection_error = !request_on_wire`.
+    pub fn request_on_wire(&self) -> bool {
+        self.request_on_wire
+    }
+
+    /// Conditionally promote the sticky `request_on_wire` flag.
+    ///
+    /// - When `condition` is `true`, the flag is set to `true` (no-op if
+    ///   already `true`).
+    /// - When `condition` is `false`, this is a NO-OP — the existing flag
+    ///   is preserved, never demoted from `true` back to `false`.
+    ///
+    /// This asymmetry is deliberate: the pool's internal retry chain
+    /// tracks `any_request_on_wire` across attempts, and threads that
+    /// boolean through `?` exits via `e.promote_on_wire_if(any_request_on_wire)`.
+    /// A `false` value just means "no earlier attempt committed the
+    /// body" — it must NOT clobber a `true` flag that an earlier
+    /// `H3PoolError::post_wire(...)` constructor set.
+    pub fn promote_on_wire_if(mut self, condition: bool) -> Self {
+        if condition {
+            self.request_on_wire = true;
+        }
+        self
+    }
+
+    /// Consume and return the underlying error, dropping the body-on-wire
+    /// signal. Used by callers that have already extracted the signal.
+    #[allow(dead_code)] // Public escape hatch for callers that need owned anyhow::Error.
+    pub fn into_error(self) -> anyhow::Error {
+        self.inner
+    }
+}
+
+impl std::fmt::Display for H3PoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl std::error::Error for H3PoolError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // `anyhow::Error::source()` walks through the chain to the next
+        // typed cause — exactly what classifiers expect.
+        self.inner.source()
+    }
+}
+
+/// Convenience: lets callers pass `&H3PoolError` directly to classifiers
+/// that take `&(dyn std::error::Error + 'static)` (e.g.
+/// [`classify_http3_error`] and the H3 dispatcher's `classify_h3_error`
+/// wrapper).
+///
+/// Without this impl, every call site would need a manual
+/// `e.as_error().as_ref()` to peel back to the inner anyhow chain —
+/// `anyhow::Error::deref` returns `&(dyn Error + Send + Sync + 'static)`,
+/// not the same trait-object shape the classifier signature expects, and
+/// `H3PoolError::as_error()` returns the wrapper rather than a trait
+/// object. Implementing `AsRef<dyn Error + Send + Sync + 'static>`
+/// lets `e.as_ref()` flow through the wrapper to the inner anyhow's
+/// `as_ref()` in one step, which the Rust trait-object upcast at the
+/// classifier signature accepts.
+///
+/// Net effect at call sites: `classify_h3_error(e.as_ref())` reads as
+/// "classify the underlying error chain" without leaking the
+/// `H3PoolError` -> `anyhow::Error` -> `dyn Error` shuffle.
+impl AsRef<dyn std::error::Error + Send + Sync + 'static> for H3PoolError {
+    fn as_ref(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self.inner.as_ref()
+    }
+}
+
+/// Result type alias for the H3 pool.
+pub type H3PoolResult<T> = std::result::Result<T, H3PoolError>;
+
 /// Result of a streaming HTTP/3 request — headers received, body still in flight.
 ///
 /// The caller reads response body chunks via `recv_stream.recv_data()`.
@@ -428,6 +565,16 @@ impl Http3ConnectionPool {
     /// The `tls_config_fn` closure is only called on cache miss (when a new
     /// QUIC connection must be established), avoiding the overhead of cloning
     /// the TLS root certificate store on every request.
+    ///
+    /// Body-on-wire tracking: the pool tries the cached connection first, then
+    /// falls back across other cached indices, then opens a new connection.
+    /// `any_request_on_wire` is set sticky across all internal attempts — once
+    /// one of them got past `send_request` (request headers committed), the
+    /// final returned [`H3PoolError`] reports `request_on_wire=true` regardless
+    /// of which later attempt produced the actual error message. This prevents
+    /// the gateway from inferring `connection_error=true` and replaying a
+    /// non-idempotent request that may already have reached the backend on
+    /// an earlier internal attempt.
     pub async fn request(
         &self,
         proxy: &Proxy,
@@ -436,13 +583,15 @@ impl Http3ConnectionPool {
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
-    ) -> Result<(u16, Vec<u8>, HashMap<String, String>), anyhow::Error> {
+    ) -> H3PoolResult<(u16, Vec<u8>, HashMap<String, String>)> {
         // Per-proxy override takes priority over global default
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+
+        let mut any_request_on_wire = false;
 
         let cached = self
             .pool
@@ -451,7 +600,10 @@ impl Http3ConnectionPool {
             match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
             {
                 Ok(result) => return Ok(result),
-                Err(_) => {
+                Err(e) => {
+                    if e.request_on_wire() {
+                        any_request_on_wire = true;
+                    }
                     // Cached connection failed — fall through to the full
                     // retry/reconnect path below which allocates pool keys.
                 }
@@ -468,6 +620,9 @@ impl Http3ConnectionPool {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
+                    if e.request_on_wire() {
+                        any_request_on_wire = true;
+                    }
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
                     self.pool.invalidate(&key);
 
@@ -487,7 +642,10 @@ impl Http3ConnectionPool {
                             .await
                             {
                                 Ok(result) => return Ok(result),
-                                Err(_) => {
+                                Err(e) => {
+                                    if e.request_on_wire() {
+                                        any_request_on_wire = true;
+                                    }
                                     self.pool.invalidate(&fallback_key);
                                 }
                             }
@@ -497,12 +655,24 @@ impl Http3ConnectionPool {
             }
         }
 
-        // Create new connection — only now do we need the TLS config
-        let tls_config = tls_config_fn()?;
+        // Create new connection — only now do we need the TLS config.
+        //
+        // CRITICAL: `tls_config_fn()` and `create_or_get_proxy_sender()`
+        // can fail BEFORE `do_request` runs. If an earlier internal
+        // attempt above already set `any_request_on_wire = true`, those
+        // setup failures must STILL promote the sticky flag — otherwise
+        // a post-wire first attempt followed by a fresh-connect setup
+        // failure would surface as `request_on_wire=false`, and the
+        // gateway would treat the call as pre-wire and replay a
+        // non-idempotent request via `retry_on_connect_failure`. Each
+        // `?` exit applies the promotion explicitly.
+        let tls_config = tls_config_fn()
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
-            .await?;
+            .await
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request(
@@ -514,6 +684,7 @@ impl Http3ConnectionPool {
             body,
         )
         .await
+        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 
     /// Send an HTTP/3 request to an explicit host/port target, independent of
@@ -533,7 +704,7 @@ impl Http3ConnectionPool {
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
-    ) -> Result<(u16, Vec<u8>, HashMap<String, String>), anyhow::Error> {
+    ) -> H3PoolResult<(u16, Vec<u8>, HashMap<String, String>)> {
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
@@ -541,12 +712,17 @@ impl Http3ConnectionPool {
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
 
+        let mut any_request_on_wire = false;
+
         // Try cached connection on the selected index first
         if let Some(mut sr) = self.pool.cached(&key) {
             match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
+                    if e.request_on_wire() {
+                        any_request_on_wire = true;
+                    }
                     debug!(
                         "HTTP/3 cached connection to {}:{} failed, reconnecting: {}",
                         target_host, target_port, e
@@ -574,7 +750,10 @@ impl Http3ConnectionPool {
                             .await
                             {
                                 Ok(result) => return Ok(result),
-                                Err(_) => {
+                                Err(e) => {
+                                    if e.request_on_wire() {
+                                        any_request_on_wire = true;
+                                    }
                                     self.pool.invalidate(&fallback_key);
                                 }
                             }
@@ -584,8 +763,13 @@ impl Http3ConnectionPool {
             }
         }
 
-        // Create new connection to the explicit target
-        let tls_config = tls_config_fn()?;
+        // Create new connection to the explicit target.
+        // See `request()` for why these `?` exits must apply the
+        // sticky `any_request_on_wire` promotion (post-wire cached
+        // attempt → fresh-connect setup failure must NOT report
+        // request_on_wire=false).
+        let tls_config = tls_config_fn()
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_target_sender(
@@ -596,7 +780,8 @@ impl Http3ConnectionPool {
                 tls_config,
                 h3_config,
             )
-            .await?;
+            .await
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request(
@@ -608,6 +793,7 @@ impl Http3ConnectionPool {
             body,
         )
         .await
+        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 
     /// Create a new QUIC connection + h3 session using a shared endpoint.
@@ -755,6 +941,13 @@ impl Http3ConnectionPool {
     }
 
     /// Execute an HTTP/3 request on an existing SendRequest handle.
+    ///
+    /// Returns [`H3PoolError`] on failure with `request_on_wire` set
+    /// according to whether `send_request` had already opened the QUIC
+    /// stream when the failure surfaced — once the stream is open, the
+    /// request headers (and possibly body bytes) are committed and the
+    /// backend may have processed the request, so the gateway must
+    /// respect `retry_on_methods` instead of replaying blindly.
     async fn do_request(
         send_request: &mut H3SendRequest,
         proxy: &Proxy,
@@ -762,17 +955,17 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
-    ) -> Result<(u16, Vec<u8>, HashMap<String, String>), anyhow::Error> {
+    ) -> H3PoolResult<(u16, Vec<u8>, HashMap<String, String>)> {
         let uri: http::Uri = backend_url
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
+            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
         let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-        let req_method: http::Method = method
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid HTTP method: {}", method))?;
+        let req_method: http::Method = method.parse().map_err(|_| {
+            H3PoolError::pre_wire(anyhow::anyhow!("Invalid HTTP method: {}", method))
+        })?;
 
         let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
         for (name, value) in headers {
@@ -784,15 +977,31 @@ impl Http3ConnectionPool {
             }
         }
 
-        let req = req_builder.body(())?;
-        let mut stream = send_request.send_request(req).await?;
+        let req = req_builder.body(()).map_err(H3PoolError::pre_wire)?;
+        // `send_request().await` opens the QUIC stream and commits the
+        // request headers. Failure here is pre-wire (no stream, no body
+        // delivery). Anything below this line is post-wire — the
+        // backend may already be processing the request.
+        let mut stream = send_request
+            .send_request(req)
+            .await
+            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
 
         if !body.is_empty() {
-            stream.send_data(body).await?;
+            stream
+                .send_data(body)
+                .await
+                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
         }
-        stream.finish().await?;
+        stream
+            .finish()
+            .await
+            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = stream.recv_response().await?;
+        let response = stream
+            .recv_response()
+            .await
+            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e)))?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -810,8 +1019,17 @@ impl Http3ConnectionPool {
         }
 
         let mut response_body = Vec::new();
-        while let Some(chunk) = stream.recv_data().await? {
-            response_body.extend_from_slice(chunk.chunk());
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(chunk)) => response_body.extend_from_slice(chunk.chunk()),
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(H3PoolError::post_wire(anyhow::anyhow!(
+                        "recv_data failed: {}",
+                        e
+                    )));
+                }
+            }
         }
 
         Ok((status, response_body, response_headers))
@@ -820,6 +1038,9 @@ impl Http3ConnectionPool {
     /// Execute an HTTP/3 request, returning headers and a stream handle for the
     /// response body. Unlike `do_request`, this does NOT buffer the body — the
     /// caller reads chunks via `recv_stream.recv_data()`.
+    ///
+    /// Body-on-wire semantics match [`do_request`] — `request_on_wire`
+    /// flips to `true` once `send_request().await` succeeds.
     async fn do_request_streaming(
         send_request: &mut H3SendRequest,
         proxy: &Proxy,
@@ -827,17 +1048,17 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
-    ) -> Result<H3StreamingResponse, anyhow::Error> {
+    ) -> H3PoolResult<H3StreamingResponse> {
         let uri: http::Uri = backend_url
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
+            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
         let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-        let req_method: http::Method = method
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid HTTP method: {}", method))?;
+        let req_method: http::Method = method.parse().map_err(|_| {
+            H3PoolError::pre_wire(anyhow::anyhow!("Invalid HTTP method: {}", method))
+        })?;
 
         let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
         for (name, value) in headers {
@@ -849,15 +1070,27 @@ impl Http3ConnectionPool {
             }
         }
 
-        let req = req_builder.body(())?;
-        let mut stream = send_request.send_request(req).await?;
+        let req = req_builder.body(()).map_err(H3PoolError::pre_wire)?;
+        let mut stream = send_request
+            .send_request(req)
+            .await
+            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
 
         if !body.is_empty() {
-            stream.send_data(body).await?;
+            stream
+                .send_data(body)
+                .await
+                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
         }
-        stream.finish().await?;
+        stream
+            .finish()
+            .await
+            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = stream.recv_response().await?;
+        let response = stream
+            .recv_response()
+            .await
+            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e)))?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -888,6 +1121,12 @@ impl Http3ConnectionPool {
     /// limits are enforced inline during streaming. This is the zero-copy
     /// request body path for the H3 frontend when no plugins need body buffering
     /// and no retries are configured.
+    ///
+    /// Body-on-wire semantics: `request_on_wire` flips to `true` once the
+    /// QUIC stream is opened (`send_request` succeeded). The size-limit
+    /// rejection is post-wire because we cannot abort the stream cleanly
+    /// after dispatch — the H3 server callers translate this back into a
+    /// 413 status which is intentionally not a transport-class failure.
     async fn do_request_streaming_body(
         send_request: &mut H3SendRequest,
         proxy: &Proxy,
@@ -899,17 +1138,17 @@ impl Http3ConnectionPool {
             bytes::Bytes,
         >,
         max_request_body_size: usize,
-    ) -> Result<H3StreamingResponse, anyhow::Error> {
+    ) -> H3PoolResult<H3StreamingResponse> {
         let uri: http::Uri = backend_url
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
+            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
         let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-        let req_method: http::Method = method
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid HTTP method: {}", method))?;
+        let req_method: http::Method = method.parse().map_err(|_| {
+            H3PoolError::pre_wire(anyhow::anyhow!("Invalid HTTP method: {}", method))
+        })?;
 
         let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
         for (name, value) in headers {
@@ -921,26 +1160,51 @@ impl Http3ConnectionPool {
             }
         }
 
-        let req = req_builder.body(())?;
-        let mut backend_stream = send_request.send_request(req).await?;
+        let req = req_builder.body(()).map_err(H3PoolError::pre_wire)?;
+        let mut backend_stream = send_request
+            .send_request(req)
+            .await
+            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
 
         // Stream request body: read chunks from frontend, forward to backend.
         // Uses Buf::copy_to_bytes() which is zero-copy when the underlying
         // buffer is already bytes::Bytes (common with h3-quinn).
         let mut total_sent: usize = 0;
-        while let Some(mut chunk) = frontend_stream.recv_data().await? {
+        loop {
+            let recv_res = frontend_stream.recv_data().await;
+            let chunk_opt = match recv_res {
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(H3PoolError::post_wire(anyhow::anyhow!(
+                        "client disconnected while sending request body: {}",
+                        e
+                    )));
+                }
+            };
+            let Some(mut chunk) = chunk_opt else { break };
             let len = chunk.remaining();
             if max_request_body_size > 0 {
                 total_sent += len;
                 if total_sent > max_request_body_size {
-                    return Err(anyhow::anyhow!("Request body exceeds maximum size"));
+                    return Err(H3PoolError::post_wire(anyhow::anyhow!(
+                        "Request body exceeds maximum size"
+                    )));
                 }
             }
-            backend_stream.send_data(chunk.copy_to_bytes(len)).await?;
+            backend_stream
+                .send_data(chunk.copy_to_bytes(len))
+                .await
+                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
         }
-        backend_stream.finish().await?;
+        backend_stream
+            .finish()
+            .await
+            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = backend_stream.recv_response().await?;
+        let response = backend_stream
+            .recv_response()
+            .await
+            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e)))?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -969,6 +1233,10 @@ impl Http3ConnectionPool {
     ///
     /// Used by the H1/H2 frontend -> H3 backend path when no request-body
     /// plugins need buffering and no retries can replay the body.
+    ///
+    /// Body-on-wire semantics: `request_on_wire` flips to `true` once
+    /// `send_request` succeeds; subsequent client-disconnect / size-limit
+    /// errors are post-wire because the backend already received headers.
     #[allow(clippy::too_many_arguments)]
     async fn do_request_streaming_incoming_body(
         send_request: &mut H3SendRequest,
@@ -979,17 +1247,17 @@ impl Http3ConnectionPool {
         mut frontend_body: Incoming,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
-    ) -> Result<H3StreamingResponse, anyhow::Error> {
+    ) -> H3PoolResult<H3StreamingResponse> {
         let uri: http::Uri = backend_url
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
+            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
         let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-        let req_method: http::Method = method
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid HTTP method: {}", method))?;
+        let req_method: http::Method = method.parse().map_err(|_| {
+            H3PoolError::pre_wire(anyhow::anyhow!("Invalid HTTP method: {}", method))
+        })?;
 
         let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
         for (name, value) in headers {
@@ -1001,13 +1269,19 @@ impl Http3ConnectionPool {
             }
         }
 
-        let req = req_builder.body(())?;
-        let mut backend_stream = send_request.send_request(req).await?;
+        let req = req_builder.body(()).map_err(H3PoolError::pre_wire)?;
+        let mut backend_stream = send_request
+            .send_request(req)
+            .await
+            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
 
         let mut total_sent: usize = 0;
         while let Some(frame_result) = frontend_body.frame().await {
             let frame = frame_result.map_err(|e| {
-                anyhow::anyhow!("Client disconnected while sending request body: {}", e)
+                H3PoolError::post_wire(anyhow::anyhow!(
+                    "Client disconnected while sending request body: {}",
+                    e
+                ))
             })?;
             let Ok(mut chunk) = frame.into_data() else {
                 continue;
@@ -1016,18 +1290,29 @@ impl Http3ConnectionPool {
             if max_request_body_size > 0 {
                 total_sent += len;
                 if total_sent > max_request_body_size {
-                    return Err(anyhow::anyhow!("Request body exceeds maximum size"));
+                    return Err(H3PoolError::post_wire(anyhow::anyhow!(
+                        "Request body exceeds maximum size"
+                    )));
                 }
             }
             if len == 0 {
                 continue;
             }
             bytes_seen.fetch_add(len as u64, Ordering::Release);
-            backend_stream.send_data(chunk.copy_to_bytes(len)).await?;
+            backend_stream
+                .send_data(chunk.copy_to_bytes(len))
+                .await
+                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
         }
-        backend_stream.finish().await?;
+        backend_stream
+            .finish()
+            .await
+            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = backend_stream.recv_response().await?;
+        let response = backend_stream
+            .recv_response()
+            .await
+            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e)))?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -1068,7 +1353,7 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
-    ) -> Result<H3StreamingResponse, anyhow::Error> {
+    ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
@@ -1108,11 +1393,12 @@ impl Http3ConnectionPool {
         }
 
         // Create new connection
-        let tls_config = tls_config_fn()?;
+        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
-            .await?;
+            .await
+            .map_err(H3PoolError::pre_wire)?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request_streaming_body(
@@ -1141,7 +1427,7 @@ impl Http3ConnectionPool {
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
-    ) -> Result<H3StreamingResponse, anyhow::Error> {
+    ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
@@ -1177,11 +1463,12 @@ impl Http3ConnectionPool {
             }
         }
 
-        let tls_config = tls_config_fn()?;
+        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
-            .await?;
+            .await
+            .map_err(H3PoolError::pre_wire)?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request_streaming_incoming_body(
@@ -1214,7 +1501,7 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
-    ) -> Result<H3StreamingResponse, anyhow::Error> {
+    ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
@@ -1246,7 +1533,7 @@ impl Http3ConnectionPool {
             }
         }
 
-        let tls_config = tls_config_fn()?;
+        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_target_sender(
@@ -1257,7 +1544,8 @@ impl Http3ConnectionPool {
                 tls_config,
                 h3_config,
             )
-            .await?;
+            .await
+            .map_err(H3PoolError::pre_wire)?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request_streaming_body(
@@ -1287,7 +1575,7 @@ impl Http3ConnectionPool {
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
-    ) -> Result<H3StreamingResponse, anyhow::Error> {
+    ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
@@ -1323,7 +1611,7 @@ impl Http3ConnectionPool {
             }
         }
 
-        let tls_config = tls_config_fn()?;
+        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_target_sender(
@@ -1334,7 +1622,8 @@ impl Http3ConnectionPool {
                 tls_config,
                 h3_config,
             )
-            .await?;
+            .await
+            .map_err(H3PoolError::pre_wire)?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request_streaming_incoming_body(
@@ -1360,18 +1649,20 @@ impl Http3ConnectionPool {
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
-    ) -> Result<H3StreamingResponse, anyhow::Error> {
+    ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
+        let mut any_request_on_wire = false;
+
         let cached = self
             .pool
             .cached_with(|buf| Self::write_pool_key(buf, proxy, start));
-        if let Some(mut sr) = cached
-            && let Ok(result) = Self::do_request_streaming(
+        if let Some(mut sr) = cached {
+            match Self::do_request_streaming(
                 &mut sr,
                 proxy,
                 method,
@@ -1380,8 +1671,14 @@ impl Http3ConnectionPool {
                 body.clone(),
             )
             .await
-        {
-            return Ok(result);
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    if e.request_on_wire() {
+                        any_request_on_wire = true;
+                    }
+                }
+            }
         }
 
         // Slow path: allocate pool key String
@@ -1400,6 +1697,9 @@ impl Http3ConnectionPool {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
+                    if e.request_on_wire() {
+                        any_request_on_wire = true;
+                    }
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
                     self.pool.invalidate(&key);
 
@@ -1418,7 +1718,10 @@ impl Http3ConnectionPool {
                             .await
                             {
                                 Ok(result) => return Ok(result),
-                                Err(_) => {
+                                Err(e) => {
+                                    if e.request_on_wire() {
+                                        any_request_on_wire = true;
+                                    }
                                     self.pool.invalidate(&fallback_key);
                                 }
                             }
@@ -1428,11 +1731,15 @@ impl Http3ConnectionPool {
             }
         }
 
-        let tls_config = tls_config_fn()?;
+        // See `request()` for why these `?` exits must apply the
+        // sticky `any_request_on_wire` promotion.
+        let tls_config = tls_config_fn()
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
-            .await?;
+            .await
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request_streaming(
@@ -1444,6 +1751,7 @@ impl Http3ConnectionPool {
             body,
         )
         .await
+        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 
     /// Send an HTTP/3 request to an explicit host/port target, returning headers
@@ -1459,13 +1767,15 @@ impl Http3ConnectionPool {
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
-    ) -> Result<H3StreamingResponse, anyhow::Error> {
+    ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
+
+        let mut any_request_on_wire = false;
 
         if let Some(mut sr) = self.pool.cached(&key) {
             match Self::do_request_streaming(
@@ -1480,6 +1790,9 @@ impl Http3ConnectionPool {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
+                    if e.request_on_wire() {
+                        any_request_on_wire = true;
+                    }
                     debug!(
                         "HTTP/3 cached connection to {}:{} failed, reconnecting: {}",
                         target_host, target_port, e
@@ -1506,7 +1819,10 @@ impl Http3ConnectionPool {
                             .await
                             {
                                 Ok(result) => return Ok(result),
-                                Err(_) => {
+                                Err(e) => {
+                                    if e.request_on_wire() {
+                                        any_request_on_wire = true;
+                                    }
                                     self.pool.invalidate(&fallback_key);
                                 }
                             }
@@ -1516,7 +1832,10 @@ impl Http3ConnectionPool {
             }
         }
 
-        let tls_config = tls_config_fn()?;
+        // See `request()` for why these `?` exits must apply the
+        // sticky `any_request_on_wire` promotion.
+        let tls_config = tls_config_fn()
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_target_sender(
@@ -1527,7 +1846,8 @@ impl Http3ConnectionPool {
                 tls_config,
                 h3_config,
             )
-            .await?;
+            .await
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request_streaming(
@@ -1539,6 +1859,7 @@ impl Http3ConnectionPool {
             body,
         )
         .await
+        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 }
 
@@ -1770,4 +2091,160 @@ async fn resolve_backend_addr(host: &str, port: u16) -> Result<SocketAddr, anyho
         })?;
 
     Ok(addr)
+}
+
+#[cfg(test)]
+mod h3_pool_error_tests {
+    //! Inline tests for the body-on-wire signal carried by [`H3PoolError`].
+    //!
+    //! These cover the construction primitives and the sticky-promotion
+    //! behaviour that the pool's internal retry chain relies on. The
+    //! end-to-end body-on-wire integration is exercised by the new
+    //! functional test in `tests/functional/`.
+
+    use super::*;
+
+    #[test]
+    fn pre_wire_marks_request_not_committed() {
+        let e = H3PoolError::pre_wire(anyhow::anyhow!("connect refused"));
+        assert!(
+            !e.request_on_wire(),
+            "pre_wire constructor must report request_on_wire=false"
+        );
+    }
+
+    #[test]
+    fn post_wire_marks_request_committed() {
+        let e = H3PoolError::post_wire(anyhow::anyhow!("send_data failed"));
+        assert!(
+            e.request_on_wire(),
+            "post_wire constructor must report request_on_wire=true"
+        );
+    }
+
+    #[test]
+    fn promote_on_wire_if_only_promotes_false_to_true() {
+        // The pool's retry chain calls `e.promote_on_wire_if(any_request_on_wire)`
+        // on each fresh-connect setup `?` exit. The contract is asymmetric:
+        // `condition=true` flips false → true; `condition=false` is a no-op.
+        let pre = H3PoolError::pre_wire(anyhow::anyhow!("connect refused"));
+        let promoted = pre.promote_on_wire_if(true);
+        assert!(promoted.request_on_wire());
+
+        // `condition=false` must NOT demote an already-true flag — that's
+        // exactly the case where an earlier post-wire attempt set the
+        // flag and a later pre-wire setup failure would otherwise clobber
+        // it. Verify both directions: `true → true` is idempotent and
+        // `false on an already-true` is a no-op.
+        let post = H3PoolError::post_wire(anyhow::anyhow!("recv_response failed"));
+        assert!(post.promote_on_wire_if(false).request_on_wire());
+
+        let post = H3PoolError::post_wire(anyhow::anyhow!("recv_response failed"));
+        assert!(post.promote_on_wire_if(true).request_on_wire());
+    }
+
+    #[test]
+    fn display_forwards_to_inner_error() {
+        let e = H3PoolError::pre_wire(anyhow::anyhow!("synthetic connect failure"));
+        let rendered = format!("{}", e);
+        assert!(
+            rendered.contains("synthetic connect failure"),
+            "Display must forward to inner anyhow::Error: got {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn classify_http3_error_picks_protocol_for_application_close() {
+        // Regression: h3 0.0.8 renders ConnectionError::ApplicationClose
+        // as the bare token "ApplicationClose" (no trailing 'd'), so the
+        // generic "closed" substring used to miss it. The shared
+        // classifier explicitly handles `applicationclose`.
+        let err: anyhow::Error = anyhow::anyhow!("connection ApplicationClose received");
+        let class = classify_http3_error(err.as_ref());
+        assert_eq!(
+            class,
+            crate::retry::ErrorClass::ConnectionClosed,
+            "ApplicationClose must classify as ConnectionClosed (post-wire)"
+        );
+    }
+
+    #[test]
+    fn classify_http3_error_keeps_h3_protocol_codes_as_protocol() {
+        // Regression: a stream-level RESET_STREAM contains "reset", and
+        // the classifier used to short-circuit on bare "reset" before
+        // checking the more specific protocol tokens. The fix puts
+        // protocol tokens first.
+        let err: anyhow::Error = anyhow::anyhow!("h3 stream RESET_STREAM code=H3_REQUEST_REJECTED");
+        assert_eq!(
+            classify_http3_error(err.as_ref()),
+            crate::retry::ErrorClass::ProtocolError,
+            "RESET_STREAM is application-layer (stream abort), not connection reset"
+        );
+    }
+
+    /// Codex P1 regression: when an earlier internal attempt set
+    /// `any_request_on_wire = true` (post-wire) and then `tls_config_fn()`
+    /// or `create_or_get_proxy_sender()` fails on the fresh-connect
+    /// fallback, the pool MUST promote the sticky flag onto the resulting
+    /// `H3PoolError::pre_wire`. Without that promotion, the gateway sees
+    /// `request_on_wire=false`, treats the call as pre-wire, and replays
+    /// a non-idempotent request via `retry_on_connect_failure` even
+    /// though the FIRST internal attempt may already have been processed
+    /// by the backend.
+    ///
+    /// **Coverage scope.** This test is unit-level and only verifies the
+    /// closure shape — `H3PoolError::pre_wire(e).promote_on_wire_if(true)`
+    /// returns `request_on_wire=true`. It does NOT exercise the live
+    /// `Http3ConnectionPool::request*` retry chain (cached attempt's
+    /// post-wire failure → fresh-connect setup failure) end-to-end,
+    /// because doing that requires a scripted QUIC backend that:
+    /// (a) accepts the QUIC handshake, (b) accepts the stream open, (c)
+    /// fails the body / response so the cached attempt is post-wire,
+    /// then (d) refuses subsequent connect attempts so the fresh-connect
+    /// setup also fails. The functional test
+    /// `retry_on_connect_failure_fires_with_empty_methods_and_statuses`
+    /// covers the gateway-level retry contract end-to-end via ECONNREFUSED
+    /// but does not tickle this specific cached-success → fresh-connect
+    /// setup-failure ordering. Tracked as a follow-up coverage gap; the
+    /// closure-shape assertion below is the regression guard for the
+    /// fix that this PR introduces.
+    #[test]
+    fn pre_wire_setup_failure_after_post_wire_attempt_preserves_sticky_flag() {
+        // Simulate: any_request_on_wire = true (an earlier internal attempt
+        // sent the request body). Now tls_config_fn() fails.
+        let any_request_on_wire = true;
+        let synthetic_setup_failure = anyhow::anyhow!("synthetic tls_config_fn() failure");
+
+        let propagated: H3PoolError =
+            H3PoolError::pre_wire(synthetic_setup_failure).promote_on_wire_if(any_request_on_wire);
+
+        assert!(
+            propagated.request_on_wire(),
+            "TLS / sender-creation failure path must propagate sticky \
+             request_on_wire=true so the gateway respects retry_on_methods \
+             instead of replaying via retry_on_connect_failure. If this \
+             assertion fails, a future refactor likely reverted to the \
+             bare `map_err(pre_wire)?` shape — restore the closure form: \
+             `|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire)`"
+        );
+    }
+
+    #[test]
+    fn pre_wire_setup_failure_with_no_prior_post_wire_attempt_stays_pre_wire() {
+        // Counterpart: if NO earlier internal attempt sent the body
+        // (any_request_on_wire = false), the same closure must NOT
+        // mistakenly mark the error as post-wire.
+        let any_request_on_wire = false;
+        let synthetic_setup_failure = anyhow::anyhow!("synthetic tls_config_fn() failure");
+
+        let propagated: H3PoolError =
+            H3PoolError::pre_wire(synthetic_setup_failure).promote_on_wire_if(any_request_on_wire);
+
+        assert!(
+            !propagated.request_on_wire(),
+            "Setup failure with no prior post-wire attempt must remain \
+             request_on_wire=false so retry_on_connect_failure can fire"
+        );
+    }
 }
