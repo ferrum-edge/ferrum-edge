@@ -2440,6 +2440,15 @@ pub(crate) fn inject_sticky_cookie(
 }
 
 fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::ErrorClass {
+    // Graceful remote close (`H3_NO_ERROR` ApplicationClose / GOAWAY) at
+    // the response read boundary is the peer's spec-legal teardown
+    // signal — see RFC 9114 §8.1. Surface it as a distinct class so
+    // `is_h3_transport_error_class` returns false and the gateway
+    // suppresses `mark_h3_unsupported`. The 502 still propagates because
+    // we have no headers to forward, but the next request stays on H3.
+    if e.is_graceful_close() {
+        return crate::retry::ErrorClass::GracefulRemoteClose;
+    }
     // Delegate to the shared HTTP/3 classifier, which walks the source chain
     // for typed quinn::ConnectionError / quinn::ConnectError / io::Error
     // variants before falling back to string heuristics. This gives more
