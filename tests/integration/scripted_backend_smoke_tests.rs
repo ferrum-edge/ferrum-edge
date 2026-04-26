@@ -442,5 +442,6 @@ async fn serve_blocks_until_shutdown_when_no_listener_handles() {
     tokio::time::timeout(Duration::from_secs(2), join_task)
         .await
         .expect("join() did not complete within 2 s of shutdown")
-        .expect("join_task panicked");
+        .expect("join_task panicked")
+        .expect("listener task panicked");
 }

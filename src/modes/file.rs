@@ -174,8 +174,15 @@ impl ServeHandles {
     ///    awaited with [`BACKGROUND_DRAIN_TIMEOUT`]. A stuck task logs a
     ///    warning instead of wedging shutdown — without this cap a
     ///    rolling restart could hang on a single misbehaving task.
-    pub async fn join(mut self) {
-        if self.listener_handles.is_empty() {
+    ///
+    /// Returns the first listener-task `JoinError` if any listener panicked.
+    /// Every listener is still awaited (so `JoinError`s on later handles get
+    /// logged) and the drain phases still run, but the returned `Err`
+    /// propagates up to `run()` so the binary surfaces a panicked listener
+    /// instead of silently exiting with one listener missing — matching
+    /// the pre-refactor `handle.await?` semantics.
+    pub async fn join(mut self) -> Result<(), tokio::task::JoinError> {
+        let listener_result = if self.listener_handles.is_empty() {
             // Stream-only deployment: there are no JoinHandles to await,
             // so block on the shutdown watch channel until somebody fires
             // it. Mirrors the pre-refactor `run()` which had the same
@@ -187,11 +194,10 @@ impl ServeHandles {
                     break;
                 }
             }
+            Ok(())
         } else {
-            for handle in self.listener_handles {
-                let _ = handle.await;
-            }
-        }
+            await_listener_handles(self.listener_handles).await
+        };
         if self.drain_seconds > 0 {
             crate::overload::wait_for_drain(
                 &self.proxy_state.overload,
@@ -200,6 +206,30 @@ impl ServeHandles {
             .await;
         }
         join_background_handles(self.background_handles, BACKGROUND_DRAIN_TIMEOUT).await;
+        listener_result
+    }
+}
+
+/// Await every listener handle. Logs each `JoinError` and returns the
+/// first one so a panicked listener bubbles up to `run()` (instead of
+/// silently leaving the binary running with one fewer accept loop).
+/// Pulled out of [`ServeHandles::join`] so the panic-propagation
+/// behaviour is unit-testable without constructing a `ProxyState`.
+async fn await_listener_handles(
+    handles: Vec<JoinHandle<()>>,
+) -> Result<(), tokio::task::JoinError> {
+    let mut first_error: Option<tokio::task::JoinError> = None;
+    for handle in handles {
+        if let Err(err) = handle.await {
+            error!("Gateway listener task failed: {}", err);
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }
 
@@ -322,13 +352,16 @@ pub async fn run(
         }
     });
 
-    // Wait for serve()'s tasks to drain (proxy listeners + background tasks).
-    handles.join().await;
+    // Wait for serve()'s tasks to drain (proxy listeners + background
+    // tasks). Surface any listener-task panic so the binary exits non-zero
+    // and the operator's process supervisor can restart — silently
+    // continuing with one listener missing was the pre-fix behaviour.
+    let listener_result = handles.join().await;
 
     // SIGHUP listener exits via shutdown_rx — wait for it too with a timeout.
     let _ = tokio::time::timeout(Duration::from_secs(5), sighup_handle).await;
 
-    Ok(())
+    listener_result.map_err(|e| anyhow::anyhow!("Gateway listener task panicked: {e}"))
 }
 
 /// In-process entry point.
@@ -870,5 +903,40 @@ mod tests {
             elapsed < Duration::from_millis(100),
             "well-behaved background handles should drain promptly; took {elapsed:?}",
         );
+    }
+
+    // Regression: `ServeHandles::join` previously did `let _ = handle.await`
+    // for every listener handle, silently swallowing JoinErrors. The
+    // pre-refactor `run()` used `handle.await?`, so a panicked listener
+    // task would terminate the binary. Codex flagged the silent drop —
+    // verify `await_listener_handles` surfaces panics as `Err` so `run()`
+    // can exit non-zero and the operator's supervisor restarts.
+    #[tokio::test]
+    async fn await_listener_handles_returns_err_when_a_listener_panics() {
+        let healthy = tokio::spawn(async {});
+        let panicker = tokio::spawn(async {
+            panic!("simulated listener crash");
+        });
+        let healthy_late = tokio::spawn(async {});
+
+        let result = await_listener_handles(vec![healthy, panicker, healthy_late]).await;
+        let err = result.expect_err("a listener panicked, await_listener_handles must return Err");
+        assert!(
+            err.is_panic(),
+            "JoinError should report `is_panic()` for a panicked listener; got {err:?}",
+        );
+    }
+
+    // Sanity: when no listener panics, the helper returns Ok and never
+    // synthesises a phantom error. Guards against a regression where
+    // `first_error` accidentally becomes a marker value.
+    #[tokio::test]
+    async fn await_listener_handles_returns_ok_when_all_listeners_complete() {
+        let h1 = tokio::spawn(async {});
+        let h2 = tokio::spawn(async {});
+
+        await_listener_handles(vec![h1, h2])
+            .await
+            .expect("no listener panicked; helper must return Ok");
     }
 }

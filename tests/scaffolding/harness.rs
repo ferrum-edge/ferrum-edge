@@ -390,7 +390,13 @@ async fn try_spawn_in_process(
     let join_handle = tokio::spawn(async move {
         // ServeHandles owns the listeners' join handles. We move it onto
         // its own task so dropping the harness waits for clean drain.
-        handles.join().await;
+        // A listener panic returns Err(JoinError) — surface it as an
+        // eprintln so a flaky listener doesn't disappear silently into
+        // the test runtime; the test that triggered it is already in
+        // teardown by the time this runs, so we can't fail it directly.
+        if let Err(err) = handles.join().await {
+            eprintln!("In-process gateway listener panicked: {err}");
+        }
     });
 
     Ok(GatewayHarness {
@@ -479,12 +485,23 @@ struct InProcessBackend {
 
 impl Drop for InProcessBackend {
     fn drop(&mut self) {
+        // Signal graceful shutdown — every listener / background task
+        // subscribed to the watch channel observes this and exits on its
+        // own.
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
         }
-        if let Some(handle) = self.join.take() {
-            handle.abort();
-        }
+        // Drop the JoinHandle without aborting. `abort()` would cancel
+        // the task running `ServeHandles::join`, which is the ONLY task
+        // awaiting the inner listener / background JoinHandles — those
+        // would then drop unawaited, detaching the underlying tasks and
+        // letting them outlive the harness. Detached tasks holding onto
+        // ProxyState / DNS cache / stream listeners can pile up across a
+        // full `cargo test` run and (for stream proxies) keep listening
+        // sockets open. By NOT aborting, the join task continues to
+        // drain in the background; tokio will run it to completion via
+        // the shutdown signal we just sent.
+        let _ = self.join.take();
     }
 }
 
