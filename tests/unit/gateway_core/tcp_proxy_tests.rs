@@ -4,6 +4,7 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::plugins::{Direction, DisconnectCause};
 use ferrum_edge::retry::ErrorClass;
+use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -993,5 +994,586 @@ async fn test_slow_progressing_write_does_not_fire_timeout() {
     assert!(
         result.is_err(),
         "slow-but-progressing write should keep watermark fresh; copy should not terminate"
+    );
+}
+
+// ── Graceful shutdown reclassification (write-after-opposite-EOF race) ───────
+//
+// Regression coverage for the TLS close_notify → FIN tail race that was
+// producing 1 spurious error per payload size at 70 KB / 500 KB in the
+// CI benchmark. The bidirectional relay's drain phase used to classify
+// any `BrokenPipe` / `ConnectionReset` on the write side as a transport
+// failure, even when the opposite half had already completed cleanly.
+// These tests lock in the reclassification: write-after-EOF races on
+// the remaining direction become `DisconnectCause::GracefulShutdown`
+// (first_failure = None), and genuine errors are still flagged.
+
+/// Outcome for a single `poll_write` call in `ScriptedStream`.
+#[derive(Clone, Debug)]
+enum WriteOutcome {
+    /// Accept the entire buffer (`Ok(buf.len())`).
+    Accept,
+    /// Return `Ok(0)` — tokio's `write_all` translates this into
+    /// `io::ErrorKind::WriteZero` after retrying.
+    Zero,
+    /// Return `Err(io::Error::new(kind, msg))`.
+    Fail(io::ErrorKind, &'static str),
+}
+/// Flexible stream fixture for bidirectional-copy reclassification tests.
+///
+/// `reads` is a script of chunks returned in order; once exhausted, every
+/// subsequent `poll_read` returns EOF. `writes` is a per-call outcome
+/// script; once exhausted, every subsequent `poll_write` falls back to
+/// `write_default`. Both directions are independent (an `AsyncRead` and an
+/// `AsyncWrite` impl on the same stream — the bidirectional copy splits
+/// the stream into halves via `tokio::io::split`).
+///
+/// This single fixture replaces ad-hoc stream structs in tests that need
+/// to flow bytes successfully *before* triggering the close-race write
+/// error — required for the `both_directions_transferred` admission gate
+/// in the production reclassification logic.
+struct ScriptedStream {
+    reads: VecDeque<Vec<u8>>,
+    writes: VecDeque<WriteOutcome>,
+    write_default: WriteOutcome,
+}
+
+impl ScriptedStream {
+    fn new(reads: Vec<Vec<u8>>, writes: Vec<WriteOutcome>, write_default: WriteOutcome) -> Self {
+        Self {
+            reads: reads.into(),
+            writes: writes.into(),
+            write_default,
+        }
+    }
+}
+
+impl AsyncRead for ScriptedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.reads.pop_front() {
+            None => Poll::Ready(Ok(())),
+            Some(mut chunk) => {
+                let n = buf.remaining().min(chunk.len());
+                buf.put_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    chunk.drain(..n);
+                    self.reads.push_front(chunk);
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+impl AsyncWrite for ScriptedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let outcome = self
+            .writes
+            .pop_front()
+            .unwrap_or_else(|| self.write_default.clone());
+        match outcome {
+            WriteOutcome::Accept => Poll::Ready(Ok(buf.len())),
+            WriteOutcome::Zero => Poll::Ready(Ok(0)),
+            WriteOutcome::Fail(kind, msg) => Poll::Ready(Err(io::Error::new(kind, msg))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Helper: build the canonical "bench close-race" client/backend pair.
+///
+/// * Client transfers `request` bytes c2b, then EOFs its read side.
+/// * Backend transfers `response_chunks` to b2c, then EOFs its read side.
+/// * One write call on the *failing_side* succeeds (so the relevant
+///   counter advances past zero), then a second write fails with
+///   `failure_kind` — emulating the TLS close_notify → FIN tail race
+///   firing AFTER both directions have already delivered bytes.
+fn close_race_pair(
+    request: &[u8],
+    response_chunks: &[&[u8]],
+    failing_side: FailingSide,
+    failure: WriteOutcome,
+) -> (ScriptedStream, ScriptedStream) {
+    let response_chunks: Vec<Vec<u8>> = response_chunks.iter().map(|c| c.to_vec()).collect();
+    match failing_side {
+        // Client write fails on the second call → b2c (which writes to
+        // client) errors after delivering the first response chunk.
+        FailingSide::Client => {
+            let client = ScriptedStream::new(
+                vec![request.to_vec()],
+                vec![WriteOutcome::Accept, failure],
+                WriteOutcome::Accept,
+            );
+            let backend = ScriptedStream::new(response_chunks, vec![], WriteOutcome::Accept);
+            (client, backend)
+        }
+        // Backend write fails on the second call → c2b (which writes to
+        // backend) errors after delivering the first request chunk.
+        FailingSide::Backend => {
+            let client = ScriptedStream::new(
+                vec![request.to_vec(), b"second-chunk".to_vec()],
+                vec![],
+                WriteOutcome::Accept,
+            );
+            let backend = ScriptedStream::new(
+                response_chunks,
+                vec![WriteOutcome::Accept, failure],
+                WriteOutcome::Accept,
+            );
+            (client, backend)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FailingSide {
+    Client,
+    Backend,
+}
+
+/// Regression: when one half of the bidirectional copy finishes with a
+/// clean `Ok(0)` EOF and the remaining half subsequently hits `BrokenPipe`
+/// on its write side (the classic TLS close_notify → FIN tail race), the
+/// connection has shut down gracefully from the proxy's perspective. The
+/// relay must report `first_failure = None` so operators see
+/// `DisconnectCause::GracefulShutdown` instead of a spurious BackendError.
+///
+/// Setup mirrors the bench scenario the PR was written for: both
+/// directions transfer real bytes (request c2b, first response chunk b2c)
+/// *before* the close-race tail fires. The
+/// `both_directions_transferred` admission gate is satisfied, so the
+/// reclassification is allowed to proceed.
+#[tokio::test]
+async fn test_bidirectional_copy_reclassifies_write_after_eof_as_graceful() {
+    let (client, backend) = close_race_pair(
+        b"REQUEST",
+        &[b"RESP-CHUNK-1", b"RESP-CHUNK-2"],
+        FailingSide::Client,
+        WriteOutcome::Fail(io::ErrorKind::BrokenPipe, "simulated write-after-close"),
+    );
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "write-after-EOF-on-opposite-half must reclassify as graceful, got {:?}",
+        result.first_failure
+    );
+    assert!(
+        result.bytes_client_to_backend > 0 && result.bytes_backend_to_client > 0,
+        "both directions must have transferred bytes for the close-race admission gate to allow reclassification"
+    );
+}
+
+/// Same reclassification, but triggered by `ConnectionReset` on the write
+/// side instead of `BrokenPipe`. Both errnos map to the same benign
+/// post-EOF tail race (Linux emits ECONNRESET when the peer has sent an
+/// RST after close_notify, macOS/BSD tend to emit EPIPE).
+#[tokio::test]
+async fn test_bidirectional_copy_reclassifies_connection_reset_after_eof_as_graceful() {
+    let (client, backend) = close_race_pair(
+        b"REQUEST",
+        &[b"RESP-CHUNK-1", b"RESP-CHUNK-2"],
+        FailingSide::Client,
+        WriteOutcome::Fail(
+            io::ErrorKind::ConnectionReset,
+            "simulated peer reset during close",
+        ),
+    );
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "write-side ConnectionReset after opposite EOF must reclassify as graceful, got {:?}",
+        result.first_failure
+    );
+}
+
+/// Negative control: if the first half errors BEFORE any EOF, the
+/// reclassification MUST NOT fire — a read error from the client is a
+/// genuine transport failure. This prevents the graceful-shutdown branch
+/// from masking real errors.
+#[tokio::test]
+async fn test_bidirectional_copy_does_not_reclassify_when_first_half_errors() {
+    let client = ResetOnReadStream;
+    let (backend, _peer) = tokio::io::duplex(1024);
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    let (dir, class, side, _msg) = result
+        .first_failure
+        .as_ref()
+        .expect("client read error must still surface first_failure, not be masked");
+    assert_eq!(
+        *dir,
+        Direction::ClientToBackend,
+        "direction must still be attributed to the erroring half"
+    );
+    assert_eq!(
+        *class,
+        ErrorClass::ConnectionReset,
+        "genuine read-side ConnectionReset must keep its classification"
+    );
+    assert_eq!(
+        *side,
+        Some(StreamIoSide::Read),
+        "read-side failures must never be reclassified as graceful"
+    );
+}
+
+/// Negative control: a read-side failure on the opposite half AFTER the
+/// first half EOF'd must NOT be reclassified as graceful. This is the
+/// "backend RST-after-FIN misbehaviour" case — the backend is actively
+/// misbehaving and operators must see the error on their dashboards.
+#[tokio::test]
+async fn test_bidirectional_copy_does_not_reclassify_read_side_error_after_eof() {
+    // c2b side: client EOFs immediately on read. Writes from c2b go to
+    // backend and succeed so the EOF path (shutdown backend) runs cleanly.
+    struct ClientEofReaderOkWriter;
+    impl AsyncRead for ClientEofReaderOkWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncWrite for ClientEofReaderOkWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // Backend stream: read fails with ConnectionReset (backend RST after
+    // our FIN) — this is NOT graceful, it's a misbehaving backend.
+    let client = ClientEofReaderOkWriter;
+    let backend = ResetOnReadStream;
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    let (dir, class, side, _msg) = result
+        .first_failure
+        .as_ref()
+        .expect("backend read-side ConnectionReset must NOT be reclassified as graceful");
+    assert_eq!(*dir, Direction::BackendToClient);
+    assert_eq!(*class, ErrorClass::ConnectionReset);
+    assert_eq!(
+        *side,
+        Some(StreamIoSide::Read),
+        "read-side errors are genuine transport failures regardless of opposite-half EOF state"
+    );
+}
+
+/// Verify the reclassification preserves accurate per-direction byte
+/// counters. The successful first-chunk write in each direction must be
+/// reflected; the failed second-chunk write in b2c must NOT bump the
+/// counter (per `copy_one_direction`'s post-write `fetch_add` which only
+/// runs after a successful write).
+#[tokio::test]
+async fn test_bidirectional_copy_graceful_reclassification_preserves_byte_counts() {
+    let request: &[u8] = b"REQUEST-7B";
+    let response_chunks: [&[u8]; 2] = [b"RESP-CHUNK-1", b"RESP-CHUNK-2"];
+    let (client, backend) = close_race_pair(
+        request,
+        &response_chunks,
+        FailingSide::Client,
+        WriteOutcome::Fail(io::ErrorKind::BrokenPipe, "simulated write-after-close"),
+    );
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "expected graceful reclassification, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(
+        result.bytes_client_to_backend,
+        request.len() as u64,
+        "c2b counter should reflect the single successful request write"
+    );
+    // First response chunk's write to client succeeded; second chunk's
+    // write hit the BrokenPipe BEFORE the counter increment. The metric
+    // must reflect only the successfully-delivered first chunk — this
+    // lock-in catches any "count partial/failed writes" regression that
+    // could inflate `bytes_backend_to_client`.
+    assert_eq!(
+        result.bytes_backend_to_client,
+        response_chunks[0].len() as u64,
+        "b2c counter should reflect only the first chunk; the failed second-write is not credited"
+    );
+}
+
+// ── Phase 1 grace-window reclassification (raw-kind precision) ──────────────
+//
+// The drain-path tests above exercise `drain_half_close_copy`, which sees
+// the raw `io::ErrorKind` directly. These tests target the *other* half
+// of the fix: the Phase 1 grace-window paths (lines ~2174 / ~2221 of
+// `bidirectional_copy`). Those paths fire when one direction errors first,
+// then the opposite direction completes `Ok(())` within the 100 ms grace
+// window. Phase 2 must use the **precise raw `io::ErrorKind`** captured at
+// Phase 1 time (`phase1_benign_write_candidate`) — never the post-classified
+// `ErrorClass`, which collapses two distinct errnos into one bucket
+// (`BrokenPipe` and `ConnectionAborted` both map to `ConnectionClosed`)
+// and drops `WriteZero` into `RequestError` entirely.
+
+/// Regression: a Phase 1 c2b `WriteZero` followed by an opposite-half
+/// `Ok(())` EOF in the grace window MUST reclassify as graceful shutdown.
+///
+/// Why this matters: `WriteZero` post-classifies to `ErrorClass::RequestError`
+/// (no match in `classify_boxed_error`'s `io::ErrorKind` arms). A previous
+/// version of the Phase 2 reclassification used a post-classification helper
+/// keyed on `ErrorClass::ConnectionClosed | ConnectionReset`, which silently
+/// dropped `WriteZero` cases on the floor — the very benign-write-after-close
+/// pattern produced by `copy_one_direction`'s own write loop when a TLS
+/// peer's receive side has gone away mid-flush.
+///
+/// Setup flows bytes through both directions before the WriteZero error:
+/// - c2b: client returns two request chunks; backend accepts the first
+///   write, then returns `Ok(0)` on the second → tokio `write_all` emits
+///   `WriteZero`. c2b transferred the first chunk successfully, so
+///   `c2b_bytes > 0`.
+/// - b2c: backend returns one response chunk then EOF; client accepts.
+///   b2c delivers the chunk, then sees EOF → `Ok(())`. `b2c_bytes > 0`.
+///
+/// Trace:
+/// 1. Phase 1 (biased) polls c2b first. c2b transfers the first chunk
+///    (c2b_bytes += N), then on the second write-iteration hits `Ok(0)`
+///    → `write_all` emits `WriteZero`. c2b errors with `(Write, WriteZero)`;
+///    `phase1_benign_write_candidate` captured as `true` from the raw kind.
+/// 2. Phase 2 enters the b2c grace window. b2c transfers the response
+///    chunk (b2c_bytes += M), then read returns EOF → `Ok(())`.
+/// 3. Phase 2 reclassifies: `phase1_benign_write_candidate && both_directions_transferred`
+///    → `first_failure = None` (graceful shutdown).
+#[tokio::test]
+async fn test_phase1_grace_window_reclassifies_write_zero_as_graceful() {
+    let (client, backend) = close_race_pair(
+        b"REQUEST",
+        &[b"RESP-CHUNK-1"],
+        FailingSide::Backend,
+        WriteOutcome::Zero,
+    );
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "WriteZero on Phase 1 c2b followed by clean b2c EOF (with bytes flowed both ways) must reclassify as graceful, got {:?}",
+        result.first_failure
+    );
+    assert!(
+        result.bytes_client_to_backend > 0 && result.bytes_backend_to_client > 0,
+        "scenario requires both directions to have transferred bytes for the close-race admission gate"
+    );
+}
+
+/// Regression (negative): a Phase 1 c2b `ConnectionAborted` followed by an
+/// opposite-half `Ok(())` EOF in the grace window MUST NOT be reclassified
+/// as graceful — `ConnectionAborted` is intentionally outside the benign
+/// admission set even though it shares `ErrorClass::ConnectionClosed` with
+/// the benign `BrokenPipe`.
+///
+/// Why this matters: a previous version of the Phase 2 reclassification
+/// used a post-classification helper that admitted any
+/// `ErrorClass::ConnectionClosed` Write-side failure. That over-admitted
+/// `ConnectionAborted` (kernel-aborted connection, e.g., keepalive
+/// failure) as if it were the benign TLS close-race tail. Operators would
+/// then lose visibility into a real connection-abort signal. The fix
+/// captures the precise raw `io::ErrorKind` at Phase 1 time so the Phase 2
+/// grace window can honor the same exclusion list as
+/// `is_post_eof_benign_write_error`.
+///
+/// Setup mirrors the WriteZero positive case (bytes flow in both
+/// directions) so this test specifically validates the **raw-kind**
+/// exclusion rather than tripping the orthogonal `both_directions_transferred`
+/// gate. With both bytes counters > 0, the only reason the reclassification
+/// is denied is the precise raw-kind check.
+#[tokio::test]
+async fn test_phase1_grace_window_does_not_reclassify_connection_aborted() {
+    let (client, backend) = close_race_pair(
+        b"REQUEST",
+        &[b"RESP-CHUNK-1"],
+        FailingSide::Backend,
+        WriteOutcome::Fail(
+            io::ErrorKind::ConnectionAborted,
+            "simulated kernel connection abort",
+        ),
+    );
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    let (dir, class, side, _msg) = result.first_failure.as_ref().expect(
+        "ConnectionAborted on Phase 1 c2b must NOT be reclassified as graceful — \
+         it is outside the precise benign-write admission set even though it \
+         shares ErrorClass::ConnectionClosed with the benign BrokenPipe",
+    );
+    assert_eq!(
+        *dir,
+        Direction::ClientToBackend,
+        "direction must be attributed to the c2b half that errored"
+    );
+    assert_eq!(
+        *class,
+        ErrorClass::ConnectionClosed,
+        "ConnectionAborted post-classifies to ConnectionClosed (per classify_boxed_error)"
+    );
+    assert_eq!(
+        *side,
+        Some(StreamIoSide::Write),
+        "the failure was on the write side of c2b"
+    );
+    assert!(
+        result.bytes_client_to_backend > 0 && result.bytes_backend_to_client > 0,
+        "both directions transferred bytes — exclusion must be due to the raw-kind check, not the bytes gate"
+    );
+}
+
+// ── Asymmetric truncation: bytes-flow gate denies reclassification ──────────
+//
+// The close-race reclassification is gated on **both** directions having
+// transferred bytes (`both_directions_transferred` in tcp_proxy.rs).
+// Without this gate, two genuine failure shapes would be silently
+// re-labelled as `GracefulShutdown`:
+//
+//  1. The backend dies before responding — c2b transferred upload bytes
+//     (c2b > 0), b2c never delivered any response (b2c == 0). c2b's next
+//     write to the dead backend hits BrokenPipe, b2c sees FIN as EOF.
+//  2. A client connects and immediately half-closes its write side without
+//     sending anything (port scanner, premature abort). c2b sees EOF
+//     instantly (c2b == 0); when backend pushes data into b2c, the write
+//     to the closed client peer fails (b2c == 0).
+//
+// Both shapes look identical to the close-race tail at the
+// raw-`io::ErrorKind` layer — the only signal that differentiates them
+// is "did the relay carry a real transaction?", which the byte counters
+// answer.
+
+/// Asymmetric truncation #1: backend dies in the middle of a client
+/// upload. c2b transferred request bytes successfully before hitting the
+/// failing write; b2c never got a response chunk through. Even though the
+/// raw kind is benign (BrokenPipe) and the opposite half completed
+/// `Ok(())` cleanly, the reclassification MUST be denied because
+/// `b2c_bytes == 0` — operators need to see this as a backend failure,
+/// not graceful shutdown.
+#[tokio::test]
+async fn test_phase1_grace_window_denies_reclassification_when_b2c_transferred_no_bytes() {
+    // c2b: client returns two chunks; backend accepts the first write,
+    // then fails the second with BrokenPipe (backend died mid-upload).
+    // b2c: backend read returns EOF immediately (no response delivered).
+    let client = ScriptedStream::new(
+        vec![b"REQ-CHUNK-1".to_vec(), b"REQ-CHUNK-2".to_vec()],
+        vec![],
+        WriteOutcome::Accept,
+    );
+    let backend = ScriptedStream::new(
+        vec![],
+        vec![
+            WriteOutcome::Accept,
+            WriteOutcome::Fail(
+                io::ErrorKind::BrokenPipe,
+                "simulated backend died mid-upload",
+            ),
+        ],
+        WriteOutcome::Accept,
+    );
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    let (dir, _class, side, _msg) = result.first_failure.as_ref().expect(
+        "Asymmetric truncation (backend died before responding, b2c_bytes == 0) must NOT be \
+         reclassified as graceful — operators need to see the backend failure",
+    );
+    assert_eq!(*dir, Direction::ClientToBackend);
+    assert_eq!(*side, Some(StreamIoSide::Write));
+    assert!(
+        result.bytes_client_to_backend > 0,
+        "c2b should have transferred at least the first request chunk before the backend died"
+    );
+    assert_eq!(
+        result.bytes_backend_to_client, 0,
+        "b2c should have transferred no bytes — backend FIN'd before responding"
+    );
+}
+
+/// Asymmetric truncation #2: client connects and immediately half-closes
+/// its write side without sending anything (port scanner / premature
+/// abort). When the backend pushes data into b2c, the write to the
+/// already-closed client peer fails. Even though the raw kind is benign
+/// (BrokenPipe) and Phase 1 ended with c2b clean EOF, the drain-path
+/// reclassification MUST be denied because both `c2b_bytes == 0` AND
+/// `b2c_bytes == 0` — there's no evidence a real transaction took place.
+#[tokio::test]
+async fn test_drain_path_denies_reclassification_when_no_bytes_transferred() {
+    // c2b: client read returns EOF immediately (Phase 1 c2b clean EOF;
+    // no bytes carried). Client write fails with BrokenPipe so the b2c
+    // drain path produces a benign-write error.
+    let client = ScriptedStream::new(
+        vec![],
+        vec![],
+        WriteOutcome::Fail(
+            io::ErrorKind::BrokenPipe,
+            "simulated client closed before backend pushed",
+        ),
+    );
+    // b2c: backend returns one response chunk so the drain has something
+    // to attempt to write into the closed client; the failed write is
+    // what triggers the reclassification check.
+    let backend = ScriptedStream::new(
+        vec![b"UNSOLICITED-RESPONSE".to_vec()],
+        vec![],
+        WriteOutcome::Accept,
+    );
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    let (dir, _class, side, _msg) = result.first_failure.as_ref().expect(
+        "Drain path with no bytes transferred either direction must NOT be reclassified \
+         as graceful — there's no evidence of a real transaction",
+    );
+    assert_eq!(*dir, Direction::BackendToClient);
+    assert_eq!(*side, Some(StreamIoSide::Write));
+    assert_eq!(
+        result.bytes_client_to_backend, 0,
+        "client never sent any bytes (immediate EOF)"
+    );
+    assert_eq!(
+        result.bytes_backend_to_client, 0,
+        "b2c write failed before counter increment"
     );
 }
