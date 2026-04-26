@@ -374,17 +374,27 @@ async fn tls_expired_cert_produces_tls_error_not_generic_502() {
 // The TLS backend's server-side ALPN list is exactly `[http/1.1]`. When the
 // gateway's H2 direct pool probes the backend (either at warmup or on first
 // request), rustls negotiates `http/1.1`, the pool raises
-// `BackendSelectedHttp1`, and `is_known_http1_backend` returns `true` on
-// subsequent probes. Pool warmup must be enabled so the probe actually
-// happens.
+// `BackendSelectedHttp1`, and the dispatcher invokes
+// `BackendCapabilityRegistry::mark_h2_tls_unsupported(...)` so subsequent
+// requests skip the direct H2 pool. Pool warmup must be enabled so the
+// probe actually happens.
 //
 // Observables:
 //   1. The backend records `last_alpn = "http/1.1"` on the probe
 //      handshake (before any request reaches it).
-//   2. The gateway's captured logs contain the warmup-level
-//      "Pool warmup failed: H2 ...: BackendSelectedHttp1 ..." line.
+//   2. The capability registry, exposed via `GET /backend-capabilities`,
+//      records `plain_http.h2_tls = "unsupported"` AND
+//      `plain_http.h1 = "supported"` for this backend after the
+//      ALPN-driven downgrade.
 //   3. Subsequent client requests succeed (served via reqwest's
 //      http/1.1 path).
+//
+// The previous incarnation of this test scraped the gateway log for
+// `BackendSelectedHttp1`, which was flaky: the registry warmup path can
+// classify the backend silently without emitting that exact substring,
+// and capturing stdout/stderr races with hyper / tokio buffering. Querying
+// the admin endpoint instead is deterministic — the registry is the source
+// of truth that the hot path actually consults.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h2_alpn_fallback_downgrades_capability() {
@@ -423,7 +433,6 @@ async fn h2_alpn_fallback_downgrades_capability() {
         // Pool warmup is disabled by default in the shared harness to keep
         // unrelated tests fast — we need it ON for the H2 probe to run.
         .env("FERRUM_POOL_WARMUP_ENABLED", "true")
-        .capture_output()
         .spawn()
         .await
         .expect("spawn gateway");
@@ -436,20 +445,11 @@ async fn h2_alpn_fallback_downgrades_capability() {
     assert_eq!(r1.status, StatusCode::OK);
     assert_eq!(r1.body_text(), "ok");
 
-    // Let the gateway persist observations, then fire a second request.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let r2 = client
-        .get(&harness.proxy_url("/api/two"))
-        .await
-        .expect("r2");
-    assert_eq!(r2.status, StatusCode::OK);
-    assert_eq!(r2.body_text(), "ok");
-
-    // Backend assertions: the H2 pool probe negotiated http/1.1 on the
-    // warmup handshake. Subsequent reqwest-based requests may or may not
-    // advertise ALPN (reqwest keeps the h1-only path allocation-light), so
-    // we only assert that *at least one* ALPN negotiation resolved to
-    // http/1.1 across the full handshake history.
+    // Backend assertion: the H2 pool probe (warmup OR first request)
+    // negotiated http/1.1 on a TLS handshake. reqwest's h1 follow-on
+    // request may also advertise ALPN, so we only assert that *at least
+    // one* ALPN negotiation across the full handshake history resolved to
+    // http/1.1.
     let history = backend.all_alpn().await;
     let saw_http1 = history
         .iter()
@@ -463,18 +463,71 @@ async fn h2_alpn_fallback_downgrades_capability() {
         history
     );
 
-    // Log assertion: the "BackendSelectedHttp1" log line is the single most
-    // diagnostic signal that `mark_h2_tls_unsupported` fired and populated
-    // `is_known_http1_backend` — this is the regression test CLAUDE.md
-    // called out in the phase-1 plan.
+    // Capability-registry assertion: after the ALPN-driven classification,
+    // the single-proxy registry MUST contain exactly one entry with
+    // `h2_tls = "unsupported"` AND `h1 = "supported"`. This is the
+    // operator-facing source of truth — what `GET /backend-capabilities`
+    // returns drives the gateway's hot-path routing decision.
     //
-    // NOTE: this couples the test to the exact `BackendSelectedHttp1` error
-    // string in `Http2PoolError`. If that variant is renamed, update here.
-    // No stable test-visible counter exists yet — adding one is a reasonable
-    // Phase 2 improvement.
-    let logs = require_logs(&harness);
-    assert!(
-        logs.contains("BackendSelectedHttp1"),
-        "expected gateway log to mention BackendSelectedHttp1; logs:\n{logs}"
+    // Two paths can land us here, both with identical observable state:
+    //   • Warmup path: `probe_h2_tls` sees `BackendSelectedHttp1` and
+    //     classifies cleanly — `last_probe_error` is `null`.
+    //   • Request path: warmup didn't run / didn't observe ALPN, request
+    //     hits the H2 pool, `mark_h2_tls_unsupported` fires and stamps
+    //     `last_probe_error` with the "ALPN-negotiated HTTP/1.1" message.
+    // The hot-path semantics are identical for the two endpoints' `h2_tls`,
+    // `h1`, and `grpc_transport.h2_tls` fields, so we only assert on those.
+    let entry = wait_for_h2_downgraded_entry(&harness, Duration::from_secs(10))
+        .await
+        .expect("registry should record h2_tls=unsupported within timeout");
+    assert_eq!(
+        entry["plain_http"]["h2_tls"].as_str(),
+        Some("unsupported"),
+        "expected plain_http.h2_tls=unsupported after ALPN-driven downgrade; entry: {entry:#?}"
     );
+    assert_eq!(
+        entry["plain_http"]["h1"].as_str(),
+        Some("supported"),
+        "expected plain_http.h1=supported (HTTPS still works over h1); entry: {entry:#?}"
+    );
+    assert_eq!(
+        entry["grpc_transport"]["h2_tls"].as_str(),
+        Some("unsupported"),
+        "ALPN-driven downgrade marks both plain_http.h2_tls and grpc_transport.h2_tls; entry: {entry:#?}"
+    );
+
+    // Second request must still succeed via the reqwest http/1.1 fallback
+    // path now that the registry has steered the dispatcher away from the
+    // direct H2 pool.
+    let r2 = client
+        .get(&harness.proxy_url("/api/two"))
+        .await
+        .expect("r2");
+    assert_eq!(r2.status, StatusCode::OK);
+    assert_eq!(r2.body_text(), "ok");
+}
+
+/// Poll `GET /backend-capabilities` until exactly one entry exists AND its
+/// `plain_http.h2_tls` field is `"unsupported"`. Returns the entry on
+/// success, `None` on timeout. Mirrors the helper in
+/// `scripted_backend_h3_tests.rs` but waits for the post-downgrade state
+/// rather than just any populated entry.
+async fn wait_for_h2_downgraded_entry(
+    harness: &GatewayHarness,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(body) = harness.get_admin_json("/backend-capabilities").await
+            && let Some(entries) = body["entries"].as_array()
+            && let Some(entry) = entries.first()
+            && entry["plain_http"]["h2_tls"].as_str() == Some("unsupported")
+        {
+            return Some(entry.clone());
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

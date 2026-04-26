@@ -246,11 +246,29 @@ Deliverables:
 - `backend_bandwidth_below_budget_triggers_write_timeout` (when configured).
 - `high_latency_preserves_first_byte_latency_metrics`.
 
-### Phase 6 — Cross-protocol matrix macro (~3 days)
+### Phase 6 — Cross-protocol matrix macro (~3 days) — **DONE** (PR forthcoming)
 
 **Goal**: one scenario, N protocol combinations.
 
-Deliverables:
+Deliverables (shipped):
+
+- `tests/scaffolding/matrix.rs` — `gateway_matrix!` macro plus
+  `FrontendKind` (H1/H2/H3/WS/Grpc) and `BackendKind`
+  (H1/H2/H3/Grpc/Tcp/Udp) enums with helper methods (`spawn_refuse_connect`,
+  `spawn_accept_then_rst`, `send_get`, `assert_status`, `file_mode_yaml`,
+  `request_path`, `listen_path`).
+- Two demo invocations in
+  `tests/functional/scripted_backend_matrix_tests.rs`:
+  `backend_refuses_returns_502` and `backend_accepts_then_rst_returns_502`,
+  each generating one `#[tokio::test] #[ignore]` per
+  `(frontend, backend)` combination not in the supplied skip list.
+- Skip filter is implemented as a runtime gate inside each generated
+  test (rather than a tt-muncher comparison) — the macro_rules!
+  language can't compare two metavariables for equality, and the
+  runtime gate is one-line and deterministic. Skipped combinations
+  appear in `cargo test --list` as near-instant passes.
+
+Original plan example:
 
 - `gateway_matrix!` macro:
   ```rust
@@ -271,9 +289,36 @@ Deliverables:
   ```
   Expands to ~15 tests, each with its own `#[tokio::test]` function (for clean test-runner output).
 
-### Phase 7 — Scenario catalog (~ongoing)
+### Phase 7 — Scenario catalog (~ongoing) — **DONE** (PR forthcoming)
 
-**Goal**: populate `tests/scenarios/catalog.rs` with the ~30 pre-built failure scripts so tests are short:
+**Goal**: populate `tests/scenarios/catalog.rs` with the ~30 pre-built failure scripts so tests are short.
+
+Shipped catalog (each entry is a small constructor returning the most
+ergonomic shape — `Vec<TcpStep>` / `Vec<HttpStep>` / `TlsConfig` /
+backend-builder / `Result<ScriptedXxxBackend, _>` etc.):
+
+- **Connection-level**: `refuse_connect`, `accept_then_rst`,
+  `accept_then_fin_before_response`, `handshake_timeout`,
+  `handshake_then_close`.
+- **HTTP/1**: `slow_header_trickle`, `raw_status_trickle`,
+  `slow_body_trickle`, `respond_partial_body`,
+  `respond_with_wrong_content_length`, `send_malformed_chunked_encoding`,
+  `send_duplicate_content_length`, `respond_but_close_before_trailer`.
+- **TLS / cert**: `cert_expired`, `cert_san_mismatch`, `cert_self_signed`,
+  `cert_not_yet_valid`, `alpn_downgrade_h2_to_h1`, `alpn_only_http_1_1`.
+- **HTTP/2**: `h2_goaway_immediately`, `h2_stream_reset_mid_response`,
+  `h2_window_stall`.
+- **HTTP/3 / QUIC**: `quic_refuse`, `quic_drop_initial`,
+  `quic_connection_close`, `quic_stream_reset`.
+- **UDP / DTLS**: `udp_silent_backend`, `udp_amplification_attempt`,
+  `dtls_handshake_timeout`.
+- **Network conditions** (Phase-5 wrappers): `slow_link`, `bandwidth_limited`.
+- **Built-backend constructors**: `spawn_refusing_tcp_backend`,
+  `spawn_resetting_tcp_backend`, `spawn_close_before_status_backend`,
+  `spawn_h2_goaway_backend`, `spawn_grpc_missing_trailer_backend`,
+  `spawn_silent_udp_backend`.
+
+Plan-original list:
 
 - `refuse_connect()`, `accept_then_rst()`, `accept_then_fin_before_response()`
 - `slow_header_trickle(chunk_size, pause)`, `slow_body_trickle(...)`

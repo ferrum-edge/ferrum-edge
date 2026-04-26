@@ -141,7 +141,8 @@ pub struct ScriptedH3BackendBuilder {
 
 impl ScriptedH3BackendBuilder {
     /// Start a new builder against a pre-bound `UdpSocket`. Use
-    /// [`reserve_udp_port`] to obtain one without a drop-rebind race.
+    /// [`super::super::ports::reserve_udp_port`] to obtain one without a
+    /// drop-rebind race.
     pub fn new(udp: UdpSocket, tls: H3TlsConfig) -> Self {
         Self {
             udp,
@@ -611,67 +612,11 @@ async fn record_request(state: &Arc<H3BackendState>, req: &http::Request<()>) {
     state.requests.lock().await.push(recorded);
 }
 
-/// Reserve a UDP port wrapped in a `UdpSocket`. Mirrors
-/// [`super::super::ports::reserve_port`] for QUIC: the socket stays open
-/// until the caller hands it to the backend, avoiding the bind-drop-rebind
-/// race flagged in CLAUDE.md.
-pub async fn reserve_udp_port() -> std::io::Result<UdpSocketReservation> {
-    // Retry a few times — QUIC backends run in parallel tests and occasional
-    // EADDRINUSE is expected under load.
-    let mut last_err: Option<std::io::Error> = None;
-    for attempt in 0..10u32 {
-        match UdpSocket::bind("127.0.0.1:0").await {
-            Ok(sock) => {
-                let port = sock.local_addr()?.port();
-                return Ok(UdpSocketReservation { port, sock });
-            }
-            Err(e) => {
-                last_err = Some(e);
-                tokio::time::sleep(Duration::from_millis(10 * (attempt + 1) as u64)).await;
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            "exhausted UDP port reservation retries",
-        )
-    }))
-}
-
-/// A UDP port held by a live `UdpSocket` (analogous to `PortReservation`
-/// for TCP).
-pub struct UdpSocketReservation {
-    pub port: u16,
-    sock: UdpSocket,
-}
-
-impl UdpSocketReservation {
-    /// Wrap an arbitrary `(port, UdpSocket)` pair as a reservation. Used
-    /// when tests need to colocate a TCP listener and a UDP socket on the
-    /// same port — the TCP half comes from [`super::super::ports::reserve_port`],
-    /// and the UDP half is bound separately by the caller.
-    pub fn new(port: u16, sock: UdpSocket) -> Self {
-        Self { port, sock }
-    }
-
-    /// Consume the reservation and return the held socket.
-    pub fn into_socket(self) -> UdpSocket {
-        self.sock
-    }
-
-    /// Drop the socket (freeing the port) and return just the port number.
-    /// Only use this when handing the port to a subprocess that will itself
-    /// bind. Race-prone — prefer `into_socket` when possible.
-    pub fn drop_and_take_port(self) -> u16 {
-        self.port
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scaffolding::certs::TestCa;
+    use crate::scaffolding::ports::reserve_udp_port;
 
     #[tokio::test]
     async fn tls_config_requires_tls_13_ciphers() {

@@ -583,9 +583,7 @@ pub async fn serve(
         let st = admin_state.clone();
         let sh = shutdown_tx.subscribe();
         let h = tokio::spawn(async move {
-            if let Err(e) =
-                admin::start_admin_listener_with_bound_listener(listener, st, sh, None).await
-            {
+            if let Err(e) = admin::serve_admin_on_listener(listener, st, sh, None).await {
                 error!("Admin HTTP listener error: {}", e);
             }
         });
@@ -629,9 +627,7 @@ pub async fn serve(
                     let sh = shutdown_tx.subscribe();
                     let cfg = Some(admin_tls_config);
                     let h = tokio::spawn(async move {
-                        if let Err(e) =
-                            admin::start_admin_listener_with_bound_listener(listener, st, sh, cfg)
-                                .await
+                        if let Err(e) = admin::serve_admin_on_listener(listener, st, sh, cfg).await
                         {
                             error!("Admin HTTPS listener error: {}", e);
                         }

@@ -27,7 +27,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use super::http3::{H3TlsConfig, UdpSocketReservation};
+use super::super::ports::UdpPortReservation;
+use super::http3::H3TlsConfig;
 
 /// A running QUIC "refuser" backend. Drop shuts it down.
 pub struct QuicRefuser {
@@ -41,10 +42,12 @@ pub struct QuicRefuser {
 impl QuicRefuser {
     /// Start a QUIC refuser that closes every incoming connection with
     /// `code=0` (`NO_ERROR`) immediately after accept. The UDP socket must
-    /// be pre-bound via [`super::http3::reserve_udp_port`] to avoid the
-    /// bind-drop-rebind race.
+    /// be pre-bound via [`super::super::ports::reserve_udp_port`] (or
+    /// [`super::super::ports::reserve_colocated_tcp_udp`] when the test
+    /// also needs a co-located TCP backend) to avoid the bind-drop-rebind
+    /// race.
     pub fn start(
-        reservation: UdpSocketReservation,
+        reservation: UdpPortReservation,
         tls: H3TlsConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Self::start_with_alpn(reservation, tls, vec![b"h3".to_vec()])
@@ -56,14 +59,14 @@ impl QuicRefuser {
     /// us but refused the H3 negotiation" path rather than a raw
     /// `CONNECTION_CLOSE`.
     pub fn start_alpn_mismatch(
-        reservation: UdpSocketReservation,
+        reservation: UdpPortReservation,
         tls: H3TlsConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Self::start_with_alpn(reservation, tls, vec![b"no-h3".to_vec()])
     }
 
     fn start_with_alpn(
-        reservation: UdpSocketReservation,
+        reservation: UdpPortReservation,
         tls: H3TlsConfig,
         alpn: Vec<Vec<u8>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -197,8 +200,8 @@ impl Drop for QuicRefuser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scaffolding::backends::http3::reserve_udp_port;
     use crate::scaffolding::certs::TestCa;
+    use crate::scaffolding::ports::reserve_udp_port;
 
     #[tokio::test]
     async fn start_reports_bind_address() {
