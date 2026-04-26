@@ -485,6 +485,66 @@ fn test_http3_coalesce_min_allows_large_value_when_max_raised() {
 }
 
 #[test]
+fn test_h3_request_body_drain_ms_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_H3_REQUEST_BODY_DRAIN_MS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.h3_request_body_drain_ms, 50);
+        },
+    );
+}
+
+#[test]
+fn test_h3_request_body_drain_ms_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_H3_REQUEST_BODY_DRAIN_MS", "200"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.h3_request_body_drain_ms, 200);
+        },
+    );
+}
+
+#[test]
+fn test_h3_request_body_drain_ms_zero_disables() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_H3_REQUEST_BODY_DRAIN_MS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.h3_request_body_drain_ms, 0);
+        },
+    );
+}
+
+#[test]
+fn test_h3_request_body_drain_ms_clamped_above_cap() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_H3_REQUEST_BODY_DRAIN_MS", "5000"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.h3_request_body_drain_ms, 1000);
+        },
+    );
+}
+
+#[test]
 fn test_http3_coalesce_min_non_numeric_rejected() {
     with_env_vars(
         &[

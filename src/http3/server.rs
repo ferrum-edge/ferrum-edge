@@ -2849,7 +2849,9 @@ async fn proxy_to_backend_h3(
     }
 }
 
-/// Send an HTTP/3 response with a body.
+/// Send an HTTP/3 response with a body. Halts the request-body recv half
+/// before returning so an in-flight client upload does not surface as
+/// `RESET_STREAM(0x0)` when this `RequestStream` is later dropped.
 async fn send_h3_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
@@ -2865,10 +2867,12 @@ async fn send_h3_response(
         .send_data(Bytes::copy_from_slice(body.as_bytes()))
         .await?;
     stream.finish().await?;
+    crate::http3::stream_util::halt_request_body(stream);
     Ok(())
 }
 
-/// Send an HTTP/3 rejection response with custom headers.
+/// Send an HTTP/3 rejection response with custom headers. Same recv-half
+/// halt contract as `send_h3_response`.
 async fn send_h3_reject_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
@@ -2892,6 +2896,7 @@ async fn send_h3_reject_response(
     stream.send_response(resp).await?;
     stream.send_data(Bytes::copy_from_slice(body)).await?;
     stream.finish().await?;
+    crate::http3::stream_util::halt_request_body(stream);
     Ok(())
 }
 
@@ -2899,6 +2904,7 @@ async fn send_h3_reject_response(
 /// HTTP 200 with `grpc-status` and `grpc-message` in the header block and
 /// an empty body. Used when a gRPC request is rejected before dispatch so
 /// the client sees a valid gRPC error instead of a raw HTTP/JSON payload.
+/// Same recv-half halt contract as `send_h3_response`.
 async fn send_h3_grpc_error(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     grpc_status: u32,
@@ -2913,6 +2919,7 @@ async fn send_h3_grpc_error(
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC error response: {}", e))?;
     stream.send_response(resp).await?;
     stream.finish().await?;
+    crate::http3::stream_util::halt_request_body(stream);
     Ok(())
 }
 
@@ -2990,6 +2997,7 @@ async fn send_h3_reject_flavor_aware(
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC reject response: {}", e))?;
     stream.send_response(resp).await?;
     stream.finish().await?;
+    crate::http3::stream_util::halt_request_body(stream);
     Ok(())
 }
 
