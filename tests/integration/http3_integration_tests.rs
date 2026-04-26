@@ -1023,3 +1023,233 @@ async fn test_http3_connection_performance() {
         info!("HTTP/3 performance test completed successfully");
     }
 }
+
+/// Verify that a buffered H3 response survives a post-response
+/// CONNECTION_CLOSE(H3_NO_ERROR). The script sends headers + body, waits for
+/// them to propagate, then explicitly closes the connection with H3_NO_ERROR
+/// (0x100) WITHOUT calling stream.finish(). This means the stream has no FIN —
+/// recv_data() MUST hit the Err branch and recover via the graceful-close
+/// predicate. The test is deterministic on all platforms because there is no
+/// FIN to race against.
+#[tokio::test]
+async fn h3_buffered_response_survives_graceful_close_race() {
+    use crate::scaffolding::backends::{H3Step, H3TlsConfig, ScriptedH3Backend};
+    use crate::scaffolding::certs::TestCa;
+    use crate::scaffolding::ports::reserve_udp_port;
+
+    init_crypto_provider();
+
+    let ca = TestCa::new("h3-close-race").expect("test CA");
+    let (cert, key) = ca.valid().expect("leaf cert");
+
+    let udp = reserve_udp_port().await.expect("reserve udp port");
+    let port = udp.port;
+    let backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(&cert, &key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", "12".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(
+            b"ok-from-h3-b",
+        )))
+        // Let response data propagate before closing.
+        .step(H3Step::StallFor(std::time::Duration::from_millis(50)))
+        // Explicit graceful close — skips stream.finish(), so no FIN on the
+        // stream. The client's recv_data() will see Err(H3_NO_ERROR) instead
+        // of Ok(None), exercising the fix deterministically.
+        .step(H3Step::CloseConnectionWithCode(0x100))
+        .spawn()
+        .expect("spawn scripted H3 backend");
+
+    // Build a rustls client config that trusts the test CA.
+    let provider = rustls::crypto::ring::default_provider();
+    let mut root_store = rustls::RootCertStore::empty();
+    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+        .filter_map(|c| c.ok())
+        .collect();
+    for cert_der in &ca_certs {
+        root_store.add(cert_der.clone()).expect("add CA cert");
+    }
+    let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let h3_client = ferrum_edge::http3::client::Http3Client::new(Arc::new(client_tls), None)
+        .expect("H3 client");
+
+    let mut proxy = create_http3_test_proxy();
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = port;
+    proxy.backend_tls_verify_server_cert = true;
+
+    let url = format!("https://127.0.0.1:{}/", port);
+    let headers = vec![(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{}", port)).unwrap(),
+    )];
+
+    let (status, body, _headers) = h3_client
+        .request(&proxy, "GET", &url, headers, bytes::Bytes::new())
+        .await
+        .expect("request should succeed despite post-response CONNECTION_CLOSE");
+
+    assert_eq!(status, 200);
+    assert_eq!(body, b"ok-from-h3-b");
+    assert_eq!(backend.accepted_handshakes(), 1);
+    assert_eq!(
+        backend.connection_close_sent(),
+        1,
+        "explicit CloseConnectionWithCode must fire"
+    );
+
+    drop(backend);
+}
+
+/// Verify that a stream-level RESET_STREAM(H3_NO_ERROR) after a partial body
+/// is NOT treated as graceful. `SendStreamReset` aborts the individual stream
+/// (the server decided to stop sending), whereas `CONNECTION_CLOSE` is a
+/// connection-level close that doesn't invalidate already-sent data. h3's
+/// `is_h3_no_error()` intentionally does not match `RemoteTerminate`, so the
+/// fix must not recover here — the response is incomplete.
+#[tokio::test]
+async fn h3_stream_reset_after_partial_body_is_not_treated_as_graceful() {
+    use crate::scaffolding::backends::{H3Step, H3TlsConfig, ScriptedH3Backend};
+    use crate::scaffolding::certs::TestCa;
+    use crate::scaffolding::ports::reserve_udp_port;
+
+    init_crypto_provider();
+
+    let ca = TestCa::new("h3-reset-negative").expect("test CA");
+    let (cert, key) = ca.valid().expect("leaf cert");
+
+    let udp = reserve_udp_port().await.expect("reserve udp port");
+    let port = udp.port;
+    let _backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(&cert, &key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", "24".to_string()),
+        ]))
+        // Send only half the promised body, then reset the stream.
+        .step(H3Step::RespondData(bytes::Bytes::from_static(
+            b"partial-data",
+        )))
+        .step(H3Step::StallFor(std::time::Duration::from_millis(50)))
+        .step(H3Step::SendStreamReset(0x100))
+        .spawn()
+        .expect("spawn scripted H3 backend");
+
+    let provider = rustls::crypto::ring::default_provider();
+    let mut root_store = rustls::RootCertStore::empty();
+    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+        .filter_map(|c| c.ok())
+        .collect();
+    for cert_der in &ca_certs {
+        root_store.add(cert_der.clone()).expect("add CA cert");
+    }
+    let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let h3_client = ferrum_edge::http3::client::Http3Client::new(Arc::new(client_tls), None)
+        .expect("H3 client");
+
+    let mut proxy = create_http3_test_proxy();
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = port;
+    proxy.backend_tls_verify_server_cert = true;
+
+    let url = format!("https://127.0.0.1:{}/", port);
+    let headers = vec![(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{}", port)).unwrap(),
+    )];
+
+    let result = h3_client
+        .request(&proxy, "GET", &url, headers, bytes::Bytes::new())
+        .await;
+
+    assert!(
+        result.is_err(),
+        "stream reset after partial body must NOT be treated as graceful: {result:?}"
+    );
+}
+
+/// Verify that GOAWAY after a complete body is treated as graceful, same as
+/// CONNECTION_CLOSE(H3_NO_ERROR). Per RFC 9114 §5.2, GOAWAY is a graceful
+/// signal and in-progress streams should complete. If FIN+GOAWAY coalesce,
+/// recv_data returns RemoteClosing instead of Ok(None); the fix recovers
+/// when the body is already complete.
+#[tokio::test]
+async fn h3_goaway_after_complete_body_is_treated_as_graceful() {
+    use crate::scaffolding::backends::{H3Step, H3TlsConfig, ScriptedH3Backend};
+    use crate::scaffolding::certs::TestCa;
+    use crate::scaffolding::ports::reserve_udp_port;
+
+    init_crypto_provider();
+
+    let ca = TestCa::new("h3-goaway-graceful").expect("test CA");
+    let (cert, key) = ca.valid().expect("leaf cert");
+
+    let udp = reserve_udp_port().await.expect("reserve udp port");
+    let port = udp.port;
+    let _backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(&cert, &key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", "12".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(
+            b"ok-from-h3-b",
+        )))
+        .step(H3Step::StallFor(std::time::Duration::from_millis(50)))
+        // GOAWAY tells the client "no new streams"; existing streams should
+        // complete. Without the fix, recv_data surfaces RemoteClosing → 502.
+        .step(H3Step::SendGoaway(0))
+        .spawn()
+        .expect("spawn scripted H3 backend");
+
+    let provider = rustls::crypto::ring::default_provider();
+    let mut root_store = rustls::RootCertStore::empty();
+    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+        .filter_map(|c| c.ok())
+        .collect();
+    for cert_der in &ca_certs {
+        root_store.add(cert_der.clone()).expect("add CA cert");
+    }
+    let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let h3_client = ferrum_edge::http3::client::Http3Client::new(Arc::new(client_tls), None)
+        .expect("H3 client");
+
+    let mut proxy = create_http3_test_proxy();
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = port;
+    proxy.backend_tls_verify_server_cert = true;
+
+    let url = format!("https://127.0.0.1:{}/", port);
+    let headers = vec![(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{}", port)).unwrap(),
+    )];
+
+    let (status, body, _headers) = h3_client
+        .request(&proxy, "GET", &url, headers, bytes::Bytes::new())
+        .await
+        .expect("request should succeed despite post-response GOAWAY");
+
+    assert_eq!(status, 200);
+    assert_eq!(body, b"ok-from-h3-b");
+}

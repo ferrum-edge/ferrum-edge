@@ -152,6 +152,93 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
     }
 }
 
+/// Cap on Content-Length-driven `Vec` pre-allocation for buffered H3 response
+/// bodies. Bounds the worst case when a malicious or misconfigured backend
+/// sends a huge `content-length` header — the actual body can still grow past
+/// this via `extend_from_slice`, but the initial reservation is capped.
+pub(crate) const H3_BODY_PREALLOC_CAP_BYTES: u64 = 1024 * 1024;
+
+/// Drain an H3 response stream into a `Vec<u8>`, tolerating a post-body
+/// graceful close signal. Two variants are recovered:
+///
+/// - `CONNECTION_CLOSE(H3_NO_ERROR)` — matched by `is_h3_no_error()`. The
+///   common case: backend finishes the response and tears down the connection.
+/// - `GOAWAY` — surfaces as `StreamError::RemoteClosing`. Per RFC 9114 §5.2,
+///   GOAWAY is graceful and in-progress streams should complete. If FIN+GOAWAY
+///   coalesce, recv_data returns `RemoteClosing` instead of `Ok(None)`.
+///
+/// Note: `StreamError::RemoteTerminate { code: H3_NO_ERROR }` (stream-level
+/// reset) is NOT recovered — a stream reset means the server aborted this
+/// particular stream, whereas the connection-level signals above don't
+/// invalidate already-sent data.
+pub(crate) async fn drain_h3_response_body(
+    stream: &mut H3RequestStream,
+    method: &str,
+    status: u16,
+    content_length: Option<u64>,
+) -> Result<Vec<u8>, h3::error::StreamError> {
+    let mut body = match content_length {
+        Some(cl) => Vec::with_capacity(cl.min(H3_BODY_PREALLOC_CAP_BYTES) as usize),
+        None => Vec::new(),
+    };
+    loop {
+        match stream.recv_data().await {
+            Ok(Some(chunk)) => body.extend_from_slice(chunk.chunk()),
+            Ok(None) => break,
+            Err(e) => {
+                if is_h3_graceful_close(&e)
+                    && is_response_body_complete(body.len() as u64, method, status, content_length)
+                {
+                    debug!(
+                        bytes_received = body.len(),
+                        "H3 recv_data hit graceful close after complete body; treating as success"
+                    );
+                    break;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(body)
+}
+
+/// Whether `e` is a connection-level graceful-close signal that may legally
+/// follow a complete response body: `CONNECTION_CLOSE(H3_NO_ERROR)` or
+/// `GOAWAY` (RFC 9114 §5.1, §5.2). Stream-level resets (`RemoteTerminate`)
+/// are intentionally NOT considered graceful — the server aborted the stream.
+///
+/// The `RemoteClosing` (GOAWAY) variant is `#[non_exhaustive]` and h3 marks
+/// the unit variant itself unconstructible from outside the crate, so it
+/// cannot be matched by name. We fall back to its `Display` string (stable
+/// in h3 0.0.8); any future wording change is caught by
+/// `h3_goaway_after_complete_body_is_treated_as_graceful`.
+pub(crate) fn is_h3_graceful_close(e: &h3::error::StreamError) -> bool {
+    e.is_h3_no_error() || e.to_string() == "Remote is closing the connection"
+}
+
+/// Whether the received body is semantically complete for this response.
+///
+/// Uses exact equality for Content-Length-delimited bodies — an overlong body
+/// (more bytes than declared) is malformed and must not be accepted as
+/// "complete". HEAD, 204, and 304 responses have no body by definition
+/// (RFC 9110 §6.4.1, §15.3.5, §15.4.5) and are complete when empty.
+/// Returns `false` when Content-Length is absent and the response normally
+/// carries a body, since completeness cannot be determined without the FIN.
+pub(crate) fn is_response_body_complete(
+    body_len: u64,
+    method: &str,
+    status: u16,
+    content_length: Option<u64>,
+) -> bool {
+    if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
+        return body_len == 0;
+    }
+    match content_length {
+        Some(declared) => body_len == declared,
+        None => false,
+    }
+}
+
 /// Type alias for the h3 send request handle.
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 
@@ -1018,19 +1105,17 @@ impl Http3ConnectionPool {
             }
         }
 
-        let mut response_body = Vec::new();
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(chunk)) => response_body.extend_from_slice(chunk.chunk()),
-                Ok(None) => break,
-                Err(e) => {
-                    return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                        "recv_data failed: {}",
-                        e
-                    )));
-                }
-            }
-        }
+        let content_length: Option<u64> = response_headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok());
+
+        // Body-on-wire semantics: `send_request` already returned Ok by this
+        // point, so any recv_data error is post_wire. Recovery for graceful
+        // CONNECTION_CLOSE(H3_NO_ERROR) / GOAWAY after a complete body lives
+        // inside `drain_h3_response_body`.
+        let response_body = drain_h3_response_body(&mut stream, method, status, content_length)
+            .await
+            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_data failed: {}", e)))?;
 
         Ok((status, response_body, response_headers))
     }
@@ -2007,10 +2092,12 @@ impl Http3Client {
         }
 
         // Collect response body
-        let mut response_body = Vec::new();
-        while let Some(chunk) = stream.recv_data().await? {
-            response_body.extend_from_slice(chunk.chunk());
-        }
+        let content_length: Option<u64> = response_headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok());
+
+        let response_body =
+            drain_h3_response_body(&mut stream, method, status, content_length).await?;
 
         Ok((status, response_body, response_headers))
     }

@@ -1586,17 +1586,21 @@ async fn handle_h3_request(
                     match chunk_result {
                         Ok(Some(chunk)) => {
                             let chunk_bytes = chunk.chunk();
-                            if state.max_response_body_size_bytes > 0 {
-                                total_streamed += chunk_bytes.len();
-                                if total_streamed > state.max_response_body_size_bytes {
-                                    warn!(
-                                        "Backend response exceeded {} byte limit during streaming",
-                                        state.max_response_body_size_bytes
-                                    );
-                                    let _ = stream.finish().await;
-                                    body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
-                                    break 'outer;
-                                }
+                            // Always count received bytes — the graceful-close
+                            // recovery below uses this to decide if the body is
+                            // semantically complete, even when the body-size
+                            // limit is disabled (FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0).
+                            total_streamed += chunk_bytes.len();
+                            if state.max_response_body_size_bytes > 0
+                                && total_streamed > state.max_response_body_size_bytes
+                            {
+                                warn!(
+                                    "Backend response exceeded {} byte limit during streaming",
+                                    state.max_response_body_size_bytes
+                                );
+                                let _ = stream.finish().await;
+                                body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                                break 'outer;
                             }
                             coalesce_buf.extend_from_slice(chunk_bytes);
                             if coalesce_buf.len() >= coalesce_min_bytes {
@@ -1613,17 +1617,33 @@ async fn handle_h3_request(
                         }
                         Ok(None) => { stream_done = true; }
                         Err(e) => {
-                            error!("Error reading backend h3 response during streaming: {}", e);
-                            if !coalesce_buf.is_empty() {
-                                let data = coalesce_buf.split().freeze();
-                                let data_len = data.len() as u64;
-                                if stream.send_data(data).await.is_ok() {
-                                    bytes_streamed += data_len;
+                            let cl: Option<u64> = response_headers
+                                .get("content-length")
+                                .and_then(|v| v.parse().ok());
+                            let received = total_streamed as u64;
+                            if crate::http3::client::is_h3_graceful_close(&e)
+                                && crate::http3::client::is_response_body_complete(
+                                    received, &method, response_status, cl,
+                                )
+                            {
+                                debug!(
+                                    bytes_received = received,
+                                    "H3 streaming recv_data hit graceful close after complete body; treating as success"
+                                );
+                                stream_done = true;
+                            } else {
+                                error!("Error reading backend h3 response during streaming: {}", e);
+                                if !coalesce_buf.is_empty() {
+                                    let data = coalesce_buf.split().freeze();
+                                    let data_len = data.len() as u64;
+                                    if stream.send_data(data).await.is_ok() {
+                                        bytes_streamed += data_len;
+                                    }
                                 }
+                                let _ = stream.finish().await;
+                                body_error_class = Some(crate::http3::client::classify_http3_error(&e));
+                                break 'outer;
                             }
-                            let _ = stream.finish().await;
-                            body_error_class = Some(crate::http3::client::classify_http3_error(&e));
-                            break 'outer;
                         }
                     }
                 }
@@ -2666,18 +2686,22 @@ async fn proxy_to_backend_h3_streaming(
                 match chunk_result {
                     Ok(Some(chunk)) => {
                         let chunk_bytes = chunk.chunk();
-                        if state.max_response_body_size_bytes > 0 {
-                            total_streamed += chunk_bytes.len();
-                            if total_streamed > state.max_response_body_size_bytes {
-                                warn!(
-                                    "Backend response exceeded {} byte limit during streaming",
-                                    state.max_response_body_size_bytes
-                                );
-                                let _ = h3_stream.finish().await;
-                                terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
-                                body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
-                                break 'outer;
-                            }
+                        // Always count received bytes — the graceful-close
+                        // recovery below uses this to decide if the body is
+                        // semantically complete, even when the body-size
+                        // limit is disabled (FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0).
+                        total_streamed += chunk_bytes.len();
+                        if state.max_response_body_size_bytes > 0
+                            && total_streamed > state.max_response_body_size_bytes
+                        {
+                            warn!(
+                                "Backend response exceeded {} byte limit during streaming",
+                                state.max_response_body_size_bytes
+                            );
+                            let _ = h3_stream.finish().await;
+                            terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                            body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                            break 'outer;
                         }
 
                         coalesce_buf.extend_from_slice(chunk_bytes);
@@ -2698,19 +2722,35 @@ async fn proxy_to_backend_h3_streaming(
                         stream_done = true;
                     }
                     Err(e) => {
-                        error!("Error reading backend h3 response during streaming: {}", e);
-                        if !coalesce_buf.is_empty() {
-                            let data = coalesce_buf.split().freeze();
-                            let data_len = data.len() as u64;
-                            if h3_stream.send_data(data).await.is_ok() {
-                                bytes_streamed += data_len;
+                        let cl: Option<u64> = response_headers
+                            .get("content-length")
+                            .and_then(|v| v.parse().ok());
+                        let received = total_streamed as u64;
+                        if crate::http3::client::is_h3_graceful_close(&e)
+                            && crate::http3::client::is_response_body_complete(
+                                received, method, response_status, cl,
+                            )
+                        {
+                            debug!(
+                                bytes_received = received,
+                                "H3 streaming recv_data hit graceful close after complete body; treating as success"
+                            );
+                            stream_done = true;
+                        } else {
+                            error!("Error reading backend h3 response during streaming: {}", e);
+                            if !coalesce_buf.is_empty() {
+                                let data = coalesce_buf.split().freeze();
+                                let data_len = data.len() as u64;
+                                if h3_stream.send_data(data).await.is_ok() {
+                                    bytes_streamed += data_len;
+                                }
                             }
+                            let _ = h3_stream.finish().await;
+                            let class = crate::http3::client::classify_http3_error(&e);
+                            terminal_error_class = Some(class);
+                            body_error_class = Some(class);
+                            break 'outer;
                         }
-                        let _ = h3_stream.finish().await;
-                        let class = crate::http3::client::classify_http3_error(&e);
-                        terminal_error_class = Some(class);
-                        body_error_class = Some(class);
-                        break 'outer;
                     }
                 }
             }

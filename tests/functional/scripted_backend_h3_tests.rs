@@ -1147,7 +1147,22 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
     .expect("spawn tls");
 
     // Real H3 backend that records the inbound `:authority` + headers.
-    // Accept stream, send 200 + 2-byte body.
+    // Accept stream, send 200 + 2-byte body, then hold the connection open
+    // briefly before the implicit script-end drop.
+    //
+    // The StallFor is load-bearing: without it, the script's end-of-loop
+    // drop closes the connection immediately after `RespondData`, which on
+    // Linux + io_uring (CI) coalesces the CONNECTION_CLOSE(H3_NO_ERROR)
+    // into the same UDP burst as the HEADERS+DATA+FIN. quinn then surfaces
+    // the close to the gateway's H3 client BEFORE h3 finishes parsing the
+    // HEADERS frame, so `recv_response()` returns
+    // `Err(ApplicationClose: H3_NO_ERROR)` — the gateway 502s and
+    // `mark_h3_unsupported` fires, and this Host-header assertion never
+    // gets the chance to run. Same coalescing race the PR's
+    // `drain_h3_response_body` recovery handles at `recv_data`, but at the
+    // `recv_response` boundary instead — which can't be made transparent
+    // (there are no synthesizable headers). 50ms is comfortably more than
+    // any plausible single-host gateway read latency for an empty path.
     let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
         .step(H3Step::AcceptStream)
         .step(H3Step::RespondHeaders(vec![
@@ -1156,6 +1171,7 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
             ("content-type", "text/plain".to_string()),
         ]))
         .step(H3Step::RespondData(bytes::Bytes::from_static(b"ok")))
+        .step(H3Step::StallFor(Duration::from_millis(50)))
         .spawn()
         .expect("spawn h3 backend");
 

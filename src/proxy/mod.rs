@@ -44,7 +44,7 @@ pub mod udp_batch;
 pub mod udp_proxy;
 
 use arc_swap::ArcSwap;
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
@@ -9136,48 +9136,53 @@ async fn proxy_to_backend_http3(
                             let status = response.status;
                             let response_headers = response.headers;
                             let mut recv_stream = response.recv_stream;
-                            let mut response_body = Vec::new();
-                            loop {
-                                match recv_stream.recv_data().await {
-                                    Ok(Some(chunk)) => {
-                                        response_body.extend_from_slice(chunk.chunk())
-                                    }
-                                    Ok(None) => break,
-                                    Err(e) => {
-                                        let (error_kind, error_class) = classify_h3_error(&e);
-                                        // We have already received response
-                                        // headers and started reading the
-                                        // body — the request was on the wire
-                                        // and the backend already processed
-                                        // it. `connection_error=false`
-                                        // unconditionally so a mid-body
-                                        // QUIC failure does not bypass
-                                        // `retry_on_methods`.
-                                        error!(
-                                            proxy_id = %proxy.id,
-                                            backend_url = %backend_url,
-                                            error_kind = error_kind,
-                                            error = %e,
-                                            "HTTP/3 backend buffered response read failed"
-                                        );
-                                        return (
-                                            retry::BackendResponse {
-                                                status_code: 502,
-                                                body: ResponseBody::Buffered(
-                                                    r#"{"error":"HTTP/3 backend request failed"}"#
-                                                        .as_bytes()
-                                                        .to_vec(),
-                                                ),
-                                                headers: HashMap::new(),
-                                                connection_error: false,
-                                                backend_resolved_ip: resolved_ip,
-                                                error_class: Some(error_class),
-                                            },
-                                            None,
-                                        );
-                                    }
+                            let content_length: Option<u64> = response_headers
+                                .get("content-length")
+                                .and_then(|v| v.parse().ok());
+
+                            let response_body = match crate::http3::client::drain_h3_response_body(
+                                &mut recv_stream,
+                                method,
+                                status,
+                                content_length,
+                            )
+                            .await
+                            {
+                                Ok(body) => body,
+                                Err(e) => {
+                                    let (error_kind, error_class) = classify_h3_error(&e);
+                                    // We have already received response headers and
+                                    // started reading the body — the request was on
+                                    // the wire and the backend already processed it.
+                                    // `connection_error=false` unconditionally so a
+                                    // mid-body QUIC failure does not bypass
+                                    // `retry_on_methods`. Graceful close after a
+                                    // complete body is recovered inside
+                                    // `drain_h3_response_body` and never reaches here.
+                                    error!(
+                                        proxy_id = %proxy.id,
+                                        backend_url = %backend_url,
+                                        error_kind = error_kind,
+                                        error = %e,
+                                        "HTTP/3 backend buffered response read failed"
+                                    );
+                                    return (
+                                        retry::BackendResponse {
+                                            status_code: 502,
+                                            body: ResponseBody::Buffered(
+                                                r#"{"error":"HTTP/3 backend request failed"}"#
+                                                    .as_bytes()
+                                                    .to_vec(),
+                                            ),
+                                            headers: HashMap::new(),
+                                            connection_error: false,
+                                            backend_resolved_ip: resolved_ip,
+                                            error_class: Some(error_class),
+                                        },
+                                        None,
+                                    );
                                 }
-                            }
+                            };
 
                             debug!(
                                 proxy_id = %proxy.id,
