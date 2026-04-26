@@ -68,6 +68,43 @@ fn is_post_eof_benign_write_error(side: StreamIoSide, kind: std::io::ErrorKind) 
         )
 }
 
+/// Second piece of evidence for the close-race reclassification: both
+/// directions of the relay must have successfully transferred at least one
+/// byte. Without this, "opposite half EOF + this side benign write error"
+/// is too permissive — it admits cases that look identical at the TCP
+/// layer but are genuine truncations rather than the tail of a clean
+/// close dance.
+///
+/// Cases this guard filters (which would otherwise be silently
+/// reclassified as `GracefulShutdown`):
+///
+/// * **Backend closes before responding to a client upload** — c2b
+///   transferred partial upload bytes, then backend FIN'd before
+///   processing. b2c never delivered any response (`b2c_bytes == 0`),
+///   so `c2b_bytes > 0 && b2c_bytes == 0`. Real backend failure;
+///   operators must see it.
+/// * **Client connects and immediately half-closes its write side**
+///   without sending anything (port scanner, premature abort). Backend
+///   may try to push data and hit `BrokenPipe`. Both counters stay 0.
+/// * **Connection setup that never carried application traffic** at all
+///   on either direction — same `c2b == 0 && b2c == 0` shape.
+///
+/// What this guard does **not** filter (still reclassified as graceful,
+/// which is a deliberate TCP-layer-level limitation): a *symmetric*
+/// mid-response disconnect where both directions had transferred bytes
+/// but the response was truncated. That case is indistinguishable at the
+/// TCP layer from a clean close-race tail; only an application-protocol-
+/// aware proxy (HTTP plugin observing `Content-Length`, gRPC noticing
+/// missing trailers, etc.) can flag it.
+///
+/// The bench scenario this PR was written for (wrk2 emitting 1 client
+/// error per 70 KB / 500 KB payload after the full request *and*
+/// response delivered cleanly) trivially passes the guard — both
+/// directions have non-zero counters by the time the close race fires.
+fn both_directions_transferred(c2b_bytes: &AtomicU64, b2c_bytes: &AtomicU64) -> bool {
+    c2b_bytes.load(Ordering::Relaxed) > 0 && b2c_bytes.load(Ordering::Relaxed) > 0
+}
+
 // Shared error-message prefixes used at `anyhow::anyhow!` construction sites
 // AND at the `error_message.contains(...)` check sites in
 // `pre_copy_disconnect_cause` / `dtls_disconnect_cause`. Keeping them as
@@ -2167,20 +2204,27 @@ where
                 Direction::ClientToBackend,
                 c2b_write_watermark,
                 backend_write_timeout_ms,
+                &c2b_bytes,
+                &b2c_bytes,
             )
             .await;
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
                 Ok(Ok(())) => {
                     // Phase 1 errored on b2c but c2b completed cleanly in
-                    // the grace window. If the Phase 1 error was a benign
-                    // write-after-close (precise raw-`io::ErrorKind` check
-                    // captured at Phase 1 time — see
-                    // `phase1_benign_write_candidate`), we now know the
-                    // opposite half EOF'd cleanly: the session shut down
-                    // gracefully and Phase 1's write error was just the
-                    // close race tail.
-                    if phase1_benign_write_candidate {
+                    // the grace window. Reclassify as graceful only if:
+                    //   (a) the Phase 1 error was a benign write-after-close
+                    //       (precise raw-`io::ErrorKind` check captured at
+                    //       Phase 1 time — see `phase1_benign_write_candidate`),
+                    //   AND
+                    //   (b) both directions actually transferred bytes — this
+                    //       filters the "backend died before responding"
+                    //       and "connection never carried traffic" cases
+                    //       that would otherwise be silently re-labelled
+                    //       as graceful (see `both_directions_transferred`).
+                    if phase1_benign_write_candidate
+                        && both_directions_transferred(&c2b_bytes, &b2c_bytes)
+                    {
                         first_failure = None;
                     }
                 }
@@ -2217,13 +2261,17 @@ where
                 Direction::BackendToClient,
                 b2c_read_watermark,
                 backend_read_timeout_ms,
+                &c2b_bytes,
+                &b2c_bytes,
             )
             .await;
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
                 Ok(Ok(())) => {
                     // Symmetric to the c2b grace path — see comment above.
-                    if phase1_benign_write_candidate {
+                    if phase1_benign_write_candidate
+                        && both_directions_transferred(&c2b_bytes, &b2c_bytes)
+                    {
                         first_failure = None;
                     }
                 }
@@ -2279,6 +2327,8 @@ async fn drain_half_close_copy<F>(
     direction: Direction,
     direction_watermark: Option<&AtomicU64>,
     direction_timeout_ms: u64,
+    c2b_bytes: &AtomicU64,
+    b2c_bytes: &AtomicU64,
 ) -> Option<(Direction, ErrorClass, Option<StreamIoSide>, String)>
 where
     F: std::future::Future<Output = Result<(), (StreamIoSide, std::io::Error)>> + Unpin,
@@ -2293,9 +2343,15 @@ where
                 if let Err((side, e)) = result {
                     // Opposite half already EOF'd cleanly (drain_half_close_copy
                     // precondition). A benign write-after-close here is the tail
-                    // of graceful shutdown, not a transport failure — return
-                    // `None` so the caller records DisconnectCause::GracefulShutdown.
-                    if is_post_eof_benign_write_error(side, e.kind()) {
+                    // of graceful shutdown — but only if both directions
+                    // actually transferred bytes. Without that second piece of
+                    // evidence we'd silently re-label "client connected and
+                    // immediately half-closed" or "backend died before
+                    // responding" (asymmetric truncation) as graceful and
+                    // hide real failures from operator dashboards.
+                    if is_post_eof_benign_write_error(side, e.kind())
+                        && both_directions_transferred(c2b_bytes, b2c_bytes)
+                    {
                         return None;
                     }
                     let msg = e.to_string();
