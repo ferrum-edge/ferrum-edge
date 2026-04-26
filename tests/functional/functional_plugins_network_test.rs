@@ -373,28 +373,52 @@ async fn compression_handles_mid_stream_backend_close_without_corrupting_output(
                 return; // pass: clean error
             }
             if content_encoding.as_deref() == Some("gzip") {
+                // Empty gzip body with content-encoding: gzip is a
+                // contradiction — the gateway claimed compressed output
+                // but produced nothing. That's a corruption signal we
+                // explicitly want to catch, not silently accept.
+                assert!(
+                    !bytes.is_empty(),
+                    "gateway emitted `content-encoding: gzip` with an empty body; \
+                     this is a regression — either omit the header or send a \
+                     valid (possibly truncated) gzip stream"
+                );
                 // Try to decode; partial truncation should still be a
                 // valid gzip stream up to the truncation point — gzip
-                // is a streaming format. If decode succeeds (even
-                // partially), pass.
+                // is a streaming format.
                 use std::io::Read;
                 let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
                 let mut decoded = Vec::new();
-                let r = decoder.read_to_end(&mut decoded);
+                let decode_result = decoder.read_to_end(&mut decoded);
                 eprintln!(
                     "test3 gzip decode result: {:?}, decoded_len={}",
-                    r,
+                    decode_result,
                     decoded.len()
                 );
-                // Gzip streams are tolerant of truncation — the decoder
-                // can return Err on truncated trailer but the produced
-                // bytes are still valid prefix data. We assert that
-                // either the full payload decoded OR at least no garbage
-                // was produced (decoded.iter().all(|b| *b == b'A')).
+                // Truncated gzip streams typically fail at the trailer
+                // check but still produce valid prefix bytes before the
+                // error. We require decoded bytes to be non-empty (a
+                // malformed stream that produces zero output before
+                // erroring is the corruption case the reviewer flagged
+                // — without this check, `decoded.iter().all(...)` would
+                // pass vacuously).
                 assert!(
-                    decoded.iter().all(|b| *b == b'A'),
-                    "expected only valid 'A' bytes in decoded gzip stream; got {} non-A bytes",
-                    decoded.iter().filter(|b| **b != b'A').count()
+                    !decoded.is_empty(),
+                    "gzip decoder produced zero output bytes from a non-empty \
+                     gzip body ({} bytes in); decode_result={decode_result:?}. \
+                     This means the gateway emitted bytes that the gzip decoder \
+                     could not interpret as ANY valid prefix — output corruption.",
+                    bytes.len()
+                );
+                // And every decoded byte must come from the backend's
+                // 'A' payload — anything else is corruption.
+                let non_a = decoded.iter().filter(|b| **b != b'A').count();
+                assert_eq!(
+                    non_a,
+                    0,
+                    "expected only valid 'A' bytes in decoded gzip stream; \
+                     got {non_a} non-A bytes out of {} decoded; decode_result={decode_result:?}",
+                    decoded.len()
                 );
             } else {
                 // Uncompressed body — the gateway abandoned compression

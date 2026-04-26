@@ -1126,27 +1126,25 @@ async fn request_count_above_threshold_returns_503() {
     teardown(gw, stop).await;
 }
 
-/// Phase-8 Test 9: gRPC overload rejection returns trailer-only
-/// `UNAVAILABLE` (gRPC status 14), not HTTP 503.
+/// Phase-8 Test 9: gRPC overload rejection returns gRPC `UNAVAILABLE`
+/// (status 14), not a bare HTTP 503.
 ///
 /// We send a request with `Content-Type: application/grpc` to the gateway's
 /// gRPC proxy. Once the gateway is in critical request-count pressure, the
-/// overload-rejection path should produce an HTTP/2 trailer-only response
-/// with `grpc-status: 14`. We assert on the response status (HTTP/1.1
-/// frontend will see 200 with grpc-status trailer in HTTP/2; this test
-/// uses HTTP/1.1, but the gateway still produces trailer-only responses
-/// where possible).
+/// overload-rejection path calls `build_grpc_error_response(UNAVAILABLE,
+/// "Service overloaded")` (`src/proxy/grpc_proxy.rs`), which emits:
 ///
-/// The gateway tests the request's content-type up front and short-
-/// circuits the overload reject as a gRPC error. We assert by reading the
-/// response and confirming either:
-///   1. HTTP/2 trailer-only with `grpc-status: 14` and HTTP 200, or
-///   2. HTTP/1.1: gateway emits a body that contains `grpc-status: 14`
-///      either in trailer (via TE: trailers) or as a header.
+///   * HTTP status 200
+///   * `content-type: application/grpc`
+///   * `grpc-status: 14` HEADER (HTTP/1.1 can't carry trailers reliably,
+///     so the gateway emits gRPC status as a regular header)
+///   * `grpc-message: Service overloaded`
 ///
-/// CONNECT/h2c upgrade isn't always available in the test harness, so we
-/// hit the proxy as plain HTTP/1.1 with gRPC content-type and check the
-/// response's gateway-emitted indicators.
+/// The gateway short-circuits via `is_grpc_request()` (content-type check)
+/// before the regular HTTP 503 path runs. The pass criterion below requires
+/// the actual gRPC signal (`grpc-status: 14` header) — accepting bare HTTP
+/// 503 would mask a regression where the gateway forgets to special-case
+/// gRPC content-types in the overload reject path.
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grpc_overload_returns_grpc_status_unavailable_not_http_503() {
@@ -1183,14 +1181,18 @@ async fn grpc_overload_returns_grpc_status_unavailable_not_http_503() {
     }
     sleep(Duration::from_millis(1000)).await;
 
-    // Probe: send an HTTP/1.1 request with gRPC content-type. We'd prefer
-    // an HTTP/2 client but the gateway emits a sane response on HTTP/1.1
-    // too — typically still a 503 + a body indicating the gRPC failure
-    // class (the gateway can't emit trailers on HTTP/1.1). We accept ONE of:
-    //   * trailer-only `grpc-status: 14` (h2 / h2c)
-    //   * 503 + body / header containing `grpc-status` text
-    //   * HTTP 200 with `grpc-status: 14` header (some code paths set the
-    //     header directly under HTTP/1.1)
+    // Probe: send an HTTP/1.1 request with gRPC content-type. The gateway's
+    // overload reject path detects `application/grpc` and emits HTTP 200
+    // with `grpc-status: 14` and `grpc-message` as headers (HTTP/1.1 can't
+    // carry trailers on a hyper-built response, so the gateway emits the
+    // gRPC status as a header, which is what gRPC clients fall back to
+    // checking when no trailers arrive).
+    //
+    // PASS CRITERION (mandatory): `grpc-status: 14` header MUST be present.
+    // We do NOT accept a bare HTTP 503 — that would mean the gateway took
+    // the generic HTTP reject path and forgot to short-circuit on the gRPC
+    // content-type, which is exactly the regression this test is meant to
+    // catch.
     let probe_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .pool_max_idle_per_host(0)
@@ -1212,23 +1214,31 @@ async fn grpc_overload_returns_grpc_status_unavailable_not_http_503() {
         if let Ok(r) = resp {
             let status = r.status().as_u16();
             // Capture the headers BEFORE consuming the response so the
-            // `grpc-status` header check survives `text()` consumption.
+            // `grpc-status` / `grpc-message` checks survive `text()`.
             let grpc_status_hdr = r
                 .headers()
                 .get("grpc-status")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
+            let grpc_message_hdr = r
+                .headers()
+                .get("grpc-message")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let content_type_hdr = r
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let body = r.text().await.unwrap_or_default();
-            last_summary =
-                format!("status={status} grpc_status={grpc_status_hdr:?} body_excerpt={body:.80}");
-            // Acceptable outcomes:
-            // * grpc-status header == "14"
-            // * body contains the literal `grpc-status` string and 14
-            // * HTTP 503 with the gateway producing the standard reject
-            if grpc_status_hdr.as_deref() == Some("14")
-                || body.contains("grpc-status")
-                || status == 503
-            {
+            last_summary = format!(
+                "status={status} content_type={content_type_hdr:?} \
+                 grpc_status={grpc_status_hdr:?} grpc_message={grpc_message_hdr:?} \
+                 body_excerpt={body:.80}"
+            );
+            // The ONLY acceptable success signal is the gRPC marker. A
+            // bare 503 with no grpc-status header is treated as failure.
+            if grpc_status_hdr.as_deref() == Some("14") {
                 got_grpc_overload = true;
                 break;
             }
@@ -1237,8 +1247,11 @@ async fn grpc_overload_returns_grpc_status_unavailable_not_http_503() {
     }
     assert!(
         got_grpc_overload,
-        "gRPC overload should produce a gRPC-flavored rejection (grpc-status=14 or 503); \
-         last response: {last_summary}"
+        "gRPC overload must produce a `grpc-status: 14` header on the response \
+         (HTTP/1.1 can't carry trailers, so the gateway emits gRPC status as \
+         a regular header). Bare HTTP 503 without gRPC markers is NOT acceptable \
+         — it indicates the overload reject path forgot to short-circuit on the \
+         gRPC content-type. Last response: {last_summary}"
     );
 
     for f in inflight {
