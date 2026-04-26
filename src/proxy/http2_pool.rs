@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -410,17 +411,25 @@ impl Http2ConnectionPool {
         write_http2_pool_key(&mut key_buf, &proxy.backend_host, proxy.backend_port, proxy);
         let base_len = key_buf.len();
 
+        // Round-robin counter is per-host, but on FIRST access we seed it with
+        // a thread-local PRNG offset so a burst of concurrent requests on a
+        // cold pool does not land all on shard 0 before the atomic counter
+        // wraps around. `AtomicUsize::fetch_add(1, Relaxed)` is wait-free
+        // after the seed — the seed only matters for the first `shard_count`
+        // picks per host on this gateway.
         let rr = match self.rr_counters.get(&key_buf) {
             Some(existing) => existing.value().clone(),
             None => self
                 .rr_counters
                 .entry(key_buf[..base_len].to_owned())
-                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .or_insert_with(|| Arc::new(AtomicUsize::new(rr_seed())))
                 .clone(),
         };
         let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
 
-        let mut first_live: Option<(String, http2::SendRequest<Incoming>)> = None;
+        // Cheap probe pass — any shard whose cached sender is immediately
+        // ready wins. `now_or_never` never awaits, so this is a quick sweep
+        // of the shard ring with no per-shard stall.
         for offset in 0..shard_count {
             let shard = (start + offset) % shard_count;
             Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
@@ -431,20 +440,18 @@ impl Http2ConnectionPool {
                     Some(Err(_)) => {
                         self.pool.invalidate(&key_buf);
                     }
-                    None => {
-                        if first_live.is_none() {
-                            first_live = Some((key_buf.clone(), sender));
-                        }
-                    }
+                    // Shard exists but is mid-send. Previously we stashed
+                    // the first such sender and `timeout(5ms, ready())`ed
+                    // on it, which serialized ~100-concurrent bursts onto
+                    // the already-busy shard and net-pessimized throughput
+                    // (5 MB/100-conc HTTP/2 stuck at 81 RPS vs direct 232).
+                    // Skip — we would rather open a fresh connection than
+                    // wait on this one. `create_or_get_existing_owned` is
+                    // per-key-coalesced, so a burst of concurrent callers
+                    // for the same shard key dedupes onto ONE create future
+                    // (no thundering herd).
+                    None => {}
                 }
-            }
-        }
-
-        if let Some((key, mut sender)) = first_live {
-            match tokio::time::timeout(Duration::from_millis(5), sender.ready()).await {
-                Ok(Ok(())) => return Ok(sender),
-                Ok(Err(_)) => self.pool.invalidate(&key),
-                Err(_) => {}
             }
         }
 
@@ -473,6 +480,55 @@ impl Http2ConnectionPool {
         };
         Ok(sender)
     }
+}
+
+/// Thread-local PRNG used to seed per-host round-robin counters on first
+/// access so cold-start bursts spread across shards from request #1 rather
+/// than all funneling onto shard 0. Uses xorshift64 for zero heap traffic
+/// and nanosecond seed time. Shared with `grpc_proxy::GrpcConnectionPool`
+/// so both H2 pools seed their counters from the same draw stream.
+pub(crate) fn rr_seed() -> usize {
+    thread_local! {
+        static STATE: Cell<u64> = const { Cell::new(0) };
+    }
+    STATE.with(|cell| {
+        let mut s = cell.get();
+        if s == 0 {
+            // Mix the thread id with the monotonic time so different
+            // threads/workers start on different shards. Falling back to
+            // `1` on the astronomically unlikely case where the product
+            // is zero keeps the generator from getting stuck on 0.
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(1);
+            let tid = thread_id_mix();
+            s = nanos ^ tid;
+            if s == 0 {
+                s = 1;
+            }
+        }
+        // xorshift64 — one multiply-free round, good enough for a uniform
+        // shard offset.
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        cell.set(s);
+        s as usize
+    })
+}
+
+/// Mix the current thread id into a `u64` using a stable per-call hash
+/// of the `Debug` repr. `ThreadId::as_u64` is unstable; this avoids the
+/// nightly-only API while still giving each worker a distinct seed.
+fn thread_id_mix() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let id = std::thread::current().id();
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    // `ThreadId` implements Hash; feed it directly.
+    std::hash::Hash::hash(&id, &mut h);
+    h.finish()
 }
 
 /// Classify an `Http2PoolError` into the shared `ErrorClass` taxonomy.
@@ -874,6 +930,152 @@ impl Http2PoolError {
             // message. The dispatching caller routes via reqwest on this
             // variant rather than surfacing the message to clients.
             Self::BackendSelectedHttp1 { .. } => "backend does not support http/2",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline tests for private internals of the HTTP/2 connection pool.
+    //!
+    //! These test helpers that are `pub(crate)` at best — promoting them to
+    //! `pub` solely for `tests/` access would expose them on the crate's
+    //! external API, which we want to avoid.
+    //!
+    //! The functional behaviour of `get_sender` (burst concurrency against a
+    //! live backend) is exercised in `tests/integration/http2_pool_tests.rs`;
+    //! the tests below target the specific code-path changes in
+    //! `perf/h2-pool-sender-ready-and-grpc-trailer-stall`.
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Fix 2: the thread-local PRNG that seeds per-host RR counters should
+    /// produce non-zero draws. Seeding with `0` would make all cold bursts
+    /// land on shard 0, which is the bug we are fixing.
+    #[test]
+    fn rr_seed_is_non_zero() {
+        for _ in 0..64 {
+            assert_ne!(rr_seed(), 0, "rr_seed() must never return 0");
+        }
+    }
+
+    /// Fix 2: consecutive draws from the same thread should differ — the
+    /// seed is persisted in a `Cell<u64>` and stepped once per call.
+    /// `thread_local!` means the Cell persists across calls from the same
+    /// thread; xorshift64 has period ~2^64 - 1 so a collision in a tiny
+    /// sample is astronomically unlikely.
+    #[test]
+    fn rr_seed_draws_diverge_within_thread() {
+        let mut seen = HashSet::new();
+        for _ in 0..32 {
+            seen.insert(rr_seed());
+        }
+        // 32 independent xorshift draws should all be distinct.
+        assert_eq!(
+            seen.len(),
+            32,
+            "expected 32 distinct RR seeds, got {}",
+            seen.len()
+        );
+    }
+
+    /// Fix 2: even when `shard_count` is small (e.g., 4), the seeded RR
+    /// counter should cover all shards within a few draws — not get stuck
+    /// on one position. This validates that the modulo distribution is
+    /// not degenerate on common shard counts.
+    #[test]
+    fn rr_seed_spans_all_shards_for_small_shard_counts() {
+        for &shard_count in &[2usize, 4, 8, 16] {
+            let mut visited = vec![false; shard_count];
+            // 64 draws is ~16x the shard count — coupon-collector
+            // expectation says every shard is hit with overwhelming
+            // probability. If the seed is deterministic and modular bias
+            // is pathological we would miss a shard.
+            let mut rr = AtomicUsize::new(rr_seed());
+            for _ in 0..64 {
+                let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
+                visited[start] = true;
+                // Recreate the counter occasionally so we emulate the
+                // cold-start seed path on many distinct hosts.
+                if rand_lite().is_multiple_of(8) {
+                    rr = AtomicUsize::new(rr_seed());
+                }
+            }
+            assert!(
+                visited.iter().all(|v| *v),
+                "shard_count={} should have visited all shards, got {:?}",
+                shard_count,
+                visited
+            );
+        }
+    }
+
+    /// Bare-bones pseudo-random helper for the test above. Reads from the
+    /// thread-local state directly by re-calling `rr_seed`.
+    fn rand_lite() -> usize {
+        rr_seed()
+    }
+
+    /// Fix 1: source-level assertion that the 5 ms timeout branch has
+    /// been removed from `get_sender`. Protects against a future re-add
+    /// of the `tokio::time::timeout(Duration::from_millis(5), ...)` pattern.
+    ///
+    /// We read our own source file at compile time (`include_str!`) and
+    /// check that no line contains the regression pattern. This is a
+    /// belt-and-braces guard — cheaper and more specific than a runtime
+    /// benchmark, and catches the accidental revert immediately.
+    #[test]
+    fn no_five_millisecond_sender_ready_wait() {
+        let src = include_str!("http2_pool.rs");
+        let mut in_test_mod = false;
+        for (i, line) in src.lines().enumerate() {
+            // Skip the test module itself — the assertion string below
+            // would otherwise match.
+            if line.contains("#[cfg(test)]") {
+                in_test_mod = true;
+            }
+            if in_test_mod {
+                continue;
+            }
+            assert!(
+                !line.contains("Duration::from_millis(5)"),
+                "regression: found `Duration::from_millis(5)` at line {} — \
+                 the 5 ms sender-ready wait was removed on purpose (see Fix 1 \
+                 in perf/h2-pool-sender-ready-and-grpc-trailer-stall). \
+                 Open a new connection via `create_or_get_existing_owned` \
+                 instead of stalling on a busy shard's `ready()`.",
+                i + 1
+            );
+        }
+    }
+
+    /// Fix 1: source-level assertion that `first_live` stash has been
+    /// removed. The previous control flow cached the first non-ready
+    /// sender into `first_live`, then timed out on it — deleting this
+    /// path is the essence of Fix 1.
+    #[test]
+    fn no_first_live_stash_in_get_sender() {
+        let src = include_str!("http2_pool.rs");
+        let mut in_test_mod = false;
+        for (i, line) in src.lines().enumerate() {
+            if line.contains("#[cfg(test)]") {
+                in_test_mod = true;
+            }
+            if in_test_mod {
+                continue;
+            }
+            // Allow the pattern inside comments — we only care about the
+            // binding itself.
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            assert!(
+                !line.contains("first_live"),
+                "regression: `first_live` stash detected at line {}. \
+                 Fix 1 removed this branch; restore fix before re-adding.",
+                i + 1
+            );
         }
     }
 }

@@ -711,3 +711,212 @@ async fn test_grpc_unmatched_path_returns_grpc_error() {
     let grpc_status = headers.get("grpc-status").expect("should have grpc-status");
     assert_eq!(grpc_status, "5", "Route miss should map to NOT_FOUND (5)");
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Fix 4 regression tests: gRPC server-streaming response with retry
+// configured should NOT buffer the entire response body before emitting
+// trailers. Before the fix, `grpc_should_stream = !grpc_has_retry && ...`
+// forced buffering whenever any retry policy was present, which held
+// `grpc-status` trailer behind the final data frame and produced the
+// 500 KB p99 = 732 ms pattern observed in CI.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Mock gRPC backend that sends a configurable number of DATA frames with
+/// a delay between each, then a trailers-only response. Used to exercise
+/// the streaming-response path with a visible gap between body and trailer
+/// arrival — if the gateway were buffering, the trailer wall-clock would
+/// trail the first data frame by at least N × per-frame delay.
+///
+/// Implemented as a driven `mpsc` channel rather than `async_stream` since
+/// the workspace does not depend on `async-stream`. A backend task sends
+/// Frames into the channel with the configured delay; a tokio-stream
+/// wrapper converts the Receiver into a Stream for `StreamBody`.
+async fn start_streaming_grpc_backend(
+    num_frames: usize,
+    frame_size: usize,
+    per_frame_delay: Duration,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let _ = stream.set_nodelay(true);
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let builder = Http2ServerBuilder::new(TokioExecutor::new());
+
+                let service = service_fn(move |_req: Request<Incoming>| async move {
+                    // Channel capacity = 1 so the sender blocks after each
+                    // enqueued frame until the gateway actually consumes
+                    // it — this is what makes the delay visible end-to-
+                    // end. If the channel were unbounded, the sender
+                    // would dump all frames into the buffer and the
+                    // apparent spread would collapse.
+                    let (tx, rx) = tokio::sync::mpsc::channel::<
+                        Result<Frame<Bytes>, std::convert::Infallible>,
+                    >(1);
+
+                    tokio::spawn(async move {
+                        for i in 0..num_frames {
+                            if i > 0 {
+                                tokio::time::sleep(per_frame_delay).await;
+                            }
+                            let bytes = vec![b'X'; frame_size];
+                            if tx.send(Ok(Frame::data(Bytes::from(bytes)))).await.is_err() {
+                                return;
+                            }
+                        }
+                        // Terminal trailers frame.
+                        let mut trailers = hyper::HeaderMap::new();
+                        trailers.insert(
+                            hyper::header::HeaderName::from_static("grpc-status"),
+                            hyper::header::HeaderValue::from_static("0"),
+                        );
+                        trailers.insert(
+                            hyper::header::HeaderName::from_static("grpc-message"),
+                            hyper::header::HeaderValue::from_static("OK"),
+                        );
+                        let _ = tx.send(Ok(Frame::trailers(trailers))).await;
+                    });
+
+                    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                    let body = StreamBody::new(stream);
+
+                    let response = Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(body)
+                        .unwrap();
+
+                    Ok::<_, hyper::Error>(response)
+                });
+
+                if let Err(e) = builder.serve_connection(io, service).await {
+                    eprintln!("Streaming backend connection error: {}", e);
+                }
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, handle)
+}
+
+/// Fix 4: with retry configured, a gRPC server-streaming response with
+/// multiple data frames separated by delays must still reach the client
+/// as distinct frames — the `grpc-status` trailer must NOT be delayed by
+/// having the entire body buffered gateway-side.
+///
+/// Assertion strategy: consume the response frame-by-frame on the client
+/// side and record the timestamp each frame arrives. If the gateway is
+/// buffering, ALL frames (and the trailer) will land together after
+/// `num_frames × per_frame_delay`. If streaming, the first frame arrives
+/// quickly and later frames are spread out roughly by `per_frame_delay`.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_retry_enabled_does_not_stall_trailers_behind_streaming_body() {
+    use std::time::Instant;
+
+    // 5 data frames × 100 ms = 500 ms total body time. If the gateway
+    // buffers we would see ALL frames arrive in a 500 ms burst at the
+    // end, so the gap between first and last arrival would be ~0 ms.
+    // If streaming, the gap should be ≥ 300 ms.
+    const NUM_FRAMES: usize = 5;
+    const FRAME_SIZE: usize = 1024;
+    const PER_FRAME_DELAY_MS: u64 = 100;
+
+    let (backend_addr, _backend_handle) = start_streaming_grpc_backend(
+        NUM_FRAMES,
+        FRAME_SIZE,
+        Duration::from_millis(PER_FRAME_DELAY_MS),
+    )
+    .await;
+
+    let mut proxy = create_grpc_proxy("grpc-stream", "/grpc", backend_addr.port());
+    // Configure retry — before Fix 4 this would force buffering.
+    proxy.retry = Some(ferrum_edge::config::types::RetryConfig {
+        max_retries: 2,
+        retryable_status_codes: vec![502, 503],
+        retryable_methods: vec!["POST".to_string()],
+        backoff: Default::default(),
+        retry_on_connect_failure: true,
+    });
+    let state = create_test_proxy_state(vec![proxy]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    // Send a request through the gateway using hyper's H2 client so we
+    // can drive the response body frame-by-frame.
+    use hyper::client::conn::http2;
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/grpc/my.Service/StreamingEcho")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(Bytes::from_static(b"")))
+        .unwrap();
+
+    let t_start = Instant::now();
+    let response = sender.send_request(req).await.expect("request send failed");
+    assert_eq!(response.status(), 200);
+
+    // Drive the body frame-by-frame.
+    let mut body = response.into_body();
+    let mut arrival_times: Vec<Duration> = Vec::new();
+    let mut saw_trailer = false;
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.expect("frame error");
+        let arrival = t_start.elapsed();
+        arrival_times.push(arrival);
+        if frame.is_trailers() {
+            saw_trailer = true;
+        }
+    }
+
+    assert!(saw_trailer, "client did not observe a trailers frame");
+    assert!(
+        arrival_times.len() >= NUM_FRAMES,
+        "expected at least {} frames, got {}",
+        NUM_FRAMES,
+        arrival_times.len()
+    );
+
+    // If the gateway is buffering, first and last frame arrivals will
+    // be within a few ms of each other (all land after the full body
+    // is collected). If streaming, the spread should roughly equal
+    // the inter-frame delay times (num_frames - 1).
+    let first = arrival_times.first().copied().unwrap();
+    let last = arrival_times.last().copied().unwrap();
+    let spread = last.saturating_sub(first);
+
+    // Require at least 60 % of the synthetic delay window to be observed
+    // — this is comfortably above buffered-mode's ~0 ms spread and
+    // robust to scheduler jitter.
+    let expected_spread_ms = ((NUM_FRAMES as u64 - 1) * PER_FRAME_DELAY_MS) * 6 / 10;
+    assert!(
+        spread.as_millis() as u64 >= expected_spread_ms,
+        "streamed-response trailer stall: arrival spread {} ms is below \
+         the {} ms threshold expected for {}-frame × {} ms delay. \
+         Raw timings: {:?}",
+        spread.as_millis(),
+        expected_spread_ms,
+        NUM_FRAMES,
+        PER_FRAME_DELAY_MS,
+        arrival_times
+    );
+}

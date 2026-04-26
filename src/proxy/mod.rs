@@ -171,6 +171,43 @@ pub(crate) fn should_stream_response_body(
     }
 }
 
+/// Fix 5: decide whether a plain-HTTPS direct-H2 response body should skip
+/// the `CoalescingH2Body` adapter and stream through hyper's `Incoming`
+/// directly.
+///
+/// Bypass is safe when:
+///   * `content-length` is known (we can size-check up-front), AND
+///   * it is ≥ 512 KiB (backend is already emitting large H2 frames —
+///     `http2_max_frame_size` is 1 MiB in our build — so coalescing just
+///     adds a `BytesMut::extend_from_slice` copy that the large-frame
+///     bypass at `body.rs:~1184` would skip anyway), AND
+///   * the size fits within `max_response_body_size_bytes` (or the limit
+///     is disabled). Outside that window we keep the coalescer so any
+///     upstream size enforcement still wraps the body.
+///
+/// Does NOT apply to the gRPC streaming response path — CLAUDE.md
+/// documents a +35 % gRPC large-payload win from coalescing, so that path
+/// deliberately stays on `CoalescingH2Body`.
+///
+/// Threshold is 512 KiB: below that the coalescer's per-frame amortisation
+/// dominates; above that the backend's own frame size already matches or
+/// exceeds the coalesce target of 128 KiB so coalescing is a net copy.
+pub(crate) fn should_bypass_h2_coalesce_for_large_response(
+    content_length: Option<u64>,
+    max_response_body_size_bytes: usize,
+) -> bool {
+    /// Responses smaller than this retain the coalescer — per-frame
+    /// writer amortisation still helps the downstream H2 send path.
+    const LARGE_H2_BYPASS_THRESHOLD: u64 = 512 * 1024;
+
+    let Some(len) = content_length else {
+        return false;
+    };
+    let within_limit =
+        max_response_body_size_bytes == 0 || len <= max_response_body_size_bytes as u64;
+    len >= LARGE_H2_BYPASS_THRESHOLD && within_limit
+}
+
 fn warn_if_h3_backend_tls_policy_incompatible(
     config: &GatewayConfig,
     tls_policy: Option<&TlsPolicy>,
@@ -5529,24 +5566,47 @@ async fn handle_proxy_request_inner(
         );
         let backend_start = Instant::now();
 
-        // Streaming is safe only when the current request has no effective
-        // retries and no plugin (or explicit response_body_mode) needs the
-        // response body buffered.
+        // Streaming-response safety:
+        //   * Retries are triggered by CONNECTION errors (BackendUnavailable,
+        //     BackendTimeout::Connect) that fire BEFORE response headers
+        //     arrive. Once headers arrive we have already committed to a
+        //     single attempt — response-body streaming does not prevent
+        //     retry, so retry alone is NOT a reason to buffer.
+        //   * The REQUEST body still has to be collected up-front when
+        //     retry is configured (caller side), so the retry loop can
+        //     replay it. `proxy_grpc_request` preserves the collected
+        //     request bytes regardless of the `stream_response` flag.
+        //   * Streaming IS unsafe when a plugin (or explicit
+        //     `response_body_mode = Buffer`) requires the full response
+        //     body in memory to make an admission decision.
+        //
+        // Fixing the old `!grpc_has_retry &&` gate eliminates the
+        // trailer-stall on server-streaming RPCs where retry was
+        // configured: previously the gateway collected every data frame
+        // into a Vec before surfacing `grpc-status`, which turned a
+        // stream-of-small-frames RPC into a "wait for the whole body"
+        // pattern (500 KB p99 = 732 ms under 100 concurrency).
         let grpc_has_retry = crate::retry::can_retry_connection_failures(proxy.retry.as_ref());
-        let grpc_should_stream = !grpc_has_retry
-            && should_stream_response_body(
-                &proxy,
-                &plugins,
-                &ctx,
-                state
-                    .plugin_cache
-                    .requires_response_body_buffering(&proxy.id),
-            );
+        let grpc_should_stream = should_stream_response_body(
+            &proxy,
+            &plugins,
+            &ctx,
+            state
+                .plugin_cache
+                .requires_response_body_buffering(&proxy.id),
+        );
 
         // When plugins need request body access (e.g., protobuf validation),
         // collect the body first, run hooks, then dispatch to backend.
         // Otherwise, use the fast combined collect+dispatch path.
         let grpc_needs_request_body_hooks = requires_request_body_buffering;
+        // `proxy_grpc_request_streaming` streams BOTH the request AND the
+        // response, which means the request body is consumed on the wire
+        // and cannot be replayed — incompatible with retry. Gate it on
+        // `!grpc_has_retry` so retry-enabled streaming proxies still flow
+        // via `proxy_grpc_request` (collects request body up-front,
+        // streams response frame-by-frame).
+        let grpc_can_use_streaming_fast_path = grpc_should_stream && !grpc_has_retry;
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
             let request = match client_request_body {
@@ -5626,7 +5686,18 @@ async fn handle_proxy_request_inner(
                 }
             }
 
-            // Dispatch to backend with pre-collected body bytes
+            // Dispatch to backend with pre-collected body bytes.
+            //
+            // The collected request body must be returned to the caller
+            // regardless of `grpc_should_stream` — retries fire on
+            // CONNECTION errors that occur BEFORE response headers, so the
+            // streaming-or-not choice for the response has no bearing on
+            // whether the request body needs to be replayable. Returning
+            // `Bytes::new()` here on the streaming branch silently fed the
+            // retry loop an empty body whenever a body-hook proxy also had
+            // `retry_on_connect_failure` enabled. Mirrors the same
+            // single-return contract documented in
+            // `proxy_grpc_request`.
             let result = grpc_proxy::proxy_grpc_request_core(
                 grpc_method,
                 grpc_headers,
@@ -5639,11 +5710,7 @@ async fn handle_proxy_request_inner(
                 grpc_should_stream,
             )
             .await;
-            if grpc_should_stream {
-                (result, Bytes::new())
-            } else {
-                (result, grpc_req_body)
-            }
+            (result, grpc_req_body)
         } else {
             // Fast path: no plugin body hooks needed
             let request = match client_request_body {
@@ -5656,9 +5723,10 @@ async fn handle_proxy_request_inner(
                     ));
                 }
             };
-            if grpc_should_stream {
-                // Streaming fast path: forward request body frame-by-frame
-                // without collecting. No retries possible, no body plugins.
+            if grpc_can_use_streaming_fast_path {
+                // Fully streaming fast path: forward request body frame-by-
+                // frame without collecting. No retries possible (request
+                // body consumed on wire) and no body plugins.
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
                     &proxy,
@@ -5671,7 +5739,10 @@ async fn handle_proxy_request_inner(
                 .await;
                 (result, Bytes::new())
             } else {
-                // Buffered path: collect body for potential retries
+                // Mixed path: collect request body up-front (required for
+                // retry replay) but propagate the streaming decision to the
+                // response so trailers reach the client immediately when
+                // the response path is safe to stream.
                 grpc_proxy::proxy_grpc_request(
                     request,
                     &proxy,
@@ -5779,6 +5850,16 @@ async fn handle_proxy_request_inner(
                     "Retrying gRPC backend request"
                 );
 
+                // Stream the retry response under the same conditions as
+                // the initial attempt. The retry loop only fires on
+                // CONNECTION errors that surface BEFORE response headers
+                // (`BackendUnavailable` / `BackendTimeout::Connect`) — once
+                // a response begins, this loop breaks out and never touches
+                // the body, so passing `grpc_should_stream=true` here is
+                // safe and necessary to keep the trailer-stall fix that
+                // motivates this PR working when the very first connect
+                // hiccups (otherwise a transient TCP RST silently downgrades
+                // a streaming RPC to fully buffered).
                 grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
                     grpc_method.clone(),
                     grpc_req_headers.clone(),
@@ -5788,7 +5869,7 @@ async fn handle_proxy_request_inner(
                     &state.grpc_pool,
                     &state.dns_cache,
                     proxy_headers,
-                    false, // retries always buffer so the response can be inspected
+                    grpc_should_stream,
                 )
                 .await;
             }
@@ -6996,7 +7077,40 @@ async fn handle_proxy_request_inner(
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
+            // Plain-HTTPS direct-H2 large-response fast path.
+            //
+            // The backend's H2 writer already emits `http2_max_frame_size`
+            // chunks (default 1 MiB). For small/medium responses the
+            // coalescer usefully amortises the per-frame write cost on
+            // the downstream client side; but for large responses
+            // (>= 512 KiB) the backend frames are already big enough that
+            // coalescing them into 128 KiB target chunks just adds a
+            // `BytesMut::extend_from_slice` copy before the pre-existing
+            // large-frame bypass at `body.rs:~1184` would skip it anyway.
+            // That copy was the remaining gap for 5 MB HTTP/2 throughput
+            // (81 RPS vs direct 232 RPS).
+            //
+            // Decision made ONCE per response using `content-length` — we
+            // only bypass when the size is known AND large. Unknown CL
+            // keeps the coalescer (we cannot be sure frames are already
+            // 1 MiB when the backend is chunked).
+            //
+            // gRPC still uses the coalescing path (see gRPC streaming
+            // response at ~line 5905) because gRPC's +35 % large-payload
+            // win is documented in CLAUDE.md and depends on coalescing.
+            let use_passthrough = should_bypass_h2_coalesce_for_large_response(
+                cl,
+                state.max_response_body_size_bytes,
+            );
+
             if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
+                crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
+            } else if use_passthrough {
+                // Response too large to benefit from coalescing — stream
+                // direct, let hyper forward 1 MiB frames as-is. Saves the
+                // `BytesMut::extend_from_slice` copy that CoalescingH2Body
+                // would do on every data frame before the large-frame
+                // bypass kicks in at body.rs:~1184.
                 crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
             } else {
                 crate::proxy::body::coalescing_h2_body(
@@ -9804,5 +9918,204 @@ mod tests {
             false,
             Some(retry::ErrorClass::RequestBodyTooLarge)
         )));
+    }
+
+    // ── Fix 5: `should_bypass_h2_coalesce_for_large_response` ───────────
+    // Validates the per-response decision that steers plain-HTTPS
+    // direct-H2 responses away from `CoalescingH2Body` when the
+    // backend is already emitting large frames (response >= 512 KiB).
+
+    #[test]
+    fn h2_coalesce_bypass_skips_large_known_length_when_unlimited() {
+        // 1 MiB response, no cap → bypass.
+        assert!(super::should_bypass_h2_coalesce_for_large_response(
+            Some(1_048_576),
+            0
+        ));
+    }
+
+    #[test]
+    fn h2_coalesce_bypass_skips_exactly_at_threshold() {
+        // Threshold is 512 KiB; exactly 512 KiB should qualify (>=, not >).
+        assert!(super::should_bypass_h2_coalesce_for_large_response(
+            Some(512 * 1024),
+            0
+        ));
+    }
+
+    #[test]
+    fn h2_coalesce_bypass_keeps_coalescer_for_small_response() {
+        // Under 512 KiB → coalescer still wins.
+        assert!(!super::should_bypass_h2_coalesce_for_large_response(
+            Some(64 * 1024),
+            0
+        ));
+        // 256 KiB is still under threshold.
+        assert!(!super::should_bypass_h2_coalesce_for_large_response(
+            Some(256 * 1024),
+            0
+        ));
+    }
+
+    #[test]
+    fn h2_coalesce_bypass_requires_known_content_length() {
+        // Chunked / unknown length → keep coalescer. We cannot assume
+        // frames are already large when the backend has not told us
+        // the total size.
+        assert!(!super::should_bypass_h2_coalesce_for_large_response(
+            None, 0
+        ));
+        // Same with a size limit configured — unknown length still
+        // retains the coalescer, which is the size-enforcement
+        // pathway when CL is absent.
+        assert!(!super::should_bypass_h2_coalesce_for_large_response(
+            None,
+            10 * 1024 * 1024,
+        ));
+    }
+
+    #[test]
+    fn h2_coalesce_bypass_honours_response_size_limit() {
+        // Limit is 2 MiB, response is 5 MiB → bypass disabled so the
+        // coalescer's size-enforcement path stays in play even though
+        // the body itself is larger than the threshold. (The upstream
+        // admission check should reject CL > limit earlier, but the
+        // decision layer is defensive.)
+        assert!(!super::should_bypass_h2_coalesce_for_large_response(
+            Some(5 * 1024 * 1024),
+            2 * 1024 * 1024,
+        ));
+    }
+
+    #[test]
+    fn h2_coalesce_bypass_allows_response_exactly_at_size_limit() {
+        // Limit is 1 MiB, response is exactly 1 MiB — inclusive, so
+        // bypass is allowed.
+        assert!(super::should_bypass_h2_coalesce_for_large_response(
+            Some(1024 * 1024),
+            1024 * 1024,
+        ));
+    }
+
+    /// Regression guard: the gRPC request-body-hook branch must always
+    /// return the collected request bytes alongside the dispatch result,
+    /// even when the response is being streamed.
+    ///
+    /// Background: the response-streaming decision (`grpc_should_stream`)
+    /// is orthogonal to whether the REQUEST body must be replayable on a
+    /// connection-level retry. The retry loop fires on connection errors
+    /// observed BEFORE response headers, so streaming-vs-buffering the
+    /// response has no bearing on whether the request needs to be
+    /// replayable. The OLD pattern collapsed both into a single decision:
+    ///
+    /// ```ignore
+    /// if grpc_should_stream { (result, Bytes::new()) }
+    /// else                  { (result, grpc_req_body) }
+    /// ```
+    ///
+    /// which silently fed the retry loop an empty request body whenever a
+    /// body-hook proxy ALSO had `retry_on_connect_failure` enabled and the
+    /// streaming-response gate was open. This test fingerprints the fixed
+    /// shape so a future cleanup cannot accidentally re-introduce the
+    /// branching.
+    #[test]
+    fn grpc_hook_path_returns_collected_request_body_unconditionally() {
+        let src = include_str!("mod.rs");
+        let marker = "// Dispatch to backend with pre-collected body bytes";
+        let block_start = src
+            .find(marker)
+            .expect("hook-path dispatch block marker not found");
+        // The block ends at the `} else {` that opens the `grpc_needs_request_body_hooks=false` arm.
+        let tail = &src[block_start..];
+        let block_end = tail
+            .find("} else {\n            // Fast path: no plugin body hooks needed")
+            .expect("end of grpc hook-path branch not found");
+        let block = &tail[..block_end];
+
+        for (i, line) in block.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            assert!(
+                !trimmed.starts_with("if grpc_should_stream"),
+                "regression at relative line {} of grpc hook-path branch: \
+                 found `if grpc_should_stream` split on the success path. \
+                 Always return the collected request body so a connect-level \
+                 retry can replay it. Offending line:\n  {}",
+                i + 1,
+                line
+            );
+            assert!(
+                !trimmed.contains("Bytes::new()"),
+                "regression at relative line {} of grpc hook-path branch: \
+                 the success path must return `grpc_req_body`, not \
+                 `Bytes::new()`. Offending line:\n  {}",
+                i + 1,
+                line
+            );
+        }
+    }
+
+    /// Regression guard: the gRPC retry loop must propagate the original
+    /// streaming-response decision into each retry attempt.
+    ///
+    /// Background: the loop only retries CONNECTION errors that surface
+    /// BEFORE response headers (`BackendUnavailable` /
+    /// `BackendTimeout::Connect`). Once any retry attempt produces a
+    /// response, the loop's match falls through and the response is
+    /// handed off to the downstream client untouched. Buffering the retry
+    /// response therefore has no benefit but reintroduces the
+    /// trailer-stall the rest of this PR is fixing — a single transient
+    /// connect failure on a server-streaming RPC would silently downgrade
+    /// the entire response to "wait for the whole body".
+    #[test]
+    fn grpc_retry_loop_passes_streaming_decision_through() {
+        let src = include_str!("mod.rs");
+        let loop_start = src
+            .find("// gRPC retry loop — retries on connection failures")
+            .expect("gRPC retry loop marker not found");
+        let tail = &src[loop_start..];
+        let loop_end = tail
+            .find("\n        }\n\n        let backend_total_ms = backend_start.elapsed()")
+            .expect("end of gRPC retry loop not found");
+        let loop_body = &tail[..loop_end];
+
+        let call_marker = "grpc_proxy::proxy_grpc_request_from_bytes(";
+        let call_idx = loop_body
+            .find(call_marker)
+            .expect("retry-loop call to proxy_grpc_request_from_bytes not found");
+        let call_tail = &loop_body[call_idx..];
+        let call_end = call_tail
+            .find(")\n                .await")
+            .expect("end of retry-loop call not found");
+        let call_args = &call_tail[..call_end];
+
+        // The OLD pattern hard-coded the streaming flag to `false` on the
+        // retry path. Either explicit `false,` or any phrasing that
+        // disables streaming irrespective of the initial decision is a
+        // regression.
+        for (i, line) in call_args.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            assert!(
+                trimmed != "false," && trimmed != "false",
+                "regression at relative line {} of gRPC retry call: \
+                 `proxy_grpc_request_from_bytes` is invoked with a hard-\
+                 coded `false` streaming flag. Pass `grpc_should_stream` \
+                 instead so successful retries keep the trailer-stall fix \
+                 active. Offending line:\n  {}",
+                i + 1,
+                line
+            );
+        }
+        assert!(
+            call_args.contains("grpc_should_stream"),
+            "expected `grpc_should_stream` to be threaded into the retry \
+             call to proxy_grpc_request_from_bytes; argument list was:\n{}",
+            call_args
+        );
     }
 }
