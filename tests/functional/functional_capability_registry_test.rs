@@ -107,43 +107,90 @@ fn h3_file_config(port: u16) -> String {
 /// pool warmup, and an optional periodic-refresh interval (seconds). The
 /// HTTPS port is also persisted into the harness temp dir as
 /// `https-port.txt` so tests can recover it.
+///
+/// **HTTPS port race handling**: `FERRUM_PROXY_HTTPS_PORT` is fixed once
+/// in the gateway's env, so the inner harness's retry loop (which
+/// reserves fresh proxy/admin ports per attempt) cannot recover from a
+/// stolen HTTPS port. We instead reserve a fresh HTTPS port on every
+/// outer attempt, set inner `max_attempts(1)` so it doesn't waste 3
+/// retries on a port that will never become free, and rebuild the whole
+/// harness from scratch on each iteration. CA + frontend certs are also
+/// rebuilt per attempt since the previous attempt's `Box::leak`'d
+/// scratch dir would otherwise pin freed memory until process exit.
 async fn spawn_h3_gateway(
     backend_port: u16,
     pool_warmup_enabled: bool,
     refresh_interval_secs: Option<u64>,
 ) -> (GatewayHarness, u16) {
-    let reservation = reserve_port().await.expect("reserve https port");
-    let https_port = reservation.port;
-    drop(reservation);
+    const OUTER_MAX_ATTEMPTS: u32 = 5;
+    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    for attempt in 1..=OUTER_MAX_ATTEMPTS {
+        // Reserve a fresh HTTPS port for THIS attempt. The listener is
+        // dropped immediately so the gateway can bind it; if a parallel
+        // process steals it before bind, the spawn fails and the next
+        // outer iteration will reserve a different port.
+        let reservation = match reserve_port().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(e.into());
+                continue;
+            }
+        };
+        let https_port = reservation.port;
+        drop(reservation);
 
-    let scratch = tempfile::tempdir().expect("scratch");
-    let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "phase8-gw-ca");
-    Box::leak(Box::new(scratch));
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "phase8-gw-ca");
 
-    let yaml = h3_file_config(backend_port);
-    let mut builder = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env(
-            "FERRUM_POOL_WARMUP_ENABLED",
-            if pool_warmup_enabled { "true" } else { "false" },
-        );
-    if let Some(secs) = refresh_interval_secs {
-        builder = builder.env(
-            "FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS",
-            secs.to_string(),
-        );
+        let yaml = h3_file_config(backend_port);
+        let mut builder = GatewayHarness::builder()
+            .file_config(yaml)
+            .log_level("info")
+            .capture_output()
+            // Inner retries can't pick a different HTTPS port (it's
+            // pinned via env), so cap at 1 — the outer loop here owns
+            // retries that re-reserve the port.
+            .max_attempts(1)
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
+            .env("FERRUM_TLS_NO_VERIFY", "true")
+            .env(
+                "FERRUM_POOL_WARMUP_ENABLED",
+                if pool_warmup_enabled { "true" } else { "false" },
+            );
+        if let Some(secs) = refresh_interval_secs {
+            builder = builder.env(
+                "FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS",
+                secs.to_string(),
+            );
+        }
+        match builder.spawn().await {
+            Ok(harness) => {
+                // Cert files must outlive the harness; only leak them on
+                // the successful attempt so failed attempts free memory.
+                Box::leak(Box::new(scratch));
+                let port_file = harness.temp_path().join("https-port.txt");
+                std::fs::write(&port_file, https_port.to_string()).expect("write https-port.txt");
+                return (harness, https_port);
+            }
+            Err(e) => {
+                eprintln!(
+                    "spawn_h3_gateway attempt {attempt}/{OUTER_MAX_ATTEMPTS} \
+                     failed (https_port={https_port}): {e}"
+                );
+                last_err = Some(e);
+                // Brief backoff so we don't immediately re-collide with
+                // whatever stole the previous port.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
     }
-    let harness = builder.spawn().await.expect("spawn gateway");
-    let port_file = harness.temp_path().join("https-port.txt");
-    std::fs::write(&port_file, https_port.to_string()).expect("write https-port.txt");
-    (harness, https_port)
+    panic!(
+        "spawn_h3_gateway: exhausted {OUTER_MAX_ATTEMPTS} attempts; last error: {:?}",
+        last_err.map(|e| e.to_string())
+    );
 }
 
 /// Drive an H3 request through the gateway's HTTPS port. The `harness`

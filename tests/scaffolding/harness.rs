@@ -129,6 +129,16 @@ impl GatewayHarnessBuilder {
         self
     }
 
+    /// Override the inner spawn-retry budget (default 3, per CLAUDE.md).
+    /// Use `1` when the caller is wrapping `spawn()` in its own retry loop
+    /// (e.g., to re-reserve a fixed env-pinned port like
+    /// `FERRUM_PROXY_HTTPS_PORT`) so internal retries don't waste attempts
+    /// on a port that won't change between them.
+    pub fn max_attempts(mut self, attempts: u32) -> Self {
+        self.inner = self.inner.max_attempts(attempts);
+        self
+    }
+
     /// Finalize the builder and spawn the harness.
     pub async fn spawn(self) -> Result<GatewayHarness, Box<dyn std::error::Error + Send + Sync>> {
         // In-process mode is a Phase-2 deliverable — see module docs. Error

@@ -209,9 +209,15 @@ async fn retry_respects_retry_on_methods() {
         post_count, 1,
         "POST must NOT retry (got {post_count} attempts) — retryable_methods=[GET] (baseline={baseline}, post_total={post_total})"
     );
-    assert!(
-        get_count >= 4,
-        "GET should retry up to max_retries=3 (4 total attempts), got {get_count}"
+    // max_retries=3 → 1 initial + 3 retries = exactly 4 attempts. A
+    // weaker `>= 4` would silently allow a regression where the gateway
+    // retried beyond the configured cap (e.g., 5+ attempts), defeating
+    // the retry-limit contract this test protects.
+    assert_eq!(
+        get_count, 4,
+        "GET must retry exactly max_retries=3 times (1 initial + 3 retries = 4 attempts); \
+         got {get_count}. Anything other than 4 means either the retry loop short-circuited \
+         (< 4) or exceeded the cap (> 4). post_total={post_total}, total_count={total_count}."
     );
 }
 
