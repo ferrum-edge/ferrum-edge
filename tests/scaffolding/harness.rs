@@ -44,14 +44,46 @@
 //!   - kTLS / io_uring kernel features that depend on the process having
 //!     its own runtime.
 //!
-//! ## Caveats specific to in-process mode
+//! ## Pool warmup interaction (KNOWN GOTCHA)
 //!
-//! - **`FERRUM_POOL_WARMUP_ENABLED` defaults to `false`** in both
-//!   harness modes — most tests want cold pools so their per-request
-//!   connection-count assertions aren't inflated by the warmup probe.
-//!   Tests that depend on the capability registry's first probe
-//!   (e.g. `h2_alpn_fallback_downgrades_capability`) explicitly opt
-//!   in via [`GatewayHarnessBuilder::pool_warmup_enabled(true)`].
+//! Both harness modes default [`GatewayHarnessBuilder::pool_warmup_enabled`]
+//! to **`false`** even though
+//! [`FERRUM_POOL_WARMUP_ENABLED`](../../ferrum.conf) defaults to `true` in
+//! production. The production default issues a probe against every
+//! configured backend at startup to pre-establish
+//! reqwest / gRPC / direct-H2 / H3 connections — useful in production,
+//! **a footgun in tests that count backend hits**.
+//!
+//! Concrete failure modes you'll hit if you flip warmup back on without
+//! thinking:
+//!
+//! - **Attempt-count off-by-one.** A test that drives one client request
+//!   and asserts `backend.received_requests().len() == 1` will see `2`
+//!   because the warmup probe landed first.
+//! - **Connection-counter drift.** Tests that assert
+//!   `backend.accepted_connections() == 1` (e.g.
+//!   `h2_direct_pool_reuses_connection_across_requests`) need warmup off
+//!   because the warmup probe consumes the first connection slot.
+//! - **Capability classification timing.** Conversely, tests that depend
+//!   on the capability registry having a `Supported` entry for an HTTPS
+//!   backend before traffic flows REQUIRE warmup on — without it the
+//!   first request lands while the registry is still empty and falls
+//!   through to reqwest. See
+//!   `initial_refresh_when_warmup_off_classifies_before_traffic` in
+//!   `functional_capability_registry_test.rs` for the explicit case.
+//!
+//! Rule of thumb:
+//!
+//! - Tests that **count backend hits / connections** → keep the harness
+//!   default (warmup off). No action needed.
+//! - Tests that **assert on capability-registry / H2 ALPN classification
+//!   state** before driving traffic → opt in via
+//!   [`GatewayHarnessBuilder::pool_warmup_enabled(true)`].
+//! - Tests that don't care about either → keep the default. Warmup is
+//!   cheap, but cold is the cheaper *test* default.
+//!
+//! ## Other caveats specific to in-process mode
+//!
 //! - The file-mode YAML loader's strict-loading rules apply identically
 //!   in in-process mode — every top-level collection (`consumers`,
 //!   `upstreams`, `plugin_configs`) still has to be present in the
