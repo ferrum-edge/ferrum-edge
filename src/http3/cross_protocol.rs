@@ -1437,21 +1437,26 @@ where
         }
     }
 
-    // Stream the response when the current request has no effective gRPC
-    // retries and no plugin (or explicit response_body_mode) needs the
-    // body buffered. Without this, server-streaming / bidi gRPC responses
-    // would accumulate fully in memory before the first byte flows to the
-    // H3 client.
+    // Stream the response whenever the per-request streaming policy
+    // permits it. The previous `!grpc_has_retry &&` gate forced buffering
+    // any time retry was configured, even though the retry loop below
+    // only fires on CONNECTION errors that surface BEFORE any response
+    // headers arrive (`BackendUnavailable` / `BackendTimeout::Connect`).
+    // Once a response begins flowing the loop breaks out and never has to
+    // inspect the body, so the streaming-vs-buffering choice for the
+    // RESPONSE is orthogonal to whether the REQUEST body needs to be
+    // replayable. Coupling them silently downgraded server-streaming /
+    // bidi gRPC responses to "wait for the whole body" — the same
+    // trailer-stall PR #497 fixed on the H1/H2 path.
     let grpc_has_retry = crate::retry::can_retry_connection_failures(proxy.retry.as_ref());
-    let stream_grpc_response = !grpc_has_retry
-        && crate::proxy::should_stream_response_body(
-            proxy,
-            plugins,
-            ctx,
-            state
-                .plugin_cache
-                .requires_response_body_buffering(&proxy.id),
-        );
+    let stream_grpc_response = crate::proxy::should_stream_response_body(
+        proxy,
+        plugins,
+        ctx,
+        state
+            .plugin_cache
+            .requires_response_body_buffering(&proxy.id),
+    );
     let body_bytes = Bytes::from(body);
     record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
     let mut result = proxy_grpc_request_from_bytes(
@@ -1521,6 +1526,13 @@ where
             );
             record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
 
+            // Stream the retry response under the same conditions as the
+            // initial attempt. Hard-coding `false` here would silently
+            // downgrade a server-streaming RPC to fully buffered the
+            // moment a transient TCP RST hit the very first attempt —
+            // exactly the trailer-stall PR #497 fixed on the H1/H2 path.
+            // Safe because this loop only retries pre-headers connection
+            // errors; once a response begins it breaks out untouched.
             result = proxy_grpc_request_from_bytes(
                 hyper_method.clone(),
                 hmap.clone(),
@@ -1530,7 +1542,7 @@ where
                 &state.grpc_pool,
                 &state.dns_cache,
                 proxy_headers,
-                false,
+                stream_grpc_response,
             )
             .await;
         }
@@ -3058,6 +3070,103 @@ mod tests {
         assert_eq!(
             ctx.metadata.get("grpc_message").map(|value| value.as_str()),
             Some("Rate limit exceeded")
+        );
+    }
+
+    /// Regression guard: the H3 cross-protocol gRPC dispatch must compute
+    /// the streaming-response decision independently of `grpc_has_retry`.
+    ///
+    /// Background (mirrors PR #497 on the H1/H2 path): the cross-protocol
+    /// retry loop only re-fires on CONNECTION errors that surface BEFORE
+    /// any response headers (`BackendUnavailable` /
+    /// `BackendTimeout::Connect`). Once a response begins flowing the
+    /// loop breaks out and never inspects the body, so the streaming-or-
+    /// not choice for the response has no bearing on whether the request
+    /// can be retried. The OLD pattern coupled the two:
+    ///
+    /// ```ignore
+    /// let stream_grpc_response = !grpc_has_retry
+    ///     && crate::proxy::should_stream_response_body(...);
+    /// ```
+    ///
+    /// which silently downgraded server-streaming / bidi gRPC responses
+    /// to fully buffered — the same trailer-stall PR #497 fixed on the
+    /// H1/H2 path.
+    #[test]
+    fn h3_cross_protocol_grpc_stream_decision_does_not_gate_on_retry() {
+        let src = include_str!("cross_protocol.rs");
+        let assignment_marker = "let stream_grpc_response =";
+        let assignment_idx = src
+            .find(assignment_marker)
+            .expect("assignment of stream_grpc_response not found");
+        let tail = &src[assignment_idx..];
+        let assignment_end = tail
+            .find(";\n")
+            .expect("end of stream_grpc_response assignment not found");
+        let assignment = &tail[..assignment_end];
+
+        assert!(
+            !assignment.contains("!grpc_has_retry"),
+            "regression: `stream_grpc_response` is gated on `!grpc_has_retry`. \
+             Drop the gate — retry replay only needs the request body \
+             preserved (which `body_bytes` already is), not the response \
+             buffered. Offending assignment:\n{}",
+            assignment
+        );
+    }
+
+    /// Regression guard: the H3 cross-protocol gRPC retry loop must
+    /// propagate the original streaming-response decision into each
+    /// retry attempt.
+    ///
+    /// Same rationale as the H1/H2-path guard added in PR #497 (commit
+    /// d09e776): hard-coding `false` on retry reintroduces the trailer
+    /// stall on the very first transient connection error, since the
+    /// successful retry response would then be fully buffered before any
+    /// frame reaches the H3 client.
+    #[test]
+    fn h3_cross_protocol_grpc_retry_passes_streaming_decision_through() {
+        let src = include_str!("cross_protocol.rs");
+        let loop_start_marker = "if grpc_has_retry && let Some(retry_config) = &proxy.retry {";
+        let loop_start = src
+            .find(loop_start_marker)
+            .expect("cross-protocol gRPC retry loop start not found");
+        let tail = &src[loop_start..];
+
+        // Retry-call marker — the second `proxy_grpc_request_from_bytes(`
+        // call lives inside the retry loop. We scope the search to the
+        // loop body to be unambiguous.
+        let call_marker = "proxy_grpc_request_from_bytes(";
+        let call_idx = tail
+            .find(call_marker)
+            .expect("retry-loop call to proxy_grpc_request_from_bytes not found");
+        let call_tail = &tail[call_idx..];
+        let call_end = call_tail
+            .find(")\n            .await")
+            .expect("end of retry-loop call not found");
+        let call_args = &call_tail[..call_end];
+
+        for (i, line) in call_args.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            assert!(
+                trimmed != "false," && trimmed != "false",
+                "regression at relative line {} of H3 cross-protocol gRPC \
+                 retry call: `proxy_grpc_request_from_bytes` is invoked \
+                 with a hard-coded `false` streaming flag. Pass \
+                 `stream_grpc_response` instead so successful retries \
+                 keep the trailer-stall fix active. Offending line:\n  {}",
+                i + 1,
+                line
+            );
+        }
+        assert!(
+            call_args.contains("stream_grpc_response"),
+            "expected `stream_grpc_response` to be threaded into the H3 \
+             cross-protocol retry call; argument list was:\n{}",
+            call_args
         );
     }
 }
