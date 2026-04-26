@@ -195,6 +195,37 @@ fn test_batch_tier3_burst() {
     assert_eq!(tracker.get_batch_limit("proxy-1"), 6000);
 }
 
+// ── Jitter-based tier bumping ───────────────────────────────────────────────
+
+#[test]
+fn test_jitter_bumps_buffer_tier() {
+    let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 64);
+    tracker.record_connection("p1", 4096);
+    assert_eq!(tracker.get_buffer_size("p1"), 8192);
+
+    tracker.record_jitter("p1", 15_000);
+    assert_eq!(tracker.get_buffer_size("p1"), 32 * 1024);
+}
+
+#[test]
+fn test_jitter_no_bump_when_low() {
+    let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 64);
+    tracker.record_connection("p1", 4096);
+    tracker.record_jitter("p1", 5_000);
+    assert_eq!(tracker.get_buffer_size("p1"), 8192);
+}
+
+#[test]
+fn test_jitter_no_bump_beyond_max_tier() {
+    let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 1_048_576, 65_536, 64);
+    tracker.record_connection("p1", 10 * 1024 * 1024);
+    let size_before = tracker.get_buffer_size("p1");
+    tracker.record_jitter("p1", 50_000);
+    assert_eq!(tracker.get_buffer_size("p1"), size_before);
+}
+
+// ── Concurrency ────────────────────────────────────────────────────────────
+
 #[test]
 fn test_concurrent_recording() {
     use std::sync::Arc;

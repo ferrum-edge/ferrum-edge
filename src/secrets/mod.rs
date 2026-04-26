@@ -11,8 +11,8 @@
 mod aws;
 #[cfg(feature = "secrets-azure")]
 mod azure;
-mod env;
-mod file;
+pub mod env;
+pub mod file;
 #[cfg(feature = "secrets-gcp")]
 mod gcp;
 mod registry;

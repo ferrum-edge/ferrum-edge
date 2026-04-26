@@ -925,6 +925,19 @@ pub async fn serve(
         info!("TLS not configured - HTTPS listener disabled");
     }
 
+    // Operator-visible warning when both HTTP and HTTPS proxy listeners
+    // are off — only stream proxies (TCP/UDP) will serve traffic, which
+    // is rarely the intent. Mirrors the same warn in `database.rs` and
+    // `data_plane.rs`. (PR #490's serve() refactor accidentally dropped
+    // this warn during the lift; restored in PR #500's CI fix because
+    // `functional_tls_only_warn_when_plaintext_disabled_and_no_tls`
+    // pinpoints its absence.)
+    if env_config.proxy_http_port == 0 && tls_config.is_none() {
+        warn!(
+            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and no TLS configured. Only stream proxies (TCP/UDP) will serve traffic."
+        );
+    }
+
     // ── HTTP/3 (QUIC) listener ───────────────────────────────────────────
     // H3 always binds its own UDP socket — no pre-bound variant. Reuse
     // the HTTPS listener's resolved address so the QUIC port matches the

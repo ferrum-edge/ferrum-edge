@@ -512,6 +512,14 @@ fn port_exhaustion_counter_increments() {
 }
 
 #[test]
+fn snapshot_includes_red_probability() {
+    let state = OverloadState::new();
+    state.red_drop_probability.store(500, Ordering::Relaxed);
+    let snap = state.snapshot();
+    assert!((snap.red_drop_probability_pct - 50.0).abs() < 0.1);
+}
+
+#[test]
 fn snapshot_includes_port_exhaustion_events() {
     let state = OverloadState::new();
     state.fd_max.store(1024, Ordering::Relaxed);

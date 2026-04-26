@@ -343,48 +343,14 @@ mod tests {
     #[test]
     fn test_update_ewma_subsequent_smoothing() {
         let val = AtomicU64::new(100_000);
-        // α=0.3: new = 0.3 * 200_000 + 0.7 * 100_000 = 60_000 + 70_000 = 130_000
         update_ewma(&val, 200_000, 300);
         assert_eq!(val.load(Ordering::Relaxed), 130_000);
-    }
-
-    #[test]
-    fn test_jitter_bumps_buffer_tier() {
-        let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 64);
-        // Record small bytes so we get tier 0 (8 KiB buffer)
-        tracker.record_connection("p1", 4096);
-        assert_eq!(tracker.get_buffer_size("p1"), 8192);
-
-        // Record high jitter (>10ms) — should bump tier 0 → tier 1
-        tracker.record_jitter("p1", 15_000);
-        assert_eq!(tracker.get_buffer_size("p1"), 32 * 1024);
-    }
-
-    #[test]
-    fn test_jitter_no_bump_when_low() {
-        let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 64);
-        tracker.record_connection("p1", 4096);
-        // Low jitter (5ms) — no bump
-        tracker.record_jitter("p1", 5_000);
-        assert_eq!(tracker.get_buffer_size("p1"), 8192);
-    }
-
-    #[test]
-    fn test_jitter_no_bump_beyond_max_tier() {
-        let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 1_048_576, 65_536, 64);
-        // Record huge bytes to get tier 3
-        tracker.record_connection("p1", 10 * 1024 * 1024);
-        let size_before = tracker.get_buffer_size("p1");
-        // High jitter should not bump beyond tier 3
-        tracker.record_jitter("p1", 50_000);
-        assert_eq!(tracker.get_buffer_size("p1"), size_before);
     }
 
     #[test]
     fn test_record_jitter_disabled() {
         let tracker = AdaptiveBufferTracker::new(false, false, 300, 8192, 262_144, 65_536, 64);
         tracker.record_jitter("p1", 15_000);
-        // Should not create state entry when disabled
         assert!(tracker.state.get("p1").is_none());
     }
 }

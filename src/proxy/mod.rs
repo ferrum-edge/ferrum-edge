@@ -6498,6 +6498,36 @@ async fn handle_proxy_request_inner(
     // Perform the backend request with retry logic.
     // Returns the response and the final CB target key (may differ from the
     // initial target when retries switch to a different upstream target).
+    //
+    // Dispatch decision is per-target, captured atomically per attempt:
+    //
+    // * Same target across attempts → keep the snapshot. Cross-protocol
+    //   replay against the same backend would bypass
+    //   `proxy.retry.retry_on_methods` (the failed transport attempt may
+    //   have flushed headers/body before the error surfaced) and risk
+    //   duplicating non-idempotent requests on the same backend instance.
+    //
+    // * Load-balancer rotated to a different target → recompute the
+    //   snapshot for the new target. Different target → different backend
+    //   → no same-target partial-write replay risk, so the new target's
+    //   actual capability classification (the registry already knows each
+    //   target's protocol) wins. Mixed-capability upstreams (target A
+    //   speaks H3, target B speaks H1) MUST switch transports here, else
+    //   retries would force `proxy_to_backend_http3_retry` against an H1
+    //   backend and 502 forever.
+    //
+    // The snapshot is captured by the OUTER code and threaded into
+    // `proxy_to_backend` as `dispatch_h3`; re-reading inside that function
+    // would race the async DNS resolve against a concurrent
+    // `mark_h3_unsupported` / refresh and let the dispatch decision split
+    // mid-attempt.
+    //
+    // Note: `proxy_to_backend_retry` always uses reqwest (not the direct H2
+    // pool), and reqwest's client pool is keyed per-target, so a
+    // `dispatch_h3=false` rotation already picks up the new target's warmed
+    // reqwest client without extra plumbing here.
+    let mut current_dispatch_h3 =
+        supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
@@ -6518,6 +6548,7 @@ async fn handle_proxy_request_inner(
             has_retry,
             &request_client_ip,
             is_tls,
+            current_dispatch_h3,
             &ctx.request_bytes_observed,
         )
         .await;
@@ -6538,7 +6569,13 @@ async fn handle_proxy_request_inner(
             tokio::time::sleep(delay).await;
             attempt += 1;
 
-            // Try a different target on retry if load balancing is configured
+            // Try a different target on retry if load balancing is configured.
+            // When the LB hands us a NEW target (host:port), recompute the
+            // dispatch decision for that target — different target may have
+            // different protocol classification in the registry. When the
+            // LB returns the same host:port (single-backend, sticky LB), the
+            // snapshot stays unchanged so same-target retries keep the
+            // same protocol.
             if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(ref hash_key) = lb_hash_key
                 && let Some(next) = state.load_balancer_cache.select_next_target(
@@ -6555,6 +6592,7 @@ async fn handle_proxy_request_inner(
                     }),
                 )
             {
+                let target_changed = next.host != prev_target.host || next.port != prev_target.port;
                 current_url = build_backend_url_with_target(
                     &proxy,
                     &path,
@@ -6567,6 +6605,15 @@ async fn handle_proxy_request_inner(
                 current_cb_target_key =
                     Some(crate::circuit_breaker::target_key(&next.host, next.port));
                 current_target = Some(next);
+                if target_changed {
+                    // Per-target capability lookup is O(1) (DashMap +
+                    // thread-local key buffer). Unknown / Unsupported both
+                    // gracefully fall through to reqwest, so an
+                    // un-pre-warmed target degrades to the safe path until
+                    // the periodic refresh classifies it.
+                    current_dispatch_h3 =
+                        supports_native_http3_backend(&state, &proxy, current_target.as_deref());
+                }
             }
 
             warn!(
@@ -6581,8 +6628,10 @@ async fn handle_proxy_request_inner(
             // the body was never sent, so replaying is correct and safe.
             // The final retry attempt uses streaming if configured.
             let is_last_attempt = attempt >= retry_config.max_retries;
-            let tried_h3 = supports_native_http3_backend(&state, &proxy, current_target.as_deref());
-            result = if tried_h3 {
+            // `current_dispatch_h3` was either kept from the prior attempt
+            // (same target → same protocol) or recomputed above for the
+            // new target (rotation → match the new target's capability).
+            result = if current_dispatch_h3 {
                 proxy_to_backend_http3_retry(
                     &state,
                     &proxy,
@@ -6611,11 +6660,13 @@ async fn handle_proxy_request_inner(
                 .await
             };
             // If H3 was attempted and produced a transport-level failure,
-            // downgrade the cached capability so the next retry iteration
-            // (and subsequent requests) skip the H3 pool and route via
-            // reqwest instead of repeatedly 502-ing against a backend
-            // whose QUIC support rolled back between refresh cycles.
-            if tried_h3 && is_h3_transport_failure(&result) {
+            // downgrade the cached capability so subsequent requests (and
+            // any future retry that rotates BACK to this target) skip the
+            // H3 pool. This downgrade does NOT change the current
+            // iteration's `current_dispatch_h3` — that decision was locked
+            // before the attempt — but it does affect the next iteration
+            // IF the LB rotates to a target that gets recomputed here.
+            if current_dispatch_h3 && is_h3_transport_failure(&result) {
                 state
                     .backend_capabilities
                     .mark_h3_unsupported(&proxy, current_target.as_deref());
@@ -6638,6 +6689,7 @@ async fn handle_proxy_request_inner(
             false, // no retry — don't retain body
             &request_client_ip,
             is_tls,
+            current_dispatch_h3,
             &ctx.request_bytes_observed,
         )
         .await
@@ -7533,6 +7585,21 @@ pub(crate) async fn proxy_to_backend_retry(
 }
 
 /// Proxy the request to the backend.
+///
+/// `dispatch_h3` is captured by the caller and forced through here so the
+/// dispatch decision is made exactly once per attempt — see the
+/// `current_dispatch_h3` capture in `proxy_to_backend_inner` for the
+/// rationale. Without it, a concurrent capability refresh /
+/// `mark_h3_unsupported` between the outer capture and the async DNS resolve
+/// below could flip the inner re-check and split a single attempt's
+/// dispatch decision in half on the same target — the exact
+/// cross-protocol-mid-attempt behavior this contract forbids.
+///
+/// Per-target rotation across retries IS allowed to switch protocols (see the
+/// retry loop's recompute-on-target-change branch). The prohibition is on
+/// switching transports mid-attempt or across same-target retries; cross-
+/// target rotation runs against a different backend, so the new target's
+/// own capability classification is the right answer.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend(
     state: &ProxyState,
@@ -7549,6 +7616,7 @@ async fn proxy_to_backend(
     retain_request_body: bool,
     client_ip: &str,
     is_tls: bool,
+    dispatch_h3: bool,
     // Shared counter for request body bytes observed on the wire. Populated
     // by the body handling block below via either `fetch_max` (buffered paths)
     // or frame-by-frame `fetch_add` (streaming paths via SizeLimitedIncoming /
@@ -7589,17 +7657,24 @@ async fn proxy_to_backend(
     // supports H3. gRPC and WebSocket dispatch earlier in the handler and
     // never reach this block, so only Plain-flavor requests can enter.
     //
+    // `dispatch_h3` is the caller-captured snapshot of
+    // `supports_native_http3_backend` taken once at the start of the request.
+    // Re-reading the registry here would race a concurrent
+    // `mark_h3_unsupported` / refresh between the outer capture and the
+    // async DNS resolve above, letting the first attempt and the retry loop
+    // pick different transports.
+    //
     // On H3 transport failure we downgrade the cached capability so
     // subsequent requests skip the native pool immediately — but we do NOT
-    // replay the body via reqwest on the same request. The failed H3
-    // attempt may already have flushed headers / body to the backend
-    // before the reset, timeout, or protocol error surfaced, so replaying
-    // the same body would bypass the operator's retry policy and could
-    // duplicate non-idempotent requests. The outer retry loop (when
-    // `proxy.retry` is configured) is the only place that decides whether
-    // replay is safe per method + `retry_on_methods`. Without retry, the
-    // 502 propagates to the client and the next request uses reqwest.
-    if supports_native_http3_backend(state, proxy, upstream_target) {
+    // cross protocols on the same request. The failed H3 attempt may
+    // already have flushed headers / body to the backend before the reset,
+    // timeout, or protocol error surfaced, so cross-protocol replay would
+    // bypass the operator's `retry_on_methods` policy and could duplicate
+    // non-idempotent requests. Same-protocol H3 retries do replay the
+    // retained body — the outer retry loop's job — but only against the
+    // H3 pool. Without retry, the 502 propagates to the client and the
+    // NEXT request uses reqwest.
+    if dispatch_h3 {
         let (mut backend_resp, body_bytes) = proxy_to_backend_http3(
             state,
             proxy,

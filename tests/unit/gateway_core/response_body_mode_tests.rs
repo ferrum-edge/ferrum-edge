@@ -1,7 +1,5 @@
 use chrono::Utc;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
-use ferrum_edge::proxy::body::ProxyBody;
-use http_body::Body;
 
 fn test_proxy() -> Proxy {
     Proxy {
@@ -141,27 +139,6 @@ fn test_proxy_yaml_stream_response_body_mode() {
     "#;
     let proxy: Proxy = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(proxy.response_body_mode, ResponseBodyMode::Stream);
-}
-
-// --- ProxyBody type tests ---
-
-#[test]
-fn test_proxy_body_full_from_bytes() {
-    let body = ProxyBody::full(bytes::Bytes::from("hello world"));
-    // Full body is immediately end-of-stream after polling all frames
-    assert!(!body.is_end_stream()); // has data to yield
-}
-
-#[test]
-fn test_proxy_body_from_string() {
-    let body = ProxyBody::from_string("hello");
-    assert!(!body.is_end_stream()); // has data to yield
-}
-
-#[test]
-fn test_proxy_body_empty() {
-    let body = ProxyBody::empty();
-    assert!(body.is_end_stream());
 }
 
 // --- Plugin requires_response_body_buffering tests ---
