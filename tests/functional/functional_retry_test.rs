@@ -5,11 +5,12 @@
 //!
 //! * `retry_on_methods` enforcement (POST must NOT replay even on
 //!   connection-level failures when only GET is in the retry list).
-//! * H3 capability-registry interaction with the single-protocol-per-
-//!   request contract: within a single request, every retry attempt
-//!   stays on the protocol the request started with; only the NEXT
-//!   request observes the downgrade and routes via the cross-protocol
-//!   bridge (reqwest path).
+//! * H3 capability-registry interaction with the per-target dispatch
+//!   contract: same-target retries stay on the protocol the attempt
+//!   started with; load-balancer rotation to a different target
+//!   recomputes the dispatch decision against the registry so a
+//!   mixed-capability upstream (target A speaks H3, target B speaks
+//!   H1) correctly switches transports across attempts.
 //! * Streaming-body requests are NOT replayed by the retry loop (the
 //!   Codex P1 fix; previously a same-request fallback could double-
 //!   fire the body).
@@ -766,5 +767,258 @@ async fn retry_attempts_within_same_request_stay_on_h3_pool() {
         downgrade_observed,
         "after an H3 transport failure the registry must downgrade h3 to unsupported \
          so the NEXT request routes via reqwest — without this the lifecycle is broken"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 6 — Mixed-capability upstream: LB rotation across targets recomputes
+// the dispatch decision per-target.
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Companion to `retry_attempts_within_same_request_stay_on_h3_pool`.
+// That sibling pins SAME-TARGET retries (must stay on the same
+// protocol). This one pins CROSS-TARGET rotation: when the LB picks a
+// different target on retry, the gateway must consult the registry
+// for that target's actual capability and switch protocols if needed.
+//
+// Without per-target recomputation a snapshot taken from the initial
+// target leaks across the rotation — e.g. a reqwest-only target A
+// picked first locks `current_dispatch_h3 = false` for every retry,
+// so a rotation to H3-only target B forces `proxy_to_backend_retry`
+// (reqwest) against a backend with no TCP listener and 502 forever.
+// This is the regression Codex flagged on c6e1a5c.
+//
+// Setup avoids the H3 pool's cached-connection caching gotchas by
+// putting the H3 target SECOND. The initial attempt goes through
+// reqwest (no QUIC pool cache to drain) and only the *retry* exercises
+// the H3 native pool — at which point the cached connection from
+// warmup is fresh and usable.
+//
+// Setup (round-robin LB, two targets):
+//   * Target A (TCP+TLS only, NO QUIC listener):
+//       — Returns HTTP/1 502 to every request → trips
+//         `retryable_status_codes: [502]`.
+//       — `h3 = Unsupported` in the registry (UDP probe times out).
+//   * Target B (UDP only, NO TCP listener):
+//       — Real H3 backend that returns 200 OK with body "ok-from-h3-b".
+//       — `h3 = Supported` in the registry.
+//
+// Retry policy: `max_retries: 1`, `retryable_status_codes: [502]`,
+// `retryable_methods: ["GET"]`. 502 is the only retry trigger we
+// could use here that classify_h3_error doesn't help with — A's
+// HTTP/1 502 is a status-code retry, B's H3 200 is a success, so
+// `retry_on_connect_failure` would never fire either way. This
+// keeps the test focused on the dispatch-recompute behavior, not on
+// the classifier's quirks around H3 transport failures.
+//
+// Assertions:
+//   * Response is 200 OK with body "ok-from-h3-b" — proves the
+//     rotation reached target B via H3 native pool. Pre-fix would
+//     force reqwest on retry and either 502 (if reqwest connected to
+//     B's nonexistent TCP listener) or some connect-refused 502.
+//   * Target B's H3 backend recorded at least 1 received request —
+//     direct proof the recomputed dispatch fell to H3, not reqwest.
+//   * Target A's TCP backend saw at least 1 connection — proves the
+//     initial attempt dispatched via reqwest (so the recompute path
+//     is the one we actually exercised, not "both targets via H3").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn retry_rotation_across_mixed_capability_targets_recomputes_dispatch() {
+    let ca = TestCa::new("retry-mixed-capability").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    // Target A — TCP+TLS only (no UDP listener). Returns HTTP/1 502
+    // for every request so the gateway retries via
+    // `retryable_status_codes`.
+    let target_a_reservation = reserve_port().await.expect("reserve target A port");
+    let target_a_port = target_a_reservation.port;
+    let target_a_tcp_backend = ScriptedTlsBackend::builder(
+        target_a_reservation.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 5\r\nConnection: close\r\n\r\nA-502".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn target A tls");
+
+    // Target B — H3 only (no TCP listener). Returns 200 OK with body
+    // "ok-from-h3-b" — small body, no streaming. The script accepts the
+    // first request stream, sends headers + body, then closes the
+    // connection cleanly so the gateway's read terminates.
+    let target_b_reservation = reserve_port().await.expect("reserve target B port");
+    let target_b_port = target_b_reservation.port;
+    drop(target_b_reservation);
+    let target_b_udp = tokio::net::UdpSocket::bind(("127.0.0.1", target_b_port))
+        .await
+        .expect("bind target B udp");
+    let target_b_h3 = ScriptedH3Backend::builder(target_b_udp, H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", "12".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(
+            b"ok-from-h3-b",
+        )))
+        .spawn()
+        .expect("spawn target B h3");
+
+    // Proxy with a load-balanced upstream containing both targets.
+    let yaml_value = json!({
+        "proxies": [{
+            "id": "phase8-mixed-capability",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": target_a_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "upstream_id": "mixed-capability-upstream",
+            "retry": {
+                "max_retries": 1,
+                "retryable_status_codes": [502],
+                "retryable_methods": ["GET"],
+            },
+        }],
+        "consumers": [],
+        "upstreams": [{
+            "id": "mixed-capability-upstream",
+            "name": "mixed-capability-upstream",
+            "algorithm": "round_robin",
+            "targets": [
+                { "host": "127.0.0.1", "port": target_a_port, "weight": 1 },
+                { "host": "127.0.0.1", "port": target_b_port, "weight": 1 },
+            ],
+        }],
+        "plugin_configs": [],
+    });
+    let yaml = serde_yaml::to_string(&yaml_value).expect("yaml serialize");
+
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        // Warmup must populate the registry so A=h3-Unknown and
+        // B=h3-Supported BEFORE the request fires. Without this gate
+        // the request races the probe and may land while both targets
+        // are still Unknown.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    // Wait for warmup to classify B as h3=Supported. A's classification
+    // is allowed to be either Unknown (UDP probe timeout) or Unsupported
+    // — both map to `supports_native_http3_backend = false`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut both_classified = false;
+    let mut last_snapshot = serde_json::Value::Null;
+    while std::time::Instant::now() < deadline {
+        if let Ok(body) = harness.get_admin_json("/backend-capabilities").await {
+            last_snapshot = body.clone();
+            let entries = body["entries"].as_array().cloned().unwrap_or_default();
+            let mut a_not_supported = false;
+            let mut b_supported = false;
+            for e in &entries {
+                let key = e["key"].as_str().unwrap_or("");
+                // Key shape: `scheme|host|port|dns|ca|cert|key|verify`
+                let port: u16 = key
+                    .split('|')
+                    .nth(2)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let h3 = e["plain_http"]["h3"].as_str();
+                if port == target_a_port && matches!(h3, Some("unsupported") | Some("unknown")) {
+                    a_not_supported = true;
+                }
+                if port == target_b_port && h3 == Some("supported") {
+                    b_supported = true;
+                }
+            }
+            if a_not_supported && b_supported {
+                both_classified = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(
+        both_classified,
+        "warmup must classify A=h3-(unsupported|unknown) AND B=h3-supported before the \
+         request fires; without this the test does not exercise the per-target recompute \
+         path. target_a_port={target_a_port} target_b_port={target_b_port} \
+         last_snapshot={last_snapshot:#}"
+    );
+
+    let a_tcp_baseline = target_a_tcp_backend.accepted_connections();
+    let b_h3_streams_baseline = target_b_h3.received_requests().await.len();
+
+    // Single request. Round-robin selects A first (rr_counter starts
+    // at 0 → index 0 → A). Initial attempt: dispatch_h3=false (A is
+    // h3-not-supported) → reqwest → A returns 502 → retry fires on
+    // status code. LB rotates to B (excluding A). Per-target
+    // recompute: B is h3=Supported → current_dispatch_h3 flips to
+    // true → H3 to B → 200 OK with body "ok-from-h3-b".
+    let client = harness.http_client().expect("client");
+    let resp = match client.get(&harness.proxy_url("/api/mixed")).await {
+        Ok(r) => r,
+        Err(e) => {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("send request failed: {e}\n=== gateway logs ===\n{logs}");
+        }
+    };
+
+    // Allow target B's stream counter to settle.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let body = resp.body_text();
+    let a_tcp_after = target_a_tcp_backend.accepted_connections();
+    let b_h3_streams_after = target_b_h3.received_requests().await.len();
+    let a_tcp_hits = a_tcp_after - a_tcp_baseline;
+    let b_h3_streams = b_h3_streams_after - b_h3_streams_baseline;
+
+    // Load-bearing assertion: the request must succeed via the rotation
+    // to target B's H3 native pool. Pre-fix (Codex P1 on c6e1a5c) the
+    // initial-target snapshot from target A's classification (false)
+    // would force reqwest on retry against B → connect refused (B has
+    // no TCP) → 502, not 200.
+    if resp.status.as_u16() != 200 {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!(
+            "request must succeed via target-B rotation; got status {} body {body:?}. \
+             A non-200 here means the rotation forced reqwest against H3-only target B \
+             instead of switching to H3 (the regression Codex P1 flagged on c6e1a5c). \
+             a_tcp_hits={a_tcp_hits} b_h3_streams={b_h3_streams}\n\
+             === gateway logs ===\n{logs}",
+            resp.status.as_u16()
+        );
+    }
+    assert_eq!(
+        body, "ok-from-h3-b",
+        "response body must come from target B's H3 backend (\"ok-from-h3-b\"); \
+         got {body:?}. Anything else means the rotation did not actually \
+         reach target B via H3."
+    );
+    assert!(
+        b_h3_streams >= 1,
+        "target B's H3 backend must record at least one stream from the retry \
+         rotation; got {b_h3_streams}. b_h3_streams_baseline={b_h3_streams_baseline}, \
+         b_h3_streams_after={b_h3_streams_after}. Without this, the rotation \
+         either never happened or routed via reqwest (which would have failed \
+         to connect to B's nonexistent TCP listener)."
+    );
+    assert!(
+        a_tcp_hits >= 1,
+        "target A's TCP backend must record at least the initial-attempt connection; \
+         got {a_tcp_hits}. Without this, the initial dispatch never actually went \
+         to A — the test is meaningless because the recompute path wasn't exercised."
     );
 }
