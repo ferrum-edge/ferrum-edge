@@ -29,51 +29,9 @@ use crate::scaffolding::backends::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::reserve_port;
+use crate::scaffolding::ports::{reserve_colocated_tcp_udp, reserve_port};
 use serde_json::{Value, json};
-use std::net::UdpSocket as StdUdpSocket;
 use std::time::Duration;
-use tokio::net::{TcpListener, UdpSocket};
-
-// ────────────────────────────────────────────────────────────────────────────
-// Shared helpers
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Reserve a co-located TCP + UDP pair on the same port number. Tests that
-/// need both a TCP (TLS) backend and a UDP (H3) backend on the SAME port
-/// use this so the proxy's single `backend_port` value works for both.
-/// The UDP half is returned as a `tokio::net::UdpSocket` (so it can be
-/// handed straight into `ScriptedH3Backend::builder`); the TCP half is
-/// returned as a `tokio::net::TcpListener`.
-async fn reserve_colocated_tcp_udp()
--> Result<(TcpListener, UdpSocket, u16), Box<dyn std::error::Error + Send + Sync>> {
-    // Strategy: bind TCP on 0, note its port, then bind UDP on that same
-    // port. Retry on UDP conflict. UDP+TCP share the port namespace at
-    // the kernel level without issue (different protocol numbers), so a
-    // UDP bind at the same port generally succeeds.
-    for attempt in 0..10 {
-        let tcp = TcpListener::bind("127.0.0.1:0").await?;
-        let port = tcp.local_addr()?.port();
-        // UDP bind is sync; quinn will later take ownership via
-        // into_std(). Use std binding then wrap — matches quinn's
-        // canonical setup.
-        match StdUdpSocket::bind(("127.0.0.1", port)) {
-            Ok(std_udp) => {
-                std_udp.set_nonblocking(true)?;
-                let udp = UdpSocket::from_std(std_udp)?;
-                return Ok((tcp, udp, port));
-            }
-            Err(e) => {
-                drop(tcp);
-                if attempt == 9 {
-                    return Err(format!("udp bind at shared port failed: {e}").into());
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-    }
-    Err("exhausted colocated TCP/UDP reservation retries".into())
-}
 
 /// Build a frontend TLS cert + CA PEMs and write them to the harness temp
 /// dir. Returns `(ca_pem, cert_path, key_path)` as strings.
@@ -302,14 +260,15 @@ async fn h3_backend_connection_close_mid_request_downgrades_capability() {
     let ca = TestCa::new("phase3-t2").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
-    let (tcp_listener, udp_socket, backend_port) = reserve_colocated_tcp_udp()
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
         .await
         .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
 
     // TCP+TLS side: always answers 200 so the cross-protocol bridge works
     // on the second request.
     let _tcp_backend = ScriptedTlsBackend::builder(
-        tcp_listener,
+        tcp_res.into_listener(),
         TlsConfig::new(cert.clone(), key.clone())
             .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
     )
@@ -325,7 +284,7 @@ async fn h3_backend_connection_close_mid_request_downgrades_capability() {
     // + close the connection. Once the probe completes, the gateway caches
     // `h3 = Supported`. First real request arrives → CONNECTION_CLOSE →
     // gateway 502s + downgrades. Second request skips the H3 pool.
-    let h3_backend = ScriptedH3Backend::builder(udp_socket, H3TlsConfig::new(cert, key))
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
         .step(H3Step::AcceptStream)
         .step(H3Step::CloseConnectionWithCode(0))
         .spawn()
@@ -423,13 +382,14 @@ async fn h3_protocol_error_downgrades_via_connection_error_false_path() {
     let ca = TestCa::new("phase3-t3").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
-    let (tcp_listener, udp_socket, backend_port) = reserve_colocated_tcp_udp()
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
         .await
         .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
 
     // TCP+TLS side — 200 responder for the cross-protocol bridge.
     let _tcp_backend = ScriptedTlsBackend::builder(
-        tcp_listener,
+        tcp_res.into_listener(),
         TlsConfig::new(cert.clone(), key.clone())
             .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
     )
@@ -444,11 +404,12 @@ async fn h3_protocol_error_downgrades_via_connection_error_false_path() {
     // H3 side: accept handshake + stream, then send GOAWAY. This
     // translates to a ProtocolError class with connection_error=false —
     // exactly the code path the Codex P2 fix was for.
-    let _h3_backend = ScriptedH3Backend::builder(udp_socket, H3TlsConfig::new(cert, key))
-        .step(H3Step::AcceptStream)
-        .step(H3Step::SendGoaway(0))
-        .spawn()
-        .expect("spawn h3");
+    let _h3_backend =
+        ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+            .step(H3Step::AcceptStream)
+            .step(H3Step::SendGoaway(0))
+            .spawn()
+            .expect("spawn h3");
 
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
@@ -515,13 +476,14 @@ async fn h3_backend_recovers_after_periodic_refresh() {
     let ca = TestCa::new("phase3-t4").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
-    let (tcp_listener, udp_socket, backend_port) = reserve_colocated_tcp_udp()
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
         .await
         .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
 
     // TCP+TLS side — stays up for the whole test (used by cross-protocol bridge).
     let _tcp_backend = ScriptedTlsBackend::builder(
-        tcp_listener,
+        tcp_res.into_listener(),
         TlsConfig::new(cert.clone(), key.clone())
             .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
     )
@@ -539,13 +501,9 @@ async fn h3_backend_recovers_after_periodic_refresh() {
     // synchronously within `warmup_connection`, pinning the
     // classification to Unsupported rather than racing a subsequent
     // CONNECTION_CLOSE against the probe's cached sender.
-    let refuser_reservation =
-        crate::scaffolding::backends::UdpSocketReservation::new(backend_port, udp_socket);
-    let mut refuser = QuicRefuser::start_alpn_mismatch(
-        refuser_reservation,
-        H3TlsConfig::new(cert.clone(), key.clone()),
-    )
-    .expect("start refuser");
+    let mut refuser =
+        QuicRefuser::start_alpn_mismatch(udp_res, H3TlsConfig::new(cert.clone(), key.clone()))
+            .expect("start refuser");
 
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
@@ -627,12 +585,13 @@ async fn h3_frontend_to_h3_backend_failure_downgrades_from_server_path() {
     let ca = TestCa::new("phase3-t5").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
-    let (tcp_listener, udp_socket, backend_port) = reserve_colocated_tcp_udp()
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
         .await
         .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
 
     let _tcp_backend = ScriptedTlsBackend::builder(
-        tcp_listener,
+        tcp_res.into_listener(),
         TlsConfig::new(cert.clone(), key.clone())
             .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
     )
@@ -647,11 +606,12 @@ async fn h3_frontend_to_h3_backend_failure_downgrades_from_server_path() {
     // H3 side: accept stream, then close the whole connection. We use
     // CloseConnectionWithCode — distinct from Test 2 only in the
     // intermediate assertion focus (which HANDLER marks_h3_unsupported).
-    let _h3_backend = ScriptedH3Backend::builder(udp_socket, H3TlsConfig::new(cert, key))
-        .step(H3Step::AcceptStream)
-        .step(H3Step::CloseConnectionWithCode(0x10c)) // H3_REQUEST_CANCELLED
-        .spawn()
-        .expect("spawn h3");
+    let _h3_backend =
+        ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+            .step(H3Step::AcceptStream)
+            .step(H3Step::CloseConnectionWithCode(0x10c)) // H3_REQUEST_CANCELLED
+            .spawn()
+            .expect("spawn h3");
 
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
@@ -700,13 +660,14 @@ async fn h3_pool_key_separates_by_dns_override() {
 
     // Same backend port — we don't actually send traffic, we just want
     // the registry to see two distinct proxies.
-    let (tcp_listener, udp_socket, backend_port) = reserve_colocated_tcp_udp()
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
         .await
         .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
 
     // Keep the backends alive so the probe succeeds.
     let _tcp_backend = ScriptedTlsBackend::builder(
-        tcp_listener,
+        tcp_res.into_listener(),
         TlsConfig::new(cert.clone(), key.clone())
             .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
     )
@@ -718,10 +679,11 @@ async fn h3_pool_key_separates_by_dns_override() {
     .spawn()
     .expect("spawn tls");
 
-    let _h3_backend = ScriptedH3Backend::builder(udp_socket, H3TlsConfig::new(cert, key))
-        .step(H3Step::StallFor(Duration::from_secs(60)))
-        .spawn()
-        .expect("spawn h3");
+    let _h3_backend =
+        ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+            .step(H3Step::StallFor(Duration::from_secs(60)))
+            .spawn()
+            .expect("spawn h3");
 
     // Frontend certs.
     let scratch = tempfile::tempdir().expect("scratch");

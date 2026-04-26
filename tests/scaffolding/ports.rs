@@ -179,6 +179,59 @@ pub async fn unbound_udp_port() -> io::Result<u16> {
     Ok(reserve_udp_port().await?.drop_and_take_port())
 }
 
+/// Reserve a co-located TCP + UDP pair on the same port number.
+///
+/// Returned as a `(PortReservation, UdpPortReservation)` tuple — the same
+/// types `reserve_port` / `reserve_udp_port` use individually. Callers can
+/// hand the TCP listener and UDP socket to a TCP+TLS backend and an H3
+/// backend respectively, so the proxy's single `backend_port` value works
+/// for both.
+///
+/// Strategy: bind TCP on `0`, note its port, then bind UDP on that same
+/// port. Retry on UDP conflict. TCP and UDP share the port namespace at
+/// the kernel level without issue (different protocol numbers), so a UDP
+/// bind at the same port generally succeeds on the first try.
+pub async fn reserve_colocated_tcp_udp() -> io::Result<(PortReservation, UdpPortReservation)> {
+    for attempt in 0..MAX_RESERVE_ATTEMPTS {
+        let tcp_listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => {
+                if attempt + 1 == MAX_RESERVE_ATTEMPTS {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_millis(10 * (attempt + 1) as u64)).await;
+                continue;
+            }
+        };
+        let port = tcp_listener.local_addr()?.port();
+        match UdpSocket::bind(("127.0.0.1", port)).await {
+            Ok(udp_socket) => {
+                return Ok((
+                    PortReservation {
+                        port,
+                        listener: tcp_listener,
+                    },
+                    UdpPortReservation {
+                        port,
+                        socket: udp_socket,
+                    },
+                ));
+            }
+            Err(e) => {
+                drop(tcp_listener);
+                if attempt + 1 == MAX_RESERVE_ATTEMPTS {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_millis(10 * (attempt + 1) as u64)).await;
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "exhausted colocated TCP/UDP port reservation retries",
+    ))
+}
+
 /// Reserve and immediately release a port. Connects to the returned port
 /// produce a genuine `ECONNREFUSED` at the kernel level (nothing is
 /// listening), unlike
@@ -235,5 +288,17 @@ mod tests {
         let reservation = reserve_port().await.expect("reserve");
         let port = reservation.drop_and_take_port();
         assert!(port > 0);
+    }
+
+    #[tokio::test]
+    async fn reserve_colocated_tcp_udp_shares_port_across_protocols() {
+        let (tcp, udp) = reserve_colocated_tcp_udp()
+            .await
+            .expect("colocated reserve");
+        assert_eq!(tcp.port, udp.port, "TCP and UDP halves must share a port");
+        // Both halves should still be live — drop them in sequence and
+        // confirm `local_addr()` works on each.
+        assert_eq!(tcp.local_addr().unwrap().port(), tcp.port);
+        assert_eq!(udp.local_addr().unwrap().port(), udp.port);
     }
 }
