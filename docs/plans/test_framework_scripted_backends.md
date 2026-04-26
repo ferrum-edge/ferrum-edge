@@ -344,7 +344,8 @@ Each returns a `Script` suitable for whichever backend it targets.
   - **Refresh coalescer under rapid reload**: apply 50 config updates in 100 ms; assert exactly one or two refresh tasks ran (not 50), and the final config's capability entries are present.
 - `tests/functional/functional_retry_test.rs`:
   - `retry_respects_retry_on_methods` — backend sends connection_reset; POST with `retry_on_methods = [GET]` must NOT retry; GET must.
-  - `retry_on_h3_transport_failure_routes_next_attempt_via_reqwest` — exercises the downgrade-in-retry-loop path.
+  - `post_h3_downgrade_subsequent_requests_route_via_cross_protocol_bridge` — first H3 request fails and downgrades the cached capability; the SECOND request routes via reqwest. Pins the next-request half of the single-protocol-per-request contract.
+  - `retry_attempts_within_same_request_stay_on_h3_pool` — sibling that pins the same-request half: once a request dispatches via H3, every retry attempt for that request stays on H3 even after `mark_h3_unsupported` fires.
 - `tests/functional/functional_overload_test.rs`:
   - FD pressure → keepalive disabled; assert `Connection: close` on responses.
   - Request ceiling → 503 with correct `overload_reason`.
