@@ -1123,9 +1123,10 @@ fn build_health_check_client_with_tls(
     if let Some(ca_path) = ca_path {
         if let Ok(ca_data) = std::fs::read(ca_path) {
             if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_data) {
-                builder = builder
-                    .tls_built_in_root_certs(false)
-                    .add_root_certificate(ca_cert);
+                // reqwest 0.13: `tls_certs_only` replaces the trust store entirely,
+                // matching the project's "CA exclusivity" rule (no webpki mixing
+                // when a custom CA is provided).
+                builder = builder.tls_certs_only([ca_cert]);
             } else {
                 tracing::warn!(
                     "Health check: failed to parse CA cert from {}, using system roots",

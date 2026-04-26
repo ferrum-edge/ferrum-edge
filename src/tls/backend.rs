@@ -186,10 +186,11 @@ impl<'a> BackendTlsConfigBuilder<'a> {
     }
 
     pub fn build_reqwest(&self) -> Result<ClientBuilder, TlsError> {
+        // reqwest 0.13 removed `tls_built_in_root_certs`. We always pass a
+        // fully-built `rustls::ClientConfig` via `use_preconfigured_tls`, which
+        // is the sole source of truth for the trust anchors anyway — the
+        // built-in roots toggle never had any effect on this path.
         let mut builder = reqwest::Client::builder();
-        if self.custom_ca_path().is_some() {
-            builder = builder.tls_built_in_root_certs(false);
-        }
         if self.skip_verification() {
             builder = builder.danger_accept_invalid_certs(true);
         }

@@ -468,19 +468,50 @@ async fn test_restore_body_size_limit() {
     let body = format!(r#"{{"proxies":[],"pad":"{padding}"}}"#);
     assert!(body.len() > 1024 * 1024, "test body must exceed 1 MiB");
 
-    let resp = client
+    // Gateway enforces the size cap by returning 413 PAYLOAD_TOO_LARGE and
+    // closing the connection. Two outcomes are observable from the client:
+    //
+    //   1. The gateway reads + buffers up to 1 MiB, sends 413, then closes.
+    //      If the client managed to flush the rest of the 2 MiB body into
+    //      the socket before the close lands, it sees the 413 cleanly.
+    //
+    //   2. The client is still writing the body when the connection is
+    //      closed. macOS surfaces this as ECONNRESET in `BodyWrite`. Newer
+    //      reqwest / hyper-util raise that as a `Request` error rather than
+    //      silently completing. This is a race against TCP send/receive
+    //      buffer pressure (~128 KiB on macOS by default), so under
+    //      parallel test load the connection-reset path is the common one.
+    //
+    // Both outcomes prove the gateway enforced the cap — accept either.
+    match client
         .post(format!("{}/restore?confirm=true", harness.admin_base_url))
         .header("Authorization", harness.auth_header())
         .header("Content-Type", "application/json")
         .body(body)
         .send()
         .await
-        .expect("POST /restore failed");
-    assert_eq!(
-        resp.status().as_u16(),
-        413,
-        "2 MiB body under 1 MiB limit should return 413 PAYLOAD_TOO_LARGE"
-    );
+    {
+        Ok(resp) => assert_eq!(
+            resp.status().as_u16(),
+            413,
+            "2 MiB body under 1 MiB limit should return 413 PAYLOAD_TOO_LARGE \
+             when the response races back before the connection close"
+        ),
+        Err(err) => {
+            // Confirm this is the gateway-closed-mid-body class of error,
+            // not e.g. a connect failure that would mean the gateway never
+            // saw the request in the first place.
+            let chain = format!("{err:?}");
+            assert!(
+                chain.contains("BodyWrite")
+                    || chain.contains("ConnectionReset")
+                    || chain.contains("connection closed")
+                    || chain.contains("broken pipe"),
+                "expected ConnectionReset / BodyWrite when gateway closes \
+                 mid-upload after enforcing the size cap, got: {chain}"
+            );
+        }
+    }
 }
 
 /// Test 8: `/restore` with malformed JSON → 400 with parse error in body.

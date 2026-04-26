@@ -143,9 +143,9 @@ impl PluginHttpClient {
             match std::fs::read(ca_path) {
                 Ok(ca_pem) => match reqwest::Certificate::from_pem(&ca_pem) {
                     Ok(cert) => {
-                        builder = builder
-                            .tls_built_in_root_certs(false)
-                            .add_root_certificate(cert);
+                        // reqwest 0.13: `tls_certs_only` replaces the trust
+                        // store entirely (CA exclusivity).
+                        builder = builder.tls_certs_only([cert]);
                     }
                     Err(e) => {
                         tracing::warn!("Failed to parse CA bundle from {}: {}", ca_path, e);
