@@ -66,6 +66,39 @@ pub fn strip_backend_request_headers(headers: &mut http::HeaderMap) {
     }
 }
 
+/// In-place strip of every backend-request hop-by-hop header from a
+/// `http::HeaderMap`, then synthesise the gRPC-required `te: trailers`
+/// directive.
+///
+/// gRPC over HTTP/2 ([gRPC HTTP/2 spec][grpc-http2]) defines `te:
+/// trailers` as a mandatory request header. Many gRPC servers (notably
+/// `grpc-go`) reject requests missing it as evidence of a non-gRPC-aware
+/// proxy in the path, so the proxy MUST forward it on every gRPC backend
+/// request. The generic [`strip_backend_request_headers`] removes `te`
+/// alongside the rest of the RFC 9110 §7.6.1 hop-by-hop set (correct for
+/// HTTP/2 generally, where only `te: trailers` is even legal per RFC
+/// 9113 §8.2.2), so the gRPC paths must re-establish the header after
+/// stripping. We synthesise it unconditionally rather than preserving
+/// the client's value because:
+///
+/// - Per RFC 9113 §8.2.2 the only TE value an HTTP/2 client may send is
+///   `trailers`, so any preserved value would be `trailers` anyway.
+/// - Some clients (or earlier proxies) silently drop `te` despite gRPC
+///   requiring it; synthesising guarantees the gRPC backend's strict
+///   check passes.
+/// - Anything other than `trailers` would itself be a protocol
+///   violation.
+///
+/// Mirrors the pre-PR-511 effective behaviour for valid gRPC clients
+/// (their `te: trailers` previously survived the partial 2-header strip)
+/// and now works correctly even when the client omitted it.
+///
+/// [grpc-http2]: https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md
+pub fn strip_backend_request_headers_for_grpc(headers: &mut http::HeaderMap) {
+    strip_backend_request_headers(headers);
+    headers.insert(http::header::TE, http::HeaderValue::from_static("trailers"));
+}
+
 /// Returns `true` for headers that must NOT be forwarded on a backend
 /// response, per RFC 9110 §7.6.1 (response-direction hop-by-hop set).
 ///
@@ -199,5 +232,80 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn grpc_request_strip_synthesises_te_trailers_when_client_omitted_it() {
+        // Some clients / earlier proxies drop `te` despite gRPC requiring
+        // `te: trailers`. The gRPC-specific strip must always end with the
+        // header set so the backend's strict check passes.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/grpc"),
+        );
+        strip_backend_request_headers_for_grpc(&mut headers);
+        assert_eq!(
+            headers.get(http::header::TE),
+            Some(&http::HeaderValue::from_static("trailers")),
+            "gRPC strip must synthesise te: trailers even when missing",
+        );
+    }
+
+    #[test]
+    fn grpc_request_strip_replaces_invalid_te_with_trailers() {
+        // A client sending `te: gzip` (invalid in HTTP/2 per RFC 9113
+        // §8.2.2) would normally reach the backend if we only stripped
+        // `connection` and `transfer-encoding` (the pre-PR-511 behaviour).
+        // After this PR, the canonical strip removes any `te` value, then
+        // the gRPC helper re-inserts the spec-compliant `trailers`.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::TE, http::HeaderValue::from_static("gzip"));
+        strip_backend_request_headers_for_grpc(&mut headers);
+        assert_eq!(
+            headers.get(http::header::TE),
+            Some(&http::HeaderValue::from_static("trailers")),
+            "gRPC strip must overwrite a non-`trailers` TE value",
+        );
+    }
+
+    #[test]
+    fn grpc_request_strip_preserves_te_trailers_for_valid_clients() {
+        // The valid-client case: an H2 gRPC client sent `te: trailers`.
+        // After strip + synthesise, the same value remains. This is the
+        // pre-PR-511 effective behaviour, now restored.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::TE, http::HeaderValue::from_static("trailers"));
+        strip_backend_request_headers_for_grpc(&mut headers);
+        assert_eq!(
+            headers.get(http::header::TE),
+            Some(&http::HeaderValue::from_static("trailers")),
+            "gRPC strip must preserve te: trailers from valid clients",
+        );
+    }
+
+    #[test]
+    fn grpc_request_strip_still_removes_other_hop_by_hop_headers() {
+        // Smoke check: the gRPC helper must NOT regress the rest of the
+        // RFC 9110 §7.6.1 strip — only `te` is special-cased.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("keep-alive"),
+        );
+        headers.insert(
+            "proxy-authorization",
+            http::HeaderValue::from_static("Bearer xyz"),
+        );
+        headers.insert("proxy-connection", http::HeaderValue::from_static("close"));
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("42"),
+        );
+        strip_backend_request_headers_for_grpc(&mut headers);
+        assert!(headers.get(http::header::CONNECTION).is_none());
+        assert!(headers.get("proxy-authorization").is_none());
+        assert!(headers.get("proxy-connection").is_none());
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
     }
 }

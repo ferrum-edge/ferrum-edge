@@ -42,7 +42,9 @@ use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
-use crate::proxy::headers::{is_backend_response_strip_header, strip_backend_request_headers};
+use crate::proxy::headers::{
+    is_backend_response_strip_header, strip_backend_request_headers_for_grpc,
+};
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
 
@@ -889,14 +891,13 @@ pub async fn proxy_grpc_request_streaming(
 
     // Build headers, apply proxy transforms.
     //
-    // Strip the full RFC 9110 §7.6.1 request hop-by-hop set plus
-    // `content-length` (hyper frames the body via DATA frames so any
-    // forwarded value is informational and risks mismatch with the
-    // framed length when a request_transformer plugin mutated the body)
-    // and the internal Ferrum compression marker. Canonical predicate
-    // lives in `proxy::headers`.
+    // Use the gRPC-specific strip helper: same RFC 9110 §7.6.1 hop-by-hop
+    // strip + content-length + internal markers as the generic path, then
+    // synthesise `te: trailers` (mandatory per the gRPC HTTP/2 spec; many
+    // gRPC servers reject requests missing it). See `proxy::headers` for
+    // the rationale.
     let mut headers = parts.headers;
-    strip_backend_request_headers(&mut headers);
+    strip_backend_request_headers_for_grpc(&mut headers);
     for (k, v) in proxy_headers {
         if let (Ok(name), Ok(val)) = (
             hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -993,9 +994,20 @@ pub async fn proxy_grpc_request_streaming(
     // Return streaming response with the exceeded flag so the response body
     // consumer can detect late-arriving size violations (bidi/client-streaming
     // RPCs where request frames continue after response headers arrive).
+    //
+    // Strip hop-by-hop response headers per RFC 9110 §7.6.1 — see
+    // `proxy::headers`. This is the always-streaming entry point (used
+    // when there are no body plugins and no retry); without filtering
+    // here, hop-by-hop response headers (`proxy-authenticate`,
+    // `proxy-connection`, `te`, `trailer`, etc.) leak downstream past
+    // the proxy boundary. Mirrors `proxy_grpc_request_core` so the two
+    // gRPC response paths cannot drift.
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     for (k, v) in response.headers() {
+        if is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
         if let Ok(vs) = v.to_str() {
             resp_headers.insert(k.as_str().to_string(), vs.to_string());
         }
@@ -1074,11 +1086,11 @@ pub(crate) async fn proxy_grpc_request_core(
         .parse()
         .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
 
-    // Clear the full RFC 9110 §7.6.1 request hop-by-hop set plus
-    // `content-length` and the internal Ferrum compression marker.
-    // Canonical predicate lives in `proxy::headers`. Mirrors the
-    // buffered gRPC path above so the two cannot drift.
-    strip_backend_request_headers(&mut headers);
+    // Use the gRPC-specific strip helper: full RFC 9110 §7.6.1 hop-by-hop
+    // strip + content-length + internal markers, then synthesise
+    // `te: trailers` (mandatory per the gRPC HTTP/2 spec). Mirrors the
+    // streaming gRPC path above so the two cannot drift.
+    strip_backend_request_headers_for_grpc(&mut headers);
 
     // Apply proxy headers from the plugin pipeline (before_proxy transformations)
     for (k, v) in proxy_headers {
