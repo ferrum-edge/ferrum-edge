@@ -1460,10 +1460,16 @@ components:
       required: false
       schema:
         type: string
-        pattern: "^[a-zA-Z0-9_-]+$"
+        pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+        maxLength: 254
         default: ferrum
       description: |
         Scopes the request to a specific namespace. Defaults to `ferrum`.
+        Must start with an alphanumeric character and contain only
+        alphanumeric characters, dots, underscores, or hyphens (max 254
+        chars) — same rules as resource IDs (see `validate_namespace` in
+        `src/config/types.rs`).
+
         On write operations, this value overrides the `namespace` field in
         the request body (which is therefore effectively read-only on the
         wire). Resources from other namespaces are not visible to this
@@ -1577,6 +1583,8 @@ components:
           type: string
           default: ferrum
           readOnly: true
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          maxLength: 254
           description: >-
             Namespace this proxy belongs to. Read-only on the wire — set from
             the `X-Ferrum-Namespace` request header (or the `ferrum` default)
@@ -2003,6 +2011,8 @@ components:
           type: string
           default: ferrum
           readOnly: true
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          maxLength: 254
           description: >-
             Namespace this consumer belongs to. Read-only on the wire — set
             from the `X-Ferrum-Namespace` request header (or the `ferrum`
@@ -2204,6 +2214,8 @@ components:
           type: string
           default: ferrum
           readOnly: true
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          maxLength: 254
           description: >-
             Namespace this plugin config belongs to. Read-only on the wire —
             set from the `X-Ferrum-Namespace` request header (or the `ferrum`
@@ -2580,6 +2592,8 @@ components:
           type: string
           default: ferrum
           readOnly: true
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          maxLength: 254
           description: >-
             Namespace this upstream belongs to. Read-only on the wire — set
             from the `X-Ferrum-Namespace` request header (or the `ferrum`
@@ -2916,11 +2930,31 @@ components:
     # ── Health response ─────────────────────────────────────────────
     HealthResponse:
       type: object
-      required: [status, timestamp, mode, database, cached_config]
+      required: [status, timestamp, mode, ready, admin_writes_enabled, cached_config]
       properties:
         status:
           type: [string, "null"]
-          enum: [ok, degraded]
+          enum: [ok, degraded, starting]
+          description: |
+            Aggregate gateway health.
+            `ok` — fully ready and healthy (200).
+            `degraded` — ready but DB is disconnected or admin writes are
+            blocked (still 200; the gateway continues to serve from cached
+            config).
+            `starting` — startup not yet complete (returned with 503 and
+            `ready: false`).
+        ready:
+          type: boolean
+          description: |
+            `true` once the gateway has finished startup. While `false`, the
+            endpoint returns `503 Service Unavailable`.
+        admin_writes_enabled:
+          type: boolean
+          description: |
+            `true` when the admin API will accept writes. `false` when the
+            admin API is in read-only mode or when the database is currently
+            unavailable. When `false` and read-only mode is not configured,
+            `status` is forced to `degraded`.
         timestamp:
           type: [string, "null"]
           format: date-time
@@ -2933,14 +2967,17 @@ components:
             - file
         database:
           type: object
-          required: [status, type]
+          description: |
+            Database connectivity info. Present only when the gateway has a
+            configured database (database/cp/dp modes); absent in file mode.
+          required: [status]
           properties:
             status:
               type: [string, "null"]
               enum: [connected, disconnected]
             type:
               type: [string, "null"]
-              description: Database engine type
+              description: Database engine type. Present only when connected.
               examples:
                 - postgres
                 - mysql
