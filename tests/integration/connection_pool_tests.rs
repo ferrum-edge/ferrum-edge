@@ -486,3 +486,247 @@ async fn test_idle_timeout_does_not_fragment_pool() {
         "Different idle_timeout_seconds should NOT fragment the pool"
     );
 }
+
+/// Regression test for the `seanmonstar/reqwest#3017` work-around lift.
+///
+/// Pool keys intentionally exclude policy fields like `backend_connect_timeout_ms`,
+/// so two proxies that target the same backend (same host, port, scheme, TLS,
+/// DNS override) MUST share a single `reqwest::Client`. Previously this caused
+/// cross-proxy connect-timeout leakage: the first proxy's value was baked into
+/// the shared client and dictated the timeout for every other proxy reusing
+/// that pool entry. The vendored reqwest patch (PR #3017) lets us apply
+/// `RequestBuilder::connect_timeout()` per request, so per-proxy timeouts are
+/// now honored independently even when the underlying client is shared.
+///
+/// This test verifies the pool-sharing precondition that makes the
+/// per-request-override semantics observable: if pool-sharing ever broke,
+/// the per-request-override fix would have nothing left to fix. The actual
+/// per-request `connect_timeout` API is exercised at the dispatch site in
+/// `src/proxy/mod.rs` (and `src/http3/cross_protocol.rs`); the test here
+/// guards the pool-key contract.
+#[tokio::test]
+async fn test_connect_timeout_does_not_fragment_pool() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+        None,
+        std::sync::Arc::new(Vec::new()),
+    );
+
+    let mut proxy_fast = create_test_proxy();
+    proxy_fast.id = "fast".to_string();
+    proxy_fast.backend_connect_timeout_ms = 250;
+
+    let mut proxy_slow = create_test_proxy();
+    proxy_slow.id = "slow".to_string();
+    proxy_slow.backend_connect_timeout_ms = 30_000;
+
+    let _client_fast = pool.get_client(&proxy_fast).await.unwrap();
+    let _client_slow = pool.get_client(&proxy_slow).await.unwrap();
+
+    let stats = pool.get_stats();
+    assert_eq!(
+        stats.total_pools, 1,
+        "Different backend_connect_timeout_ms MUST NOT fragment the pool — \
+         per-request `connect_timeout` (vendored reqwest #3017) makes pool \
+         sharing safe even when timeouts diverge"
+    );
+}
+
+/// Smoke test that the vendored `RequestBuilder::connect_timeout` API is
+/// reachable through the pooled client. We aren't exercising the timer here
+/// (that's reqwest's own unit test) — we're locking in the shape of the
+/// dispatch-site call so that if upstream renames the API or we accidentally
+/// drop the patch, the regression surfaces immediately rather than at
+/// runtime against a real backend.
+#[tokio::test]
+async fn test_pooled_client_exposes_per_request_connect_timeout() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+        None,
+        std::sync::Arc::new(Vec::new()),
+    );
+
+    let proxy = create_test_proxy();
+    let client = pool.get_client(&proxy).await.unwrap();
+
+    // Build a RequestBuilder and verify both per-request overrides chain.
+    let _builder = client
+        .get("http://localhost:1/")
+        .connect_timeout(std::time::Duration::from_millis(
+            proxy.backend_connect_timeout_ms,
+        ))
+        .timeout(std::time::Duration::from_millis(
+            proxy.backend_read_timeout_ms,
+        ));
+}
+
+/// Runtime regression test: per-request `connect_timeout` actually fires.
+///
+/// The smoke test above only verifies the call shape compiles. This test
+/// exercises the patch end-to-end: dispatch a real request with a tight
+/// per-request connect timeout against a non-routable IP, and verify the
+/// request fails quickly. If the vendored reqwest patch ever regressed at
+/// the thread-local/connector boundary, the override would be silently
+/// dropped and connect would hang for the OS's default TCP SYN-retransmit
+/// budget (~75s on Linux) — caught by the upper-bound timing assertion.
+///
+/// Uses TEST-NET-1 (RFC 5737, 192.0.2.0/24) for a non-routable address,
+/// matching the established pattern in `tests/integration/http2_pool_tests.rs`.
+#[tokio::test]
+async fn test_per_request_connect_timeout_fires_at_runtime() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+        None,
+        std::sync::Arc::new(Vec::new()),
+    );
+
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "192.0.2.1".to_string(); // TEST-NET-1, RFC 5737
+    proxy.backend_port = 9999;
+    proxy.backend_connect_timeout_ms = 100;
+    proxy.backend_tls_verify_server_cert = false;
+
+    let client = pool.get_client(&proxy).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let result = client
+        .get("http://192.0.2.1:9999/")
+        .connect_timeout(std::time::Duration::from_millis(
+            proxy.backend_connect_timeout_ms,
+        ))
+        .send()
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        result.is_err(),
+        "Connect to non-routable 192.0.2.1:9999 must fail"
+    );
+    let err = result.err().unwrap();
+    // Accept either timeout or connect error: on systems where TEST-NET-1
+    // hangs, the connect_timeout fires (is_timeout); on systems where it's
+    // immediately rejected as unreachable, we get a connect error
+    // (is_connect). Both prove the request didn't slip past the override.
+    assert!(
+        err.is_timeout() || err.is_connect(),
+        "Expected timeout/connect error from per-request connect_timeout, got: {:?}",
+        err
+    );
+    // If the patch silently dropped connect_timeout, this would take ~75s
+    // on Linux (kernel TCP SYN-retransmit budget). 5s is well above the
+    // configured 100ms timeout (room for CI scheduling jitter) and well
+    // below the OS default that would surface a regression.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "Per-request connect_timeout=100ms didn't apply at runtime — \
+         request took {:?}. The vendored reqwest patch may have regressed \
+         at the thread-local/connector boundary.",
+        elapsed
+    );
+}
+
+/// Runtime regression test: pool-sharing siblings honor per-request connect timeouts.
+///
+/// Two proxies that resolve to the same `reqwest::Client` (per pool-key
+/// contract verified above) must each observe their own
+/// `backend_connect_timeout_ms` via the per-request override — NOT a
+/// shared client-level value. This test exercises the patch through a
+/// shared client to catch any regression where the thread-local override
+/// leaks across requests on the same client or fails to propagate to the
+/// connector when reused.
+#[tokio::test]
+async fn test_pool_sharing_siblings_observe_per_request_connect_timeout_at_runtime() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+        None,
+        std::sync::Arc::new(Vec::new()),
+    );
+
+    let mut proxy_a = create_test_proxy();
+    proxy_a.id = "sibling_a".to_string();
+    proxy_a.backend_host = "192.0.2.1".to_string();
+    proxy_a.backend_port = 9999;
+    proxy_a.backend_connect_timeout_ms = 100;
+    proxy_a.backend_tls_verify_server_cert = false;
+
+    let mut proxy_b = create_test_proxy();
+    proxy_b.id = "sibling_b".to_string();
+    proxy_b.backend_host = "192.0.2.1".to_string();
+    proxy_b.backend_port = 9999;
+    proxy_b.backend_connect_timeout_ms = 200;
+    proxy_b.backend_tls_verify_server_cert = false;
+
+    let client_a = pool.get_client(&proxy_a).await.unwrap();
+    let client_b = pool.get_client(&proxy_b).await.unwrap();
+
+    // Pool-sharing precondition: same `reqwest::Client` instance. The
+    // per-request override semantics below depend on this — if pool sharing
+    // ever broke, the per-request fix wouldn't have anything left to fix.
+    assert_eq!(
+        pool.get_stats().total_pools,
+        1,
+        "Two proxies with the same pool key MUST share one reqwest::Client"
+    );
+
+    // First request through the shared client.
+    let started = std::time::Instant::now();
+    let r1 = client_a
+        .get("http://192.0.2.1:9999/")
+        .connect_timeout(std::time::Duration::from_millis(
+            proxy_a.backend_connect_timeout_ms,
+        ))
+        .send()
+        .await;
+    let elapsed_a = started.elapsed();
+
+    assert!(r1.is_err(), "Connect to non-routable IP must fail");
+    let err_a = r1.err().unwrap();
+    assert!(
+        err_a.is_timeout() || err_a.is_connect(),
+        "Sibling A: expected timeout/connect error, got: {:?}",
+        err_a
+    );
+    assert!(
+        elapsed_a < std::time::Duration::from_secs(5),
+        "Sibling A's per-request connect_timeout=100ms didn't apply — \
+         took {:?}",
+        elapsed_a
+    );
+
+    // Second request on the SAME shared client. If the patch's thread-local
+    // override leaked or didn't re-apply for this request, it would fall
+    // back to the (absent) client-level timeout and hang for ~75s.
+    let started = std::time::Instant::now();
+    let r2 = client_b
+        .get("http://192.0.2.1:9999/")
+        .connect_timeout(std::time::Duration::from_millis(
+            proxy_b.backend_connect_timeout_ms,
+        ))
+        .send()
+        .await;
+    let elapsed_b = started.elapsed();
+
+    assert!(r2.is_err(), "Connect to non-routable IP must fail");
+    let err_b = r2.err().unwrap();
+    assert!(
+        err_b.is_timeout() || err_b.is_connect(),
+        "Sibling B: expected timeout/connect error, got: {:?}",
+        err_b
+    );
+    assert!(
+        elapsed_b < std::time::Duration::from_secs(5),
+        "Sibling B's per-request connect_timeout=200ms didn't apply on \
+         the shared client — took {:?}. This suggests the thread-local \
+         override didn't propagate on the second request through a reused \
+         client.",
+        elapsed_b
+    );
+}

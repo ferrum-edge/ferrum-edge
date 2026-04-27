@@ -429,6 +429,14 @@ fn build_plain_request_builder(
 ) -> reqwest::RequestBuilder {
     let mut req_builder = client.request(req_method, backend_url);
 
+    // Per-request timeout overrides. The shared `reqwest::Client` has no
+    // client-level connect or read timeout, so each request must apply its
+    // own. The connect-timeout API is provided by a vendored copy of reqwest
+    // patched with seanmonstar/reqwest#3017.
+    if proxy.backend_connect_timeout_ms > 0 {
+        req_builder =
+            req_builder.connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms));
+    }
     if proxy.backend_read_timeout_ms > 0 {
         req_builder = req_builder.timeout(Duration::from_millis(proxy.backend_read_timeout_ms));
     }

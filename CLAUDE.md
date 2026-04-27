@@ -302,7 +302,9 @@ Shared shell in `src/pool/mod.rs`; per-pool key formats below. Key must include 
 
 Rules: never add policy fields (timeouts, pool sizes, keepalives); empty/default strings are free; keep `|` delimiter.
 
-**Policy cross-proxy sharing**: Because pool keys exclude policy fields, proxies resolving to the same entry share policy baked into the client (first-wins). `backend_read_timeout_ms` not observable (applied per-request via `RequestBuilder::timeout()`). `backend_connect_timeout_ms` IS observable (reqwest has no per-request override). Force separation via distinct `dns_override`. Upstream fix tracked: seanmonstar/reqwest#3017.
+**Policy cross-proxy sharing**: Because pool keys exclude policy fields, proxies resolving to the same entry share the underlying `reqwest::Client`. Both `backend_connect_timeout_ms` and `backend_read_timeout_ms` are applied per-request on the dispatch side (`RequestBuilder::connect_timeout()` and `RequestBuilder::timeout()`), so two proxies with different timeouts on the same pool entry get independent per-request timeouts — no cross-proxy leakage, no need for a `dns_override` work-around. The `connect_timeout` per-request override comes from a vendored copy of reqwest 0.13.2 with PR seanmonstar/reqwest#3017 applied; see `vendor/reqwest-0.13.2-ferrum-patched/` and `docs/upstream-reqwest-patches/001-per-request-connect-timeout/` for the lifecycle and retirement plan.
+
+One nuance: hyper coalesces concurrent cold-pool connects, so simultaneous requests from sibling proxies racing the same shared client over a cold/saturated pool entry all wait on a single in-flight handshake — whichever poller wins the connect dictates the effective connect timeout for the coalesced group. The same coalescing happened with the old client-level connect timeout; it's not a regression. Steady-state dispatches reuse warm idle connections and skip the window. If strict per-proxy isolation including the cold-connect race is required, fragment the pool via distinct `dns_override` values.
 
 ### Backend Capability Registry (`src/proxy/backend_capabilities.rs`)
 

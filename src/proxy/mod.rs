@@ -1651,11 +1651,22 @@ impl ProxyState {
                     .map_err(|e| format!("{}: {}", desc, e))?;
 
                 let url = format!("{}://{}:{}/", scheme, host, port);
-                let result = client
-                    .head(&url)
-                    .timeout(Duration::from_secs(5))
-                    .send()
-                    .await;
+                // Apply the proxy's `backend_connect_timeout_ms` as a per-request
+                // connect timeout, capped by the 5s overall warmup budget. Without
+                // this, the shared `reqwest::Client` carries no client-level
+                // connect timeout (we removed it so per-request overrides can
+                // diverge across pool-sharing siblings), so unreachable backends
+                // would consume the full 5s overall timeout per probe. Operators
+                // who set a tight `backend_connect_timeout_ms` (e.g. 500ms) get
+                // that bound at startup too. `0` disables — fall back to the 5s
+                // overall cap.
+                let mut req = client.head(&url).timeout(Duration::from_secs(5));
+                if proxy.backend_connect_timeout_ms > 0 {
+                    let warmup_cap = Duration::from_secs(5);
+                    let configured = Duration::from_millis(proxy.backend_connect_timeout_ms);
+                    req = req.connect_timeout(configured.min(warmup_cap));
+                }
+                let result = req.send().await;
 
                 match result {
                     Ok(_) => Ok(desc),
@@ -7415,11 +7426,18 @@ pub(crate) async fn proxy_to_backend_retry(
 
     let mut req_builder = client.request(req_method, backend_url);
 
-    // Per-request timeout override. The shared `reqwest::Client` intentionally
-    // has no client-level timeout (see `connection_pool::create_client`) so
-    // two proxies with different timeouts sharing the same pool entry do not
-    // leak policy across routes. `0` means "disabled" — skip the override so
-    // reqwest's default (no timeout) applies.
+    // Per-request timeout overrides. The shared `reqwest::Client` intentionally
+    // has no client-level connect or read timeout (see
+    // `connection_pool::create_client`) so two proxies with different timeouts
+    // sharing the same pool entry do not leak policy across routes. `0` means
+    // "disabled" for both — skip the override so reqwest's default (no timeout)
+    // applies. The per-request `connect_timeout` API is provided by a vendored
+    // copy of reqwest patched with seanmonstar/reqwest#3017.
+    if proxy.backend_connect_timeout_ms > 0 {
+        req_builder = req_builder.connect_timeout(std::time::Duration::from_millis(
+            proxy.backend_connect_timeout_ms,
+        ));
+    }
     if proxy.backend_read_timeout_ms > 0 {
         req_builder = req_builder.timeout(std::time::Duration::from_millis(
             proxy.backend_read_timeout_ms,
@@ -7880,11 +7898,18 @@ async fn proxy_to_backend(
 
     let mut req_builder = client.request(req_method, backend_url);
 
-    // Per-request timeout override. The shared `reqwest::Client` intentionally
-    // has no client-level timeout (see `connection_pool::create_client`) so
-    // two proxies with different timeouts sharing the same pool entry do not
-    // leak policy across routes. `0` means "disabled" — skip the override so
-    // reqwest's default (no timeout) applies.
+    // Per-request timeout overrides. The shared `reqwest::Client` intentionally
+    // has no client-level connect or read timeout (see
+    // `connection_pool::create_client`) so two proxies with different timeouts
+    // sharing the same pool entry do not leak policy across routes. `0` means
+    // "disabled" for both — skip the override so reqwest's default (no timeout)
+    // applies. The per-request `connect_timeout` API is provided by a vendored
+    // copy of reqwest patched with seanmonstar/reqwest#3017.
+    if proxy.backend_connect_timeout_ms > 0 {
+        req_builder = req_builder.connect_timeout(std::time::Duration::from_millis(
+            proxy.backend_connect_timeout_ms,
+        ));
+    }
     if proxy.backend_read_timeout_ms > 0 {
         req_builder = req_builder.timeout(std::time::Duration::from_millis(
             proxy.backend_read_timeout_ms,

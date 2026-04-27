@@ -1,0 +1,606 @@
+diff --git a/src/async_impl/client.rs b/src/async_impl/client.rs
+index fc9c0edb6..dc2ea0a71 100644
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -4,7 +4,7 @@ use std::future::Future;
+ use std::net::IpAddr;
+ use std::pin::Pin;
+ use std::sync::Arc;
+-use std::task::{ready, Context, Poll};
++use std::task::{Context, Poll};
+ use std::time::Duration;
+ use std::{collections::HashMap, convert::TryInto, net::SocketAddr};
+ use std::{fmt, str};
+@@ -16,7 +16,7 @@ use super::Body;
+ use crate::async_impl::h3_client::connect::{H3ClientConfig, H3Connector};
+ #[cfg(feature = "http3")]
+ use crate::async_impl::h3_client::H3Client;
+-use crate::config::{RequestConfig, TotalTimeout};
++use crate::config::{ConnectTimeout, RequestConfig, TotalTimeout};
+ #[cfg(unix)]
+ use crate::connect::uds::UnixSocketProvider;
+ #[cfg(target_os = "windows")]
+@@ -1082,6 +1082,7 @@ impl ClientBuilder {
+                 },
+                 headers: config.headers,
+                 referer: config.referer,
++                connect_timeout: RequestConfig::new(config.connect_timeout),
+                 read_timeout: config.read_timeout,
+                 total_timeout: RequestConfig::new(config.timeout),
+                 hyper,
+@@ -2628,6 +2629,7 @@ impl Client {
+             .copied()
+             .map(tokio::time::sleep)
+             .map(Box::pin);
++        let connect_timeout = self.inner.connect_timeout.fetch(&extensions).copied();
+ 
+         let read_timeout_fut = self
+             .inner
+@@ -2647,6 +2649,7 @@ impl Client {
+                 total_timeout,
+                 read_timeout_fut,
+                 read_timeout: self.inner.read_timeout,
++                connect_timeout,
+             })),
+         }
+     }
+@@ -2912,6 +2915,7 @@ struct ClientRef {
+     #[cfg(feature = "http3")]
+     h3_client: Option<LayeredService<H3Client>>,
+     referer: bool,
++    connect_timeout: RequestConfig<ConnectTimeout>,
+     total_timeout: RequestConfig<TotalTimeout>,
+     read_timeout: Option<Duration>,
+     proxies: Arc<Vec<ProxyMatcher>>,
+@@ -2949,6 +2953,7 @@ impl ClientRef {
+ 
+         f.field("default_headers", &self.headers);
+ 
++        self.connect_timeout.fmt_as_field(f);
+         self.total_timeout.fmt_as_field(f);
+ 
+         if let Some(ref d) = self.read_timeout {
+@@ -2984,6 +2989,7 @@ pin_project! {
+         #[pin]
+         read_timeout_fut: Option<Pin<Box<Sleep>>>,
+         read_timeout: Option<Duration>,
++        connect_timeout: Option<Duration>,
+     }
+ }
+ 
+@@ -3053,20 +3059,32 @@ impl Future for PendingRequest {
+             }
+         }
+ 
+-        let res = match self.as_mut().in_flight().get_mut() {
+-            ResponseFuture::Default(r) => match ready!(Pin::new(r).poll(cx)) {
+-                Err(e) => {
+-                    return Poll::Ready(Err(e.if_no_url(|| self.url.clone())));
+-                }
+-                Ok(res) => res.map(super::body::boxed),
+-            },
+-            #[cfg(feature = "http3")]
+-            ResponseFuture::H3(r) => match ready!(Pin::new(r).poll(cx)) {
+-                Err(e) => {
+-                    return Poll::Ready(Err(crate::error::request(e).with_url(self.url.clone())));
+-                }
+-                Ok(res) => res.map(super::body::boxed),
+-            },
++        let connect_timeout = {
++            let this = self.as_mut().project();
++            *this.connect_timeout
++        };
++
++        let res = crate::connect::with_connect_timeout_override(connect_timeout, || {
++            match self.as_mut().in_flight().get_mut() {
++                ResponseFuture::Default(r) => match Pin::new(r).poll(cx) {
++                    Poll::Pending => Poll::Pending,
++                    Poll::Ready(Err(e)) => Poll::Ready(Err(e.if_no_url(|| self.url.clone()))),
++                    Poll::Ready(Ok(res)) => Poll::Ready(Ok(res.map(super::body::boxed))),
++                },
++                #[cfg(feature = "http3")]
++                ResponseFuture::H3(r) => match Pin::new(r).poll(cx) {
++                    Poll::Pending => Poll::Pending,
++                    Poll::Ready(Err(e)) => {
++                        Poll::Ready(Err(crate::error::request(e).with_url(self.url.clone())))
++                    }
++                    Poll::Ready(Ok(res)) => Poll::Ready(Ok(res.map(super::body::boxed))),
++                },
++            }
++        });
++        let res = match res {
++            Poll::Pending => return Poll::Pending,
++            Poll::Ready(Ok(res)) => res,
++            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+         };
+ 
+         if let Some(url) = &res
+diff --git a/src/async_impl/request.rs b/src/async_impl/request.rs
+index 1d845380f..c505bbe8a 100644
+--- a/src/async_impl/request.rs
++++ b/src/async_impl/request.rs
+@@ -13,7 +13,7 @@ use super::client::{Client, Pending};
+ #[cfg(feature = "multipart")]
+ use super::multipart;
+ use super::response::Response;
+-use crate::config::{RequestConfig, TotalTimeout};
++use crate::config::{ConnectTimeout, RequestConfig, TotalTimeout};
+ #[cfg(feature = "multipart")]
+ use crate::header::CONTENT_LENGTH;
+ #[cfg(any(feature = "multipart", feature = "form", feature = "json"))]
+@@ -127,6 +127,18 @@ impl Request {
+         RequestConfig::<TotalTimeout>::get_mut(&mut self.extensions)
+     }
+ 
++    /// Get the connect timeout.
++    #[inline]
++    pub fn connect_timeout(&self) -> Option<&Duration> {
++        RequestConfig::<ConnectTimeout>::get(&self.extensions)
++    }
++
++    /// Get a mutable reference to the connect timeout.
++    #[inline]
++    pub fn connect_timeout_mut(&mut self) -> &mut Option<Duration> {
++        RequestConfig::<ConnectTimeout>::get_mut(&mut self.extensions)
++    }
++
+     /// Get the http version.
+     #[inline]
+     pub fn version(&self) -> Version {
+@@ -149,6 +161,7 @@ impl Request {
+         };
+         let mut req = Request::new(self.method().clone(), self.url().clone());
+         *req.timeout_mut() = self.timeout().copied();
++        *req.connect_timeout_mut() = self.connect_timeout().copied();
+         *req.headers_mut() = self.headers().clone();
+         *req.version_mut() = self.version();
+         *req.extensions_mut() = self.extensions().clone();
+@@ -298,6 +311,18 @@ impl RequestBuilder {
+         self
+     }
+ 
++    /// Enables a request connect timeout.
++    ///
++    /// The timeout is applied while a new connection is being established. It
++    /// affects only this request and overrides the timeout configured using
++    /// `ClientBuilder::connect_timeout()`.
++    pub fn connect_timeout(mut self, timeout: Duration) -> RequestBuilder {
++        if let Ok(ref mut req) = self.request {
++            *req.connect_timeout_mut() = Some(timeout);
++        }
++        self
++    }
++
+     /// Sends a multipart/form-data body.
+     ///
+     /// ```
+@@ -940,6 +965,20 @@ mod tests {
+         builder.build().unwrap();
+     }
+ 
++    #[test]
++    fn request_connect_timeout_round_trips_through_clone() {
++        let mut request = Request::new(Method::GET, "https://example.com".try_into().unwrap());
++        *request.timeout_mut() = Some(Duration::from_secs(42));
++        *request.connect_timeout_mut() = Some(Duration::from_secs(7));
++        *request.version_mut() = Version::HTTP_11;
++
++        let clone = request.try_clone().unwrap();
++        assert_eq!(request.version(), clone.version());
++        assert_eq!(request.headers(), clone.headers());
++        assert_eq!(request.timeout(), clone.timeout());
++        assert_eq!(request.connect_timeout(), clone.connect_timeout());
++    }
++
+     /*
+     use {body, Method};
+     use super::Client;
+diff --git a/src/blocking/request.rs b/src/blocking/request.rs
+index 37580cf98..fe95a1d55 100644
+--- a/src/blocking/request.rs
++++ b/src/blocking/request.rs
+@@ -115,6 +115,18 @@ impl Request {
+         self.inner.timeout_mut()
+     }
+ 
++    /// Get the connect timeout.
++    #[inline]
++    pub fn connect_timeout(&self) -> Option<&Duration> {
++        self.inner.connect_timeout()
++    }
++
++    /// Get a mutable reference to the connect timeout.
++    #[inline]
++    pub fn connect_timeout_mut(&mut self) -> &mut Option<Duration> {
++        self.inner.connect_timeout_mut()
++    }
++
+     /// Attempts to clone the `Request`.
+     ///
+     /// None is returned if a body is which can not be cloned. This can be because the body is a
+@@ -131,6 +143,7 @@ impl Request {
+         };
+         let mut req = Request::new(self.method().clone(), self.url().clone());
+         *req.timeout_mut() = self.timeout().copied();
++        *req.connect_timeout_mut() = self.connect_timeout().copied();
+         *req.headers_mut() = self.headers().clone();
+         *req.version_mut() = self.version().clone();
+         req.body = body;
+@@ -366,6 +379,18 @@ impl RequestBuilder {
+         self
+     }
+ 
++    /// Enables a request connect timeout.
++    ///
++    /// The timeout is applied while a new connection is being established. It
++    /// affects only this request and overrides the timeout configured using
++    /// `ClientBuilder::connect_timeout()`.
++    pub fn connect_timeout(mut self, timeout: Duration) -> RequestBuilder {
++        if let Ok(ref mut req) = self.request {
++            *req.connect_timeout_mut() = Some(timeout);
++        }
++        self
++    }
++
+     /// Modify the query string of the URL.
+     ///
+     /// Modifies the URL of this request, adding the parameters provided.
+@@ -1104,11 +1129,13 @@ mod tests {
+     fn test_request_cloning() {
+         let mut request = Request::new(Method::GET, "https://example.com".try_into().unwrap());
+         *request.timeout_mut() = Some(Duration::from_secs(42));
++        *request.connect_timeout_mut() = Some(Duration::from_secs(7));
+         *request.version_mut() = Version::HTTP_11;
+ 
+         let clone = request.try_clone().unwrap();
+         assert_eq!(request.version(), clone.version());
+         assert_eq!(request.headers(), clone.headers());
+         assert_eq!(request.timeout(), clone.timeout());
++        assert_eq!(request.connect_timeout(), clone.connect_timeout());
+     }
+ }
+diff --git a/src/config.rs b/src/config.rs
+index 417c8076d..815326904 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -108,3 +108,10 @@ pub(crate) struct TotalTimeout;
+ impl RequestConfigValue for TotalTimeout {
+     type Value = Duration;
+ }
++
++#[derive(Clone, Copy)]
++pub(crate) struct ConnectTimeout;
++
++impl RequestConfigValue for ConnectTimeout {
++    type Value = Duration;
++}
+diff --git a/src/connect.rs b/src/connect.rs
+index f2d456e13..4cbd55d5e 100644
+--- a/src/connect.rs
++++ b/src/connect.rs
+@@ -11,9 +11,10 @@ use hyper_util::rt::TokioIo;
+ use native_tls_crate::{TlsConnector, TlsConnectorBuilder};
+ use pin_project_lite::pin_project;
+ use tower::util::{BoxCloneSyncServiceLayer, MapRequestLayer};
+-use tower::{timeout::TimeoutLayer, util::BoxCloneSyncService, ServiceBuilder};
++use tower::{util::BoxCloneSyncService, ServiceBuilder};
+ use tower_service::Service;
+ 
++use std::cell::Cell;
+ use std::future::Future;
+ use std::io::{self, IoSlice};
+ use std::net::IpAddr;
+@@ -67,6 +68,71 @@ pub(crate) type BoxedConnectorService = BoxCloneSyncService<Unnameable, Conn, Bo
+ pub(crate) type BoxedConnectorLayer =
+     BoxCloneSyncServiceLayer<BoxedConnectorService, Unnameable, Conn, BoxError>;
+ 
++thread_local! {
++    static REQUEST_CONNECT_TIMEOUT: Cell<Option<Duration>> = const { Cell::new(None) };
++}
++
++pub(crate) fn with_connect_timeout_override<T>(
++    timeout: Option<Duration>,
++    f: impl FnOnce() -> T,
++) -> T {
++    struct Restore<'a> {
++        slot: &'a Cell<Option<Duration>>,
++        previous: Option<Duration>,
++    }
++
++    impl Drop for Restore<'_> {
++        fn drop(&mut self) {
++            self.slot.set(self.previous);
++        }
++    }
++
++    REQUEST_CONNECT_TIMEOUT.with(|slot| {
++        let previous = slot.replace(timeout);
++        let _restore = Restore { slot, previous };
++        f()
++    })
++}
++
++fn effective_connect_timeout(default_timeout: Option<Duration>) -> Option<Duration> {
++    REQUEST_CONNECT_TIMEOUT.with(|slot| slot.get().or(default_timeout))
++}
++
++#[derive(Clone)]
++struct ConnectTimeoutService<S> {
++    inner: S,
++    default_timeout: Option<Duration>,
++}
++
++impl<S> ConnectTimeoutService<S> {
++    fn new(inner: S, default_timeout: Option<Duration>) -> Self {
++        Self {
++            inner,
++            default_timeout,
++        }
++    }
++}
++
++impl<S, Req> Service<Req> for ConnectTimeoutService<S>
++where
++    S: Service<Req, Response = Conn, Error = BoxError> + Clone + Send + Sync + 'static,
++    S::Future: Send + 'static,
++    Req: Send + 'static,
++{
++    type Response = Conn;
++    type Error = BoxError;
++    type Future = Connecting;
++
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        self.inner.poll_ready(cx)
++    }
++
++    fn call(&mut self, req: Req) -> Self::Future {
++        let timeout = effective_connect_timeout(self.default_timeout);
++        Box::pin(with_timeout(self.inner.call(req), timeout))
++    }
++}
++
+ pub(crate) struct ConnectorBuilder {
+     inner: Inner,
+     proxies: Arc<Vec<ProxyMatcher>>,
+@@ -94,6 +160,7 @@ where {
+             inner: self.inner,
+             proxies: self.proxies,
+             verbose: self.verbose,
++            connect_timeout: self.timeout,
+             #[cfg(feature = "__tls")]
+             nodelay: self.nodelay,
+             #[cfg(feature = "__tls")]
+@@ -138,33 +205,13 @@ where {
+             service = ServiceBuilder::new().layer(layer).service(service);
+         }
+ 
+-        // now we handle the concrete stuff - any `connect_timeout`,
+-        // plus a final map_err layer we can use to cast default tower layer
+-        // errors to internal errors
+-        match self.timeout {
+-            Some(timeout) => {
+-                let service = ServiceBuilder::new()
+-                    .layer(TimeoutLayer::new(timeout))
+-                    .service(service);
+-                let service = ServiceBuilder::new()
+-                    .map_err(|error: BoxError| cast_to_internal_error(error))
+-                    .service(service);
+-                let service = BoxCloneSyncService::new(service);
+-
+-                Connector::WithLayers(service)
+-            }
+-            None => {
+-                // no timeout, but still map err
+-                // no named timeout layer but we still map errors since
+-                // we might have user-provided timeout layer
+-                let service = ServiceBuilder::new().service(service);
+-                let service = ServiceBuilder::new()
+-                    .map_err(|error: BoxError| cast_to_internal_error(error))
+-                    .service(service);
+-                let service = BoxCloneSyncService::new(service);
+-                Connector::WithLayers(service)
+-            }
+-        }
++        let service = ConnectTimeoutService::new(service, self.timeout);
++        let service = ServiceBuilder::new()
++            .map_err(|error: BoxError| cast_to_internal_error(error))
++            .service(service);
++        let service = BoxCloneSyncService::new(service);
++
++        Connector::WithLayers(service)
+     }
+ 
+     #[cfg(not(feature = "__tls"))]
+@@ -485,6 +532,7 @@ pub(crate) struct ConnectorService {
+     inner: Inner,
+     proxies: Arc<Vec<ProxyMatcher>>,
+     verbose: verbose::Wrapper,
++    connect_timeout: Option<Duration>,
+     /// When there is a single timeout layer and no other layers,
+     /// we embed it directly inside our base Service::call().
+     /// This lets us avoid an extra `Box::pin` indirection layer
+@@ -534,6 +582,10 @@ impl Inner {
+ }
+ 
+ impl ConnectorService {
++    fn request_connect_timeout(&self) -> Option<Duration> {
++        effective_connect_timeout(self.connect_timeout)
++    }
++
+     #[cfg(feature = "socks")]
+     async fn connect_socks(mut self, dst: Uri, proxy: Intercepted) -> Result<Conn, BoxError> {
+         let dns = match proxy.uri().scheme_str() {
+@@ -543,10 +595,12 @@ impl ConnectorService {
+                 unreachable!("connect_socks is only called for socks proxies");
+             }
+         };
++        let connect_timeout = self.request_connect_timeout();
+ 
+         match &mut self.inner {
+             #[cfg(feature = "__native-tls")]
+             Inner::NativeTls(http, tls) => {
++                http.set_connect_timeout(connect_timeout);
+                 if dst.scheme() == Some(&Scheme::HTTPS) {
+                     let host = dst.host().ok_or("no host in url")?.to_string();
+                     let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
+@@ -564,6 +618,7 @@ impl ConnectorService {
+             }
+             #[cfg(feature = "__rustls")]
+             Inner::RustlsTls { http, tls, .. } => {
++                http.set_connect_timeout(connect_timeout);
+                 if dst.scheme() == Some(&Scheme::HTTPS) {
+                     use std::convert::TryFrom;
+                     use tokio_rustls::TlsConnector as RustlsConnector;
+@@ -589,6 +644,7 @@ impl ConnectorService {
+             }
+             #[cfg(not(feature = "__tls"))]
+             Inner::Http(http) => {
++                http.set_connect_timeout(connect_timeout);
+                 let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
+                 return Ok(Conn {
+                     inner: self.verbose.wrap(TokioIo::new(conn)),
+@@ -600,6 +656,7 @@ impl ConnectorService {
+ 
+         let resolver = &self.resolver;
+         let http = self.inner.get_http_connector();
++        http.set_connect_timeout(connect_timeout);
+         socks::connect(proxy, dst, dns, resolver, http)
+             .await
+             .map(|tcp| Conn {
+@@ -611,9 +668,11 @@ impl ConnectorService {
+     }
+ 
+     async fn connect_with_maybe_proxy(self, dst: Uri, is_proxy: bool) -> Result<Conn, BoxError> {
++        let connect_timeout = self.request_connect_timeout();
+         match self.inner {
+             #[cfg(not(feature = "__tls"))]
+             Inner::Http(mut http) => {
++                http.set_connect_timeout(connect_timeout);
+                 let io = http.call(dst).await?;
+                 Ok(Conn {
+                     inner: self.verbose.wrap(io),
+@@ -624,6 +683,7 @@ impl ConnectorService {
+             #[cfg(feature = "__native-tls")]
+             Inner::NativeTls(http, tls) => {
+                 let mut http = http.clone();
++                http.set_connect_timeout(connect_timeout);
+ 
+                 // Disable Nagle's algorithm for TLS handshake
+                 //
+@@ -663,6 +723,7 @@ impl ConnectorService {
+             #[cfg(feature = "__rustls")]
+             Inner::RustlsTls { http, tls, .. } => {
+                 let mut http = http.clone();
++                http.set_connect_timeout(connect_timeout);
+ 
+                 // Disable Nagle's algorithm for TLS handshake
+                 //
+@@ -782,6 +843,7 @@ impl ConnectorService {
+ 
+     async fn connect_via_proxy(self, dst: Uri, proxy: Intercepted) -> Result<Conn, BoxError> {
+         log::debug!("proxy({proxy:?}) intercepts '{:?}'", dst.host());
++        let connect_timeout = self.request_connect_timeout();
+ 
+         #[cfg(feature = "socks")]
+         match proxy.uri().scheme_str().ok_or("proxy scheme expected")? {
+@@ -804,8 +866,9 @@ impl ConnectorService {
+                 if dst.scheme() == Some(&Scheme::HTTPS) {
+                     log::trace!("tunneling HTTPS over proxy");
+                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
+-                    let inner =
+-                        hyper_tls::HttpsConnector::from((http.clone(), tls_connector.clone()));
++                    let mut http = http.clone();
++                    http.set_connect_timeout(connect_timeout);
++                    let inner = hyper_tls::HttpsConnector::from((http, tls_connector.clone()));
+                     // TODO: we could cache constructing this
+                     let mut tunnel =
+                         hyper_util::client::legacy::connect::proxy::Tunnel::new(proxy_dst, inner);
+@@ -849,7 +912,8 @@ impl ConnectorService {
+                     use tokio_rustls::TlsConnector as RustlsConnector;
+ 
+                     log::trace!("tunneling HTTPS over proxy");
+-                    let http = http.clone();
++                    let mut http = http.clone();
++                    http.set_connect_timeout(connect_timeout);
+                     let inner = hyper_rustls::HttpsConnector::from((http, tls_proxy.clone()));
+                     // TODO: we could cache constructing this
+                     let mut tunnel =
+@@ -927,7 +991,7 @@ impl Service<Uri> for ConnectorService {
+ 
+     fn call(&mut self, dst: Uri) -> Self::Future {
+         log::debug!("starting new connection '{:?}'", dst.host());
+-        let timeout = self.simple_timeout;
++        let timeout = effective_connect_timeout(self.simple_timeout);
+ 
+         // Local transports (UDS, Windows Named Pipes) skip proxies
+         #[cfg(any(unix, target_os = "windows"))]
+diff --git a/tests/connector_layers.rs b/tests/connector_layers.rs
+index 2681f6600..36add9ef6 100644
+--- a/tests/connector_layers.rs
++++ b/tests/connector_layers.rs
+@@ -53,6 +53,30 @@ async fn non_op_layer_with_timeout() {
+     assert!(err.is_connect() && err.is_timeout());
+ }
+ 
++#[cfg(not(target_arch = "wasm32"))]
++#[tokio::test]
++async fn request_connect_timeout_overrides_client_timeout_with_layers() {
++    let _ = env_logger::try_init();
++
++    let server = server::http(move |_req| async { http::Response::default() });
++
++    let client = reqwest::Client::builder()
++        .connector_layer(DelayLayer::new(Duration::from_millis(100)))
++        .connect_timeout(Duration::from_millis(50))
++        .no_proxy()
++        .build()
++        .unwrap();
++
++    let url = format!("http://{}", server.addr());
++    let res = client
++        .get(url)
++        .connect_timeout(Duration::from_millis(200))
++        .send()
++        .await;
++
++    assert!(res.is_ok());
++}
++
+ #[cfg(not(target_arch = "wasm32"))]
+ #[tokio::test]
+ async fn with_connect_timeout_layer_never_returning() {
+diff --git a/tests/timeouts.rs b/tests/timeouts.rs
+index c19141db8..292430eb7 100644
+--- a/tests/timeouts.rs
++++ b/tests/timeouts.rs
+@@ -88,6 +88,30 @@ async fn connect_timeout() {
+     assert!(err.is_connect() && err.is_timeout());
+ }
+ 
++#[tokio::test]
++async fn request_connect_timeout() {
++    let _ = env_logger::try_init();
++
++    let client = reqwest::Client::builder()
++        .connect_timeout(Duration::from_secs(5))
++        .no_proxy()
++        .build()
++        .unwrap();
++
++    let url = "http://192.0.2.1:81/slow";
++
++    let res = client
++        .get(url)
++        .connect_timeout(Duration::from_millis(100))
++        .timeout(Duration::from_millis(1000))
++        .send()
++        .await;
++
++    let err = res.unwrap_err();
++
++    assert!(err.is_connect() && err.is_timeout());
++}
++
+ #[cfg(not(target_arch = "wasm32"))]
+ #[tokio::test]
+ async fn connect_many_timeout_succeeds() {
