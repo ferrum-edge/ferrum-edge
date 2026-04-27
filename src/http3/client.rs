@@ -418,6 +418,27 @@ impl H3PoolError {
     ///
     /// `graceful_close` is preserved verbatim — promotion only affects
     /// the body-on-wire signal.
+    ///
+    /// **Streaming-body callers do not use this method.** The four
+    /// `request_*streaming_body` / `request_*streaming_incoming_body`
+    /// entry points are single-attempt by construction (the frontend
+    /// stream / `Incoming` body is consumed mid-attempt, so a fallback
+    /// chain over multiple pool entries cannot replay it). With no
+    /// fallback chain, no prior post-wire attempt can exist whose flag
+    /// would need to be carried forward — every error originates from
+    /// the one and only attempt, and `H3PoolError::pre_wire(e)` /
+    /// `H3PoolError::post_wire(e)` carry the correct flag directly.
+    /// **If you ever add a fallback / fresh-connect chain to a
+    /// streaming-body entry point, you MUST mirror the buffered
+    /// `request` / `request_with_target` pattern: track
+    /// `any_request_on_wire` across internal attempts and apply
+    /// `.promote_on_wire_if(any_request_on_wire)` to every `?` exit
+    /// in the fresh-connect setup section (`tls_config_fn` and
+    /// `create_or_get_*_sender`). Without this, a post-wire first
+    /// attempt followed by a fresh-connect TLS / sender setup failure
+    /// would surface as `request_on_wire=false` and the gateway would
+    /// silently replay a non-idempotent request via
+    /// `retry_on_connect_failure`.**
     pub fn promote_on_wire_if(mut self, condition: bool) -> Self {
         if condition {
             self.request_on_wire = true;
@@ -1562,7 +1583,11 @@ impl Http3ConnectionPool {
             }
         }
 
-        // Create new connection
+        // Create new connection. Single-attempt path — no fallback chain,
+        // so no prior post-wire attempt exists whose `request_on_wire` flag
+        // would need to be carried forward via `.promote_on_wire_if(...)`.
+        // See `H3PoolError::promote_on_wire_if` for the pattern that any
+        // future multi-attempt loop here MUST follow.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
@@ -1633,6 +1658,11 @@ impl Http3ConnectionPool {
             }
         }
 
+        // Create new connection. Single-attempt path — no fallback chain,
+        // so no prior post-wire attempt exists whose `request_on_wire` flag
+        // would need to be carried forward via `.promote_on_wire_if(...)`.
+        // See `H3PoolError::promote_on_wire_if` for the pattern that any
+        // future multi-attempt loop here MUST follow.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
@@ -1703,6 +1733,11 @@ impl Http3ConnectionPool {
             }
         }
 
+        // Create new connection. Single-attempt path — no fallback chain,
+        // so no prior post-wire attempt exists whose `request_on_wire` flag
+        // would need to be carried forward via `.promote_on_wire_if(...)`.
+        // See `H3PoolError::promote_on_wire_if` for the pattern that any
+        // future multi-attempt loop here MUST follow.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
@@ -1781,6 +1816,11 @@ impl Http3ConnectionPool {
             }
         }
 
+        // Create new connection. Single-attempt path — no fallback chain,
+        // so no prior post-wire attempt exists whose `request_on_wire` flag
+        // would need to be carried forward via `.promote_on_wire_if(...)`.
+        // See `H3PoolError::promote_on_wire_if` for the pattern that any
+        // future multi-attempt loop here MUST follow.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
