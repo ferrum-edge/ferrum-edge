@@ -7,10 +7,10 @@
 | Patch ID | 001-recv-frame-drain-on-quic-close |
 | Target crate | `h3` |
 | Target version | 0.0.8 (forward-ports cleanly to master at the time of writing) |
-| State | **Drafted; not applied to our build** |
-| Upstream issue | TBD — see `issue.md`, file at https://github.com/hyperium/h3/issues/new |
-| Upstream PR | TBD — see `pr-description.md` |
-| Local fork | https://github.com/jeremyjpj0916/h3 (fork exists, no branches pushed yet) |
+| State | **Applied via vendored crate at `vendor/h3-0.0.8-ferrum-patched`** |
+| Upstream issue | [hyperium/h3#338](https://github.com/hyperium/h3/issues/338) |
+| Upstream PR | [hyperium/h3#339](https://github.com/hyperium/h3/pull/339) |
+| Local fork | https://github.com/jeremyjpj0916/h3 (branch: `fix/recv-frame-drain-on-quic-close`) |
 | Tracks | [ferrum-edge#506](https://github.com/ferrum-edge/ferrum-edge/pull/506) — gateway-side suppression that compensates while this is unfixed |
 
 ## Why this directory exists

@@ -1,6 +1,6 @@
 # frame: drain buffered bytes before propagating QUIC connection error
 
-Fixes #NNN (file the issue first; replace NNN with the issue number).
+Fixes #338.
 
 ## Problem
 
@@ -101,5 +101,5 @@ on, so the only fix is at h3's frame layer.
 ## Refs
 
 - RFC 9114 §8.1 — H3 error codes
-- Issue #NNN — bug report with reproducer and rationale
+- Issue #338 — bug report with reproducer and rationale
 - Downstream consumer: [ferrum-edge#506](https://github.com/ferrum-edge/ferrum-edge/pull/506) — gateway-side suppression of capability-downgrade for graceful closes (treats the symptom while we await this upstream fix)
