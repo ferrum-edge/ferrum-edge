@@ -7415,11 +7415,18 @@ pub(crate) async fn proxy_to_backend_retry(
 
     let mut req_builder = client.request(req_method, backend_url);
 
-    // Per-request timeout override. The shared `reqwest::Client` intentionally
-    // has no client-level timeout (see `connection_pool::create_client`) so
-    // two proxies with different timeouts sharing the same pool entry do not
-    // leak policy across routes. `0` means "disabled" — skip the override so
-    // reqwest's default (no timeout) applies.
+    // Per-request timeout overrides. The shared `reqwest::Client` intentionally
+    // has no client-level connect or read timeout (see
+    // `connection_pool::create_client`) so two proxies with different timeouts
+    // sharing the same pool entry do not leak policy across routes. `0` means
+    // "disabled" for both — skip the override so reqwest's default (no timeout)
+    // applies. The per-request `connect_timeout` API is provided by a vendored
+    // copy of reqwest patched with seanmonstar/reqwest#3017.
+    if proxy.backend_connect_timeout_ms > 0 {
+        req_builder = req_builder.connect_timeout(std::time::Duration::from_millis(
+            proxy.backend_connect_timeout_ms,
+        ));
+    }
     if proxy.backend_read_timeout_ms > 0 {
         req_builder = req_builder.timeout(std::time::Duration::from_millis(
             proxy.backend_read_timeout_ms,
@@ -7880,11 +7887,18 @@ async fn proxy_to_backend(
 
     let mut req_builder = client.request(req_method, backend_url);
 
-    // Per-request timeout override. The shared `reqwest::Client` intentionally
-    // has no client-level timeout (see `connection_pool::create_client`) so
-    // two proxies with different timeouts sharing the same pool entry do not
-    // leak policy across routes. `0` means "disabled" — skip the override so
-    // reqwest's default (no timeout) applies.
+    // Per-request timeout overrides. The shared `reqwest::Client` intentionally
+    // has no client-level connect or read timeout (see
+    // `connection_pool::create_client`) so two proxies with different timeouts
+    // sharing the same pool entry do not leak policy across routes. `0` means
+    // "disabled" for both — skip the override so reqwest's default (no timeout)
+    // applies. The per-request `connect_timeout` API is provided by a vendored
+    // copy of reqwest patched with seanmonstar/reqwest#3017.
+    if proxy.backend_connect_timeout_ms > 0 {
+        req_builder = req_builder.connect_timeout(std::time::Duration::from_millis(
+            proxy.backend_connect_timeout_ms,
+        ));
+    }
     if proxy.backend_read_timeout_ms > 0 {
         req_builder = req_builder.timeout(std::time::Duration::from_millis(
             proxy.backend_read_timeout_ms,

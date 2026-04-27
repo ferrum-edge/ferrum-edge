@@ -212,3 +212,19 @@ paste = "1"
 h2 = "0.4"
 # Simple HTTP server dependencies
 tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
+
+# ── Vendored upstream patches ──────────────────────────────────────────────
+# We carry a vendored copy of reqwest 0.13.2 with PR seanmonstar/reqwest#3017
+# applied so each request can override the client-level connect timeout via
+# `RequestBuilder::connect_timeout(Duration)`. Without the patch, two proxies
+# sharing the same connection-pool key (which intentionally excludes policy
+# fields like `backend_connect_timeout_ms`) would also share whichever
+# connect timeout the underlying `reqwest::Client` was first built with.
+#
+# Retirement plan: when reqwest#3017 merges and ships in a release we use,
+# remove this `[patch.crates-io]` block, drop `vendor/reqwest-0.13.2-ferrum-patched/`,
+# and unpin the dependency. The call-site change in `src/connection_pool.rs`
+# uses the upstream API as proposed in the PR, so it stays intact.
+# See `docs/upstream-reqwest-patches/001-per-request-connect-timeout/README.md`.
+[patch.crates-io]
+reqwest = { path = "vendor/reqwest-0.13.2-ferrum-patched" }

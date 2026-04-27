@@ -107,24 +107,14 @@ This is the single most important pool setting for performance and reliability. 
 
 The pool is keyed on **connection identity** (backend host/port, protocol, DNS override, TLS trust, mTLS credentials) and intentionally excludes policy fields like timeouts, pool sizes, and keep-alive intervals. This keeps memory and connection count bounded — proxies that all point at the same backend share one underlying client.
 
-A side effect is that **policy values baked into the shared client are first-wins**: whichever proxy populates the pool entry first sets the value for every sibling proxy reusing it. Two cases to know about:
+Per-request policy fields are applied at dispatch time on the `RequestBuilder`, so they're independent per proxy even when the underlying client is shared:
 
 | Field | Per-proxy override respected? | Why |
 |---|---|---|
-| `backend_read_timeout_ms` | **Yes** — always the requesting proxy's value | Applied per-request via `RequestBuilder::timeout()` at dispatch time, not baked into the shared client. |
-| `backend_connect_timeout_ms` | **No** — first-wins across sibling proxies | The HTTP client library does not expose a per-request connect-timeout override. The value is set at client construction time. |
+| `backend_read_timeout_ms` | **Yes** — always the requesting proxy's value | Applied per-request via `RequestBuilder::timeout()` at dispatch time. |
+| `backend_connect_timeout_ms` | **Yes** — always the requesting proxy's value | Applied per-request via `RequestBuilder::connect_timeout()` at dispatch time. The per-request `connect_timeout` API ships in a vendored copy of reqwest 0.13.2 with [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) applied — see [`docs/upstream-reqwest-patches/001-per-request-connect-timeout/`](upstream-reqwest-patches/001-per-request-connect-timeout/README.md) for the lifecycle. Once the upstream PR merges in a release we consume, the vendored crate is dropped; the call sites already use the upstream API shape. |
 
-**Impact of the connect-timeout limitation** is bounded to paths that actually open a new connection:
-- First request to a backend after process start (cold pool)
-- Concurrent demand exceeds `pool_max_idle_per_host` (pool scaling)
-- A pooled connection gets evicted (idle timeout, backend RST/FIN, keepalive failure)
-- DNS re-resolution after `pool_max_lifetime`
-
-In steady-state with keep-alive, `connect_timeout` rarely fires, so most deployments never observe the sharing.
-
-**If you need per-proxy connect timeouts**, force separate pool entries by making the pool key unique for each proxy — for example, set a distinct `dns_override` on each. That forces a dedicated client per proxy at the cost of extra file descriptors and DNS warmup.
-
-**Upstream fix** is tracked in [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) (per-request connect timeout). Once that lands, the gateway will move `backend_connect_timeout_ms` to dispatch time and the first-wins behaviour will go away.
+Both timeouts can therefore be set independently per proxy without forcing distinct `dns_override` values to fragment the pool. Earlier versions of ferrum-edge documented a `dns_override` work-around for `backend_connect_timeout_ms` — that work-around is no longer needed.
 
 ## Protocol-Specific Recommendations
 
