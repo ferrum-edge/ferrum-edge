@@ -218,14 +218,14 @@ impl ConnectionPool {
 
     /// Expose the pool key for warmup deduplication.
     ///
-    /// Used by external pool-key tests (`tests/unit/gateway_core/pool_key_tests.rs`)
-    /// to verify the `(scheme, host, port, dns_override, ca, mtls_*, verify)`
-    /// shape that connection-pool sharing depends on. The original warmup
-    /// path inserted this key into its dedup set; the current warmup uses a
-    /// per-target `(scheme, host, port)` dedup key (see
-    /// `collect_reqwest_warmup_candidates_for_proxy` in `proxy/mod.rs`),
-    /// so this accessor is bin-dead but library-live.
-    #[allow(dead_code)]
+    /// `warmup_connection_pools` composes this with the per-target
+    /// `host:port` to dedup reqwest HEAD warmup tasks. Including the
+    /// pool key (which carries the TLS-aware client identity:
+    /// `{dest}|{proto}|{dns_override}|{ca}|{mtls_cert}|{verify}`) in
+    /// the dedup means proxies that share `(scheme, host, port)` but
+    /// have divergent TLS configs each get their own warmup task —
+    /// matching the fact that they end up with separate
+    /// `reqwest::Client`s at runtime.
     pub fn pool_key_for_warmup(&self, proxy: &Proxy) -> String {
         self.pool.manager().pool_key_owned(proxy)
     }

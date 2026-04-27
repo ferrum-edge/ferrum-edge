@@ -278,12 +278,23 @@ fn proxy_config_forces_reqwest_dispatch(
 /// candidates must wait for the refresh so the gating phase can consult
 /// the registry.
 ///
+/// `pool_key` is the proxy's `ConnectionPool::pool_key_for_warmup(proxy)` —
+/// the same identity the connection pool uses to keep distinct
+/// `reqwest::Client`s. Including it in the dedup key (instead of just
+/// `(scheme, host, port)`) ensures two proxies that share a backend
+/// `host:port` BUT have different TLS configs (different CA bundle,
+/// different mTLS cert, different DNS override, …) each get their own
+/// warmup task — because they end up with separate `reqwest::Client`s
+/// at runtime. Without TLS-aware dedup, only the first-collected
+/// proxy's client gets warmed and the others pay a cold connect on
+/// the first real request despite warmup being enabled.
+///
 /// `forces_reqwest` is the per-proxy verdict from
 /// `proxy_config_forces_reqwest_dispatch` — `true` when the proxy's
 /// configuration would route some traffic via reqwest at runtime. The
 /// flag is OR-merged into any existing candidate sharing the same
-/// `(scheme, host, port)`: if proxy A on the target can use the direct
-/// H2 pool but proxy B (same target) requires reqwest, the merged
+/// dedup key: if proxy A on the target can use the direct H2 pool but
+/// proxy B (same target, same TLS) requires reqwest, the merged
 /// candidate's `requires_reqwest_warmup` stays `true` so the gating
 /// phase keeps the warmup task. This is the regression guard against
 /// the per-target dedup hiding a single proxy's reqwest dependency.
@@ -293,9 +304,11 @@ fn proxy_config_forces_reqwest_dispatch(
 /// log lines key off the per-target description, not insertion order.
 ///
 /// Free function so it's callable from tests without constructing a full
-/// `ProxyState`.
+/// `ProxyState`. Tests pass arbitrary `pool_key` strings to exercise the
+/// dedup contract directly.
 fn collect_reqwest_warmup_candidates_for_proxy(
     proxy: &Proxy,
+    pool_key: &str,
     forces_reqwest: bool,
     upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
     http_candidates: &mut HashMap<String, ReqwestWarmupCandidate>,
@@ -325,7 +338,14 @@ fn collect_reqwest_warmup_candidates_for_proxy(
     };
 
     for (host, port) in targets {
-        let dedup_key = format!("reqwest_conn|{}|{}|{}", scheme, host, port);
+        // Dedup key composes the connection pool's TLS-aware client key
+        // with the per-target host:port. Multiple targets in one upstream
+        // share a pool key but get distinct dedup keys (each target
+        // connection in reqwest's internal pool needs its own HEAD).
+        // Multiple proxies sharing the same (host, port) but different
+        // TLS configs have distinct pool keys → distinct dedup keys →
+        // each `reqwest::Client` gets its own warmup task.
+        let dedup_key = format!("{}|{}:{}", pool_key, host, port);
         bucket
             .entry(dedup_key)
             .and_modify(|existing| {
@@ -1871,10 +1891,20 @@ impl ProxyState {
 
         // Collect ALL reqwest warmup candidates upfront, partitioned by
         // scheme so each phase can build its own task list. Each bucket is
-        // a `HashMap<dedup_key, ReqwestWarmupCandidate>` so the per-target
-        // entry can be OR-merged when multiple proxies route to the same
-        // (scheme, host, port) — see
-        // `collect_reqwest_warmup_candidates_for_proxy`.
+        // a `HashMap<dedup_key, ReqwestWarmupCandidate>` keyed by
+        // `{pool_key}|{host}:{port}` — the connection pool's TLS-aware
+        // client identity composed with the per-target host:port. This
+        // dedup contract:
+        //   - Same pool_key + same target → one HEAD (multiple proxies
+        //     sharing identical TLS + backend collapse correctly).
+        //   - Same pool_key + different targets → one HEAD per target
+        //     (a load-balanced upstream warms each backend connection
+        //     in the shared `reqwest::Client`'s internal pool).
+        //   - Different pool_keys + same target → one HEAD per pool
+        //     (proxies that point at the same backend with divergent TLS
+        //     end up with separate `reqwest::Client`s — each one needs
+        //     its own warm connection or the first request through
+        //     whichever client wasn't warmed pays a cold connect).
         let mut http_candidates: HashMap<String, ReqwestWarmupCandidate> = HashMap::new();
         let mut https_candidates: HashMap<String, ReqwestWarmupCandidate> = HashMap::new();
         let pool_config = self.connection_pool.global_pool_config();
@@ -1886,8 +1916,8 @@ impl ProxyState {
             // route a request via reqwest? If yes, the warmup gating must
             // keep the reqwest HEAD even when the capability registry says
             // h2_tls=Supported. The flag is OR-merged across every proxy
-            // sharing the (scheme, host, port) dedup key — one
-            // reqwest-forcing proxy is enough to keep the pool warm.
+            // sharing the dedup key — one reqwest-forcing proxy is enough
+            // to keep the pool warm.
             let per_proxy_pool = pool_config.for_proxy(proxy);
             let requires_request_body_buffering =
                 self.plugin_cache.requires_request_body_buffering(&proxy.id);
@@ -1896,8 +1926,10 @@ impl ProxyState {
                 per_proxy_pool.enable_http2,
                 requires_request_body_buffering,
             );
+            let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
             collect_reqwest_warmup_candidates_for_proxy(
                 proxy,
+                &pool_key,
                 forces_reqwest,
                 &upstream_map,
                 &mut http_candidates,
@@ -10765,6 +10797,18 @@ mod tests {
         (HashMap::new(), HashMap::new())
     }
 
+    /// Synthesize a stand-in pool key for the test. Real production keys
+    /// come from `ConnectionPool::pool_key_for_warmup(proxy)` and embed
+    /// `(scheme, host, port, dns_override, ca, mtls_*, verify)`. For the
+    /// dedup contract these tests exercise, ANY string serves — same key
+    /// → dedupe, different key → separate candidate. Embedding the proxy
+    /// id by default makes tests where every proxy has a unique pool key
+    /// trivially correct, while tests that need shared keys can pass an
+    /// explicit string.
+    fn fake_pool_key(proxy_id: &str) -> String {
+        format!("test-pool-key|{proxy_id}")
+    }
+
     #[test]
     fn collect_partitions_http_and_https_proxies_into_separate_buckets() {
         let http_proxy = warmup_test_proxy("h", BackendScheme::Http, "plain.test", 80);
@@ -10775,6 +10819,7 @@ mod tests {
 
         collect_reqwest_warmup_candidates_for_proxy(
             &http_proxy,
+            &fake_pool_key("h"),
             true, // HTTP backends always force reqwest dispatch
             &upstreams,
             &mut http_candidates,
@@ -10782,6 +10827,7 @@ mod tests {
         );
         collect_reqwest_warmup_candidates_for_proxy(
             &https_proxy,
+            &fake_pool_key("s"),
             false,
             &upstreams,
             &mut http_candidates,
@@ -10810,18 +10856,20 @@ mod tests {
     }
 
     #[test]
-    fn collect_dedupes_repeated_targets_across_proxies() {
-        // Two HTTPS proxies pointing at the same backend host:port. The
-        // dedup map must collapse them into a single candidate so the
-        // warmup batch doesn't pay for two redundant HEAD requests.
+    fn collect_dedupes_repeated_targets_when_pool_keys_match() {
+        // Two HTTPS proxies pointing at the same backend host:port AND
+        // with identical TLS configs (same pool_key). They share the same
+        // `reqwest::Client` at runtime, so one warmup HEAD covers both.
         let proxy_a = warmup_test_proxy("a", BackendScheme::Https, "shared.test", 443);
         let proxy_b = warmup_test_proxy("b", BackendScheme::Https, "shared.test", 443);
+        let shared_pool_key = "test-pool-key|shared-tls";
 
         let upstreams: HashMap<&str, &Upstream> = HashMap::new();
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
 
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_a,
+            shared_pool_key,
             false,
             &upstreams,
             &mut http_candidates,
@@ -10829,6 +10877,7 @@ mod tests {
         );
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_b,
+            shared_pool_key,
             false,
             &upstreams,
             &mut http_candidates,
@@ -10842,14 +10891,69 @@ mod tests {
         assert_eq!(
             https_candidates.len(),
             1,
-            "two HTTPS proxies pointing at the same backend should dedupe to one warmup target"
+            "two HTTPS proxies sharing a pool key + target should dedupe to one warmup task"
         );
+    }
+
+    #[test]
+    fn collect_keeps_separate_candidates_when_pool_keys_differ_for_same_target() {
+        // TLS-aware dedup regression guard: two HTTPS proxies with the
+        // same backend host:port but DIFFERENT TLS configs (different CA
+        // bundle, different mTLS cert, different DNS override, …) end
+        // up with separate `reqwest::Client`s in the connection pool.
+        // Each client needs its own warmup HEAD or the un-warmed one
+        // pays a cold connect on its first real request despite warmup
+        // being enabled.
+        //
+        // The previous `(scheme, host, port)`-only dedup would have
+        // collapsed these two onto a single candidate, leaving one
+        // client cold. Composing the connection pool's TLS-aware
+        // pool_key into the dedup key fixes that.
+        let proxy_a = warmup_test_proxy("a", BackendScheme::Https, "shared.test", 443);
+        let proxy_b = warmup_test_proxy("b", BackendScheme::Https, "shared.test", 443);
+
+        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
+
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_a,
+            "pool-key-tls-A",
+            false,
+            &upstreams,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_b,
+            "pool-key-tls-B",
+            false,
+            &upstreams,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+
+        assert!(http_candidates.is_empty());
+        assert_eq!(
+            https_candidates.len(),
+            2,
+            "different TLS configs → different pool keys → separate warmup tasks (each `reqwest::Client` must be warmed)",
+        );
+        // Both still target the same host:port.
+        let mut targets: Vec<(&str, u16)> = https_candidates
+            .values()
+            .map(|c| (c.host.as_str(), c.port))
+            .collect();
+        targets.sort();
+        assert_eq!(targets, vec![("shared.test", 443), ("shared.test", 443)]);
     }
 
     #[test]
     fn collect_expands_upstream_targets_into_per_target_candidates() {
         // An upstream-bearing proxy should produce one candidate per
-        // upstream target, not just one for the proxy as a whole.
+        // upstream target. The pool key stays constant across the
+        // upstream's targets (one shared `reqwest::Client`), but each
+        // target gets its own warmup HEAD because reqwest's internal
+        // connection pool keys on host:port too.
         let proxy = {
             let mut p = warmup_test_proxy("u", BackendScheme::Https, "fallback.test", 443);
             p.upstream_id = Some("up1".to_string());
@@ -10865,6 +10969,7 @@ mod tests {
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy,
+            "pool-key-upstream-up1",
             false,
             &upstreams,
             &mut http_candidates,
@@ -10880,8 +10985,8 @@ mod tests {
     #[test]
     fn collect_or_merges_requires_reqwest_when_any_sharing_proxy_forces_it() {
         // Regression guard for the dedup-hides-sibling-needs case the
-        // reviewer flagged: if ONE proxy on a shared (host, port) needs
-        // reqwest (e.g. has a body-buffering plugin), the merged
+        // reviewer flagged: if ONE proxy on a shared (pool_key, target)
+        // needs reqwest (e.g. has a body-buffering plugin), the merged
         // candidate's `requires_reqwest_warmup` must end up `true`
         // regardless of the order proxies are collected — otherwise the
         // gating phase would skip the only pool that can serve that
@@ -10889,11 +10994,14 @@ mod tests {
         let proxy_skip = warmup_test_proxy("skip", BackendScheme::Https, "shared.test", 443);
         let proxy_force = warmup_test_proxy("force", BackendScheme::Https, "shared.test", 443);
         let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        // Same pool_key so the two proxies actually share a candidate.
+        let shared_pool_key = "pool-key-shared";
 
         // Order 1: skip-eligible proxy first, reqwest-forcing proxy second.
         let (mut http1, mut https1) = empty_candidate_maps();
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_skip,
+            shared_pool_key,
             false,
             &upstreams,
             &mut http1,
@@ -10901,11 +11009,13 @@ mod tests {
         );
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_force,
+            shared_pool_key,
             true,
             &upstreams,
             &mut http1,
             &mut https1,
         );
+        assert_eq!(https1.len(), 1, "shared pool_key + target must dedupe");
         let merged = https1.values().next().unwrap();
         assert!(
             merged.requires_reqwest_warmup,
@@ -10917,6 +11027,7 @@ mod tests {
         let (mut http2, mut https2) = empty_candidate_maps();
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_force,
+            shared_pool_key,
             true,
             &upstreams,
             &mut http2,
@@ -10924,6 +11035,7 @@ mod tests {
         );
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_skip,
+            shared_pool_key,
             false,
             &upstreams,
             &mut http2,
