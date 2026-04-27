@@ -2939,10 +2939,14 @@ components:
           enum: [ok, degraded, starting]
           description: |
             Aggregate gateway health.
-            `ok` — fully ready and healthy (200).
-            `degraded` — ready but DB is disconnected or admin writes are
-            blocked (still 200; the gateway continues to serve from cached
-            config).
+            `ok` — fully ready and healthy (200). Also returned for
+            intentionally read-only deployments (admin API in read-only mode
+            with a healthy DB) — `admin_writes_enabled` is the right signal
+            for that, not `status`.
+            `degraded` — ready but the configured database is currently
+            unavailable (still 200; the gateway continues to serve from
+            cached config). Intentional read-only mode does NOT set
+            `degraded`.
             `starting` — startup not yet complete (returned with 503 and
             `ready: false`).
         ready:
