@@ -116,6 +116,8 @@ Per-request policy fields are applied at dispatch time on the `RequestBuilder`, 
 
 Both timeouts can therefore be set independently per proxy without forcing distinct `dns_override` values to fragment the pool. Earlier versions of ferrum-edge documented a `dns_override` work-around for `backend_connect_timeout_ms` — that work-around is no longer needed.
 
+**One nuance for cold pools.** When two simultaneous requests from different proxies arrive at the same shared client and the pool entry is cold (or saturated), only one of them actually performs the TCP/TLS handshake — the others coalesce onto that pending connect via hyper's connection pool. The whole coalesced group resolves when the in-flight handshake finishes (or fails), so a sibling proxy with a tighter `backend_connect_timeout_ms` will not abort the connect early; it observes whatever the first poller's connect timeout governed. This is intrinsic to how hyper deduplicates concurrent connect attempts and was true under the old client-level connect timeout as well. In steady state, almost all dispatches reuse a warm idle connection and skip the coalescing window entirely, so this edge case rarely matters in practice. Paths that can hit it: the very first request to a backend after process start, demand spikes that exceed `pool_max_idle_per_host`, eviction (idle timeout, RST/FIN, keepalive failure), and DNS re-resolution after `pool_max_lifetime`. If you need strictly independent connect timeouts including the cold-pool race, fragment the pool with a distinct `dns_override` per proxy — the same fragmentation lever the docs previously prescribed for the steady-state case.
+
 ## Protocol-Specific Recommendations
 
 ### HTTP/HTTPS APIs
