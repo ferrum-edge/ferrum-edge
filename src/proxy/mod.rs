@@ -8150,9 +8150,6 @@ async fn proxy_to_backend(
                 }
 
                 if !body_bytes.is_empty() {
-                    // See note above on the buffered branch — converting to
-                    // `Bytes` once turns the optional retain-clone into a
-                    // refcount bump rather than a Vec deep copy.
                     let body_bytes = Bytes::from(body_bytes);
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
