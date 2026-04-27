@@ -148,6 +148,167 @@ fn append_probe_error(record: &mut BackendCapabilityRecord, msg: String) {
 type WarmupTask =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>;
 
+/// One unique reqwest warmup target captured during candidate collection,
+/// before the task future is built. Held as a separate struct so the HTTPS
+/// gating phase can decide per-target whether to materialize the task at all
+/// (skipping is much cheaper than building a task and dropping it unrun).
+struct ReqwestWarmupCandidate {
+    proxy: Proxy,
+    host: String,
+    port: u16,
+    /// Scheme literal for URL formatting + log lines. `&'static str` instead
+    /// of `String` because the only valid values are the two compile-time
+    /// constants the dispatcher accepts ("http", "https").
+    scheme: &'static str,
+}
+
+/// Lookup the capability registry for a specific (proxy, host, port) triple
+/// and decide whether the direct HTTP/2 pool will handle all client traffic
+/// to this backend (so the reqwest pool does not need a startup HEAD).
+///
+/// Returns `true` only when `plain_http.h2_tls` is definitively `Supported`.
+/// `Unknown` (probe never ran or timed out) and `Unsupported` (post-ALPN
+/// HTTP/1.1 fallback) both fall back to "warm reqwest" so the fallback pool
+/// is always pre-warmed for any target the H2 pool cannot cover.
+///
+/// Constructed as a free function so the gating predicate is unit-testable
+/// against a stand-alone `BackendCapabilityRegistry` without needing to
+/// instantiate a full `ProxyState`.
+fn target_uses_direct_h2_pool(
+    registry: &BackendCapabilityRegistry,
+    proxy: &Proxy,
+    host: &str,
+    port: u16,
+) -> bool {
+    let target = UpstreamTarget {
+        host: host.to_string(),
+        port,
+        weight: 1,
+        tags: HashMap::new(),
+        path: None,
+    };
+    registry
+        .get(proxy, Some(&target))
+        .map(|record| record.plain_http.h2_tls.is_supported())
+        .unwrap_or(false)
+}
+
+/// Collect reqwest warmup candidates for a single proxy, partitioning by
+/// scheme so the caller can run HTTP-only candidates in parallel with the
+/// capability refresh and apply capability-driven gating to HTTPS-only
+/// candidates after the refresh completes.
+///
+/// HTTP candidates can warm in parallel with the refresh — they hit a
+/// disjoint pool (reqwest plain HTTP) from the gRPC h2c probe. HTTPS
+/// candidates must wait for the refresh so the gating phase can consult
+/// the registry.
+///
+/// Free function so it's callable from tests without constructing a full
+/// `ProxyState`. The pool-key dedup insertion (vestigial from the original
+/// implementation — pool key and per-target key never collide) stays in
+/// the caller so this function has no `ConnectionPool` dependency.
+fn collect_reqwest_warmup_candidates_for_proxy(
+    proxy: &Proxy,
+    upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+    seen: &mut std::collections::HashSet<String>,
+    http_candidates: &mut Vec<ReqwestWarmupCandidate>,
+    https_candidates: &mut Vec<ReqwestWarmupCandidate>,
+) {
+    let scheme: &'static str = match proxy.backend_scheme {
+        Some(BackendScheme::Http) => "http",
+        _ => "https",
+    };
+
+    let mut targets: Vec<(String, u16)> = Vec::new();
+    if let Some(ref upstream_id) = proxy.upstream_id
+        && let Some(upstream) = upstream_map.get(upstream_id.as_str())
+    {
+        for target in &upstream.targets {
+            targets.push((target.host.clone(), target.port));
+        }
+    }
+    if targets.is_empty() {
+        targets.push((proxy.backend_host.clone(), proxy.backend_port));
+    }
+
+    for (host, port) in targets {
+        let dedup_key = format!("reqwest_conn|{}|{}|{}", scheme, host, port);
+        if !seen.insert(dedup_key) {
+            continue;
+        }
+        let candidate = ReqwestWarmupCandidate {
+            proxy: proxy.clone(),
+            host,
+            port,
+            scheme,
+        };
+        if scheme == "http" {
+            http_candidates.push(candidate);
+        } else {
+            https_candidates.push(candidate);
+        }
+    }
+}
+
+/// Run a batch of warmup tasks with bounded concurrency and emit aggregate
+/// info-level success/failure counts. Used by both the HTTP-only warmup phase
+/// (running in parallel with the capability refresh) and the gated HTTPS
+/// warmup phase. `label` identifies the batch in log lines so operators can
+/// tell the two phases apart.
+async fn run_warmup_task_batch(tasks: Vec<WarmupTask>, concurrency: usize, label: &'static str) {
+    use futures_util::stream;
+
+    if tasks.is_empty() {
+        debug!("Pool warmup ({}): no targets to warm", label);
+        return;
+    }
+
+    let total = tasks.len();
+    info!(
+        "Pool warmup ({}): establishing {} backend connections (concurrency={})",
+        label, total, concurrency
+    );
+
+    let ok = Arc::new(AtomicU64::new(0));
+    let failed = Arc::new(AtomicU64::new(0));
+
+    stream::iter(tasks)
+        .for_each_concurrent(concurrency, |task| {
+            let ok = ok.clone();
+            let failed = failed.clone();
+            async move {
+                match task.await {
+                    Ok(desc) => {
+                        debug!("Pool warmup: {} ok", desc);
+                        ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(msg) => {
+                        warn!("Pool warmup failed: {}", msg);
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        })
+        .await;
+
+    let ok_count = ok.load(Ordering::Relaxed);
+    let failed_count = failed.load(Ordering::Relaxed);
+    if failed_count > 0 {
+        info!(
+            "Pool warmup complete ({}): {} ok, {} failed out of {} targets",
+            label,
+            ok_count,
+            failed_count,
+            ok_count + failed_count
+        );
+    } else {
+        info!(
+            "Pool warmup complete ({}): all {} targets ok",
+            label, ok_count
+        );
+    }
+}
+
 /// Shared response-body buffering decision used across the H1/H2, H3, and
 /// cross-protocol paths so `response_body_mode` and per-request plugin
 /// refinements stay in sync.
@@ -1527,167 +1688,166 @@ impl ProxyState {
 
     /// Pre-establish backend connections for all HTTP-family proxies.
     ///
-    /// Startup first refreshes the backend capability registry so protocol
-    /// support is learned outside the request hot path. The probes themselves
-    /// warm the gRPC, direct HTTP/2, and HTTP/3 pools for targets that support
-    /// those transports. reqwest clients are then warmed for every HTTP-family
-    /// backend so the fallback/general path is also ready before traffic.
+    /// Two-phase startup:
+    ///
+    /// 1. **Capability refresh in parallel with HTTP-only reqwest warmup.**
+    ///    The capability probes warm the gRPC, direct HTTP/2, and HTTP/3
+    ///    pools for targets that support those transports. They classify
+    ///    backends so the request hot path can decide between the native
+    ///    H2/H3 pools and the reqwest fallback. The reqwest HEAD warmup
+    ///    for plain-HTTP backends has no capability dependency (h2c is
+    ///    only consulted for gRPC dispatch), so it overlaps the refresh
+    ///    via `tokio::join!` — both batches share `for_each_concurrent`
+    ///    parallelism but the wall-clock costs no longer stack.
+    ///
+    /// 2. **HTTPS reqwest warmup with capability gating.** After the
+    ///    refresh has populated the registry, HTTPS targets that classified
+    ///    as `plain_http.h2_tls = Supported` skip the reqwest HEAD entirely
+    ///    — the direct H2 pool already covers all client types (H1/H2/H3
+    ///    frontends → H2/TLS backend), so the reqwest pool is purely
+    ///    fallback. If H2/TLS silently downgrades at runtime (handled by
+    ///    `mark_h2_tls_unsupported`), the first fallback request pays a
+    ///    cold connect — acceptable recovery cost vs. paying a redundant
+    ///    TLS handshake at startup for every H2/TLS-capable target.
     pub async fn warmup_connection_pools(&self) {
-        use futures_util::stream;
-
-        self.refresh_backend_capabilities().await;
-
         let config = self.config.load_full();
         let concurrency = self.env_config.pool_warmup_concurrency.max(1);
-        let mut seen_reqwest: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut tasks: Vec<WarmupTask> = Vec::new();
         let upstream_map: HashMap<&str, &crate::config::types::Upstream> = config
             .upstreams
             .iter()
             .map(|upstream| (upstream.id.as_str(), upstream))
             .collect();
 
+        // Collect ALL reqwest warmup candidates upfront, partitioned by
+        // scheme so each phase can build its own task list. Dedup is shared
+        // across both partitions: a (host, port) pair already accepted by
+        // one scheme bucket cannot be re-collected by the other (matching
+        // the original single-bucket dedup semantics).
+        let mut seen_reqwest: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut http_candidates: Vec<ReqwestWarmupCandidate> = Vec::new();
+        let mut https_candidates: Vec<ReqwestWarmupCandidate> = Vec::new();
         for proxy in &config.proxies {
             if !proxy.dispatch_kind.is_http_family() {
                 continue;
             }
-            self.collect_reqwest_warmup_tasks(proxy, &upstream_map, &mut seen_reqwest, &mut tasks);
-        }
-
-        if tasks.is_empty() {
-            debug!("Pool warmup: no HTTP-family backends to warm via reqwest");
-            return;
-        }
-
-        info!(
-            "Pool warmup: establishing {} reqwest backend connections (concurrency={})",
-            tasks.len(),
-            concurrency
-        );
-
-        let ok = Arc::new(AtomicU64::new(0));
-        let failed = Arc::new(AtomicU64::new(0));
-
-        stream::iter(tasks)
-            .for_each_concurrent(concurrency, |task| {
-                let ok = ok.clone();
-                let failed = failed.clone();
-                async move {
-                    match task.await {
-                        Ok(desc) => {
-                            debug!("Pool warmup: {} ok", desc);
-                            ok.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(msg) => {
-                            warn!("Pool warmup failed: {}", msg);
-                            failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-            })
-            .await;
-
-        let ok_count = ok.load(Ordering::Relaxed);
-        let failed_count = failed.load(Ordering::Relaxed);
-        if failed_count > 0 {
-            info!(
-                "Pool warmup complete: {} ok, {} failed out of {} reqwest targets",
-                ok_count,
-                failed_count,
-                ok_count + failed_count
+            // Preserve the historical pool-key insertion into the dedup set.
+            // The pool key has a different format than the per-target dedup
+            // key, so it never collides — but the original code did this and
+            // we keep behaviour bit-identical to avoid masking any subtle
+            // dedup interaction we don't yet see.
+            let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
+            let _ = seen_reqwest.insert(pool_key);
+            collect_reqwest_warmup_candidates_for_proxy(
+                proxy,
+                &upstream_map,
+                &mut seen_reqwest,
+                &mut http_candidates,
+                &mut https_candidates,
             );
-        } else {
-            info!("Pool warmup complete: all {} reqwest targets ok", ok_count);
-        }
-    }
-
-    /// Collect reqwest pool warmup tasks for a proxy.
-    ///
-    /// Creates the `reqwest::Client` (TLS config, cert parsing) and then sends
-    /// a lightweight HEAD request to each unique backend host:port to force
-    /// TCP/TLS connection establishment. reqwest caches connections internally
-    /// by host:port, so subsequent requests reuse the warmed connection.
-    fn collect_reqwest_warmup_tasks(
-        &self,
-        proxy: &Proxy,
-        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
-        seen: &mut std::collections::HashSet<String>,
-        tasks: &mut Vec<WarmupTask>,
-    ) {
-        let scheme = match proxy.backend_scheme {
-            Some(BackendScheme::Http) => "http",
-            _ => "https",
-        };
-
-        let mut targets: Vec<(String, u16)> = Vec::new();
-        if let Some(ref upstream_id) = proxy.upstream_id
-            && let Some(upstream) = upstream_map.get(upstream_id.as_str())
-        {
-            for target in &upstream.targets {
-                targets.push((target.host.clone(), target.port));
-            }
-        }
-        if targets.is_empty() {
-            targets.push((proxy.backend_host.clone(), proxy.backend_port));
         }
 
-        let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
-        let _ = seen.insert(pool_key);
+        // Phase 1: capability refresh ‖ HTTP-only reqwest warmup.
+        let http_tasks: Vec<WarmupTask> = http_candidates
+            .into_iter()
+            .map(|c| Self::build_reqwest_warmup_task(self.connection_pool.clone(), c))
+            .collect();
+        let http_label = "reqwest http";
+        let refresh_fut = self.refresh_backend_capabilities();
+        let http_warmup_fut = run_warmup_task_batch(http_tasks, concurrency, http_label);
+        tokio::join!(refresh_fut, http_warmup_fut);
 
-        for (host, port) in targets {
-            let dedup_key = format!("reqwest_conn|{}|{}|{}", scheme, host, port);
-            if !seen.insert(dedup_key) {
+        // Phase 2: HTTPS reqwest warmup with capability gating. Skip targets
+        // the direct H2 pool already covers; warm everything else (Unknown,
+        // Unsupported, or HTTPS without an H2/TLS classification yet).
+        let total_https_candidates = https_candidates.len();
+        let mut https_tasks: Vec<WarmupTask> = Vec::with_capacity(https_candidates.len());
+        let mut skipped_h2_tls = 0usize;
+        for candidate in https_candidates {
+            if target_uses_direct_h2_pool(
+                &self.backend_capabilities,
+                &candidate.proxy,
+                &candidate.host,
+                candidate.port,
+            ) {
+                debug!(
+                    "Pool warmup: skipping reqwest HEAD for {}:{} (direct H2 pool covers this target)",
+                    candidate.host, candidate.port
+                );
+                skipped_h2_tls += 1;
                 continue;
             }
-
-            let pool = self.connection_pool.clone();
-            let proxy = proxy.clone();
-            let scheme = scheme.to_string();
-            tasks.push(Box::pin(async move {
-                let desc = format!("reqwest {}:{}", host, port);
-                let client = pool
-                    .get_client(&proxy)
-                    .await
-                    .map_err(|e| format!("{}: {}", desc, e))?;
-
-                let url = format!("{}://{}:{}/", scheme, host, port);
-                // Apply the proxy's `backend_connect_timeout_ms` as a per-request
-                // connect timeout, capped by the 5s overall warmup budget. Without
-                // this, the shared `reqwest::Client` carries no client-level
-                // connect timeout (we removed it so per-request overrides can
-                // diverge across pool-sharing siblings), so unreachable backends
-                // would consume the full 5s overall timeout per probe. Operators
-                // who set a tight `backend_connect_timeout_ms` (e.g. 500ms) get
-                // that bound at startup too. `0` disables — fall back to the 5s
-                // overall cap.
-                let mut req = client.head(&url).timeout(Duration::from_secs(5));
-                if proxy.backend_connect_timeout_ms > 0 {
-                    let warmup_cap = Duration::from_secs(5);
-                    let configured = Duration::from_millis(proxy.backend_connect_timeout_ms);
-                    req = req.connect_timeout(configured.min(warmup_cap));
-                }
-                let result = req.send().await;
-
-                match result {
-                    Ok(_) => Ok(desc),
-                    // Pool-warmup classification: this is the startup
-                    // HEAD probe, not a retry decision. We only want to
-                    // surface "couldn't reach the backend at all" as an
-                    // error here; a backend that responds with any HTTP
-                    // status (including 5xx) is reachable enough to keep
-                    // the pool warm. `e.is_connect() || e.is_timeout()`
-                    // is the right predicate for that narrow purpose,
-                    // and intentionally diverges from the unified
-                    // `request_reached_wire` boundary used by the
-                    // request-time retry path — different decision,
-                    // different criteria. Don't "unify" this call to
-                    // the shared classifier without revisiting what the
-                    // warmup probe actually needs to gate.
-                    Err(e) if e.is_connect() || e.is_timeout() => Err(format!("{}: {}", desc, e)),
-                    Err(_) => Ok(desc),
-                }
-            }));
+            https_tasks.push(Self::build_reqwest_warmup_task(
+                self.connection_pool.clone(),
+                candidate,
+            ));
         }
+        if skipped_h2_tls > 0 {
+            info!(
+                "Pool warmup: gating skipped {} of {} HTTPS reqwest targets (direct H2 pool will handle them)",
+                skipped_h2_tls, total_https_candidates
+            );
+        }
+        run_warmup_task_batch(https_tasks, concurrency, "reqwest https").await;
+    }
+
+    /// Build a single reqwest HEAD warmup task from a candidate. The
+    /// classification logic is identical across HTTP/HTTPS — the gating
+    /// happens in the caller (which decides whether to build the task at
+    /// all).
+    fn build_reqwest_warmup_task(
+        pool: Arc<ConnectionPool>,
+        candidate: ReqwestWarmupCandidate,
+    ) -> WarmupTask {
+        let ReqwestWarmupCandidate {
+            proxy,
+            host,
+            port,
+            scheme,
+        } = candidate;
+        Box::pin(async move {
+            let desc = format!("reqwest {}:{}", host, port);
+            let client = pool
+                .get_client(&proxy)
+                .await
+                .map_err(|e| format!("{}: {}", desc, e))?;
+
+            let url = format!("{}://{}:{}/", scheme, host, port);
+            // Apply the proxy's `backend_connect_timeout_ms` as a per-request
+            // connect timeout, capped by the 5s overall warmup budget. Without
+            // this, the shared `reqwest::Client` carries no client-level
+            // connect timeout (we removed it so per-request overrides can
+            // diverge across pool-sharing siblings), so unreachable backends
+            // would consume the full 5s overall timeout per probe. Operators
+            // who set a tight `backend_connect_timeout_ms` (e.g. 500ms) get
+            // that bound at startup too. `0` disables — fall back to the 5s
+            // overall cap.
+            let mut req = client.head(&url).timeout(Duration::from_secs(5));
+            if proxy.backend_connect_timeout_ms > 0 {
+                let warmup_cap = Duration::from_secs(5);
+                let configured = Duration::from_millis(proxy.backend_connect_timeout_ms);
+                req = req.connect_timeout(configured.min(warmup_cap));
+            }
+            let result = req.send().await;
+
+            match result {
+                Ok(_) => Ok(desc),
+                // Pool-warmup classification: this is the startup
+                // HEAD probe, not a retry decision. We only want to
+                // surface "couldn't reach the backend at all" as an
+                // error here; a backend that responds with any HTTP
+                // status (including 5xx) is reachable enough to keep
+                // the pool warm. `e.is_connect() || e.is_timeout()`
+                // is the right predicate for that narrow purpose,
+                // and intentionally diverges from the unified
+                // `request_reached_wire` boundary used by the
+                // request-time retry path — different decision,
+                // different criteria. Don't "unify" this call to
+                // the shared classifier without revisiting what the
+                // warmup probe actually needs to gate.
+                Err(e) if e.is_connect() || e.is_timeout() => Err(format!("{}: {}", desc, e)),
+                Err(_) => Ok(desc),
+            }
+        })
     }
 
     /// Apply a new configuration, using incremental (surgical) updates when
@@ -10364,6 +10524,246 @@ mod tests {
             "expected `grpc_should_stream` to be threaded into the retry \
              call to proxy_grpc_request_from_bytes; argument list was:\n{}",
             call_args
+        );
+    }
+
+    // ----- Pool warmup partition + gating tests --------------------------
+    //
+    // These cover the dual optimization in `warmup_connection_pools`:
+    //   1. Phase-1 partitioning sends HTTP-only candidates to the parallel
+    //      warmup batch (which runs alongside the capability refresh) and
+    //      HTTPS candidates to the gated phase-2 batch.
+    //   2. Phase-2 gating skips reqwest HEADs for HTTPS targets the
+    //      capability registry has already classified as covered by the
+    //      direct HTTP/2 pool, while still warming `Unknown` /
+    //      `Unsupported` targets so the fallback pool is ready.
+
+    use super::backend_capabilities::{
+        BackendCapabilityRecord, BackendCapabilityRegistry, ProtocolSupport, capability_key,
+    };
+    use crate::config::types::{BackendScheme, DispatchKind, Upstream};
+
+    /// Build a minimal HTTPS proxy at `host:port`. The proxy carries the
+    /// default TLS config so it shares a capability key with the registry
+    /// fixtures below.
+    fn warmup_test_proxy(id: &str, scheme: BackendScheme, host: &str, port: u16) -> Proxy {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "id": id,
+            "backend_host": host,
+            "backend_port": port,
+            "backend_scheme": match scheme {
+                BackendScheme::Http => "http",
+                BackendScheme::Https => "https",
+                _ => "https",
+            },
+            "listen_path": "/",
+        }))
+        .expect("warmup test proxy should deserialize");
+        proxy.dispatch_kind = DispatchKind::from(scheme);
+        proxy
+    }
+
+    fn upstream_with_targets(id: &str, targets: &[(&str, u16)]) -> Upstream {
+        let targets_json: Vec<_> = targets
+            .iter()
+            .map(|(host, port)| {
+                json!({
+                    "host": host,
+                    "port": port,
+                })
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "id": id,
+            "name": id,
+            "algorithm": "round_robin",
+            "targets": targets_json,
+        }))
+        .expect("upstream should deserialize")
+    }
+
+    #[test]
+    fn collect_partitions_http_and_https_proxies_into_separate_buckets() {
+        let http_proxy = warmup_test_proxy("h", BackendScheme::Http, "plain.test", 80);
+        let https_proxy = warmup_test_proxy("s", BackendScheme::Https, "secure.test", 443);
+
+        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut http_candidates = Vec::new();
+        let mut https_candidates = Vec::new();
+
+        collect_reqwest_warmup_candidates_for_proxy(
+            &http_proxy,
+            &upstreams,
+            &mut seen,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+        collect_reqwest_warmup_candidates_for_proxy(
+            &https_proxy,
+            &upstreams,
+            &mut seen,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+
+        assert_eq!(http_candidates.len(), 1);
+        assert_eq!(http_candidates[0].host, "plain.test");
+        assert_eq!(http_candidates[0].port, 80);
+        assert_eq!(http_candidates[0].scheme, "http");
+
+        assert_eq!(https_candidates.len(), 1);
+        assert_eq!(https_candidates[0].host, "secure.test");
+        assert_eq!(https_candidates[0].port, 443);
+        assert_eq!(https_candidates[0].scheme, "https");
+    }
+
+    #[test]
+    fn collect_dedupes_repeated_targets_across_proxies() {
+        // Two HTTPS proxies pointing at the same backend host:port. The
+        // dedup set must collapse them into a single candidate so the
+        // warmup batch doesn't pay for two redundant HEAD requests.
+        let proxy_a = warmup_test_proxy("a", BackendScheme::Https, "shared.test", 443);
+        let proxy_b = warmup_test_proxy("b", BackendScheme::Https, "shared.test", 443);
+
+        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut http_candidates = Vec::new();
+        let mut https_candidates = Vec::new();
+
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_a,
+            &upstreams,
+            &mut seen,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_b,
+            &upstreams,
+            &mut seen,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+
+        assert!(
+            http_candidates.is_empty(),
+            "no HTTP candidates expected for HTTPS-only fixtures"
+        );
+        assert_eq!(
+            https_candidates.len(),
+            1,
+            "two HTTPS proxies pointing at the same backend should dedupe to one warmup target"
+        );
+    }
+
+    #[test]
+    fn collect_expands_upstream_targets_into_per_target_candidates() {
+        // An upstream-bearing proxy should produce one candidate per
+        // upstream target, not just one for the proxy as a whole.
+        let proxy = {
+            let mut p = warmup_test_proxy("u", BackendScheme::Https, "fallback.test", 443);
+            p.upstream_id = Some("up1".to_string());
+            p
+        };
+        let upstream = upstream_with_targets(
+            "up1",
+            &[("a.test", 8443), ("b.test", 8443), ("c.test", 8443)],
+        );
+        let mut upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        upstreams.insert("up1", &upstream);
+
+        let mut seen = std::collections::HashSet::new();
+        let mut http_candidates = Vec::new();
+        let mut https_candidates = Vec::new();
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy,
+            &upstreams,
+            &mut seen,
+            &mut http_candidates,
+            &mut https_candidates,
+        );
+
+        assert!(http_candidates.is_empty());
+        let mut hosts: Vec<&str> = https_candidates.iter().map(|c| c.host.as_str()).collect();
+        hosts.sort();
+        assert_eq!(hosts, vec!["a.test", "b.test", "c.test"]);
+    }
+
+    #[test]
+    fn target_uses_direct_h2_pool_returns_true_only_for_supported_classification() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+
+        // Empty registry → conservatively warm reqwest (returns false).
+        assert!(!target_uses_direct_h2_pool(
+            &registry, &proxy, "h2.test", 443
+        ));
+
+        // Pre-populate as Supported. The capability key is derived from
+        // (scheme, host, port, dns_override, ca, mtls_*, verify), so we
+        // build the key from the same proxy that the gating predicate
+        // will look up under.
+        let key = capability_key(&proxy);
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h2_tls = ProtocolSupport::Supported;
+        record.plain_http.h1 = ProtocolSupport::Supported;
+        record.plain_http.h3 = ProtocolSupport::Unsupported;
+        registry.upsert(key, record);
+
+        assert!(
+            target_uses_direct_h2_pool(&registry, &proxy, "h2.test", 443),
+            "h2_tls=Supported target must be skipped by reqwest warmup"
+        );
+    }
+
+    #[test]
+    fn target_uses_direct_h2_pool_does_not_skip_unknown_or_unsupported() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "fallback.test", 443);
+        let key = capability_key(&proxy);
+
+        // Classified as Unsupported (post-ALPN HTTP/1.1 fallback): we
+        // still need reqwest to serve traffic, so gating must NOT skip.
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h1 = ProtocolSupport::Supported;
+        record.plain_http.h2_tls = ProtocolSupport::Unsupported;
+        registry.upsert(key.clone(), record);
+        assert!(
+            !target_uses_direct_h2_pool(&registry, &proxy, "fallback.test", 443),
+            "h2_tls=Unsupported must keep reqwest warmup enabled — H1-only backend depends on it"
+        );
+
+        // Classified as Unknown (probe never ran or timed out): also must
+        // NOT skip — we don't know whether the H2 pool will work.
+        let mut record_unknown = BackendCapabilityRecord::default();
+        record_unknown.plain_http.h2_tls = ProtocolSupport::Unknown;
+        registry.upsert(key, record_unknown);
+        assert!(
+            !target_uses_direct_h2_pool(&registry, &proxy, "fallback.test", 443),
+            "h2_tls=Unknown must keep reqwest warmup enabled — classification not yet decided"
+        );
+    }
+
+    #[test]
+    fn target_uses_direct_h2_pool_only_inspects_h2_tls_bucket() {
+        // h3=Supported alone must NOT skip reqwest: only H3 frontends
+        // would dispatch via the native H3 backend pool, and even then
+        // the H3 pool can downgrade. H1/H2 frontends still need a warm
+        // reqwest pool against the same backend.
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "h3only.test", 443);
+        let key = capability_key(&proxy);
+
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h3 = ProtocolSupport::Supported;
+        record.plain_http.h2_tls = ProtocolSupport::Unsupported;
+        record.plain_http.h1 = ProtocolSupport::Supported;
+        registry.upsert(key, record);
+
+        assert!(
+            !target_uses_direct_h2_pool(&registry, &proxy, "h3only.test", 443),
+            "h3=Supported alone is not sufficient — H1/H2 frontends still need reqwest"
         );
     }
 }
