@@ -9286,7 +9286,7 @@ async fn proxy_to_backend_http3(
                             // `retry_on_connect_failure` for those cases.
                             // Trust the pool's typed signal.
                             let is_conn_error = !e.request_on_wire();
-                            let (error_kind, error_class) = classify_h3_error(e.as_ref());
+                            let (error_kind, error_class) = classify_h3_pool_error(&e);
                             error!(
                                 proxy_id = %proxy.id,
                                 backend_url = %backend_url,
@@ -9489,7 +9489,7 @@ async fn proxy_to_backend_http3(
                 // streaming-incoming-body branch above for why we drop
                 // the error-class contribution here.
                 let is_conn_error = !e.request_on_wire();
-                let (error_kind, error_class) = classify_h3_error(e.as_ref());
+                let (error_kind, error_class) = classify_h3_pool_error(&e);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -9566,7 +9566,7 @@ async fn proxy_to_backend_http3(
                 // Trust the pool's body-on-wire signal — see the streaming
                 // H3 branch above for why we drop the class contribution.
                 let is_conn_error = !e.request_on_wire();
-                let (error_kind, error_class) = classify_h3_error(e.as_ref());
+                let (error_kind, error_class) = classify_h3_pool_error(&e);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -9612,6 +9612,33 @@ async fn proxy_to_backend_http3(
 fn classify_h3_error(err: &(dyn std::error::Error + 'static)) -> (&'static str, retry::ErrorClass) {
     let class = crate::http3::client::classify_http3_error(err);
     (retry::error_class_log_kind(class), class)
+}
+
+/// Classifier overload for [`crate::http3::client::H3PoolError`] that
+/// honors the typed `is_graceful_close()` signal before falling back to
+/// the shared error-chain classifier.
+///
+/// The recv_response error sites in [`crate::http3::client`] flag
+/// `H3_NO_ERROR` `ApplicationClose` / GOAWAY via the dedicated
+/// [`crate::http3::client::H3PoolError::graceful_close`] constructor.
+/// Surfacing those as [`retry::ErrorClass::GracefulRemoteClose`] keeps
+/// `is_h3_transport_error_class` returning false so the cached H3
+/// capability stays `Supported` even though the in-flight request must
+/// 502 (no headers were available to forward).
+///
+/// The recv_data Err path at the buffered streaming-incoming-body site
+/// uses a raw [`h3::error::StreamError`] rather than `H3PoolError` —
+/// classification there stays on [`classify_h3_error`] because a close
+/// mid-body is a real protocol fault (the backend signaled completion
+/// but truncated the response), not a spec-legal teardown.
+fn classify_h3_pool_error(
+    e: &crate::http3::client::H3PoolError,
+) -> (&'static str, retry::ErrorClass) {
+    if e.is_graceful_close() {
+        let class = retry::ErrorClass::GracefulRemoteClose;
+        return (retry::error_class_log_kind(class), class);
+    }
+    classify_h3_error(e.as_ref())
 }
 
 /// Replay a saved HTTP/3 request to an explicit target (used during retries).
@@ -9763,7 +9790,7 @@ async fn proxy_to_backend_http3_retry(
             // Trust the pool's body-on-wire signal — see the streaming
             // H3 branch above for why we drop the class contribution.
             let is_conn_error = !e.request_on_wire();
-            let (error_kind, error_class) = classify_h3_error(e.as_ref());
+            let (error_kind, error_class) = classify_h3_pool_error(&e);
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
@@ -9981,10 +10008,21 @@ mod tests {
         // Application-layer errors must NOT downgrade the H3 capability — the
         // backend is fine, the request itself is bad. Downgrading here would
         // route subsequent requests via reqwest for no operational reason.
+        //
+        // `GracefulRemoteClose` is also excluded: `H3_NO_ERROR` /
+        // `RemoteClosing` is a spec-legal teardown signal (RFC 9114 §8.1),
+        // not a transport-level capability fault — see the docstring on
+        // [`crate::http3::client::H3PoolError::graceful_close`] and the
+        // matching short-circuit in
+        // [`crate::http3::server::classify_h3_error`]. Adding it to the
+        // positive list in `is_h3_transport_error_class` would re-introduce
+        // the regression where a fast responder racing FIN with
+        // `CONNECTION_CLOSE` permanently disables H3 for the backend.
         for class in [
             retry::ErrorClass::ClientDisconnect,
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
+            retry::ErrorClass::GracefulRemoteClose,
             retry::ErrorClass::RequestError,
         ] {
             assert!(
@@ -10166,6 +10204,48 @@ mod tests {
         let class = classify_h3_message("Connection refused: ECONNREFUSED");
         assert_eq!(class, retry::ErrorClass::ConnectionRefused);
         assert!(!retry::request_reached_wire(class));
+    }
+
+    #[test]
+    fn classify_h3_pool_error_short_circuits_on_graceful_close_flag() {
+        // Regression: when an `H3PoolError` carries `is_graceful_close=true`
+        // (set at the recv_response sites for `H3_NO_ERROR` ApplicationClose
+        // / RemoteClosing), the classifier MUST surface the dedicated
+        // `GracefulRemoteClose` class so `is_h3_transport_error_class`
+        // returns false and the gateway skips `mark_h3_unsupported`. The
+        // underlying error chain would otherwise classify as
+        // `ConnectionClosed`, which IS in the transport-error list.
+        let e = crate::http3::client::H3PoolError::graceful_close(anyhow::anyhow!(
+            "recv_response after graceful remote close: ApplicationClose"
+        ));
+        let (kind, class) = super::classify_h3_pool_error(&e);
+        assert_eq!(class, retry::ErrorClass::GracefulRemoteClose);
+        assert_eq!(kind, "graceful_remote_close");
+        assert!(
+            !super::is_h3_transport_error_class(class),
+            "GracefulRemoteClose must NOT be classified as a transport error \
+             — that's exactly what suppresses the cached H3 capability \
+             downgrade"
+        );
+    }
+
+    #[test]
+    fn classify_h3_pool_error_falls_through_on_post_wire_errors() {
+        // Without the graceful-close flag, the classifier delegates to
+        // `classify_h3_error` and returns the underlying class. A normal
+        // post-wire `recv_response` failure (e.g. timeout) MUST still
+        // classify as a transport failure so `mark_h3_unsupported` fires.
+        let e = crate::http3::client::H3PoolError::post_wire(anyhow::anyhow!(
+            "recv_response failed: timed out reading from QUIC stream"
+        ));
+        let (_, class) = super::classify_h3_pool_error(&e);
+        // String-heuristic fallback in classify_http3_error matches "timed out"
+        // → ReadWriteTimeout (read-side, no "connect" token).
+        assert_eq!(class, retry::ErrorClass::ReadWriteTimeout);
+        assert!(
+            super::is_h3_transport_error_class(class),
+            "Post-wire transport failure must still trigger H3 downgrade"
+        );
     }
 
     // ── Fix 5: `should_bypass_h2_coalesce_for_large_response` ───────────

@@ -794,9 +794,14 @@ pub async fn proxy_grpc_request(
     // retry was enabled. That in turn held gRPC trailers behind the last
     // data frame on buffered-response paths, inflating server-streaming
     // RPC p99 latency (500 KB p50 = 9 ms, p99 = 732 ms under 100 conc).
+    // Move method+headers into the core call instead of cloning. `parts` is
+    // not used after this await, so the deep HeaderMap clone (O(header count))
+    // and the Method clone are pure waste. `body_bytes.clone()` is just an Arc
+    // refcount bump (Bytes is shared) and is necessary because we still need
+    // to return the original body for retry replay.
     let result = proxy_grpc_request_core(
-        parts.method.clone(),
-        parts.headers.clone(),
+        parts.method,
+        parts.headers,
         body_bytes.clone(),
         proxy,
         backend_url,

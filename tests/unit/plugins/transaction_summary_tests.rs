@@ -332,6 +332,7 @@ fn test_error_class_serializes_all_variants() {
         (ErrorClass::ResponseBodyTooLarge, "response_body_too_large"),
         (ErrorClass::RequestBodyTooLarge, "request_body_too_large"),
         (ErrorClass::ConnectionPoolError, "connection_pool_error"),
+        (ErrorClass::GracefulRemoteClose, "graceful_remote_close"),
         (ErrorClass::RequestError, "request_error"),
     ];
 
