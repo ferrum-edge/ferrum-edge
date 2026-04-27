@@ -1,0 +1,122 @@
+# Linux test runner — exercises the full cargo test suite on Debian trixie
+# matching the production runtime base. Unlike the release Dockerfile (which
+# builds a distroless binary) this image's purpose is to RUN tests as the
+# final build step, so a `docker build -f Dockerfile.test .` succeeds only
+# when every test passes on Linux.
+#
+# Why this exists: the H3 graceful-close race (PR #506 fix) is sensitive to
+# Linux kernel behavior (io_uring + UDP datagram coalescing) that macOS does
+# not reproduce deterministically. Running `cargo test` inside Docker Desktop
+# on macOS still uses Docker Desktop's LinuxKit VM (Linux 6.12+ at the time
+# of writing — io_uring fully supported), so this gives us a Linux validation
+# path without needing a remote CI runner.
+#
+# Usage:
+#   docker build -f Dockerfile.test --target unit-tests .
+#   docker build -f Dockerfile.test --target integration-tests .
+#   docker build -f Dockerfile.test --target h3-tests .            # H3-only fast loop
+#   docker build -f Dockerfile.test --target all-tests .           # everything
+#
+# Each target's RUN step is the test command; a failure aborts the build,
+# which is the exact CI semantic. All targets share the same dependency
+# layer so the second invocation is fast.
+
+# ── Stage 1: shared build base ──────────────────────────────────────────
+FROM rust:latest AS base
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    clang \
+    libclang-dev \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Cap rustc parallelism so a Docker Desktop default memory budget (~8 GiB)
+# isn't blown by linking 10+ rustc processes concurrently. The Rust build
+# can consume 1-2 GiB per parallel rustc invocation during link; 10 cores
+# × 1.5 GiB > 8 GiB without this cap. Set high enough to be reasonably
+# fast on a typical laptop, low enough to fit.
+ENV CARGO_BUILD_JOBS=2
+# Skip incremental + reduce debug info so each compile uses less RAM and
+# disk. We only run tests; we don't need IDE-friendly artifacts.
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_PROFILE_DEV_DEBUG=line-tables-only
+ENV CARGO_PROFILE_TEST_DEBUG=line-tables-only
+
+# Dependency caching layer — same as Dockerfile, so the dep build hits cache
+# across this and the production image.
+#
+# `vendor/` holds patched copies of crates whose upstream releases lag
+# behind a fix we need:
+#   - `vendor/reqwest-0.13.2-ferrum-patched/` — per-request connect_timeout
+#     ([seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017))
+#   - `vendor/h3-0.0.8-ferrum-patched/` — recv_response frame drain on QUIC
+#     close ([hyperium/h3#339](https://github.com/hyperium/h3/pull/339))
+# Both are wired in via `[patch.crates-io]` in `Cargo.toml` and need to
+# COPY into the build context. See `docs/upstream-*-patches/` for each
+# patch's lifecycle and retirement plan.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto ./proto
+COPY custom_plugins ./custom_plugins
+COPY vendor ./vendor
+
+# Pre-fetch dependencies (no-op if already cached). Doing it here means
+# every test stage below shares the same dependency layer.
+RUN cargo fetch
+
+# Real source
+COPY src ./src
+COPY tests ./tests
+
+# ── Stage 2: H3-only fast loop ──────────────────────────────────────────
+# The PR #506 / #508 / #506-review tests that exercise the typed
+# request_on_wire signal end-to-end. Fastest path to validate the H3
+# graceful-close fix on Linux.
+#
+# `cargo test` only accepts one testname filter per invocation, so each
+# group runs in its own RUN step. The deps + lib compile happen on the
+# first test; subsequent steps re-use the same target/ via Docker's
+# layer cache for fast iteration.
+FROM base AS h3-tests
+RUN cargo test --lib h3_streaming_outcome_tests -- --test-threads=1 --nocapture
+RUN cargo test --lib h3_pool_error_tests -- --test-threads=1 --nocapture
+RUN cargo test --lib classify_h3 -- --test-threads=1 --nocapture
+RUN cargo test --lib graceful_close -- --test-threads=1 --nocapture
+
+# ── Stage 3: full unit test suite ───────────────────────────────────────
+FROM base AS unit-tests
+RUN cargo test --test unit_tests
+
+# ── Stage 4: full integration test suite ────────────────────────────────
+FROM base AS integration-tests
+RUN cargo test --test integration_tests
+
+# ── Stage 5: full functional suite (requires the binary to be built) ────
+# Functional tests are #[ignore]d by default; we explicitly --include-ignored
+# them and require the gateway binary to be on PATH.
+FROM base AS functional-tests
+RUN cargo build --bin ferrum-edge && \
+    cargo test --test functional_tests -- --ignored
+
+# ── Stage 6: lint + fmt gate ────────────────────────────────────────────
+FROM base AS lint
+RUN cargo fmt --all -- --check && \
+    cargo clippy --all-targets -- -D warnings
+
+# ── Stage 7: run everything (CI-equivalent) ─────────────────────────────
+# Order matches the project's pre-commit gate in CLAUDE.md:
+#   1. fmt --check
+#   2. clippy
+#   3. unit + integration tests
+#   4. functional tests (binary-required)
+FROM base AS all-tests
+RUN cargo fmt --all -- --check
+RUN cargo clippy --all-targets -- -D warnings
+RUN cargo test --test unit_tests
+RUN cargo test --test integration_tests
+RUN cargo build --bin ferrum-edge
+RUN cargo test --test functional_tests -- --ignored

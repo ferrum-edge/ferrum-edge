@@ -866,9 +866,9 @@ where
                         }
                         chunk = stream.recv_data() => {
                             match chunk {
-                                Ok(Some(chunk)) => {
-                                    let data = chunk.chunk();
-                                    if max_req_bytes > 0 && total + data.len() > max_req_bytes {
+                                Ok(Some(mut chunk)) => {
+                                    let len = chunk.remaining();
+                                    if max_req_bytes > 0 && total + len > max_req_bytes {
                                         reader_oversized.store(true, Ordering::Relaxed);
                                         crate::http3::stream_util::halt_request_body(stream);
                                         tokio::select! {
@@ -881,15 +881,21 @@ where
                                         }
                                         return;
                                     }
-                                    total += data.len();
+                                    total += len;
                                     reader_bytes.store(total as u64, Ordering::Relaxed);
+                                    // `Buf::copy_to_bytes` is zero-copy when the
+                                    // underlying buffer is already `bytes::Bytes`
+                                    // (always true with h3-quinn). Mirrors the
+                                    // pattern used by the native H3 backend pool
+                                    // in `src/http3/client.rs`.
+                                    let body_bytes = chunk.copy_to_bytes(len);
                                     let send_outcome = tokio::select! {
                                         biased;
                                         _ = reader_halt.notified() => {
                                             crate::http3::stream_util::halt_request_body(stream);
                                             return;
                                         }
-                                        res = tx.send(Ok(Bytes::copy_from_slice(data))) => res,
+                                        res = tx.send(Ok(body_bytes)) => res,
                                     };
                                     if send_outcome.is_err() {
                                         return;
