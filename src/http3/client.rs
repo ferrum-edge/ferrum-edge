@@ -212,8 +212,50 @@ pub(crate) async fn drain_h3_response_body(
 /// cannot be matched by name. We fall back to its `Display` string (stable
 /// in h3 0.0.8); any future wording change is caught by
 /// `h3_goaway_after_complete_body_is_treated_as_graceful`.
+///
+/// Two distinct call sites use this predicate:
+/// - [`drain_h3_response_body`] / streaming-response paths: a graceful close
+///   AFTER a complete body is silently recovered into a successful response.
+/// - The four `recv_response` `.map_err` sites (via
+///   [`recv_response_err`]): a graceful close BEFORE headers are parsed
+///   surfaces an unrecoverable 502 (no headers to forward), but is
+///   wrapped via [`H3PoolError::graceful_close`] so gateway dispatch
+///   sites suppress `mark_h3_unsupported` — `H3_NO_ERROR` is not a
+///   transport-level capability failure even when the response is lost.
 pub(crate) fn is_h3_graceful_close(e: &h3::error::StreamError) -> bool {
     e.is_h3_no_error() || e.to_string() == "Remote is closing the connection"
+}
+
+/// Map an h3 [`StreamError`](h3::error::StreamError) returned by
+/// `recv_response()` into the corresponding [`H3PoolError`] variant.
+///
+/// Centralises the four identical `.map_err` closures across the pool's
+/// inner request helpers (`do_request`, `do_request_streaming`,
+/// `do_request_streaming_body`, `do_request_streaming_incoming_body`) so
+/// the graceful-close detection cannot drift between sites on future
+/// edits.
+///
+/// - [`is_h3_graceful_close`] true → [`H3PoolError::graceful_close`]:
+///   the request was committed (post-wire) and the backend chose to
+///   tear down without an error code; gateway dispatch sites suppress
+///   `mark_h3_unsupported`. The 502 still propagates because no headers
+///   are available to forward.
+/// - Otherwise → [`H3PoolError::post_wire`]: a real transport / protocol
+///   failure that should drive the H3 capability downgrade.
+fn recv_response_err(e: h3::error::StreamError) -> H3PoolError {
+    if is_h3_graceful_close(&e) {
+        // Backend tore the connection down with `H3_NO_ERROR` (or sent
+        // GOAWAY) before we could parse a usable response. The 502 still
+        // propagates because no headers are available, but the gateway
+        // must NOT treat this as an H3 capability failure — see
+        // [`H3PoolError::graceful_close`] for the rationale.
+        H3PoolError::graceful_close(anyhow::anyhow!(
+            "recv_response after graceful remote close: {}",
+            e
+        ))
+    } else {
+        H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e))
+    }
 }
 
 /// Whether the received body is semantically complete for this response.
@@ -262,11 +304,23 @@ pub type H3RequestStream =
 /// The pool's internal retry chain promotes the flag forward so a later
 /// failed-connect attempt cannot mask the earlier wire commitment.
 ///
+/// Also carries `graceful_close`, set when the underlying error is a
+/// graceful remote close (`H3_NO_ERROR` `ApplicationClose` or
+/// `GOAWAY`/`RemoteClosing`) at the response read boundary. The 502
+/// propagates to the caller because we have no headers / partial body to
+/// forward, but the gateway MUST NOT treat this as an H3 capability
+/// failure — `H3_NO_ERROR` is by definition the peer's spec-legal
+/// teardown signal (RFC 9114 §8.1), not a transport-level fault.
+///
 /// Constructors:
 /// - [`H3PoolError::pre_wire`] — request never reached the backend (DNS,
 ///   TLS, connect, h3 session creation, or `send_request` itself failed).
 /// - [`H3PoolError::post_wire`] — request was at least partially sent;
 ///   any failure here loses idempotency safety.
+/// - [`H3PoolError::graceful_close`] — request reached the wire but the
+///   backend closed gracefully before a usable response could be parsed.
+///   Post-wire by construction; suppresses `mark_h3_unsupported` at
+///   gateway dispatch sites.
 /// - [`H3PoolError::promote_on_wire_if`] — conditionally promote a stored
 ///   error to `request_on_wire=true` (no-op when the condition is false).
 ///   Used by the pool's internal retry chain to surface the "any attempt
@@ -277,6 +331,7 @@ pub type H3RequestStream =
 pub struct H3PoolError {
     inner: anyhow::Error,
     request_on_wire: bool,
+    graceful_close: bool,
 }
 
 impl H3PoolError {
@@ -288,6 +343,7 @@ impl H3PoolError {
         Self {
             inner: error.into(),
             request_on_wire: false,
+            graceful_close: false,
         }
     }
 
@@ -299,6 +355,26 @@ impl H3PoolError {
         Self {
             inner: error.into(),
             request_on_wire: true,
+            graceful_close: false,
+        }
+    }
+
+    /// Construct an error for a graceful remote close at the response
+    /// read boundary (post-wire by definition: the request was sent;
+    /// the backend started or completed the response and tore the
+    /// connection down with `H3_NO_ERROR` / GOAWAY before headers
+    /// could be parsed).
+    ///
+    /// The 502 still propagates to the caller because no headers are
+    /// available to forward, but [`graceful_close`] returns `true` so
+    /// gateway dispatch sites suppress `mark_h3_unsupported` —
+    /// `H3_NO_ERROR` is the peer's spec-legal teardown signal, not a
+    /// transport-level capability failure.
+    pub fn graceful_close(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            inner: error.into(),
+            request_on_wire: true,
+            graceful_close: true,
         }
     }
 
@@ -314,6 +390,17 @@ impl H3PoolError {
         self.request_on_wire
     }
 
+    /// Returns `true` if this error originates from a graceful remote
+    /// close (`H3_NO_ERROR` `ApplicationClose` or `GOAWAY`/`RemoteClosing`)
+    /// at the response read boundary. Gateway dispatch sites use this
+    /// signal to suppress `mark_h3_unsupported`: the in-flight request
+    /// still 502s (no headers to forward), but the next request must
+    /// stay on H3 — `H3_NO_ERROR` is the peer's spec-legal teardown
+    /// signal, not a transport-level capability failure.
+    pub fn is_graceful_close(&self) -> bool {
+        self.graceful_close
+    }
+
     /// Conditionally promote the sticky `request_on_wire` flag.
     ///
     /// - When `condition` is `true`, the flag is set to `true` (no-op if
@@ -327,6 +414,9 @@ impl H3PoolError {
     /// A `false` value just means "no earlier attempt committed the
     /// body" — it must NOT clobber a `true` flag that an earlier
     /// `H3PoolError::post_wire(...)` constructor set.
+    ///
+    /// `graceful_close` is preserved verbatim — promotion only affects
+    /// the body-on-wire signal.
     pub fn promote_on_wire_if(mut self, condition: bool) -> Self {
         if condition {
             self.request_on_wire = true;
@@ -1085,10 +1175,7 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = stream
-            .recv_response()
-            .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e)))?;
+        let response = stream.recv_response().await.map_err(recv_response_err)?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -1172,10 +1259,7 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = stream
-            .recv_response()
-            .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e)))?;
+        let response = stream.recv_response().await.map_err(recv_response_err)?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -1289,7 +1373,7 @@ impl Http3ConnectionPool {
         let response = backend_stream
             .recv_response()
             .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e)))?;
+            .map_err(recv_response_err)?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -1397,7 +1481,7 @@ impl Http3ConnectionPool {
         let response = backend_stream
             .recv_response()
             .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e)))?;
+            .map_err(recv_response_err)?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -2333,5 +2417,64 @@ mod h3_pool_error_tests {
             "Setup failure with no prior post-wire attempt must remain \
              request_on_wire=false so retry_on_connect_failure can fire"
         );
+    }
+
+    #[test]
+    fn graceful_close_constructor_marks_post_wire_and_graceful() {
+        // The graceful-close constructor is used at the four `recv_response`
+        // sites when the backend tore down with `H3_NO_ERROR` /
+        // `RemoteClosing`. By definition the request was already sent
+        // (post-wire), so retries must respect `retry_on_methods` —
+        // matches `post_wire` semantics for the body-on-wire signal.
+        // The new flag is what suppresses `mark_h3_unsupported`.
+        let e = H3PoolError::graceful_close(anyhow::anyhow!(
+            "recv_response after graceful remote close: ApplicationClose"
+        ));
+        assert!(
+            e.request_on_wire(),
+            "graceful_close constructor must report request_on_wire=true — \
+             the request was committed to the wire before the backend closed"
+        );
+        assert!(
+            e.is_graceful_close(),
+            "graceful_close constructor must report is_graceful_close=true \
+             so gateway dispatch sites suppress mark_h3_unsupported"
+        );
+    }
+
+    #[test]
+    fn pre_wire_and_post_wire_constructors_do_not_set_graceful_close() {
+        // Only the dedicated `graceful_close` constructor sets the flag.
+        // Any other failure path (DNS / TLS / send_data / finish) remains
+        // a transport failure and must continue to drive the H3 capability
+        // downgrade path.
+        let pre = H3PoolError::pre_wire(anyhow::anyhow!("connect refused"));
+        assert!(!pre.is_graceful_close());
+
+        let post = H3PoolError::post_wire(anyhow::anyhow!("send_data failed"));
+        assert!(!post.is_graceful_close());
+    }
+
+    #[test]
+    fn promote_on_wire_if_preserves_graceful_close_flag() {
+        // The pool's internal retry chain pipes errors through
+        // `.promote_on_wire_if(any_request_on_wire)` on every fresh-connect
+        // setup `?` exit. That helper only modifies `request_on_wire` —
+        // a graceful-close error that flows through the chain MUST keep
+        // `is_graceful_close()=true` so the gateway suppression still fires.
+        let e = H3PoolError::graceful_close(anyhow::anyhow!(
+            "recv_response after graceful remote close"
+        ));
+        let promoted_true = e.promote_on_wire_if(true);
+        assert!(promoted_true.is_graceful_close());
+        assert!(promoted_true.request_on_wire());
+
+        let e = H3PoolError::graceful_close(anyhow::anyhow!(
+            "recv_response after graceful remote close"
+        ));
+        let promoted_false = e.promote_on_wire_if(false);
+        assert!(promoted_false.is_graceful_close());
+        // request_on_wire stays true (graceful_close constructor sets it true)
+        assert!(promoted_false.request_on_wire());
     }
 }
