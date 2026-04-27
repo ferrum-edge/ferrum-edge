@@ -57,6 +57,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{
@@ -342,12 +343,25 @@ fn collect_reqwest_warmup_candidates_for_proxy(
     }
 }
 
-/// Run a batch of warmup tasks with bounded concurrency and emit aggregate
-/// info-level success/failure counts. Used by both the HTTP-only warmup phase
-/// (running in parallel with the capability refresh) and the gated HTTPS
-/// warmup phase. `label` identifies the batch in log lines so operators can
-/// tell the two phases apart.
-async fn run_warmup_task_batch(tasks: Vec<WarmupTask>, concurrency: usize, label: &'static str) {
+/// Run a batch of warmup tasks gated by a shared concurrency semaphore and
+/// emit aggregate info-level success/failure counts. Used by both the
+/// HTTP-only warmup phase (running in parallel with the capability refresh)
+/// and the gated HTTPS warmup phase. `label` identifies the batch in log
+/// lines so operators can tell the two phases apart.
+///
+/// The semaphore is the actual concurrency cap — `for_each_concurrent` only
+/// provides the polling buffer. Phase-1 shares the semaphore with the
+/// capability refresh so the combined fanout never exceeds
+/// `pool_warmup_concurrency`. Without the shared semaphore, two
+/// `tokio::join!`-ed batches each independently respecting that limit
+/// would burst to ~2× (or more, since per-HTTPS-target probes also
+/// `tokio::join!` H2 + H3 internally) — overloading backends and
+/// triggering avoidable startup timeouts in large configs.
+async fn run_warmup_task_batch(
+    tasks: Vec<WarmupTask>,
+    semaphore: Arc<Semaphore>,
+    label: &'static str,
+) {
     use futures_util::stream;
 
     if tasks.is_empty() {
@@ -356,19 +370,26 @@ async fn run_warmup_task_batch(tasks: Vec<WarmupTask>, concurrency: usize, label
     }
 
     let total = tasks.len();
+    let concurrency_cap = semaphore.available_permits();
     info!(
-        "Pool warmup ({}): establishing {} backend connections (concurrency={})",
-        label, total, concurrency
+        "Pool warmup ({}): establishing {} backend connections (shared concurrency cap={})",
+        label, total, concurrency_cap
     );
 
     let ok = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
 
+    let buffer = concurrency_cap.max(1);
     stream::iter(tasks)
-        .for_each_concurrent(concurrency, |task| {
+        .for_each_concurrent(buffer, |task| {
             let ok = ok.clone();
             let failed = failed.clone();
+            let semaphore = semaphore.clone();
             async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("warmup semaphore not closed");
                 match task.await {
                     Ok(desc) => {
                         debug!("Pool warmup: {} ok", desc);
@@ -1647,6 +1668,26 @@ impl ProxyState {
     }
 
     pub async fn refresh_backend_capabilities(&self) {
+        let semaphore = Arc::new(Semaphore::new(
+            self.env_config.pool_warmup_concurrency.max(1),
+        ));
+        self.refresh_backend_capabilities_with_semaphore(semaphore)
+            .await;
+    }
+
+    /// Inner implementation of `refresh_backend_capabilities` that takes an
+    /// externally-supplied semaphore. The startup `warmup_connection_pools`
+    /// path uses this entry point to share a single concurrency budget
+    /// across the capability refresh AND the parallel HTTP reqwest warmup
+    /// batch — without it, each `for_each_concurrent` independently honours
+    /// its own `pool_warmup_concurrency` cap, doubling (or worse) the
+    /// effective fanout when both batches run via `tokio::join!`. The
+    /// public `refresh_backend_capabilities()` wrapper preserves the
+    /// background-refresh semantics by minting a per-call semaphore.
+    pub(crate) async fn refresh_backend_capabilities_with_semaphore(
+        &self,
+        semaphore: Arc<Semaphore>,
+    ) {
         use futures_util::stream;
 
         let config = self.config.load_full();
@@ -1656,20 +1697,29 @@ impl ProxyState {
             return;
         }
 
-        let concurrency = self.env_config.pool_warmup_concurrency.max(1);
+        // Buffer for `for_each_concurrent` is just a polling-window upper
+        // bound — the semaphore is the actual concurrency cap. Sized to
+        // the semaphore's permit count so we don't over-buffer per-target
+        // futures sitting blocked on the permit.
+        let buffer = semaphore.available_permits().max(1);
         let refreshed = Arc::new(AtomicU64::new(0));
         let h2_supported = Arc::new(AtomicU64::new(0));
         let h3_supported = Arc::new(AtomicU64::new(0));
         let h2c_supported = Arc::new(AtomicU64::new(0));
 
         stream::iter(targets)
-            .for_each_concurrent(concurrency, |target| {
+            .for_each_concurrent(buffer, |target| {
                 let state = self.clone();
                 let refreshed = refreshed.clone();
                 let h2_supported = h2_supported.clone();
                 let h3_supported = h3_supported.clone();
                 let h2c_supported = h2c_supported.clone();
+                let semaphore = semaphore.clone();
                 async move {
+                    let _permit = semaphore
+                        .acquire_owned()
+                        .await
+                        .expect("warmup semaphore not closed");
                     let record = state.probe_backend_capabilities(&target).await;
                     if record.plain_http.h2_tls.is_supported() {
                         h2_supported.fetch_add(1, Ordering::Relaxed);
@@ -1804,6 +1854,15 @@ impl ProxyState {
     pub async fn warmup_connection_pools(&self) {
         let config = self.config.load_full();
         let concurrency = self.env_config.pool_warmup_concurrency.max(1);
+        // Single shared semaphore for the whole warmup. Phase-1 hands one
+        // copy to the capability refresh and another to the HTTP reqwest
+        // warmup batch (running in `tokio::join!`); phase-2 gets the same
+        // semaphore. Without this, each `for_each_concurrent` would
+        // independently honour `pool_warmup_concurrency` and the joined
+        // batches would burst to ~2× (or more, since per-HTTPS-target
+        // probes also `tokio::join!` H2 + H3 internally) — overloading
+        // backends and breaking the operator-set cap.
+        let warmup_semaphore = Arc::new(Semaphore::new(concurrency));
         let upstream_map: HashMap<&str, &crate::config::types::Upstream> = config
             .upstreams
             .iter()
@@ -1854,8 +1913,10 @@ impl ProxyState {
             .map(|c| Self::build_reqwest_warmup_task(self.connection_pool.clone(), c))
             .collect();
         let http_label = "reqwest http";
-        let refresh_fut = self.refresh_backend_capabilities();
-        let http_warmup_fut = run_warmup_task_batch(http_tasks, concurrency, http_label);
+        let refresh_fut =
+            self.refresh_backend_capabilities_with_semaphore(warmup_semaphore.clone());
+        let http_warmup_fut =
+            run_warmup_task_batch(http_tasks, warmup_semaphore.clone(), http_label);
         tokio::join!(refresh_fut, http_warmup_fut);
 
         // Phase 2: HTTPS reqwest warmup with capability + needs-reqwest
@@ -1898,7 +1959,7 @@ impl ProxyState {
                 skipped_h2_tls, total_https_candidates
             );
         }
-        run_warmup_task_batch(https_tasks, concurrency, "reqwest https").await;
+        run_warmup_task_batch(https_tasks, warmup_semaphore, "reqwest https").await;
     }
 
     /// Build a single reqwest HEAD warmup task from a candidate. The
@@ -10955,6 +11016,91 @@ mod tests {
         // direct H2 pool covers every request, reqwest warmup IS
         // skippable (assuming the registry agrees on h2_tls=Supported).
         assert!(!proxy_config_forces_reqwest_dispatch(&proxy, true, false));
+    }
+
+    #[tokio::test]
+    async fn run_warmup_task_batch_shares_semaphore_across_concurrent_batches() {
+        // Regression guard for Codex P2: two `run_warmup_task_batch`
+        // invocations driven by `tokio::join!` (Phase-1 capability
+        // refresh ‖ Phase-1 HTTP reqwest warmup) must not each
+        // independently honour `pool_warmup_concurrency` — that would
+        // double the effective fanout and bust the operator-set cap.
+        //
+        // The fix is a single shared `Arc<Semaphore>` consumed by both
+        // batches. This test builds two batches of warmup tasks that
+        // each bump a shared in-flight counter, sleep briefly, then
+        // decrement on exit. Across the joined run the observed peak
+        // in-flight count must never exceed the semaphore's permit
+        // count, regardless of how many tasks each batch holds.
+        use std::sync::atomic::AtomicUsize;
+
+        const PERMITS: usize = 4;
+        const TASKS_PER_BATCH: usize = 20;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let observed_peak = Arc::new(AtomicUsize::new(0));
+        let semaphore = Arc::new(Semaphore::new(PERMITS));
+
+        fn make_tasks(
+            in_flight: Arc<AtomicUsize>,
+            observed_peak: Arc<AtomicUsize>,
+            count: usize,
+            label: &'static str,
+        ) -> Vec<WarmupTask> {
+            (0..count)
+                .map(|i| {
+                    let in_flight = in_flight.clone();
+                    let observed_peak = observed_peak.clone();
+                    let task: WarmupTask = Box::pin(async move {
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        observed_peak.fetch_max(now, Ordering::SeqCst);
+                        // Sleep just long enough that the scheduler will
+                        // happily start additional tasks if the semaphore
+                        // doesn't stop them.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        Ok(format!("{label}-{i}"))
+                    });
+                    task
+                })
+                .collect()
+        }
+
+        let batch_a = make_tasks(
+            in_flight.clone(),
+            observed_peak.clone(),
+            TASKS_PER_BATCH,
+            "a",
+        );
+        let batch_b = make_tasks(
+            in_flight.clone(),
+            observed_peak.clone(),
+            TASKS_PER_BATCH,
+            "b",
+        );
+
+        tokio::join!(
+            run_warmup_task_batch(batch_a, semaphore.clone(), "batch-a"),
+            run_warmup_task_batch(batch_b, semaphore.clone(), "batch-b"),
+        );
+
+        let peak = observed_peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= PERMITS,
+            "shared semaphore must cap total in-flight tasks to its permit count: \
+             observed peak={peak}, permits={PERMITS} (Codex P2 regression — \
+             two `for_each_concurrent` batches independently honouring the cap \
+             would burst to 2× as 8)"
+        );
+        assert!(
+            peak >= 1,
+            "sanity: at least one task should have been observed in-flight"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "every task must release its permit on completion"
+        );
     }
 
     #[test]
