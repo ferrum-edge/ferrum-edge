@@ -42,6 +42,7 @@ use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
+use crate::proxy::headers::{is_backend_response_strip_header, strip_backend_request_headers};
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
 
@@ -886,10 +887,16 @@ pub async fn proxy_grpc_request_streaming(
         .parse()
         .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
 
-    // Build headers, apply proxy transforms
+    // Build headers, apply proxy transforms.
+    //
+    // Strip the full RFC 9110 §7.6.1 request hop-by-hop set plus
+    // `content-length` (hyper frames the body via DATA frames so any
+    // forwarded value is informational and risks mismatch with the
+    // framed length when a request_transformer plugin mutated the body)
+    // and the internal Ferrum compression marker. Canonical predicate
+    // lives in `proxy::headers`.
     let mut headers = parts.headers;
-    headers.remove("connection");
-    headers.remove("transfer-encoding");
+    strip_backend_request_headers(&mut headers);
     for (k, v) in proxy_headers {
         if let (Ok(name), Ok(val)) = (
             hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -1067,9 +1074,11 @@ pub(crate) async fn proxy_grpc_request_core(
         .parse()
         .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
 
-    // Clear hop-by-hop headers
-    headers.remove("connection");
-    headers.remove("transfer-encoding");
+    // Clear the full RFC 9110 §7.6.1 request hop-by-hop set plus
+    // `content-length` and the internal Ferrum compression marker.
+    // Canonical predicate lives in `proxy::headers`. Mirrors the
+    // buffered gRPC path above so the two cannot drift.
+    strip_backend_request_headers(&mut headers);
 
     // Apply proxy headers from the plugin pipeline (before_proxy transformations)
     for (k, v) in proxy_headers {
@@ -1147,14 +1156,13 @@ pub(crate) async fn proxy_grpc_request_core(
         send_fut.await.map_err(map_send_err)?
     };
 
-    // Extract response status and headers, stripping hop-by-hop headers per RFC 9110 §7.6.1.
+    // Extract response status and headers, stripping hop-by-hop headers
+    // per RFC 9110 §7.6.1 (canonical predicate in `proxy::headers`).
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     for (k, v) in response.headers() {
-        match k.as_str() {
-            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-            | "trailer" | "transfer-encoding" | "upgrade" => continue,
-            _ => {}
+        if is_backend_response_strip_header(k.as_str()) {
+            continue;
         }
         if let Ok(vs) = v.to_str() {
             resp_headers.insert(k.as_str().to_string(), vs.to_string());
