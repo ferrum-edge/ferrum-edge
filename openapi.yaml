@@ -15,7 +15,9 @@ info:
     isolated per namespace — uniqueness constraints (listen_path, proxy/upstream
     name, consumer username, listen_port) apply per namespace, and a request
     only sees resources whose `namespace` field matches the header. The header
-    defaults to `ferrum` when omitted, must match `^[a-zA-Z0-9_-]+$`, and is
+    defaults to `ferrum` when omitted, must match `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`
+    (start with an alphanumeric character; alphanumerics, dots, underscores, or
+    hyphens after that; max 254 chars — same rules as resource IDs), and is
     enforced even on write operations: any `namespace` field in the request
     body is overwritten with the header value (the field is therefore
     effectively read-only on the wire). Discover all known namespaces via
