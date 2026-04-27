@@ -456,6 +456,8 @@ paths:
 
   # ── Batch ────────────────────────────────────────────────────────────
   /batch:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
     post:
       operationId: batchCreate
       summary: Batch create resources
@@ -509,6 +511,8 @@ paths:
 
   # ── Backup & Restore ────────────────────────────────────────────────
   /backup:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
     get:
       operationId: backupConfig
       summary: Export full gateway configuration
@@ -572,6 +576,8 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
 
   /restore:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
     post:
       operationId: restoreConfig
       summary: Replace all configuration from a backup
@@ -648,6 +654,8 @@ paths:
 
   # ── Proxies ─────────────────────────────────────────────────────────
   /proxies:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
     get:
       operationId: listProxies
       summary: List all proxies
@@ -717,6 +725,7 @@ paths:
   /proxies/{id}:
     parameters:
       - $ref: "#/components/parameters/ResourceId"
+      - $ref: "#/components/parameters/XFerrumNamespace"
 
     get:
       operationId: getProxy
@@ -793,6 +802,8 @@ paths:
 
   # ── Consumers ───────────────────────────────────────────────────────
   /consumers:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
     get:
       operationId: listConsumers
       summary: List all consumers
@@ -854,6 +865,7 @@ paths:
   /consumers/{id}:
     parameters:
       - $ref: "#/components/parameters/ResourceId"
+      - $ref: "#/components/parameters/XFerrumNamespace"
 
     get:
       operationId: getConsumer
@@ -934,6 +946,7 @@ paths:
           enum: [keyauth, basicauth, jwt, hmac_auth, mtls_auth]
         description: |
           Credential type to set or remove.
+      - $ref: "#/components/parameters/XFerrumNamespace"
 
     put:
       operationId: updateConsumerCredentials
@@ -1049,6 +1062,7 @@ paths:
           type: integer
           minimum: 0
         description: Zero-based index of the credential entry to remove.
+      - $ref: "#/components/parameters/XFerrumNamespace"
     delete:
       operationId: deleteConsumerCredentialByIndex
       summary: Remove a specific credential entry by index
@@ -1153,6 +1167,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
 
   /plugins/config:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
     get:
       operationId: listPluginConfigs
       summary: List all plugin configurations
@@ -1210,6 +1226,7 @@ paths:
   /plugins/config/{id}:
     parameters:
       - $ref: "#/components/parameters/ResourceId"
+      - $ref: "#/components/parameters/XFerrumNamespace"
 
     get:
       operationId: getPluginConfig
@@ -1276,6 +1293,8 @@ paths:
 
   # ── Upstreams ────────────────────────────────────────────────────────
   /upstreams:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
     get:
       operationId: listUpstreams
       summary: List all upstreams
@@ -1334,6 +1353,7 @@ paths:
   /upstreams/{id}:
     parameters:
       - $ref: "#/components/parameters/ResourceId"
+      - $ref: "#/components/parameters/XFerrumNamespace"
     get:
       operationId: getUpstream
       summary: Get an upstream by ID
