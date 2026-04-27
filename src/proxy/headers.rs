@@ -99,6 +99,34 @@ pub fn strip_backend_request_headers_for_grpc(headers: &mut http::HeaderMap) {
     headers.insert(http::header::TE, http::HeaderValue::from_static("trailers"));
 }
 
+/// Merge plugin/proxy headers on top of `headers` and then run the
+/// gRPC-specific backend strip on the union. This is the canonical
+/// order for gRPC dispatch — stripping BEFORE the merge would let any
+/// client-supplied hop-by-hop header survive, because `proxy_headers`
+/// is the full materialised request map (`ctx.headers`) and not just
+/// plugin deltas. The merge step would re-insert `proxy-authorization`,
+/// `proxy-connection`, `te`, `trailer`, `transfer-encoding`,
+/// `content-length`, etc. straight back into the outbound map.
+///
+/// Encapsulating the merge-then-strip dance in one helper means both
+/// gRPC entry points (`proxy_grpc_request_streaming` and
+/// `proxy_grpc_request_core`) share a single tested implementation;
+/// neither can call the steps in the wrong order.
+pub fn merge_proxy_headers_and_strip_for_grpc(
+    headers: &mut http::HeaderMap,
+    proxy_headers: &std::collections::HashMap<String, String>,
+) {
+    for (k, v) in proxy_headers {
+        if let (Ok(name), Ok(val)) = (
+            http::HeaderName::from_bytes(k.as_bytes()),
+            http::HeaderValue::from_str(v),
+        ) {
+            headers.insert(name, val);
+        }
+    }
+    strip_backend_request_headers_for_grpc(headers);
+}
+
 /// Returns `true` for headers that must NOT be forwarded on a backend
 /// response, per RFC 9110 §7.6.1 (response-direction hop-by-hop set).
 ///
@@ -281,6 +309,90 @@ mod tests {
             headers.get(http::header::TE),
             Some(&http::HeaderValue::from_static("trailers")),
             "gRPC strip must preserve te: trailers from valid clients",
+        );
+    }
+
+    #[test]
+    fn grpc_merge_then_strip_blocks_hop_by_hop_from_plugin_headers() {
+        // Regression: previously the gRPC paths stripped `parts.headers`
+        // and THEN merged `proxy_headers` on top, letting any
+        // client-supplied (or plugin-set) hop-by-hop header survive the
+        // strip. `proxy_headers` is the full materialised request map
+        // (`ctx.headers`) — not just plugin deltas — so a client that
+        // sent `proxy-authorization: Bearer leak` would have it forwarded
+        // to the gRPC backend. The helper must merge first and strip
+        // second, applying the predicate to the union.
+        let mut headers = http::HeaderMap::new();
+        // Original request headers (e.g. from `parts.headers`) — these
+        // would have been stripped under the old order. Include a
+        // benign header to confirm normal headers pass through.
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/grpc"),
+        );
+
+        // Materialised request headers (what `proxy_headers` carries
+        // through the dispatch pipeline). Includes a hop-by-hop set the
+        // client supplied — the bug was these survived the strip.
+        let mut proxy_headers = std::collections::HashMap::new();
+        proxy_headers.insert("proxy-authorization".to_string(), "Bearer leak".to_string());
+        proxy_headers.insert("proxy-connection".to_string(), "close".to_string());
+        proxy_headers.insert("connection".to_string(), "keep-alive".to_string());
+        proxy_headers.insert("transfer-encoding".to_string(), "chunked".to_string());
+        proxy_headers.insert("content-length".to_string(), "999".to_string());
+        proxy_headers.insert("te".to_string(), "gzip".to_string()); // bogus client TE
+        proxy_headers.insert("authorization".to_string(), "Bearer keep".to_string());
+
+        merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
+
+        // Hop-by-hop and transport-managed headers must be gone even
+        // though they came in via proxy_headers.
+        assert!(
+            headers.get("proxy-authorization").is_none(),
+            "proxy-authorization from proxy_headers must be stripped post-merge"
+        );
+        assert!(headers.get("proxy-connection").is_none());
+        assert!(headers.get(http::header::CONNECTION).is_none());
+        assert!(headers.get(http::header::TRANSFER_ENCODING).is_none());
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+
+        // `te` was set to a bogus value by the client; strip removes it,
+        // gRPC synthesise restores `trailers`.
+        assert_eq!(
+            headers.get(http::header::TE),
+            Some(&http::HeaderValue::from_static("trailers")),
+            "gRPC strip must overwrite the proxy_headers TE value with `trailers`"
+        );
+
+        // Non-hop-by-hop headers from proxy_headers are forwarded.
+        assert_eq!(
+            headers.get(http::header::AUTHORIZATION),
+            Some(&http::HeaderValue::from_static("Bearer keep"))
+        );
+        assert_eq!(
+            headers.get(http::header::CONTENT_TYPE),
+            Some(&http::HeaderValue::from_static("application/grpc"))
+        );
+    }
+
+    #[test]
+    fn grpc_merge_then_strip_synthesises_te_when_no_one_sent_it() {
+        // Neither the original headers nor proxy_headers carry `te`;
+        // the helper must still synthesise `te: trailers` after the
+        // merge+strip dance.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/grpc"),
+        );
+        let proxy_headers: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
+
+        assert_eq!(
+            headers.get(http::header::TE),
+            Some(&http::HeaderValue::from_static("trailers"))
         );
     }
 
