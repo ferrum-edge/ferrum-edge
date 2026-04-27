@@ -50,20 +50,19 @@ ENV CARGO_PROFILE_TEST_DEBUG=line-tables-only
 # Dependency caching layer — same as Dockerfile, so the dep build hits cache
 # across this and the production image.
 #
-# `vendor/` is intentionally NOT COPY'd here. Earlier iteration used
-# `COPY vendor* ./vendor/`, but Docker's COPY-with-glob fails the build
-# when no source path matches — which is the default state of this repo
-# today (no `vendor/` directory exists on PR #506's branch). Branches
-# that introduce vendored crates ([#507](https://github.com/ferrum-edge/ferrum-edge/pull/507)
-# adds `vendor/reqwest-…`, [#508](https://github.com/ferrum-edge/ferrum-edge/pull/508)
-# adds `vendor/h3-…`) MUST add their own
-#   COPY vendor ./vendor
-# line below as part of their PR diff. Keeping the line out of #506
-# means the Dockerfile is buildable on clean checkouts, and future PRs
-# get the merge-conflict signal that they need to add their COPY.
+# `vendor/` holds patched copies of crates whose upstream releases lag
+# behind a fix we need:
+#   - `vendor/reqwest-0.13.2-ferrum-patched/` — per-request connect_timeout
+#     ([seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017))
+#   - `vendor/h3-0.0.8-ferrum-patched/` — recv_response frame drain on QUIC
+#     close ([hyperium/h3#339](https://github.com/hyperium/h3/pull/339))
+# Both are wired in via `[patch.crates-io]` in `Cargo.toml` and need to
+# COPY into the build context. See `docs/upstream-*-patches/` for each
+# patch's lifecycle and retirement plan.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto ./proto
 COPY custom_plugins ./custom_plugins
+COPY vendor ./vendor
 
 # Pre-fetch dependencies (no-op if already cached). Doing it here means
 # every test stage below shares the same dependency layer.
