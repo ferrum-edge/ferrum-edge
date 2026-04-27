@@ -7655,11 +7655,16 @@ async fn proxy_to_backend(
     // `ctx.request_bytes_observed.load(Ordering::Acquire)` once the request
     // has completed.
     ctx_request_bytes_observed: &Arc<std::sync::atomic::AtomicU64>,
-) -> (retry::BackendResponse, Option<Vec<u8>>) {
+) -> (retry::BackendResponse, Option<Bytes>) {
     // When retain_request_body is true (retries configured), the collected
-    // body bytes are cloned and returned alongside the response so the
-    // caller can replay them on connection-failure retries.
-    let mut retained_body: Option<Vec<u8>> = None;
+    // body bytes are retained alongside the response so the caller can replay
+    // them on connection-failure retries. `Bytes` is shared via Arc so the
+    // retain-clone is a refcount bump, not a deep copy of the request body —
+    // the previous `Option<Vec<u8>>` deep-copied the body on every request
+    // with retry enabled, even when no retry actually fired. `Option<Bytes>`
+    // still derefs to `Option<&[u8]>` via `as_deref`, so the retry
+    // call sites in `proxy_to_backend_inner` are unchanged.
+    let mut retained_body: Option<Bytes> = None;
 
     // All reqwest clients use our DnsCacheResolver, so DNS resolution is
     // always served from the warmed cache — never hitting DNS on the hot path.
@@ -8027,6 +8032,10 @@ async fn proxy_to_backend(
                     }
                 }
                 if !body_bytes.is_empty() {
+                    // `Bytes::from(Vec<u8>)` is zero-cost (transfers ownership of
+                    // the Vec without copying). The optional clone below is then
+                    // a refcount bump, not a deep copy.
+                    let body_bytes = Bytes::from(body_bytes);
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
                     }
@@ -8141,6 +8150,10 @@ async fn proxy_to_backend(
                 }
 
                 if !body_bytes.is_empty() {
+                    // See note above on the buffered branch — converting to
+                    // `Bytes` once turns the optional retain-clone into a
+                    // refcount bump rather than a Vec deep copy.
+                    let body_bytes = Bytes::from(body_bytes);
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
                     }
@@ -9042,7 +9055,7 @@ async fn proxy_to_backend_http3(
     retain_request_body: bool,
     stream_response: bool,
     ctx_request_bytes_observed: &Arc<std::sync::atomic::AtomicU64>,
-) -> (retry::BackendResponse, Option<Vec<u8>>) {
+) -> (retry::BackendResponse, Option<Bytes>) {
     debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request to HTTP/3 backend");
 
     // Resolve backend IP from DNS cache for the effective host
@@ -9408,12 +9421,6 @@ async fn proxy_to_backend_http3(
         }
     }
 
-    let retained_body = if retain_request_body && !request_body.is_empty() {
-        Some(request_body.clone())
-    } else {
-        None
-    };
-
     let request_content_length = if !request_body.is_empty() {
         Some(request_body.len().to_string())
     } else {
@@ -9428,7 +9435,15 @@ async fn proxy_to_backend_http3(
         request_content_length.as_deref(),
     );
 
+    // `Bytes::from(Vec<u8>)` transfers ownership without copying. Convert
+    // before the optional retain-clone so retain becomes a refcount bump
+    // rather than a Vec deep copy on every retry-enabled request.
     let body_bytes: bytes::Bytes = request_body.into();
+    let retained_body = if retain_request_body && !body_bytes.is_empty() {
+        Some(body_bytes.clone())
+    } else {
+        None
+    };
 
     if stream_response {
         let h3_result = if let Some(target) = upstream_target {
