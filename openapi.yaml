@@ -8,6 +8,21 @@ info:
     `/overload` require JWT bearer token authentication via the
     `Authorization: Bearer <token>` header.
 
+    ## Namespaces
+
+    Every authenticated endpoint is scoped by the `X-Ferrum-Namespace` request
+    header. Resources (proxies, consumers, plugin configs, upstreams) are
+    isolated per namespace — uniqueness constraints (listen_path, proxy/upstream
+    name, consumer username, listen_port) apply per namespace, and a request
+    only sees resources whose `namespace` field matches the header. The header
+    defaults to `ferrum` when omitted, must match `^[a-zA-Z0-9_-]+$`, and is
+    enforced even on write operations: any `namespace` field in the request
+    body is overwritten with the header value (the field is therefore
+    effectively read-only on the wire). Discover all known namespaces via
+    `GET /namespaces`.
+
+    ## Caching and read-only mode
+
     When the primary database is unavailable, read endpoints transparently fall
     back to the most recent cached configuration and include an
     `X-Data-Source: cached` response header. Write operations require a live
@@ -15,6 +30,14 @@ info:
 
     The Admin API can be placed in **read-only mode**, in which case all POST,
     PUT, and DELETE operations return `403 Forbidden`.
+
+    ## Request body size limits
+
+    Most write endpoints accept request bodies up to 1 MiB; bodies that exceed
+    the limit are rejected with `413 Payload Too Large`. The `/restore`
+    endpoint has a higher configurable limit (default 100 MiB, controlled by
+    `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`) to accommodate large-scale
+    backups (30K+ proxies / 90K+ plugins can reach ~80 MB).
   version: 0.2.0
   license:
     name: PolyForm Noncommercial 1.0.0
@@ -68,11 +91,23 @@ paths:
       description: |
         Returns gateway health status including database connectivity and
         cached configuration availability. Also accessible at `/status`.
+
+        Returns `503 Service Unavailable` while the gateway is still in
+        startup (the body's `status` field is set to `"starting"` and
+        `ready` is `false`). Once startup is complete the endpoint returns
+        `200 OK` with `status` set to `"ok"` or `"degraded"` (DB
+        disconnected / admin writes blocked).
       tags: [Health]
       security: []
       responses:
         "200":
-          description: Health status
+          description: Gateway is ready (status `ok` or `degraded`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: Gateway is still starting (status `starting`, `ready=false`)
           content:
             application/json:
               schema:
@@ -86,7 +121,13 @@ paths:
       security: []
       responses:
         "200":
-          description: Health status
+          description: Gateway is ready (status `ok` or `degraded`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: Gateway is still starting (status `starting`, `ready=false`)
           content:
             application/json:
               schema:
@@ -922,8 +963,12 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -955,6 +1000,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -971,6 +1018,8 @@ paths:
           description: Credential removed
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -978,12 +1027,18 @@ paths:
 
   /consumers/{consumer_id}/credentials/{cred_type}/{index}:
     parameters:
-      - $ref: "#/components/parameters/ConsumerId"
+      - name: consumer_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Consumer ID
       - name: cred_type
         in: path
         required: true
         schema:
           type: string
+          enum: [keyauth, basicauth, jwt, hmac_auth, mtls_auth]
         description: Credential type (e.g. `keyauth`, `jwt`, `basicauth`).
       - name: index
         in: path
@@ -1011,6 +1066,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -1397,6 +1454,21 @@ components:
         type: string
       description: Resource UUID
 
+    XFerrumNamespace:
+      name: X-Ferrum-Namespace
+      in: header
+      required: false
+      schema:
+        type: string
+        pattern: "^[a-zA-Z0-9_-]+$"
+        default: ferrum
+      description: |
+        Scopes the request to a specific namespace. Defaults to `ferrum`.
+        On write operations, this value overrides the `namespace` field in
+        the request body (which is therefore effectively read-only on the
+        wire). Resources from other namespaces are not visible to this
+        request and uniqueness constraints apply per-namespace.
+
     PaginationOffset:
       name: offset
       in: query
@@ -1501,6 +1573,15 @@ components:
             alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
           pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
           maxLength: 254
+        namespace:
+          type: string
+          default: ferrum
+          readOnly: true
+          description: >-
+            Namespace this proxy belongs to. Read-only on the wire — set from
+            the `X-Ferrum-Namespace` request header (or the `ferrum` default)
+            on every create/update; any value in the request body is ignored.
+            See the API description for namespace semantics.
         name:
           type: [string, "null"]
           description: >-
@@ -1918,6 +1999,15 @@ components:
             alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
           pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
           maxLength: 254
+        namespace:
+          type: string
+          default: ferrum
+          readOnly: true
+          description: >-
+            Namespace this consumer belongs to. Read-only on the wire — set
+            from the `X-Ferrum-Namespace` request header (or the `ferrum`
+            default) on every create/update; any value in the request body
+            is ignored.
         username:
           type: [string, "null"]
           minLength: 1
@@ -2110,6 +2200,15 @@ components:
             alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
           pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
           maxLength: 254
+        namespace:
+          type: string
+          default: ferrum
+          readOnly: true
+          description: >-
+            Namespace this plugin config belongs to. Read-only on the wire —
+            set from the `X-Ferrum-Namespace` request header (or the `ferrum`
+            default) on every create/update; any value in the request body
+            is ignored.
         plugin_name:
           type: [string, "null"]
           description: >-
@@ -2477,6 +2576,15 @@ components:
             alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
           pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
           maxLength: 254
+        namespace:
+          type: string
+          default: ferrum
+          readOnly: true
+          description: >-
+            Namespace this upstream belongs to. Read-only on the wire — set
+            from the `X-Ferrum-Namespace` request header (or the `ferrum`
+            default) on every create/update; any value in the request body
+            is ignored.
         name:
           type: [string, "null"]
           description: >-
@@ -2518,6 +2626,32 @@ components:
             Dynamic target discovery configuration. When set, discovered targets
             are merged with any static `targets`. Can be used as the sole target
             source (allowing `targets` to be empty).
+        backend_tls_client_cert_path:
+          type: [string, "null"]
+          description: >-
+            Path to a PEM-encoded client certificate for mTLS with backend
+            targets. When this upstream is referenced by a proxy, this TLS
+            config takes precedence over the proxy's own backend TLS fields.
+            Only meaningful for TLS-enabled backend schemes (`https`, `tcps`,
+            `dtls`).
+        backend_tls_client_key_path:
+          type: [string, "null"]
+          description: >-
+            Path to a PEM-encoded private key matching
+            `backend_tls_client_cert_path`. Required when the cert path is set.
+        backend_tls_verify_server_cert:
+          type: boolean
+          default: true
+          description: >-
+            Whether to verify the backend server's TLS certificate. Set to
+            `false` only for development/testing — disabling verification
+            removes the security guarantees of TLS.
+        backend_tls_server_ca_cert_path:
+          type: [string, "null"]
+          description: >-
+            Path to a PEM CA bundle used as the sole trust anchor when
+            verifying backend server certificates for this upstream. When
+            set, the system/webpki trust store is NOT used (CA exclusivity).
         created_at:
           type: [string, "null"]
           format: date-time
@@ -2644,18 +2778,25 @@ components:
           description: Status codes considered healthy (HTTP probe only)
         probe_type:
           type: string
-          enum: [http, tcp, udp]
+          enum: [http, tcp, udp, grpc]
           default: http
           description: |
             Type of health probe.
             `http` — HTTP GET request (default).
             `tcp` — TCP SYN connection probe.
             `udp` — UDP probe with optional payload.
+            `grpc` — gRPC health check using `grpc.health.v1.Health/Check`.
         udp_probe_payload:
           type: [string, "null"]
           description: |
             Hex-encoded payload to send for UDP probes (e.g., "0000").
             If omitted, a single zero byte is sent.
+        grpc_service_name:
+          type: [string, "null"]
+          description: |
+            Service name for gRPC health check requests
+            (`grpc.health.v1.Health/Check`). Empty/null (default) checks the
+            overall server health. Only used when `probe_type: grpc`.
         use_tls:
           type: boolean
           default: false
@@ -2681,6 +2822,17 @@ components:
           format: uint64
           default: 30
           description: Sliding window for counting failures
+        healthy_after_seconds:
+          type: integer
+          format: uint64
+          default: 30
+          description: |
+            Seconds after which an unhealthy target is automatically restored
+            to the rotation. Acts as a recovery timer / half-open circuit
+            breaker. Default: 30 seconds. Set to 0 to disable automatic
+            recovery (rely on active health checks or all-unhealthy fallback
+            only). On-success recovery is always active in addition to this
+            timer.
 
     # ── Service Discovery ──────────────────────────────────────────
     ServiceDiscoveryConfig:
@@ -2717,6 +2869,13 @@ components:
             port_name:
               type: [string, "null"]
               description: Named port to select from EndpointSlice
+            label_selector:
+              type: [string, "null"]
+              description: >-
+                Label selector used to filter EndpointSlices (matches the
+                Kubernetes `labelSelector` syntax, e.g.
+                `app=my-svc,tier=backend`). Optional; when omitted all
+                EndpointSlices for the service are considered.
             poll_interval_seconds:
               type: integer
               format: uint64
