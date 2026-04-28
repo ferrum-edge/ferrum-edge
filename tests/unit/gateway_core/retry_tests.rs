@@ -306,16 +306,48 @@ fn test_grpc_invalid_server_name_classified() {
 }
 
 #[test]
-fn test_grpc_generic_unavailable_classified() {
-    // BackendRequest is the kind used for hyper::Error / send_request failures
-    // — the post-handshake "we got on the wire but the request failed" bucket.
+fn test_grpc_backend_request_classifies_as_post_wire() {
+    // CRITICAL: BackendRequest is emitted from `sender.send_request().await`
+    // AFTER the H2 connection is established and ALPN has succeeded — request
+    // bytes may already be on the wire. Classify it as ConnectionReset
+    // (post-wire / mid-stream) so request_reached_wire returns true and the
+    // connect-failure retry path does NOT replay non-idempotent POSTs.
     let err = GrpcProxyError::backend_unavailable(
         ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::BackendRequest,
         "Backend error: something went wrong".into(),
     );
-    assert_eq!(
-        classify_grpc_proxy_error(&err),
-        ErrorClass::ConnectionRefused
+    let class = classify_grpc_proxy_error(&err);
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert!(
+        ferrum_edge::retry::request_reached_wire(class),
+        "BackendRequest must classify as post-wire so retry_on_connect_failure \
+         cannot bypass retry_on_methods for non-idempotent gRPC POSTs"
+    );
+}
+
+#[test]
+fn test_grpc_kind_is_connect_class_partitions_correctly() {
+    use ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind as K;
+    // Pre-wire (safe to replay regardless of method idempotency): retry loops
+    // include these in the connect-failure matcher.
+    for kind in [
+        K::DnsResolution,
+        K::Connect,
+        K::TlsHandshake,
+        K::H2Handshake,
+        K::H2cHandshake,
+        K::InvalidServerName,
+    ] {
+        assert!(
+            kind.is_connect_class(),
+            "{kind:?} must be classified as a connect-class kind"
+        );
+    }
+    // Post-wire: retry loops must EXCLUDE this from the connect-failure
+    // matcher so retry_on_methods governs replay decisions.
+    assert!(
+        !K::BackendRequest.is_connect_class(),
+        "BackendRequest is post-handshake — must not be a connect-class kind"
     );
 }
 

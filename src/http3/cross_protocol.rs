@@ -1515,14 +1515,19 @@ where
             // `cargo check` against the new variant; the surrounding
             // tests in `tests/unit/gateway_core/grpc_*` will catch a
             // misclassification mismatch.
-            let is_connection_error = matches!(
-                &result,
-                Err(grpc_proxy::GrpcProxyError::BackendUnavailable { .. })
-                    | Err(grpc_proxy::GrpcProxyError::BackendTimeout {
-                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
-                        ..
-                    })
-            );
+            // Narrow to the connect-class kinds — see the equivalent
+            // matcher in `proxy/mod.rs` for the rationale (post-wire
+            // BackendRequest must NOT bypass retry_on_methods).
+            let is_connection_error = match &result {
+                Err(grpc_proxy::GrpcProxyError::BackendUnavailable { kind, .. }) => {
+                    kind.is_connect_class()
+                }
+                Err(grpc_proxy::GrpcProxyError::BackendTimeout {
+                    kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                    ..
+                }) => true,
+                _ => false,
+            };
             if !is_connection_error
                 || !retry_config.retry_on_connect_failure
                 || attempt >= retry_config.max_retries

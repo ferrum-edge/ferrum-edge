@@ -2853,6 +2853,15 @@ async fn create_session(
 }
 
 /// Resolve the backend target — either direct from proxy config or via load balancer.
+///
+/// Returns a typed [`StreamSetupError`] (boxed into `anyhow::Error`) on
+/// load-balancer failure so [`dtls_disconnect_cause`] /
+/// [`dtls_disconnect_direction`] read the kind directly via
+/// [`find_stream_setup_error`] rather than falling through to the
+/// `RequestError` class fallback (which would attribute the disconnect to
+/// the client-side `RecvError` instead of the correct backend-side
+/// `BackendError`). Mirrors the TCP resolver in
+/// [`crate::proxy::tcp_proxy::resolve_backend_target`].
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_cache: &LoadBalancerCache,
@@ -2860,7 +2869,13 @@ fn resolve_backend_target(
     if let Some(upstream_id) = &proxy.upstream_id {
         let selection = lb_cache
             .select_target(upstream_id, &proxy.id, None)
-            .ok_or_else(|| anyhow::anyhow!("No healthy targets for upstream {}", upstream_id))?;
+            .ok_or_else(|| -> anyhow::Error {
+                StreamSetupError::new(
+                    StreamSetupKind::NoHealthyTargets,
+                    format!("for upstream {upstream_id}"),
+                )
+                .into()
+            })?;
         Ok((selection.target.host.clone(), selection.target.port))
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))

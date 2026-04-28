@@ -6257,15 +6257,23 @@ async fn handle_proxy_request_inner(
             let mut grpc_current_cb_key = cb_target_key.clone();
 
             loop {
-                // Classify the error and determine if retryable
-                let is_connection_error = matches!(
-                    &grpc_result,
-                    Err(GrpcProxyError::BackendUnavailable { .. })
-                        | Err(GrpcProxyError::BackendTimeout {
-                            kind: grpc_proxy::GrpcTimeoutKind::Connect,
-                            ..
-                        })
-                );
+                // Classify the error and determine if retryable. Narrow to
+                // the connect-class kinds via `is_connect_class()` so
+                // `retry_on_connect_failure` cannot replay non-idempotent
+                // gRPC POSTs after a `BackendRequest` failure (post-wire,
+                // emitted from `send_request().await` after the H2 stream
+                // has been opened — request bytes may already be on the
+                // wire). The wildcard `BackendUnavailable { .. }` matcher
+                // previously here let post-wire errors bypass
+                // `retry_on_methods`.
+                let is_connection_error = match &grpc_result {
+                    Err(GrpcProxyError::BackendUnavailable { kind, .. }) => kind.is_connect_class(),
+                    Err(GrpcProxyError::BackendTimeout {
+                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                        ..
+                    }) => true,
+                    _ => false,
+                };
                 if grpc_attempt >= retry_config.max_retries
                     || !is_connection_error
                     || !retry_config.retry_on_connect_failure

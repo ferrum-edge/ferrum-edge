@@ -259,8 +259,19 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
                 GrpcBackendUnavailableKind::H2cHandshake => ErrorClass::ProtocolError,
                 GrpcBackendUnavailableKind::DnsResolution
                 | GrpcBackendUnavailableKind::InvalidServerName => ErrorClass::DnsLookupError,
-                GrpcBackendUnavailableKind::Connect
-                | GrpcBackendUnavailableKind::BackendRequest => ErrorClass::ConnectionRefused,
+                GrpcBackendUnavailableKind::Connect => ErrorClass::ConnectionRefused,
+                // `BackendRequest` is emitted from `sender.send_request().await`
+                // after the H2 connection is established and ALPN has succeeded.
+                // The request headers may already be on the wire; this is a
+                // post-wire failure by definition. Map to `ConnectionReset`
+                // (mid-stream reset) so `request_reached_wire` returns true and
+                // the connect-failure retry path does NOT replay non-idempotent
+                // POSTs across the same stream. The outer gRPC retry loops
+                // narrow to the connect-class kinds via
+                // `GrpcBackendUnavailableKind::is_connect_class()` so this
+                // variant is excluded from `retry_on_connect_failure` regardless
+                // of the class.
+                GrpcBackendUnavailableKind::BackendRequest => ErrorClass::ConnectionReset,
             }
         }
         GrpcProxyError::ResourceExhausted(_) => ErrorClass::RequestError,

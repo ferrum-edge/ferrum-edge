@@ -691,11 +691,38 @@ pub enum GrpcBackendUnavailableKind {
     /// [`crate::retry::ErrorClass::DnsLookupError`] because the failure is
     /// rooted in the configured/looked-up name, before any wire activity.
     InvalidServerName,
-    /// The backend rejected an outbound request after the connection was
-    /// established (e.g., `hyper::Error` from `send_request`). Maps to
-    /// [`crate::retry::ErrorClass::ConnectionRefused`] when no more specific
-    /// kind applies.
+    /// The backend rejected an outbound request after the H2 connection was
+    /// established and ALPN had succeeded — e.g., `hyper::Error` from
+    /// `sender.send_request(...).await`. **Post-wire by definition:** the
+    /// request headers may already have been forwarded, so this kind must
+    /// NEVER be treated as a pre-wire failure. Maps to
+    /// [`crate::retry::ErrorClass::ConnectionReset`] (mid-stream reset) so
+    /// `request_reached_wire` returns true and the connect-failure retry
+    /// path does not replay non-idempotent POSTs across the same stream.
     BackendRequest,
+}
+
+impl GrpcBackendUnavailableKind {
+    /// Returns `true` for kinds that represent a pre-wire failure (DNS,
+    /// connect, handshake) — safe to replay regardless of HTTP method
+    /// idempotency.
+    ///
+    /// Returns `false` for [`Self::BackendRequest`], which is emitted
+    /// post-handshake from `send_request().await` and may have committed the
+    /// request headers / body bytes to the wire. The outer gRPC retry loops
+    /// match on this predicate so `retry_on_connect_failure` doesn't bypass
+    /// `retry_on_methods` for post-wire failures.
+    pub fn is_connect_class(self) -> bool {
+        match self {
+            Self::DnsResolution
+            | Self::Connect
+            | Self::TlsHandshake
+            | Self::H2Handshake
+            | Self::H2cHandshake
+            | Self::InvalidServerName => true,
+            Self::BackendRequest => false,
+        }
+    }
 }
 
 /// Errors specific to gRPC proxying.
