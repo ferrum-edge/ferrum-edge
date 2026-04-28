@@ -753,19 +753,22 @@ async fn retry_attempts_within_same_request_stay_on_h3_pool() {
     .expect("spawn tls");
 
     // H3 backend: every accepted connection accepts the stream, then
-    // resets it with H3_REQUEST_CANCELLED. The script runs fresh per
-    // accepted connection, so each gateway-level retry that establishes
-    // a new QUIC connection sees the same RST.
+    // closes the connection with H3_REQUEST_CANCELLED. The script runs
+    // fresh per accepted connection, so each gateway-level retry that
+    // establishes a new QUIC connection sees the same post-wire H3
+    // transport failure. Use an explicit non-graceful close rather than
+    // RESET_STREAM: on Linux the scripted connection's eventual
+    // H3_NO_ERROR teardown can race ahead of the reset at recv_response.
     let h3_backend = ScriptedH3Backend::builder(udp_socket, H3TlsConfig::new(cert, key))
         .step(H3Step::AcceptStream)
-        .step(H3Step::SendStreamReset(0x10c))
+        .step(H3Step::CloseConnectionWithCode(0x10c))
         .spawn()
         .expect("spawn h3");
 
     // Retry policy that DEFINITELY fires on connection-class failures.
-    // The H3 stream RST is classified as `ConnectionReset`
-    // (`connection_error=true`), so `should_retry` returns true for the
-    // configured `max_retries: 2`.
+    // The H3 application close is a transport-class failure after the
+    // request reached the wire; GET is explicitly retryable, so
+    // `should_retry` returns true for the configured `max_retries: 2`.
     let yaml = https_with_retry(
         backend_port,
         json!({
