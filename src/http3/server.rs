@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 use super::config::Http3ServerConfig;
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
+use crate::proxy::headers::{is_backend_request_strip_header, is_backend_response_strip_header};
 use crate::proxy::{
     ProxyState, apply_after_proxy_hooks_to_rejection, plugin_result_into_reject_parts,
     run_after_proxy_hooks, run_authentication_phase,
@@ -2406,15 +2407,8 @@ fn build_h3_backend_headers(
                     h3_headers.push((http::header::HOST, val));
                 }
             }
-            "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade" => continue,
+            // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
+            n if is_backend_request_strip_header(n) => continue,
             k if k.starts_with(':') => continue,
             _ => {
                 if let (Ok(name), Ok(val)) = (
@@ -2681,19 +2675,10 @@ async fn proxy_to_backend_h3_streaming(
     let response_status = h3_resp.status;
     let mut response_headers = h3_resp.headers;
 
-    // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1
-    for key in &[
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    ] {
-        response_headers.remove(*key);
-    }
+    // Strip hop-by-hop response headers per RFC 9110 §7.6.1 — see
+    // `proxy::headers` for the canonical predicate. Response-direction
+    // set differs from the request-direction set.
+    response_headers.retain(|name, _| !is_backend_response_strip_header(name));
 
     // Enforce response body size limit via Content-Length fast path
     if state.max_response_body_size_bytes > 0

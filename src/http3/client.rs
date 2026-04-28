@@ -29,6 +29,7 @@ use tracing::debug;
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::pool::{GenericPool, PoolManager};
+use crate::proxy::headers::is_backend_request_strip_header;
 
 /// Classify an HTTP/3 backend error into the shared `ErrorClass` taxonomy.
 ///
@@ -1169,7 +1170,8 @@ impl Http3ConnectionPool {
         let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
         for (name, value) in headers {
             match name.as_str() {
-                "connection" | "transfer-encoding" | "keep-alive" | "upgrade" => continue,
+                // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
+                n if is_backend_request_strip_header(n) => continue,
                 _ => {
                     req_builder = req_builder.header(name, value);
                 }
@@ -1257,7 +1259,8 @@ impl Http3ConnectionPool {
         let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
         for (name, value) in headers {
             match name.as_str() {
-                "connection" | "transfer-encoding" | "keep-alive" | "upgrade" => continue,
+                // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
+                n if is_backend_request_strip_header(n) => continue,
                 _ => {
                     req_builder = req_builder.header(name, value);
                 }
@@ -1344,7 +1347,8 @@ impl Http3ConnectionPool {
         let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
         for (name, value) in headers {
             match name.as_str() {
-                "connection" | "transfer-encoding" | "keep-alive" | "upgrade" => continue,
+                // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
+                n if is_backend_request_strip_header(n) => continue,
                 _ => {
                     req_builder = req_builder.header(name, value);
                 }
@@ -1453,7 +1457,8 @@ impl Http3ConnectionPool {
         let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
         for (name, value) in headers {
             match name.as_str() {
-                "connection" | "transfer-encoding" | "keep-alive" | "upgrade" => continue,
+                // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
+                n if is_backend_request_strip_header(n) => continue,
                 _ => {
                     req_builder = req_builder.header(name, value);
                 }
@@ -2186,7 +2191,8 @@ impl Http3Client {
         for (name, value) in &headers {
             match name.as_str() {
                 // These are hop-by-hop headers from HTTP/1.1, not valid in HTTP/3
-                "connection" | "transfer-encoding" | "keep-alive" | "upgrade" => continue,
+                // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
+                n if is_backend_request_strip_header(n) => continue,
                 _ => {
                     req_builder = req_builder.header(name, value);
                 }

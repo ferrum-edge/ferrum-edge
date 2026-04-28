@@ -12,4 +12,5 @@ mod grpc_proxy_tests;
 mod http2_pool_tests;
 mod http3_integration_tests;
 mod scripted_backend_smoke_tests;
+mod tcp_fast_path_l4_plugins_tests;
 // websocket_gateway_test is a standalone binary (has fn main), not a test module

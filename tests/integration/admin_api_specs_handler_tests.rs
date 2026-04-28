@@ -18,7 +18,6 @@ use ferrum_edge::{
         serve_admin_on_listener,
     },
     config::{
-        db_backend::DatabaseBackend as _,
         db_loader::{DatabaseStore, DbPoolConfig},
         types::Proxy,
     },

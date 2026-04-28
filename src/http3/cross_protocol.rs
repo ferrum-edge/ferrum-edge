@@ -106,6 +106,7 @@ use crate::plugins::{Plugin, PluginResult, RequestContext};
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome;
 use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
+use crate::proxy::headers::is_backend_response_strip_header;
 use crate::retry::ErrorClass;
 
 /// Outcome reported back to the H3 listener so it can update request
@@ -2211,19 +2212,10 @@ fn collect_reqwest_response_headers(response: &reqwest::Response) -> HashMap<Str
         HashMap::with_capacity(response.headers().keys_len());
     for (k, v) in response.headers() {
         let name = k.as_str();
-        // Strip hop-by-hop response headers per RFC 9110 §7.6.1 so nothing
-        // leaks across the proxy boundary.
-        if matches!(
-            name,
-            "connection"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-connection"
-                | "te"
-                | "trailer"
-                | "transfer-encoding"
-                | "upgrade"
-        ) {
+        // Strip hop-by-hop response headers per RFC 9110 §7.6.1 — see
+        // `proxy::headers` for the canonical predicate. Response-direction
+        // set differs from the request-direction set.
+        if is_backend_response_strip_header(name) {
             continue;
         }
         if let Ok(val) = v.to_str() {

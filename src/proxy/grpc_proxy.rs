@@ -42,6 +42,9 @@ use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
+use crate::proxy::headers::{
+    is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
+};
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
 
@@ -891,25 +894,25 @@ pub async fn proxy_grpc_request_streaming(
         .parse()
         .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
 
-    // Build headers, apply proxy transforms
+    // Build headers: merge plugin/proxy headers on top of the inbound
+    // request's headers, then run the gRPC-specific strip on the union.
+    // The helper encapsulates the merge-then-strip ordering so this
+    // path and `proxy_grpc_request_core` cannot drift, and so neither
+    // can call the steps in the wrong order. See `proxy::headers` for
+    // why merging FIRST is required and why `te: trailers` is
+    // synthesised at the end.
     let mut headers = parts.headers;
-    headers.remove("connection");
-    headers.remove("transfer-encoding");
-    for (k, v) in proxy_headers {
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_str(v),
-        ) {
-            headers.insert(name, val);
-        }
-    }
+    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
 
-    // Apply per-route Host override AFTER the proxy_headers merge, mirroring
+    // Apply per-route Host override AFTER the strip, mirroring
     // `proxy_grpc_request_core` and the plain HTTP path in
     // `proxy::proxy_to_backend`. Without this, an H2 or H3 frontend that
     // synthesized `host` from `:authority` would forward the client's
     // external authority to the gRPC backend even when
-    // `preserve_host_header == false`.
+    // `preserve_host_header == false`. (Host is not in the hop-by-hop
+    // strip set, so order vs strip is safe — but Host MUST be applied
+    // after the synthesise step so it's not accidentally targeted by a
+    // future strip predicate change.)
     if !proxy.preserve_host_header
         && let Some(target_host) = uri.host()
         && let Ok(val) = hyper::header::HeaderValue::from_str(target_host)
@@ -991,9 +994,20 @@ pub async fn proxy_grpc_request_streaming(
     // Return streaming response with the exceeded flag so the response body
     // consumer can detect late-arriving size violations (bidi/client-streaming
     // RPCs where request frames continue after response headers arrive).
+    //
+    // Strip hop-by-hop response headers per RFC 9110 §7.6.1 — see
+    // `proxy::headers`. This is the always-streaming entry point (used
+    // when there are no body plugins and no retry); without filtering
+    // here, hop-by-hop response headers (`proxy-authenticate`,
+    // `proxy-connection`, `te`, `trailer`, etc.) leak downstream past
+    // the proxy boundary. Mirrors `proxy_grpc_request_core` so the two
+    // gRPC response paths cannot drift.
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     for (k, v) in response.headers() {
+        if is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
         if let Ok(vs) = v.to_str() {
             resp_headers.insert(k.as_str().to_string(), vs.to_string());
         }
@@ -1072,19 +1086,12 @@ pub(crate) async fn proxy_grpc_request_core(
         .parse()
         .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
 
-    // Clear hop-by-hop headers
-    headers.remove("connection");
-    headers.remove("transfer-encoding");
-
-    // Apply proxy headers from the plugin pipeline (before_proxy transformations)
-    for (k, v) in proxy_headers {
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_str(v),
-        ) {
-            headers.insert(name, val);
-        }
-    }
+    // Build headers: merge plugin/proxy headers on top of the inbound
+    // request's headers, then run the gRPC-specific strip on the union.
+    // Mirrors `proxy_grpc_request_streaming` via the shared helper so
+    // the two gRPC dispatch paths cannot drift on header handling. See
+    // `proxy::headers` for the rationale.
+    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
 
     // Apply per-route Host override AFTER the proxy_headers merge, mirroring
     // the plain HTTP path in `proxy::proxy_to_backend`. Without this, an H2 or
@@ -1152,14 +1159,13 @@ pub(crate) async fn proxy_grpc_request_core(
         send_fut.await.map_err(map_send_err)?
     };
 
-    // Extract response status and headers, stripping hop-by-hop headers per RFC 9110 §7.6.1.
+    // Extract response status and headers, stripping hop-by-hop headers
+    // per RFC 9110 §7.6.1 (canonical predicate in `proxy::headers`).
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     for (k, v) in response.headers() {
-        match k.as_str() {
-            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-            | "trailer" | "transfer-encoding" | "upgrade" => continue,
-            _ => {}
+        if is_backend_response_strip_header(k.as_str()) {
+            continue;
         }
         if let Ok(vs) = v.to_str() {
             resp_headers.insert(k.as_str().to_string(), vs.to_string());

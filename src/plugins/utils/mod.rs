@@ -16,6 +16,7 @@ pub mod log_helpers;
 pub mod rate_limit;
 pub mod redis_rate_limiter;
 pub mod size_limit;
+pub mod tcp_endpoint;
 pub mod udp_endpoint;
 
 pub use batching_logger::{BatchConfig, BatchingLogger, RetryPolicy};
@@ -24,4 +25,5 @@ pub use log_helpers::{
     BatchConfigDefaults, SummaryLogEntry, build_batch_config, handle_http_batch_response,
     parse_http_endpoint,
 };
+pub use tcp_endpoint::resolve_tcp_endpoint;
 pub use udp_endpoint::{UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, resolve_udp_endpoint};

@@ -36,6 +36,7 @@ pub mod body;
 pub mod client_ip;
 pub mod deferred_log;
 pub mod grpc_proxy;
+pub mod headers;
 pub mod http2_pool;
 pub mod sni;
 pub mod stream_listener;
@@ -81,6 +82,7 @@ use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
     WebSocketFrameDirection,
 };
+use crate::proxy::headers as headers_mod;
 use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
@@ -7444,7 +7446,8 @@ pub(crate) async fn proxy_to_backend_retry(
         ));
     }
 
-    // Forward headers, stripping hop-by-hop headers per RFC 7230 Section 6.1
+    // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
+    // (canonical predicate in `proxy::headers`).
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -7456,17 +7459,7 @@ pub(crate) async fn proxy_to_backend_retry(
                     req_builder = req_builder.header("Host", effective_host);
                 }
             }
-            // Hop-by-hop headers per RFC 7230 Section 6.1
-            "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-ferrum-original-content-encoding" => continue,
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -7921,7 +7914,8 @@ async fn proxy_to_backend(
         ));
     }
 
-    // Forward headers, stripping hop-by-hop headers per RFC 7230 Section 6.1
+    // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
+    // (canonical predicate in `proxy::headers`).
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -7933,17 +7927,7 @@ async fn proxy_to_backend(
                     req_builder = req_builder.header("Host", effective_host);
                 }
             }
-            // Hop-by-hop headers per RFC 7230 Section 6.1
-            "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-ferrum-original-content-encoding" => continue,
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -8523,12 +8507,11 @@ fn collect_response_headers_generic<'a, I>(
 {
     target.reserve(source_keys_len);
     for (k, v) in source {
-        // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1.
-        // Uses match (compiler-optimized) instead of linear array scan.
-        match k.as_str() {
-            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-            | "trailer" | "transfer-encoding" | "upgrade" => continue,
-            _ => {}
+        // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1
+        // (canonical predicate in `proxy::headers`; response-direction set
+        // differs from the request-direction set).
+        if headers_mod::is_backend_response_strip_header(k.as_str()) {
+            continue;
         }
         if let Ok(vs) = v.to_str() {
             // Determine multi-value separator before allocating the key String.
@@ -8796,16 +8779,13 @@ async fn proxy_to_backend_http2(
                     parts.headers.insert(hyper::header::HOST, val);
                 }
             }
-            // Hop-by-hop headers per RFC 7230 Section 6.1
-            "connection"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-ferrum-original-content-encoding" => continue,
+            // Hop-by-hop headers per RFC 9110 §7.6.1 (canonical predicate
+            // in `proxy::headers`). The H2 direct pool now also strips
+            // content-length: hyper frames the body via DATA frames so the
+            // header is informational, and forwarding a stale upstream
+            // value risked an authoritative-size mismatch with the framed
+            // body when a request_transformer plugin mutated the body.
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
             _ => {
                 if let (Ok(name), Ok(val)) = (
                     hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -8954,16 +8934,7 @@ fn build_http3_backend_headers(
     let mut http3_headers = Vec::with_capacity(headers.len() + 5);
     for (name, value) in headers {
         match name.as_str() {
-            "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-ferrum-original-content-encoding" => continue,
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
             "host" => {
                 // Apply per-route `preserve_host_header` override on the
                 // first-attempt H3-native backend path. Mirrors
@@ -9693,15 +9664,11 @@ async fn proxy_to_backend_http3_retry(
         Vec::new();
     for (name, value) in headers {
         match name.as_str() {
-            "connection"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-ferrum-original-content-encoding" => continue,
+            // Hop-by-hop headers per RFC 9110 §7.6.1, plus content-length
+            // (h3 frames the body via QUIC streams so any forwarded value
+            // is informational and risks mismatch with body length when
+            // a request_transformer plugin mutated the body).
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
             "host" => {
                 // Use effective upstream host unless preserve_host_header is set
                 let host_value = if proxy.preserve_host_header {
