@@ -286,6 +286,12 @@ fn pre_copy_disconnect_cause(
         ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge => {
             DisconnectCause::RecvError
         }
+        // H3-only class: `H3_NO_ERROR` graceful close at the response
+        // read boundary. Cannot reach a TCP relay in practice — TCP
+        // never produces this — but the exhaustive match means we must
+        // route it. A graceful remote close is backend-initiated, so
+        // semantically this matches the `ConnectionClosed` branch above.
+        ErrorClass::GracefulRemoteClose => DisconnectCause::BackendError,
         // `RequestError` is a semantic catch-all emitted across many paths
         // (plugin rejects, policy denials, upstream resolution failures).
         // Disambiguate via the prefix constants: plugin/policy rejections

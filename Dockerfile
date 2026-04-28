@@ -22,6 +22,11 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto ./proto
 COPY custom_plugins ./custom_plugins
+# Vendored crates referenced by [patch.crates-io] in Cargo.toml. Must be
+# present before any `cargo build` (including the dummy-main dep-cache step
+# below) — Cargo resolves patch paths during manifest load, not just at
+# compile time.
+COPY vendor ./vendor
 
 # Create a dummy main.rs to build dependencies only
 RUN mkdir src && \

@@ -5,6 +5,17 @@ edition = "2024"
 description = "A high-performance edge proxy built in Rust"
 license = "PolyForm-Noncommercial-1.0.0"
 
+# The vendored h3 crate lives at `vendor/h3-0.0.8-ferrum-patched/` and is
+# patched in via `[patch.crates-io]` below. Cargo treats vendored deps under
+# `[patch.crates-io]` as fully built, but `cargo test -p h3 --lib frame` does
+# not run their tests because they aren't workspace members. The patch's
+# regression coverage is the two new unit tests in
+# `vendor/h3-0.0.8-ferrum-patched/src/frame.rs::tests`
+# (`poll_next_drains_buffered_headers_before_quic_close` and
+# `poll_data_drains_buffered_body_before_quic_close`); to run them locally,
+# invoke `cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`.
+# The same tests are part of hyperium/h3#339 and run on the upstream PR's CI.
+
 [[bin]]
 name = "ferrum-edge"
 path = "src/main.rs"
@@ -222,9 +233,27 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
 # connect timeout the underlying `reqwest::Client` was first built with.
 #
 # Retirement plan: when reqwest#3017 merges and ships in a release we use,
-# remove this `[patch.crates-io]` block, drop `vendor/reqwest-0.13.2-ferrum-patched/`,
+# remove this `[patch.crates-io]` entry, drop `vendor/reqwest-0.13.2-ferrum-patched/`,
 # and unpin the dependency. The call-site change in `src/connection_pool.rs`
 # uses the upstream API as proposed in the PR, so it stays intact.
 # See `docs/upstream-reqwest-patches/001-per-request-connect-timeout/README.md`.
+#
+# We also carry a vendored copy of h3 0.0.8 with the frame-drain-on-quic-close
+# fix applied (hyperium/h3#339, tracking issue hyperium/h3#338). Without the
+# patch, `FrameStream::try_recv` propagates a QUIC `CONNECTION_CLOSE` via `?`
+# before the frame decoder gets to consume bytes already buffered from a prior
+# wake. When io_uring batches `STREAM(FIN)` + `CONNECTION_CLOSE(H3_NO_ERROR)`
+# into one recv (common for fast backends doing graceful shutdown), the
+# buffered HEADERS frame is silently discarded and `recv_response` returns
+# `StreamError::ConnectionError` — the gateway surfaces a 502 to the client
+# even though the response was on the wire.
+#
+# Retirement plan: when h3 ships a release with the fix, remove the
+# corresponding `[patch.crates-io]` line, drop `vendor/h3-0.0.8-ferrum-patched/`,
+# and bump the `h3` floor in `Cargo.toml` to that version. The gateway-side
+# suppression in PR #506 stays — it is correct independently of whether the
+# underlying h3 library can recover the response.
+# See `docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/README.md`.
 [patch.crates-io]
 reqwest = { path = "vendor/reqwest-0.13.2-ferrum-patched" }
+h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }

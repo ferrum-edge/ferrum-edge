@@ -2,12 +2,22 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
-use tracing::warn;
 
 use crate::dns::DnsCache;
 
 pub const UDP_RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Resolve `host:port` to a `SocketAddr` via the gateway's shared `DnsCache`.
+///
+/// **Authoritative when a cache is present.** `DnsCache::resolve` errors
+/// encode configured policy decisions — per-proxy / global static DNS
+/// overrides, negative caching, and the gateway's IP-policy denial layer
+/// (`check_backend_ip_policy`). Falling through to the OS resolver on error
+/// would silently bypass all of those, so this function propagates the cache
+/// error instead.
+///
+/// The OS resolver is consulted **only** when no cache is attached — the
+/// rare test/fallback `PluginHttpClient` path that has `dns_cache == None`.
 pub async fn resolve_udp_endpoint(
     host: &str,
     port: u16,
@@ -15,14 +25,13 @@ pub async fn resolve_udp_endpoint(
     plugin_name: &'static str,
 ) -> Result<SocketAddr, String> {
     if let Some(cache) = dns_cache {
-        match cache.resolve(host, None, None).await {
-            Ok(ip) => return Ok(SocketAddr::new(ip, port)),
-            Err(error) => {
-                warn!(
-                    "{plugin_name}: DNS cache resolution failed for '{host}': {error} — falling back to system DNS"
-                );
-            }
-        }
+        return cache
+            .resolve(host, None, None)
+            .await
+            .map(|ip| SocketAddr::new(ip, port))
+            .map_err(|error| {
+                format!("{plugin_name}: DNS resolution failed for '{host}': {error}")
+            });
     }
 
     let addr = format!("{host}:{port}");

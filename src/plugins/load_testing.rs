@@ -84,6 +84,7 @@ use tracing::info;
 use url::form_urlencoded;
 
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use crate::dns::DnsCacheResolver;
 
 pub struct LoadTesting {
     /// Shared plugin HTTP client — used for fan-out trigger requests to remote
@@ -185,9 +186,22 @@ impl LoadTesting {
         // TLS no-verify scoped only to this client (not the global gateway).
         // The timeout prevents workers from hanging on streaming/long-lived
         // responses (SSE, long-poll) that never complete.
-        let load_test_client = reqwest::Client::builder()
+        //
+        // Local synthetic requests target `127.0.0.1` (no DNS lookup needed),
+        // but `gateway_addresses` fan-out is handled by the shared
+        // `PluginHttpClient` rather than this client. We still install the
+        // gateway's `DnsCache` resolver here so this builder honours the
+        // project-wide invariant ("every reqwest::Client::builder must use the
+        // shared cache") and stays correct if a future change repurposes this
+        // client for hostname targets.
+        let mut load_test_builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(gateway_tls_no_verify)
-            .timeout(Duration::from_millis(request_timeout_ms))
+            .timeout(Duration::from_millis(request_timeout_ms));
+        if let Some(dns_cache) = http_client.dns_cache() {
+            load_test_builder =
+                load_test_builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())));
+        }
+        let load_test_client = load_test_builder
             .build()
             .map_err(|e| format!("load_testing: failed to build HTTP client: {}", e))?;
 

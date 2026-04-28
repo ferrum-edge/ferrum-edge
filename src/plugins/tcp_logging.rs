@@ -23,8 +23,10 @@ use tokio::time::Duration;
 
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
+    resolve_tcp_endpoint,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use crate::dns::DnsCache;
 
 #[derive(Clone)]
 struct TcpFlushConfig {
@@ -35,6 +37,11 @@ struct TcpFlushConfig {
     tls_no_verify: bool,
     tls_ca_bundle_path: Option<String>,
     connect_timeout: Duration,
+    /// Gateway-shared DNS cache for endpoint resolution. Pre-warmed at startup
+    /// via `Plugin::warmup_hostnames`, refreshed in the background. `None` only
+    /// when the plugin was constructed via the test/fallback `PluginHttpClient`
+    /// path that has no cache attached.
+    dns_cache: Option<DnsCache>,
 }
 
 pub struct TcpLogging {
@@ -81,6 +88,7 @@ impl TcpLogging {
             tls_no_verify: http_client.tls_no_verify(),
             tls_ca_bundle_path: http_client.tls_ca_bundle_path().map(|s| s.to_string()),
             connect_timeout: Duration::from_millis(connect_timeout_ms),
+            dns_cache: http_client.dns_cache().cloned(),
         };
         let writer = Arc::new(Mutex::new(None));
         let logger = BatchingLogger::spawn(
@@ -163,12 +171,32 @@ impl TcpWriter {
 }
 
 async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
-    let addr = format!("{}:{}", cfg.host, cfg.port);
+    // Resolve via the gateway DNS cache so log shipping shares the same
+    // pre-warmed / stale-while-revalidate behaviour as the proxy hot path.
+    //
+    // Both the resolve and the TCP connect happen inside `cfg.connect_timeout`:
+    // the previous `TcpStream::connect("host:port")` form had the OS DNS
+    // lookup implicitly bounded by the connect timeout. Now that we resolve
+    // explicitly first, a cold/expired cache or stuck upstream nameserver
+    // could otherwise block the batching task well past `connect_timeout_ms`,
+    // delaying log delivery and retries — so the timeout wraps the full
+    // resolve+connect sequence.
+    let host_log = cfg.host.clone();
+    let port = cfg.port;
+    let resolve_and_connect = async {
+        let socket_addr =
+            resolve_tcp_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "tcp_logging")
+                .await?;
+        let addr_log = format!("{host_log} ({socket_addr})");
+        let stream = TcpStream::connect(socket_addr)
+            .await
+            .map_err(|e| format!("TCP logging: failed to connect to {addr_log}: {e}"))?;
+        Ok::<(TcpStream, String), String>((stream, addr_log))
+    };
 
-    let stream = tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(&addr))
+    let (stream, addr_log) = tokio::time::timeout(cfg.connect_timeout, resolve_and_connect)
         .await
-        .map_err(|_| format!("TCP logging: connect timeout to {addr}"))?
-        .map_err(|e| format!("TCP logging: failed to connect to {addr}: {e}"))?;
+        .map_err(|_| format!("TCP logging: connect timeout to {host_log}:{port}"))??;
 
     if !cfg.tls_enabled {
         return Ok(TcpWriter::Plain(stream));
@@ -226,7 +254,7 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
     let tls_stream = connector
         .connect(server_name, stream)
         .await
-        .map_err(|error| format!("TCP logging: TLS handshake failed with {addr}: {error}"))?;
+        .map_err(|error| format!("TCP logging: TLS handshake failed with {addr_log}: {error}"))?;
 
     Ok(TcpWriter::Tls(Box::new(tls_stream)))
 }

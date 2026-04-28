@@ -1,0 +1,23 @@
+# Per-Dockerfile ignore file for Dockerfile.test (BuildKit picks this up
+# automatically when the file is named `<Dockerfile>.dockerignore`).
+#
+# Unlike the root `.dockerignore` (which strips `tests/`, `docs/`, `*.md`
+# to keep the production runtime image lean), the test runner image NEEDS
+# the test sources. Override the relevant exclusions here.
+
+# Always exclude
+.git
+.github
+target
+.claude
+.vscode
+.DS_Store
+*.swp
+*.swo
+*~
+perftest
+
+# Test runner explicitly NEEDS these (do NOT exclude):
+# - tests/    (where the actual test sources live)
+# - docs/     (some tests reference docs/ paths)
+# - *.md      (CLAUDE.md is checked by some tests)

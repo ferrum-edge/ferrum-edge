@@ -48,6 +48,17 @@ pub enum ErrorClass {
     ConnectionPoolError,
     /// All ephemeral ports are exhausted — the OS returned EADDRNOTAVAIL.
     PortExhaustion,
+    /// HTTP/3 backend closed the connection gracefully (`H3_NO_ERROR`
+    /// `ApplicationClose` or `GOAWAY`/`RemoteClosing`) at the response
+    /// read boundary, before headers could be parsed. Post-wire by
+    /// definition: the request was sent and the backend chose to tear
+    /// down the connection without signaling an error. The in-flight
+    /// request still 502s (no headers to forward), but this class is
+    /// intentionally excluded from `is_h3_transport_error_class` so the
+    /// next request stays on H3 — `H3_NO_ERROR` is the peer's
+    /// spec-legal teardown signal (RFC 9114 §8.1), not a transport-level
+    /// capability failure. See [`crate::http3::client::is_h3_graceful_close`].
+    GracefulRemoteClose,
     /// Catch-all for unclassified request errors.
     RequestError,
 }
@@ -68,6 +79,7 @@ impl std::fmt::Display for ErrorClass {
             Self::RequestBodyTooLarge => write!(f, "request_body_too_large"),
             Self::ConnectionPoolError => write!(f, "connection_pool_error"),
             Self::PortExhaustion => write!(f, "port_exhaustion"),
+            Self::GracefulRemoteClose => write!(f, "graceful_remote_close"),
             Self::RequestError => write!(f, "request_error"),
         }
     }
@@ -139,6 +151,7 @@ pub fn error_class_log_kind(class: ErrorClass) -> &'static str {
         ErrorClass::ClientDisconnect => "client_disconnect",
         ErrorClass::RequestBodyTooLarge => "request_body_too_large",
         ErrorClass::ResponseBodyTooLarge => "response_body_too_large",
+        ErrorClass::GracefulRemoteClose => "graceful_remote_close",
         ErrorClass::RequestError => "request_error",
     }
 }
@@ -693,6 +706,7 @@ mod tests {
             ErrorClass::RequestBodyTooLarge,
             ErrorClass::ResponseBodyTooLarge,
             ErrorClass::ClientDisconnect,
+            ErrorClass::GracefulRemoteClose,
             ErrorClass::RequestError,
         ] {
             assert!(
@@ -723,6 +737,7 @@ mod tests {
             ErrorClass::ClientDisconnect,
             ErrorClass::RequestBodyTooLarge,
             ErrorClass::ResponseBodyTooLarge,
+            ErrorClass::GracefulRemoteClose,
             ErrorClass::RequestError,
         ]
         .into_iter()

@@ -36,6 +36,7 @@ pub mod body;
 pub mod client_ip;
 pub mod deferred_log;
 pub mod grpc_proxy;
+pub mod headers;
 pub mod http2_pool;
 pub mod sni;
 pub mod stream_listener;
@@ -82,6 +83,7 @@ use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
     WebSocketFrameDirection,
 };
+use crate::proxy::headers as headers_mod;
 use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
@@ -7852,7 +7854,8 @@ pub(crate) async fn proxy_to_backend_retry(
         ));
     }
 
-    // Forward headers, stripping hop-by-hop headers per RFC 7230 Section 6.1
+    // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
+    // (canonical predicate in `proxy::headers`).
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -7864,17 +7867,7 @@ pub(crate) async fn proxy_to_backend_retry(
                     req_builder = req_builder.header("Host", effective_host);
                 }
             }
-            // Hop-by-hop headers per RFC 7230 Section 6.1
-            "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-ferrum-original-content-encoding" => continue,
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -8063,11 +8056,16 @@ async fn proxy_to_backend(
     // `ctx.request_bytes_observed.load(Ordering::Acquire)` once the request
     // has completed.
     ctx_request_bytes_observed: &Arc<std::sync::atomic::AtomicU64>,
-) -> (retry::BackendResponse, Option<Vec<u8>>) {
+) -> (retry::BackendResponse, Option<Bytes>) {
     // When retain_request_body is true (retries configured), the collected
-    // body bytes are cloned and returned alongside the response so the
-    // caller can replay them on connection-failure retries.
-    let mut retained_body: Option<Vec<u8>> = None;
+    // body bytes are retained alongside the response so the caller can replay
+    // them on connection-failure retries. `Bytes` is shared via Arc so the
+    // retain-clone is a refcount bump, not a deep copy of the request body —
+    // the previous `Option<Vec<u8>>` deep-copied the body on every request
+    // with retry enabled, even when no retry actually fired. `Option<Bytes>`
+    // still derefs to `Option<&[u8]>` via `as_deref`, so the retry
+    // call sites in `proxy_to_backend_inner` are unchanged.
+    let mut retained_body: Option<Bytes> = None;
 
     // All reqwest clients use our DnsCacheResolver, so DNS resolution is
     // always served from the warmed cache — never hitting DNS on the hot path.
@@ -8324,7 +8322,8 @@ async fn proxy_to_backend(
         ));
     }
 
-    // Forward headers, stripping hop-by-hop headers per RFC 7230 Section 6.1
+    // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
+    // (canonical predicate in `proxy::headers`).
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -8336,17 +8335,7 @@ async fn proxy_to_backend(
                     req_builder = req_builder.header("Host", effective_host);
                 }
             }
-            // Hop-by-hop headers per RFC 7230 Section 6.1
-            "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-ferrum-original-content-encoding" => continue,
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -8435,6 +8424,10 @@ async fn proxy_to_backend(
                     }
                 }
                 if !body_bytes.is_empty() {
+                    // `Bytes::from(Vec<u8>)` is zero-cost (transfers ownership of
+                    // the Vec without copying). The optional clone below is then
+                    // a refcount bump, not a deep copy.
+                    let body_bytes = Bytes::from(body_bytes);
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
                     }
@@ -8549,6 +8542,7 @@ async fn proxy_to_backend(
                 }
 
                 if !body_bytes.is_empty() {
+                    let body_bytes = Bytes::from(body_bytes);
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
                     }
@@ -8921,12 +8915,11 @@ fn collect_response_headers_generic<'a, I>(
 {
     target.reserve(source_keys_len);
     for (k, v) in source {
-        // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1.
-        // Uses match (compiler-optimized) instead of linear array scan.
-        match k.as_str() {
-            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-            | "trailer" | "transfer-encoding" | "upgrade" => continue,
-            _ => {}
+        // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1
+        // (canonical predicate in `proxy::headers`; response-direction set
+        // differs from the request-direction set).
+        if headers_mod::is_backend_response_strip_header(k.as_str()) {
+            continue;
         }
         if let Ok(vs) = v.to_str() {
             // Determine multi-value separator before allocating the key String.
@@ -9194,16 +9187,13 @@ async fn proxy_to_backend_http2(
                     parts.headers.insert(hyper::header::HOST, val);
                 }
             }
-            // Hop-by-hop headers per RFC 7230 Section 6.1
-            "connection"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-ferrum-original-content-encoding" => continue,
+            // Hop-by-hop headers per RFC 9110 §7.6.1 (canonical predicate
+            // in `proxy::headers`). The H2 direct pool now also strips
+            // content-length: hyper frames the body via DATA frames so the
+            // header is informational, and forwarding a stale upstream
+            // value risked an authoritative-size mismatch with the framed
+            // body when a request_transformer plugin mutated the body.
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
             _ => {
                 if let (Ok(name), Ok(val)) = (
                     hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -9352,16 +9342,7 @@ fn build_http3_backend_headers(
     let mut http3_headers = Vec::with_capacity(headers.len() + 5);
     for (name, value) in headers {
         match name.as_str() {
-            "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-ferrum-original-content-encoding" => continue,
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
             "host" => {
                 // Apply per-route `preserve_host_header` override on the
                 // first-attempt H3-native backend path. Mirrors
@@ -9450,7 +9431,7 @@ async fn proxy_to_backend_http3(
     retain_request_body: bool,
     stream_response: bool,
     ctx_request_bytes_observed: &Arc<std::sync::atomic::AtomicU64>,
-) -> (retry::BackendResponse, Option<Vec<u8>>) {
+) -> (retry::BackendResponse, Option<Bytes>) {
     debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request to HTTP/3 backend");
 
     // Resolve backend IP from DNS cache for the effective host
@@ -9694,7 +9675,7 @@ async fn proxy_to_backend_http3(
                             // `retry_on_connect_failure` for those cases.
                             // Trust the pool's typed signal.
                             let is_conn_error = !e.request_on_wire();
-                            let (error_kind, error_class) = classify_h3_error(e.as_ref());
+                            let (error_kind, error_class) = classify_h3_pool_error(&e);
                             error!(
                                 proxy_id = %proxy.id,
                                 backend_url = %backend_url,
@@ -9816,12 +9797,6 @@ async fn proxy_to_backend_http3(
         }
     }
 
-    let retained_body = if retain_request_body && !request_body.is_empty() {
-        Some(request_body.clone())
-    } else {
-        None
-    };
-
     let request_content_length = if !request_body.is_empty() {
         Some(request_body.len().to_string())
     } else {
@@ -9836,7 +9811,15 @@ async fn proxy_to_backend_http3(
         request_content_length.as_deref(),
     );
 
+    // `Bytes::from(Vec<u8>)` transfers ownership without copying. Convert
+    // before the optional retain-clone so retain becomes a refcount bump
+    // rather than a Vec deep copy on every retry-enabled request.
     let body_bytes: bytes::Bytes = request_body.into();
+    let retained_body = if retain_request_body && !body_bytes.is_empty() {
+        Some(body_bytes.clone())
+    } else {
+        None
+    };
 
     if stream_response {
         let h3_result = if let Some(target) = upstream_target {
@@ -9897,7 +9880,7 @@ async fn proxy_to_backend_http3(
                 // streaming-incoming-body branch above for why we drop
                 // the error-class contribution here.
                 let is_conn_error = !e.request_on_wire();
-                let (error_kind, error_class) = classify_h3_error(e.as_ref());
+                let (error_kind, error_class) = classify_h3_pool_error(&e);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -9974,7 +9957,7 @@ async fn proxy_to_backend_http3(
                 // Trust the pool's body-on-wire signal — see the streaming
                 // H3 branch above for why we drop the class contribution.
                 let is_conn_error = !e.request_on_wire();
-                let (error_kind, error_class) = classify_h3_error(e.as_ref());
+                let (error_kind, error_class) = classify_h3_pool_error(&e);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -10022,6 +10005,33 @@ fn classify_h3_error(err: &(dyn std::error::Error + 'static)) -> (&'static str, 
     (retry::error_class_log_kind(class), class)
 }
 
+/// Classifier overload for [`crate::http3::client::H3PoolError`] that
+/// honors the typed `is_graceful_close()` signal before falling back to
+/// the shared error-chain classifier.
+///
+/// The recv_response error sites in [`crate::http3::client`] flag
+/// `H3_NO_ERROR` `ApplicationClose` / GOAWAY via the dedicated
+/// [`crate::http3::client::H3PoolError::graceful_close`] constructor.
+/// Surfacing those as [`retry::ErrorClass::GracefulRemoteClose`] keeps
+/// `is_h3_transport_error_class` returning false so the cached H3
+/// capability stays `Supported` even though the in-flight request must
+/// 502 (no headers were available to forward).
+///
+/// The recv_data Err path at the buffered streaming-incoming-body site
+/// uses a raw [`h3::error::StreamError`] rather than `H3PoolError` —
+/// classification there stays on [`classify_h3_error`] because a close
+/// mid-body is a real protocol fault (the backend signaled completion
+/// but truncated the response), not a spec-legal teardown.
+fn classify_h3_pool_error(
+    e: &crate::http3::client::H3PoolError,
+) -> (&'static str, retry::ErrorClass) {
+    if e.is_graceful_close() {
+        let class = retry::ErrorClass::GracefulRemoteClose;
+        return (retry::error_class_log_kind(class), class);
+    }
+    classify_h3_error(e.as_ref())
+}
+
 /// Replay a saved HTTP/3 request to an explicit target (used during retries).
 ///
 /// Accepts pre-collected body bytes, method, URI, and headers so the original
@@ -10062,15 +10072,11 @@ async fn proxy_to_backend_http3_retry(
         Vec::new();
     for (name, value) in headers {
         match name.as_str() {
-            "connection"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-ferrum-original-content-encoding" => continue,
+            // Hop-by-hop headers per RFC 9110 §7.6.1, plus content-length
+            // (h3 frames the body via QUIC streams so any forwarded value
+            // is informational and risks mismatch with body length when
+            // a request_transformer plugin mutated the body).
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
             "host" => {
                 // Use effective upstream host unless preserve_host_header is set
                 let host_value = if proxy.preserve_host_header {
@@ -10171,7 +10177,7 @@ async fn proxy_to_backend_http3_retry(
             // Trust the pool's body-on-wire signal — see the streaming
             // H3 branch above for why we drop the class contribution.
             let is_conn_error = !e.request_on_wire();
-            let (error_kind, error_class) = classify_h3_error(e.as_ref());
+            let (error_kind, error_class) = classify_h3_pool_error(&e);
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
@@ -10389,10 +10395,21 @@ mod tests {
         // Application-layer errors must NOT downgrade the H3 capability — the
         // backend is fine, the request itself is bad. Downgrading here would
         // route subsequent requests via reqwest for no operational reason.
+        //
+        // `GracefulRemoteClose` is also excluded: `H3_NO_ERROR` /
+        // `RemoteClosing` is a spec-legal teardown signal (RFC 9114 §8.1),
+        // not a transport-level capability fault — see the docstring on
+        // [`crate::http3::client::H3PoolError::graceful_close`] and the
+        // matching short-circuit in
+        // [`crate::http3::server::classify_h3_error`]. Adding it to the
+        // positive list in `is_h3_transport_error_class` would re-introduce
+        // the regression where a fast responder racing FIN with
+        // `CONNECTION_CLOSE` permanently disables H3 for the backend.
         for class in [
             retry::ErrorClass::ClientDisconnect,
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
+            retry::ErrorClass::GracefulRemoteClose,
             retry::ErrorClass::RequestError,
         ] {
             assert!(
@@ -10574,6 +10591,48 @@ mod tests {
         let class = classify_h3_message("Connection refused: ECONNREFUSED");
         assert_eq!(class, retry::ErrorClass::ConnectionRefused);
         assert!(!retry::request_reached_wire(class));
+    }
+
+    #[test]
+    fn classify_h3_pool_error_short_circuits_on_graceful_close_flag() {
+        // Regression: when an `H3PoolError` carries `is_graceful_close=true`
+        // (set at the recv_response sites for `H3_NO_ERROR` ApplicationClose
+        // / RemoteClosing), the classifier MUST surface the dedicated
+        // `GracefulRemoteClose` class so `is_h3_transport_error_class`
+        // returns false and the gateway skips `mark_h3_unsupported`. The
+        // underlying error chain would otherwise classify as
+        // `ConnectionClosed`, which IS in the transport-error list.
+        let e = crate::http3::client::H3PoolError::graceful_close(anyhow::anyhow!(
+            "recv_response after graceful remote close: ApplicationClose"
+        ));
+        let (kind, class) = super::classify_h3_pool_error(&e);
+        assert_eq!(class, retry::ErrorClass::GracefulRemoteClose);
+        assert_eq!(kind, "graceful_remote_close");
+        assert!(
+            !super::is_h3_transport_error_class(class),
+            "GracefulRemoteClose must NOT be classified as a transport error \
+             — that's exactly what suppresses the cached H3 capability \
+             downgrade"
+        );
+    }
+
+    #[test]
+    fn classify_h3_pool_error_falls_through_on_post_wire_errors() {
+        // Without the graceful-close flag, the classifier delegates to
+        // `classify_h3_error` and returns the underlying class. A normal
+        // post-wire `recv_response` failure (e.g. timeout) MUST still
+        // classify as a transport failure so `mark_h3_unsupported` fires.
+        let e = crate::http3::client::H3PoolError::post_wire(anyhow::anyhow!(
+            "recv_response failed: timed out reading from QUIC stream"
+        ));
+        let (_, class) = super::classify_h3_pool_error(&e);
+        // String-heuristic fallback in classify_http3_error matches "timed out"
+        // → ReadWriteTimeout (read-side, no "connect" token).
+        assert_eq!(class, retry::ErrorClass::ReadWriteTimeout);
+        assert!(
+            super::is_h3_transport_error_class(class),
+            "Post-wire transport failure must still trigger H3 downgrade"
+        );
     }
 
     // ── Fix 5: `should_bypass_h2_coalesce_for_large_response` ───────────
