@@ -39,6 +39,7 @@ pub mod grpc_proxy;
 pub mod headers;
 pub mod http2_pool;
 pub mod sni;
+pub mod stream_error;
 pub mod stream_listener;
 pub mod tcp_proxy;
 pub mod udp_batch;
@@ -3215,8 +3216,8 @@ async fn handle_websocket_request_authenticated(
                             consumer_username: ctx.effective_identity().map(str::to_owned),
                             http_method: ws_err_method.to_string(),
                             request_path: ctx.path.clone(),
-                            matched_proxy_id: Some(proxy.id.clone()),
-                            matched_proxy_name: proxy.name.clone(),
+                            proxy_id: Some(proxy.id.clone()),
+                            proxy_name: proxy.name.clone(),
                             backend_target_url: Some(
                                 strip_query_params(&current_backend_url).to_string(),
                             ),
@@ -3281,8 +3282,8 @@ async fn handle_websocket_request_authenticated(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         http_method: ws_method.to_string(),
         request_path: ctx.path.clone(),
-        matched_proxy_id: Some(proxy.id.clone()),
-        matched_proxy_name: proxy.name.clone(),
+        proxy_id: Some(proxy.id.clone()),
+        proxy_name: proxy.name.clone(),
         backend_target_url: Some(strip_query_params(&current_backend_url).to_string()),
         backend_resolved_ip: ws_resolved_ip,
         response_status_code: ws_status_code,
@@ -4788,8 +4789,8 @@ pub async fn log_rejected_request(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         http_method: ctx.method.clone(),
         request_path: ctx.path.clone(),
-        matched_proxy_id: proxy.map(|p| p.id.clone()),
-        matched_proxy_name: proxy.and_then(|p| p.name.clone()),
+        proxy_id: proxy.map(|p| p.id.clone()),
+        proxy_name: proxy.and_then(|p| p.name.clone()),
         backend_target_url: proxy.map(|p| {
             // Host-only proxies (listen_path None) have no prefix to strip.
             let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
@@ -6256,15 +6257,23 @@ async fn handle_proxy_request_inner(
             let mut grpc_current_cb_key = cb_target_key.clone();
 
             loop {
-                // Classify the error and determine if retryable
-                let is_connection_error = matches!(
-                    &grpc_result,
-                    Err(GrpcProxyError::BackendUnavailable(_))
-                        | Err(GrpcProxyError::BackendTimeout {
-                            kind: grpc_proxy::GrpcTimeoutKind::Connect,
-                            ..
-                        })
-                );
+                // Classify the error and determine if retryable. Narrow to
+                // the connect-class kinds via `is_connect_class()` so
+                // `retry_on_connect_failure` cannot replay non-idempotent
+                // gRPC POSTs after a `BackendRequest` failure (post-wire,
+                // emitted from `send_request().await` after the H2 stream
+                // has been opened — request bytes may already be on the
+                // wire). The wildcard `BackendUnavailable { .. }` matcher
+                // previously here let post-wire errors bypass
+                // `retry_on_methods`.
+                let is_connection_error = match &grpc_result {
+                    Err(GrpcProxyError::BackendUnavailable { kind, .. }) => kind.is_connect_class(),
+                    Err(GrpcProxyError::BackendTimeout {
+                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                        ..
+                    }) => true,
+                    _ => false,
+                };
                 if grpc_attempt >= retry_config.max_retries
                     || !is_connection_error
                     || !retry_config.retry_on_connect_failure
@@ -6459,8 +6468,8 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         http_method: method,
                         request_path: path,
-                        matched_proxy_id: Some(proxy.id.clone()),
-                        matched_proxy_name: proxy.name.clone(),
+                        proxy_id: Some(proxy.id.clone()),
+                        proxy_name: proxy.name.clone(),
                         backend_target_url: Some(strip_query_params(&grpc_backend_url).to_string()),
                         backend_resolved_ip: grpc_resolved_ip,
                         response_status_code: final_status,
@@ -6761,8 +6770,8 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         http_method: method,
                         request_path: path,
-                        matched_proxy_id: Some(proxy.id.clone()),
-                        matched_proxy_name: proxy.name.clone(),
+                        proxy_id: Some(proxy.id.clone()),
+                        proxy_name: proxy.name.clone(),
                         backend_target_url: Some(strip_query_params(&grpc_backend_url).to_string()),
                         backend_resolved_ip: grpc_resolved_ip,
                         response_status_code: response_status,
@@ -6836,7 +6845,7 @@ async fn handle_proxy_request_inner(
                     state.overload.record_port_exhaustion();
                 }
                 let (grpc_code, original_msg) = match &e {
-                    GrpcProxyError::BackendUnavailable(m) => {
+                    GrpcProxyError::BackendUnavailable { message: m, .. } => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
                     }
                     GrpcProxyError::BackendTimeout { message: m, .. } => {
@@ -6892,8 +6901,8 @@ async fn handle_proxy_request_inner(
                             consumer_username: ctx.effective_identity().map(str::to_owned),
                             http_method: ctx.method.clone(),
                             request_path: ctx.path.clone(),
-                            matched_proxy_id: proxy_ref.map(|p| p.id.clone()),
-                            matched_proxy_name: proxy_ref.and_then(|p| p.name.clone()),
+                            proxy_id: proxy_ref.map(|p| p.id.clone()),
+                            proxy_name: proxy_ref.and_then(|p| p.name.clone()),
                             backend_target_url: proxy_ref.map(|p| {
                                 let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
                                 let url = build_backend_url(p, &ctx.path, "", strip_len);
@@ -7383,8 +7392,8 @@ async fn handle_proxy_request_inner(
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 http_method: method,
                 request_path: path,
-                matched_proxy_id: Some(proxy.id.clone()),
-                matched_proxy_name: proxy.name.clone(),
+                proxy_id: Some(proxy.id.clone()),
+                proxy_name: proxy.name.clone(),
                 backend_target_url: Some(strip_query_params(&backend_url).to_string()),
                 backend_resolved_ip,
                 response_status_code: response_status,

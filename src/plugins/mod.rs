@@ -616,8 +616,17 @@ pub struct TransactionSummary {
     pub consumer_username: Option<String>,
     pub http_method: String,
     pub request_path: String,
-    pub matched_proxy_id: Option<String>,
-    pub matched_proxy_name: Option<String>,
+    /// ID of the proxy that matched this request, or `None` when the request
+    /// was rejected before routing (no proxy matched the host/path). Same
+    /// JSON key as `StreamTransactionSummary.proxy_id` so log consumers see
+    /// a single `proxy_id` field across HTTP, gRPC, WebSocket, TCP, UDP, and
+    /// DTLS transactions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<String>,
+    /// Human-friendly proxy name; same JSON key as
+    /// `StreamTransactionSummary.proxy_name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_name: Option<String>,
     pub backend_target_url: Option<String>,
     /// The DNS-resolved IP address of the backend that was connected to.
     #[serde(skip_serializing_if = "Option::is_none")]

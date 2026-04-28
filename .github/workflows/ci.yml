@@ -93,6 +93,16 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Run inline lib tests
+        # Covers `#[cfg(test)] mod tests` blocks inline in `src/` (used for
+        # private fns/structs that the separate tests/ binaries can't see).
+        # CLAUDE.md lists them as required pre-commit checks; CI now runs them
+        # too so a regression in an inline test fails the PR instead of
+        # waiting until someone runs the lib suite locally.
+        run: cargo test --lib
+        env:
+          RUST_BACKTRACE: 1
+
       - name: Run integration tests
         run: cargo test --test integration_tests
         env:

@@ -14,8 +14,8 @@ fn make_full_summary() -> TransactionSummary {
         consumer_username: Some("alice".to_string()),
         http_method: "POST".to_string(),
         request_path: "/v1/users".to_string(),
-        matched_proxy_id: Some("proxy-users".to_string()),
-        matched_proxy_name: Some("Users API".to_string()),
+        proxy_id: Some("proxy-users".to_string()),
+        proxy_name: Some("Users API".to_string()),
         backend_target_url: Some("http://users-svc:3000/v1/users".to_string()),
         backend_resolved_ip: Some("10.244.1.42".to_string()),
         response_status_code: 201,
@@ -91,7 +91,7 @@ fn test_summary_deserialization_roundtrip() {
     );
     assert_eq!(parsed["http_method"], "POST");
     assert_eq!(parsed["request_path"], "/v1/users");
-    assert_eq!(parsed["matched_proxy_id"], "proxy-users");
+    assert_eq!(parsed["proxy_id"], "proxy-users");
 }
 
 #[test]

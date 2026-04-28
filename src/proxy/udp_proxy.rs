@@ -29,9 +29,10 @@ use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
 use crate::plugins::{
-    Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
-    UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
+    Direction, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
+    StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
 };
+use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 
 /// Maximum datagram size for UDP forwarding.
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
@@ -1428,31 +1429,40 @@ async fn start_dtls_frontend_listener(
                         &handler_crls,
                     )
                     .await;
-                    let (err_msg, error_class, disconnect_cause) = match &result.outcome {
-                        Ok(()) => (
-                            None,
-                            None,
-                            Some(crate::plugins::DisconnectCause::GracefulShutdown),
-                        ),
-                        Err(e) => {
-                            debug!(
-                                proxy_id = %handler_proxy_id,
-                                client = %client_addr,
-                                "DTLS client session ended: {}",
-                                e
-                            );
-                            let error_message = e.to_string();
-                            let err_class = crate::retry::classify_boxed_error(e.as_ref());
-                            // handle_dtls_client_inner can fail on backend-side
-                            // setup (DNS, backend UDP bind, backend DTLS
-                            // handshake) as well as client-side session errors.
-                            // Infer cause from the classified error + message
-                            // prefix so DTLS stream_disconnects metrics don't
-                            // collapse every failure into `recv_error`.
-                            let cause = dtls_disconnect_cause(&err_class, &error_message);
-                            (Some(error_message), Some(err_class), Some(cause))
-                        }
-                    };
+                    let (err_msg, error_class, disconnect_cause, disconnect_direction) =
+                        match &result.outcome {
+                            Ok(()) => (
+                                None,
+                                None,
+                                Some(crate::plugins::DisconnectCause::GracefulShutdown),
+                                None,
+                            ),
+                            Err(e) => {
+                                debug!(
+                                    proxy_id = %handler_proxy_id,
+                                    client = %client_addr,
+                                    "DTLS client session ended: {}",
+                                    e
+                                );
+                                let error_message = e.to_string();
+                                let err_class = crate::retry::classify_boxed_error(e.as_ref());
+                                // handle_dtls_client_inner can fail on
+                                // backend-side setup (DNS, backend UDP bind,
+                                // backend DTLS handshake) as well as
+                                // client-side session errors. The typed
+                                // `StreamSetupError` (when present) drives
+                                // both cause and direction; otherwise we fall
+                                // back to error-class inference.
+                                let cause = dtls_disconnect_cause(e, &err_class);
+                                let direction = dtls_disconnect_direction(e, &err_class);
+                                (
+                                    Some(error_message),
+                                    Some(err_class),
+                                    Some(cause),
+                                    Some(direction),
+                                )
+                            }
+                        };
 
                     // Fire on_stream_disconnect plugins
                     if !handler_plugins.is_empty() {
@@ -1473,7 +1483,7 @@ async fn start_dtls_frontend_listener(
                             bytes_received: result.bytes_received,
                             connection_error: err_msg,
                             error_class,
-                            disconnect_direction: None,
+                            disconnect_direction,
                             disconnect_cause,
                             metadata: &handler_metadata,
                         });
@@ -1575,24 +1585,42 @@ async fn handle_dtls_client(
     }
 }
 
-/// Shared error-message prefix. Used at the `anyhow::anyhow!` construction
-/// site AND at the `error_message.contains(...)` check site in
-/// `dtls_disconnect_cause` — keeping this as a constant means a rename of
-/// the prefix is a compile error everywhere rather than a silent drift.
+/// Legacy DTLS error-message prefix.
+///
+/// Now produced by [`StreamSetupKind::BackendDtlsHandshake`] via
+/// [`StreamSetupError`]; the constant remains as a public-API surface for
+/// log consumers and integration tests. New construction sites MUST use the
+/// typed error wrapper. See [`crate::proxy::stream_error`] for the rationale.
 pub(crate) const STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED: &str = "Backend DTLS handshake failed";
 
-/// Map a DTLS session failure to a `DisconnectCause`. Backend-facing classes
-/// (DNS, connect, port exhaustion, pool) map to `BackendError` so DTLS
-/// stream_disconnects metrics don't collapse every failure into
-/// `recv_error`. TLS is ambiguous so disambiguate by the shared prefix
-/// constant (`STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED`) — generic
-/// session/decrypt errors remain client-side (`RecvError`).
+/// Map a DTLS session failure to a `DisconnectCause`.
+///
+/// **Typed-kind first.** When the chain carries a [`StreamSetupError`] (the
+/// canonical wrapper at every DTLS construction site that previously used the
+/// `STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED` prefix), its
+/// [`StreamSetupKind`] is the authoritative signal and the error class is
+/// only used as a backup for non-setup failures (raw recv errors, generic
+/// I/O timeouts).
+///
+/// Backend-facing classes (DNS, connect, port exhaustion, pool) map to
+/// `BackendError` so DTLS `stream_disconnects` metrics don't collapse every
+/// failure into `recv_error`. Generic decrypt errors remain client-side
+/// (`RecvError`).
 fn dtls_disconnect_cause(
+    error: &anyhow::Error,
     class: &crate::retry::ErrorClass,
-    error_message: &str,
 ) -> crate::plugins::DisconnectCause {
     use crate::plugins::DisconnectCause;
     use crate::retry::ErrorClass;
+
+    if let Some(setup_err) = find_stream_setup_error(error) {
+        return if setup_err.kind.is_client_side() {
+            DisconnectCause::RecvError
+        } else {
+            DisconnectCause::BackendError
+        };
+    }
+
     match class {
         ErrorClass::DnsLookupError
         | ErrorClass::ConnectionTimeout
@@ -1603,13 +1631,38 @@ fn dtls_disconnect_cause(
         | ErrorClass::ConnectionPoolError
         | ErrorClass::ProtocolError => DisconnectCause::BackendError,
         ErrorClass::TlsError => {
-            if error_message.contains(STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED) {
-                DisconnectCause::BackendError
-            } else {
-                DisconnectCause::RecvError
-            }
+            // Untyped TLS error in the chain — conservative default. Migrate
+            // remaining sites to `StreamSetupError` to remove this fallback.
+            DisconnectCause::RecvError
         }
         _ => DisconnectCause::RecvError,
+    }
+}
+
+/// Direction attribution for DTLS session failures, mirroring
+/// [`dtls_disconnect_cause`]. Used to populate
+/// [`StreamTransactionSummary::disconnect_direction`] for UDP/DTLS sessions
+/// — historically `None`, now derived from the typed kind (when present) or
+/// inferred from the error class so operators can tell whether the client or
+/// the backend tore down the session.
+fn dtls_disconnect_direction(error: &anyhow::Error, class: &crate::retry::ErrorClass) -> Direction {
+    use crate::retry::ErrorClass;
+    if let Some(setup_err) = find_stream_setup_error(error) {
+        return setup_err.kind.direction();
+    }
+    match class {
+        ErrorClass::DnsLookupError
+        | ErrorClass::ConnectionTimeout
+        | ErrorClass::ConnectionRefused
+        | ErrorClass::ConnectionReset
+        | ErrorClass::ConnectionClosed
+        | ErrorClass::PortExhaustion
+        | ErrorClass::ConnectionPoolError
+        | ErrorClass::ProtocolError => Direction::BackendToClient,
+        ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge => {
+            Direction::ClientToBackend
+        }
+        _ => Direction::Unknown,
     }
 }
 
@@ -1749,11 +1802,15 @@ async fn handle_dtls_client_inner(
                     );
                     cb.record_failure(502, true);
                 }
-                return Err(anyhow::anyhow!(
-                    "{}: {}",
-                    STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED,
-                    e
-                ));
+                // dtls::DtlsConnection::connect returns anyhow::Error, which
+                // doesn't implement std::error::Error directly — render the
+                // chain into the message so log lines and source-walking
+                // consumers still see the underlying cause.
+                return Err(StreamSetupError::new(
+                    StreamSetupKind::BackendDtlsHandshake,
+                    format!(": {e:#}"),
+                )
+                .into());
             }
         };
         debug!(
@@ -2085,7 +2142,9 @@ async fn create_session(
     };
     for plugin in plugins {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
-            return Err(anyhow::anyhow!("UDP session rejected by plugin"));
+            return Err(
+                StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(UDP session)").into(),
+            );
         }
     }
 
@@ -2201,7 +2260,15 @@ async fn create_session(
                         );
                         cb.record_failure(502, true);
                     }
-                    return Err(anyhow::anyhow!("DTLS handshake failed: {}", e));
+                    // dtls::DtlsConnection::connect returns anyhow::Error,
+                    // which doesn't implement std::error::Error directly —
+                    // render the chain into the message so consumers still
+                    // see the underlying cause.
+                    return Err(StreamSetupError::new(
+                        StreamSetupKind::BackendDtlsHandshake,
+                        format!(": {e:#}"),
+                    )
+                    .into());
                 }
             };
             debug!(
@@ -2786,6 +2853,15 @@ async fn create_session(
 }
 
 /// Resolve the backend target — either direct from proxy config or via load balancer.
+///
+/// Returns a typed [`StreamSetupError`] (boxed into `anyhow::Error`) on
+/// load-balancer failure so [`dtls_disconnect_cause`] /
+/// [`dtls_disconnect_direction`] read the kind directly via
+/// [`find_stream_setup_error`] rather than falling through to the
+/// `RequestError` class fallback (which would attribute the disconnect to
+/// the client-side `RecvError` instead of the correct backend-side
+/// `BackendError`). Mirrors the TCP resolver in
+/// [`crate::proxy::tcp_proxy::resolve_backend_target`].
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_cache: &LoadBalancerCache,
@@ -2793,7 +2869,13 @@ fn resolve_backend_target(
     if let Some(upstream_id) = &proxy.upstream_id {
         let selection = lb_cache
             .select_target(upstream_id, &proxy.id, None)
-            .ok_or_else(|| anyhow::anyhow!("No healthy targets for upstream {}", upstream_id))?;
+            .ok_or_else(|| -> anyhow::Error {
+                StreamSetupError::new(
+                    StreamSetupKind::NoHealthyTargets,
+                    format!("for upstream {upstream_id}"),
+                )
+                .into()
+            })?;
         Ok((selection.target.host.clone(), selection.target.port))
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))
@@ -2843,8 +2925,8 @@ fn epoch_millis_precise() -> u64 {
 mod tests {
     use super::{
         DtlsDisconnectContext, STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext,
-        UdpSession, build_dtls_stream_summary, build_udp_stream_summary,
-        emit_udp_stream_disconnect,
+        UdpSession, build_dtls_stream_summary, build_udp_stream_summary, dtls_disconnect_cause,
+        dtls_disconnect_direction, emit_udp_stream_disconnect,
     };
     use crate::config::types::BackendScheme;
     use crate::plugins::{Plugin, StreamTransactionSummary};
@@ -3044,6 +3126,67 @@ mod tests {
         assert_eq!(
             summary.error_class,
             Some(crate::retry::ErrorClass::TlsError)
+        );
+    }
+
+    // --- typed cause/direction tests for DTLS sessions (Gap 2 + Gap 4) ---
+
+    #[test]
+    fn typed_dtls_kind_drives_cause_and_direction() {
+        use crate::plugins::{Direction, DisconnectCause};
+        use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+        use crate::retry::ErrorClass;
+
+        // Backend DTLS handshake = backend-side, b2c direction.
+        let e: anyhow::Error =
+            StreamSetupError::new(StreamSetupKind::BackendDtlsHandshake, ": handshake failed")
+                .into();
+        assert_eq!(
+            dtls_disconnect_cause(&e, &ErrorClass::TlsError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            dtls_disconnect_direction(&e, &ErrorClass::TlsError),
+            Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn untyped_dtls_session_falls_back_to_class() {
+        use crate::plugins::{Direction, DisconnectCause};
+        use crate::retry::ErrorClass;
+
+        // Generic recv error from the DTLS session — no typed kind in chain.
+        // Falls back to class: ConnectionReset → backend-side / b2c.
+        let e: anyhow::Error = anyhow::anyhow!("decrypt error mid-session");
+        assert_eq!(
+            dtls_disconnect_cause(&e, &ErrorClass::ConnectionReset),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            dtls_disconnect_direction(&e, &ErrorClass::ConnectionReset),
+            Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn typed_kind_overrides_class_for_dtls_too() {
+        use crate::plugins::{Direction, DisconnectCause};
+        use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+        use crate::retry::ErrorClass;
+
+        // RejectedByPlugin (client-side) classified misleadingly as
+        // ConnectionReset (which the class fallback calls backend-side).
+        // Typed kind must win.
+        let e: anyhow::Error =
+            StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(UDP session)").into();
+        assert_eq!(
+            dtls_disconnect_cause(&e, &ErrorClass::ConnectionReset),
+            DisconnectCause::RecvError
+        );
+        assert_eq!(
+            dtls_disconnect_direction(&e, &ErrorClass::ConnectionReset),
+            Direction::ClientToBackend
         );
     }
 }

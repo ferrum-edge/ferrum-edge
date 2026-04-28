@@ -25,6 +25,7 @@ ferrum-edge                     # No args = legacy env-var-only mode (backcompat
 cargo build                               # Debug
 cargo build --release                     # O3, thin LTO, strip
 cargo test --test unit_tests              # Fast, no I/O
+cargo test --lib                          # Inline #[cfg(test)] mod tests in src/ (private fns)
 cargo test --test integration_tests       # Component interaction
 cargo build --bin ferrum-edge && cargo test --test functional_tests -- --ignored  # E2E
 cargo clippy --all-targets -- -D warnings
@@ -40,7 +41,7 @@ cargo fmt --all && cargo fmt --all -- --check
 0. `rustup update stable` — CI uses `dtolnay/rust-toolchain@stable`; new clippy lints will fail CI if you're behind
 1. `cargo fmt --all` then `cargo fmt --all -- --check` (fmt can miss files that --check catches)
 2. `cargo clippy --all-targets -- -D warnings`
-3. `cargo test --test unit_tests && cargo test --test integration_tests`
+3. `cargo test --test unit_tests && cargo test --lib && cargo test --test integration_tests`
 4. If proxy behavior changed: `cargo build --bin ferrum-edge && cargo test --test functional_tests -- --ignored`
 
 ### CI (GitHub Actions)

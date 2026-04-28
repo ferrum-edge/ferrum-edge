@@ -648,8 +648,8 @@ impl Plugin for ApiChargeback {
             None => return,
         };
 
-        let proxy_id = summary.matched_proxy_id.as_deref().unwrap_or("unknown");
-        let proxy_name = summary.matched_proxy_name.as_deref().unwrap_or("unknown");
+        let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
+        let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
 
         self.registry.record(
             consumer,

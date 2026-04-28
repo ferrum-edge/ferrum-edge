@@ -191,7 +191,7 @@ async fn test_rejected_request_summary_no_backend_fields() {
     assert_eq!(summary.client_ip, "127.0.0.1");
     assert_eq!(summary.http_method, "GET");
     assert_eq!(summary.request_path, "/test");
-    assert_eq!(summary.matched_proxy_id, Some("test-proxy".to_string()));
+    assert_eq!(summary.proxy_id, Some("test-proxy".to_string()));
     assert_eq!(
         summary.metadata.get("rejection_phase"),
         Some(&"authenticate".to_string())

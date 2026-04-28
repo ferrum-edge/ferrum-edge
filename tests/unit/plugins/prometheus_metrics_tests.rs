@@ -23,8 +23,8 @@ fn make_summary(
         consumer_username: None,
         http_method: method.to_string(),
         request_path: "/test".to_string(),
-        matched_proxy_id: Some(proxy_id.to_string()),
-        matched_proxy_name: Some("Test".to_string()),
+        proxy_id: Some(proxy_id.to_string()),
+        proxy_name: Some("Test".to_string()),
         backend_target_url: Some("http://localhost:3000".to_string()),
         backend_resolved_ip: None,
         response_status_code: status,
@@ -254,7 +254,7 @@ async fn test_registry_unknown_proxy_uses_default_key() {
     let registry = MetricsRegistry::new();
 
     let mut summary = make_summary("", "GET", 200, 10.0, 5.0);
-    summary.matched_proxy_id = None;
+    summary.proxy_id = None;
     registry.record(&summary);
 
     assert!(registry.request_counter.contains_key(&CounterKey {

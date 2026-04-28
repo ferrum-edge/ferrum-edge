@@ -233,7 +233,7 @@ Splunk will parse each object in the JSON array as a separate event. All `Transa
 **Example Splunk search:**
 ```
 sourcetype="ferrum_edge_logs" response_status_code>=500
-| stats count by matched_proxy_name, error_class
+| stats count by proxy_name, error_class
 ```
 
 > **Note:** If you use the standard HEC endpoint (`/services/collector/event`) instead of `/services/collector/raw`, Splunk expects each event wrapped in `{"event": ...}` — which `http_logging` does not produce. Always use the `/raw` endpoint.
@@ -659,8 +659,8 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `consumer_username` | String or null | Authenticated identity used for policy/logging: mapped Consumer username when present, otherwise external `authenticated_identity`; null if unauthenticated |
 | `http_method` | String | HTTP method (e.g., `GET`, `POST`) |
 | `request_path` | String | Request path (query string stripped) |
-| `matched_proxy_id` | String or null | Proxy ID that matched the route (null for unmatched) |
-| `matched_proxy_name` | String or null | Proxy name (null if unnamed or unmatched) |
+| `proxy_id` | String or null | Proxy ID that matched the route (null for unmatched) |
+| `proxy_name` | String or null | Proxy name (null if unnamed or unmatched) |
 | `backend_target_url` | String or null | Backend URL (`host:port/path`); null for rejected requests |
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
 | `response_status_code` | u16 | HTTP status code |
@@ -719,8 +719,8 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
   "consumer_username": "api-service-a",
   "http_method": "POST",
   "request_path": "/api/v1/users",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440001",
-  "matched_proxy_name": "users-api",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440001",
+  "proxy_name": "users-api",
   "backend_target_url": "10.0.2.10:8080/api/v1/users",
   "backend_resolved_ip": "10.0.2.10",
   "response_status_code": 201,
@@ -745,8 +745,8 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
   "consumer_username": null,
   "http_method": "GET",
   "request_path": "/api/v1/events",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440002",
-  "matched_proxy_name": "sse-events",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440002",
+  "proxy_name": "sse-events",
   "backend_target_url": "10.0.2.15:8080/api/v1/events",
   "backend_resolved_ip": "10.0.2.15",
   "response_status_code": 200,
@@ -774,8 +774,8 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
   "consumer_username": "mobile-app",
   "http_method": "GET",
   "request_path": "/api/v2/feed",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440003",
-  "matched_proxy_name": "feed-api",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440003",
+  "proxy_name": "feed-api",
   "backend_target_url": "10.0.2.20:8080/api/v2/feed",
   "backend_resolved_ip": "10.0.2.20",
   "response_status_code": 200,
@@ -802,8 +802,8 @@ HTTP/3 uses the same `TransactionSummary` as HTTP/1.1 and HTTP/2. The frontend a
   "consumer_username": "grpc-client",
   "http_method": "POST",
   "request_path": "/myapp.UserService/GetUser",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440004",
-  "matched_proxy_name": "grpc-users",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440004",
+  "proxy_name": "grpc-users",
   "backend_target_url": "10.0.2.30:50051/myapp.UserService/GetUser",
   "backend_resolved_ip": "10.0.2.30",
   "response_status_code": 200,
@@ -834,8 +834,8 @@ gRPC errors return HTTP 200 with the error in `grpc-status`/`grpc-message` trail
   "consumer_username": "ws-user",
   "http_method": "GET",
   "request_path": "/ws/chat",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440005",
-  "matched_proxy_name": "ws-chat",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440005",
+  "proxy_name": "ws-chat",
   "backend_target_url": "10.0.2.40:8080/ws/chat",
   "backend_resolved_ip": "10.0.2.40",
   "response_status_code": 101,
@@ -862,8 +862,8 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
   "consumer_username": null,
   "http_method": "GET",
   "request_path": "/ws/chat",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440005",
-  "matched_proxy_name": "ws-chat",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440005",
+  "proxy_name": "ws-chat",
   "backend_target_url": "10.0.2.40:8080/ws/chat",
   "response_status_code": 502,
   "latency_total_ms": 5012.30,
@@ -888,8 +888,8 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
   "consumer_username": null,
   "http_method": "GET",
   "request_path": "/api/v1/secrets",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440001",
-  "matched_proxy_name": "users-api",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440001",
+  "proxy_name": "users-api",
   "backend_target_url": null,
   "response_status_code": 401,
   "latency_total_ms": 0.15,

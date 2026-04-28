@@ -53,7 +53,7 @@ struct SpanData {
     timestamp_received: String,
     // Rich attributes from TransactionSummary
     user_agent: Option<String>,
-    matched_proxy_id: Option<String>,
+    proxy_id: Option<String>,
     matched_route: Option<String>,
     backend_target_url: Option<String>,
     backend_resolved_ip: Option<String>,
@@ -380,8 +380,8 @@ impl Plugin for OtelTracing {
                 consumer: summary.consumer_username.clone(),
                 timestamp_received: summary.timestamp_received.clone(),
                 user_agent: summary.request_user_agent.clone(),
-                matched_proxy_id: summary.matched_proxy_id.clone(),
-                matched_route: summary.matched_proxy_name.clone(),
+                proxy_id: summary.proxy_id.clone(),
+                matched_route: summary.proxy_name.clone(),
                 backend_target_url: summary.backend_target_url.clone(),
                 backend_resolved_ip: summary.backend_resolved_ip.clone(),
                 error_class: summary.error_class.as_ref().map(|e| format!("{e:?}")),
@@ -593,7 +593,7 @@ fn build_otlp_payload(
             if let Some(ref ua) = s.user_agent {
                 attributes.push(otlp_attribute("user_agent.original", ua));
             }
-            if let Some(ref proxy_id) = s.matched_proxy_id {
+            if let Some(ref proxy_id) = s.proxy_id {
                 attributes.push(otlp_attribute("gateway.proxy.id", proxy_id));
             }
             if let Some(ref route) = s.matched_route {

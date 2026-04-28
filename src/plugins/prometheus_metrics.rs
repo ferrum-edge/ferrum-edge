@@ -336,8 +336,7 @@ impl MetricsRegistry {
     }
 
     pub fn record(&self, summary: &TransactionSummary) {
-        let proxy_id: Arc<str> =
-            Arc::from(summary.matched_proxy_id.as_deref().unwrap_or("unknown"));
+        let proxy_id: Arc<str> = Arc::from(summary.proxy_id.as_deref().unwrap_or("unknown"));
 
         // Increment request counter (composite key — no format!() allocation)
         let counter_key = CounterKey {

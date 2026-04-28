@@ -35,7 +35,7 @@ impl SummaryLogEntry {
 
     pub fn proxy_id(&self) -> Option<&str> {
         match self {
-            Self::Http(summary) => summary.matched_proxy_id.as_deref(),
+            Self::Http(summary) => summary.proxy_id.as_deref(),
             Self::Stream(summary) => Some(&summary.proxy_id),
         }
     }

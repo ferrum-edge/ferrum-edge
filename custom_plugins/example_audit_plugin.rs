@@ -94,7 +94,7 @@ impl Plugin for ExampleAuditPlugin {
         //       .bind(summary.response_status_code as i32)
         //       .bind(summary.latency_total_ms)
         //       .bind(&summary.consumer_username)
-        //       .bind(&summary.matched_proxy_id)
+        //       .bind(&summary.proxy_id)
         //       .bind(&headers_json)
         //       .execute(&self.pool)
         //       .await

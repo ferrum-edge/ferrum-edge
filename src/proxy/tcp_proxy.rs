@@ -26,6 +26,7 @@ use crate::plugin_cache::PluginCache;
 use crate::plugins::{
     Direction, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
 };
+use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::retry::ErrorClass;
 
 pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
@@ -105,19 +106,21 @@ fn both_directions_transferred(c2b_bytes: &AtomicU64, b2c_bytes: &AtomicU64) -> 
     c2b_bytes.load(Ordering::Relaxed) > 0 && b2c_bytes.load(Ordering::Relaxed) > 0
 }
 
-// Shared error-message prefixes used at `anyhow::anyhow!` construction sites
-// AND at the `error_message.contains(...)` check sites in
-// `pre_copy_disconnect_cause` / `dtls_disconnect_cause`. Keeping them as
-// constants means a rename at the construction site is a compile error
-// everywhere — the checkers can't silently fall out of sync with the message
-// wording. Do not inline these strings; route any new "wraps a stream error"
-// site through a constant.
+// Legacy stream-error message prefixes.
+//
+// These are public-API surface for log consumers, dashboards, and
+// integration tests that grep on the wording. They are produced at runtime
+// by [`StreamSetupKind::prefix`] (`StreamSetupError`'s Display delegates to
+// it); a regression test in `stream_error.rs` asserts the constants and the
+// typed prefix stay in lockstep.
+//
+// New construction sites MUST emit a [`StreamSetupError`] rather than a
+// bare `anyhow!()` — typed cause/direction attribution then survives
+// `.context()`, `.into()`, and downstream error wrapping without depending
+// on substring matching.
 pub(crate) const STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED: &str = "Frontend TLS handshake failed";
 pub(crate) const STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED: &str = "Backend TLS handshake failed";
 pub(crate) const STREAM_ERR_REJECTED_BY_PLUGIN: &str = "rejected by plugin";
-pub(crate) const STREAM_ERR_REJECTED_BY_ACL: &str = "rejected by ACL";
-pub(crate) const STREAM_ERR_REJECTED_BY_POLICY: &str = "rejected by policy";
-pub(crate) const STREAM_ERR_THROTTLED: &str = "throttled";
 pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
 
 /// Sentinel prefix used by the Linux splice paths
@@ -222,13 +225,17 @@ pub fn disconnect_cause_for_failure(
 /// port exhaustion, pool errors) map to `BackendError` so `stream_disconnects`
 /// metrics don't misclassify backend outages as client recv errors.
 ///
-/// `TlsError` is ambiguous — it can come from the frontend TLS handshake
-/// (client-side issue, e.g. invalid client cert) or the backend TLS
-/// origination. We use the error message prefix set at each call site
-/// (`"Frontend TLS handshake failed ..."` vs. backend TLS wrapping) to
-/// disambiguate; when the message doesn't clearly identify the side, we fall
-/// back to the conservative `RecvError` so a client-side TLS error never
-/// trips a backend-error dashboard/alert.
+/// **Typed-kind first.** When the error chain carries a [`StreamSetupError`]
+/// (the canonical wrapper at every construction site that previously emitted
+/// a `STREAM_ERR_*` prefix), its [`StreamSetupKind`] is the authoritative
+/// signal: `is_client_side()` decides `RecvError` vs `BackendError` directly.
+/// The class-based fallback below applies only when the chain has no
+/// typed setup error — for example, when the failure originated outside the
+/// proxy module or pre-dates the typed infrastructure.
+///
+/// `TlsError` would otherwise be ambiguous (frontend handshake vs backend
+/// handshake) — the typed kind resolves this without inspecting the
+/// message.
 ///
 /// Genuinely client-side failures (e.g., `ClientDisconnect`) stay
 /// `RecvError`. Timeouts during connect become `BackendError`, not
@@ -236,14 +243,26 @@ pub fn disconnect_cause_for_failure(
 ///
 /// The match is **exhaustive over `ErrorClass`** (no `_ => ...` catch-all)
 /// so that adding a new variant triggers a compile error here. This
-/// prevents the silent "unhandled class → RecvError" drift that Codex
-/// flagged — every backend-facing variant must be explicitly routed to
-/// `BackendError`, and every client-facing variant to `RecvError`.
+/// prevents the silent "unhandled class → RecvError" drift — every
+/// backend-facing variant must be explicitly routed to `BackendError`, and
+/// every client-facing variant to `RecvError`.
 fn pre_copy_disconnect_cause(
+    error: &anyhow::Error,
     class: &ErrorClass,
-    error_message: &str,
 ) -> crate::plugins::DisconnectCause {
     use crate::plugins::DisconnectCause;
+
+    // Typed-kind shortcut: when the construction site attached a
+    // `StreamSetupError`, we know which side failed without inspecting
+    // the message. Stays in lockstep with `pre_copy_disconnect_direction`.
+    if let Some(setup_err) = find_stream_setup_error(error) {
+        return if setup_err.kind.is_client_side() {
+            DisconnectCause::RecvError
+        } else {
+            DisconnectCause::BackendError
+        };
+    }
+
     match class {
         // Backend-facing failure classes — the client never saw a reply,
         // so these are always backend problems regardless of message.
@@ -259,28 +278,19 @@ fn pre_copy_disconnect_cause(
         | ErrorClass::ReadWriteTimeout
         // Backend oversized its response — by definition backend-side.
         | ErrorClass::ResponseBodyTooLarge => DisconnectCause::BackendError,
-        // `ConnectionReset` / `ConnectionClosed` can originate on either
-        // side: a frontend TLS handshake abort from a client that resets
-        // mid-handshake surfaces here too. Disambiguate by the message
-        // prefix constant set at the construction site.
+        // No typed kind available — `ConnectionReset` / `ConnectionClosed`
+        // without `StreamSetupError` originate from outside the typed
+        // construction sites; treat conservatively as backend-side since the
+        // typed frontend-TLS path would have surfaced via the kind shortcut
+        // above.
         ErrorClass::ConnectionReset | ErrorClass::ConnectionClosed => {
-            if error_message.contains(STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED) {
-                DisconnectCause::RecvError
-            } else {
-                DisconnectCause::BackendError
-            }
+            DisconnectCause::BackendError
         }
-        ErrorClass::TlsError => {
-            if error_message.contains(STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED) {
-                DisconnectCause::RecvError
-            } else if error_message.contains(STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED) {
-                DisconnectCause::BackendError
-            } else {
-                // Unknown TLS side — conservative fallback to avoid
-                // misattributing frontend issues to the backend.
-                DisconnectCause::RecvError
-            }
-        }
+        // No typed kind — fall back conservatively. The typed path above
+        // resolves frontend vs backend TLS without ambiguity; reaching this
+        // arm means the chain has no `StreamSetupError`, which is unexpected
+        // for TLS errors emitted by the proxy.
+        ErrorClass::TlsError => DisconnectCause::RecvError,
         // Client-facing failure classes — the client is the problem or
         // the one that disconnected, so these are always recv-side.
         ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge => {
@@ -292,30 +302,52 @@ fn pre_copy_disconnect_cause(
         // route it. A graceful remote close is backend-initiated, so
         // semantically this matches the `ConnectionClosed` branch above.
         ErrorClass::GracefulRemoteClose => DisconnectCause::BackendError,
-        // `RequestError` is a semantic catch-all emitted across many paths
-        // (plugin rejects, policy denials, upstream resolution failures).
-        // Disambiguate via the prefix constants: plugin/policy rejections
-        // are client-side; backend resolution / "no healthy targets" are
-        // backend-side. Messages mentioning "upstream" or "backend" that
-        // aren't covered by a specific constant are conservatively treated
-        // as backend-facing so outages surface on the right dashboards.
-        ErrorClass::RequestError => {
-            if error_message.contains(STREAM_ERR_REJECTED_BY_PLUGIN)
-                || error_message.contains(STREAM_ERR_REJECTED_BY_ACL)
-                || error_message.contains(STREAM_ERR_REJECTED_BY_POLICY)
-                || error_message.contains(STREAM_ERR_THROTTLED)
-            {
-                DisconnectCause::RecvError
-            } else if error_message.contains(STREAM_ERR_NO_HEALTHY_TARGETS)
-                || error_message.contains("upstream")
-                || error_message.contains("backend")
-            {
-                DisconnectCause::BackendError
-            } else {
-                // Unknown-side request error — conservative fallback.
-                DisconnectCause::RecvError
-            }
+        // `RequestError` is a semantic catch-all. The typed `StreamSetupError`
+        // path above already attributes plugin/ACL/throttle/policy rejects
+        // (client-side) and `NoHealthyTargets` (backend-side); reaching here
+        // means the chain has no typed kind, so defer to a conservative
+        // recv-side fallback rather than substring-matching. Migrate
+        // remaining untyped sites to `StreamSetupError` to remove this fallback.
+        ErrorClass::RequestError => DisconnectCause::RecvError,
+    }
+}
+
+/// Map a pre-copy error to the originating direction.
+///
+/// Mirrors [`pre_copy_disconnect_cause`]: the typed
+/// [`StreamSetupError`] kind is authoritative when present
+/// ([`StreamSetupKind::direction`]); otherwise the error class is the
+/// fallback signal (backend-facing classes → `BackendToClient`,
+/// client-facing classes → `ClientToBackend`, ambiguous → `Unknown`).
+///
+/// Used by every TCP/UDP construction site that builds a
+/// `StreamTransactionSummary` with `disconnect_direction: Some(...)` so log
+/// consumers see consistent attribution across stream-family protocols.
+fn pre_copy_disconnect_direction(error: &anyhow::Error, class: &ErrorClass) -> Direction {
+    if let Some(setup_err) = find_stream_setup_error(error) {
+        return setup_err.kind.direction();
+    }
+    match class {
+        // Backend-facing classes attribute to the b2c half (the half that
+        // tried to talk to the backend).
+        ErrorClass::DnsLookupError
+        | ErrorClass::ConnectionTimeout
+        | ErrorClass::ConnectionRefused
+        | ErrorClass::PortExhaustion
+        | ErrorClass::ConnectionPoolError
+        | ErrorClass::ProtocolError
+        | ErrorClass::ReadWriteTimeout
+        | ErrorClass::ResponseBodyTooLarge
+        | ErrorClass::ConnectionReset
+        | ErrorClass::ConnectionClosed
+        | ErrorClass::GracefulRemoteClose => Direction::BackendToClient,
+        // Client-facing classes attribute to the c2b half.
+        ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge => {
+            Direction::ClientToBackend
         }
+        // Unknown side — leave it ambiguous so log consumers know the proxy
+        // could not attribute the failure.
+        ErrorClass::TlsError | ErrorClass::RequestError => Direction::Unknown,
     }
 }
 
@@ -745,19 +777,20 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             let error_message = e.to_string();
                             let err_class = classify_stream_error(e);
                             // Pre-copy error (DNS, connect, plugin reject, TLS
-                            // handshake). No bytes flowed and direction can't
-                            // be attributed to a specific half, so use Unknown.
-                            // Map backend-facing failure classes (DNS/connect/
-                            // TLS/port exhaustion) to `BackendError` so cause-
-                            // based dashboards aren't misattributed to client
-                            // recv errors.
-                            let cause = pre_copy_disconnect_cause(&err_class, &error_message);
+                            // handshake). No bytes flowed; the typed
+                            // `StreamSetupError` (when present in the chain)
+                            // resolves which side failed without inspecting
+                            // the message string. Direction is derived from
+                            // the same typed kind so cause/direction stay in
+                            // lockstep across protocols.
+                            let cause = pre_copy_disconnect_cause(e, &err_class);
+                            let direction = pre_copy_disconnect_direction(e, &err_class);
                             (
                                 0,
                                 0,
                                 Some(error_message),
                                 Some(err_class),
-                                Some(Direction::Unknown),
+                                Some(direction),
                                 Some(cause),
                             )
                         }
@@ -1058,10 +1091,11 @@ async fn handle_tcp_connection_inner(
                         sni = ?stream_ctx.sni_hostname,
                         "TCP passthrough connection rejected by plugin"
                     );
-                    return Err(anyhow::anyhow!(
-                        "Connection {}",
-                        STREAM_ERR_REJECTED_BY_PLUGIN
-                    ));
+                    return Err(StreamSetupError::new(
+                        StreamSetupKind::RejectedByPlugin,
+                        "(passthrough)",
+                    )
+                    .into());
                 }
             }
         }
@@ -1226,10 +1260,9 @@ async fn handle_tcp_connection_inner(
                     client = %remote_addr.ip(),
                     "TCP connection rejected by plugin"
                 );
-                return Err(anyhow::anyhow!(
-                    "Connection {}",
-                    STREAM_ERR_REJECTED_BY_PLUGIN
-                ));
+                return Err(
+                    StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(TCP)").into(),
+                );
             }
         }
     }
@@ -1420,14 +1453,15 @@ async fn handle_tcp_connection_inner(
             Ok(s) => s,
             Err(e) => {
                 // Frontend TLS failures are client-side — do not penalise the backend CB.
-                // Prefix is a shared constant so `pre_copy_disconnect_cause` can
-                // detect "frontend side" without drifting from the wording here.
-                return Err(anyhow::anyhow!(
-                    "{} from {}: {}",
-                    STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED,
-                    remote_addr,
-                    e
-                ));
+                // The typed `StreamSetupError` carries the kind so
+                // `pre_copy_disconnect_cause` reads `Frontend` directly from
+                // `StreamSetupKind::FrontendTlsHandshake`, no string match.
+                return Err(StreamSetupError::with_source(
+                    StreamSetupKind::FrontendTlsHandshake,
+                    format!("from {remote_addr}: {e}"),
+                    e,
+                )
+                .into());
             }
         };
 
@@ -1462,10 +1496,11 @@ async fn handle_tcp_connection_inner(
                         client = %remote_addr.ip(),
                         "TCP/TLS connection rejected by plugin"
                     );
-                    return Err(anyhow::anyhow!(
-                        "Connection {}",
-                        STREAM_ERR_REJECTED_BY_PLUGIN
-                    ));
+                    return Err(StreamSetupError::new(
+                        StreamSetupKind::RejectedByPlugin,
+                        "(TCP/TLS)",
+                    )
+                    .into());
                 }
             }
         }
@@ -1675,12 +1710,12 @@ fn resolve_backend_target(
     if let Some(upstream_id) = &proxy.upstream_id {
         let selection = lb_cache
             .select_target(upstream_id, &proxy.id, None)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{} for upstream {}",
-                    STREAM_ERR_NO_HEALTHY_TARGETS,
-                    upstream_id
+            .ok_or_else(|| -> anyhow::Error {
+                StreamSetupError::new(
+                    StreamSetupKind::NoHealthyTargets,
+                    format!("for upstream {upstream_id}"),
                 )
+                .into()
             })?;
         Ok((selection.target.host.clone(), selection.target.port))
     } else {
@@ -1791,19 +1826,21 @@ async fn connect_backend_tls_cached(
     let server_name = rustls::pki_types::ServerName::try_from(hostname.to_string())
         .map_err(|e| anyhow::anyhow!("Invalid server name '{}': {}", hostname, e))?;
 
-    // Prefix is a shared constant so `pre_copy_disconnect_cause` can detect
-    // "backend TLS side" without drifting from the wording here.
-    let tls_stream = connector
-        .connect(server_name, tcp_stream)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "{} to {}: {}",
-                STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED,
-                addr,
-                e
-            )
-        })?;
+    // Typed `StreamSetupError::BackendTlsHandshake` lets cause mappers read
+    // the side directly from the kind — no substring match against the
+    // legacy `STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED` prefix.
+    let tls_stream =
+        connector
+            .connect(server_name, tcp_stream)
+            .await
+            .map_err(|e| -> anyhow::Error {
+                StreamSetupError::with_source(
+                    StreamSetupKind::BackendTlsHandshake,
+                    format!("to {addr}: {e}"),
+                    e,
+                )
+                .into()
+            })?;
 
     Ok(tls_stream)
 }
@@ -3756,5 +3793,105 @@ mod ktls_param_tests {
             ),
         };
         assert!(build_ktls_params(0x0303, &secrets).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cause_direction_tests {
+    //! Tests for `pre_copy_disconnect_cause` / `pre_copy_disconnect_direction`,
+    //! the typed-kind-first cause/direction mappers shared between TCP and UDP
+    //! disconnect logging. Inline because both functions are private to the
+    //! module.
+    use super::{pre_copy_disconnect_cause, pre_copy_disconnect_direction};
+    use crate::plugins::{Direction, DisconnectCause};
+    use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+    use crate::retry::ErrorClass;
+
+    fn err(kind: StreamSetupKind) -> anyhow::Error {
+        StreamSetupError::new(kind, "test detail").into()
+    }
+
+    #[test]
+    fn typed_frontend_tls_maps_to_recv_error_and_client_direction() {
+        let e = err(StreamSetupKind::FrontendTlsHandshake);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::TlsError),
+            DisconnectCause::RecvError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::TlsError),
+            Direction::ClientToBackend
+        );
+    }
+
+    #[test]
+    fn typed_backend_tls_maps_to_backend_error_and_backend_direction() {
+        let e = err(StreamSetupKind::BackendTlsHandshake);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::TlsError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::TlsError),
+            Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn typed_no_healthy_targets_maps_to_backend_error_and_backend_direction() {
+        let e = err(StreamSetupKind::NoHealthyTargets);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::RequestError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
+            Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn typed_plugin_reject_maps_to_recv_error_and_client_direction() {
+        let e = err(StreamSetupKind::RejectedByPlugin);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::RequestError),
+            DisconnectCause::RecvError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
+            Direction::ClientToBackend
+        );
+    }
+
+    #[test]
+    fn typed_kind_takes_precedence_over_misleading_error_class() {
+        // Adversarial: RejectedByPlugin (client-side) classified as
+        // ConnectionTimeout (which the class-fallback would call backend).
+        // The typed kind must win.
+        let e = err(StreamSetupKind::RejectedByPlugin);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::ConnectionTimeout),
+            DisconnectCause::RecvError,
+            "typed kind must override class-based inference"
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::ConnectionTimeout),
+            Direction::ClientToBackend
+        );
+    }
+
+    #[test]
+    fn untyped_dns_lookup_falls_back_to_backend_via_class() {
+        // No StreamSetupError in the chain — class fallback drives the
+        // mapping. DNS failures attribute to the backend half.
+        let e: anyhow::Error = anyhow::anyhow!("nxdomain");
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::DnsLookupError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::DnsLookupError),
+            Direction::BackendToClient
+        );
     }
 }

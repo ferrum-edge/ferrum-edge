@@ -425,7 +425,7 @@ async fn test_logging_transaction_summary_on_proxied_request() {
             .contains("/log-test/hello")
     );
     assert_eq!(get_log["response_status_code"].as_u64().unwrap(), 200);
-    assert_eq!(get_log["matched_proxy_id"].as_str().unwrap(), proxy_id);
+    assert_eq!(get_log["proxy_id"].as_str().unwrap(), proxy_id);
     assert!(get_log["client_ip"].as_str().is_some());
     assert!(get_log["timestamp_received"].as_str().is_some());
 

@@ -185,7 +185,7 @@ impl LokiLogging {
     fn build_http_labels(&self, summary: &TransactionSummary) -> BTreeMap<String, String> {
         let mut labels = self.label_config.static_labels.clone();
         if self.label_config.include_proxy_id
-            && let Some(ref proxy_id) = summary.matched_proxy_id
+            && let Some(ref proxy_id) = summary.proxy_id
         {
             labels.insert("proxy_id".to_string(), proxy_id.clone());
         }
@@ -421,7 +421,7 @@ mod tests {
             client_ip: "10.0.0.1".to_string(),
             http_method: "GET".to_string(),
             request_path: "/t".to_string(),
-            matched_proxy_id: proxy_id.map(str::to_owned),
+            proxy_id: proxy_id.map(str::to_owned),
             response_status_code: status,
             latency_total_ms: 1.0,
             latency_gateway_processing_ms: 1.0,
@@ -429,8 +429,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn label_legacy_key_controls_proxy_id_label() {
+    // `LokiLogging::new` spawns a `BatchingLogger` flush task via
+    // `tokio::spawn`, which panics under plain `#[test]` because no Tokio
+    // reactor is running. The test bodies themselves are synchronous (no
+    // awaits) but need to execute inside a tokio runtime so `tokio::spawn`
+    // can register the flush task — `#[tokio::test]` provides that runtime.
+    #[tokio::test]
+    async fn label_legacy_key_controls_proxy_id_label() {
         // Backward compat: `include_listen_path_label` (old name) must still
         // suppress the `proxy_id` label when callers explicitly set it false.
         let plugin = LokiLogging::new(
@@ -448,8 +453,8 @@ mod tests {
         assert!(!labels.contains_key("status_class"));
     }
 
-    #[test]
-    fn label_new_key_takes_precedence_over_legacy() {
+    #[tokio::test]
+    async fn label_new_key_takes_precedence_over_legacy() {
         // When both keys are set with opposing values, the new
         // `include_proxy_id_label` wins.
         let plugin = LokiLogging::new(
@@ -466,8 +471,8 @@ mod tests {
         assert_eq!(labels.get("proxy_id").map(String::as_str), Some("p-2"));
     }
 
-    #[test]
-    fn label_default_includes_proxy_id() {
+    #[tokio::test]
+    async fn label_default_includes_proxy_id() {
         let plugin = LokiLogging::new(
             &json!({ "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push" }),
             client(),

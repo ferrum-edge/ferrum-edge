@@ -185,9 +185,9 @@ fn format_http_metrics(
     let status = summary.response_status_code;
     let status_class = format!("{}xx", status / 100);
     let proxy_raw = summary
-        .matched_proxy_name
+        .proxy_name
         .as_deref()
-        .or(summary.matched_proxy_id.as_deref())
+        .or(summary.proxy_id.as_deref())
         .unwrap_or("none");
     let proxy_tag = sanitize_tag_value(proxy_raw);
 

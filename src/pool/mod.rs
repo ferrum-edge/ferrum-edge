@@ -445,10 +445,14 @@ mod tests {
                 tokio::time::sleep(self.create_delay).await;
             }
             self.attempts.fetch_add(1, Ordering::Relaxed);
+            // `Bool::then` is lazy — `remaining - 1` only evaluates when
+            // remaining > 0. The `.then_some(remaining - 1)` form was eager
+            // and overflowed when fetch_update was retried after a CAS race
+            // observed `remaining == 0`.
             if self
                 .fail_creates_remaining
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                    (remaining > 0).then_some(remaining - 1)
+                    (remaining > 0).then(|| remaining - 1)
                 })
                 .is_ok()
             {
@@ -459,10 +463,11 @@ mod tests {
         }
 
         fn is_healthy(&self, _conn: &Self::Connection) -> bool {
+            // Same lazy-vs-eager fix as `create()` above.
             if self
                 .unhealthy_checks_remaining
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                    (remaining > 0).then_some(remaining - 1)
+                    (remaining > 0).then(|| remaining - 1)
                 })
                 .is_ok()
             {

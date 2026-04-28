@@ -1515,14 +1515,19 @@ where
             // `cargo check` against the new variant; the surrounding
             // tests in `tests/unit/gateway_core/grpc_*` will catch a
             // misclassification mismatch.
-            let is_connection_error = matches!(
-                &result,
-                Err(grpc_proxy::GrpcProxyError::BackendUnavailable(_))
-                    | Err(grpc_proxy::GrpcProxyError::BackendTimeout {
-                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
-                        ..
-                    })
-            );
+            // Narrow to the connect-class kinds — see the equivalent
+            // matcher in `proxy/mod.rs` for the rationale (post-wire
+            // BackendRequest must NOT bypass retry_on_methods).
+            let is_connection_error = match &result {
+                Err(grpc_proxy::GrpcProxyError::BackendUnavailable { kind, .. }) => {
+                    kind.is_connect_class()
+                }
+                Err(grpc_proxy::GrpcProxyError::BackendTimeout {
+                    kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                    ..
+                }) => true,
+                _ => false,
+            };
             if !is_connection_error
                 || !retry_config.retry_on_connect_failure
                 || attempt >= retry_config.max_retries
@@ -1871,15 +1876,25 @@ where
                 grpc_proxy::GrpcProxyError::Internal(_) => {
                     (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
                 }
-                grpc_proxy::GrpcProxyError::BackendUnavailable(_) => {
+                grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                     (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                 }
             };
+            // Derive `connection_error` from the unified
+            // `request_reached_wire` boundary instead of hard-coding `true`.
+            // Hard-coding it tripped the circuit breaker / passive-health
+            // counter as a connect-class failure for post-wire errors
+            // (BackendRequest now `ConnectionReset`, read timeouts,
+            // ResourceExhausted/Internal where the request bytes already
+            // crossed the wire). Mirrors the H1/H2 gRPC path so a single
+            // predicate governs `connection_error` everywhere.
+            let connection_error = !crate::retry::request_reached_wire(error_class);
             warn!(
                 proxy_id = %proxy.id,
                 error = %err,
                 class = ?error_class,
                 grpc_status = grpc_status_code,
+                connection_error,
                 "cross-protocol H3→gRPC backend call failed"
             );
             record_backend_outcome(
@@ -1888,7 +1903,7 @@ where
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
                 502,
-                true,
+                connection_error,
                 backend_start.elapsed(),
             );
             let mut outcome = write_grpc_error(
@@ -1900,7 +1915,7 @@ where
             )
             .await?;
             outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
-            outcome.connection_error = true;
+            outcome.connection_error = connection_error;
             outcome.error_class = Some(error_class);
             outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
             Ok(outcome)
