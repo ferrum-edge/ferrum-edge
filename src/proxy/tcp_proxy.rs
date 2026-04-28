@@ -2692,6 +2692,21 @@ async fn bidirectional_splice(
     }
 }
 
+/// Propagate a clean EOF across a splice relay.
+///
+/// `tokio::io::copy_bidirectional` half-closes the opposite write side when
+/// one read side reaches EOF. The splice path works with raw fds, so we must
+/// do that explicitly; otherwise request/response backends can wait forever
+/// for EOF and the connection task never reaches stream-disconnect hooks.
+#[cfg(target_os = "linux")]
+fn shutdown_write_fd(fd: i32) {
+    // Ignore errors: the peer may already have closed/reset the socket. This is
+    // best-effort half-close propagation, not an additional failure source.
+    unsafe {
+        libc::shutdown(fd, libc::SHUT_WR);
+    }
+}
+
 /// Splice-path equivalent of `drain_half_close_copy`. Separate function
 /// because the splice direction future's `Ok` branch returns `anyhow::Error`
 /// rather than `std::io::Error`, and the classifier takes the outer anyhow
@@ -3003,7 +3018,7 @@ fn io_uring_splice_direction(
     timeout_ms: u64,
     shared_activity: &AtomicU64,
 ) -> Result<u64, (StreamIoSide, anyhow::Error)> {
-    match crate::socket_opts::io_uring_splice::io_uring_splice_loop(
+    let result = match crate::socket_opts::io_uring_splice::io_uring_splice_loop(
         src_fd,
         pipe_w,
         pipe_r,
@@ -3034,7 +3049,13 @@ fn io_uring_splice_direction(
                 Err((side, anyhow::anyhow!("io_uring splice error: {}", e.source)))
             }
         }
+    };
+
+    if result.is_ok() {
+        shutdown_write_fd(dst_fd);
     }
+
+    result
 }
 
 /// Fallback libc::splice loop for when io_uring ring creation fails.
@@ -3100,6 +3121,7 @@ fn libc_splice_loop(
                         shared_activity.store(coarse_now_ms(), Ordering::Relaxed);
                     }
                 } else if written == 0 {
+                    shutdown_write_fd(dst_fd);
                     return Ok(total);
                 } else {
                     let err = std::io::Error::last_os_error();
@@ -3132,6 +3154,7 @@ fn libc_splice_loop(
                 }
             }
         } else if n == 0 {
+            shutdown_write_fd(dst_fd);
             return Ok(total);
         } else {
             let err = std::io::Error::last_os_error();
@@ -3237,6 +3260,7 @@ async fn splice_one_direction_no_guard(
                     remaining -= written as usize;
                     bytes.fetch_add(written as u64, Ordering::Relaxed);
                 } else if written == 0 {
+                    shutdown_write_fd(dst_fd);
                     return Ok(());
                 } else {
                     let err = std::io::Error::last_os_error();
@@ -3255,6 +3279,7 @@ async fn splice_one_direction_no_guard(
             }
         } else if n == 0 {
             // EOF — source closed
+            shutdown_write_fd(dst_fd);
             return Ok(());
         } else {
             let err = std::io::Error::last_os_error();
