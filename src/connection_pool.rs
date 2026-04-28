@@ -217,6 +217,15 @@ impl ConnectionPool {
     }
 
     /// Expose the pool key for warmup deduplication.
+    ///
+    /// `warmup_connection_pools` composes this with the per-target
+    /// `host:port` to dedup reqwest HEAD warmup tasks. Including the
+    /// pool key (which carries the TLS-aware client identity:
+    /// `{dest}|{proto}|{dns_override}|{ca}|{mtls_cert}|{verify}`) in
+    /// the dedup means proxies that share `(scheme, host, port)` but
+    /// have divergent TLS configs each get their own warmup task —
+    /// matching the fact that they end up with separate
+    /// `reqwest::Client`s at runtime.
     pub fn pool_key_for_warmup(&self, proxy: &Proxy) -> String {
         self.pool.manager().pool_key_owned(proxy)
     }
