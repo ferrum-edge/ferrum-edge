@@ -416,10 +416,20 @@ async fn run_warmup_task_batch(
             let failed = failed.clone();
             let semaphore = semaphore.clone();
             async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .expect("warmup semaphore not closed");
+                // The semaphore is owned by `warmup_connection_pools` and
+                // not closed during normal operation, but the codebase
+                // rule (`No .unwrap()/.expect() in production`) prefers
+                // explicit Err handling. Skip the task and count it as
+                // failed if the semaphore ever does close — startup must
+                // not panic.
+                let _permit = match semaphore.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        warn!("Pool warmup: semaphore closed before acquire ({e}); skipping task");
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                };
                 match task.await {
                     Ok(desc) => {
                         debug!("Pool warmup: {} ok", desc);
@@ -1750,10 +1760,22 @@ impl ProxyState {
                 let h2c_supported = h2c_supported.clone();
                 let semaphore = semaphore.clone();
                 async move {
-                    let _permit = semaphore
-                        .acquire_owned()
-                        .await
-                        .expect("warmup semaphore not closed");
+                    // Same rule as `run_warmup_task_batch`: prefer
+                    // explicit Err handling over `.expect()` so a
+                    // future refactor that closes the semaphore can't
+                    // panic the startup path. Skip the probe — the next
+                    // periodic refresh will pick it up.
+                    let _permit = match semaphore.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            warn!(
+                                "Backend capability refresh: semaphore closed before acquire ({e}); skipping target {}:{}",
+                                target.host(),
+                                target.port()
+                            );
+                            return;
+                        }
+                    };
                     let record = state.probe_backend_capabilities(&target).await;
                     if record.plain_http.h2_tls.is_supported() {
                         h2_supported.fetch_add(1, Ordering::Relaxed);
@@ -1876,12 +1898,31 @@ impl ProxyState {
     ///    via `tokio::join!` — both batches share `for_each_concurrent`
     ///    parallelism but the wall-clock costs no longer stack.
     ///
-    /// 2. **HTTPS reqwest warmup with capability gating.** After the
-    ///    refresh has populated the registry, HTTPS targets that classified
-    ///    as `plain_http.h2_tls = Supported` skip the reqwest HEAD entirely
-    ///    — the direct H2 pool already covers all client types (H1/H2/H3
-    ///    frontends → H2/TLS backend), so the reqwest pool is purely
-    ///    fallback. If H2/TLS silently downgrades at runtime (handled by
+    /// 2. **HTTPS reqwest warmup with capability + needs-reqwest +
+    ///    H3-frontend gating.** After the refresh has populated the
+    ///    registry, an HTTPS target's reqwest HEAD is skipped iff ALL
+    ///    three guards pass; if any fails we warm reqwest. The guards:
+    ///
+    ///    **(1) Capability**: registry classifies the target
+    ///    `plain_http.h2_tls = Supported`, so the direct H2 pool can
+    ///    talk to it for H1/H2 frontend traffic.
+    ///
+    ///    **(2) Needs-reqwest**: no proxy routing to the target has a
+    ///    configuration that forces reqwest dispatch — i.e.
+    ///    `requires_reqwest_warmup` is `false` after OR-merging across
+    ///    every sharing proxy. See `proxy_config_forces_reqwest_dispatch`
+    ///    for the guard set: `pool_enable_http2`, retain-request-body
+    ///    retries, request-body-buffering plugins.
+    ///
+    ///    **(3) H3 frontend disabled** (`env_config.enable_http3 == false`):
+    ///    the `http3::cross_protocol::run` bridge sends ALL non-native-H3
+    ///    backend traffic from H3 frontend clients through reqwest (gRPC
+    ///    over H3 always; Plain over H3 when backend `h3=Unsupported`),
+    ///    regardless of what the direct H2 pool would do for the same
+    ///    request from an H1/H2 frontend client. With H3 enabled we
+    ///    conservatively warm reqwest for every HTTPS target.
+    ///
+    ///    If H2/TLS silently downgrades at runtime (handled by
     ///    `mark_h2_tls_unsupported`), the first fallback request pays a
     ///    cold connect — acceptable recovery cost vs. paying a redundant
     ///    TLS handshake at startup for every H2/TLS-capable target.
