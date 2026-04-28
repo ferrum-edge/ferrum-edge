@@ -488,10 +488,8 @@ async fn connected_tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) 
 /// With the fix, clean EOF on one side transitions to an unbounded wait on
 /// the other (still bounded by the overall idle timeout).
 ///
-/// Note: this test does not rely on half-close FIN propagation across the
-/// proxy (which `splice_one_direction_no_guard` does not do — unlike the
-/// `copy_one_direction` path, which calls `writer.shutdown()` on EOF). The
-/// backend reads a fixed request length, then starts its response delay.
+/// The backend reads a fixed request length, then starts its response delay.
+/// The sibling test below pins the explicit EOF propagation contract.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_bidirectional_splice_half_close_delayed_response_not_truncated() {
@@ -557,6 +555,95 @@ async fn test_bidirectional_splice_half_close_delayed_response_not_truncated() {
         result.bytes_backend_to_client, response_len
     );
     assert_eq!(result.bytes_client_to_backend, request.len() as u64);
+}
+
+/// Regression: splice must propagate a clean read EOF as a write-side
+/// half-close to the opposite socket. Without this, backends that read until
+/// EOF before responding never see the client's half-close, so the connection
+/// task can stall and stream-disconnect hooks never run.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_bidirectional_splice_client_eof_half_closes_backend_write_side() {
+    use ferrum_edge::_test_support::bidirectional_splice_for_test;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (proxy_client_side, mut external_client) = connected_tcp_pair().await;
+    let (proxy_backend_side, mut external_backend) = connected_tcp_pair().await;
+
+    let request = b"REQUEST-EOF";
+    let response = b"EOF-OBSERVED".to_vec();
+    let expected_response = response.clone();
+
+    let client_task = tokio::spawn(async move {
+        external_client.write_all(request).await?;
+        external_client.shutdown().await?;
+
+        let mut received = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            external_client.read_to_end(&mut received),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "client read timed out"))??;
+        Ok::<_, io::Error>(received)
+    });
+
+    let backend_task = tokio::spawn(async move {
+        let mut received = Vec::new();
+        let saw_eof = match tokio::time::timeout(
+            Duration::from_secs(2),
+            external_backend.read_to_end(&mut received),
+        )
+        .await
+        {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => false,
+        };
+
+        if saw_eof {
+            external_backend.write_all(&response).await?;
+            external_backend.shutdown().await?;
+        }
+
+        Ok::<_, io::Error>((saw_eof, received))
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(6),
+        bidirectional_splice_for_test(
+            proxy_client_side,
+            proxy_backend_side,
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
+            64 * 1024,
+        ),
+    )
+    .await
+    .expect("splice relay should complete after backend observes EOF");
+
+    let (backend_saw_eof, backend_received) = backend_task.await.unwrap().unwrap();
+    assert!(
+        backend_saw_eof,
+        "backend must observe EOF from the splice relay after client half-closes"
+    );
+    assert_eq!(backend_received, request);
+
+    let client_received = client_task.await.unwrap().unwrap();
+    assert_eq!(
+        client_received, expected_response,
+        "client must still receive backend response after propagated half-close"
+    );
+    assert!(
+        result.first_failure.is_none(),
+        "clean half-close relay should complete without first_failure, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(result.bytes_client_to_backend, request.len() as u64);
+    assert_eq!(
+        result.bytes_backend_to_client,
+        expected_response.len() as u64
+    );
 }
 
 /// Verify the idle-timeout fallback still fires on the splice path during the

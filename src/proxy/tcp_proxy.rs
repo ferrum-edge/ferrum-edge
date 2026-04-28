@@ -3121,6 +3121,10 @@ fn libc_splice_loop(
                         shared_activity.store(coarse_now_ms(), Ordering::Relaxed);
                     }
                 } else if written == 0 {
+                    // A zero-byte pipe -> destination splice is a clean
+                    // terminal write-side condition. We are returning Ok
+                    // and ending this relay direction, so mirror the read-EOF
+                    // path and propagate a best-effort half-close.
                     shutdown_write_fd(dst_fd);
                     return Ok(total);
                 } else {
@@ -3260,6 +3264,9 @@ async fn splice_one_direction_no_guard(
                     remaining -= written as usize;
                     bytes.fetch_add(written as u64, Ordering::Relaxed);
                 } else if written == 0 {
+                    // See the synchronous libc fallback above: a clean
+                    // terminal write-side condition should still propagate
+                    // the relay half-close before this direction exits Ok.
                     shutdown_write_fd(dst_fd);
                     return Ok(());
                 } else {
