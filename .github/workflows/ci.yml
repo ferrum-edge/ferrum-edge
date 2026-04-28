@@ -65,7 +65,7 @@ jobs:
           toolchain: stable
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
         continue-on-error: true
 
       - name: Configure sccache
@@ -140,7 +140,7 @@ jobs:
           components: clippy
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
         continue-on-error: true
 
       - name: Configure sccache
@@ -181,7 +181,7 @@ jobs:
           toolchain: stable
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
         continue-on-error: true
 
       - name: Configure sccache
@@ -342,7 +342,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
         continue-on-error: true
 
       - name: Configure sccache
