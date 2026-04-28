@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use bytes::{Buf, Bytes};
+
 /// Default value for the H3 response streaming coalesce-buffer initial capacity
 /// and MIN upper bound (when `FERRUM_HTTP3_COALESCE_MAX_BYTES` is unset).
 /// See `FERRUM_HTTP3_COALESCE_MAX_BYTES` for runtime tuning.
@@ -30,6 +32,29 @@ pub const QUIC_INITIAL_MTU_MIN: u16 = 1200;
 /// QUIC maximum initial MTU (per quinn — limited by the 16-bit varint space
 /// after accounting for UDP/IP headers).
 pub const QUIC_INITIAL_MTU_MAX: u16 = 65527;
+
+/// Return true when an H3 response DATA chunk is already large enough to send
+/// directly instead of copying it into the coalescing buffer first.
+pub(crate) fn should_direct_send_response_chunk(
+    buffered_bytes: usize,
+    chunk_bytes: usize,
+    coalesce_min_bytes: usize,
+) -> bool {
+    buffered_bytes == 0 && chunk_bytes >= coalesce_min_bytes
+}
+
+/// Copy the complete remaining H3 response DATA chunk into `Bytes`.
+///
+/// `recv_data()` returns `impl Buf`. h3-quinn yields contiguous `Bytes` today,
+/// but using `remaining()` + `copy_to_bytes()` keeps accounting and forwarding
+/// correct if a future implementation returns a chained/non-contiguous buffer.
+pub(crate) fn copy_remaining_response_chunk<B>(chunk: &mut B) -> Bytes
+where
+    B: Buf,
+{
+    let chunk_len = chunk.remaining();
+    chunk.copy_to_bytes(chunk_len)
+}
 
 /// HTTP/3 server configuration
 #[derive(Debug, Clone)]
@@ -95,5 +120,30 @@ impl Default for Http3ServerConfig {
             send_window: 8_388_608,           // 8 MiB
             initial_mtu: 1500,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::{Buf, Bytes};
+
+    use super::{copy_remaining_response_chunk, should_direct_send_response_chunk};
+
+    #[test]
+    fn direct_send_requires_empty_buffer_and_large_chunk() {
+        assert!(should_direct_send_response_chunk(0, 32_768, 32_768));
+        assert!(should_direct_send_response_chunk(0, 65_536, 32_768));
+        assert!(!should_direct_send_response_chunk(1, 65_536, 32_768));
+        assert!(!should_direct_send_response_chunk(0, 32_767, 32_768));
+    }
+
+    #[test]
+    fn copy_remaining_response_chunk_handles_non_contiguous_bufs() {
+        let mut chunk = Bytes::from_static(b"hello, ").chain(Bytes::from_static(b"h3"));
+
+        let copied = copy_remaining_response_chunk(&mut chunk);
+
+        assert_eq!(&copied[..], b"hello, h3");
+        assert!(!chunk.has_remaining());
     }
 }

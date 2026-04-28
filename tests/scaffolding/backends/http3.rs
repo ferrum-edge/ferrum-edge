@@ -82,8 +82,8 @@ pub enum H3Step {
     /// end the script.
     SendStreamReset(u64),
     /// Send an H3 GOAWAY with the given max-stream-id, then end the
-    /// script. Translated into a client-visible "protocol error" by the
-    /// gateway's `classify_h3_error`.
+    /// script. GOAWAY / H3_NO_ERROR is a graceful shutdown signal; use
+    /// `SendStreamReset` or `CloseConnectionWithCode` for downgrade tests.
     SendGoaway(u64),
     /// Pause for `duration` without sending anything. Use to trigger
     /// `backend_read_timeout_ms`-style watchdogs.

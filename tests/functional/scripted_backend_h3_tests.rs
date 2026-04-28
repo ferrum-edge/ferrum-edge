@@ -372,13 +372,13 @@ async fn h3_backend_connection_close_mid_request_downgrades_capability() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Test 3 — Backend GOAWAY mid-request returns `(connection_error=false,
-// ProtocolError)` from classify_h3_error; downgrade must still fire.
+// Test 3 — Backend non-graceful close mid-request returns
+// `(connection_error=false, transport error class)`; downgrade must still fire.
 // Regression test for the Codex P2 fix on the capability-registry PR.
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn h3_protocol_error_downgrades_via_connection_error_false_path() {
+async fn h3_non_graceful_close_downgrades_via_connection_error_false_path() {
     let ca = TestCa::new("phase3-t3").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
@@ -401,13 +401,16 @@ async fn h3_protocol_error_downgrades_via_connection_error_false_path() {
     .spawn()
     .expect("spawn tls");
 
-    // H3 side: accept handshake + stream, then send GOAWAY. This
-    // translates to a ProtocolError class with connection_error=false —
-    // exactly the code path the Codex P2 fix was for.
+    // H3 side: accept handshake + stream, then close the connection with
+    // a non-graceful H3 application code. The request has reached the
+    // wire (`connection_error=false`), but the error class is still a
+    // transport-class H3 failure, so the cached H3 capability must be
+    // downgraded. Do not use GOAWAY / H3_NO_ERROR here: that is now
+    // intentionally treated as graceful and must not downgrade the cache.
     let _h3_backend =
         ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
             .step(H3Step::AcceptStream)
-            .step(H3Step::SendGoaway(0))
+            .step(H3Step::CloseConnectionWithCode(0x10c))
             .spawn()
             .expect("spawn h3");
 
@@ -421,23 +424,24 @@ async fn h3_protocol_error_downgrades_via_connection_error_false_path() {
     assert_eq!(
         pre["plain_http"]["h3"].as_str(),
         Some("supported"),
-        "expected h3=supported before GOAWAY; entry: {pre:#?}"
+        "expected h3=supported before non-graceful close; entry: {pre:#?}"
     );
 
-    // First request: GOAWAY-classified error.
+    // First request: non-graceful H3 close.
     let first = h3_get(&harness, "/api/t3").await;
     match first {
         Ok(resp) => {
             assert_eq!(
                 resp.status.as_u16(),
                 502,
-                "first H3 request should 502 after GOAWAY"
+                "first H3 request should 502 after non-graceful close"
             );
         }
         Err(e) => {
             let msg = e.to_string().to_lowercase();
             assert!(
-                msg.contains("goaway")
+                msg.contains("reset")
+                    || msg.contains("goaway")
                     || msg.contains("protocol")
                     || msg.contains("close")
                     || msg.contains("h3")
@@ -457,7 +461,7 @@ async fn h3_protocol_error_downgrades_via_connection_error_false_path() {
     assert_eq!(
         post["plain_http"]["h3"].as_str(),
         Some("unsupported"),
-        "expected h3=unsupported after GOAWAY; entry: {post:#?}\n--- gateway logs ---\n{logs}"
+        "expected h3=unsupported after non-graceful close; entry: {post:#?}\n--- gateway logs ---\n{logs}"
     );
 }
 

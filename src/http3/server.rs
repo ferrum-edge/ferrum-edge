@@ -1585,13 +1585,13 @@ async fn handle_h3_request(
             tokio::select! {
                 chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
                     match chunk_result {
-                        Ok(Some(chunk)) => {
-                            let chunk_bytes = chunk.chunk();
+                        Ok(Some(mut chunk)) => {
+                            let chunk_len = chunk.remaining();
                             // Always count received bytes — the graceful-close
                             // recovery below uses this to decide if the body is
                             // semantically complete, even when the body-size
                             // limit is disabled (FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0).
-                            total_streamed += chunk_bytes.len();
+                            total_streamed += chunk_len;
                             if state.max_response_body_size_bytes > 0
                                 && total_streamed > state.max_response_body_size_bytes
                             {
@@ -1603,7 +1603,26 @@ async fn handle_h3_request(
                                 body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                                 break 'outer;
                             }
-                            coalesce_buf.extend_from_slice(chunk_bytes);
+                            if crate::http3::config::should_direct_send_response_chunk(
+                                coalesce_buf.len(),
+                                chunk_len,
+                                coalesce_min_bytes,
+                            ) {
+                                let data =
+                                    crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                                if stream.send_data(data).await.is_err() {
+                                    client_disconnected = true;
+                                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                                    break 'outer;
+                                }
+                                bytes_streamed += chunk_len as u64;
+                                flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
+                                continue;
+                            }
+
+                            let chunk_bytes =
+                                crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                            coalesce_buf.extend_from_slice(&chunk_bytes);
                             if coalesce_buf.len() >= coalesce_min_bytes {
                                 let data = coalesce_buf.split().freeze();
                                 let data_len = data.len() as u64;
@@ -2787,13 +2806,13 @@ async fn proxy_to_backend_h3_streaming(
         tokio::select! {
             chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
                 match chunk_result {
-                    Ok(Some(chunk)) => {
-                        let chunk_bytes = chunk.chunk();
+                    Ok(Some(mut chunk)) => {
+                        let chunk_len = chunk.remaining();
                         // Always count received bytes — the graceful-close
                         // recovery below uses this to decide if the body is
                         // semantically complete, even when the body-size
                         // limit is disabled (FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0).
-                        total_streamed += chunk_bytes.len();
+                        total_streamed += chunk_len;
                         if state.max_response_body_size_bytes > 0
                             && total_streamed > state.max_response_body_size_bytes
                         {
@@ -2807,7 +2826,26 @@ async fn proxy_to_backend_h3_streaming(
                             break 'outer;
                         }
 
-                        coalesce_buf.extend_from_slice(chunk_bytes);
+                        if crate::http3::config::should_direct_send_response_chunk(
+                            coalesce_buf.len(),
+                            chunk_len,
+                            coalesce_min_bytes,
+                        ) {
+                            let data =
+                                crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                            if h3_stream.send_data(data).await.is_err() {
+                                client_disconnected = true;
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                                break 'outer;
+                            }
+                            bytes_streamed += chunk_len as u64;
+                            flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
+                            continue;
+                        }
+
+                        let chunk_bytes =
+                            crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                        coalesce_buf.extend_from_slice(&chunk_bytes);
 
                         if coalesce_buf.len() >= coalesce_min_bytes {
                             let data = coalesce_buf.split().freeze();

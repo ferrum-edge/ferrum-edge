@@ -1976,6 +1976,24 @@ where
                                 break 'outer;
                             }
                         }
+                        let chunk_len = chunk.len();
+                        if crate::http3::config::should_direct_send_response_chunk(
+                            coalesce_buf.len(),
+                            chunk_len,
+                            coalesce.min_bytes,
+                        ) {
+                            if stream.send_data(chunk).await.is_err() {
+                                client_disconnected = true;
+                                body_error_class = Some(ErrorClass::ClientDisconnect);
+                                break 'outer;
+                            }
+                            bytes_streamed += chunk_len as u64;
+                            flush_timer
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + coalesce.flush_interval);
+                            continue;
+                        }
+
                         coalesce_buf.extend_from_slice(&chunk);
                         if coalesce_buf.len() >= coalesce.min_bytes {
                             let data = coalesce_buf.split().freeze();
@@ -2098,6 +2116,24 @@ where
                                     break 'outer;
                                 }
                             }
+                            let data_len = data.len();
+                            if crate::http3::config::should_direct_send_response_chunk(
+                                coalesce_buf.len(),
+                                data_len,
+                                coalesce.min_bytes,
+                            ) {
+                                if stream.send_data(data).await.is_err() {
+                                    client_disconnected = true;
+                                    body_error_class = Some(ErrorClass::ClientDisconnect);
+                                    break 'outer;
+                                }
+                                bytes_streamed += data_len as u64;
+                                flush_timer
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + coalesce.flush_interval);
+                                continue;
+                            }
+
                             coalesce_buf.extend_from_slice(&data);
                             if coalesce_buf.len() >= coalesce.min_bytes {
                                 let out = coalesce_buf.split().freeze();

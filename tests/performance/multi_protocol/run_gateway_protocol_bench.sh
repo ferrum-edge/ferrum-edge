@@ -247,7 +247,12 @@ start_ferrum() {
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()
     case "$PROTOCOL" in
-        http3) extra_env+=(-e "FERRUM_ENABLE_HTTP3=true") ;;
+        http3)
+            extra_env+=(
+                -e "FERRUM_ENABLE_HTTP3=true"
+                -e "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND=8"
+            )
+            ;;
     esac
     # Optional extra env var injection for per-experiment tuning. Set
     # FERRUM_EXTRA_ENV to a space-separated list of KEY=VALUE pairs, e.g.:
