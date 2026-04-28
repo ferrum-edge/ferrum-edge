@@ -83,6 +83,8 @@ tags:
     description: CP/DP cluster status and operational introspection
   - name: Backend Capabilities
     description: Inspect and force-refresh the per-backend-target protocol classification cache (H1/H2/H3/h2c/gRPC)
+  - name: API Specs
+    description: Submit, retrieve, replace, and delete OpenAPI/Swagger spec bundles that create proxy + upstream + plugin resources atomically
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
@@ -1448,6 +1450,550 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  # ── API Specs ────────────────────────────────────────────────────────
+  /api-specs:
+    get:
+      operationId: listApiSpecs
+      summary: List API spec metadata
+      description: |
+        Returns paginated summary records for all API specs in the namespace.
+        Spec content (the raw OpenAPI/Swagger document) is intentionally omitted
+        from list responses — use `GET /api-specs/{id}` to retrieve the full
+        document for a specific spec.
+
+        Defaults to 50 items per page, maximum 200. Default sort is
+        `updated_at DESC` (most recently updated first). Use `sort_by` and
+        `order` to change ordering. Use `offset` to page through results.
+
+        Supports the following optional filters: `proxy_id`, `spec_version`
+        (prefix match), `title_contains` (case-insensitive substring),
+        `updated_since` (ISO-8601 timestamp), and `has_tag` (exact tag name).
+
+        This endpoint is available in database and CP modes. It returns 503 in
+        DP and file modes where no database is present.
+      tags: [API Specs]
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of items to return (max 200).
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Number of items to skip.
+        - name: proxy_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Exact match on `proxy_id`. Returns only the spec that owns this proxy.
+        - name: spec_version
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Prefix match on `spec_version`. For example, `spec_version=3.1`
+            matches `3.1.0`, `3.1.1`, etc.
+        - name: title_contains
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Case-insensitive substring match on `title`.
+        - name: updated_since
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: |
+            Return only specs with `updated_at >= ?`. Accepts ISO-8601 /
+            RFC-3339 format (e.g. `2026-04-01T00:00:00Z`).
+        - name: has_tag
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Exact tag membership filter. Returns only specs whose `tags` array
+            contains this tag name.
+        - name: sort_by
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [updated_at, title, operation_count, created_at]
+            default: updated_at
+          description: |
+            Column to sort results by. Allowed values: `updated_at` (default),
+            `title`, `operation_count`, `created_at`. Any other value returns 400.
+        - name: order
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+          description: |
+            Sort direction. `desc` (default) = largest/newest first; `asc` =
+            smallest/oldest first. Any other value returns 400.
+        - name: X-Ferrum-Namespace
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Namespace to operate in. Defaults to `FERRUM_NAMESPACE` when omitted.
+      responses:
+        "200":
+          description: Paginated list of API spec summaries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiSpecListResponse"
+        "400":
+          description: |
+            Invalid query parameter — for example, an unknown `sort_by` value.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    post:
+      operationId: submitApiSpec
+      summary: Submit an OpenAPI/Swagger spec bundle
+      description: |
+        Parses an OpenAPI 2.0 (Swagger), 3.0.x, 3.1.x, or 3.2.x specification
+        document and atomically creates the embedded proxy, optional upstream,
+        and proxy-scoped plugins as a single transactional bundle.
+
+        The spec document must contain Ferrum extension fields at the root:
+
+        - **`x-ferrum-proxy`** (required) — a `Proxy` object that defines the
+          route, backend, and protocol settings. Fields follow the same schema
+          as `POST /proxies`.
+        - **`x-ferrum-upstream`** (optional) — an `Upstream` object. When
+          present, a new upstream load-balancer group is created and the proxy's
+          `upstream_id` is automatically linked to it.
+        - **`x-ferrum-plugins`** (optional) — an array of proxy-scoped
+          `PluginConfig` objects. All plugins must have `scope: proxy` (or
+          omit `scope`, which defaults to `proxy`). Global and proxy-group
+          scopes are rejected.
+
+        **Forbidden**: `x-ferrum-consumers` is rejected — use `POST /consumers`
+        separately. Plugin `config` values must not contain credential or
+        consumer fields (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`,
+        `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`).
+
+        **Content-Type detection**: `application/json` → JSON parser;
+        `application/yaml` / `application/x-yaml` / `text/yaml` → YAML parser;
+        other or missing Content-Type → autodetect by first non-whitespace byte
+        (`{` → JSON, else YAML).
+
+        **Body size limit**: controlled by `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB`
+        (default 25 MiB). Returns 413 when exceeded.
+
+        **Ownership**: all created resources are tagged with the new spec's ID
+        via `api_spec_id`. A `UNIQUE(namespace, proxy_id)` constraint prevents
+        more than one spec per proxy. Deleting the spec (`DELETE /api-specs/{id}`)
+        also deletes the proxy (and its plugins via FK cascade) and any
+        spec-owned upstream.
+
+        **Hot-path isolation**: specs are admin-only metadata. The gateway
+        runtime never reads `api_specs` rows; spec submission does not affect
+        in-flight request handling.
+
+        See [docs/api_specs.md](../docs/api_specs.md) for the full extension
+        contract, worked examples, and curl recipes.
+      tags: [API Specs]
+      parameters:
+        - name: X-Ferrum-Namespace
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Namespace to operate in. Defaults to `FERRUM_NAMESPACE` when omitted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: |
+                Raw OpenAPI or Swagger document in JSON format. Must contain
+                `x-ferrum-proxy` at the root. See description for the full
+                extension contract.
+            example:
+              openapi: "3.1.0"
+              info:
+                title: Orders API
+                version: "1.4.0"
+              x-ferrum-proxy:
+                id: orders-proxy
+                hosts: ["api.example.com"]
+                listen_path: /orders
+                backend_host: orders.internal
+                backend_port: 8080
+                backend_scheme: https
+          application/yaml:
+            schema:
+              type: string
+              description: |
+                Raw OpenAPI or Swagger document in YAML format. Must contain
+                `x-ferrum-proxy` at the root. Also accepted as
+                `application/x-yaml` or `text/yaml`.
+          application/x-yaml:
+            schema:
+              type: string
+          text/yaml:
+            schema:
+              type: string
+      responses:
+        "201":
+          description: Spec accepted; proxy, upstream, and plugins created
+          headers:
+            Location:
+              schema:
+                type: string
+              description: URL of the newly created spec (`/api-specs/{id}`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiSpecCreateResponse"
+        "400":
+          description: Spec could not be parsed (invalid JSON/YAML, unrecognised version, or forbidden extension)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiSpecParseError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "409":
+          description: A spec already exists for this proxy ID, or a resource name / listen_path conflicts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: Request body exceeds `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25 MiB)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: Spec parsed successfully but one or more extracted resources failed validation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiSpecValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api-specs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: API spec UUID returned by `POST /api-specs`
+
+    get:
+      operationId: getApiSpec
+      summary: Retrieve a spec by ID
+      description: |
+        Returns the raw spec document (decompressed from its gzip-compressed
+        storage). The response body is the original spec document in the format
+        that was submitted (JSON or YAML), subject to content negotiation via
+        the `Accept` header.
+
+        **Content negotiation**:
+        - `Accept: application/json` when the stored format is YAML → converts
+          to JSON before responding.
+        - `Accept: application/yaml` (or `application/x-yaml`/`text/yaml`) when
+          the stored format is JSON → converts to YAML before responding.
+        - `Accept: */*` or matching stored format → responds in stored format.
+
+        **Conditional GET** (`If-None-Match`): the response includes an `ETag`
+        header set to the SHA-256 hex content hash of the uncompressed spec.
+        Clients that send `If-None-Match: "<hash>"` receive `304 Not Modified`
+        when the spec is unchanged, saving bandwidth on polling integrations.
+
+        The spec content is served as-is — the gateway does not rewrite any
+        Ferrum extension fields in the response.
+      tags: [API Specs]
+      parameters:
+        - name: X-Ferrum-Namespace
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Namespace to operate in.
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+          description: ETag from a previous response. Returns 304 if the spec is unchanged.
+      responses:
+        "200":
+          description: Spec document
+          headers:
+            Content-Type:
+              schema:
+                type: string
+                enum: [application/json, application/yaml]
+            ETag:
+              schema:
+                type: string
+              description: Quoted SHA-256 hex hash of the uncompressed spec content
+            Cache-Control:
+              schema:
+                type: string
+                enum: ["no-store"]
+            X-Content-Type-Options:
+              schema:
+                type: string
+                enum: [nosniff]
+          content:
+            application/json:
+              schema:
+                type: object
+                description: The raw spec document (JSON format)
+            application/yaml:
+              schema:
+                type: string
+                description: The raw spec document (YAML format)
+        "304":
+          description: Spec unchanged — ETag matches `If-None-Match`
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    put:
+      operationId: replaceApiSpec
+      summary: Replace an existing spec bundle
+      description: |
+        Parses the new spec document and atomically replaces all resources that
+        were originally created by this spec (tagged with `api_spec_id = {id}`).
+
+        **Replacement semantics**: spec-owned resources (those with a matching
+        `api_spec_id`) are deleted and re-created from the new document.
+        Resources that were added to the same proxy via direct admin endpoints
+        (e.g., a plugin added with `POST /plugins/config`) have `api_spec_id =
+        null` and survive the replace unchanged.
+
+        The spec must reference the same proxy ID as the original submission.
+        Changing the proxy ID requires deleting the spec (`DELETE /api-specs/{id}`)
+        and submitting a new one (`POST /api-specs`).
+
+        **Idempotent PUT (resource-hash short-circuit)**: At submit time, the
+        gateway computes a SHA-256 hash over the serialised proxy, upstream, and
+        plugin definitions (the "resource bundle"). If a PUT supplies a bundle
+        that produces the same hash as the stored one — for example, when only
+        `info.description` or other doc-only fields changed — the proxy, upstream,
+        and plugin rows are left untouched. Their `updated_at` timestamps do NOT
+        advance, and the polling cycle / DP gRPC broadcast sees no delta.
+        The `api_specs` row is always updated (new `updated_at`, `content_hash`,
+        and any changed metadata fields). This makes PUT safe to run on every
+        CI/CD deploy cycle without causing unnecessary cache rebuilds.
+
+        `created_at` is preserved from the original spec; `updated_at` and
+        `content_hash` reflect the new document.
+
+        The request body, content negotiation, and validation rules are identical
+        to `POST /api-specs`.
+      tags: [API Specs]
+      parameters:
+        - name: X-Ferrum-Namespace
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Namespace to operate in.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: New OpenAPI or Swagger document in JSON format
+          application/yaml:
+            schema:
+              type: string
+              description: New OpenAPI or Swagger document in YAML format
+          application/x-yaml:
+            schema:
+              type: string
+          text/yaml:
+            schema:
+              type: string
+      responses:
+        "200":
+          description: Spec replaced; spec-owned resources recreated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiSpecCreateResponse"
+        "400":
+          description: New spec could not be parsed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiSpecParseError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: A resource name / listen_path in the new spec conflicts with an existing resource outside this bundle
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: Request body exceeds the configured size limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: New spec parsed but one or more resources failed validation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiSpecValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    delete:
+      operationId: deleteApiSpec
+      summary: Delete a spec and cascade its owned resources
+      description: |
+        Deletes the API spec and cascades the deletion to all resources it owns:
+
+        - **Proxy** (spec-owned, always present): deleted. Its proxy-scoped plugin
+          configs are deleted by the database FK cascade, including both spec-owned
+          plugins and any plugins added manually via `POST /plugins/config`.
+        - **Upstream** (spec-owned, if present): deleted. Upstreams that were
+          created manually outside the spec (`api_spec_id = null`) are not
+          affected.
+        - **Spec row**: deleted.
+
+        The proxy is also deleted when `DELETE /proxies/{id}` is called directly —
+        the database `ON DELETE CASCADE` constraint removes the spec row in that
+        case too.
+
+        Returns 204 on success, 404 if the spec does not exist.
+      tags: [API Specs]
+      parameters:
+        - name: X-Ferrum-Namespace
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Namespace to operate in.
+      responses:
+        "204":
+          description: Spec and spec-owned resources deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api-specs/by-proxy/{proxy_id}:
+    parameters:
+      - name: proxy_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Proxy ID to look up
+
+    get:
+      operationId: getApiSpecByProxy
+      summary: Retrieve the spec for a given proxy
+      description: |
+        Looks up the API spec that owns the given proxy ID and returns its
+        raw document with the same content-negotiation and conditional-GET
+        (`ETag`/`If-None-Match`) semantics as `GET /api-specs/{id}`.
+
+        Since the `(namespace, proxy_id)` pair is unique, this endpoint
+        returns a single spec or 404 when no spec exists for the proxy.
+
+        Useful when the proxy ID is known (e.g., from a CI/CD pipeline
+        that created the proxy) but the spec UUID is not stored.
+      tags: [API Specs]
+      parameters:
+        - name: X-Ferrum-Namespace
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Namespace to operate in.
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+          description: ETag from a previous response. Returns 304 if the spec is unchanged.
+      responses:
+        "200":
+          description: Spec document for the given proxy
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Quoted SHA-256 hex content hash
+            Cache-Control:
+              schema:
+                type: string
+                enum: ["no-store"]
+          content:
+            application/json:
+              schema:
+                type: object
+                description: The raw spec document (JSON format)
+            application/yaml:
+              schema:
+                type: string
+                description: The raw spec document (YAML format)
+        "304":
+          description: Spec unchanged — ETag matches `If-None-Match`
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
 # ════════════════════════════════════════════════════════════════════════
 components:
   # ── Security ────────────────────────────────────────────────────────
@@ -1945,6 +2491,15 @@ components:
             - `buffer`: Always buffers the full response body before running
               after-proxy plugins, even if no plugin requires it. Use this when you
               need to guarantee the complete body is available for inspection.
+        api_spec_id:
+          type: [string, "null"]
+          description: |
+            ID of the `ApiSpec` that created this proxy via the spec-import admin
+            API (`POST /api-specs`). `null` for proxies created via direct admin
+            endpoints (`POST /proxies`). When set, the proxy participates in
+            spec-level ownership: `PUT /api-specs/{id}` replaces this proxy as part
+            of the bundle, and `DELETE /api-specs/{id}` deletes this proxy (and
+            its plugins via FK cascade).
         created_at:
           type: [string, "null"]
           format: date-time
@@ -2283,6 +2838,13 @@ components:
             multiple instances of the same plugin type are attached to a proxy
             (e.g., two http_logging instances shipping to Splunk and Datadog).
             When null (default), the plugin uses its built-in priority.
+        api_spec_id:
+          type: [string, "null"]
+          description: |
+            ID of the `ApiSpec` that created this plugin via the spec-import admin
+            API (`POST /api-specs`). `null` for plugins created via direct admin
+            endpoints (`POST /plugins/config`). When set, `PUT /api-specs/{id}`
+            replaces this plugin as part of the bundle.
         created_at:
           type: [string, "null"]
           format: date-time
@@ -2688,6 +3250,13 @@ components:
             Path to a PEM CA bundle used as the sole trust anchor when
             verifying backend server certificates for this upstream. When
             set, the system/webpki trust store is NOT used (CA exclusivity).
+        api_spec_id:
+          type: [string, "null"]
+          description: |
+            ID of the `ApiSpec` that created this upstream via the spec-import admin
+            API (`POST /api-specs`). `null` for upstreams created via direct admin
+            endpoints (`POST /upstreams`). When set, `DELETE /api-specs/{id}` also
+            deletes this upstream; `PUT /api-specs/{id}` replaces it.
         created_at:
           type: [string, "null"]
           format: date-time
@@ -6322,3 +6891,209 @@ components:
           description: Every registry entry keyed by backend-target identity.
           items:
             $ref: "#/components/schemas/BackendCapabilityEntry"
+
+    # ── API Specs ─────────────────────────────────────────────────────
+    ApiSpecSummary:
+      type: object
+      description: |
+        Summary record for a single API spec. Returned by `GET /api-specs`.
+        The raw spec content (the OpenAPI/Swagger document) is intentionally
+        omitted — use `GET /api-specs/{id}` to retrieve the full document.
+      properties:
+        id:
+          type: string
+          description: UUID of the spec
+        proxy_id:
+          type: string
+          description: ID of the proxy owned by this spec
+        namespace:
+          type: string
+          description: Namespace in which this spec and its resources live
+        spec_version:
+          type: string
+          description: OpenAPI/Swagger version string detected from the document
+          example: "3.1.0"
+        spec_format:
+          type: string
+          enum: [json, yaml]
+          description: Format in which the spec was submitted and is stored
+        title:
+          type: [string, "null"]
+          description: "`info.title` from the spec document, if present"
+        info_version:
+          type: [string, "null"]
+          description: "`info.version` from the spec document, if present"
+        description:
+          type: [string, "null"]
+          description: |
+            `info.description` from the spec, truncated to 4096 bytes at a
+            UTF-8 character boundary if necessary.
+        contact_name:
+          type: [string, "null"]
+          description: "`info.contact.name` from the spec, if present"
+        contact_email:
+          type: [string, "null"]
+          description: "`info.contact.email` from the spec, if present"
+        license_name:
+          type: [string, "null"]
+          description: "`info.license.name` from the spec, if present"
+        license_identifier:
+          type: [string, "null"]
+          description: |
+            `info.license.identifier` (OpenAPI 3.1+) or `info.license.url`
+            fallback, if present.
+        tags:
+          type: array
+          items:
+            type: string
+          description: |
+            Top-level `tags[].name` entries from the spec, de-duplicated and
+            sorted alphabetically. Empty array when no tags are defined.
+        server_urls:
+          type: array
+          items:
+            type: string
+          description: |
+            Server URLs: `servers[].url` for OpenAPI 3.x; for Swagger 2.0,
+            constructed as `{scheme}://{host}{basePath}` for each scheme.
+            Empty array when no server information is present.
+        operation_count:
+          type: integer
+          format: int32
+          description: |
+            Count of HTTP method keys (`get`, `post`, `put`, `delete`,
+            `options`, `head`, `patch`, `trace`) summed across all `paths.*`
+            entries in the spec.
+        uncompressed_size:
+          type: integer
+          format: int64
+          description: Size in bytes of the uncompressed spec content
+        content_hash:
+          type: string
+          description: Lowercase hex SHA-256 digest of the uncompressed spec content. Used as ETag value.
+        content_encoding:
+          type: string
+          enum: [gzip]
+          description: Encoding used for stored spec content (always `gzip`)
+        created_at:
+          type: string
+          format: date-time
+          description: When the spec was first submitted
+        updated_at:
+          type: string
+          format: date-time
+          description: When the spec was last replaced via `PUT /api-specs/{id}`
+
+    ApiSpecListResponse:
+      type: object
+      description: Paginated response from `GET /api-specs`.
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiSpecSummary"
+          description: Spec summary records for the current page
+        limit:
+          type: integer
+          description: Maximum items per page (as requested)
+        offset:
+          type: integer
+          description: Number of items skipped (as requested)
+        next_offset:
+          type: [integer, "null"]
+          description: |
+            Offset to use for the next page, or `null` when this is the last
+            page. A non-null value means `items.length == limit`; the actual
+            total item count is not returned to avoid an expensive COUNT query.
+
+    ApiSpecCreateResponse:
+      type: object
+      description: |
+        Response body for a successful `POST /api-specs` (201) or
+        `PUT /api-specs/{id}` (200). Provides the identifiers and content hash
+        of the spec that was created or replaced.
+      properties:
+        id:
+          type: string
+          description: UUID of the spec (new on POST, unchanged on PUT)
+        proxy_id:
+          type: string
+          description: ID of the proxy created or updated by this spec
+        spec_version:
+          type: string
+          description: OpenAPI/Swagger version string from the document
+        content_hash:
+          type: string
+          description: Lowercase hex SHA-256 of the uncompressed spec bytes. Suitable for use as an ETag.
+
+    ApiSpecValidationError:
+      type: object
+      description: |
+        Response body for 422 Unprocessable Entity from `POST /api-specs` or
+        `PUT /api-specs/{id}`. The spec document was parsed successfully and the
+        Ferrum extensions were found, but one or more extracted resources failed
+        structural validation or database cross-checks (e.g., duplicate
+        `listen_path`, invalid plugin config).
+      properties:
+        error:
+          type: string
+          example: "Spec validation failed"
+        spec_version:
+          type: string
+          description: Version string detected from the submitted document
+        failures:
+          type: array
+          description: One entry per resource that failed validation
+          items:
+            type: object
+            properties:
+              resource_type:
+                type: string
+                enum: [proxy, upstream, plugin]
+                description: Kind of resource that failed
+              id:
+                type: string
+                description: ID of the resource (from the extension object)
+              errors:
+                type: array
+                items:
+                  type: string
+                description: Human-readable validation error messages for this resource
+
+    ApiSpecParseError:
+      type: object
+      description: |
+        Response body for 400 Bad Request from `POST /api-specs` or
+        `PUT /api-specs/{id}`. The spec document could not be parsed, or a
+        required Ferrum extension is missing or malformed.
+      properties:
+        error:
+          type: string
+          description: Short human-readable summary
+        code:
+          type: string
+          enum:
+            - InvalidJson
+            - InvalidYaml
+            - UnknownVersion
+            - MissingProxyExtension
+            - MalformedExtension
+            - ConsumerExtensionNotAllowed
+            - PluginInvalidScope
+            - PluginProxyIdMismatch
+            - PluginContainsCredentials
+          description: |
+            Machine-readable error discriminant:
+
+            - `InvalidJson` — body is not valid JSON
+            - `InvalidYaml` — body is not valid YAML
+            - `UnknownVersion` — no recognised `swagger: "2.0"` or `openapi: "3.x.y"` at root
+            - `MissingProxyExtension` — `x-ferrum-proxy` is absent
+            - `MalformedExtension` — `x-ferrum-proxy`, `x-ferrum-upstream`, or `x-ferrum-plugins` failed to deserialise
+            - `ConsumerExtensionNotAllowed` — `x-ferrum-consumers` is present (forbidden)
+            - `PluginInvalidScope` — a plugin in `x-ferrum-plugins` has `scope: global` or `scope: proxy_group`
+            - `PluginProxyIdMismatch` — a plugin's `proxy_id` does not match the spec's proxy ID
+            - `PluginContainsCredentials` — a plugin's `config` contains a forbidden key (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, or `consumers`)
+        details:
+          type: string
+          description: Full error text including field paths and values where applicable

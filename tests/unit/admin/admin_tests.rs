@@ -55,6 +55,7 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(

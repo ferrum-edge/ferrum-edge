@@ -65,6 +65,12 @@ impl V001SqlBuilder {
             self.create_proxies_sql(),
             self.create_plugin_configs_sql(),
             self.create_proxy_plugins_sql(),
+            // api_specs must come AFTER proxies (FK proxies(id) → api_specs via
+            // the api_spec_id back-link is ON DELETE SET NULL, but the api_specs
+            // table itself FKs proxies ON DELETE CASCADE, so proxies must exist
+            // first). api_specs is admin-only metadata; the gateway runtime never
+            // reads this table.
+            self.create_api_specs_sql(),
         ] {
             sqlx::query(sql).execute(pool).await?;
         }
@@ -91,6 +97,13 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_updated ON upstreams (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_scope ON plugin_configs (namespace, scope)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_plugin_name ON plugin_configs (namespace, plugin_name)",
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_namespace ON api_specs (namespace)",
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_namespace_updated_at ON api_specs (namespace, updated_at)",
+            // Wave 5 indexes — for spec_version filter, title sort, operation_count sort, created_at sort
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_spec_version ON api_specs (namespace, spec_version)",
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_title ON api_specs (namespace, title)",
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_operation_count ON api_specs (namespace, operation_count)",
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_created_at ON api_specs (namespace, created_at)",
         ];
 
         for idx_sql in indexes {
@@ -159,6 +172,7 @@ impl V001SqlBuilder {
                 backend_tls_client_key_path VARCHAR(2048),
                 backend_tls_verify_server_cert TINYINT NOT NULL DEFAULT 1,
                 backend_tls_server_ca_cert_path VARCHAR(2048),
+                api_spec_id VARCHAR(255),
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL
             )
@@ -179,6 +193,7 @@ impl V001SqlBuilder {
                 backend_tls_client_key_path TEXT,
                 backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1,
                 backend_tls_server_ca_cert_path TEXT,
+                api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -266,6 +281,7 @@ impl V001SqlBuilder {
                 allowed_methods TEXT,
                 allowed_ws_origins TEXT,
                 udp_max_response_amplification_factor REAL,
+                api_spec_id VARCHAR(255),
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL,
                 CONSTRAINT fk_proxies_upstream FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE RESTRICT,
@@ -325,6 +341,7 @@ impl V001SqlBuilder {
                 allowed_methods TEXT,
                 allowed_ws_origins TEXT,
                 udp_max_response_amplification_factor REAL,
+                api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 CHECK (backend_port >= 0 AND backend_port <= 65535),
@@ -349,6 +366,7 @@ impl V001SqlBuilder {
                 proxy_id VARCHAR(255),
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority_override INTEGER DEFAULT NULL,
+                api_spec_id VARCHAR(255),
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL,
                 CONSTRAINT fk_plugin_configs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
@@ -365,6 +383,7 @@ impl V001SqlBuilder {
                 proxy_id TEXT REFERENCES proxies(id) ON DELETE CASCADE,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority_override INTEGER DEFAULT NULL,
+                api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -394,6 +413,75 @@ impl V001SqlBuilder {
         }
     }
 
+    fn create_api_specs_sql(&self) -> &'static str {
+        // api_specs is admin-only metadata. The gateway runtime never reads
+        // this table; it is excluded from db_loader.rs, GatewayConfig, and
+        // all gRPC/CP distribution paths.
+        //
+        // FK: proxy_id → proxies(id) ON DELETE CASCADE so deleting the proxy
+        //     (e.g., when a spec is purged) automatically removes the spec row.
+        // The api_spec_id back-links on proxies/upstreams/plugin_configs use
+        // ON DELETE SET NULL (deferred to Wave 2 ALTER or inline on fresh
+        // schema) so destroying a spec record doesn't cascade-wipe its
+        // generated resources unless the caller requests it explicitly.
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS api_specs (
+                id VARCHAR(255) PRIMARY KEY,
+                namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
+                proxy_id VARCHAR(255) NOT NULL,
+                spec_version VARCHAR(50) NOT NULL,
+                spec_format VARCHAR(10) NOT NULL,
+                spec_content LONGBLOB NOT NULL,
+                content_encoding VARCHAR(50) NOT NULL DEFAULT 'gzip',
+                uncompressed_size BIGINT NOT NULL,
+                content_hash VARCHAR(64) NOT NULL,
+                title TEXT,
+                info_version VARCHAR(255),
+                description LONGTEXT,
+                contact_name TEXT,
+                contact_email TEXT,
+                license_name TEXT,
+                license_identifier TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                server_urls TEXT NOT NULL DEFAULT '[]',
+                operation_count INTEGER NOT NULL DEFAULT 0,
+                resource_hash VARCHAR(64) NOT NULL DEFAULT '',
+                created_at VARCHAR(50) NOT NULL,
+                updated_at VARCHAR(50) NOT NULL,
+                CONSTRAINT fk_api_specs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS api_specs (
+                id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL DEFAULT 'ferrum',
+                proxy_id TEXT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+                spec_version TEXT NOT NULL,
+                spec_format TEXT NOT NULL,
+                spec_content BLOB NOT NULL,
+                content_encoding TEXT NOT NULL DEFAULT 'gzip',
+                uncompressed_size BIGINT NOT NULL,
+                content_hash TEXT NOT NULL,
+                title TEXT,
+                info_version TEXT,
+                description TEXT,
+                contact_name TEXT,
+                contact_email TEXT,
+                license_name TEXT,
+                license_identifier TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                server_urls TEXT NOT NULL DEFAULT '[]',
+                operation_count INTEGER NOT NULL DEFAULT 0,
+                resource_hash TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#
+        }
+    }
+
     fn unique_listen_port_sql(&self) -> &'static str {
         if self.is_mysql() {
             "CREATE UNIQUE INDEX idx_proxies_unique_listen_port ON proxies (namespace, listen_port)"
@@ -409,6 +497,7 @@ impl V001SqlBuilder {
                 "CREATE UNIQUE INDEX idx_consumers_namespace_username ON consumers (namespace, username)",
                 "CREATE UNIQUE INDEX idx_consumers_namespace_custom_id ON consumers (namespace, custom_id)",
                 "CREATE UNIQUE INDEX idx_upstreams_namespace_name ON upstreams (namespace, name)",
+                "CREATE UNIQUE INDEX idx_api_specs_namespace_proxy_id ON api_specs (namespace, proxy_id)",
             ]
         } else {
             &[
@@ -416,6 +505,7 @@ impl V001SqlBuilder {
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_consumers_namespace_username ON consumers (namespace, username)",
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_consumers_namespace_custom_id ON consumers (namespace, custom_id) WHERE custom_id IS NOT NULL",
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_upstreams_namespace_name ON upstreams (namespace, name) WHERE name IS NOT NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_api_specs_namespace_proxy_id ON api_specs (namespace, proxy_id)",
             ]
         }
     }

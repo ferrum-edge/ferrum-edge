@@ -45,6 +45,7 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         upstream_id: None,
+        api_spec_id: None,
         circuit_breaker: None,
         retry: None,
         response_body_mode: ResponseBodyMode::default(),
@@ -76,6 +77,7 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>, updated_at: DateTime<Ut
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        api_spec_id: None,
         created_at: updated_at,
         updated_at,
     }
@@ -107,6 +109,7 @@ fn make_plugin_config(
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: updated_at,
         updated_at,
     }

@@ -131,6 +131,7 @@ fn fast_path_tcp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -154,6 +155,7 @@ fn throttle_plugin_config() -> PluginConfig {
         proxy_id: Some(PROXY_ID.to_string()),
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

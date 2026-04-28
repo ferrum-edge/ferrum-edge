@@ -260,6 +260,8 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/backup > backup.jso
 curl -X POST -H "Authorization: Bearer $TOKEN" -d @backup.json "http://localhost:9000/restore?confirm=true"
 ```
 
+Submit an OpenAPI/Swagger spec to atomically provision a proxy, upstream, and plugins in one call — see [docs/api_specs.md](docs/api_specs.md).
+
 See [docs/admin_api.md](docs/admin_api.md) for the full endpoint reference, and [openapi.yaml](openapi.yaml) for the OpenAPI specification.
 
 ## Plugin System

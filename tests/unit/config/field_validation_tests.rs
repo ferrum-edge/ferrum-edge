@@ -52,6 +52,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http3_connections_per_backend: None,
         pool_tcp_keepalive_seconds: None,
         upstream_id: None,
+        api_spec_id: None,
         circuit_breaker: None,
         retry: None,
         response_body_mode: Default::default(),
@@ -102,6 +103,7 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -117,6 +119,7 @@ fn make_plugin_config(id: &str) -> PluginConfig {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -1651,6 +1654,7 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };

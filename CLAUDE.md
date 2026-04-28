@@ -100,7 +100,7 @@ At startup, before config load. Env var suffixes resolve the base name: `_VAULT`
 ### Source Layout (pointers)
 
 - `src/{main,cli}.rs` — CLI, mode dispatch, signals
-- `src/admin/` — REST API + JWT middleware
+- `src/admin/` — REST API + JWT middleware; `api_specs/` (extractor + handlers), `spec_codec.rs` (gzip + sha256)
 - `src/config/` — `types.rs` (domain model), `env_config.rs` (90+ vars), `db_backend.rs` trait + `db_loader.rs`/`mongo_store.rs`, `file_loader.rs`, `migrations/`
 - `src/modes/` — database/file/control_plane/data_plane/migrate
 - `src/proxy/` — `mod.rs` (handle_proxy_request), `handler.rs`, `body.rs` (ProxyBody + Coalescing adapters), `grpc_proxy.rs`, `http2_pool.rs`, `tcp_proxy.rs`, `udp_proxy.rs`, `udp_batch.rs`, `sni.rs`, `stream_listener.rs`, `client_ip.rs`
@@ -117,6 +117,8 @@ At startup, before config load. Env var suffixes resolve the base name: `_VAULT`
 **Namespace isolation**: `FERRUM_NAMESPACE` controls what a gateway loads. DB queries filter by namespace; file mode filters post-deserialize. Admin API uses `X-Ferrum-Namespace` header. Uniqueness constraints (listen_path, proxy name, consumer identity, upstream name, listen_port) are per-namespace — same `listen_port` is safe across namespaces (OS bind catches real conflicts).
 
 **Hostname normalization**: ASCII-lowercase at admission via `normalize_fields()` — `Proxy.hosts`, `Proxy.backend_host`, `UpstreamTarget.host`. Applied in every entry point (admin API, loaders, DP gRPC, restore). Downstream consumers rely on this — **do not re-lowercase** in DNS/pool/health/LB keys.
+
+**`ApiSpec` is intentionally not in `GatewayConfig`** — it is admin-only metadata (one row per `(namespace, proxy_id)`), accessed via the `DatabaseBackend` trait surface from admin handlers only. `Proxy`/`Upstream`/`PluginConfig` carry an optional `api_spec_id: Option<String>` ownership tag (NULL for resources created via direct admin endpoints; set when extracted from a spec). PUT-replace and DELETE semantics depend on this tag — see "API Spec Management" below.
 
 ### Route Matching
 
@@ -201,6 +203,36 @@ Shared singleton; pre-warmed. Native TTL by default, floored by `FERRUM_DNS_MIN_
 ### Centralized Rate Limiting (Redis)
 
 Four rate plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`) support `sync_mode: "redis"`. Shared client in `src/plugins/utils/redis_rate_limiter.rs`. Algorithm: two-window weighted via pipelined `INCR`/`GET`/`EXPIRE` — no Lua. Keys `{prefix}:{rate_key}:{window_index}`; default prefix `{FERRUM_NAMESPACE}:{plugin_name}` prevents cross-gateway collisions. Auto-fallback to in-memory on outage + background reconnect. TLS via `rediss://` uses global `FERRUM_TLS_*`. Works with Redis/Valkey/DragonflyDB/KeyDB/Garnet.
+
+### API Spec Management (admin-only metadata)
+
+Operators submit OpenAPI 2.0 / 3.0.x / 3.1.x / 3.2.x docs (JSON or YAML, autodetected) augmented with `x-ferrum-proxy` (required), `x-ferrum-upstream` (optional), `x-ferrum-plugins` (optional) extensions at the doc root. The handler extracts native Ferrum resources, runs the SAME validation pipeline as direct admin POSTs, persists transactionally, and stores the original doc gzip-compressed for retrieval. Endpoints: `POST/PUT/GET/DELETE /api-specs[/{id}]`, `GET /api-specs/by-proxy/{proxy_id}`, `GET /api-specs`. See [docs/api_specs.md](docs/api_specs.md).
+
+**Hot-path invariant — `api_specs` is admin-only metadata, NEVER loaded by gateway runtime.** Required guards:
+- Not a `GatewayConfig` field — adding `Vec<ApiSpec>` would put 25 MiB+ blobs through `ArcSwap` and the polling loop
+- Not in `src/config/db_loader.rs` `load_*` / poll path — only the per-bundle admin trait methods touch the table
+- Not in `src/grpc/cp_server.rs` `broadcast_update` — DPs never see specs (CP-only storage)
+- Not added to any periodic refresh, snapshot, or runtime cache
+
+Specs are admin-API on-demand only. Adding them to any runtime path is a regression. Integration test in `tests/integration/admin_db_api_specs_tests.rs` covers the trait contract; preserve hot-path isolation when modifying.
+
+**Validation reuse — do NOT fork the admit path.** Spec-extracted resources go through identical validators to direct admin POSTs: `Proxy::normalize_fields() + validate_fields()`, `validate_host_entry()`, `plugins::validate_plugin_config()`, `db.check_listen_path_unique() / check_proxy_name_unique() / check_upstream_name_unique()`. See `extract_and_validate()` in `src/admin/api_specs/handlers.rs`. Forking creates silent admit-rules drift between routes.
+
+**Ownership model**: nullable `api_spec_id: Option<String>` column on `proxies`, `upstreams`, `plugin_configs` (added inline to v1 schema in `src/config/migrations/sql_dialect.rs`). PUT `/api-specs/{id}` deletes spec-owned resources (`WHERE api_spec_id = {id}`) and re-inserts; hand-added resources (api_spec_id NULL) survive. DELETE `/api-specs/{id}` deletes the spec-owned proxy → existing FK cascade wipes attached plugins + the api_spec row; spec-owned upstream is cleaned manually (no FK on the back-link by design — would require complex cross-table create ordering on MySQL).
+
+**Forbidden in specs** (rejected at extract time, `src/admin/api_specs/extractor.rs`): `x-ferrum-consumers` (use `POST /consumers` instead), plugin `scope != proxy` (only proxy-scoped allowed), plugin `proxy_id != spec proxy.id`, embedded credential keys (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`) anywhere in plugin config (recursive walk on the `config` value, NOT the plugin name — a `jwt` plugin with normal config is fine).
+
+**Storage**: gzip-compressed bytes (BYTEA / LONGBLOB / BLOB on SQL, BinData on Mongo) + sha256 hex `content_hash` (ETag for `If-None-Match` 304s) + `uncompressed_size`. Body cap on submit: `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25). MongoDB BSON 16 MB cap is enforced pre-flight at write time — operators with >~14 MiB compressed specs should use a SQL backend.
+
+**Atomicity**: SQL backends use `sqlx::Transaction` for submit/replace. MongoDB uses `with_transaction` when `FERRUM_MONGO_REPLICA_SET` is configured; otherwise best-effort with compensating deletes (partial-failure window on infrastructure faults). Production MongoDB deployments should use a replica set.
+
+**Mode behavior**: db/cp = read+write; dp/file = both endpoints reject (no DB). Same gating as other write endpoints via `AdminState::check_write_allowed()`.
+
+**Idempotent PUT (no-churn for doc-only edits)**: `replace_api_spec_bundle` compares `old.resource_hash` (sha256 of the bundle's resource fields, excluding `api_spec_id` / `created_at` / `updated_at`) to the new bundle's hash. On match, only the `api_specs` row updates; `proxies` / `upstreams` / `plugin_configs` are untouched and their `updated_at` does NOT advance — so the polling cycle does not trigger router-cache rebuild, plugin-cache rebuild, pool warmup, capability-registry refresh, or DP gRPC broadcast. Hash helper: `hash_resource_bundle()` in [src/admin/api_specs/extractor.rs](src/admin/api_specs/extractor.rs). When changing the hash function, update the `resource_hash` column comparison in `replace_api_spec_bundle` impls in `db_loader.rs` and `mongo_store.rs` together — otherwise existing rows look like they always need a re-write.
+
+**Listable metadata** (Tier 1 — extracted at submit time, queryable as columns): `description` (truncated 4 KiB at UTF-8 boundary), `contact_name`, `contact_email`, `license_name`, `license_identifier` (`info.license.identifier` in 3.1+, falls back to `info.license.url`), `tags` (top-level `tags[].name`, deduped + sorted), `server_urls` (`servers[].url` in 3.x; `{scheme}://{host}{basePath}` in 2.0), `operation_count` (HTTP methods summed across all `paths.*`). All extracted from the same `serde_yaml::Value` walk used for Ferrum extensions — zero extra parse cost. The `ApiSpecSummary` returned by `GET /api-specs` and `GET /api-specs/by-proxy/{proxy_id}` includes these fields but EXCLUDES `resource_hash` (internal use only).
+
+**List filters** on `GET /api-specs` (Tier 2): `?proxy_id` (exact), `?spec_version` (prefix match — `3.1` matches `3.1.0`/`3.1.1`), `?title_contains` (case-insensitive substring), `?updated_since` (ISO-8601 — `updated_at >= ?`), `?has_tag` (exact tag membership), `?sort_by` (whitelist: `updated_at` (default) / `title` / `operation_count` / `created_at`), `?order` (`asc` / `desc` — default `desc`). Unknown `sort_by` / `order` values return 400. Default sort is `updated_at desc` (most recent first — matches UI expectation). The `has_tag` SQL backend uses LIKE pattern matching against the JSON-stored tag array; tag names containing `"` or `%` could cause false matches (documented limitation in [src/config/db_loader.rs](src/config/db_loader.rs); MongoDB uses native array membership and is unaffected).
 
 ## Test Structure
 
@@ -476,6 +508,7 @@ Full list: 90+ vars in `src/config/env_config.rs` and `ferrum.conf`. Most-common
 - `FERRUM_LOG_LEVEL` (`error`)
 - `FERRUM_PROXY_HTTP_PORT`/`HTTPS_PORT` (8000/8443); `FERRUM_ADMIN_HTTP_PORT`/`HTTPS_PORT` (9000/9443) — `0` disables plaintext
 - `FERRUM_ADMIN_JWT_SECRET` (required db/cp, ≥32 chars)
+- `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (25; body cap for `POST/PUT /api-specs`. Mongo backends are additionally bounded by the BSON 16 MB doc limit, enforced at write time)
 - `FERRUM_FRONTEND_TLS_CERT_PATH`/`KEY_PATH`
 - `FERRUM_TLS_CA_BUNDLE_PATH` (global backend CA, exclusive); `FERRUM_TLS_NO_VERIFY` (**testing only**); `FERRUM_TLS_CRL_FILE_PATH`
 - `FERRUM_FILE_CONFIG_PATH` (required file mode)

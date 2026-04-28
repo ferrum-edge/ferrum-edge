@@ -265,6 +265,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - Config version validation on restore endpoint
 - Database error masking in API responses (internal details logged, not exposed)
 - Batch operations and full config backup/restore
+- API Spec import — submit OpenAPI/Swagger documents to atomically provision proxy + upstream + plugins as a bundle (`POST /api-specs`); see [docs/api_specs.md](docs/api_specs.md)
 - Zero-downtime config reload via DB polling, SIGHUP, or CP push
 - Atomic config swap via ArcSwap (no partial config visible to requests)
 - Incremental database polling with indexed `updated_at` queries and full config validation

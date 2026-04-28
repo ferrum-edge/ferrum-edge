@@ -104,6 +104,7 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         upstream_id: None,
+        api_spec_id: None,
         circuit_breaker: None,
         retry: None,
         response_body_mode: Default::default(),
@@ -147,6 +148,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             enabled: true,
             proxy_id: None,
             priority_override: None,
+            api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }],
@@ -177,6 +179,7 @@ fn create_test_upstream(id: &str, name: &str) -> Upstream {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -269,6 +272,7 @@ async fn test_list_proxies_falls_back_to_cached_config() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -310,6 +314,7 @@ async fn test_list_consumers_falls_back_to_cached_config() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -346,6 +351,7 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -386,6 +392,7 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -421,6 +428,7 @@ async fn test_get_proxy_not_found_in_cache() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -454,6 +462,7 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -489,6 +498,7 @@ async fn test_get_consumer_not_found_in_cache() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -522,6 +532,7 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -558,6 +569,7 @@ async fn test_get_plugin_config_not_found_in_cache() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -591,6 +603,7 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -627,6 +640,7 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -663,6 +677,7 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -703,6 +718,7 @@ async fn test_health_endpoint_shows_cached_config_info() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -744,6 +760,7 @@ async fn test_health_endpoint_shows_no_cached_config() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -783,6 +800,7 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
         startup_ready: Some(startup_ready.clone()),
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -834,6 +852,7 @@ async fn test_cached_config_reflects_live_updates() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -904,6 +923,7 @@ fn create_pagination_test_config() -> GatewayConfig {
             enabled: true,
             proxy_id: None,
             priority_override: None,
+            api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -932,6 +952,7 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -1093,6 +1114,7 @@ async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDi
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -1177,6 +1199,7 @@ async fn create_db_admin_state_with_availability(
         startup_ready: None,
         db_available,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -1306,6 +1329,7 @@ async fn test_batch_create_read_only_rejected() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -1622,6 +1646,7 @@ async fn test_restore_read_only_rejected() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -1770,6 +1795,7 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -1811,6 +1837,7 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -1846,6 +1873,7 @@ async fn test_get_upstream_not_found_in_cache() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -1877,6 +1905,7 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -1913,6 +1942,7 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -2227,6 +2257,7 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -2267,6 +2298,7 @@ async fn test_backup_no_db_no_cache_returns_503() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -2306,6 +2338,7 @@ async fn test_create_proxy_returns_503_when_no_db() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -2342,6 +2375,7 @@ async fn test_create_upstream_returns_503_when_no_db() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -2424,6 +2458,7 @@ async fn test_cached_config_reflects_upstream_updates() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -2682,6 +2717,7 @@ async fn test_health_endpoint_shows_db_availability() {
         startup_ready: None,
         db_available: Some(db_flag.clone()),
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -2838,6 +2874,7 @@ async fn test_cluster_endpoint_requires_auth() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -2873,6 +2910,7 @@ async fn test_cluster_endpoint_cp_mode_empty_registry() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -2923,6 +2961,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -2973,6 +3012,7 @@ async fn test_cluster_endpoint_dp_mode_connected() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -3010,6 +3050,7 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
@@ -3043,6 +3084,7 @@ async fn test_cluster_endpoint_database_mode() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: std::sync::Arc::new(
