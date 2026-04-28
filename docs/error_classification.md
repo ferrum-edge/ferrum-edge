@@ -1,145 +1,189 @@
 # Error Classification
 
-Ferrum Edge classifies gateway-level communication failures into human-friendly error categories via the `error_class` field on `TransactionSummary`. This helps operators quickly identify the root cause of failed transactions without parsing raw error messages.
+This document describes the unified error-classification taxonomy used across every protocol path in the gateway (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP, TCP+TLS, UDP, DTLS) and how it flows into the transaction summary fields consumed by logging plugins.
 
-## How It Works
+The goal is **one taxonomy, one boundary, one set of typed downcasts** — operators grep the same labels regardless of which dispatcher emitted the failure, and dashboards key off enum variants, not substring matches.
 
-When a backend request fails (connection error, timeout, TLS failure, etc.), the gateway inspects the error chain and assigns an `ErrorClass` variant. This classification:
+Classification runs only on the error path — successful requests never execute it, so there is zero hot-path overhead.
 
-1. **Runs only on the error path** — successful requests never execute the classification logic, so there is zero hot-path overhead.
-2. **Is set in `BackendResponse`** — the proxy core classifies the error immediately when the backend call fails.
-3. **Flows to `TransactionSummary`** — all logging plugins (stdout, HTTP, TCP, Prometheus, OTel, transaction debugger) receive the `error_class` field automatically.
-4. **Is omitted when `None`** — successful transactions produce no extra JSON field (`#[serde(skip_serializing_if = "Option::is_none")]`).
+## Canonical taxonomy (`ErrorClass`)
 
-## Error Classes
+Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/retry.rs). Variants serialize as `snake_case` strings (`"connection_timeout"`, `"tls_error"`, …).
 
-| Error Class | Serialized Value | When It Occurs | Likely Cause |
+| Variant | Meaning | `request_reached_wire`? |
+|---|---|---|
+| `ConnectionRefused` | TCP connect refused (port not listening, firewall RST). Includes connect-phase RSTs (functionally indistinguishable from ECONNREFUSED). | `false` (pre-wire) |
+| `ConnectionTimeout` | TCP connect did not complete before the configured timeout. | `false` (pre-wire) |
+| `ConnectionReset` | Mid-stream RST received after the connection was established. | `true` (post-wire) |
+| `ConnectionClosed` | Peer sent FIN before a response was completed; broken pipe; aborted connection. | `true` (post-wire) |
+| `DnsLookupError` | Hostname could not be resolved. | `false` (pre-wire) |
+| `TlsError` | TLS or DTLS handshake failed (certificate, ALPN, alert). | `false` (pre-wire) |
+| `ReadWriteTimeout` | Backend read or write exceeded the per-direction watermark. | `true` (post-wire) |
+| `ProtocolError` | HTTP/2 or HTTP/3 protocol-level error (stream reset, GOAWAY, h2c handshake), or RFC 6455 WebSocket protocol violation. | `true` (post-wire) |
+| `ResponseBodyTooLarge` | Backend response exceeded the configured maximum size. | `true` (post-wire) |
+| `RequestBodyTooLarge` | Request body exceeded the configured maximum size. | `true` (post-wire) |
+| `ConnectionPoolError` | Could not acquire or create an HTTP client from the pool. | `false` (pre-wire) |
+| `PortExhaustion` | EADDRNOTAVAIL — all ephemeral ports in use. | `false` (pre-wire) |
+| `ClientDisconnect` | Client gave up before the gateway could complete the response. | `true` (post-wire) |
+| `GracefulRemoteClose` | Peer closed the session cleanly: HTTP/3 `H3_NO_ERROR`/GOAWAY at the response read boundary, or RFC 6455 Close frame on a WebSocket. Excluded from H3 capability downgrades so a backend that closes after every response stays on H3. | `true` (post-wire) |
+| `RequestError` | Catch-all for unclassified gateway-side rejections (plugin denials, unknown failure modes). | `true` (post-wire) |
+
+Two helpers live with the enum:
+
+- [`request_reached_wire(class)`](../src/retry.rs) — the single boundary that decides whether `BackendResponse::connection_error` is `true` (the body never went on the wire, so retry-on-connect-failure can fire regardless of method idempotency) or `false` (the body may have been processed, so retries must respect `retryable_methods`). Every classifier funnels through this; per-classifier `connection_error: bool` fields are intentionally absent so the predicate cannot drift.
+- [`error_class_log_kind(class)`](../src/retry.rs) — stable short labels (`"connect_failure"`, `"tls_error"`, `"graceful_remote_close"`, …) emitted as the `error_kind` field on `tracing::error!` lines from every dispatcher. Operators grep one set of strings across protocols.
+
+## Per-protocol classifiers
+
+Each dispatcher hands its native error type to a classifier; every classifier returns `ErrorClass`. **Typed source-chain walking is preferred to substring matching** — string fallbacks remain only as defence-in-depth for legacy error types that don't expose typed sources.
+
+| Protocol | Classifier | Input | Technique |
 |---|---|---|---|
-| `ConnectionTimeout` | `"ConnectionTimeout"` | TCP connect timed out before a connection was established | Backend is unreachable, firewall dropping SYN packets, network latency |
-| `ConnectionRefused` | `"ConnectionRefused"` | TCP connect was refused by the backend (RST received during handshake) | Backend port not listening, firewall actively rejecting, service down |
-| `ConnectionReset` | `"ConnectionReset"` | TCP connection was reset by the backend (RST received mid-stream) | Backend crashed, kernel killed the connection, intermediary proxy reset |
-| `ConnectionClosed` | `"ConnectionClosed"` | TCP connection was closed cleanly by the backend before a response was sent | Backend closed idle connection, connection pool stale entry, keep-alive timeout |
-| `DnsLookupError` | `"DnsLookupError"` | DNS resolution failed for the backend hostname | Hostname typo, DNS server unreachable, NXDOMAIN, missing DNS record |
-| `TlsError` | `"TlsError"` | TLS handshake failed | Certificate expired/untrusted, protocol version mismatch, SNI mismatch, self-signed cert without `tls_no_verify` |
-| `ReadWriteTimeout` | `"ReadWriteTimeout"` | Connection was established but the response was not received within the configured timeout | Backend is slow, query/computation takes too long, deadlock in backend |
-| `ClientDisconnect` | `"ClientDisconnect"` | Client disconnected before the gateway could forward the full request/response | Client cancelled request, mobile network drop, browser navigation |
-| `ProtocolError` | `"ProtocolError"` | HTTP/2 or HTTP/3 protocol-level error (stream reset, GOAWAY, etc.) | Backend sent invalid HTTP frames, HTTP/2 stream limit exceeded, QUIC protocol error |
-| `ResponseBodyTooLarge` | `"ResponseBodyTooLarge"` | Backend response body exceeded the configured maximum size | Backend returned unexpectedly large payload, misconfigured size limit |
-| `RequestBodyTooLarge` | `"RequestBodyTooLarge"` | Request body exceeded the configured maximum size | Client sent oversized upload, misconfigured size limit |
-| `ConnectionPoolError` | `"ConnectionPoolError"` | Could not acquire or create an HTTP client from the connection pool | Pool exhaustion (all connections in use), pool configuration too restrictive |
-| `PortExhaustion` | `"PortExhaustion"` | OS returned EADDRNOTAVAIL — all ephemeral ports are consumed | High outbound connection rate, too many TIME_WAIT sockets, `net.ipv4.ip_local_port_range` too narrow |
-| `RequestError` | `"RequestError"` | Catch-all for unclassified request errors | Unexpected error not matching any specific category — check gateway logs for details |
+| HTTP/1.1 (reqwest) | [`classify_reqwest_error`](../src/retry.rs) | `&reqwest::Error` | `is_connect()` / `is_timeout()` typed methods → typed source-chain walk for io/TLS/DNS → bounded substring fallback inside the `is_connect()` branch |
+| HTTP/2 (direct pool) | [`classify_http2_pool_error`](../src/proxy/http2_pool.rs) | `&Http2PoolError` (typed enum) | Pattern match on typed variants → typed source-chain walk (io/hyper/rustls) → minimal Display fallback |
+| HTTP/3 (native pool) | [`classify_http3_error`](../src/http3/client.rs) | `&dyn Error` | Typed walk for `quinn::ConnectionError` / `quinn::ConnectError` / `io::Error` → anchored substring fallback for `h3::Error` Display |
+| gRPC | [`classify_grpc_proxy_error`](../src/retry.rs) | `&GrpcProxyError` (typed enum with kinds) | Pattern match on `BackendUnavailable.kind: GrpcBackendUnavailableKind` → typed `is_port_exhaustion` source walk → no message substring matching |
+| WebSocket / generic boxed | [`classify_boxed_error`](../src/retry.rs) | `&dyn Error` | Typed walk: `StreamSetupError` (TCP/UDP setup) → `tokio_tungstenite::tungstenite::Error` (RFC 6455 ConnectionClosed/AlreadyClosed/Protocol) → `io::Error` → `hyper::Error` → bounded Display/Debug fallback |
+| TCP relay (stream) | [`classify_stream_error`](../src/proxy/tcp_proxy.rs) | `&anyhow::Error` | Thin wrapper over `classify_boxed_error` — same typed walk |
+| Streaming response body | [`classify_body_error`](../src/retry.rs) | `&dyn Error` | Typed walk for io/hyper, returns `(ErrorClass, client_disconnected: bool)` |
 
-## Debugging Guide
+The H3 pool returns a typed [`H3PoolError`](../src/http3/client.rs) whose `request_on_wire()` flag is the **authoritative** body-on-wire signal — `connection_error` is derived directly from `!e.request_on_wire()` at H3 dispatch sites, NOT from the class. See [docs/http3.md](http3.md) for that contract.
 
-### Network-Level Issues (Gateway Node)
+## Stream-family typed errors (`StreamSetupError`)
 
-These error classes typically indicate problems with the gateway node itself or the network between the gateway and backends:
+TCP and UDP relays previously classified their setup-phase failures by `.contains()`-matching shared error-message prefixes (`STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED`, etc.) to disambiguate frontend vs backend TLS, plugin rejects, and load-balancer failures. That mechanism was fragile: a typo at a construction site or a reworded `format!()` silently broke cause attribution.
 
-- **`ConnectionTimeout`** — Check network connectivity to the backend. Verify firewall rules allow outbound connections. Consider increasing the proxy's `connect_timeout` if the backend is on a high-latency network.
-- **`ConnectionRefused`** — Verify the backend is running and listening on the expected host:port. Check `backend_host` and `backend_port` in the proxy config.
-- **`DnsLookupError`** — Check DNS resolver configuration. Verify the `backend_host` hostname is correct and resolvable. Check `/etc/resolv.conf` or the gateway's DNS settings.
-- **`ConnectionPoolError`** — The gateway may be under heavy load with all pooled connections in use. Consider increasing the global `FERRUM_POOL_MAX_IDLE_PER_HOST` env var or the per-proxy `pool_idle_timeout` setting.
-- **`PortExhaustion`** — The OS has no more ephemeral ports available for outbound connections (EADDRNOTAVAIL). Widen the port range with `sysctl net.ipv4.ip_local_port_range="1024 65535"`, enable `net.ipv4.tcp_tw_reuse=1`, and reduce idle pool timeouts (`FERRUM_POOL_IDLE_TIMEOUT_SECONDS`). Monitor via the `port_exhaustion_events` counter on `GET /overload`.
+[`StreamSetupError`](../src/proxy/stream_error.rs) replaces the substring approach with a typed kind:
 
-### TLS Issues
+```rust
+pub enum StreamSetupKind {
+    FrontendTlsHandshake,   // client → gateway TLS failed (client-side)
+    BackendTlsHandshake,    // gateway → backend TCP-TLS failed (backend-side)
+    BackendDtlsHandshake,   // gateway → backend DTLS failed (backend-side)
+    RejectedByPlugin,       // umbrella for ACL/policy/throttle rejections (client-side)
+    NoHealthyTargets,       // load-balancer pool empty / all circuit-broken (backend-side)
+}
+```
 
-- **`TlsError`** — Check that the backend's TLS certificate is valid and trusted by the gateway. For self-signed certs in development, set `FERRUM_TLS_NO_VERIFY=true`. For mTLS backends, verify the client certificate and CA chain.
+`StreamSetupKind::tls_side()`, `is_client_side()`, and `direction()` derive cause/direction attribution **directly from the typed kind**. The `Display` impl reproduces the legacy `STREAM_ERR_*` prefix verbatim (a regression test enforces this) so log consumers and dashboards keying on the wording continue to work.
 
-### Backend Performance Issues
+Construction-site idiom:
 
-- **`ReadWriteTimeout`** — The backend accepted the connection but didn't respond in time. Check backend application performance, database query times, or resource contention. Consider increasing the proxy's `request_timeout`.
-- **`ConnectionReset`** / **`ConnectionClosed`** — The backend dropped the connection mid-transaction. Check backend logs for crashes, OOM kills, or connection limit violations.
+```rust
+return Err(StreamSetupError::with_source(
+    StreamSetupKind::BackendTlsHandshake,
+    format!("to {addr}: {e}"),
+    e, // typed io::Error / rustls::Error preserved on `source()`
+).into()); // boxes into anyhow::Error
+```
 
-### Client-Side Issues
+The cause/direction mappers walk the chain via `find_stream_setup_error()` — `.context()`, `.into()`, and intermediate wrappers do not break the typed lookup.
 
-- **`ClientDisconnect`** — The client (not the backend) dropped the connection. This is often benign (user navigated away, mobile network change). High rates may indicate client-side timeouts are too aggressive.
+## gRPC typed errors
 
-### Protocol Issues
+`GrpcProxyError::BackendUnavailable` carries a [`GrpcBackendUnavailableKind`](../src/proxy/grpc_proxy.rs) so the classifier reads the failure mode from the typed kind:
 
-- **`ProtocolError`** — Check for HTTP/2 or HTTP/3 compatibility issues between the gateway and backend. Verify the backend supports the negotiated protocol version.
+| Kind | Class | Notes |
+|---|---|---|
+| `DnsResolution` | `DnsLookupError` | `dns_cache.resolve()` failure |
+| `Connect` | `ConnectionRefused` | TCP connect failed (post-DNS) |
+| `TlsHandshake` | `TlsError` | rustls handshake (TLS path) |
+| `H2Handshake` | `TlsError` | HTTP/2 handshake over TLS |
+| `H2cHandshake` | `ProtocolError` | HTTP/2 cleartext handshake |
+| `InvalidServerName` | `DnsLookupError` | rustls rejected the SNI name |
+| `BackendRequest` | `ConnectionRefused` | hyper `send_request` failed post-handshake |
 
-### Size Limit Issues
+Construction sites attach a typed `source` so [`is_port_exhaustion`](../src/retry.rs)'s typed `io::Error::raw_os_error == EADDRNOTAVAIL` walk works on every gRPC dispatch path — not just the message-substring fallback.
 
-- **`RequestBodyTooLarge`** / **`ResponseBodyTooLarge`** — Review the `body_validator` plugin config and proxy-level size limits. Adjust if the limits are too restrictive for legitimate traffic.
+## WebSocket graceful close
 
-## Example Log Output
+[`classify_boxed_error`](../src/retry.rs) downcasts `tokio_tungstenite::tungstenite::Error::ConnectionClosed` and `Error::AlreadyClosed` to `ErrorClass::GracefulRemoteClose`. These represent an orderly RFC 6455 close (the peer sent a Close frame, or we wrote after observing one) and must NOT inflate transport-failure metrics. `Error::Protocol(_)` maps to `ErrorClass::ProtocolError`.
+
+`GracefulRemoteClose` is shared with the HTTP/3 graceful-close path: operators see one label whether the peer closed an H3 connection with `H3_NO_ERROR` or a WS connection with a normal Close frame.
+
+## Transaction summary integration
+
+Two summary types in [`src/plugins/mod.rs`](../src/plugins/mod.rs) carry classification fields:
+
+### `TransactionSummary` (HTTP / gRPC / WebSocket)
+
+| Field | Source | When populated |
+|---|---|---|
+| `error_class: Option<ErrorClass>` | per-protocol classifier | gateway-side failure reaching the backend |
+| `body_error_class: Option<ErrorClass>` | `classify_body_error` | error during streaming-response-body delivery |
+| `client_disconnected: bool` | `classify_body_error` returns `(_, true)` | client gave up after headers were sent |
+
+### `StreamTransactionSummary` (TCP / UDP / DTLS)
+
+| Field | Source | When populated |
+|---|---|---|
+| `error_class: Option<ErrorClass>` | `classify_stream_error` / `classify_boxed_error` | session-level failure |
+| `disconnect_cause: Option<DisconnectCause>` | `pre_copy_disconnect_cause` (TCP) / `dtls_disconnect_cause` (UDP) | typed `StreamSetupKind` first, class fallback otherwise |
+| `disconnect_direction: Option<Direction>` | `pre_copy_disconnect_direction` (TCP) / `dtls_disconnect_direction` (UDP) | typed `StreamSetupKind` first, class fallback otherwise — populated for UDP/DTLS sessions on the same terms as TCP, so operators can tell which side tore down a DTLS session |
+| `connection_error: Option<String>` | `error.to_string()` | preserves the original message text alongside the typed class |
+
+`disconnect_cause` and `disconnect_direction` agree by construction: both consult the same typed kind (when present) and apply the same class-driven fallback (when absent). Adding a new `ErrorClass` variant requires updating both class-fallback arms in lockstep — the exhaustive `match` on `ErrorClass` makes this a compile error rather than a silent miscategorisation.
+
+## Adding a new error path
+
+When you add a dispatcher or a new failure mode:
+
+1. **Reuse `ErrorClass`.** Add a new variant only if the failure is genuinely orthogonal to every existing one (and update `request_reached_wire`, `error_class_log_kind`, and the per-protocol exhaustive matches in lockstep).
+2. **Return typed errors at the construction site.** For stream-family proxies, prefer `StreamSetupError`. For gRPC, extend `GrpcBackendUnavailableKind`. Avoid bare `anyhow!()` for new paths that need cause/direction attribution.
+3. **Walk `source()` in the classifier**, not the Display string. Add a typed downcast for the new error type before extending the substring fallback.
+4. **Test the typed kind, not the message.** A regression test that wraps the typed error in `.context()` and re-derives the class is more robust than asserting the human-readable message format.
+
+## Example log output
 
 When a backend connection times out, the `TransactionSummary` JSON includes:
 
 ```json
 {
-  "timestamp_received": "2026-03-26T12:00:00.000Z",
+  "timestamp_received": "2026-04-28T12:00:00.000Z",
   "client_ip": "10.0.0.1",
   "http_method": "GET",
   "request_path": "/api/v1/users",
-  "backend_status": 502,
-  "error_class": "ConnectionTimeout",
-  "latency_ms": 30000,
-  "proxy_id": "abc123"
+  "response_status_code": 502,
+  "error_class": "connection_timeout",
+  "latency_total_ms": 30000.0
 }
 ```
 
-For a successful request, `error_class` is omitted entirely:
+For a successful request, `error_class` is omitted entirely (skipped via `#[serde(skip_serializing_if = "Option::is_none")]`).
+
+For a TCP/DTLS session that the backend tore down mid-relay:
 
 ```json
 {
-  "timestamp_received": "2026-03-26T12:00:00.000Z",
+  "proxy_id": "abc123",
   "client_ip": "10.0.0.1",
-  "http_method": "GET",
-  "request_path": "/api/v1/users",
-  "backend_status": 200,
-  "latency_ms": 15,
-  "proxy_id": "abc123"
+  "protocol": "tcp_tls",
+  "duration_ms": 1234.5,
+  "bytes_sent": 65536,
+  "bytes_received": 0,
+  "connection_error": "Backend TLS handshake failed to 10.0.2.10:8443: alert: bad_certificate",
+  "error_class": "tls_error",
+  "disconnect_direction": "backend_to_client",
+  "disconnect_cause": "backend_error"
 }
 ```
 
-## Protocol Coverage
+## Debugging guide
 
-Error classification is wired into all proxy protocols:
+Refer to the canonical-taxonomy table above for what each class means. A few class-specific operational notes:
 
-| Protocol | Summary Type | Error Classification | Classifier |
-|---|---|---|---|
-| HTTP/1.1 | `TransactionSummary` | Full (14 error classes) | `classify_reqwest_error()` |
-| HTTP/2 | `TransactionSummary` | Full (14 error classes) | `classify_reqwest_error()` |
-| HTTP/3 (QUIC) | `TransactionSummary` | Full (14 error classes) | `classify_reqwest_error()` |
-| gRPC / gRPCs | `TransactionSummary` | Full (via gRPC error mapping) | `classify_grpc_proxy_error()` |
-| WebSocket / WSS | `TransactionSummary` | Full (connection-phase errors) | `classify_boxed_error()` |
-| TCP / TCP+TLS | `StreamTransactionSummary` | Field available (`error_class`) | Classified from `anyhow::Error` context |
-| UDP / DTLS | `StreamTransactionSummary` | Field available (`error_class`) | Classified from `anyhow::Error` context |
+- **`ConnectionPoolError`** — pool exhaustion. Increase `FERRUM_POOL_MAX_IDLE_PER_HOST` or per-proxy `pool_idle_timeout`.
+- **`PortExhaustion`** — EADDRNOTAVAIL. Widen the port range with `sysctl net.ipv4.ip_local_port_range="1024 65535"`, enable `net.ipv4.tcp_tw_reuse=1`, and reduce idle pool timeouts (`FERRUM_POOL_IDLE_TIMEOUT_SECONDS`). Monitor via the `port_exhaustion_events` counter on `GET /overload`.
+- **`TlsError`** — for self-signed certs in development, set `FERRUM_TLS_NO_VERIFY=true`. For mTLS backends, verify the client certificate and CA chain. The typed `StreamSetupKind::FrontendTlsHandshake` vs `BackendTlsHandshake`/`BackendDtlsHandshake` tells you which side failed without inspecting the message.
+- **`GracefulRemoteClose`** — informational, not an error. The peer closed the session cleanly. Do not alert on this.
+- **`ClientDisconnect`** — the client (not the backend) dropped the connection. Often benign (user navigated away). High rates may indicate aggressive client-side timeouts.
 
-### Per-Error-Class Protocol Applicability
+## Reading material
 
-Not all error classes apply to all protocols equally:
-
-| Error Class | HTTP | gRPC | HTTP/3 | WebSocket | TCP/UDP |
-|---|:---:|:---:|:---:|:---:|:---:|
-| `ConnectionTimeout` | Yes | Yes | Yes | Yes | Yes |
-| `ConnectionRefused` | Yes | Yes | Yes | Yes | Yes |
-| `ConnectionReset` | Yes | — | Yes | Yes | Yes |
-| `ConnectionClosed` | Yes | — | Yes | Yes | Yes |
-| `DnsLookupError` | Yes | Yes | Yes | Yes | Yes |
-| `TlsError` | Yes | Yes | Yes | Yes | Yes |
-| `ReadWriteTimeout` | Yes | Yes | Yes | — | — |
-| `ClientDisconnect` | Yes | — | — | — | — |
-| `ProtocolError` | Yes | Yes | Yes | — | — |
-| `ResponseBodyTooLarge` | Yes | — | Yes | — | — |
-| `RequestBodyTooLarge` | Yes | — | — | — | — |
-| `ConnectionPoolError` | Yes | — | — | — | — |
-| `PortExhaustion` | Yes | Yes | Yes | Yes | Yes |
-| `RequestError` | Yes | Yes | Yes | Yes | — |
-
-**Notes:**
-- gRPC uses hyper's HTTP/2 client (not reqwest), so its error classification maps from `GrpcProxyError` variants which carry enough context to distinguish timeout, TLS, refused, and protocol errors.
-- WebSocket errors are classified during the backend connection phase (before the upgrade response — 101 for HTTP/1.1, 200 OK for HTTP/2 Extended CONNECT). Once the connection is upgraded, errors occur at the frame level and are not classified (the connection is already established). `ReadWriteTimeout` does not apply because WebSocket connections are long-lived and use connect-phase timeouts only.
-- TCP/UDP streams don't have request/response semantics, so body size limits and client disconnect don't apply. Their primary error classes are connection-level: timeout, refused, reset, DNS, and TLS.
-
-## Implementation Details
-
-Error classification is implemented in `src/retry.rs`:
-
-- `ErrorClass` enum — 14 variants covering the full spectrum of gateway-level failures.
-- `classify_reqwest_error()` — inspects the `reqwest::Error` chain (connect errors, timeout, TLS, DNS, reset, etc.) and returns the appropriate `ErrorClass`. Used by HTTP/1.1, HTTP/2, and HTTP/3 paths.
-- `classify_grpc_proxy_error()` — maps `GrpcProxyError` variants (timeout, unavailable, internal) into `ErrorClass`. Inspects the error message to further distinguish TLS, connection refused, protocol, and DNS errors.
-- `classify_boxed_error()` — inspects generic `Box<dyn Error>` by its Display/Debug representation. Used by the WebSocket path where errors come from `tokio-tungstenite` rather than reqwest.
-- All classification functions are only called when the backend request fails, keeping the hot path allocation-free.
+- [`src/retry.rs`](../src/retry.rs) — `ErrorClass`, `request_reached_wire`, `error_class_log_kind`, `classify_*` functions
+- [`src/proxy/stream_error.rs`](../src/proxy/stream_error.rs) — typed stream-family error wrapper
+- [`src/proxy/grpc_proxy.rs`](../src/proxy/grpc_proxy.rs) — `GrpcProxyError`, `GrpcBackendUnavailableKind`
+- [`src/proxy/tcp_proxy.rs`](../src/proxy/tcp_proxy.rs) — `pre_copy_disconnect_cause`, `pre_copy_disconnect_direction`
+- [`src/proxy/udp_proxy.rs`](../src/proxy/udp_proxy.rs) — `dtls_disconnect_cause`, `dtls_disconnect_direction`
+- [`src/http3/client.rs`](../src/http3/client.rs) — typed `H3PoolError` with `request_on_wire()` body-on-wire signal
+- [`src/proxy/http2_pool.rs`](../src/proxy/http2_pool.rs) — `Http2PoolError` typed classifier (exemplary template)

@@ -411,10 +411,10 @@ impl GrpcPoolManager {
             )
             .await
             .map_err(|e| {
-                GrpcProxyError::BackendUnavailable(format!(
-                    "DNS resolution failed for {}: {}",
-                    host, e
-                ))
+                GrpcProxyError::backend_unavailable(
+                    GrpcBackendUnavailableKind::DnsResolution,
+                    format!("DNS resolution failed for {}: {}", host, e),
+                )
             })?;
 
         // Construct SocketAddr from the resolved IpAddr + port directly.
@@ -456,7 +456,11 @@ impl GrpcPoolManager {
             } else {
                 warn!("gRPC: failed to connect to backend {}: {}", addr, e);
             }
-            GrpcProxyError::BackendUnavailable(format!("Connection failed: {}", e))
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::Connect,
+                format!("Connection failed: {}", e),
+                e,
+            )
         })?;
 
         // Disable Nagle for lower latency
@@ -540,7 +544,11 @@ impl GrpcPoolManager {
         let builder = Self::build_h2_builder(pool_config);
 
         let (sender, conn) = builder.handshake(io).await.map_err(|e| {
-            GrpcProxyError::BackendUnavailable(format!("h2c handshake failed: {}", e))
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2cHandshake,
+                format!("h2c handshake failed: {}", e),
+                e,
+            )
         })?;
 
         // Spawn the connection driver
@@ -567,18 +575,29 @@ impl GrpcPoolManager {
         let tls_config = self.get_tls_config(proxy)?;
         let connector = TlsConnector::from(tls_config);
         let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
-            GrpcProxyError::BackendUnavailable(format!("Invalid server name: {}", e))
+            GrpcProxyError::backend_unavailable(
+                GrpcBackendUnavailableKind::InvalidServerName,
+                format!("Invalid server name: {}", e),
+            )
         })?;
 
         let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-            GrpcProxyError::BackendUnavailable(format!("TLS handshake failed: {}", e))
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::TlsHandshake,
+                format!("TLS handshake failed: {}", e),
+                e,
+            )
         })?;
 
         let io = TokioIo::new(tls_stream);
         let builder = Self::build_h2_builder(pool_config);
 
         let (sender, conn) = builder.handshake(io).await.map_err(|e| {
-            GrpcProxyError::BackendUnavailable(format!("h2 handshake failed: {}", e))
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2Handshake,
+                format!("h2 handshake failed: {}", e),
+                e,
+            )
         })?;
 
         // Spawn the connection driver
@@ -634,10 +653,65 @@ pub enum GrpcTimeoutKind {
     Read,
 }
 
+/// Why a gRPC backend connection failed.
+///
+/// Attached to [`GrpcProxyError::BackendUnavailable`] so the classifier
+/// ([`crate::retry::classify_grpc_proxy_error`]) reads the cause directly
+/// from the typed kind instead of substring-matching the error message —
+/// the legacy approach that broke whenever `tonic`/`hyper` reworded its
+/// errors.
+///
+/// **Adding a new variant**: extend [`GrpcBackendUnavailableKind`], update
+/// the classifier match arm, and pass the new kind at every relevant
+/// construction site. Drift between construction site and classifier is
+/// now a compile error rather than a silent miscategorisation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcBackendUnavailableKind {
+    /// DNS resolution failed for the backend hostname. Maps to
+    /// [`crate::retry::ErrorClass::DnsLookupError`].
+    DnsResolution,
+    /// TCP connect refused / failed (post-DNS, pre-handshake). Maps to
+    /// [`crate::retry::ErrorClass::ConnectionRefused`] (or
+    /// `ConnectionTimeout` when wrapped via the timeout variant — see
+    /// [`GrpcTimeoutKind::Connect`]).
+    Connect,
+    /// rustls TLS handshake failed (e.g., certificate verification, ALPN
+    /// mismatch, alert from peer). Maps to
+    /// [`crate::retry::ErrorClass::TlsError`].
+    TlsHandshake,
+    /// HTTP/2 handshake failed over an established TLS connection (post-ALPN
+    /// `h2`). Maps to [`crate::retry::ErrorClass::TlsError`] because the
+    /// handshake error is rooted in the secure transport setup.
+    H2Handshake,
+    /// HTTP/2 cleartext (h2c) handshake failed (no TLS). Maps to
+    /// [`crate::retry::ErrorClass::ProtocolError`] — the wire reached the
+    /// backend but the H2 handshake failed.
+    H2cHandshake,
+    /// `rustls::pki_types::ServerName::try_from` rejected the host. Maps to
+    /// [`crate::retry::ErrorClass::DnsLookupError`] because the failure is
+    /// rooted in the configured/looked-up name, before any wire activity.
+    InvalidServerName,
+    /// The backend rejected an outbound request after the connection was
+    /// established (e.g., `hyper::Error` from `send_request`). Maps to
+    /// [`crate::retry::ErrorClass::ConnectionRefused`] when no more specific
+    /// kind applies.
+    BackendRequest,
+}
+
 /// Errors specific to gRPC proxying.
+///
+/// `BackendUnavailable` carries a typed [`GrpcBackendUnavailableKind`] and
+/// an optional source so the classifier can downcast typed errors
+/// (`io::Error`, `hyper::Error`, `rustls::Error`) instead of formatting and
+/// substring-matching the message. Construction sites attach the source via
+/// [`GrpcProxyError::backend_unavailable`].
 #[derive(Debug)]
 pub enum GrpcProxyError {
-    BackendUnavailable(String),
+    BackendUnavailable {
+        kind: GrpcBackendUnavailableKind,
+        message: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    },
     BackendTimeout {
         kind: GrpcTimeoutKind,
         message: String,
@@ -646,18 +720,55 @@ pub enum GrpcProxyError {
     Internal(String),
 }
 
+impl GrpcProxyError {
+    /// Build a `BackendUnavailable` variant with no typed source.
+    pub fn backend_unavailable(kind: GrpcBackendUnavailableKind, message: String) -> Self {
+        Self::BackendUnavailable {
+            kind,
+            message,
+            source: None,
+        }
+    }
+
+    /// Build a `BackendUnavailable` variant with a typed source for chain
+    /// walkers (port-exhaustion detection, classification).
+    pub fn backend_unavailable_with_source<E>(
+        kind: GrpcBackendUnavailableKind,
+        message: String,
+        source: E,
+    ) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::BackendUnavailable {
+            kind,
+            message,
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
 impl std::fmt::Display for GrpcProxyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BackendUnavailable(msg) | Self::ResourceExhausted(msg) | Self::Internal(msg) => {
-                write!(f, "{}", msg)
-            }
+            Self::BackendUnavailable { message, .. }
+            | Self::ResourceExhausted(message)
+            | Self::Internal(message) => write!(f, "{}", message),
             Self::BackendTimeout { message, .. } => write!(f, "{}", message),
         }
     }
 }
 
-impl std::error::Error for GrpcProxyError {}
+impl std::error::Error for GrpcProxyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendUnavailable { source, .. } => {
+                source.as_deref().map(|s| s as &dyn std::error::Error)
+            }
+            _ => None,
+        }
+    }
+}
 
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
@@ -967,7 +1078,11 @@ pub async fn proxy_grpc_request_streaming(
                     ));
                 }
                 error!("gRPC backend request failed (streaming body): {}", e);
-                GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
+                GrpcProxyError::backend_unavailable_with_source(
+                    GrpcBackendUnavailableKind::BackendRequest,
+                    format!("Backend request failed: {}", e),
+                    e,
+                )
             })?
     } else {
         sender.send_request(backend_req).await.map_err(|e| {
@@ -978,7 +1093,11 @@ pub async fn proxy_grpc_request_streaming(
                 ));
             }
             error!("gRPC backend request failed (streaming body): {}", e);
-            GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::BackendRequest,
+                format!("Backend request failed: {}", e),
+                e,
+            )
         })?
     };
 
@@ -1137,7 +1256,11 @@ pub(crate) async fn proxy_grpc_request_core(
                 message: format!("Backend timeout: {}", e),
             }
         } else {
-            GrpcProxyError::BackendUnavailable(format!("Backend error: {}", e))
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::BackendRequest,
+                format!("Backend error: {}", e),
+                e,
+            )
         }
     };
     let response = if let Some(timeout_ms) = effective_timeout_ms {

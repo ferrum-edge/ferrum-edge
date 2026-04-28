@@ -180,7 +180,8 @@ pub fn is_port_exhaustion(e: &(dyn std::error::Error + 'static)) -> bool {
 
 /// Returns `true` if a string representation of an error indicates port
 /// exhaustion (EADDRNOTAVAIL). Used for error types that have already been
-/// stringified (e.g. `GrpcProxyError::BackendUnavailable(String)`).
+/// stringified (legacy fallback; the typed
+/// [`is_port_exhaustion`] walker is preferred).
 pub fn is_port_exhaustion_message(msg: &str) -> bool {
     msg.contains("address not available")
         || msg.contains("os error 99")
@@ -188,33 +189,77 @@ pub fn is_port_exhaustion_message(msg: &str) -> bool {
         || msg.contains("os error 10049")
 }
 
+/// Map a [`crate::proxy::stream_error::StreamSetupKind`] to the
+/// [`ErrorClass`] it corresponds to.
+///
+/// Used by [`classify_boxed_error`] (and by
+/// [`crate::proxy::tcp_proxy::classify_stream_error`]) when a
+/// [`crate::proxy::stream_error::StreamSetupError`] surfaces in the source
+/// chain, so the error class agrees with what the cause/direction mappers
+/// already derived from the same kind. Frontend TLS / backend TLS / DTLS
+/// handshakes share the [`ErrorClass::TlsError`] class regardless of side
+/// (the side info lives on the typed kind itself).
+fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind) -> ErrorClass {
+    use crate::proxy::stream_error::StreamSetupKind;
+    match kind {
+        StreamSetupKind::FrontendTlsHandshake
+        | StreamSetupKind::BackendTlsHandshake
+        | StreamSetupKind::BackendDtlsHandshake => ErrorClass::TlsError,
+        // Plugin reject (umbrella for ACL/policy/throttle) is a
+        // gateway-side decision, not a transport error.
+        StreamSetupKind::RejectedByPlugin | StreamSetupKind::NoHealthyTargets => {
+            ErrorClass::RequestError
+        }
+    }
+}
+
 /// Classify a gRPC proxy error into an `ErrorClass`.
 ///
-/// Maps `GrpcProxyError` variants (which carry message strings describing
-/// the failure) into the appropriate `ErrorClass`. Called on the error path only.
+/// **Typed-kind first.** `BackendUnavailable` carries a
+/// [`crate::proxy::grpc_proxy::GrpcBackendUnavailableKind`] that names the
+/// failure mode at construction time, so the classifier reads the cause
+/// directly from the kind without inspecting the human-readable message —
+/// the legacy substring-matching approach silently miscategorised any error
+/// whose wording drifted in `tonic`/`hyper`.
+///
+/// Port-exhaustion is detected via [`is_port_exhaustion`], which walks the
+/// typed `source()` chain (`io::Error::raw_os_error == EADDRNOTAVAIL` on the
+/// underlying syscall failure). The legacy `is_port_exhaustion_message`
+/// fallback is retained as a defence-in-depth for sources that don't
+/// surface a typed `io::Error`. Called on the error path only.
 pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -> ErrorClass {
-    use crate::proxy::grpc_proxy::{GrpcProxyError, GrpcTimeoutKind};
+    use crate::proxy::grpc_proxy::{GrpcBackendUnavailableKind, GrpcProxyError, GrpcTimeoutKind};
+
     match e {
         GrpcProxyError::BackendTimeout { kind, .. } => match kind {
             GrpcTimeoutKind::Connect => ErrorClass::ConnectionTimeout,
             GrpcTimeoutKind::Read => ErrorClass::ReadWriteTimeout,
         },
-        GrpcProxyError::BackendUnavailable(msg) => {
-            if is_port_exhaustion_message(msg) {
-                ErrorClass::PortExhaustion
-            } else if msg.contains("TLS handshake failed")
-                || msg.contains("h2 handshake failed")
-                || msg.contains("certificate")
+        GrpcProxyError::BackendUnavailable {
+            kind,
+            message,
+            source,
+        } => {
+            // Typed source walk for port exhaustion (EADDRNOTAVAIL) — this
+            // covers io::Error wrapped inside hyper::Error, rustls::Error,
+            // etc. The message-substring fallback is kept for sources that
+            // never expose a typed io::Error (e.g., rustls config errors).
+            if let Some(src) = source.as_deref()
+                && is_port_exhaustion(src)
             {
-                ErrorClass::TlsError
-            } else if msg.contains("Connection refused") {
-                ErrorClass::ConnectionRefused
-            } else if msg.contains("h2c handshake failed") {
-                ErrorClass::ProtocolError
-            } else if msg.contains("Invalid server name") || msg.contains("DNS resolution") {
-                ErrorClass::DnsLookupError
-            } else {
-                ErrorClass::ConnectionRefused
+                return ErrorClass::PortExhaustion;
+            }
+            if is_port_exhaustion_message(message) {
+                return ErrorClass::PortExhaustion;
+            }
+            match kind {
+                GrpcBackendUnavailableKind::TlsHandshake
+                | GrpcBackendUnavailableKind::H2Handshake => ErrorClass::TlsError,
+                GrpcBackendUnavailableKind::H2cHandshake => ErrorClass::ProtocolError,
+                GrpcBackendUnavailableKind::DnsResolution
+                | GrpcBackendUnavailableKind::InvalidServerName => ErrorClass::DnsLookupError,
+                GrpcBackendUnavailableKind::Connect
+                | GrpcBackendUnavailableKind::BackendRequest => ErrorClass::ConnectionRefused,
             }
         }
         GrpcProxyError::ResourceExhausted(_) => ErrorClass::RequestError,
@@ -223,13 +268,54 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
 }
 
 /// Classify a generic boxed error (e.g. from WebSocket connections) into an
-/// `ErrorClass` by inspecting its Display and Debug representations. Called
-/// on the error path only.
+/// `ErrorClass` by walking its `source()` chain for typed errors and falling
+/// back to Display/Debug substring matching. Called on the error path only.
+///
+/// **Source chain order (typed-first):**
+/// 1. [`crate::proxy::stream_error::StreamSetupError`] — typed kind from a
+///    stream-family construction site. Frontend TLS / backend TLS / DTLS
+///    handshake / plugin reject / no-healthy-targets get a class without
+///    inspecting the message string.
+/// 2. `tokio_tungstenite::tungstenite::Error::ConnectionClosed` / `AlreadyClosed`
+///    — peer sent a clean RFC 6455 Close frame (or we wrote after one).
+///    Maps to [`ErrorClass::GracefulRemoteClose`] so WebSocket sessions
+///    that ended cleanly don't inflate transport-failure metrics.
+/// 3. `tungstenite::Error::Protocol` — RFC 6455 protocol-level failure.
+///    Maps to [`ErrorClass::ProtocolError`].
+/// 4. `io::Error` — kind / raw_os_error → connect/reset/closed/timeout/EADDRNOTAVAIL.
+/// 5. `hyper::Error` — `is_timeout` / `is_incomplete_message`.
+///
+/// The Display/Debug substring fallbacks below remain as defence-in-depth
+/// for legacy error types that don't expose typed source chains; new code
+/// should prefer to add a typed downcast here rather than extending the
+/// substring set.
 pub fn classify_boxed_error(e: &(dyn std::error::Error + Send + Sync + 'static)) -> ErrorClass {
-    // Walk the source chain for typed io::Error / hyper::Error first so
-    // classification is stable regardless of Display wording.
+    // Walk the source chain for typed errors first so classification is
+    // stable regardless of Display wording.
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(err) = current {
+        // Typed stream-family setup error — see `proxy::stream_error`.
+        if let Some(setup_err) = err.downcast_ref::<crate::proxy::stream_error::StreamSetupError>()
+        {
+            return classify_stream_setup_kind(setup_err.kind);
+        }
+        // tokio-tungstenite WebSocket errors. `ConnectionClosed` and
+        // `AlreadyClosed` represent an orderly RFC 6455 close (the peer
+        // sent a Close frame, or we wrote after observing one); these are
+        // not transport failures and must not pollute connection-error
+        // dashboards.
+        if let Some(ws_err) = err.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
+            use tokio_tungstenite::tungstenite::Error as WsError;
+            match ws_err {
+                WsError::ConnectionClosed | WsError::AlreadyClosed => {
+                    return ErrorClass::GracefulRemoteClose;
+                }
+                WsError::Protocol(_) => return ErrorClass::ProtocolError,
+                // Other WsError variants (Io, Tls, Http, Url, etc.) wrap
+                // typed sources we keep walking for below.
+                _ => {}
+            }
+        }
         if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
             match io_err.kind() {
                 std::io::ErrorKind::TimedOut => return ErrorClass::ReadWriteTimeout,

@@ -1517,7 +1517,7 @@ where
             // misclassification mismatch.
             let is_connection_error = matches!(
                 &result,
-                Err(grpc_proxy::GrpcProxyError::BackendUnavailable(_))
+                Err(grpc_proxy::GrpcProxyError::BackendUnavailable { .. })
                     | Err(grpc_proxy::GrpcProxyError::BackendTimeout {
                         kind: grpc_proxy::GrpcTimeoutKind::Connect,
                         ..
@@ -1871,7 +1871,7 @@ where
                 grpc_proxy::GrpcProxyError::Internal(_) => {
                     (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
                 }
-                grpc_proxy::GrpcProxyError::BackendUnavailable(_) => {
+                grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                     (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                 }
             };

@@ -39,6 +39,7 @@ pub mod grpc_proxy;
 pub mod headers;
 pub mod http2_pool;
 pub mod sni;
+pub mod stream_error;
 pub mod stream_listener;
 pub mod tcp_proxy;
 pub mod udp_batch;
@@ -5810,7 +5811,7 @@ async fn handle_proxy_request_inner(
                 // Classify the error and determine if retryable
                 let is_connection_error = matches!(
                     &grpc_result,
-                    Err(GrpcProxyError::BackendUnavailable(_))
+                    Err(GrpcProxyError::BackendUnavailable { .. })
                         | Err(GrpcProxyError::BackendTimeout {
                             kind: grpc_proxy::GrpcTimeoutKind::Connect,
                             ..
@@ -6387,7 +6388,7 @@ async fn handle_proxy_request_inner(
                     state.overload.record_port_exhaustion();
                 }
                 let (grpc_code, original_msg) = match &e {
-                    GrpcProxyError::BackendUnavailable(m) => {
+                    GrpcProxyError::BackendUnavailable { message: m, .. } => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
                     }
                     GrpcProxyError::BackendTimeout { message: m, .. } => {

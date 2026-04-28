@@ -257,7 +257,10 @@ fn test_grpc_body_read_timeout_classified() {
 
 #[test]
 fn test_grpc_tls_handshake_failure_classified() {
-    let err = GrpcProxyError::BackendUnavailable(
+    // Construction site emits TlsHandshake kind; classifier reads it directly
+    // — no substring match against the (now informational-only) message.
+    let err = GrpcProxyError::backend_unavailable(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::TlsHandshake,
         "TLS handshake failed: certificate verify failed".into(),
     );
     assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::TlsError);
@@ -265,13 +268,19 @@ fn test_grpc_tls_handshake_failure_classified() {
 
 #[test]
 fn test_grpc_h2_handshake_failure_classified() {
-    let err = GrpcProxyError::BackendUnavailable("h2 handshake failed: protocol error".into());
+    let err = GrpcProxyError::backend_unavailable(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::H2Handshake,
+        "h2 handshake failed: protocol error".into(),
+    );
     assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::TlsError);
 }
 
 #[test]
 fn test_grpc_connection_refused_classified() {
-    let err = GrpcProxyError::BackendUnavailable("Connection refused: connection refused".into());
+    let err = GrpcProxyError::backend_unavailable(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::Connect,
+        "Connection refused: connection refused".into(),
+    );
     assert_eq!(
         classify_grpc_proxy_error(&err),
         ErrorClass::ConnectionRefused
@@ -280,22 +289,53 @@ fn test_grpc_connection_refused_classified() {
 
 #[test]
 fn test_grpc_h2c_handshake_failure_classified() {
-    let err = GrpcProxyError::BackendUnavailable("h2c handshake failed: connection reset".into());
+    let err = GrpcProxyError::backend_unavailable(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::H2cHandshake,
+        "h2c handshake failed: connection reset".into(),
+    );
     assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::ProtocolError);
 }
 
 #[test]
 fn test_grpc_invalid_server_name_classified() {
-    let err = GrpcProxyError::BackendUnavailable("Invalid server name: invalid dnsname".into());
+    let err = GrpcProxyError::backend_unavailable(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::InvalidServerName,
+        "Invalid server name: invalid dnsname".into(),
+    );
     assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::DnsLookupError);
 }
 
 #[test]
 fn test_grpc_generic_unavailable_classified() {
-    let err = GrpcProxyError::BackendUnavailable("Backend error: something went wrong".into());
+    // BackendRequest is the kind used for hyper::Error / send_request failures
+    // — the post-handshake "we got on the wire but the request failed" bucket.
+    let err = GrpcProxyError::backend_unavailable(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::BackendRequest,
+        "Backend error: something went wrong".into(),
+    );
     assert_eq!(
         classify_grpc_proxy_error(&err),
         ErrorClass::ConnectionRefused
+    );
+}
+
+#[test]
+fn test_grpc_classifier_ignores_substring_drift_in_message() {
+    // Regression: the legacy substring-matching classifier returned
+    // `TlsError` for ANY message containing "TLS handshake failed", even when
+    // attached to the wrong kind. The typed classifier must read the kind,
+    // not the message — so a Connect kind with an arbitrarily-worded
+    // message still classifies as ConnectionRefused.
+    let err = GrpcProxyError::backend_unavailable(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::Connect,
+        // Adversarial wording mentioning "TLS" and "handshake" — must NOT
+        // mislead the typed classifier.
+        "Connection failed: TLS handshake failed by accident".into(),
+    );
+    assert_eq!(
+        classify_grpc_proxy_error(&err),
+        ErrorClass::ConnectionRefused,
+        "typed kind must override misleading message wording"
     );
 }
 
@@ -435,10 +475,31 @@ fn test_is_port_exhaustion_message_false() {
 
 #[test]
 fn test_grpc_port_exhaustion_classified() {
-    let err = GrpcProxyError::BackendUnavailable(
+    // Port exhaustion is detected via either typed io::Error source walk
+    // OR the message-substring fallback. This test exercises the message
+    // path (no typed source attached).
+    let err = GrpcProxyError::backend_unavailable(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::Connect,
         "Connection failed: Can't assign requested address (os error 99)".into(),
     );
     assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::PortExhaustion);
+}
+
+#[test]
+fn test_grpc_port_exhaustion_via_typed_source() {
+    // The typed io::Error attached as a source must be discoverable by the
+    // chain walker even when the message has no port-exhaustion wording.
+    let io_err = std::io::Error::from_raw_os_error(99);
+    let err = GrpcProxyError::backend_unavailable_with_source(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::Connect,
+        "Connection failed".into(),
+        io_err,
+    );
+    assert_eq!(
+        classify_grpc_proxy_error(&err),
+        ErrorClass::PortExhaustion,
+        "typed io::Error source must drive port-exhaustion classification"
+    );
 }
 
 #[test]
@@ -482,18 +543,13 @@ fn test_is_port_exhaustion_message_windows() {
 
 #[test]
 fn test_grpc_dns_failure_classified_as_dns_error() {
-    // The H2/gRPC pools now emit "DNS resolution failed for {host}: {err}"
-    // when dns_cache.resolve() fails. Verify the classifier catches this.
-    let err = GrpcProxyError::BackendUnavailable(
+    // The H2/gRPC pools attach DnsResolution kind when dns_cache.resolve()
+    // fails — the typed kind drives classification regardless of message
+    // wording.
+    let err = GrpcProxyError::backend_unavailable(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::DnsResolution,
         "DNS resolution failed for backend.example.com: no record found".into(),
     );
-    assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::DnsLookupError);
-}
-
-#[test]
-fn test_grpc_dns_failure_original_pattern_still_works() {
-    // The original pattern from proxy/mod.rs gRPC dispatch should still work.
-    let err = GrpcProxyError::BackendUnavailable("DNS resolution for backend failed".into());
     assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::DnsLookupError);
 }
 
@@ -623,4 +679,84 @@ fn test_classify_body_error_walks_source_chain_to_io_error() {
     let (class, disconnected) = classify_body_error(&wrapped);
     assert_eq!(class, ErrorClass::ConnectionClosed);
     assert!(!disconnected);
+}
+
+// --- Typed StreamSetupError classification (Gap 2 + Gap 4) ---
+
+#[test]
+fn test_classify_boxed_error_typed_frontend_tls_error() {
+    use ferrum_edge::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamSetupError::new(
+        StreamSetupKind::FrontendTlsHandshake,
+        "from 1.2.3.4:5678",
+    ));
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::TlsError);
+}
+
+#[test]
+fn test_classify_boxed_error_typed_backend_dtls_error() {
+    use ferrum_edge::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamSetupError::new(
+        StreamSetupKind::BackendDtlsHandshake,
+        ": certificate verify failed",
+    ));
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::TlsError);
+}
+
+#[test]
+fn test_classify_boxed_error_typed_no_healthy_targets() {
+    use ferrum_edge::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamSetupError::new(
+        StreamSetupKind::NoHealthyTargets,
+        "for upstream foo",
+    ));
+    // RequestError is the umbrella class for gateway-side rejections that
+    // weren't TLS/DNS/connect failures. The typed kind is what carries the
+    // backend-vs-client attribution downstream.
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::RequestError);
+}
+
+#[test]
+fn test_classify_boxed_error_typed_kind_survives_anyhow_context() {
+    // Construction sites convert StreamSetupError to anyhow::Error via
+    // .into() and may further .context(...) it before reaching the cause
+    // mapper. The downcast must keep working through both layers.
+    use ferrum_edge::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+    let original: anyhow::Error = StreamSetupError::new(
+        StreamSetupKind::BackendTlsHandshake,
+        "to backend.example.com:8443",
+    )
+    .into();
+    let wrapped = original.context("dispatch failed");
+    assert_eq!(classify_boxed_error(wrapped.as_ref()), ErrorClass::TlsError);
+}
+
+// --- WebSocket graceful close (Gap 3) ---
+
+#[test]
+fn test_classify_boxed_error_ws_connection_closed_is_graceful() {
+    // RFC 6455 normal closure surfaces as tungstenite::Error::ConnectionClosed.
+    // Must classify as GracefulRemoteClose so WS sessions that ended cleanly
+    // don't pollute connection-error metrics.
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(tokio_tungstenite::tungstenite::Error::ConnectionClosed);
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::GracefulRemoteClose);
+}
+
+#[test]
+fn test_classify_boxed_error_ws_already_closed_is_graceful() {
+    // Writing after a Close frame surfaces as Error::AlreadyClosed —
+    // semantically the same orderly close.
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(tokio_tungstenite::tungstenite::Error::AlreadyClosed);
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::GracefulRemoteClose);
+}
+
+#[test]
+fn test_classify_boxed_error_ws_protocol_error_is_protocol_class() {
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(
+        tokio_tungstenite::tungstenite::Error::Protocol(ProtocolError::HandshakeIncomplete),
+    );
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::ProtocolError);
 }
