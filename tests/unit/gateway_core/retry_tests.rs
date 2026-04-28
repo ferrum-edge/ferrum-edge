@@ -288,12 +288,22 @@ fn test_grpc_connection_refused_classified() {
 }
 
 #[test]
-fn test_grpc_h2c_handshake_failure_classified() {
+fn test_grpc_h2c_handshake_failure_classified_as_pre_wire() {
+    // h2c handshake fails BEFORE any HTTP/2 stream is opened — request
+    // bytes never reach the backend's application layer. Must classify
+    // as a pre-wire class so request_reached_wire returns false and
+    // the connect-failure retry can replay regardless of method
+    // idempotency, in agreement with is_connect_class().
     let err = GrpcProxyError::backend_unavailable(
         ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::H2cHandshake,
         "h2c handshake failed: connection reset".into(),
     );
-    assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::ProtocolError);
+    let class = classify_grpc_proxy_error(&err);
+    assert_eq!(class, ErrorClass::ConnectionRefused);
+    assert!(
+        !ferrum_edge::retry::request_reached_wire(class),
+        "H2cHandshake must be pre-wire to agree with is_connect_class"
+    );
 }
 
 #[test]
@@ -349,6 +359,64 @@ fn test_grpc_kind_is_connect_class_partitions_correctly() {
         !K::BackendRequest.is_connect_class(),
         "BackendRequest is post-handshake — must not be a connect-class kind"
     );
+}
+
+#[test]
+fn test_every_connect_class_kind_classifies_as_pre_wire() {
+    // STRUCTURAL CONTRACT: `is_connect_class()` and the unified
+    // `request_reached_wire` boundary must agree for every variant. If a
+    // kind is in the connect-class predicate (gRPC retry loops fire
+    // `retry_on_connect_failure` for it), its classified `ErrorClass` MUST
+    // satisfy `!request_reached_wire(class)` — otherwise the retry path
+    // bypasses `retry_on_methods` for a post-wire failure and could replay
+    // non-idempotent POSTs.
+    //
+    // This test enumerates EVERY `GrpcBackendUnavailableKind` variant via
+    // an exhaustive match — adding a new variant is a compile error here
+    // until you decide its connect-class membership AND its classified
+    // ErrorClass, in lockstep.
+    use ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind as K;
+    let all_kinds = [
+        K::DnsResolution,
+        K::Connect,
+        K::TlsHandshake,
+        K::H2Handshake,
+        K::H2cHandshake,
+        K::InvalidServerName,
+        K::BackendRequest,
+    ];
+    // Compile-time exhaustiveness: if a new variant is added, this match
+    // forces an update before tests can compile.
+    for kind in all_kinds {
+        let _exhaustive: () = match kind {
+            K::DnsResolution
+            | K::Connect
+            | K::TlsHandshake
+            | K::H2Handshake
+            | K::H2cHandshake
+            | K::InvalidServerName
+            | K::BackendRequest => (),
+        };
+        let err = GrpcProxyError::backend_unavailable(kind, format!("{kind:?} test"));
+        let class = classify_grpc_proxy_error(&err);
+        if kind.is_connect_class() {
+            assert!(
+                !ferrum_edge::retry::request_reached_wire(class),
+                "{kind:?} is connect-class but classified as {class:?} \
+                 (request_reached_wire={}); the retry-loop predicate would \
+                 fire retry_on_connect_failure for a post-wire failure",
+                ferrum_edge::retry::request_reached_wire(class),
+            );
+        } else {
+            assert!(
+                ferrum_edge::retry::request_reached_wire(class),
+                "{kind:?} is NOT connect-class but classified as {class:?} \
+                 (request_reached_wire=false); operators expect post-wire \
+                 classes for non-connect kinds — connect-class membership \
+                 may need updating",
+            );
+        }
+    }
 }
 
 #[test]

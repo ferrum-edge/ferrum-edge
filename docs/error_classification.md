@@ -85,13 +85,15 @@ The cause/direction mappers walk the chain via `find_stream_setup_error()` — `
 
 | Kind | Class | Notes |
 |---|---|---|
-| `DnsResolution` | `DnsLookupError` | `dns_cache.resolve()` failure |
-| `Connect` | `ConnectionRefused` | TCP connect failed (post-DNS) |
-| `TlsHandshake` | `TlsError` | rustls handshake (TLS path) |
-| `H2Handshake` | `TlsError` | HTTP/2 handshake over TLS |
-| `H2cHandshake` | `ProtocolError` | HTTP/2 cleartext handshake |
-| `InvalidServerName` | `DnsLookupError` | rustls rejected the SNI name |
-| `BackendRequest` | `ConnectionRefused` | hyper `send_request` failed post-handshake |
+| `DnsResolution` | `DnsLookupError` | `dns_cache.resolve()` failure (pre-wire) |
+| `Connect` | `ConnectionRefused` | TCP connect failed, post-DNS (pre-wire) |
+| `TlsHandshake` | `TlsError` | rustls handshake (pre-wire) |
+| `H2Handshake` | `TlsError` | HTTP/2 handshake over TLS (pre-wire) |
+| `H2cHandshake` | `ConnectionRefused` | HTTP/2 cleartext handshake — fails before any stream is opened, so request bytes never reach the application layer (pre-wire) |
+| `InvalidServerName` | `DnsLookupError` | rustls rejected the SNI name (pre-wire) |
+| `BackendRequest` | `ConnectionReset` | hyper `send_request` failed post-handshake — request bytes may already be on the wire, so this is **post-wire** by definition. Excluded from `is_connect_class()` so `retry_on_connect_failure` cannot bypass `retry_on_methods` and replay non-idempotent POSTs |
+
+`GrpcBackendUnavailableKind::is_connect_class()` enumerates the pre-wire kinds; the gRPC and H3→gRPC retry loops use it to decide whether `retry_on_connect_failure` is eligible for a given failure. A regression test (`test_every_connect_class_kind_classifies_as_pre_wire`) enforces the invariant that every connect-class kind classifies to `!request_reached_wire(class)` so the retry-loop predicate and the canonical wire boundary cannot drift.
 
 Construction sites attach a typed `source` so [`is_port_exhaustion`](../src/retry.rs)'s typed `io::Error::raw_os_error == EADDRNOTAVAIL` walk works on every gRPC dispatch path — not just the message-substring fallback.
 

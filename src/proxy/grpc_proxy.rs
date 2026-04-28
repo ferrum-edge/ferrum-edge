@@ -684,8 +684,15 @@ pub enum GrpcBackendUnavailableKind {
     /// handshake error is rooted in the secure transport setup.
     H2Handshake,
     /// HTTP/2 cleartext (h2c) handshake failed (no TLS). Maps to
-    /// [`crate::retry::ErrorClass::ProtocolError`] — the wire reached the
-    /// backend but the H2 handshake failed.
+    /// [`crate::retry::ErrorClass::ConnectionRefused`] — the TCP connection
+    /// was established but the H2 protocol negotiation failed BEFORE any
+    /// stream was opened, so the request never reached the backend's
+    /// application layer. Pre-wire under the unified
+    /// [`crate::retry::request_reached_wire`] boundary, which keeps the
+    /// classifier consistent with [`Self::is_connect_class`] (a regression
+    /// test in `tests/unit/gateway_core/retry_tests.rs` enforces that
+    /// every connect-class kind classifies to `request_reached_wire ==
+    /// false`).
     H2cHandshake,
     /// `rustls::pki_types::ServerName::try_from` rejected the host. Maps to
     /// [`crate::retry::ErrorClass::DnsLookupError`] because the failure is

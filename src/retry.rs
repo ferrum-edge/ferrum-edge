@@ -256,7 +256,16 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
             match kind {
                 GrpcBackendUnavailableKind::TlsHandshake
                 | GrpcBackendUnavailableKind::H2Handshake => ErrorClass::TlsError,
-                GrpcBackendUnavailableKind::H2cHandshake => ErrorClass::ProtocolError,
+                // H2c handshake happens AFTER TCP connect but BEFORE any
+                // HTTP/2 stream is opened — request bytes never reach the
+                // backend's application layer, so this is pre-wire under
+                // the unified `request_reached_wire` boundary. Classify as
+                // ConnectionRefused so `request_reached_wire == false` and
+                // the connect-failure retry can replay regardless of HTTP
+                // method idempotency. (Previous mapping to ProtocolError
+                // disagreed with `is_connect_class` and broke the
+                // single-classifier-boundary invariant.)
+                GrpcBackendUnavailableKind::H2cHandshake => ErrorClass::ConnectionRefused,
                 GrpcBackendUnavailableKind::DnsResolution
                 | GrpcBackendUnavailableKind::InvalidServerName => ErrorClass::DnsLookupError,
                 GrpcBackendUnavailableKind::Connect => ErrorClass::ConnectionRefused,
