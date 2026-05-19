@@ -2354,7 +2354,14 @@ async fn handle_h3_request(
         body_data
     };
 
-    match crate::proxy::run_final_request_body_hooks(&plugins, &proxy_headers, &body_data).await {
+    match crate::proxy::run_final_request_body_hooks(
+        &plugins,
+        Some(&mut ctx),
+        &proxy_headers,
+        &body_data,
+    )
+    .await
+    {
         crate::plugins::PluginResult::Continue => {}
         reject @ crate::plugins::PluginResult::Reject { .. }
         | reject @ crate::plugins::PluginResult::RejectBinary { .. } => {

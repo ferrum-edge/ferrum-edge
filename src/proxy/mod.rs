@@ -1350,11 +1350,19 @@ pub(crate) async fn apply_request_body_plugins(
 
 pub(crate) async fn run_final_request_body_hooks(
     plugins: &[Arc<dyn Plugin>],
+    mut ctx: Option<&mut RequestContext>,
     headers: &HashMap<String, String>,
     body: &[u8],
 ) -> PluginResult {
     for plugin in plugins {
-        match plugin.on_final_request_body(headers, body).await {
+        let result = if let Some(ctx) = ctx.as_deref_mut() {
+            plugin
+                .on_final_request_body_with_context(ctx, headers, body)
+                .await
+        } else {
+            plugin.on_final_request_body(headers, body).await
+        };
+        match result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 return reject;
@@ -8711,6 +8719,8 @@ async fn handle_proxy_request_inner(
     // the right content-type. The gRPC pool uses h2c (plaintext HTTP/2) for
     // `BackendScheme::Http` and TLS+ALPN=h2 for `BackendScheme::Https`.
     if is_grpc_request && proxy.dispatch_kind.is_http_family() {
+        let proxy_headers = proxy_headers.clone();
+        let proxy_headers = &proxy_headers;
         // Honor DestinationRule per-port `connect_timeout_ms` overrides on
         // the gRPC path — the gRPC transport reads
         // `proxy.backend_{host,port,connect_timeout_ms}` directly
@@ -8823,7 +8833,14 @@ async fn handle_proxy_request_inner(
             );
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
-            match run_final_request_body_hooks(&plugins, &hook_headers, &grpc_req_body).await {
+            match run_final_request_body_hooks(
+                &plugins,
+                Some(&mut ctx),
+                &hook_headers,
+                &grpc_req_body,
+            )
+            .await
+            {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
@@ -9768,11 +9785,21 @@ async fn handle_proxy_request_inner(
         && supports_hbone_backend(&state, &proxy, upstream_target.as_deref());
     let mut current_dispatch_h3 =
         supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
+    let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
+    let needs_final_request_body_context = requires_request_body_buffering
+        && plugins
+            .iter()
+            .any(|plugin| plugin.needs_final_request_body_context());
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
+        let mut body_hook_ctx = if needs_final_request_body_context {
+            Some(ctx.clone())
+        } else {
+            None
+        };
         let (mut result, retained_body) = proxy_to_backend(
             &state,
             &proxy,
@@ -9782,6 +9809,7 @@ async fn handle_proxy_request_inner(
             client_request_body,
             upstream_target.as_deref(),
             &plugins,
+            body_hook_ctx.as_mut(),
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
@@ -9790,7 +9818,7 @@ async fn handle_proxy_request_inner(
             is_tls,
             false,
             current_dispatch_h3,
-            &ctx.bytes_sent_observed,
+            &bytes_sent_observed,
             inbound_version,
         )
         .await;
@@ -9915,8 +9943,16 @@ async fn handle_proxy_request_inner(
                     .mark_h3_unsupported(&proxy, current_target.as_deref());
             }
         }
+        if let Some(body_hook_ctx) = body_hook_ctx {
+            ctx.metadata = body_hook_ctx.metadata;
+        }
         (result, current_cb_target_key)
     } else {
+        let mut body_hook_ctx = if needs_final_request_body_context {
+            Some(ctx.clone())
+        } else {
+            None
+        };
         let resp = proxy_to_backend(
             &state,
             &proxy,
@@ -9926,6 +9962,7 @@ async fn handle_proxy_request_inner(
             client_request_body,
             upstream_target.as_deref(),
             &plugins,
+            body_hook_ctx.as_mut(),
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
@@ -9934,11 +9971,14 @@ async fn handle_proxy_request_inner(
             is_tls,
             current_dispatch_hbone,
             current_dispatch_h3,
-            &ctx.bytes_sent_observed,
+            &bytes_sent_observed,
             inbound_version,
         )
         .await
         .0;
+        if let Some(body_hook_ctx) = body_hook_ctx {
+            ctx.metadata = body_hook_ctx.metadata;
+        }
         (resp, cb_target_key.clone())
     };
     let mut response_status = backend_resp.status_code;
@@ -11163,6 +11203,7 @@ async fn proxy_to_backend(
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     #[allow(unused_variables)] plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&mut RequestContext>,
     stream_response: bool,
     requires_request_body_buffering: bool,
     stream_request_body: bool,
@@ -11271,6 +11312,7 @@ async fn proxy_to_backend(
             headers,
             client_request_body,
             plugins,
+            ctx,
             upstream_target,
             client_ip,
             stream_request_body,
@@ -11628,7 +11670,7 @@ async fn proxy_to_backend(
                     std::sync::atomic::Ordering::Release,
                 );
                 let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
-                match run_final_request_body_hooks(plugins, headers, &body_bytes).await {
+                match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -11745,7 +11787,7 @@ async fn proxy_to_backend(
 
                 // Transform request body via plugins (JSON field rename, add, remove, etc.)
                 let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
-                match run_final_request_body_hooks(plugins, headers, &body_bytes).await {
+                match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -13444,6 +13486,7 @@ async fn proxy_to_backend_http3(
     headers: &HashMap<String, String>,
     client_request_body: ClientRequestBody,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&mut RequestContext>,
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
     stream_request_body: bool,
@@ -13840,7 +13883,7 @@ async fn proxy_to_backend_http3(
     ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
 
     let request_body = apply_request_body_plugins(plugins, headers, request_body).await;
-    match run_final_request_body_hooks(plugins, headers, &request_body).await {
+    match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
         PluginResult::Continue => {}
         reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
             return (

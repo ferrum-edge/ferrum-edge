@@ -83,7 +83,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ## Plugin System
 
-- 60 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 61 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Three plugin scopes: **global** (all proxies), **proxy** (single proxy), **proxy_group** (shared across a subset of proxies) — scoped plugins replace global plugins of the same name. Proxy-group plugins share a single instance across all associated proxies, so stateful plugins (e.g., rate_limiting) share counters across the group
@@ -112,6 +112,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Rate Limiting** — per-IP or per-consumer with configurable windows and optional header exposure; supports centralized Redis-backed mode (`sync_mode: "redis"`) for coordinated rate limiting across multiple data plane instances. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`
 - **Request Size Limiting** — per-proxy request body size limits (lower than global default), Content-Length fast path + buffered body check
 - **Response Size Limiting** — per-proxy response body size limits (lower than global default), Content-Length fast path + optional buffered body check
+- **WAF** — OWASP-style SQLi, XSS, command injection, traversal, SSRF, disclosure, and data-leakage detection for HTTP-family traffic with monitor/enforce modes
 - **Bot Detection** — User-Agent pattern blocking with allow-list support
 - **CORS** — preflight handling with origin, method, and header validation
 - **Body Validator** — JSON Schema, XML, and gRPC protobuf validation

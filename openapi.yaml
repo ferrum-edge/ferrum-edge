@@ -1925,6 +1925,7 @@ paths:
                 - grpc_web
                 - rate_limiting
                 - request_size_limiting
+                - waf
                 - response_size_limiting
                 - body_validator
                 - request_termination
@@ -7887,6 +7888,208 @@ components:
             Maximum allowed request body size in bytes. Required and must be
             greater than zero — the gateway rejects plugin creation when
             missing or 0.
+
+    WafPluginConfig:
+      type: object
+      description: "Plugin: waf — OWASP-style content-pattern threat detection for HTTP-family requests and optional responses."
+      properties:
+        mode:
+          type: string
+          enum: [enforce, monitor, disabled]
+          default: enforce
+        paranoia_level:
+          type: integer
+          minimum: 1
+          maximum: 4
+          default: 1
+        request_inspection:
+          type: boolean
+          default: true
+        request_body_inspection:
+          type: boolean
+          default: true
+        response_inspection:
+          type: boolean
+          default: false
+        response_body_inspection:
+          type: boolean
+          default: false
+        log_to_metadata:
+          type: boolean
+          default: true
+        log_to_stdout:
+          type: boolean
+          default: false
+        scan_budget_ms:
+          type: integer
+          default: 50
+        max_scan_bytes:
+          type: integer
+          default: 1048576
+        on_scan_timeout:
+          type: string
+          enum: [allow, block, log_and_allow]
+          default: log_and_allow
+        on_body_too_large:
+          type: string
+          enum: [scan_truncated, skip]
+          default: scan_truncated
+        include_default_rules:
+          type: boolean
+          default: true
+        disabled_default_rules:
+          type: array
+          items:
+            type: string
+          default: []
+        rule_modes:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [enforce, monitor, disabled]
+        custom_rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/WafRule"
+          default: []
+        global_exemptions:
+          $ref: "#/components/schemas/WafExemptions"
+        body_methods:
+          type: array
+          items:
+            type: string
+          default: [POST, PUT, PATCH]
+        body_content_types:
+          type: array
+          items:
+            type: string
+          default:
+            - application/json
+            - application/x-www-form-urlencoded
+            - application/xml
+            - text/xml
+            - text/plain
+            - text/html
+        inspect_multipart:
+          type: boolean
+          default: false
+        inspect_binary_body:
+          type: boolean
+          default: false
+        disallowed_methods:
+          type: array
+          items:
+            type: string
+          default: []
+        reject_status_code:
+          type: integer
+          minimum: 400
+          maximum: 599
+          default: 403
+        reject_content_type:
+          type: string
+          default: application/json
+        reject_body:
+          type: string
+          default: '{"error":"Forbidden"}'
+
+    WafRule:
+      type: object
+      required: [id, category, target]
+      properties:
+        id:
+          type: string
+          example: FE-SQLI-001
+        name:
+          type: string
+        category:
+          type: string
+          example: sqli
+        severity:
+          type: string
+          enum: [info, low, medium, high, critical]
+          default: medium
+        target:
+          oneOf:
+            - type: string
+            - type: object
+              required: [type]
+              properties:
+                type:
+                  type: string
+                names:
+                  type: array
+                  items:
+                    type: string
+                path:
+                  type: string
+        match_kind:
+          type: string
+          enum: [regex, literal, contains, equals, luhn, cidr]
+          default: regex
+        pattern:
+          type: string
+        action:
+          type: string
+          enum: [enforce, monitor, disabled]
+          default: monitor
+        fp_filters:
+          type: array
+          items:
+            type: string
+          default: []
+        paranoia_min:
+          type: integer
+          minimum: 1
+          maximum: 4
+          default: 1
+        conditions:
+          type: object
+          properties:
+            paths:
+              type: array
+              items:
+                type: string
+            methods:
+              type: array
+              items:
+                type: string
+            headers:
+              type: object
+              additionalProperties:
+                type: [string, "null"]
+            consumers:
+              type: array
+              items:
+                type: string
+
+    WafExemptions:
+      type: object
+      properties:
+        paths:
+          type: array
+          items:
+            type: string
+        methods:
+          type: array
+          items:
+            type: string
+        consumers:
+          type: array
+          items:
+            type: string
+        ips:
+          type: array
+          items:
+            type: string
+        header_present:
+          type: object
+          additionalProperties:
+            type: [string, "null"]
+        fp_capture_filters:
+          type: array
+          items:
+            type: string
 
     ResponseSizeLimitingConfig:
       type: object

@@ -1,4 +1,4 @@
-//! Plugin system — 60 built-in plugins with a trait-based architecture.
+//! Plugin system — 61 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -75,6 +75,7 @@ pub mod transaction_log_schema;
 pub mod udp_logging;
 pub mod udp_rate_limiting;
 pub mod utils;
+pub mod waf;
 pub mod ws_frame_logging;
 pub mod ws_logging;
 pub mod ws_message_size_limiting;
@@ -748,6 +749,16 @@ impl RequestContext {
         }
     }
 
+    /// Borrow the raw query string without materializing it.
+    ///
+    /// Inspection plugins use this before `materialize_query_params()` consumes
+    /// the raw form, for example to detect duplicate/conflicting parameter
+    /// keys that would be collapsed by the parsed `HashMap`.
+    #[inline]
+    pub fn raw_query_string(&self) -> Option<&str> {
+        self.raw_query_string.as_deref()
+    }
+
     /// Parse the raw query string into `self.query_params`. Keys and values are
     /// percent-decoded so plugins see human-readable strings. Parameters without
     /// `=` (e.g., `?flag`) are stored with an empty-string value.
@@ -1337,7 +1348,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975), ai_federation (2985) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), workload_metrics (9360), __mesh_bpf_metrics (9365), access_log (9375) |
@@ -1378,6 +1389,7 @@ pub mod priority {
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
     pub const AI_PROMPT_SHIELD: u16 = 2925;
+    pub const WAF: u16 = 2930;
     pub const FAULT_INJECTION: u16 = 2940;
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const AI_REQUEST_GUARD: u16 = 2975;
@@ -1654,6 +1666,26 @@ pub trait Plugin: Send + Sync {
         _body: &[u8],
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Context-aware variant of `on_final_request_body`.
+    ///
+    /// Existing plugins can keep overriding `on_final_request_body`. Plugins
+    /// that need to annotate request metadata after request body transforms
+    /// can override this hook and the proxy will call it instead.
+    async fn on_final_request_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.on_final_request_body(headers, body).await
+    }
+
+    /// Returns true when `on_final_request_body_with_context` needs the real
+    /// mutable request context rather than the compatibility wrapper.
+    fn needs_final_request_body_context(&self) -> bool {
+        false
     }
 
     /// Transform the response body before it is sent to the client.
@@ -1968,6 +2000,7 @@ pub fn create_plugin_with_http_client(
         "request_size_limiting" => Ok(Some(Arc::new(
             request_size_limiting::RequestSizeLimiting::new(config)?,
         ))),
+        "waf" => Ok(Some(Arc::new(waf::Waf::new(config)?))),
         "response_size_limiting" => Ok(Some(Arc::new(
             response_size_limiting::ResponseSizeLimiting::new(config)?,
         ))),
@@ -2156,6 +2189,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "grpc_web",
         "rate_limiting",
         "request_size_limiting",
+        "waf",
         "response_size_limiting",
         "body_validator",
         "request_termination",

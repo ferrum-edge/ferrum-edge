@@ -340,8 +340,13 @@ where
             // Run validators. Reject = emit a trailers-only gRPC error
             // (Grpc flavor) or a plain JSON error (everything else) and
             // return early WITHOUT dispatching to the backend.
-            match crate::proxy::run_final_request_body_hooks(plugins, proxy_headers, &transformed)
-                .await
+            match crate::proxy::run_final_request_body_hooks(
+                plugins,
+                Some(ctx),
+                proxy_headers,
+                &transformed,
+            )
+            .await
             {
                 PluginResult::Continue => Some(transformed),
                 reject => {

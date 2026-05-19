@@ -89,7 +89,7 @@ Connection/Session In
 └─────────────────────────┘
 ```
 
-Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validator`, `ai_request_guard`, and `ai_prompt_shield` now pre-buffer only matching request bodies (for example JSON `POST` requests). Non-matching requests can continue on the faster streaming path.
+Body-aware plugins such as `graphql`, request-side `body_validator`, `waf`, `ai_request_guard`, and `ai_prompt_shield` now pre-buffer only matching request bodies (for example JSON `POST` requests). Non-matching requests can continue on the faster streaming path.
 
 **Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS and UDP+DTLS listeners it runs after the frontend TLS/DTLS handshake and before the backend connection/session is opened, so plugins can inspect the client certificate without spending upstream capacity first. Frontend TLS/DTLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection/session immediately and do not dial the backend. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`.
 
@@ -224,7 +224,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `ai_semantic_cache` (2700), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `fault_injection` (2940), `body_validator` (2950), `ai_request_guard` (2975), `ai_federation` (2985), `mesh_route_dispatch` (2995) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `ai_semantic_cache` (2700), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `ai_request_guard` (2975), `ai_federation` (2985), `mesh_route_dispatch` (2995) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `load_testing` (3080), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_response_guard` (4075), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
@@ -275,14 +275,15 @@ Given all built-in plugins enabled, the execution order is:
 | 31 | `ws_rate_limiting` | 2910 | on_ws_frame |
 | 32 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 33 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 34 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
-| 35 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
-| 36 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 37 | `ai_federation` | 2985 | before_proxy |
-| 38 | `mesh_route_dispatch` | 2995 | before_proxy |
-| 39 | `request_transformer` | 3000 | before_proxy, transform_request_body |
-| 40 | `serverless_function` | 3025 | before_proxy |
-| 41 | `response_mock` | 3030 | before_proxy |
+| 34 | `waf` | 2930 | on_request_received, on_final_request_body, after_proxy, on_final_response_body |
+| 35 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
+| 36 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
+| 37 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 38 | `ai_federation` | 2985 | before_proxy |
+| 39 | `mesh_route_dispatch` | 2995 | before_proxy |
+| 40 | `request_transformer` | 3000 | before_proxy, transform_request_body |
+| 41 | `serverless_function` | 3025 | before_proxy |
+| 42 | `response_mock` | 3030 | before_proxy |
 | 42 | `grpc_deadline` | 3050 | before_proxy |
 | 43 | `request_mirror` | 3075 | before_proxy |
 | 44 | `load_testing` | 3080 | before_proxy |
@@ -365,7 +366,7 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 
 The five AI plugins are ordered to compose correctly:
 
-1. **`ai_prompt_shield` (2925)** runs first in the pre-proxy flow — PII must be detected/redacted before the request reaches any other validation or the backend. It sits right after `rate_limiting` so brute-force protection applies first.
+1. **`ai_prompt_shield` (2925)** runs first in the pre-proxy flow — PII must be detected/redacted before the request reaches any other validation or the backend. It sits right after `rate_limiting` so brute-force protection applies first, and immediately before `waf` (2930), which handles general content-threat detection.
 2. **`ai_request_guard` (2975)** runs after PII scanning — it validates model names, max_tokens, message counts, and temperature. If the prompt shield already rejected or redacted the request, the guard validates the cleaned version.
 3. **`ai_federation` (2985)** runs after the guard — it translates the OpenAI-format request to the matched provider's native format, calls the provider, normalizes the response back to OpenAI format, and returns via `RejectBinary`. Since this short-circuits the proxy, `on_response_body` does not fire. The plugin writes token metadata (`ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`) directly into `ctx.metadata` using the same keys as `ai_token_metrics`.
 4. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses the LLM response body to extract token usage (prompt, completion, total, model) and writes it to `ctx.metadata`. This metadata flows into `TransactionSummary` for all downstream logging plugins. Note: when `ai_federation` is active, this plugin does not fire because the response comes via `RejectBinary` — `ai_federation` writes the same metadata keys directly.
@@ -503,6 +504,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `graphql` | ✓ | | | | | GraphQL is HTTP-only (JSON body parsing) |
 | `request_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy request body size limits |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
+| `waf` | ✓ | ✓ | ✓ | | | Content-pattern threat detection for HTTP-family traffic |
 | `fault_injection` | ✓ | ✓ | ✓ | ✓ | ✓ | Probabilistic aborts and delays for chaos testing |
 | `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
 | `request_mirror` | ✓ | ✓ | | | | Duplicates traffic to a shadow destination for validation |

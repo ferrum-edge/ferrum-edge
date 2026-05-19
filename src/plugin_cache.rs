@@ -141,6 +141,19 @@ impl Plugin for PriorityOverridePlugin {
     ) -> PluginResult {
         self.inner.on_final_request_body(headers, body).await
     }
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.inner
+            .on_final_request_body_with_context(ctx, headers, body)
+            .await
+    }
+    fn needs_final_request_body_context(&self) -> bool {
+        self.inner.needs_final_request_body_context()
+    }
     async fn transform_response_body(
         &self,
         body: &[u8],
