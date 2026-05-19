@@ -2401,6 +2401,102 @@ config:
 
 ## Validation Plugins
 
+### `waf`
+
+Inspects HTTP-family traffic for content-threat patterns such as SQL injection,
+XSS, command injection, path traversal, SSRF, response disclosure, and
+data-leakage indicators. The built-in seed rules are monitor-only by default;
+set individual `rule_modes` or custom rule `action` values to `enforce` when a
+rule should block. Invalid WAF configuration is security-fatal at
+startup/reload, so the gateway does not silently serve without the intended
+inspection.
+
+Request-body inspection runs on the final backend-visible body after request
+body transforms. It buffers only matching methods/content types. Response
+inspection is opt-in and can scan response headers and final response bodies.
+
+**Priority:** 2930
+**Protocol:** HTTP, gRPC, WebSocket
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `mode` | string | `enforce` | Global mode: `enforce`, `monitor`, or `disabled`. Default rules remain monitor-only unless overridden with `rule_modes`. |
+| `paranoia_level` | u8 | `1` | Enables rules whose `paranoia_min` is less than or equal to this value. Must be 1-4. |
+| `include_default_rules` | bool | `true` | Include Ferrum's built-in seed rules. |
+| `disabled_default_rules` | string[] | `[]` | Built-in rule IDs to remove from the active ruleset. |
+| `rule_modes` | object | `{}` | Per-rule action overrides keyed by rule ID. Values: `enforce`, `monitor`, `disabled` (aliases like `block` and `off` are accepted). |
+| `custom_rules` | object[] | `[]` | Additional rules. See custom rule fields below. |
+| `global_exemptions` | object | `{}` | Request-level exemptions and false-positive filters. |
+| `request_inspection` | bool | `true` | Inspect request path, query, headers, cookies, method, and configured request bodies. |
+| `request_body_inspection` | bool | `true` | Enable request body rules when request inspection is active. |
+| `response_inspection` | bool | `false` | Inspect response headers and, when enabled separately, response bodies. |
+| `response_body_inspection` | bool | `false` | Enable response body rules. |
+| `body_methods` | string[] | `["POST","PUT","PATCH"]` | Methods eligible for request body buffering and scanning. |
+| `body_content_types` | string[] | JSON, form, XML, text, HTML | MIME types eligible for body scanning. Parameters such as `; charset=utf-8` are ignored. |
+| `inspect_multipart` | bool | `false` | Inspect `multipart/*` bodies. |
+| `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
+| `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
+| `on_body_too_large` | string | `scan_truncated` | `scan_truncated` scans the first `max_scan_bytes`; `skip` skips known-oversized bodies. |
+| `scan_budget_ms` | u64 | `50` | Timeout budget for body scan hooks. `0` disables the timeout wrapper. |
+| `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
+| `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
+| `log_to_metadata` | bool | `true` | Write WAF metadata such as `waf.rule_hits`, `waf.action`, and `waf.severity` into transaction logs. |
+| `log_to_stdout` | bool | `false` | Emit `tracing::warn!` events for rule matches. |
+| `reject_status_code` | u16 | `403` | HTTP status for enforced rejects. Must be 400-599. |
+| `reject_content_type` | string | `application/json` | Content-Type header for enforced rejects. |
+| `reject_body` | string | `{"error":"Forbidden"}` | Body returned for enforced rejects. |
+
+**Custom rule fields:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `id` | string | required | Unique rule ID. |
+| `name` | string | `id` | Human-readable rule name. |
+| `category` | string | required | Category label, such as `sqli`, `xss`, or `custom`. |
+| `severity` | string | `medium` | `info`, `low`, `medium`, `high`, or `critical`. |
+| `target` | string/object | required | Scan target. Object targets support `type`, optional `names` for request header values, and `path` for JSON-path body rules. |
+| `match_kind` | string | `regex` | `regex`, `literal`, `contains`, `equals`, `luhn`, or `cidr`. |
+| `pattern` | string | `""` | Pattern text. Required except for `luhn` rules. CIDR rules accept an IP or CIDR range. |
+| `action` | string | global default | `enforce`, `monitor`, or `disabled`. |
+| `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
+| `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
+| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. |
+
+Supported targets: `header_names`, `header_values`, `query_keys`,
+`query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,
+`body_json_path`, `response_headers`, and `response_body`.
+
+`global_exemptions` supports `paths`, `methods`, `consumers`, `ips`,
+`header_present`, and `fp_capture_filters`. Path entries ending in `*` are
+prefix matches; entries starting with `~` are treated as regex patterns.
+
+```yaml
+config:
+  mode: enforce
+  include_default_rules: true
+  rule_modes:
+    FE-XSS-001: enforce
+    FE-SQLI-002: enforce
+  max_scan_bytes: 1048576
+  response_inspection: true
+  response_body_inspection: false
+  custom_rules:
+    - id: CUSTOM-PRIVATE-IP
+      name: Private IP in forwarded header
+      category: custom
+      severity: high
+      target:
+        type: header_values
+        names: ["x-forwarded-for"]
+      match_kind: cidr
+      pattern: 10.0.0.0/8
+      action: enforce
+  global_exemptions:
+    paths: ["/health*"]
+```
+
+---
+
 ### `body_validator`
 
 Validates JSON, XML, and gRPC protobuf request and response bodies against schemas. Supports comprehensive JSON Schema validation.
