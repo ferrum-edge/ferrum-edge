@@ -10,8 +10,9 @@
 //! The `PluginCache` pre-filters plugins per protocol at config reload time
 //! so the hot path does zero filtering.
 //!
-//! Security plugins (auth, ACL, IP restriction) that fail config validation
-//! cause the gateway to refuse startup — they never silently degrade.
+//! Security plugins (auth, ACL, IP restriction, WAF, and mesh policy gates)
+//! that fail config validation cause the gateway to refuse startup — they
+//! never silently degrade.
 //! Non-security plugins that fail validation are skipped with a warning.
 
 pub mod access_control;
@@ -2123,7 +2124,7 @@ pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> 
 }
 
 /// List of all available plugin names (built-in + custom).
-/// Returns true if the named plugin is security-critical (auth or access control).
+/// Returns true if the named plugin is security-critical.
 ///
 /// Validation failures for these plugins are fatal at startup — the gateway
 /// refuses to start rather than serving traffic without the intended security.
@@ -2142,6 +2143,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "access_control"
             | "tcp_connection_throttle"
             | "ip_restriction"
+            | "waf"
             | "soap_ws_security"
     )
 }

@@ -3743,7 +3743,7 @@ components:
             again when the plugin is instantiated at config reload time.
             Security plugins (key_auth, basic_auth, jwt_auth, jwks_auth,
             hmac_auth, ldap_auth, mtls_auth, access_control,
-            tcp_connection_throttle, ip_restriction, mesh_authz,
+            tcp_connection_throttle, ip_restriction, waf, mesh_authz,
             mesh_outbound_registry) are validation-fatal: invalid config blocks
             gateway startup in file mode, and on DB/CP polling the new config
             snapshot is rejected as a whole (the gateway keeps serving the

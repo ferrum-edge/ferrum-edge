@@ -1,5 +1,5 @@
 use ferrum_edge::plugins::waf::Waf;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, is_security_plugin};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -141,6 +141,77 @@ async fn custom_body_json_path_rule_scans_only_selected_value() {
 }
 
 #[tokio::test]
+async fn cidr_text_rules_are_scoped_to_their_configured_target() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-CIDR-HEADER",
+            "name": "private forwarding address",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "header_values", "names": ["x-forwarded-for"] },
+            "match_kind": "cidr",
+            "pattern": "10.0.0.0/8",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut query_ctx = ctx("GET", "/search");
+    query_ctx.set_raw_query_string("ip=10.1.2.3".into());
+    let result = plugin.on_request_received(&mut query_ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !query_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-CIDR-HEADER"))
+    );
+
+    let mut header_ctx = ctx("GET", "/search");
+    header_ctx
+        .headers
+        .insert("x-forwarded-for".into(), "10.1.2.3".into());
+    let result = plugin.on_request_received(&mut header_ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        header_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-CIDR-HEADER")
+    );
+}
+
+#[tokio::test]
+async fn response_header_cidr_rule_matches_without_regex_header_rules() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "custom_rules": [{
+            "id": "CUSTOM-CIDR-RESP",
+            "name": "private upstream header",
+            "category": "custom",
+            "severity": "medium",
+            "target": "response_headers",
+            "match_kind": "cidr",
+            "pattern": "10.0.0.0/8",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/debug");
+    let mut headers = HashMap::from([("x-upstream-ip".to_string(), "10.2.3.4".to_string())]);
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-CIDR-RESP")
+    );
+}
+
+#[tokio::test]
 async fn response_body_inspection_is_off_by_default() {
     let plugin = Waf::new(&json!({})).unwrap();
     let ctx = ctx("GET", "/");
@@ -211,4 +282,9 @@ fn luhn_match_kind_requires_body_target() {
     .unwrap_err();
 
     assert!(err.contains("match_kind luhn is only supported for body targets"));
+}
+
+#[test]
+fn waf_is_security_critical() {
+    assert!(is_security_plugin("waf"));
 }

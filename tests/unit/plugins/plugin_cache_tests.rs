@@ -37,6 +37,7 @@ fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
         }
         "request_size_limiting" => json!({"max_bytes": 1048576}),
+        "waf" => json!({}),
         "response_size_limiting" => json!({"max_bytes": 1048576}),
         "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
         "ws_rate_limiting" => json!({"frames_per_second": 100}),
@@ -940,6 +941,32 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
         result.is_err(),
         "apply_delta should reject invalid security plugin config"
     );
+}
+
+#[test]
+fn test_plugin_cache_rejects_invalid_waf_config_as_security_plugin() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc1"])],
+        vec![PluginConfig {
+            id: "pc1".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "waf".to_string(),
+            config: json!({"max_scan_bytes": 0}),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }],
+    );
+
+    let err = PluginCache::new(&config)
+        .err()
+        .expect("invalid WAF config should be rejected");
+    assert!(err.contains("waf"));
+    assert!(err.contains("max_scan_bytes"));
 }
 
 #[test]

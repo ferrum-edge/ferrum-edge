@@ -284,32 +284,32 @@ Given all built-in plugins enabled, the execution order is:
 | 40 | `request_transformer` | 3000 | before_proxy, transform_request_body |
 | 41 | `serverless_function` | 3025 | before_proxy |
 | 42 | `response_mock` | 3030 | before_proxy |
-| 42 | `grpc_deadline` | 3050 | before_proxy |
-| 43 | `request_mirror` | 3075 | before_proxy |
-| 44 | `load_testing` | 3080 | before_proxy |
-| 45 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 46 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
-| 47 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 48 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
-| 49 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
-| 50 | `ai_token_metrics` | 4100 | on_response_body |
-| 51 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
-| 52 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 53 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 54 | `statsd_logging` | 9075 | log, on_stream_disconnect |
-| 55 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 56 | `tcp_logging` | 9125 | log, on_stream_disconnect |
-| 57 | `kafka_logging` | 9150 | log, on_stream_disconnect |
-| 58 | `loki_logging` | 9155 | log, on_stream_disconnect |
-| 59 | `udp_logging` | 9160 | log, on_stream_disconnect |
-| 60 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 61 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 62 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
-| 63 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
-| 64 | `api_chargeback` | 9350 | log |
-| 65 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
-| 66 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
-| 67 | `access_log` | 9375 | log, on_stream_disconnect |
+| 43 | `grpc_deadline` | 3050 | before_proxy |
+| 44 | `request_mirror` | 3075 | before_proxy |
+| 45 | `load_testing` | 3080 | before_proxy |
+| 46 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
+| 47 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 48 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 49 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 50 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
+| 51 | `ai_token_metrics` | 4100 | on_response_body |
+| 52 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 53 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 54 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 55 | `statsd_logging` | 9075 | log, on_stream_disconnect |
+| 56 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 57 | `tcp_logging` | 9125 | log, on_stream_disconnect |
+| 58 | `kafka_logging` | 9150 | log, on_stream_disconnect |
+| 59 | `loki_logging` | 9155 | log, on_stream_disconnect |
+| 60 | `udp_logging` | 9160 | log, on_stream_disconnect |
+| 61 | `ws_logging` | 9175 | log, on_stream_disconnect |
+| 62 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 63 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
+| 64 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 65 | `api_chargeback` | 9350 | log |
+| 66 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
+| 67 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
+| 68 | `access_log` | 9375 | log, on_stream_disconnect |
 
 ## Why This Order Matters
 

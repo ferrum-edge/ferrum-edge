@@ -3,8 +3,8 @@ use std::net::IpAddr;
 
 use super::decode;
 use super::rules::{
-    BytesRuleSet, JsonPathMatcher, JsonPathRule, JsonPathSegment, RuleHit, RuleRef, TextRuleSet,
-    extract_ip_tokens,
+    BytesRuleSet, JsonPathMatcher, JsonPathRule, JsonPathSegment, RuleHit, RuleRef, RuleTarget,
+    TextRuleSet, extract_ip_tokens,
 };
 use super::{WAF_INTERNAL_EXEMPT_KEY, Waf};
 use crate::plugins::RequestContext;
@@ -40,6 +40,13 @@ impl Waf {
             ctx,
             None,
         );
+        self.scan_cidr_rules_matching(
+            &mut outcome,
+            &ctx.path,
+            &self.compiled.text_cidr_rules,
+            ctx,
+            |target| matches!(target, RuleTarget::UrlPath),
+        );
 
         if let Some(raw_query) = raw_query.as_deref() {
             if !raw_query.is_empty() {
@@ -54,6 +61,13 @@ impl Waf {
                     ctx,
                     None,
                 );
+                self.scan_cidr_rules_matching(
+                    &mut outcome,
+                    &full_url,
+                    &self.compiled.text_cidr_rules,
+                    ctx,
+                    |target| matches!(target, RuleTarget::FullUrl),
+                );
                 self.scan_encoding_specials(&mut outcome, &full_url, ctx);
                 self.scan_hpp_special(&mut outcome, raw_query, ctx);
             }
@@ -64,6 +78,13 @@ impl Waf {
                 &ctx.path,
                 ctx,
                 None,
+            );
+            self.scan_cidr_rules_matching(
+                &mut outcome,
+                &ctx.path,
+                &self.compiled.text_cidr_rules,
+                ctx,
+                |target| matches!(target, RuleTarget::FullUrl),
             );
             self.scan_encoding_specials(&mut outcome, &ctx.path, ctx);
         }
@@ -84,7 +105,20 @@ impl Waf {
                 ctx,
                 None,
             );
-            self.scan_cidr_rules(&mut outcome, value, &self.compiled.text_cidr_rules, ctx);
+            self.scan_cidr_rules_matching(
+                &mut outcome,
+                key,
+                &self.compiled.text_cidr_rules,
+                ctx,
+                |target| matches!(target, RuleTarget::QueryKeys),
+            );
+            self.scan_cidr_rules_matching(
+                &mut outcome,
+                value,
+                &self.compiled.text_cidr_rules,
+                ctx,
+                |target| matches!(target, RuleTarget::QueryValues),
+            );
         }
 
         for (name, value) in &ctx.headers {
@@ -95,12 +129,26 @@ impl Waf {
                 ctx,
                 Some(name.as_str()),
             );
+            self.scan_cidr_rules_matching(
+                &mut outcome,
+                name,
+                &self.compiled.text_cidr_rules,
+                ctx,
+                |target| matches!(target, RuleTarget::HeaderNames),
+            );
             self.scan_text_set(
                 &mut outcome,
                 self.compiled.header_values.as_ref(),
                 value,
                 ctx,
                 Some(name.as_str()),
+            );
+            self.scan_cidr_rules_matching(
+                &mut outcome,
+                value,
+                &self.compiled.text_cidr_rules,
+                ctx,
+                |target| header_value_target_matches(target, name),
             );
             if name == "cookie" {
                 self.scan_cookies(&mut outcome, value, ctx);
@@ -113,6 +161,13 @@ impl Waf {
             &ctx.method,
             ctx,
             None,
+        );
+        self.scan_cidr_rules_matching(
+            &mut outcome,
+            &ctx.method,
+            &self.compiled.text_cidr_rules,
+            ctx,
+            |target| matches!(target, RuleTarget::Method),
         );
         self.scan_method_special(&mut outcome, &ctx.method, ctx);
         self.scan_method_override_special(&mut outcome, &ctx.headers, ctx);
@@ -142,14 +197,25 @@ impl Waf {
         headers: &HashMap<String, String>,
     ) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
-        if let Some(set) = self.compiled.response_headers.as_ref() {
-            for (name, value) in headers {
-                let mut line = String::with_capacity(name.len() + value.len() + 2);
-                line.push_str(name);
-                line.push_str(": ");
-                line.push_str(value);
-                self.scan_text_set(&mut outcome, Some(set), &line, ctx, Some(name.as_str()));
-            }
+        for (name, value) in headers {
+            let mut line = String::with_capacity(name.len() + value.len() + 2);
+            line.push_str(name);
+            line.push_str(": ");
+            line.push_str(value);
+            self.scan_text_set(
+                &mut outcome,
+                self.compiled.response_headers.as_ref(),
+                &line,
+                ctx,
+                Some(name.as_str()),
+            );
+            self.scan_cidr_rules_matching(
+                &mut outcome,
+                &line,
+                &self.compiled.text_cidr_rules,
+                ctx,
+                |target| matches!(target, RuleTarget::ResponseHeaders),
+            );
         }
         outcome
     }
@@ -260,6 +326,13 @@ impl Waf {
             let cookie = cookie.trim();
             if !cookie.is_empty() {
                 self.scan_text_set(outcome, self.compiled.cookies.as_ref(), cookie, ctx, None);
+                self.scan_cidr_rules_matching(
+                    outcome,
+                    cookie,
+                    &self.compiled.text_cidr_rules,
+                    ctx,
+                    |target| matches!(target, RuleTarget::Cookies),
+                );
             }
         }
     }
@@ -296,6 +369,19 @@ impl Waf {
         rule_indices: &[usize],
         ctx: &RequestContext,
     ) {
+        self.scan_cidr_rules_matching(outcome, value, rule_indices, ctx, |_| true);
+    }
+
+    fn scan_cidr_rules_matching<F>(
+        &self,
+        outcome: &mut ScanOutcome,
+        value: &str,
+        rule_indices: &[usize],
+        ctx: &RequestContext,
+        target_matches: F,
+    ) where
+        F: Fn(&RuleTarget) -> bool,
+    {
         if rule_indices.is_empty() {
             return;
         }
@@ -308,9 +394,12 @@ impl Waf {
             let Some(cidr) = rule.cidr else {
                 continue;
             };
-            if ips.iter().any(|ip| cidr.matches(*ip))
+            if target_matches(&rule.target)
+                && ips.iter().any(|ip| cidr.matches(*ip))
                 && rule.matches_conditions(ctx)
                 && !self.exemptions.suppresses_rule_for_request(ctx)
+                && !self.exemptions.suppresses_value(value)
+                && !rule.suppresses_text(value)
             {
                 outcome.push(RuleHit {
                     rule_index,
@@ -417,6 +506,16 @@ impl Waf {
                 target_name: rule_ref.target_name,
             });
         }
+    }
+}
+
+fn header_value_target_matches(target: &RuleTarget, header_name: &str) -> bool {
+    match target {
+        RuleTarget::HeaderValues(None) => true,
+        RuleTarget::HeaderValues(Some(names)) => names
+            .iter()
+            .any(|configured| configured.eq_ignore_ascii_case(header_name)),
+        _ => false,
     }
 }
 

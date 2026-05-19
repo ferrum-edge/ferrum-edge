@@ -210,6 +210,7 @@ async fn test_all_plugins_available() {
         "grpc_web",
         "rate_limiting",
         "request_size_limiting",
+        "waf",
         "response_size_limiting",
         "body_validator",
         "request_termination",
