@@ -6970,24 +6970,90 @@ components:
                 description: |
                   Match criteria — all configured fields must match for the
                   rule to fire. At least one of `methods`/`headers`/
-                  `query_params`/`source_namespace` must be configured (an
-                  empty match is rejected at load time).
+                  `query_params`/`authority`/`source_namespace`/`uri` must be
+                  configured (an empty match is rejected at load time).
                 properties:
                   methods:
                     type: array
                     items:
-                      type: string
+                      oneOf:
+                        - type: string
+                          description: Bare-string back-compat form, interpreted as Exact.
+                        - type: object
+                          description: |
+                            Istio StringMatch shape — exactly one of
+                            `exact` / `prefix` / `regex`. Prefix/regex
+                            patterns are uppercased at compile time
+                            (methods are uppercase ASCII per RFC 9110 §9.1).
+                          additionalProperties: false
+                          properties:
+                            exact:
+                              type: string
+                            prefix:
+                              type: string
+                            regex:
+                              type: string
                     description: HTTP methods (any-of). Empty = no method restriction.
                   headers:
                     type: object
                     additionalProperties:
-                      type: string
-                    description: Header equality matches (all-of). Header names are case-insensitive.
+                      oneOf:
+                        - type: string
+                          description: Bare-string back-compat form, interpreted as Exact.
+                        - type: object
+                          description: |
+                            Istio StringMatch shape — exactly one of
+                            `exact` / `prefix` / `regex`.
+                          additionalProperties: false
+                          properties:
+                            exact:
+                              type: string
+                            prefix:
+                              type: string
+                            regex:
+                              type: string
+                    description: Header matches (all-of). Header names are case-insensitive.
                   query_params:
                     type: object
                     additionalProperties:
                       type: string
                     description: Query parameter equality matches (all-of). Decoded after percent-decoding.
+                  uri:
+                    description: |
+                      Optional URI predicate (Istio `StringMatch` shape).
+                      Exactly one of `exact` / `prefix` / `regex`. This is
+                      normally omitted because the parent proxy `listen_path`
+                      gates URI selection; the VirtualService translator emits
+                      it for widened `ignoreUriCase` routes and collapsed
+                      route-order fallbacks that need dispatch-layer URI
+                      precision.
+                    oneOf:
+                      - type: object
+                        required: [exact]
+                        additionalProperties: false
+                        properties:
+                          exact:
+                            type: string
+                      - type: object
+                        required: [prefix]
+                        additionalProperties: false
+                        properties:
+                          prefix:
+                            type: string
+                      - type: object
+                        required: [regex]
+                        additionalProperties: false
+                        properties:
+                          regex:
+                            type: string
+                  ignore_uri_case:
+                    type: boolean
+                    description: |
+                      When true, folds ASCII case for `match.uri.exact` and
+                      `match.uri.prefix` comparisons only. Regex URI matches
+                      keep their operator-supplied regex unchanged; operators
+                      who want case-insensitive regex should write `(?i)` in
+                      the pattern. Requires `match.uri`.
                   source_namespace:
                     type: [string, "null"]
                     description: |
@@ -7003,6 +7069,40 @@ components:
                       peer SPIFFE identity, so non-mesh requests and clients
                       that present non-SPIFFE certificates do not match.
                       Empty / whitespace-only values are rejected at load time.
+                  authority:
+                    description: |
+                      `:authority` / `Host` match (Istio `HTTPMatchRequest.authority`).
+                      Exactly one of `exact` / `prefix` / `regex` per rule.
+                      Exact and prefix patterns compare against the raw request
+                      `Host`/`:authority` case-sensitively, including an
+                      explicit request port when present. Regex patterns are
+                      compiled verbatim and must match the full authority
+                      string; operators who want case-insensitive regex should
+                      write `(?i)` in the pattern. Distinct from
+                      VirtualService-level `hosts`, which gates proxy
+                      admission — this is a per-rule predicate evaluated AFTER
+                      routing has picked the proxy.
+                    oneOf:
+                      - type: string
+                        description: Bare-string back-compat form, interpreted as Exact.
+                      - type: object
+                        required: [exact]
+                        additionalProperties: false
+                        properties:
+                          exact:
+                            type: string
+                      - type: object
+                        required: [prefix]
+                        additionalProperties: false
+                        properties:
+                          prefix:
+                            type: string
+                      - type: object
+                        required: [regex]
+                        additionalProperties: false
+                        properties:
+                          regex:
+                            type: string
               destination:
                 type: object
                 description: |

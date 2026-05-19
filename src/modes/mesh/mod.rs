@@ -1223,9 +1223,7 @@ fn apply_destination_rules(
             .iter()
             .enumerate()
             .filter_map(|(idx, upstream)| {
-                (upstream.namespace == dr.namespace
-                    && destination_rule_matches_upstream(dr, upstream))
-                .then_some(idx)
+                destination_rule_matches_upstream(dr, upstream).then_some(idx)
             })
             .collect();
 
@@ -1362,9 +1360,10 @@ fn apply_destination_rules(
 
             if let Some(timeout_ms) = connect_timeout_ms {
                 let upstream_id = upstream.id.clone();
+                let upstream_namespace = upstream.namespace.clone();
                 for proxy in &mut config.proxies {
                     if proxy.upstream_id.as_deref() == Some(upstream_id.as_str())
-                        && proxy.namespace == dr.namespace
+                        && proxy.namespace == upstream_namespace
                         && proxy.backend_connect_timeout_ms != timeout_ms
                     {
                         debug!(
@@ -5223,6 +5222,7 @@ mod tests {
     fn destination_rule_test_proxy(id: &str, upstream_id: &str) -> Proxy {
         serde_json::from_value(serde_json::json!({
             "id": id,
+            "namespace": "default",
             "hosts": [format!("{id}.example.com")],
             "backend_host": "",
             "backend_port": 0,
@@ -5285,40 +5285,48 @@ mod tests {
         let mut victim_proxy = destination_rule_test_proxy("p-victim", "u-victim");
         victim_proxy.namespace = "victim".to_string();
 
-        let mut config = GatewayConfig {
+        let config = GatewayConfig {
             proxies: vec![victim_proxy],
             upstreams: vec![victim_upstream],
+            mesh: Some(Box::new(MeshConfig {
+                destination_rules: vec![MeshDestinationRule {
+                    name: "reviews".to_string(),
+                    namespace: "attacker".to_string(),
+                    host: "reviews.victim.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(1),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: vec![MeshSubset {
+                        name: "attacker-subset".to_string(),
+                        labels: HashMap::from([("version".to_string(), "v2".to_string())]),
+                        traffic_policy: None,
+                    }],
+                }],
+                ..MeshConfig::default()
+            })),
             ..GatewayConfig::default()
         };
-        let slice = MeshSlice {
-            destination_rules: vec![MeshDestinationRule {
-                name: "reviews".to_string(),
-                namespace: "attacker".to_string(),
-                host: "reviews.victim.svc.cluster.local".to_string(),
-                traffic_policy: Some(MeshTrafficPolicy {
-                    connect_timeout_ms: Some(1),
-                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
-                    ..MeshTrafficPolicy::default()
-                }),
-                port_level_settings: HashMap::new(),
-                subsets: vec![MeshSubset {
-                    name: "attacker-subset".to_string(),
-                    labels: HashMap::from([("version".to_string(), "v2".to_string())]),
-                    traffic_policy: None,
-                }],
-            }],
-            ..MeshSlice::default()
+        let original_timeout_ms = config.proxies[0].backend_connect_timeout_ms;
+        let runtime = MeshRuntimeConfig {
+            namespace: "victim".to_string(),
+            ..test_mesh_runtime_config()
         };
 
-        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
-            .expect("destination rules apply");
+        let config =
+            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
 
         assert_eq!(
             config.upstreams[0].algorithm,
             LoadBalancerAlgorithm::RoundRobin
         );
         assert!(config.upstreams[0].subsets.is_none());
-        assert_eq!(config.proxies[0].backend_connect_timeout_ms, 30_000);
+        assert_eq!(
+            config.proxies[0].backend_connect_timeout_ms,
+            original_timeout_ms
+        );
     }
 
     #[test]

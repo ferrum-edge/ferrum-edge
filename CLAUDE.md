@@ -334,9 +334,9 @@ Specs are admin-API on-demand only. Adding them to any runtime path is a regress
 ## Test Structure
 
 ```
-tests/{unit_tests,integration_tests,functional_tests}.rs   # Entry points
+tests/{unit_tests,integration_tests,functional_tests,conformance_tests}.rs   # Entry points
 tests/unit/{config,plugins,admin,gateway_core}/
-tests/{integration,functional,performance}/                # functional tests are #[ignore]
+tests/{integration,functional,performance,conformance}/    # functional tests are #[ignore]
 ```
 
 ### Test Placement — follow exactly
@@ -345,6 +345,7 @@ tests/{integration,functional,performance}/                # functional tests ar
 - Public API → `tests/unit/<category>/<module>_tests.rs`
 - Component interaction → `tests/integration/`
 - Full binary E2E → `tests/functional/` with `#[ignore]`; requires `cargo build --bin ferrum-edge`
+- Istio + xDS compatibility matrix coverage → `tests/conformance/<category>.rs` (registers `(category, feature, status)` via `register_feature!`; the end-of-suite reporter emits `target/conformance/coverage.{json,md}`). See [CONFORMANCE.md](CONFORMANCE.md#istio--xds-conformance-suite).
 
 Inline `#[cfg(test)]` modules are intentional — do NOT promote fns to `pub` to enable external tests. Files with inline tests: `adaptive_buffer.rs`, `overload.rs`, `load_balancer.rs`, `router_cache.rs`, `config/mongo_store.rs`, `grpc/cp_server.rs`, `proxy/udp_proxy.rs`, `secrets/{env,file,mod}.rs`, `service_discovery/{consul,kubernetes}.rs`.
 

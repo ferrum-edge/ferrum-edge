@@ -69,6 +69,15 @@ pub fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_guard() -> MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn overlay(entries: &[(&str, RuntimeValue)]) -> MeshRuntimeOverlay {
         let mut fields = HashMap::new();
@@ -80,6 +89,7 @@ mod tests {
 
     #[test]
     fn applies_bool_gate_per_scope() {
+        let _guard = test_guard();
         reset_for_test();
         apply_overlay(&overlay(&[
             (
@@ -98,6 +108,7 @@ mod tests {
 
     #[test]
     fn ignores_request_keys() {
+        let _guard = test_guard();
         reset_for_test();
         apply_overlay(&overlay(&[(
             "ferrum.request_transformer.public.enabled",

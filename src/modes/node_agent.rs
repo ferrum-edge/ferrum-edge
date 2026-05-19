@@ -637,6 +637,7 @@ fn handle_kube_pod_applied(
         annotations: &annotations,
         pod_ip_str: pod_ip,
         pod_pid: None,
+        veth_iface_override: None,
     };
     handle_pod_added(backend, pod_states, config, metrics, &event);
     Some(pod_uid)
@@ -651,6 +652,15 @@ pub struct PodEvent<'a> {
     pub annotations: &'a HashMap<String, String>,
     pub pod_ip_str: Option<&'a str>,
     pub pod_pid: Option<u32>,
+    /// Pre-resolved host-side veth interface name for this pod, bypassing
+    /// the production resolver. Production always sets this to `None` and
+    /// relies on the procfs/sysfs probe from either the explicit pod PID or
+    /// the resolved pod cgroup; tests set it to a synthetic interface name
+    /// (e.g., `"veth-mock"`) to satisfy the post-`65606d87` enrollment
+    /// invariant that requires an inbound tc attach before the pod is
+    /// considered enrolled, without needing a real pod PID or a Linux kernel
+    /// under test.
+    pub veth_iface_override: Option<&'a str>,
 }
 
 pub fn handle_pod_added(
@@ -679,22 +689,39 @@ pub fn handle_pod_added(
     }
 
     let pod_ip = event.pod_ip_str.and_then(pod_watcher::parse_pod_ip);
-    if let Some(mut state) = pod_states.get_mut(pod_uid) {
-        reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
-        reconcile_existing_pod_include_ports(
-            backend,
-            metrics,
-            pod_uid,
-            event.annotations,
-            &mut state,
-        );
-        debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
-        return;
-    }
-
     let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
         .map(|p| p.to_string_lossy().to_string());
-    let veth_iface = veth::discover_veth_for_pod(event.pod_pid);
+    // Production: the kube-rs caller sets `veth_iface_override = None`; the
+    // resolver first uses an explicit pod PID when available, then falls back
+    // to the resolved pod cgroup to find a live process in that pod.
+    // Tests supply a synthetic name so the post-65606d87 inbound-tc invariant
+    // is satisfied without a real pod PID / Linux kernel.
+    let veth_iface = event
+        .veth_iface_override
+        .map(|s| s.to_string())
+        .or_else(|| veth::discover_veth_for_pod(event.pod_pid, cgroup_path.as_deref()));
+
+    if let Some(mut state) = pod_states.get_mut(pod_uid) {
+        let attachment_target_changed = state.cgroup_path != cgroup_path
+            || veth_iface
+                .as_ref()
+                .is_some_and(|iface| state.veth_iface.as_ref() != Some(iface));
+        if attachment_target_changed {
+            drop(state);
+            handle_pod_removed(backend, pod_states, metrics, pod_uid);
+        } else {
+            reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
+            reconcile_existing_pod_include_ports(
+                backend,
+                metrics,
+                pod_uid,
+                event.annotations,
+                &mut state,
+            );
+            debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
+            return;
+        }
+    }
 
     let mut state = PodAttachmentState {
         pod_uid: pod_uid.to_string(),
@@ -1480,7 +1507,7 @@ mod tests {
                 namespace: "default".to_string(),
                 pod_ip: None,
                 cgroup_path: None,
-                veth_iface: None,
+                veth_iface: Some("veth-mock".to_string()),
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
@@ -1789,6 +1816,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1827,6 +1855,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1857,6 +1886,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1901,6 +1931,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1934,6 +1965,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2016,7 +2048,7 @@ mod tests {
                 namespace: "default".to_string(),
                 pod_ip: None,
                 cgroup_path: None,
-                veth_iface: None,
+                veth_iface: Some("veth-mock".to_string()),
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
@@ -2031,11 +2063,71 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         assert_eq!(pod_states.get("pod-uid-1").unwrap().pod_name, "existing");
+    }
+
+    #[test]
+    fn handle_pod_added_reattaches_when_veth_changes_for_existing_pod() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let cgroup_path = cgroup_root.path().join("kubepods/podpod-uid-1");
+        std::fs::create_dir_all(&cgroup_path).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "existing".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: Some(cgroup_path.to_string_lossy().to_string()),
+                veth_iface: Some("veth-old".to_string()),
+                attached: true,
+                include_ports_cgroup_id: None,
+                include_ports_policy: None,
+            },
+        );
+
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "sandbox-recreated",
+            namespace: "default",
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.9"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-new"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert_eq!(backend.detached_pods, vec!["pod-uid-1".to_string()]);
+        assert!(
+            backend
+                .tc_attachments
+                .iter()
+                .any(|(iface, program)| iface == "veth-new" && program == "ferrum_tc_inbound")
+        );
+        let state = pod_states.get("pod-uid-1").unwrap();
+        assert_eq!(state.pod_name, "sandbox-recreated");
+        assert_eq!(state.veth_iface.as_deref(), Some("veth-new"));
     }
 
     #[test]
@@ -2062,7 +2154,7 @@ mod tests {
                 namespace: "default".to_string(),
                 pod_ip: None,
                 cgroup_path: None,
-                veth_iface: None,
+                veth_iface: Some("veth-mock".to_string()),
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
@@ -2077,6 +2169,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.8"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2494,6 +2587,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2539,6 +2633,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2584,6 +2679,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2630,6 +2726,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2671,6 +2768,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2730,6 +2828,7 @@ mod tests {
             annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         }
     }
 

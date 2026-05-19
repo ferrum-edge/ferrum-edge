@@ -39,6 +39,12 @@ pub(super) enum ParsedRule {
 pub(super) enum ParsedClientIp {
     V4(u32),
     V6(u128),
+    /// IPv4-mapped IPv6 address. Match both IPv4 rules and the original IPv6
+    /// mapped CIDR/exact rules so operators can express either family.
+    V4MappedV6 {
+        v4: u32,
+        v6: u128,
+    },
     /// Unparseable client IP string — never matches validated rules.
     Unknown,
 }
@@ -246,11 +252,14 @@ pub(super) fn parse_client_ip(ip: &str) -> ParsedClientIp {
         return ParsedClientIp::V4(u32::from_be_bytes(octets));
     }
     if let Some(parts) = parse_ipv6(ip) {
-        let v6 = Ipv6Addr::from(parts);
-        if let Some(v4) = v6.to_ipv4_mapped() {
-            return ParsedClientIp::V4(u32::from(v4));
+        let v6_bits = ipv6_to_u128(&parts);
+        if let Some(v4) = Ipv6Addr::from(parts).to_ipv4_mapped() {
+            return ParsedClientIp::V4MappedV6 {
+                v4: u32::from(v4),
+                v6: v6_bits,
+            };
         }
-        return ParsedClientIp::V6(ipv6_to_u128(&parts));
+        return ParsedClientIp::V6(v6_bits);
     }
     ParsedClientIp::Unknown
 }
@@ -268,6 +277,11 @@ pub(super) fn rule_matches(client: &ParsedClientIp, rule: &ParsedRule) -> bool {
         (ParsedClientIp::V4(client_bits), ParsedRule::CidrV4 { network, mask }) => {
             (client_bits & mask) == *network
         }
+        // IPv4-mapped IPv6 addresses should satisfy IPv4 rules.
+        (ParsedClientIp::V4MappedV6 { v4, .. }, ParsedRule::ExactV4(rule_bits)) => v4 == rule_bits,
+        (ParsedClientIp::V4MappedV6 { v4, .. }, ParsedRule::CidrV4 { network, mask }) => {
+            (v4 & mask) == *network
+        }
         // IPv6 exact
         (ParsedClientIp::V6(client_bits), ParsedRule::ExactV6(rule_bits)) => {
             client_bits == rule_bits
@@ -275,6 +289,11 @@ pub(super) fn rule_matches(client: &ParsedClientIp, rule: &ParsedRule) -> bool {
         // IPv6 CIDR
         (ParsedClientIp::V6(client_bits), ParsedRule::CidrV6 { network, mask }) => {
             (client_bits & mask) == *network
+        }
+        // IPv4-mapped IPv6 addresses should also satisfy IPv6 mapped rules.
+        (ParsedClientIp::V4MappedV6 { v6, .. }, ParsedRule::ExactV6(rule_bits)) => v6 == rule_bits,
+        (ParsedClientIp::V4MappedV6 { v6, .. }, ParsedRule::CidrV6 { network, mask }) => {
+            (v6 & mask) == *network
         }
         // Unknown or cross-family types never match validated rules.
         _ => false,

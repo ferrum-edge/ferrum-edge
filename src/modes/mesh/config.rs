@@ -2150,10 +2150,18 @@ pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, Str
         return;
     }
 
-    *headers = headers
-        .drain()
-        .map(|(key, value)| (key.to_ascii_lowercase(), value))
-        .collect();
+    let mut normalized = HashMap::with_capacity(headers.len());
+    for (key, value) in headers.iter() {
+        let lower = key.to_ascii_lowercase();
+        if let Some(existing) = normalized.get(&lower)
+            && existing != value
+        {
+            return;
+        }
+        normalized.insert(lower, value.clone());
+    }
+
+    *headers = normalized;
 }
 
 // ── MeshRuntimeOverlay (GAP-3E) ───────────────────────────────────────────

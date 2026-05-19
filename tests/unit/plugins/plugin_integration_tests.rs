@@ -516,7 +516,11 @@ async fn test_response_caching_stores_transformed_body() {
     let plugins = sort_plugins(vec![
         create_plugin(
             "response_caching",
-            &json!({"ttl_seconds": 60, "add_cache_status_header": true}),
+            &json!({
+                "ttl_seconds": 60,
+                "add_cache_status_header": true,
+                "cache_key_include_consumer": true
+            }),
         )
         .unwrap()
         .unwrap(),

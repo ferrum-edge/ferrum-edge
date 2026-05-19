@@ -357,8 +357,8 @@ impl Plugin for AiTokenMetrics {
         true
     }
 
-    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
-        true
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        ctx.method.eq_ignore_ascii_case("POST")
     }
 
     async fn on_response_body(

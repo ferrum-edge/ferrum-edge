@@ -9,35 +9,37 @@ use std::path::{Path, PathBuf};
 
 /// Resolve the cgroup v2 path for a Kubernetes pod.
 ///
-/// Tries the systemd driver path first (`kubepods.slice/...`), then falls back
-/// to the cgroupfs driver path (`kubepods/pod{uid}/`).
+/// Tries systemd driver paths first (`kubepods.slice/...`), then falls back to
+/// cgroupfs driver paths (`kubepods/pod{uid}/`).
 pub fn resolve_pod_cgroup_path(cgroup_root: &str, pod_uid: &str) -> Option<PathBuf> {
     let sanitized_uid = pod_uid.replace('-', "_");
 
-    let systemd_path =
-        Path::new(cgroup_root).join(format!("kubepods.slice/kubepods-pod{sanitized_uid}.slice"));
-    if systemd_path.exists() {
-        return Some(systemd_path);
-    }
+    systemd_pod_cgroup_paths(cgroup_root, &sanitized_uid)
+        .into_iter()
+        .chain(cgroupfs_pod_cgroup_paths(cgroup_root, pod_uid))
+        .find(|path| path.exists())
+}
 
-    let cgroupfs_path = Path::new(cgroup_root).join(format!("kubepods/pod{pod_uid}"));
-    if cgroupfs_path.exists() {
-        return Some(cgroupfs_path);
-    }
+fn systemd_pod_cgroup_paths(cgroup_root: &str, sanitized_uid: &str) -> [PathBuf; 3] {
+    let root = Path::new(cgroup_root).join("kubepods.slice");
+    [
+        root.join(format!("kubepods-pod{sanitized_uid}.slice")),
+        root.join(format!(
+            "kubepods-burstable.slice/kubepods-burstable-pod{sanitized_uid}.slice"
+        )),
+        root.join(format!(
+            "kubepods-besteffort.slice/kubepods-besteffort-pod{sanitized_uid}.slice"
+        )),
+    ]
+}
 
-    let cgroupfs_burstable =
-        Path::new(cgroup_root).join(format!("kubepods/burstable/pod{pod_uid}"));
-    if cgroupfs_burstable.exists() {
-        return Some(cgroupfs_burstable);
-    }
-
-    let cgroupfs_besteffort =
-        Path::new(cgroup_root).join(format!("kubepods/besteffort/pod{pod_uid}"));
-    if cgroupfs_besteffort.exists() {
-        return Some(cgroupfs_besteffort);
-    }
-
-    None
+fn cgroupfs_pod_cgroup_paths(cgroup_root: &str, pod_uid: &str) -> [PathBuf; 3] {
+    let root = Path::new(cgroup_root).join("kubepods");
+    [
+        root.join(format!("pod{pod_uid}")),
+        root.join(format!("burstable/pod{pod_uid}")),
+        root.join(format!("besteffort/pod{pod_uid}")),
+    ]
 }
 
 /// Build the expected cgroup path for a given QoS class (for testing/validation).
@@ -87,5 +89,33 @@ mod tests {
     fn systemd_path_sanitizes_dashes_to_underscores() {
         let sanitized = "abc-def-123".replace('-', "_");
         assert_eq!(sanitized, "abc_def_123");
+    }
+
+    #[test]
+    fn resolve_pod_cgroup_path_finds_systemd_burstable_pod() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podabc_def.slice");
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert_eq!(
+            resolve_pod_cgroup_path(dir.path().to_str().unwrap(), "abc-def"),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn resolve_pod_cgroup_path_finds_systemd_besteffort_pod() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podabc_def.slice");
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert_eq!(
+            resolve_pod_cgroup_path(dir.path().to_str().unwrap(), "abc-def"),
+            Some(path)
+        );
     }
 }

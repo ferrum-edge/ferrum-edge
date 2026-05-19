@@ -2902,12 +2902,27 @@ impl DatabaseStore {
             return Ok(());
         }
 
+        let assoc_exists_sql = self
+            .q("SELECT 1 FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ? LIMIT 1");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
             let mut tx = self.pool().begin().await?;
+            let mut seen = HashSet::new();
             for proxy in chunk {
                 for assoc in &proxy.plugins {
+                    if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
+                        continue;
+                    }
+                    let already_attached = sqlx::query(&assoc_exists_sql)
+                        .bind(&proxy.id)
+                        .bind(&assoc.plugin_config_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .is_some();
+                    if already_attached {
+                        continue;
+                    }
                     sqlx::query(&assoc_sql)
                         .bind(&proxy.id)
                         .bind(&assoc.plugin_config_id)

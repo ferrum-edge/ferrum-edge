@@ -601,12 +601,18 @@ fn commands_for_family(
             config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
         if emit_include_cidrs {
             if include_cidrs.is_empty() {
-                commands.push(idempotent_append(
-                    binary,
-                    "nat",
-                    "FERRUM_MESH_OUTBOUND",
-                    &format!("-p tcp -j REDIRECT --to-ports {}", config.outbound_port),
-                ));
+                let has_include_cidrs_for_other_family = config
+                    .include_cidrs
+                    .iter()
+                    .any(|cidr| cidr_family(cidr).is_some_and(|cidr_family| cidr_family != family));
+                if config.include_cidrs_explicit || !has_include_cidrs_for_other_family {
+                    commands.push(idempotent_append(
+                        binary,
+                        "nat",
+                        "FERRUM_MESH_OUTBOUND",
+                        &format!("-p tcp -j REDIRECT --to-ports {}", config.outbound_port),
+                    ));
+                }
             } else {
                 for cidr in include_cidrs {
                     commands.push(idempotent_append(

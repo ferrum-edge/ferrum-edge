@@ -385,7 +385,7 @@ async fn condition_match_on_request_header_enforces_match_and_no_match() {
 
 #[tokio::test]
 async fn request_principal_match_from_jwks_auth_metadata() {
-    // `jwks_auth` populates `metadata["jwks_auth.request_principal"]`
+    // `jwks_auth` populates `metadata["mesh.request_principal"]`
     // from the validated JWT's `iss/sub`. `mesh_authz` reads that and
     // matches against `rule.request_principals` globs — this is
     // Istio's `from[].source.requestPrincipals` semantics.
@@ -406,7 +406,7 @@ async fn request_principal_match_from_jwks_auth_metadata() {
 
     let mut ok_ctx = ctx_with_principal("GET", "/api", None);
     ok_ctx.metadata.insert(
-        "jwks_auth.request_principal".to_string(),
+        "mesh.request_principal".to_string(),
         "https://issuer.example.com/user-42".to_string(),
     );
     assert!(matches!(
@@ -417,7 +417,7 @@ async fn request_principal_match_from_jwks_auth_metadata() {
     // Different issuer → no rule matches → implicit deny.
     let mut blocked_ctx = ctx_with_principal("GET", "/api", None);
     blocked_ctx.metadata.insert(
-        "jwks_auth.request_principal".to_string(),
+        "mesh.request_principal".to_string(),
         "https://attacker.com/u".to_string(),
     );
     assert!(matches!(

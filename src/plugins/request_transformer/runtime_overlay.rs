@@ -81,6 +81,15 @@ pub fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_guard() -> MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn overlay(entries: &[(&str, RuntimeValue)]) -> MeshRuntimeOverlay {
         let mut fields = HashMap::new();
@@ -92,6 +101,7 @@ mod tests {
 
     #[test]
     fn applies_bool_gate_per_scope() {
+        let _guard = test_guard();
         reset_for_test();
         apply_overlay(&overlay(&[
             (
@@ -111,6 +121,7 @@ mod tests {
 
     #[test]
     fn ignores_non_bool_values() {
+        let _guard = test_guard();
         reset_for_test();
         apply_overlay(&overlay(&[(
             "ferrum.request_transformer.bad.enabled",
@@ -122,6 +133,7 @@ mod tests {
 
     #[test]
     fn empty_scope_is_ignored() {
+        let _guard = test_guard();
         reset_for_test();
         apply_overlay(&overlay(&[(
             "ferrum.request_transformer..enabled",
@@ -133,6 +145,7 @@ mod tests {
 
     #[test]
     fn empty_overlay_clears_state() {
+        let _guard = test_guard();
         reset_for_test();
         apply_overlay(&overlay(&[(
             "ferrum.request_transformer.cart.enabled",

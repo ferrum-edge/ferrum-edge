@@ -1560,8 +1560,9 @@ impl PluginCache {
                 error!("{}", err);
             }
             return Err(format!(
-                "Gateway startup aborted: {} security plugin(s) failed config validation",
-                security_errors.len()
+                "Gateway startup aborted: {} security plugin(s) failed config validation: {}",
+                security_errors.len(),
+                security_errors.join("; ")
             ));
         }
 
