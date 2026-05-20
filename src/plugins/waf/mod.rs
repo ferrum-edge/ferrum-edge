@@ -4,15 +4,18 @@
 //! intentionally scoped to payload and metadata inspection; authentication,
 //! authorization, rate limiting, protocol smuggling defense, and structural
 //! schema validation remain in their dedicated plugins/core layers.
+//!
+//! Query scanning uses the raw query string when the proxy pipeline has not
+//! already materialized it, so duplicate raw pairs remain visible for HPP
+//! checks. When an earlier phase has consumed the raw query, WAF falls back to
+//! the decoded `RequestContext::query_params` map for key/value scans and
+//! best-effort full-URL checks.
 
 mod decode;
 mod defaults;
 mod exemptions;
 mod rules;
 mod scan;
-
-#[allow(unused_imports)]
-pub use rules::{Conditions, MatchKind, RuleAction, RuleTarget, Severity, WafRule};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -22,7 +25,10 @@ use tracing::warn;
 
 use self::defaults::default_rules;
 use self::exemptions::CompiledExemptions;
-use self::rules::{CompiledRules, RuleHit, compile_rules, parse_custom_rule, parse_rule_action};
+use self::rules::{
+    CompiledRules, RuleAction, RuleHit, Severity, WafRule, compile_rules, parse_custom_rule,
+    parse_rule_action,
+};
 use self::scan::ScanOutcome;
 use super::utils::sse::is_sse_request;
 use super::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
@@ -283,24 +289,51 @@ impl Waf {
         if start.elapsed() >= budget {
             return ScanOutcome {
                 timed_out: true,
-                ..ScanOutcome::default()
+                ..outcome
             };
         }
         outcome
     }
 
     fn finish_scan(&self, ctx: &mut RequestContext, outcome: ScanOutcome) -> PluginResult {
-        if outcome.timed_out {
-            return self.finish_timeout(ctx);
-        }
         if outcome.hits.is_empty() {
             if outcome.truncated && self.config.log_to_metadata {
                 ctx.metadata
                     .insert("waf.scan_truncated".to_string(), "true".to_string());
             }
+            if outcome.timed_out {
+                return self.finish_timeout(ctx);
+            }
             return PluginResult::Continue;
         }
 
+        let has_blocking_rule = self.record_hits(ctx, &outcome, !outcome.timed_out);
+        if outcome.timed_out {
+            return self.finish_timeout(ctx);
+        }
+
+        if has_blocking_rule {
+            let mut headers = HashMap::new();
+            headers.insert(
+                "content-type".to_string(),
+                self.config.reject_content_type.clone(),
+            );
+            PluginResult::Reject {
+                status_code: self.config.reject_status_code,
+                body: self.config.reject_body.clone(),
+                headers,
+            }
+        } else {
+            PluginResult::Continue
+        }
+    }
+
+    fn record_hits(
+        &self,
+        ctx: &mut RequestContext,
+        outcome: &ScanOutcome,
+        enforce_actions: bool,
+    ) -> bool {
         let mut first_blocking_rule = None;
         let mut highest = Severity::Info;
         let mut rule_ids = Vec::with_capacity(outcome.hits.len());
@@ -312,7 +345,10 @@ impl Waf {
             if !targets.contains(&hit.target_name) {
                 targets.push(hit.target_name);
             }
-            if rule.action == RuleAction::Enforce && first_blocking_rule.is_none() {
+            if enforce_actions
+                && rule.action == RuleAction::Enforce
+                && first_blocking_rule.is_none()
+            {
                 first_blocking_rule = Some(rule.id.as_str());
             }
             self.warn_hit(ctx, hit);
@@ -343,29 +379,24 @@ impl Waf {
             }
         }
 
-        if first_blocking_rule.is_some() {
-            let mut headers = HashMap::new();
-            headers.insert(
-                "content-type".to_string(),
-                self.config.reject_content_type.clone(),
-            );
-            PluginResult::Reject {
-                status_code: self.config.reject_status_code,
-                body: self.config.reject_body.clone(),
-                headers,
-            }
-        } else {
-            PluginResult::Continue
-        }
+        first_blocking_rule.is_some()
     }
 
     fn finish_timeout(&self, ctx: &mut RequestContext) -> PluginResult {
         if self.config.log_to_metadata {
             ctx.metadata
                 .insert("waf.scan_timed_out".to_string(), "true".to_string());
-            ctx.metadata
-                .entry("waf.action".to_string())
-                .or_insert_with(|| "clean".to_string());
+            match self.config.on_scan_timeout {
+                TimeoutAction::Block => {
+                    ctx.metadata
+                        .insert("waf.action".to_string(), "blocked".to_string());
+                }
+                TimeoutAction::Allow | TimeoutAction::LogAndAllow => {
+                    ctx.metadata
+                        .entry("waf.action".to_string())
+                        .or_insert_with(|| "clean".to_string());
+                }
+            }
         }
         warn!(
             target: "waf",
@@ -408,6 +439,13 @@ impl Waf {
             method = %ctx.method,
             "WAF rule matched"
         );
+    }
+
+    fn response_body_eligible_for_scan(&self, content_type: Option<&str>) -> bool {
+        // Response bodies with missing or malformed content-type are still
+        // eligible when binary inspection is explicit; request bodies are
+        // gated earlier by `should_buffer_request_body`.
+        self.config.inspect_binary_body || self.should_inspect_body_content_type(content_type)
     }
 }
 
@@ -481,7 +519,7 @@ impl Plugin for Waf {
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
-        headers: &HashMap<String, String>,
+        _headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         if !self.should_buffer_request_body(ctx) {
@@ -500,7 +538,7 @@ impl Plugin for Waf {
             body
         };
         let mut outcome = self
-            .run_body_scan_with_budget(|| self.run_request_body_scan(ctx, headers, body))
+            .run_body_scan_with_budget(|| self.run_request_body_scan(ctx, body))
             .await;
         outcome.truncated = truncated;
         self.finish_scan(ctx, outcome)
@@ -546,11 +584,9 @@ impl Plugin for Waf {
         if !self.should_buffer_response_body(ctx) {
             return PluginResult::Continue;
         }
-        if !self.config.inspect_binary_body
-            && !self.should_inspect_body_content_type(
-                response_headers.get("content-type").map(String::as_str),
-            )
-        {
+        if !self.response_body_eligible_for_scan(
+            response_headers.get("content-type").map(String::as_str),
+        ) {
             return PluginResult::Continue;
         }
         let mut truncated = false;
@@ -566,7 +602,7 @@ impl Plugin for Waf {
             body
         };
         let mut outcome = self
-            .run_body_scan_with_budget(|| self.run_response_body_scan(ctx, response_headers, body))
+            .run_body_scan_with_budget(|| self.run_response_body_scan(ctx, body))
             .await;
         outcome.truncated = truncated;
         self.finish_scan(ctx, outcome)
@@ -752,5 +788,111 @@ fn optional_u64(object: &serde_json::Map<String, Value>, key: &str) -> Result<Op
             .map(Some)
             .ok_or_else(|| format!("waf: '{key}' must be a non-negative integer")),
         Some(other) => Err(format!("waf: '{key}' must be an integer, got {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn body_ctx() -> RequestContext {
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/submit".into());
+        ctx.headers
+            .insert("content-type".into(), "application/json".into());
+        ctx
+    }
+
+    #[tokio::test]
+    async fn scan_budget_timeout_preserves_hits_for_metadata() {
+        let plugin = Waf::new(&json!({
+            "include_default_rules": false,
+            "scan_budget_ms": 1,
+            "on_scan_timeout": "log_and_allow",
+            "custom_rules": [{
+                "id": "CUSTOM-SLOW",
+                "name": "slow",
+                "category": "custom",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": "needle",
+                "action": "enforce"
+            }]
+        }))
+        .unwrap();
+        let mut ctx = body_ctx();
+
+        let outcome = plugin
+            .run_body_scan_with_budget(|| {
+                std::thread::sleep(Duration::from_millis(5));
+                let mut outcome = ScanOutcome::default();
+                outcome.push(RuleHit {
+                    rule_index: 0,
+                    target_name: "request_body",
+                });
+                outcome
+            })
+            .await;
+
+        assert!(outcome.timed_out);
+        let result = plugin.finish_scan(&mut ctx, outcome);
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata.get("waf.rule_hits").map(String::as_str),
+            Some("CUSTOM-SLOW")
+        );
+        assert_eq!(
+            ctx.metadata.get("waf.scan_timed_out").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            ctx.metadata.get("waf.action").map(String::as_str),
+            Some("monitored")
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_budget_timeout_block_action_rejects() {
+        let plugin = Waf::new(&json!({
+            "include_default_rules": false,
+            "scan_budget_ms": 1,
+            "on_scan_timeout": "block",
+            "custom_rules": [{
+                "id": "CUSTOM-SLOW",
+                "name": "slow",
+                "category": "custom",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": "needle",
+                "action": "monitor"
+            }]
+        }))
+        .unwrap();
+        let mut ctx = body_ctx();
+
+        let outcome = plugin
+            .run_body_scan_with_budget(|| {
+                std::thread::sleep(Duration::from_millis(5));
+                ScanOutcome::default()
+            })
+            .await;
+        let result = plugin.finish_scan(&mut ctx, outcome);
+
+        assert!(matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ));
+        assert_eq!(
+            ctx.metadata.get("waf.scan_timed_out").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            ctx.metadata.get("waf.action").map(String::as_str),
+            Some("blocked")
+        );
     }
 }

@@ -467,6 +467,50 @@ impl RequestContext {
         }
     }
 
+    /// Build the lightweight compatibility context used by final request-body
+    /// hooks when the active plugin needs request metadata after body
+    /// transforms. Only `metadata` is copied back to the real context by the
+    /// proxy caller, so this deliberately skips raw headers, raw query strings,
+    /// parsed query maps, prebuffered body bytes, and mirror receivers.
+    pub(crate) fn clone_for_final_request_body_hooks(&self) -> Self {
+        Self {
+            client_ip: self.client_ip.clone(),
+            method: self.method.clone(),
+            path: self.path.clone(),
+            frontend_listen_port: self.frontend_listen_port,
+            raw_headers: None,
+            headers: self.headers.clone(),
+            raw_query_string: None,
+            query_params: HashMap::new(),
+            matched_proxy: self.matched_proxy.clone(),
+            identified_consumer: self.identified_consumer.clone(),
+            authenticated_identity: self.authenticated_identity.clone(),
+            authenticated_identity_header: self.authenticated_identity_header.clone(),
+            auth_method: self.auth_method,
+            timestamp_received: self.timestamp_received,
+            metadata: self.metadata.clone(),
+            tls_client_cert_der: self.tls_client_cert_der.clone(),
+            tls_client_cert_chain_der: self.tls_client_cert_chain_der.clone(),
+            peer_spiffe_id: self.peer_spiffe_id.clone(),
+            plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
+            mirror_result_rx: None,
+            request_body_bytes: None,
+            bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
+            is_early_data: self.is_early_data,
+            route_override_upstream_id: self.route_override_upstream_id.clone(),
+            route_override_backend_host: self.route_override_backend_host.clone(),
+            route_override_backend_port: self.route_override_backend_port,
+            route_override_resolved_tls: self.route_override_resolved_tls.clone(),
+            route_override_backend_read_timeout_ms: self.route_override_backend_read_timeout_ms,
+            route_override_retry: self.route_override_retry.clone(),
+            route_override_request_transform: self.route_override_request_transform.clone(),
+            route_override_response_transform: self.route_override_response_transform.clone(),
+            node_waypoint_pod_uid: self.node_waypoint_pod_uid,
+            node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
+            mesh_direction: self.mesh_direction,
+        }
+    }
+
     /// Effective upstream id for routing: plugin upstream override >
     /// direct-backend override (clears upstream) > proxy.upstream_id.
     /// Pool keys mentioning upstream identity must derive from this.

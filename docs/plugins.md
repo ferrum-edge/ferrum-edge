@@ -2422,6 +2422,10 @@ and `global_exemptions.consumers` available to request metadata rules.
 Request-body inspection runs on the final backend-visible body after request
 body transforms. It buffers only matching methods/content types. Response
 inspection is opt-in and can scan response headers and final response bodies.
+When the raw query string is still available, WAF scans raw query pairs before
+the request's parsed query map can collapse duplicate keys; if an earlier phase
+has already materialized query params, WAF falls back to scanning the parsed
+key/value map and a best-effort reconstructed URL.
 
 **Priority:** 2930
 **Phase:** `authorize`, `on_final_request_body`, `after_proxy`, `on_final_response_body`
@@ -2446,7 +2450,7 @@ inspection is opt-in and can scan response headers and final response bodies.
 | `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
 | `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
 | `on_body_too_large` | string | `scan_truncated` | `scan_truncated` scans the first `max_scan_bytes`; `skip` skips known-oversized bodies. |
-| `scan_budget_ms` | u64 | `50` | Timeout budget for body scan hooks. `0` disables the timeout wrapper. |
+| `scan_budget_ms` | u64 | `50` | Post-hoc deadline for body scan hooks. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; over-budget scans are reported after the scan returns. |
 | `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
 | `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
 | `log_to_metadata` | bool | `true` | Write WAF metadata such as `waf.rule_hits`, `waf.action`, and `waf.severity` into transaction logs. |
@@ -2474,6 +2478,11 @@ inspection is opt-in and can scan response headers and final response bodies.
 Supported targets: `header_names`, `header_values`, `query_keys`,
 `query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,
 `body_json_path`, `response_headers`, and `response_body`.
+
+CIDR rules on free-form body text are heuristic token scans. They are useful
+for tightly scoped private-address leakage checks, but broad response-body CIDR
+rules can match IPv6-shaped hex text from logs or diagnostics. Prefer narrow
+`conditions.paths`, header scoping, and false-positive filters for those rules.
 
 `global_exemptions` supports `paths`, `methods`, `consumers`, `ips`,
 `header_present`, and `fp_capture_filters`. Path entries ending in `*` are

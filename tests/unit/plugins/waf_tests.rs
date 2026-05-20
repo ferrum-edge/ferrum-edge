@@ -412,6 +412,256 @@ async fn duplicate_query_key_cannot_smuggle_payload_past_query_values_rule() {
     );
 }
 
+#[tokio::test]
+async fn parsed_query_params_are_scanned_when_raw_query_was_consumed() {
+    let plugin = Waf::new(&json!({
+        "rule_modes": {
+            "FE-XSS-001": "enforce",
+            "FE-PATHTRAV-001": "enforce"
+        }
+    }))
+    .unwrap();
+    let mut query_ctx = ctx("GET", "/search");
+    query_ctx
+        .query_params
+        .insert("q".into(), "<script>alert(1)</script>".into());
+
+    let result = plugin.authorize(&mut query_ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        query_ctx
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-XSS-001")
+    );
+
+    let mut full_url_ctx = ctx("GET", "/download");
+    full_url_ctx
+        .query_params
+        .insert("file".into(), "../etc/passwd".into());
+    let result = plugin.authorize(&mut full_url_ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        full_url_ctx
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-PATHTRAV-001")
+    );
+}
+
+#[tokio::test]
+async fn disabled_default_rules_are_skipped() {
+    let plugin = Waf::new(&json!({
+        "disabled_default_rules": ["FE-XSS-001"],
+        "rule_modes": { "FE-XSS-001": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !ctx.metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-XSS-001"))
+    );
+}
+
+#[tokio::test]
+async fn paranoia_level_filters_custom_rules() {
+    let config = json!({
+        "include_default_rules": false,
+        "custom_rules": [
+            {
+                "id": "CUSTOM-PL1",
+                "name": "pl1",
+                "category": "custom",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "never-matches",
+                "action": "monitor",
+                "paranoia_min": 1
+            },
+            {
+                "id": "CUSTOM-PL2",
+                "name": "pl2",
+                "category": "custom",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "needle",
+                "action": "enforce",
+                "paranoia_min": 2
+            }
+        ]
+    });
+
+    let plugin = Waf::new(&config).unwrap();
+    let mut low_ctx = ctx("GET", "/search");
+    low_ctx.set_raw_query_string("q=needle".into());
+    let result = plugin.authorize(&mut low_ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !low_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-PL2"))
+    );
+
+    let mut high_config = config;
+    high_config["paranoia_level"] = json!(2);
+    let plugin = Waf::new(&high_config).unwrap();
+    let mut high_ctx = ctx("GET", "/search");
+    high_ctx.set_raw_query_string("q=needle".into());
+    let result = plugin.authorize(&mut high_ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        high_ctx
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("CUSTOM-PL2")
+    );
+}
+
+#[tokio::test]
+async fn inspect_multipart_gates_body_scanning() {
+    let default_plugin = Waf::new(&json!({
+        "rule_modes": { "FE-CMD-002": "enforce" }
+    }))
+    .unwrap();
+    let mut default_ctx = ctx("POST", "/upload");
+    default_ctx.headers.insert(
+        "content-type".into(),
+        "multipart/form-data; boundary=abc".into(),
+    );
+    let headers = default_ctx.headers.clone();
+
+    let result = default_plugin
+        .on_final_request_body_with_context(&mut default_ctx, &headers, b"bash -i")
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let multipart_plugin = Waf::new(&json!({
+        "inspect_multipart": true,
+        "rule_modes": { "FE-CMD-002": "enforce" }
+    }))
+    .unwrap();
+    let mut multipart_ctx = ctx("POST", "/upload");
+    multipart_ctx.headers.insert(
+        "content-type".into(),
+        "multipart/form-data; boundary=abc".into(),
+    );
+    let headers = multipart_ctx.headers.clone();
+
+    let result = multipart_plugin
+        .on_final_request_body_with_context(&mut multipart_ctx, &headers, b"bash -i")
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+}
+
+#[tokio::test]
+async fn oversized_body_skip_mode_does_not_scan_truncated_prefix() {
+    let plugin = Waf::new(&json!({
+        "max_scan_bytes": 4,
+        "on_body_too_large": "skip",
+        "rule_modes": { "FE-CMD-002": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    ctx.headers.insert("content-length".into(), "16".into());
+    let headers = ctx.headers.clone();
+
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, b"bash -i and more")
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+#[tokio::test]
+async fn per_rule_false_positive_filters_suppress_hits() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-FP",
+            "name": "fp filter",
+            "category": "custom",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "fp_filters": ["needle ok"],
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut suppressed = ctx("GET", "/search");
+    suppressed.set_raw_query_string("q=needle%20ok".into());
+    let result = plugin.authorize(&mut suppressed).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!suppressed.metadata.contains_key("waf.rule_hits"));
+
+    let mut blocked = ctx("GET", "/search");
+    blocked.set_raw_query_string("q=needle%20bad".into());
+    let result = plugin.authorize(&mut blocked).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+}
+
+#[tokio::test]
+async fn global_exemptions_cover_ips_headers_and_capture_filters() {
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-XSS-001": "enforce" },
+        "global_exemptions": {
+            "ips": ["10.0.0.0/8"],
+            "header_present": { "x-waf-fp": "known" },
+            "fp_capture_filters": ["<script>safe</script>"]
+        }
+    }))
+    .unwrap();
+
+    let mut ip_ctx = RequestContext::new("10.1.2.3".into(), "GET".into(), "/search".into());
+    ip_ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+    let result = plugin.authorize(&mut ip_ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ip_ctx.metadata.contains_key("waf.rule_hits"));
+
+    let mut header_ctx = ctx("GET", "/search");
+    header_ctx.headers.insert("x-waf-fp".into(), "known".into());
+    header_ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+    let result = plugin.authorize(&mut header_ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!header_ctx.metadata.contains_key("waf.rule_hits"));
+
+    let mut capture_ctx = ctx("GET", "/search");
+    capture_ctx.set_raw_query_string("q=%3Cscript%3Esafe%3C/script%3E".into());
+    let result = plugin.authorize(&mut capture_ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!capture_ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+#[test]
+fn invalid_global_exemption_cidr_fails_construction() {
+    let err = Waf::new(&json!({
+        "global_exemptions": { "ips": ["not-a-cidr"] }
+    }))
+    .unwrap_err();
+
+    assert!(err.contains("global_exemptions.ips"));
+    assert!(err.contains("not-a-cidr"));
+}
+
 #[test]
 fn unknown_rule_modes_id_fails_construction() {
     // WAF is security-critical: a typo in an `enforce` override would

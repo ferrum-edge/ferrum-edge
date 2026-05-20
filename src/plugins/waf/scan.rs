@@ -73,6 +73,33 @@ impl Waf {
                 self.scan_encoding_specials(&mut outcome, &full_url, ctx);
                 self.scan_hpp_special(&mut outcome, raw_query, ctx);
             }
+        } else if !ctx.query_params.is_empty() {
+            let mut full_url = String::with_capacity(
+                ctx.path.len()
+                    + 1
+                    + ctx
+                        .query_params
+                        .iter()
+                        .map(|(key, value)| key.len() + value.len() + 2)
+                        .sum::<usize>(),
+            );
+            full_url.push_str(&ctx.path);
+            append_materialized_query(&mut full_url, &ctx.query_params);
+            self.scan_text_set(
+                &mut outcome,
+                self.compiled.full_url.as_ref(),
+                &full_url,
+                ctx,
+                None,
+            );
+            self.scan_cidr_rules_matching(
+                &mut outcome,
+                &full_url,
+                &self.compiled.text_cidr_rules,
+                ctx,
+                |target| matches!(target, RuleTarget::FullUrl),
+            );
+            self.scan_encoding_specials(&mut outcome, &full_url, ctx);
         } else {
             self.scan_text_set(
                 &mut outcome,
@@ -105,37 +132,13 @@ impl Waf {
                 let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
                 let key = percent_decode_str(raw_k).decode_utf8_lossy();
                 let value = percent_decode_str(raw_v).decode_utf8_lossy();
-                self.scan_text_set(
-                    &mut outcome,
-                    self.compiled.query_keys.as_ref(),
-                    &key,
-                    ctx,
-                    None,
-                );
-                self.scan_text_set(
-                    &mut outcome,
-                    self.compiled.query_values.as_ref(),
-                    &value,
-                    ctx,
-                    None,
-                );
-                self.scan_cidr_rules_matching(
-                    &mut outcome,
-                    &key,
-                    &self.compiled.text_cidr_rules,
-                    ctx,
-                    |target| matches!(target, RuleTarget::QueryKeys),
-                );
-                self.scan_cidr_rules_matching(
-                    &mut outcome,
-                    &value,
-                    &self.compiled.text_cidr_rules,
-                    ctx,
-                    |target| matches!(target, RuleTarget::QueryValues),
-                );
+                self.scan_query_pair(&mut outcome, &key, &value, ctx);
+            }
+        } else {
+            for (key, value) in &ctx.query_params {
+                self.scan_query_pair(&mut outcome, key, value, ctx);
             }
         }
-        ctx.materialize_query_params();
 
         for (name, value) in &ctx.headers {
             self.scan_text_set(
@@ -194,7 +197,6 @@ impl Waf {
     pub(super) fn run_request_body_scan(
         &self,
         ctx: &mut RequestContext,
-        _headers: &HashMap<String, String>,
         body: &[u8],
     ) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
@@ -239,7 +241,6 @@ impl Waf {
     pub(super) fn run_response_body_scan(
         &self,
         ctx: &mut RequestContext,
-        _headers: &HashMap<String, String>,
         body: &[u8],
     ) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
@@ -351,6 +352,37 @@ impl Waf {
                 );
             }
         }
+    }
+
+    fn scan_query_pair(
+        &self,
+        outcome: &mut ScanOutcome,
+        key: &str,
+        value: &str,
+        ctx: &RequestContext,
+    ) {
+        self.scan_text_set(outcome, self.compiled.query_keys.as_ref(), key, ctx, None);
+        self.scan_text_set(
+            outcome,
+            self.compiled.query_values.as_ref(),
+            value,
+            ctx,
+            None,
+        );
+        self.scan_cidr_rules_matching(
+            outcome,
+            key,
+            &self.compiled.text_cidr_rules,
+            ctx,
+            |target| matches!(target, RuleTarget::QueryKeys),
+        );
+        self.scan_cidr_rules_matching(
+            outcome,
+            value,
+            &self.compiled.text_cidr_rules,
+            ctx,
+            |target| matches!(target, RuleTarget::QueryValues),
+        );
     }
 
     fn scan_luhn_rules(
@@ -571,6 +603,8 @@ fn json_scan_text<'a>(
     }
 }
 
+const MAX_LUHN_DIGIT_RUN_SCAN: usize = 4096;
+
 fn contains_luhn_candidate(value: &str) -> bool {
     // Maintain a sliding window of the most recent ≤19 digits. The previous
     // implementation cleared the buffer entirely on overflow, which lets an
@@ -589,8 +623,18 @@ fn contains_luhn_candidate(value: &str) -> bool {
     //   end, catching cards padded on either side.
     let mut digits: Vec<u8> = Vec::with_capacity(19);
     let mut overflowed_run = false;
+    let mut run_digits_seen = 0usize;
+    let mut run_scan_suppressed = false;
     for ch in value.chars() {
         if ch.is_ascii_digit() {
+            run_digits_seen += 1;
+            if run_digits_seen > MAX_LUHN_DIGIT_RUN_SCAN {
+                if !run_scan_suppressed && check_run(&digits, overflowed_run) {
+                    return true;
+                }
+                run_scan_suppressed = true;
+                continue;
+            }
             digits.push(ch as u8 - b'0');
             if digits.len() > 19 {
                 if check_card_substrings(&digits[..19]) {
@@ -602,14 +646,16 @@ fn contains_luhn_candidate(value: &str) -> bool {
         } else if matches!(ch, ' ' | '-' | '.') {
             continue;
         } else {
-            if check_run(&digits, overflowed_run) {
+            if !run_scan_suppressed && check_run(&digits, overflowed_run) {
                 return true;
             }
             digits.clear();
             overflowed_run = false;
+            run_digits_seen = 0;
+            run_scan_suppressed = false;
         }
     }
-    check_run(&digits, overflowed_run)
+    !run_scan_suppressed && check_run(&digits, overflowed_run)
 }
 
 fn check_run(digits: &[u8], overflowed: bool) -> bool {
@@ -657,6 +703,24 @@ fn luhn_valid(digits: &[u8]) -> bool {
     sum.is_multiple_of(10)
 }
 
+fn append_materialized_query(
+    full_url: &mut String,
+    query_params: &std::collections::HashMap<String, String>,
+) {
+    let mut first = true;
+    for (key, value) in query_params {
+        if first {
+            full_url.push('?');
+            first = false;
+        } else {
+            full_url.push('&');
+        }
+        full_url.push_str(key);
+        full_url.push('=');
+        full_url.push_str(value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,5 +740,14 @@ mod tests {
         assert!(contains_luhn_candidate("00004111111111111111"));
         assert!(contains_luhn_candidate("41111111111111119999"));
         assert!(contains_luhn_candidate("000041111111111111119999"));
+    }
+
+    #[test]
+    fn luhn_scan_caps_page_long_digit_runs() {
+        let mut long_run = "1".repeat(MAX_LUHN_DIGIT_RUN_SCAN + 128);
+        long_run.push_str("4111111111111111");
+
+        assert!(!contains_luhn_candidate(&long_run));
+        assert!(contains_luhn_candidate("x4111111111111111"));
     }
 }

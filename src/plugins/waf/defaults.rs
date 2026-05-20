@@ -46,7 +46,7 @@ pub fn default_rules() -> Vec<WafRule> {
         r("FE-RESP-DB-001", "Verbose database error", "database_error", Severity::Medium, RuleTarget::ResponseBody, r"(?i)(?:SQLSTATE|MySQL server version|PostgreSQL.*ERROR|ORA-\d{5}|Mongo(?:DB)?Error|near\s+'WHERE')"),
         r("FE-RESP-SOURCE-001", "Server-side source disclosure", "source_disclosure", Severity::High, RuleTarget::ResponseBody, r"(?i)(?:<\?php|<%[@=]?)"),
         r("FE-RESP-FP-001", "X-Powered-By version disclosure", "fingerprinting", Severity::Low, RuleTarget::ResponseHeaders, r"(?i)\bx-powered-by\s*:\s*[A-Za-z]+/[0-9]"),
-        r("FE-DATA-LEAK-001", "Credit card number with valid Luhn checksum", "data_leak", Severity::High, RuleTarget::ResponseBody, ""),
+        r("FE-DATA-LEAK-001", "Credit card number with valid Luhn checksum (long digit runs are capped)", "data_leak", Severity::High, RuleTarget::ResponseBody, ""),
         r("FE-DATA-LEAK-002", "AWS access key", "data_leak", Severity::High, RuleTarget::ResponseBody, r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
         r("FE-DATA-LEAK-003", "Stripe live secret key", "data_leak", Severity::High, RuleTarget::ResponseBody, r"\bsk_live_[A-Za-z0-9]{16,}\b"),
         r("FE-DATA-LEAK-004", "GitHub personal access token", "data_leak", Severity::High, RuleTarget::ResponseBody, r"\bghp_[A-Za-z0-9]{36}\b"),

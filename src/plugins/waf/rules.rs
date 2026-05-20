@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use crate::plugins::RequestContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Severity {
+pub(super) enum Severity {
     Info,
     Low,
     Medium,
@@ -16,7 +16,7 @@ pub enum Severity {
 }
 
 impl Severity {
-    pub fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Severity::Info => "info",
             Severity::Low => "low",
@@ -28,14 +28,14 @@ impl Severity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuleAction {
+pub(super) enum RuleAction {
     Enforce,
     Monitor,
     Disabled,
 }
 
 impl RuleAction {
-    pub fn as_event_action(self) -> &'static str {
+    pub(super) fn as_event_action(self) -> &'static str {
         match self {
             RuleAction::Enforce => "block",
             RuleAction::Monitor => "monitor",
@@ -45,7 +45,7 @@ impl RuleAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchKind {
+pub(super) enum MatchKind {
     Regex,
     Literal,
     Contains,
@@ -55,7 +55,7 @@ pub enum MatchKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuleTarget {
+pub(super) enum RuleTarget {
     HeaderNames,
     HeaderValues(Option<Vec<String>>),
     QueryKeys,
@@ -71,7 +71,7 @@ pub enum RuleTarget {
 }
 
 impl RuleTarget {
-    pub fn log_target(&self) -> &'static str {
+    pub(super) fn log_target(&self) -> &'static str {
         match self {
             RuleTarget::HeaderNames | RuleTarget::HeaderValues(_) => "request_headers",
             RuleTarget::QueryKeys | RuleTarget::QueryValues => "request_query",
@@ -103,23 +103,23 @@ impl RuleTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Conditions {
-    pub paths: Vec<String>,
-    pub methods: Vec<String>,
-    pub headers: HashMap<String, Option<String>>,
-    pub consumers: Vec<String>,
+pub(super) struct Conditions {
+    paths: Vec<String>,
+    methods: Vec<String>,
+    headers: HashMap<String, Option<String>>,
+    consumers: Vec<String>,
 }
 
 #[derive(Debug)]
-pub struct CompiledConditions {
-    pub path_matchers: Vec<PathMatcher>,
-    pub methods: Vec<String>,
-    pub headers: HashMap<String, Option<String>>,
-    pub consumers: Vec<String>,
+struct CompiledConditions {
+    path_matchers: Vec<PathMatcher>,
+    methods: Vec<String>,
+    headers: HashMap<String, Option<String>>,
+    consumers: Vec<String>,
 }
 
 #[derive(Debug)]
-pub enum PathMatcher {
+enum PathMatcher {
     Regex(Regex),
     Prefix(String),
 }
@@ -134,7 +134,7 @@ impl PathMatcher {
 }
 
 impl CompiledConditions {
-    pub fn compile(raw: &Conditions) -> Result<Self, String> {
+    fn compile(raw: &Conditions) -> Result<Self, String> {
         let path_matchers = raw
             .paths
             .iter()
@@ -158,7 +158,7 @@ impl CompiledConditions {
         })
     }
 
-    pub fn matches(&self, ctx: &RequestContext) -> bool {
+    fn matches(&self, ctx: &RequestContext) -> bool {
         if !self.path_matchers.is_empty()
             && !self.path_matchers.iter().any(|m| m.matches(&ctx.path))
         {
@@ -197,41 +197,41 @@ impl CompiledConditions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WafRule {
-    pub id: String,
-    pub name: String,
-    pub category: String,
-    pub severity: Severity,
-    pub target: RuleTarget,
-    pub match_kind: MatchKind,
-    pub pattern: String,
-    pub conditions: Option<Conditions>,
-    pub action: RuleAction,
-    pub fp_filters: Vec<String>,
-    pub paranoia_min: u8,
+pub(super) struct WafRule {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) category: String,
+    pub(super) severity: Severity,
+    pub(super) target: RuleTarget,
+    pub(super) match_kind: MatchKind,
+    pub(super) pattern: String,
+    pub(super) conditions: Option<Conditions>,
+    pub(super) action: RuleAction,
+    pub(super) fp_filters: Vec<String>,
+    pub(super) paranoia_min: u8,
 }
 
 #[derive(Debug)]
-pub struct CompiledRule {
-    pub id: String,
-    pub name: String,
-    pub category: String,
-    pub severity: Severity,
-    pub target: RuleTarget,
-    pub action: RuleAction,
-    pub conditions: Option<CompiledConditions>,
-    pub fp_filters: Option<RegexSet>,
-    pub cidr: Option<IpCidr>,
+pub(super) struct CompiledRule {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) category: String,
+    pub(super) severity: Severity,
+    pub(super) target: RuleTarget,
+    pub(super) action: RuleAction,
+    conditions: Option<CompiledConditions>,
+    fp_filters: Option<RegexSet>,
+    pub(super) cidr: Option<IpCidr>,
 }
 
 impl CompiledRule {
-    pub fn matches_conditions(&self, ctx: &RequestContext) -> bool {
+    pub(super) fn matches_conditions(&self, ctx: &RequestContext) -> bool {
         self.conditions
             .as_ref()
             .is_none_or(|conditions| conditions.matches(ctx))
     }
 
-    pub fn suppresses_text(&self, value: &str) -> bool {
+    pub(super) fn suppresses_text(&self, value: &str) -> bool {
         self.fp_filters
             .as_ref()
             .is_some_and(|filters| filters.is_match(value))
@@ -239,14 +239,14 @@ impl CompiledRule {
 }
 
 #[derive(Debug, Clone)]
-pub struct RuleRef {
-    pub rule_index: usize,
-    pub target_name: &'static str,
-    pub header_names: Option<Vec<String>>,
+pub(super) struct RuleRef {
+    pub(super) rule_index: usize,
+    pub(super) target_name: &'static str,
+    header_names: Option<Vec<String>>,
 }
 
 impl RuleRef {
-    pub fn matches_header(&self, header_name: Option<&str>) -> bool {
+    pub(super) fn matches_header(&self, header_name: Option<&str>) -> bool {
         match (&self.header_names, header_name) {
             (Some(names), Some(header_name)) => names.iter().any(|name| name == header_name),
             (Some(_), None) => false,
@@ -256,15 +256,15 @@ impl RuleRef {
 }
 
 #[derive(Debug)]
-pub struct TextRuleSet {
-    pub set: RegexSet,
-    pub refs: Vec<RuleRef>,
+pub(super) struct TextRuleSet {
+    pub(super) set: RegexSet,
+    pub(super) refs: Vec<RuleRef>,
 }
 
 #[derive(Debug)]
-pub struct BytesRuleSet {
-    pub set: BytesRegexSet,
-    pub refs: Vec<RuleRef>,
+pub(super) struct BytesRuleSet {
+    pub(super) set: BytesRegexSet,
+    pub(super) refs: Vec<RuleRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,55 +289,55 @@ pub(super) struct JsonPathRule {
 }
 
 #[derive(Debug)]
-pub struct CompiledRules {
-    pub rules: Vec<CompiledRule>,
-    pub header_names: Option<TextRuleSet>,
-    pub header_values: Option<TextRuleSet>,
-    pub query_keys: Option<TextRuleSet>,
-    pub query_values: Option<TextRuleSet>,
-    pub cookies: Option<TextRuleSet>,
-    pub url_path: Option<TextRuleSet>,
-    pub full_url: Option<TextRuleSet>,
-    pub method: Option<TextRuleSet>,
-    pub body_bytes: Option<BytesRuleSet>,
+pub(super) struct CompiledRules {
+    pub(super) rules: Vec<CompiledRule>,
+    pub(super) header_names: Option<TextRuleSet>,
+    pub(super) header_values: Option<TextRuleSet>,
+    pub(super) query_keys: Option<TextRuleSet>,
+    pub(super) query_values: Option<TextRuleSet>,
+    pub(super) cookies: Option<TextRuleSet>,
+    pub(super) url_path: Option<TextRuleSet>,
+    pub(super) full_url: Option<TextRuleSet>,
+    pub(super) method: Option<TextRuleSet>,
+    pub(super) body_bytes: Option<BytesRuleSet>,
     pub(super) body_json_paths: Vec<JsonPathRule>,
-    pub response_headers: Option<TextRuleSet>,
-    pub response_body_bytes: Option<BytesRuleSet>,
-    pub body_luhn_rules: Vec<usize>,
-    pub response_luhn_rules: Vec<usize>,
-    pub text_cidr_rules: Vec<usize>,
-    pub body_cidr_rules: Vec<usize>,
-    pub response_cidr_rules: Vec<usize>,
-    pub request_body_rules_active: bool,
-    pub request_cheap_rules_active: bool,
-    pub response_header_rules_active: bool,
-    pub response_body_rules_active: bool,
+    pub(super) response_headers: Option<TextRuleSet>,
+    pub(super) response_body_bytes: Option<BytesRuleSet>,
+    pub(super) body_luhn_rules: Vec<usize>,
+    pub(super) response_luhn_rules: Vec<usize>,
+    pub(super) text_cidr_rules: Vec<usize>,
+    pub(super) body_cidr_rules: Vec<usize>,
+    pub(super) response_cidr_rules: Vec<usize>,
+    pub(super) request_body_rules_active: bool,
+    pub(super) request_cheap_rules_active: bool,
+    pub(super) response_header_rules_active: bool,
+    pub(super) response_body_rules_active: bool,
 }
 
 impl CompiledRules {
-    pub fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
 
-    pub fn find_rule_index(&self, id: &str) -> Option<usize> {
+    pub(super) fn find_rule_index(&self, id: &str) -> Option<usize> {
         self.rules.iter().position(|rule| rule.id == id)
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct RuleHit {
-    pub rule_index: usize,
-    pub target_name: &'static str,
+pub(super) struct RuleHit {
+    pub(super) rule_index: usize,
+    pub(super) target_name: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IpCidr {
+pub(super) struct IpCidr {
     network: IpAddr,
     prefix: u8,
 }
 
 impl IpCidr {
-    pub fn parse(raw: &str) -> Option<Self> {
+    pub(super) fn parse(raw: &str) -> Option<Self> {
         if let Some((addr, prefix)) = raw.split_once('/') {
             let network: IpAddr = addr.parse().ok()?;
             let prefix: u8 = prefix.parse().ok()?;
@@ -356,7 +356,7 @@ impl IpCidr {
         }
     }
 
-    pub fn matches(self, addr: IpAddr) -> bool {
+    pub(super) fn matches(self, addr: IpAddr) -> bool {
         match (self.network, addr) {
             (IpAddr::V4(network), IpAddr::V4(addr)) => {
                 let mask = if self.prefix == 0 {
@@ -379,7 +379,7 @@ impl IpCidr {
     }
 }
 
-pub fn compile_rules(
+pub(super) fn compile_rules(
     mut rules: Vec<(WafRule, bool)>,
     disabled_default_rules: &HashSet<String>,
     rule_modes: &HashMap<String, RuleAction>,
@@ -730,7 +730,7 @@ fn compile_json_path(path: &str, rule_id: &str) -> Result<Vec<JsonPathSegment>, 
     Ok(segments)
 }
 
-pub fn parse_rule_action(raw: &str, field: &str) -> Result<RuleAction, String> {
+pub(super) fn parse_rule_action(raw: &str, field: &str) -> Result<RuleAction, String> {
     match raw {
         "enforce" | "block" | "reject" => Ok(RuleAction::Enforce),
         "monitor" | "log" | "warn" => Ok(RuleAction::Monitor),
@@ -741,7 +741,10 @@ pub fn parse_rule_action(raw: &str, field: &str) -> Result<RuleAction, String> {
     }
 }
 
-pub fn parse_custom_rule(value: &Value, default_action: RuleAction) -> Result<WafRule, String> {
+pub(super) fn parse_custom_rule(
+    value: &Value,
+    default_action: RuleAction,
+) -> Result<WafRule, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "waf: custom_rules entries must be objects".to_string())?;
@@ -787,7 +790,7 @@ pub fn parse_custom_rule(value: &Value, default_action: RuleAction) -> Result<Wa
     })
 }
 
-pub fn parse_severity(raw: &str) -> Result<Severity, String> {
+fn parse_severity(raw: &str) -> Result<Severity, String> {
     match raw {
         "info" => Ok(Severity::Info),
         "low" => Ok(Severity::Low),
@@ -800,7 +803,7 @@ pub fn parse_severity(raw: &str) -> Result<Severity, String> {
     }
 }
 
-pub fn parse_match_kind(raw: &str) -> Result<MatchKind, String> {
+fn parse_match_kind(raw: &str) -> Result<MatchKind, String> {
     match raw {
         "regex" => Ok(MatchKind::Regex),
         "literal" => Ok(MatchKind::Literal),
@@ -814,7 +817,7 @@ pub fn parse_match_kind(raw: &str) -> Result<MatchKind, String> {
     }
 }
 
-pub fn parse_target(value: &Value) -> Result<RuleTarget, String> {
+fn parse_target(value: &Value) -> Result<RuleTarget, String> {
     if let Some(raw) = value.as_str() {
         return parse_target_string(raw, None, None);
     }
@@ -948,7 +951,7 @@ impl fmt::Display for RuleAction {
     }
 }
 
-pub fn extract_ip_tokens(value: &str) -> impl Iterator<Item = IpAddr> + '_ {
+pub(super) fn extract_ip_tokens(value: &str) -> impl Iterator<Item = IpAddr> + '_ {
     value
         .split(|ch: char| !(ch.is_ascii_hexdigit() || matches!(ch, '.' | ':' | '[' | ']')))
         .filter_map(parse_ip_token)
@@ -983,6 +986,31 @@ mod tests {
         assert!(ips.contains(&"10.2.3.4".parse().unwrap()));
         assert!(ips.contains(&"2001:db8::1".parse().unwrap()));
         assert!(ips.contains(&"2001:db8::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_ip_tokens_ignores_common_non_ip_tokens() {
+        let ips: Vec<IpAddr> = extract_ip_tokens(
+            "sha=0123456789abcdef0123456789abcdef01234567 uuid=550e8400-e29b-41d4-a716-446655440000",
+        )
+        .collect();
+
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn extract_ip_tokens_accepts_ipv6_shaped_hex_text() {
+        let ips: Vec<IpAddr> =
+            extract_ip_tokens("trace=dead:beef:cafe:1234:5678:90ab:cdef:0001").collect();
+
+        assert_eq!(
+            ips,
+            vec![
+                "dead:beef:cafe:1234:5678:90ab:cdef:1"
+                    .parse::<IpAddr>()
+                    .unwrap()
+            ]
+        );
     }
 
     #[test]

@@ -8583,6 +8583,11 @@ async fn handle_proxy_request_inner(
         &ctx.headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+    // Pre-computed at config reload (see `PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT`)
+    // so the proxy hot path does not re-scan the plugin list per request.
+    let needs_final_request_body_context = requires_request_body_buffering
+        && capabilities
+            .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
     let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
@@ -8715,8 +8720,6 @@ async fn handle_proxy_request_inner(
     // the right content-type. The gRPC pool uses h2c (plaintext HTTP/2) for
     // `BackendScheme::Http` and TLS+ALPN=h2 for `BackendScheme::Https`.
     if is_grpc_request && proxy.dispatch_kind.is_http_family() {
-        let proxy_headers = proxy_headers.clone();
-        let proxy_headers = &proxy_headers;
         // Honor DestinationRule per-port `connect_timeout_ms` overrides on
         // the gRPC path — the gRPC transport reads
         // `proxy.backend_{host,port,connect_timeout_ms}` directly
@@ -8829,14 +8832,22 @@ async fn handle_proxy_request_inner(
             );
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
-            match run_final_request_body_hooks(
+            let mut body_hook_ctx = if needs_final_request_body_context {
+                Some(ctx.clone_for_final_request_body_hooks())
+            } else {
+                None
+            };
+            let final_body_result = run_final_request_body_hooks(
                 &plugins,
-                Some(&mut ctx),
+                body_hook_ctx.as_mut(),
                 &hook_headers,
                 &grpc_req_body,
             )
-            .await
-            {
+            .await;
+            if let Some(body_hook_ctx) = body_hook_ctx {
+                ctx.metadata = body_hook_ctx.metadata;
+            }
+            match final_body_result {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
@@ -9782,18 +9793,13 @@ async fn handle_proxy_request_inner(
     let mut current_dispatch_h3 =
         supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
-    // Pre-computed at config reload (see `PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT`)
-    // so the proxy hot path does not re-scan the plugin list per request.
-    let needs_final_request_body_context = requires_request_body_buffering
-        && capabilities
-            .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
         let mut body_hook_ctx = if needs_final_request_body_context {
-            Some(ctx.clone())
+            Some(ctx.clone_for_final_request_body_hooks())
         } else {
             None
         };
@@ -9946,7 +9952,7 @@ async fn handle_proxy_request_inner(
         (result, current_cb_target_key)
     } else {
         let mut body_hook_ctx = if needs_final_request_body_context {
-            Some(ctx.clone())
+            Some(ctx.clone_for_final_request_body_hooks())
         } else {
             None
         };
