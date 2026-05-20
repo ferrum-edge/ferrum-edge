@@ -2254,12 +2254,13 @@ fn build_egress_upstream_targets(
 ///
 /// HTTP-family protocols (`Http`, `Https/Tls`, `Http2`, `Grpc`, `Unknown`) map
 /// to `Http` / `Https` so the egress gateway terminates inbound mTLS and
-/// re-emits HTTP-family traffic to the external backend. Stream-family
-/// protocols (`Tcp`, `Mongo`, `Redis`, `Mysql`, `Postgres`) map to
-/// `BackendScheme::Tcp` and are materialized as raw L4 stream proxies via
-/// [`build_stream_egress_for_entry`]; protocol-aware mediation
-/// (e.g., Mongo / Redis wire decode) is intentionally out of scope and tracked
-/// separately as T5-C.
+/// re-emits HTTP-family traffic to the external backend.
+///
+/// Stream-family protocols are intentionally not materialized as standalone
+/// stream listeners. Binding ServiceEntry destination ports as plain stream
+/// listeners can expose unauthenticated relay paths on the gateway, so those
+/// protocols currently return `None` until an mTLS-authenticated stream egress
+/// flow is implemented.
 fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
     match protocol {
         AppProtocol::Tls | AppProtocol::Http2 | AppProtocol::Grpc => Some(BackendScheme::Https),
@@ -2268,7 +2269,7 @@ fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
         | AppProtocol::Mongo
         | AppProtocol::Redis
         | AppProtocol::Mysql
-        | AppProtocol::Postgres => Some(BackendScheme::Tcp),
+        | AppProtocol::Postgres => None,
     }
 }
 
