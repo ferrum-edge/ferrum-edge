@@ -1498,13 +1498,22 @@ async fn handle_h3_request(
             headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.to_string());
         }
     }
-    // Resolve proxy_headers into an owned HashMap to avoid borrowing ctx.headers
-    // while ctx is passed as &mut to proxy functions downstream. Keep
-    // `ctx.headers` intact: context-aware final request-body hooks (including
-    // WAF) still use the request context for content-type gates and rule
-    // conditions.
-    let mut proxy_headers: HashMap<String, String> =
-        own_h3_proxy_headers(owned_proxy_headers, &ctx);
+    // Resolve proxy_headers into an owned HashMap to avoid borrowing
+    // ctx.headers while ctx is passed as &mut to proxy functions downstream.
+    //
+    // When a plugin needs the real request context in final request-body
+    // hooks (`needs_final_request_body_context` capability — e.g. WAF), the
+    // helper clones so the body hook can still read `ctx.headers` for
+    // content-type/content-length gates. Otherwise it falls back to
+    // `std::mem::take(&mut ctx.headers)` — the zero-alloc hot path that the
+    // H3 server has used since before the WAF plugin landed.
+    let needs_ctx_headers_for_body_hooks =
+        capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    let mut proxy_headers: HashMap<String, String> = own_h3_proxy_headers(
+        owned_proxy_headers,
+        &mut ctx,
+        needs_ctx_headers_for_body_hooks,
+    );
 
     // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`. The
     // native HTTP/3 frontend builds its own `proxy_headers` map separately
@@ -2357,9 +2366,18 @@ async fn handle_h3_request(
         body_data
     };
 
+    // Skip the per-plugin context-aware dispatch when no plugin opted in via
+    // `needs_final_request_body_context`. The default impl of
+    // `on_final_request_body_with_context` would just delegate back to
+    // `on_final_request_body`; passing `None` keeps us on the direct path.
+    let body_hook_ctx: Option<&mut RequestContext> = if needs_ctx_headers_for_body_hooks {
+        Some(&mut ctx)
+    } else {
+        None
+    };
     match crate::proxy::run_final_request_body_hooks(
         &plugins,
-        Some(&mut ctx),
+        body_hook_ctx,
         &proxy_headers,
         &body_data,
     )
@@ -4021,11 +4039,28 @@ fn strip_query_params(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
 }
 
+/// Resolve the per-request `proxy_headers` map for the H3 dispatch path.
+///
+/// When `needs_ctx_headers` is `false` (the common case: no context-aware
+/// final request-body hooks active), the headers are *moved* out of
+/// `ctx.headers` via `std::mem::take`, matching the pre-existing zero-alloc
+/// hot path. Downstream H3 code after this point does not read
+/// `ctx.headers`, so leaving the map empty is safe.
+///
+/// When `needs_ctx_headers` is `true` (e.g. WAF or another plugin that
+/// overrides `needs_final_request_body_context`), the map is cloned so the
+/// body hook can still read `ctx.headers` for content-type/content-length
+/// gates and rule conditions.
 fn own_h3_proxy_headers(
     owned_proxy_headers: Option<HashMap<String, String>>,
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
+    needs_ctx_headers: bool,
 ) -> HashMap<String, String> {
-    owned_proxy_headers.unwrap_or_else(|| ctx.headers.clone())
+    match owned_proxy_headers {
+        Some(headers) => headers,
+        None if needs_ctx_headers => ctx.headers.clone(),
+        None => std::mem::take(&mut ctx.headers),
+    }
 }
 
 fn record_request(state: &ProxyState, status: u16) {
@@ -4052,7 +4087,10 @@ mod h3_proxy_header_tests {
     use std::collections::HashMap;
 
     #[test]
-    fn owned_proxy_headers_preserve_context_headers_for_body_hooks() {
+    fn body_hook_context_required_clones_ctx_headers() {
+        // When a plugin opts into `needs_final_request_body_context`, the
+        // helper must clone so the body hook can still read `ctx.headers`
+        // for content-type / content-length gates.
         let mut ctx = RequestContext::new(
             "203.0.113.10".to_string(),
             "POST".to_string(),
@@ -4061,7 +4099,7 @@ mod h3_proxy_header_tests {
         ctx.headers
             .insert("content-type".to_string(), "application/json".to_string());
 
-        let proxy_headers = own_h3_proxy_headers(None, &ctx);
+        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, true);
 
         assert_eq!(
             proxy_headers.get("content-type").map(String::as_str),
@@ -4074,7 +4112,36 @@ mod h3_proxy_header_tests {
     }
 
     #[test]
+    fn body_hook_context_not_required_takes_ctx_headers() {
+        // When no plugin needs the body-hook context, the helper falls back
+        // to the original `std::mem::take` zero-alloc path. The H3 dispatch
+        // path beyond this point does not read `ctx.headers`, so leaving
+        // the map empty is safe.
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/submit".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+
+        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, false);
+
+        assert_eq!(
+            proxy_headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert!(
+            ctx.headers.is_empty(),
+            "ctx.headers should be moved into proxy_headers when no body hook needs it"
+        );
+    }
+
+    #[test]
     fn explicit_owned_proxy_headers_win_without_mutating_context() {
+        // `owned_proxy_headers` short-circuits both branches: identity-header
+        // injection / mesh egress strip have already built the outbound map,
+        // and `ctx.headers` is untouched whether or not body hooks need it.
         let mut ctx = RequestContext::new(
             "203.0.113.10".to_string(),
             "POST".to_string(),
@@ -4084,7 +4151,7 @@ mod h3_proxy_header_tests {
             .insert("content-type".to_string(), "application/json".to_string());
         let owned = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
 
-        let proxy_headers = own_h3_proxy_headers(Some(owned), &ctx);
+        let proxy_headers = own_h3_proxy_headers(Some(owned), &mut ctx, true);
 
         assert_eq!(
             proxy_headers.get("content-type").map(String::as_str),

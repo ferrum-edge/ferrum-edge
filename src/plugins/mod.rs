@@ -1736,6 +1736,15 @@ pub trait Plugin: Send + Sync {
     /// Existing plugins can keep overriding `on_final_request_body`. Plugins
     /// that need to annotate request metadata after request body transforms
     /// can override this hook and the proxy will call it instead.
+    ///
+    /// **Contract on the H1/H2 path**: `ctx` is a lightweight clone built by
+    /// [`RequestContext::clone_for_final_request_body_hooks`]; only
+    /// `ctx.metadata` is copied back to the real request context after the
+    /// hook returns. Mutations to other fields (`ctx.headers`,
+    /// `ctx.query_params`, `ctx.route_override_*`, …) on H1/H2 are dropped.
+    /// On the H3 path the hook receives the real `&mut RequestContext`, so
+    /// implementations MUST limit observable side effects to `ctx.metadata`
+    /// if they want consistent behavior across protocols.
     async fn on_final_request_body_with_context(
         &self,
         _ctx: &mut RequestContext,
