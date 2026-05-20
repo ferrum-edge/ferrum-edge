@@ -386,6 +386,7 @@ pub(super) fn compile_rules(
     paranoia_level: u8,
 ) -> Result<CompiledRules, String> {
     let mut seen = HashSet::new();
+    let mut seen_default = HashSet::new();
     let mut compiled_rules = Vec::new();
     let mut builders = RuleSetBuilders::default();
 
@@ -393,6 +394,9 @@ pub(super) fn compile_rules(
         validate_rule(&rule)?;
         if !seen.insert(rule.id.clone()) {
             return Err(format!("waf: duplicate rule id '{}'", rule.id));
+        }
+        if is_default {
+            seen_default.insert(rule.id.clone());
         }
         if rule.paranoia_min > paranoia_level {
             continue;
@@ -440,6 +444,19 @@ pub(super) fn compile_rules(
         };
         builders.add_rule(rule_index, &rule)?;
         compiled_rules.push(compiled);
+    }
+
+    let mut unknown_disabled: Vec<&str> = disabled_default_rules
+        .iter()
+        .filter(|id| !seen_default.contains(id.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unknown_disabled.is_empty() {
+        unknown_disabled.sort_unstable();
+        return Err(format!(
+            "waf: 'disabled_default_rules' references unknown default rule id(s): {}",
+            unknown_disabled.join(", ")
+        ));
     }
 
     // WAF is security-critical: a typo in an `enforce` override silently leaves

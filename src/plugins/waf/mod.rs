@@ -5,11 +5,12 @@
 //! authorization, rate limiting, protocol smuggling defense, and structural
 //! schema validation remain in their dedicated plugins/core layers.
 //!
-//! Query scanning uses the raw query string when the proxy pipeline has not
-//! already materialized it, so duplicate raw pairs remain visible for HPP
-//! checks. When an earlier phase has consumed the raw query, WAF falls back to
-//! the decoded `RequestContext::query_params` map for key/value scans and
-//! best-effort full-URL checks.
+//! Query scanning uses the raw query string even after the proxy pipeline has
+//! materialized the parsed query map, so duplicate raw pairs remain visible for
+//! HPP checks instead of being collapsed by `HashMap` parsing. Synthetic
+//! contexts without a raw query string fall back to the decoded
+//! `RequestContext::query_params` map for key/value scans and best-effort
+//! full-URL checks.
 
 mod decode;
 mod defaults;

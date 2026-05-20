@@ -118,12 +118,11 @@ impl Waf {
             self.scan_encoding_specials(&mut outcome, &ctx.path, ctx);
         }
 
-        // Scan each raw query pair before HashMap-collapse so duplicate-key
-        // payloads (HTTP Parameter Pollution) cannot smuggle a value past
-        // `query_keys`/`query_values` rules. `materialize_query_params()`
-        // stores params in a `HashMap` (`?q=<script>&q=ok` collapses to
-        // `q=ok`), so the post-materialize map would only ever see the last
-        // value — relying on the monitor-only HPP rule alone to catch it.
+        // Scan each raw query pair even after query-param materialization so
+        // duplicate-key payloads (HTTP Parameter Pollution) cannot smuggle a
+        // value past `query_keys`/`query_values` rules. The parsed HashMap
+        // still collapses `?q=<script>&q=ok` to `q=ok`, so relying on the
+        // monitor-only HPP rule alone would miss enforced query-value rules.
         if let Some(raw) = raw_query.as_deref() {
             for pair in raw.split('&') {
                 if pair.is_empty() {

@@ -388,15 +388,27 @@ fn waf_is_security_critical() {
 #[tokio::test]
 async fn duplicate_query_key_cannot_smuggle_payload_past_query_values_rule() {
     // Regression: `materialize_query_params()` collapses duplicate keys into a
-    // `HashMap`, so `?q=<script>&q=ok` previously left only `q=ok` visible to
-    // the `query_values` scan and the XSS payload slipped past an enforced
-    // rule. The fix scans each raw pair before HashMap collapse.
+    // `HashMap`. The proxy materializes query params before WAF authorize runs,
+    // so `?q=<script>&q=ok` previously left only `q=ok` visible in the normal
+    // pipeline and the XSS payload slipped past an enforced query_values rule.
+    // The fix preserves the raw query string after materialization and scans
+    // each raw pair.
     let plugin = Waf::new(&json!({
         "rule_modes": { "FE-XSS-001": "enforce" }
     }))
     .unwrap();
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E&q=ok".into());
+    ctx.materialize_query_params();
+    assert_eq!(
+        ctx.query_params.get("q").map(String::as_str),
+        Some("ok"),
+        "materialized HashMap should mirror the proxy path and keep the last duplicate"
+    );
+    assert!(
+        ctx.raw_query_string().is_some(),
+        "raw query must remain available for WAF duplicate-pair inspection"
+    );
 
     let result = plugin.authorize(&mut ctx).await;
 
@@ -413,7 +425,7 @@ async fn duplicate_query_key_cannot_smuggle_payload_past_query_values_rule() {
 }
 
 #[tokio::test]
-async fn parsed_query_params_are_scanned_when_raw_query_was_consumed() {
+async fn parsed_query_params_are_scanned_when_raw_query_is_absent() {
     let plugin = Waf::new(&json!({
         "rule_modes": {
             "FE-XSS-001": "enforce",
@@ -660,6 +672,17 @@ fn invalid_global_exemption_cidr_fails_construction() {
 
     assert!(err.contains("global_exemptions.ips"));
     assert!(err.contains("not-a-cidr"));
+}
+
+#[test]
+fn unknown_disabled_default_rule_id_fails_construction() {
+    let err = Waf::new(&json!({
+        "disabled_default_rules": ["FE-XSS-999"]
+    }))
+    .unwrap_err();
+
+    assert!(err.contains("disabled_default_rules"));
+    assert!(err.contains("FE-XSS-999"));
 }
 
 #[test]

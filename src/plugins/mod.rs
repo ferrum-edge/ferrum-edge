@@ -257,7 +257,9 @@ pub struct WsDisconnectContext {
 /// allocations on the hot path. The raw `http::HeaderMap` and query string are
 /// stored at request init time; the `HashMap<String, String>` representations
 /// are only built when a plugin phase actually needs them (via
-/// `materialize_headers()` / `materialize_query_params()`).
+/// `materialize_headers()` / `materialize_query_params()`). Query
+/// materialization preserves the raw query string so security plugins can still
+/// inspect duplicate pairs that collapse in the parsed `HashMap`.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     pub client_ip: String,
@@ -275,9 +277,14 @@ pub struct RequestContext {
     /// Materialized headers HashMap. Empty until `materialize_headers()` is
     /// called. Plugin code and backend dispatch read from this field.
     pub headers: HashMap<String, String>,
-    /// Raw query string stored for lazy parsing. `None` when empty or after a
-    /// query-param materializer has consumed it.
+    /// Raw query string stored for lazy parsing. `None` when empty. Preserved
+    /// after query-param materialization so security plugins can inspect raw
+    /// duplicate pairs.
     raw_query_string: Option<String>,
+    /// Whether either decoded or raw query-param materialization has already
+    /// populated `query_params`. Keeps materialization one-shot while preserving
+    /// `raw_query_string` for inspection.
+    query_params_materialized: bool,
     /// Parsed query parameters. Empty until `materialize_query_params()` or
     /// `materialize_query_params_raw()` is called.
     ///
@@ -437,6 +444,7 @@ impl RequestContext {
             raw_headers: None,
             headers: HashMap::new(),
             raw_query_string: None,
+            query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: None,
             identified_consumer: None,
@@ -481,6 +489,7 @@ impl RequestContext {
             raw_headers: None,
             headers: self.headers.clone(),
             raw_query_string: None,
+            query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: self.matched_proxy.clone(),
             identified_consumer: self.identified_consumer.clone(),
@@ -791,13 +800,13 @@ impl RequestContext {
     pub fn set_raw_query_string(&mut self, qs: String) {
         if !qs.is_empty() {
             self.raw_query_string = Some(qs);
+            self.query_params_materialized = false;
         }
     }
 
     /// Borrow the raw query string without materializing it.
     ///
-    /// Inspection plugins use this before `materialize_query_params()` consumes
-    /// the raw form, for example to detect duplicate/conflicting parameter
+    /// Inspection plugins use this to detect duplicate/conflicting parameter
     /// keys that would be collapsed by the parsed `HashMap`.
     #[inline]
     pub fn raw_query_string(&self) -> Option<&str> {
@@ -808,9 +817,13 @@ impl RequestContext {
     /// percent-decoded so plugins see human-readable strings. Parameters without
     /// `=` (e.g., `?flag`) are stored with an empty-string value.
     ///
-    /// This is a one-time operation — subsequent calls are no-ops.
+    /// This is a one-time operation — subsequent calls are no-ops. The raw
+    /// query string is intentionally retained for later security inspection.
     pub fn materialize_query_params(&mut self) {
-        if let Some(raw) = self.raw_query_string.take() {
+        if self.query_params_materialized {
+            return;
+        }
+        if let Some(raw) = self.raw_query_string.as_deref() {
             for pair in raw.split('&') {
                 if pair.is_empty() {
                     continue;
@@ -826,6 +839,7 @@ impl RequestContext {
                     .insert(decoded_k.into_owned(), decoded_v.into_owned());
             }
         }
+        self.query_params_materialized = true;
     }
 
     /// Materialize the raw query string into `self.query_params` without
@@ -835,13 +849,17 @@ impl RequestContext {
     /// representation unless an active plugin explicitly opts into decoded
     /// query params.
     pub fn materialize_query_params_raw(&mut self) {
-        if let Some(raw) = self.raw_query_string.take() {
+        if self.query_params_materialized {
+            return;
+        }
+        if let Some(raw) = self.raw_query_string.as_deref() {
             for pair in raw.split('&') {
                 if let Some((k, v)) = pair.split_once('=') {
                     self.query_params.insert(k.to_string(), v.to_string());
                 }
             }
         }
+        self.query_params_materialized = true;
     }
 
     /// Collect mirror response metadata from the `request_mirror` plugin.

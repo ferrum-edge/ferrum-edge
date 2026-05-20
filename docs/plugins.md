@@ -2422,10 +2422,10 @@ and `global_exemptions.consumers` available to request metadata rules.
 Request-body inspection runs on the final backend-visible body after request
 body transforms. It buffers only matching methods/content types. Response
 inspection is opt-in and can scan response headers and final response bodies.
-When the raw query string is still available, WAF scans raw query pairs before
-the request's parsed query map can collapse duplicate keys; if an earlier phase
-has already materialized query params, WAF falls back to scanning the parsed
-key/value map and a best-effort reconstructed URL.
+WAF scans raw query pairs even after the proxy has materialized the parsed
+query map, so duplicate keys remain visible before the parsed `HashMap` can
+collapse them; synthetic contexts without a raw query string fall back to
+scanning the parsed key/value map and a best-effort reconstructed URL.
 
 **Priority:** 2930
 **Phase:** `authorize`, `on_final_request_body`, `after_proxy`, `on_final_response_body`
