@@ -425,7 +425,7 @@ impl Plugin for Waf {
         HTTP_FAMILY_PROTOCOLS
     }
 
-    async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+    async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         if !self.active
             || !self.config.request_inspection
             || !self.compiled.request_cheap_rules_active

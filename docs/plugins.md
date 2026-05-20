@@ -2411,11 +2411,20 @@ rule should block. Invalid WAF configuration is security-fatal at
 startup/reload, so the gateway does not silently serve without the intended
 inspection.
 
+Request metadata inspection (path, query, headers, cookies, and method) runs
+in the `authorize` phase after authentication and earlier authorization
+plugins such as `access_control`, `mesh_authz`, and consumer-aware
+`rate_limiting`. If an authenticated proxy rejects before WAF, the gateway
+skips WAF work for that failed request; on public/no-auth proxies, the same WAF
+phase still runs before backend dispatch. This also makes `conditions.consumers`
+and `global_exemptions.consumers` available to request metadata rules.
+
 Request-body inspection runs on the final backend-visible body after request
 body transforms. It buffers only matching methods/content types. Response
 inspection is opt-in and can scan response headers and final response bodies.
 
 **Priority:** 2930
+**Phase:** `authorize`, `on_final_request_body`, `after_proxy`, `on_final_response_body`
 **Protocol:** HTTP, gRPC, WebSocket
 
 | Parameter | Type | Default | Description |

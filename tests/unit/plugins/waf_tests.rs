@@ -13,7 +13,7 @@ async fn default_waf_monitors_sqli_query_without_blocking() {
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=%27%20OR%201%3D1".into());
 
-    let result = plugin.on_request_received(&mut ctx).await;
+    let result = plugin.authorize(&mut ctx).await;
 
     assert!(matches!(result, PluginResult::Continue));
     assert!(
@@ -36,7 +36,7 @@ async fn rule_mode_can_enforce_default_rule() {
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
 
-    let result = plugin.on_request_received(&mut ctx).await;
+    let result = plugin.authorize(&mut ctx).await;
 
     match result {
         PluginResult::Reject {
@@ -69,10 +69,54 @@ async fn path_exemption_short_circuits_and_writes_no_waf_metadata() {
     let mut ctx = ctx("GET", "/healthz");
     ctx.set_raw_query_string("q=%27%20OR%201%3D1".into());
 
-    let result = plugin.on_request_received(&mut ctx).await;
+    let result = plugin.authorize(&mut ctx).await;
 
     assert!(matches!(result, PluginResult::Continue));
     assert!(!ctx.metadata.keys().any(|key| key.starts_with("waf.")));
+}
+
+#[tokio::test]
+async fn consumer_scoped_request_rule_uses_authenticated_identity() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-CONSUMER-QUERY",
+            "name": "consumer scoped query marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "conditions": { "consumers": ["alice"] },
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut anonymous_ctx = ctx("GET", "/search");
+    anonymous_ctx.set_raw_query_string("q=needle".into());
+    let result = plugin.authorize(&mut anonymous_ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !anonymous_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-CONSUMER-QUERY"))
+    );
+
+    let mut authenticated_ctx = ctx("GET", "/search");
+    authenticated_ctx.authenticated_identity = Some("alice".into());
+    authenticated_ctx.set_raw_query_string("q=needle".into());
+    let result = plugin.authorize(&mut authenticated_ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        authenticated_ctx
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("CUSTOM-CONSUMER-QUERY")
+    );
 }
 
 #[tokio::test]
@@ -159,7 +203,7 @@ async fn cidr_text_rules_are_scoped_to_their_configured_target() {
 
     let mut query_ctx = ctx("GET", "/search");
     query_ctx.set_raw_query_string("ip=10.1.2.3".into());
-    let result = plugin.on_request_received(&mut query_ctx).await;
+    let result = plugin.authorize(&mut query_ctx).await;
 
     assert!(matches!(result, PluginResult::Continue));
     assert!(
@@ -173,7 +217,7 @@ async fn cidr_text_rules_are_scoped_to_their_configured_target() {
     header_ctx
         .headers
         .insert("x-forwarded-for".into(), "10.1.2.3".into());
-    let result = plugin.on_request_received(&mut header_ctx).await;
+    let result = plugin.authorize(&mut header_ctx).await;
 
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert_eq!(
@@ -302,7 +346,7 @@ async fn duplicate_query_key_cannot_smuggle_payload_past_query_values_rule() {
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E&q=ok".into());
 
-    let result = plugin.on_request_received(&mut ctx).await;
+    let result = plugin.authorize(&mut ctx).await;
 
     match result {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),

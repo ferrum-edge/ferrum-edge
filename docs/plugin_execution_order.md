@@ -21,7 +21,7 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 3. authorize            │  Access control, mesh authorization, consumer rate limiting
+│ 3. authorize            │  AuthZ, consumer rate limiting, WAF metadata
 └────────────┬────────────┘
              │
              ▼
@@ -90,6 +90,8 @@ Connection/Session In
 ```
 
 Body-aware plugins such as `graphql`, request-side `body_validator`, `waf`, `ai_request_guard`, and `ai_prompt_shield` now pre-buffer only matching request bodies (for example JSON `POST` requests). Non-matching requests can continue on the faster streaming path.
+
+`waf` request metadata inspection (path, query, headers, cookies, and method) runs in the `authorize` phase at priority 2930, after authentication and earlier authorization plugins such as `access_control`, `mesh_authz`, and consumer-aware `rate_limiting`. Authenticated proxies that reject during auth/authz therefore avoid WAF scan cost, while public/no-auth proxies still run WAF before backend dispatch. WAF request-body inspection remains on the final backend-visible request body.
 
 **Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS and UDP+DTLS listeners it runs after the frontend TLS/DTLS handshake and before the backend connection/session is opened, so plugins can inspect the client certificate without spending upstream capacity first. Frontend TLS/DTLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection/session immediately and do not dial the backend. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`.
 
@@ -275,7 +277,7 @@ Given all built-in plugins enabled, the execution order is:
 | 31 | `ws_rate_limiting` | 2910 | on_ws_frame |
 | 32 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 33 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 34 | `waf` | 2930 | on_request_received, on_final_request_body, after_proxy, on_final_response_body |
+| 34 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body |
 | 35 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
 | 36 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
 | 37 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
@@ -366,7 +368,7 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 
 The five AI plugins are ordered to compose correctly:
 
-1. **`ai_prompt_shield` (2925)** runs first in the pre-proxy flow — PII must be detected/redacted before the request reaches any other validation or the backend. It sits right after `rate_limiting` so brute-force protection applies first, and immediately before `waf` (2930), which handles general content-threat detection.
+1. **`ai_prompt_shield` (2925)** runs first in the pre-proxy body flow — PII must be detected/redacted before the request reaches the backend or later body validators. It sits right after `rate_limiting` so brute-force protection applies first. `waf` request metadata checks have already run in `authorize`; WAF request-body checks run on the final backend-visible body after request body transforms.
 2. **`ai_request_guard` (2975)** runs after PII scanning — it validates model names, max_tokens, message counts, and temperature. If the prompt shield already rejected or redacted the request, the guard validates the cleaned version.
 3. **`ai_federation` (2985)** runs after the guard — it translates the OpenAI-format request to the matched provider's native format, calls the provider, normalizes the response back to OpenAI format, and returns via `RejectBinary`. Since this short-circuits the proxy, `on_response_body` does not fire. The plugin writes token metadata (`ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`) directly into `ctx.metadata` using the same keys as `ai_token_metrics`.
 4. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses the LLM response body to extract token usage (prompt, completion, total, model) and writes it to `ctx.metadata`. This metadata flows into `TransactionSummary` for all downstream logging plugins. Note: when `ai_federation` is active, this plugin does not fire because the response comes via `RejectBinary` — `ai_federation` writes the same metadata keys directly.
