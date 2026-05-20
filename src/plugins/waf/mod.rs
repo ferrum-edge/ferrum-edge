@@ -74,10 +74,19 @@ struct WafConfig {
 }
 
 #[derive(Debug)]
+struct SpecialRuleIndices {
+    encoding: Option<usize>,
+    hpp: Option<usize>,
+    method: Option<usize>,
+    method_override: Option<usize>,
+}
+
+#[derive(Debug)]
 pub struct Waf {
     config: WafConfig,
     compiled: CompiledRules,
     exemptions: CompiledExemptions,
+    specials: SpecialRuleIndices,
     active: bool,
 }
 
@@ -121,8 +130,6 @@ impl Waf {
                 .unwrap_or("scan_truncated"),
         )?;
         let include_default_rules = optional_bool(object, "include_default_rules")?.unwrap_or(true);
-        let _default_rule_pack_version =
-            include_default_rules.then_some(defaults::DEFAULT_RULE_PACK_VERSION);
         let disabled_default_rules = optional_string_vec(object, "disabled_default_rules")?
             .unwrap_or_default()
             .into_iter()
@@ -198,17 +205,20 @@ impl Waf {
             return Err("waf: 'reject_status_code' must be from 400 to 599".to_string());
         }
 
+        let specials = SpecialRuleIndices {
+            encoding: compiled.find_rule_index("FE-ENCODING-001"),
+            hpp: compiled.find_rule_index("FE-HPP-001"),
+            method: compiled.find_rule_index("FE-METHOD-001"),
+            method_override: compiled.find_rule_index("FE-HEADER-002"),
+        };
         let active = config.mode != GlobalMode::Disabled && !compiled.is_empty();
         Ok(Self {
             config,
             compiled,
             exemptions,
+            specials,
             active,
         })
-    }
-
-    fn special_rule(&self, id: &str) -> Option<usize> {
-        self.compiled.find_rule_index(id)
     }
 
     fn request_is_exempt(&self, ctx: &mut RequestContext) -> bool {
@@ -255,17 +265,28 @@ impl Waf {
         if self.config.scan_budget_ms == 0 {
             return scan();
         }
-        match tokio::time::timeout(Duration::from_millis(self.config.scan_budget_ms), async {
-            scan()
-        })
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(_) => ScanOutcome {
+        let budget = Duration::from_millis(self.config.scan_budget_ms);
+        let start = std::time::Instant::now();
+        // Yield to the scheduler before the scan so a timer that has already
+        // elapsed (e.g. due to scheduling congestion) can fire immediately.
+        // The scan itself is synchronous — Rust's regex crate guarantees O(n)
+        // matching, so execution time is bounded by
+        // O(active_rules × max_scan_bytes) without pathological backtracking.
+        tokio::task::yield_now().await;
+        if start.elapsed() >= budget {
+            return ScanOutcome {
                 timed_out: true,
                 ..ScanOutcome::default()
-            },
+            };
         }
+        let outcome = scan();
+        if start.elapsed() >= budget {
+            return ScanOutcome {
+                timed_out: true,
+                ..ScanOutcome::default()
+            };
+        }
+        outcome
     }
 
     fn finish_scan(&self, ctx: &mut RequestContext, outcome: ScanOutcome) -> PluginResult {

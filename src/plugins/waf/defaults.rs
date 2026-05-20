@@ -1,7 +1,5 @@
 use super::rules::{MatchKind, RuleAction, RuleTarget, Severity, WafRule};
 
-pub const DEFAULT_RULE_PACK_VERSION: &str = "ferrum-waf-seed-v1";
-
 pub fn default_rules() -> Vec<WafRule> {
     vec![
         r("FE-SQLI-001", "UNION SELECT SQL injection", "sqli", Severity::High, RuleTarget::QueryValues, r"(?i)\bunion\s+(?:all\s+)?select\b"),

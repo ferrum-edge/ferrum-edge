@@ -385,15 +385,16 @@ impl Waf {
         if rule_indices.is_empty() {
             return;
         }
-        let ips: Vec<IpAddr> = extract_ip_tokens(value).collect();
-        if ips.is_empty() {
-            return;
-        }
+        let mut ips: Option<Vec<IpAddr>> = None;
         for &rule_index in rule_indices {
             let rule = &self.compiled.rules[rule_index];
             let Some(cidr) = rule.cidr else {
                 continue;
             };
+            let ips = ips.get_or_insert_with(|| extract_ip_tokens(value).collect());
+            if ips.is_empty() {
+                return;
+            }
             if target_matches(&rule.target)
                 && ips.iter().any(|ip| cidr.matches(*ip))
                 && rule.matches_conditions(ctx)
@@ -410,30 +411,30 @@ impl Waf {
     }
 
     fn scan_encoding_specials(&self, outcome: &mut ScanOutcome, value: &str, ctx: &RequestContext) {
-        if (decode::has_double_encoded_marker(value)
-            || decode::has_percent_null_byte(value)
-            || decode::has_overlong_utf8_marker(value))
-            && let Some(rule_index) = self.special_rule("FE-ENCODING-001")
+        if let Some(rule_index) = self.specials.encoding
+            && (decode::has_double_encoded_marker(value)
+                || decode::has_percent_null_byte(value)
+                || decode::has_overlong_utf8_marker(value))
         {
             self.push_special(outcome, rule_index, ctx);
         }
     }
 
     fn scan_hpp_special(&self, outcome: &mut ScanOutcome, raw_query: &str, ctx: &RequestContext) {
-        if decode::has_conflicting_duplicate_query_key(raw_query)
-            && let Some(rule_index) = self.special_rule("FE-HPP-001")
+        if let Some(rule_index) = self.specials.hpp
+            && decode::has_conflicting_duplicate_query_key(raw_query)
         {
             self.push_special(outcome, rule_index, ctx);
         }
     }
 
     fn scan_method_special(&self, outcome: &mut ScanOutcome, method: &str, ctx: &RequestContext) {
-        if self
-            .config
-            .disallowed_methods
-            .iter()
-            .any(|configured| configured.eq_ignore_ascii_case(method))
-            && let Some(rule_index) = self.special_rule("FE-METHOD-001")
+        if let Some(rule_index) = self.specials.method
+            && self
+                .config
+                .disallowed_methods
+                .iter()
+                .any(|configured| configured.eq_ignore_ascii_case(method))
         {
             self.push_special(outcome, rule_index, ctx);
         }
@@ -445,11 +446,11 @@ impl Waf {
         headers: &HashMap<String, String>,
         ctx: &RequestContext,
     ) {
-        if let Some((_, override_method)) = headers
-            .iter()
-            .find(|(name, _)| name.as_str() == "x-http-method-override")
+        if let Some(rule_index) = self.specials.method_override
+            && let Some((_, override_method)) = headers
+                .iter()
+                .find(|(name, _)| name.as_str() == "x-http-method-override")
             && !override_method.eq_ignore_ascii_case(&ctx.method)
-            && let Some(rule_index) = self.special_rule("FE-HEADER-002")
         {
             self.push_special(outcome, rule_index, ctx);
         }

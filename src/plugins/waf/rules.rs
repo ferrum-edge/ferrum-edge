@@ -102,7 +102,7 @@ impl RuleTarget {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conditions {
     pub paths: Vec<String>,
     pub methods: Vec<String>,
@@ -110,13 +110,57 @@ pub struct Conditions {
     pub consumers: Vec<String>,
 }
 
-impl Conditions {
+#[derive(Debug)]
+pub struct CompiledConditions {
+    pub path_matchers: Vec<PathMatcher>,
+    pub methods: Vec<String>,
+    pub headers: HashMap<String, Option<String>>,
+    pub consumers: Vec<String>,
+}
+
+#[derive(Debug)]
+pub enum PathMatcher {
+    Regex(Regex),
+    Prefix(String),
+}
+
+impl PathMatcher {
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            PathMatcher::Regex(re) => re.is_match(path),
+            PathMatcher::Prefix(prefix) => path.starts_with(prefix.as_str()),
+        }
+    }
+}
+
+impl CompiledConditions {
+    pub fn compile(raw: &Conditions) -> Result<Self, String> {
+        let path_matchers = raw
+            .paths
+            .iter()
+            .map(|pattern| {
+                if let Some(regex) = pattern.strip_prefix('~') {
+                    Regex::new(regex)
+                        .map(PathMatcher::Regex)
+                        .map_err(|e| format!("waf: invalid conditions.paths regex: {e}"))
+                } else if let Some(prefix) = pattern.strip_suffix('*') {
+                    Ok(PathMatcher::Prefix(prefix.to_string()))
+                } else {
+                    Ok(PathMatcher::Prefix(pattern.clone()))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            path_matchers,
+            methods: raw.methods.clone(),
+            headers: raw.headers.clone(),
+            consumers: raw.consumers.clone(),
+        })
+    }
+
     pub fn matches(&self, ctx: &RequestContext) -> bool {
-        if !self.paths.is_empty()
-            && !self
-                .paths
-                .iter()
-                .any(|pattern| path_condition_matches(pattern, &ctx.path))
+        if !self.path_matchers.is_empty()
+            && !self.path_matchers.iter().any(|m| m.matches(&ctx.path))
         {
             return false;
         }
@@ -152,18 +196,6 @@ impl Conditions {
     }
 }
 
-fn path_condition_matches(pattern: &str, path: &str) -> bool {
-    if let Some(regex) = pattern.strip_prefix('~') {
-        return regex::Regex::new(regex)
-            .map(|re| re.is_match(path))
-            .unwrap_or(false);
-    }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return path.starts_with(prefix);
-    }
-    path.starts_with(pattern)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WafRule {
     pub id: String,
@@ -187,7 +219,7 @@ pub struct CompiledRule {
     pub severity: Severity,
     pub target: RuleTarget,
     pub action: RuleAction,
-    pub conditions: Option<Conditions>,
+    pub conditions: Option<CompiledConditions>,
     pub fp_filters: Option<RegexSet>,
     pub cidr: Option<IpCidr>,
 }
@@ -387,6 +419,13 @@ pub fn compile_rules(
             None
         };
 
+        let compiled_conditions = rule
+            .conditions
+            .as_ref()
+            .map(CompiledConditions::compile)
+            .transpose()
+            .map_err(|e| format!("waf: rule '{}': {e}", rule.id))?;
+
         let rule_index = compiled_rules.len();
         let compiled = CompiledRule {
             id: rule.id.clone(),
@@ -395,7 +434,7 @@ pub fn compile_rules(
             severity: rule.severity,
             target: rule.target.clone(),
             action: rule.action,
-            conditions: rule.conditions.clone(),
+            conditions: compiled_conditions,
             fp_filters,
             cidr,
         };
