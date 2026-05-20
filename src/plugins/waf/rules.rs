@@ -2,7 +2,7 @@ use regex::{Regex, RegexSet, RegexSetBuilder, bytes::RegexSet as BytesRegexSet};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::plugins::RequestContext;
 
@@ -951,14 +951,17 @@ impl fmt::Display for RuleAction {
 pub fn extract_ip_tokens(value: &str) -> impl Iterator<Item = IpAddr> + '_ {
     value
         .split(|ch: char| !(ch.is_ascii_hexdigit() || matches!(ch, '.' | ':' | '[' | ']')))
-        .filter_map(|token| {
-            let token = token.trim_matches(['[', ']']);
-            token
-                .parse::<IpAddr>()
-                .ok()
-                .or_else(|| token.parse::<Ipv4Addr>().map(IpAddr::V4).ok())
-                .or_else(|| token.parse::<Ipv6Addr>().map(IpAddr::V6).ok())
-        })
+        .filter_map(parse_ip_token)
+}
+
+fn parse_ip_token(token: &str) -> Option<IpAddr> {
+    let bare_token = token.trim_matches(['[', ']']);
+    bare_token
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| token.parse::<SocketAddr>().map(|socket| socket.ip()).ok())
+        .or_else(|| bare_token.parse::<Ipv4Addr>().map(IpAddr::V4).ok())
+        .or_else(|| bare_token.parse::<Ipv6Addr>().map(IpAddr::V6).ok())
 }
 
 #[cfg(test)]
@@ -970,6 +973,16 @@ mod tests {
         let cidr = IpCidr::parse("10.0.0.0/8").unwrap();
         assert!(cidr.matches("10.2.3.4".parse().unwrap()));
         assert!(!cidr.matches("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_ip_tokens_accepts_host_port_forms() {
+        let ips: Vec<IpAddr> =
+            extract_ip_tokens("10.2.3.4:8443 [2001:db8::1]:443 [2001:db8::2]").collect();
+
+        assert!(ips.contains(&"10.2.3.4".parse().unwrap()));
+        assert!(ips.contains(&"2001:db8::1".parse().unwrap()));
+        assert!(ips.contains(&"2001:db8::2".parse().unwrap()));
     }
 
     #[test]

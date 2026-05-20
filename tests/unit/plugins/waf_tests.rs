@@ -227,6 +227,58 @@ async fn cidr_text_rules_are_scoped_to_their_configured_target() {
 }
 
 #[tokio::test]
+async fn cidr_rules_match_common_ip_with_port_forms() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [
+            {
+                "id": "CUSTOM-CIDR-IPV4-PORT",
+                "name": "private forwarding address with port",
+                "category": "custom",
+                "severity": "high",
+                "target": { "type": "header_values", "names": ["x-forwarded-for"] },
+                "match_kind": "cidr",
+                "pattern": "10.0.0.0/8",
+                "action": "enforce"
+            },
+            {
+                "id": "CUSTOM-CIDR-IPV6-PORT",
+                "name": "documentation ipv6 address with port",
+                "category": "custom",
+                "severity": "high",
+                "target": { "type": "header_values", "names": ["x-forwarded-for"] },
+                "match_kind": "cidr",
+                "pattern": "2001:db8::/32",
+                "action": "enforce"
+            }
+        ]
+    }))
+    .unwrap();
+
+    let mut ipv4_ctx = ctx("GET", "/search");
+    ipv4_ctx
+        .headers
+        .insert("x-forwarded-for".into(), "10.1.2.3:8443".into());
+    let result = plugin.authorize(&mut ipv4_ctx).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ipv4_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-CIDR-IPV4-PORT")
+    );
+
+    let mut ipv6_ctx = ctx("GET", "/search");
+    ipv6_ctx
+        .headers
+        .insert("x-forwarded-for".into(), "[2001:db8::1]:443".into());
+    let result = plugin.authorize(&mut ipv6_ctx).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ipv6_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-CIDR-IPV6-PORT")
+    );
+}
+
+#[tokio::test]
 async fn response_header_cidr_rule_matches_without_regex_header_rules() {
     let plugin = Waf::new(&json!({
         "include_default_rules": false,
