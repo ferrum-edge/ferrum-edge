@@ -2467,13 +2467,13 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `name` | string | `id` | Human-readable rule name. |
 | `category` | string | required | Category label, such as `sqli`, `xss`, or `custom`. |
 | `severity` | string | `medium` | `info`, `low`, `medium`, `high`, or `critical`. |
-| `target` | string/object | required | Scan target. Object targets support `type`, optional `names` for request header values, and `path` for JSON-path body rules. |
+| `target` | string/object | required | Scan target. Object targets support `type`, optional non-empty `names` only for request header values, and `path` only for JSON-path body rules. |
 | `match_kind` | string | `regex` | `regex`, `literal`, `contains`, `equals`, `luhn`, or `cidr`. |
 | `pattern` | string | `""` | Pattern text. Required except for `luhn` rules. CIDR rules accept an IP or CIDR range. |
 | `action` | string | global default | `enforce`, `monitor`, or `disabled`. |
 | `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
-| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. |
+| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`. |
 
 Supported targets: `header_names`, `header_values`, `query_keys`,
 `query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,

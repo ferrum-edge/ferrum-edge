@@ -8138,10 +8138,12 @@ components:
                     - response_body
                 names:
                   type: array
+                  description: Only valid for header_values/request_headers targets; must be non-empty when provided.
                   items:
                     type: string
                 path:
                   type: string
+                  description: Required and only valid for body_json_path targets.
         match_kind:
           type: string
           enum: [regex, literal, contains, equals, luhn, cidr]
@@ -8167,6 +8169,7 @@ components:
           properties:
             paths:
               type: array
+              description: Exact paths by default; trailing * means prefix match and leading ~ means regex.
               items:
                 type: string
             methods:

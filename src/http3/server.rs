@@ -1499,9 +1499,12 @@ async fn handle_h3_request(
         }
     }
     // Resolve proxy_headers into an owned HashMap to avoid borrowing ctx.headers
-    // while ctx is passed as &mut to proxy functions downstream.
+    // while ctx is passed as &mut to proxy functions downstream. Keep
+    // `ctx.headers` intact: context-aware final request-body hooks (including
+    // WAF) still use the request context for content-type gates and rule
+    // conditions.
     let mut proxy_headers: HashMap<String, String> =
-        owned_proxy_headers.unwrap_or_else(|| std::mem::take(&mut ctx.headers));
+        own_h3_proxy_headers(owned_proxy_headers, &ctx);
 
     // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`. The
     // native HTTP/3 frontend builds its own `proxy_headers` map separately
@@ -4018,6 +4021,13 @@ fn strip_query_params(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
 }
 
+fn own_h3_proxy_headers(
+    owned_proxy_headers: Option<HashMap<String, String>>,
+    ctx: &RequestContext,
+) -> HashMap<String, String> {
+    owned_proxy_headers.unwrap_or_else(|| ctx.headers.clone())
+}
+
 fn record_request(state: &ProxyState, status: u16) {
     use std::sync::atomic::{AtomicU64, Ordering};
     state.request_count.fetch_add(1, Ordering::Relaxed);
@@ -4033,6 +4043,58 @@ fn record_request(state: &ProxyState, status: u16) {
             .fetch_add(1, Ordering::Relaxed);
     }
     crate::runtime_metrics::global_ref().record_http_status(status);
+}
+
+#[cfg(test)]
+mod h3_proxy_header_tests {
+    use super::own_h3_proxy_headers;
+    use crate::plugins::RequestContext;
+    use std::collections::HashMap;
+
+    #[test]
+    fn owned_proxy_headers_preserve_context_headers_for_body_hooks() {
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/submit".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+
+        let proxy_headers = own_h3_proxy_headers(None, &ctx);
+
+        assert_eq!(
+            proxy_headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            ctx.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn explicit_owned_proxy_headers_win_without_mutating_context() {
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/submit".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        let owned = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+
+        let proxy_headers = own_h3_proxy_headers(Some(owned), &ctx);
+
+        assert_eq!(
+            proxy_headers.get("content-type").map(String::as_str),
+            Some("text/plain")
+        );
+        assert_eq!(
+            ctx.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+    }
 }
 
 #[cfg(test)]

@@ -438,12 +438,14 @@ impl Waf {
             let Some(cidr) = rule.cidr else {
                 continue;
             };
+            if !target_matches(&rule.target) {
+                continue;
+            }
             let ips = ips.get_or_insert_with(|| extract_ip_tokens(value).collect());
             if ips.is_empty() {
                 return;
             }
-            if target_matches(&rule.target)
-                && ips.iter().any(|ip| cidr.matches(*ip))
+            if ips.iter().any(|ip| cidr.matches(*ip))
                 && rule.matches_conditions(ctx)
                 && !self.exemptions.suppresses_rule_for_request(ctx)
                 && !self.exemptions.suppresses_value(value)

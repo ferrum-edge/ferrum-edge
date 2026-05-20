@@ -122,6 +122,7 @@ struct CompiledConditions {
 enum PathMatcher {
     Regex(Regex),
     Prefix(String),
+    Exact(String),
 }
 
 impl PathMatcher {
@@ -129,6 +130,7 @@ impl PathMatcher {
         match self {
             PathMatcher::Regex(re) => re.is_match(path),
             PathMatcher::Prefix(prefix) => path.starts_with(prefix.as_str()),
+            PathMatcher::Exact(exact) => path == exact,
         }
     }
 }
@@ -146,7 +148,7 @@ impl CompiledConditions {
                 } else if let Some(prefix) = pattern.strip_suffix('*') {
                     Ok(PathMatcher::Prefix(prefix.to_string()))
                 } else {
-                    Ok(PathMatcher::Prefix(pattern.clone()))
+                    Ok(PathMatcher::Exact(pattern.clone()))
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -852,9 +854,26 @@ fn parse_target_string(
     names: Option<Vec<String>>,
     path: Option<String>,
 ) -> Result<RuleTarget, String> {
+    if path.is_some() && raw != "body_json_path" {
+        return Err(format!(
+            "waf: target {raw:?} does not support 'path'; 'path' is only valid for body_json_path"
+        ));
+    }
+    if names.is_some() && !matches!(raw, "header_values" | "request_headers") {
+        return Err(format!(
+            "waf: target {raw:?} does not support 'names'; 'names' is only valid for header_values/request_headers"
+        ));
+    }
     match raw {
         "header_names" => Ok(RuleTarget::HeaderNames),
-        "header_values" | "request_headers" => Ok(RuleTarget::HeaderValues(names)),
+        "header_values" | "request_headers" => {
+            if names.as_ref().is_some_and(Vec::is_empty) {
+                return Err(
+                    "waf: header_values target 'names' must be non-empty when provided".to_string(),
+                );
+            }
+            Ok(RuleTarget::HeaderValues(names))
+        }
         "query_keys" => Ok(RuleTarget::QueryKeys),
         "query_values" | "request_query" => Ok(RuleTarget::QueryValues),
         "cookies" => Ok(RuleTarget::Cookies),

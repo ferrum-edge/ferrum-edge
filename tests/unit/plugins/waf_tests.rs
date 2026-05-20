@@ -120,6 +120,57 @@ async fn consumer_scoped_request_rule_uses_authenticated_identity() {
 }
 
 #[tokio::test]
+async fn custom_rule_path_conditions_are_exact_unless_marked_as_prefix_or_regex() {
+    let exact_plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-ADMIN-QUERY",
+            "name": "admin query marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "conditions": { "paths": ["/admin"] },
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut suffix_ctx = ctx("GET", "/admin-public");
+    suffix_ctx.set_raw_query_string("q=needle".into());
+    let result = exact_plugin.authorize(&mut suffix_ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!suffix_ctx.metadata.contains_key("waf.rule_hits"));
+
+    let mut exact_ctx = ctx("GET", "/admin");
+    exact_ctx.set_raw_query_string("q=needle".into());
+    let result = exact_plugin.authorize(&mut exact_ctx).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+
+    let prefix_plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-ADMIN-PREFIX",
+            "name": "admin prefix query marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "conditions": { "paths": ["/admin*"] },
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut prefix_ctx = ctx("GET", "/admin-public");
+    prefix_ctx.set_raw_query_string("q=needle".into());
+    let result = prefix_plugin.authorize(&mut prefix_ctx).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+}
+
+#[tokio::test]
 async fn request_body_scan_uses_context_aware_final_body_hook() {
     let plugin = Waf::new(&json!({
         "rule_modes": { "FE-CMD-002": "enforce" }
@@ -378,6 +429,59 @@ fn luhn_match_kind_requires_body_target() {
     .unwrap_err();
 
     assert!(err.contains("match_kind luhn is only supported for body targets"));
+}
+
+#[test]
+fn target_object_rejects_irrelevant_fields() {
+    let err = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-BAD-NAMES",
+            "name": "bad names",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "query_values", "names": ["x-forwarded-for"] },
+            "match_kind": "contains",
+            "pattern": "needle"
+        }]
+    }))
+    .unwrap_err();
+    assert!(err.contains("does not support 'names'"));
+
+    let err = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-BAD-PATH",
+            "name": "bad path",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "response_body", "path": "message" },
+            "match_kind": "contains",
+            "pattern": "needle"
+        }]
+    }))
+    .unwrap_err();
+    assert!(err.contains("does not support 'path'"));
+}
+
+#[test]
+fn header_value_target_names_must_be_non_empty_when_provided() {
+    let err = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-EMPTY-NAMES",
+            "name": "empty names",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "header_values", "names": [] },
+            "match_kind": "contains",
+            "pattern": "needle"
+        }]
+    }))
+    .unwrap_err();
+
+    assert!(err.contains("names"));
+    assert!(err.contains("non-empty"));
 }
 
 #[test]
