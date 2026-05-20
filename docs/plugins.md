@@ -2468,7 +2468,9 @@ Supported targets: `header_names`, `header_values`, `query_keys`,
 
 `global_exemptions` supports `paths`, `methods`, `consumers`, `ips`,
 `header_present`, and `fp_capture_filters`. Path entries ending in `*` are
-prefix matches; entries starting with `~` are treated as regex patterns.
+prefix matches; entries starting with `~` are treated as regex patterns; all
+other entries are exact-path matches (so `/health` exempts only `/health`, not
+`/healthz` or `/health-admin`).
 
 ```yaml
 config:

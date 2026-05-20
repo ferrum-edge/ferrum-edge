@@ -122,7 +122,11 @@ fn exemption_path_pattern(raw: String) -> String {
     } else if let Some(prefix) = raw.strip_suffix('*') {
         format!("^{}", regex::escape(prefix))
     } else {
-        format!("^{}", regex::escape(&raw))
+        // Non-wildcard entries are exact-path matches per docs. Anchor both
+        // ends so e.g. `/health` does not also exempt `/healthz`,
+        // `/health-admin`, etc. — over-matching here can disable WAF on
+        // unintended routes.
+        format!("^{}$", regex::escape(&raw))
     }
 }
 
@@ -189,5 +193,23 @@ mod tests {
         let exemptions = CompiledExemptions::from_config(Some(&config)).unwrap();
         let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/healthz".into());
         assert!(exemptions.request_short_circuits(&ctx));
+    }
+
+    #[test]
+    fn non_wildcard_exemption_is_exact_match() {
+        let config = serde_json::json!({"paths":["/health"]});
+        let exemptions = CompiledExemptions::from_config(Some(&config)).unwrap();
+
+        let exact = RequestContext::new("127.0.0.1".into(), "GET".into(), "/health".into());
+        assert!(exemptions.request_short_circuits(&exact));
+
+        // Non-wildcard entries must NOT exempt longer paths sharing the prefix
+        // — otherwise `/health` would silently disable WAF on `/health-admin`,
+        // `/healthz`, etc.
+        let suffix = RequestContext::new("127.0.0.1".into(), "GET".into(), "/healthz".into());
+        assert!(!exemptions.request_short_circuits(&suffix));
+
+        let dashed = RequestContext::new("127.0.0.1".into(), "GET".into(), "/health-admin".into());
+        assert!(!exemptions.request_short_circuits(&dashed));
     }
 }

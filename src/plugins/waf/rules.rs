@@ -442,6 +442,22 @@ pub fn compile_rules(
         compiled_rules.push(compiled);
     }
 
+    // WAF is security-critical: a typo in an `enforce` override silently leaves
+    // the rule monitor-only while construction still succeeds. Fail loudly so
+    // unintended-monitor states cannot ship to production.
+    let mut unknown: Vec<&str> = rule_modes
+        .keys()
+        .filter(|id| !seen.contains(id.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        return Err(format!(
+            "waf: 'rule_modes' references unknown rule id(s): {}",
+            unknown.join(", ")
+        ));
+    }
+
     builders.finish(compiled_rules)
 }
 
@@ -975,5 +991,54 @@ mod tests {
             .expect("compile");
         assert!(compiled.method.as_ref().unwrap().set.is_match("PROPFIND"));
         assert!(!compiled.method.as_ref().unwrap().set.is_match("XPROPFIND"));
+    }
+
+    #[test]
+    fn unknown_rule_modes_id_is_rejected() {
+        let rule = WafRule {
+            id: "R1".into(),
+            name: "test".into(),
+            category: "test".into(),
+            severity: Severity::Low,
+            target: RuleTarget::Method,
+            match_kind: MatchKind::Equals,
+            pattern: "propfind".into(),
+            conditions: None,
+            action: RuleAction::Monitor,
+            fp_filters: vec![],
+            paranoia_min: 1,
+        };
+        let mut modes = HashMap::new();
+        modes.insert("R-TYPO".to_string(), RuleAction::Enforce);
+        modes.insert("ALSO-WRONG".to_string(), RuleAction::Enforce);
+        modes.insert("R1".to_string(), RuleAction::Enforce);
+        let err = compile_rules(vec![(rule, false)], &HashSet::new(), &modes, 1).unwrap_err();
+        assert!(err.contains("unknown rule id"));
+        assert!(err.contains("R-TYPO"));
+        assert!(err.contains("ALSO-WRONG"));
+        // Known IDs should not appear in the error list.
+        assert!(!err.contains("R1"));
+    }
+
+    #[test]
+    fn known_rule_modes_id_filtered_by_paranoia_still_accepted() {
+        let rule = WafRule {
+            id: "R1".into(),
+            name: "test".into(),
+            category: "test".into(),
+            severity: Severity::Low,
+            target: RuleTarget::Method,
+            match_kind: MatchKind::Equals,
+            pattern: "propfind".into(),
+            conditions: None,
+            action: RuleAction::Monitor,
+            fp_filters: vec![],
+            paranoia_min: 4,
+        };
+        let mut modes = HashMap::new();
+        modes.insert("R1".to_string(), RuleAction::Enforce);
+        // R1 is filtered out by paranoia_level=1 but is still a known ID, so
+        // the override is a no-op rather than an error.
+        compile_rules(vec![(rule, false)], &HashSet::new(), &modes, 1).expect("compile");
     }
 }

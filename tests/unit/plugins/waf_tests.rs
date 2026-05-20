@@ -288,3 +288,42 @@ fn luhn_match_kind_requires_body_target() {
 fn waf_is_security_critical() {
     assert!(is_security_plugin("waf"));
 }
+
+#[tokio::test]
+async fn duplicate_query_key_cannot_smuggle_payload_past_query_values_rule() {
+    // Regression: `materialize_query_params()` collapses duplicate keys into a
+    // `HashMap`, so `?q=<script>&q=ok` previously left only `q=ok` visible to
+    // the `query_values` scan and the XSS payload slipped past an enforced
+    // rule. The fix scans each raw pair before HashMap collapse.
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-XSS-001": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E&q=ok".into());
+
+    let result = plugin.on_request_received(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected reject, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-XSS-001")
+    );
+}
+
+#[test]
+fn unknown_rule_modes_id_fails_construction() {
+    // WAF is security-critical: a typo in an `enforce` override would
+    // otherwise silently leave the rule monitor-only.
+    let err = Waf::new(&json!({
+        "rule_modes": { "FE-XSS-99": "enforce" }
+    }))
+    .unwrap_err();
+    assert!(err.contains("unknown rule id"));
+    assert!(err.contains("FE-XSS-99"));
+}

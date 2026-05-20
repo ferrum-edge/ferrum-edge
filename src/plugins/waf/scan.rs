@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 
+use percent_encoding::percent_decode_str;
+
 use super::decode;
 use super::rules::{
     BytesRuleSet, JsonPathMatcher, JsonPathRule, JsonPathSegment, RuleHit, RuleRef, RuleTarget,
@@ -89,37 +91,51 @@ impl Waf {
             self.scan_encoding_specials(&mut outcome, &ctx.path, ctx);
         }
 
-        ctx.materialize_query_params();
-        for (key, value) in &ctx.query_params {
-            self.scan_text_set(
-                &mut outcome,
-                self.compiled.query_keys.as_ref(),
-                key,
-                ctx,
-                None,
-            );
-            self.scan_text_set(
-                &mut outcome,
-                self.compiled.query_values.as_ref(),
-                value,
-                ctx,
-                None,
-            );
-            self.scan_cidr_rules_matching(
-                &mut outcome,
-                key,
-                &self.compiled.text_cidr_rules,
-                ctx,
-                |target| matches!(target, RuleTarget::QueryKeys),
-            );
-            self.scan_cidr_rules_matching(
-                &mut outcome,
-                value,
-                &self.compiled.text_cidr_rules,
-                ctx,
-                |target| matches!(target, RuleTarget::QueryValues),
-            );
+        // Scan each raw query pair before HashMap-collapse so duplicate-key
+        // payloads (HTTP Parameter Pollution) cannot smuggle a value past
+        // `query_keys`/`query_values` rules. `materialize_query_params()`
+        // stores params in a `HashMap` (`?q=<script>&q=ok` collapses to
+        // `q=ok`), so the post-materialize map would only ever see the last
+        // value — relying on the monitor-only HPP rule alone to catch it.
+        if let Some(raw) = raw_query.as_deref() {
+            for pair in raw.split('&') {
+                if pair.is_empty() {
+                    continue;
+                }
+                let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
+                let key = percent_decode_str(raw_k).decode_utf8_lossy();
+                let value = percent_decode_str(raw_v).decode_utf8_lossy();
+                self.scan_text_set(
+                    &mut outcome,
+                    self.compiled.query_keys.as_ref(),
+                    &key,
+                    ctx,
+                    None,
+                );
+                self.scan_text_set(
+                    &mut outcome,
+                    self.compiled.query_values.as_ref(),
+                    &value,
+                    ctx,
+                    None,
+                );
+                self.scan_cidr_rules_matching(
+                    &mut outcome,
+                    &key,
+                    &self.compiled.text_cidr_rules,
+                    ctx,
+                    |target| matches!(target, RuleTarget::QueryKeys),
+                );
+                self.scan_cidr_rules_matching(
+                    &mut outcome,
+                    &value,
+                    &self.compiled.text_cidr_rules,
+                    ctx,
+                    |target| matches!(target, RuleTarget::QueryValues),
+                );
+            }
         }
+        ctx.materialize_query_params();
 
         for (name, value) in &ctx.headers {
             self.scan_text_set(
