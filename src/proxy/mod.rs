@@ -9782,10 +9782,11 @@ async fn handle_proxy_request_inner(
     let mut current_dispatch_h3 =
         supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
+    // Pre-computed at config reload (see `PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT`)
+    // so the proxy hot path does not re-scan the plugin list per request.
     let needs_final_request_body_context = requires_request_body_buffering
-        && plugins
-            .iter()
-            .any(|plugin| plugin.needs_final_request_body_context());
+        && capabilities
+            .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();

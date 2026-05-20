@@ -447,9 +447,7 @@ impl Waf {
         ctx: &RequestContext,
     ) {
         if let Some(rule_index) = self.specials.method_override
-            && let Some((_, override_method)) = headers
-                .iter()
-                .find(|(name, _)| name.as_str() == "x-http-method-override")
+            && let Some(override_method) = headers.get("x-http-method-override")
             && !override_method.eq_ignore_ascii_case(&ctx.method)
         {
             self.push_special(outcome, rule_index, ctx);
@@ -558,23 +556,72 @@ fn json_scan_text<'a>(
 }
 
 fn contains_luhn_candidate(value: &str) -> bool {
-    let mut digits = Vec::with_capacity(19);
+    // Maintain a sliding window of the most recent ≤19 digits. The previous
+    // implementation cleared the buffer entirely on overflow, which lets an
+    // attacker pad a real card number with extra digits and evade response-
+    // body leak detection. The behavior below splits into two regimes:
+    //
+    // * Natural-length runs (the digit run is itself between 13 and 19
+    //   digits and never overflows): check Luhn at the run's exact length.
+    //   This preserves the original semantics — a 16-digit run with an
+    //   invalid checksum still does not falsely match on some 13-digit
+    //   substring that happens to checksum.
+    // * Overflow runs (longer than 19 digits): the natural-length check
+    //   alone cannot see card-length substrings, so before sliding the
+    //   window and again at the run's terminating boundary we check every
+    //   valid card length (13..=19) anchored at the window's start and
+    //   end, catching cards padded on either side.
+    let mut digits: Vec<u8> = Vec::with_capacity(19);
+    let mut overflowed_run = false;
     for ch in value.chars() {
         if ch.is_ascii_digit() {
             digits.push(ch as u8 - b'0');
             if digits.len() > 19 {
-                digits.clear();
+                if check_card_substrings(&digits[..19]) {
+                    return true;
+                }
+                digits.remove(0);
+                overflowed_run = true;
             }
         } else if matches!(ch, ' ' | '-' | '.') {
             continue;
         } else {
-            if (13..=19).contains(&digits.len()) && luhn_valid(&digits) {
+            if check_run(&digits, overflowed_run) {
                 return true;
             }
             digits.clear();
+            overflowed_run = false;
         }
     }
-    (13..=19).contains(&digits.len()) && luhn_valid(&digits)
+    check_run(&digits, overflowed_run)
+}
+
+fn check_run(digits: &[u8], overflowed: bool) -> bool {
+    if overflowed {
+        check_card_substrings(digits)
+    } else {
+        (13..=19).contains(&digits.len()) && luhn_valid(digits)
+    }
+}
+
+fn check_card_substrings(digits: &[u8]) -> bool {
+    if digits.len() < 13 {
+        return false;
+    }
+    let max_len = digits.len().min(19);
+    // Check every valid card length anchored at the window's start and end.
+    // Combined with the per-digit slide in `contains_luhn_candidate`, this
+    // covers each 13..=19 length substring of any long digit run without
+    // running luhn_valid over the full N×N substring space.
+    for len in 13..=max_len {
+        if luhn_valid(&digits[..len]) {
+            return true;
+        }
+        if len < digits.len() && luhn_valid(&digits[digits.len() - len..]) {
+            return true;
+        }
+    }
+    false
 }
 
 fn luhn_valid(digits: &[u8]) -> bool {
@@ -602,5 +649,16 @@ mod tests {
     fn luhn_detects_valid_card_candidate() {
         assert!(contains_luhn_candidate("card 4111 1111 1111 1111 leaked"));
         assert!(!contains_luhn_candidate("card 4111 1111 1111 1112 leaked"));
+    }
+
+    #[test]
+    fn luhn_detects_card_padded_in_long_digit_run() {
+        // 4111111111111111 is a known-valid Luhn card. The previous
+        // implementation cleared the digit buffer when a run exceeded 19,
+        // losing this match entirely. The sliding-window version still
+        // surfaces it whether the padding is at the start or end of the run.
+        assert!(contains_luhn_candidate("00004111111111111111"));
+        assert!(contains_luhn_candidate("41111111111111119999"));
+        assert!(contains_luhn_candidate("000041111111111111119999"));
     }
 }

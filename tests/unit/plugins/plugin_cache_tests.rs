@@ -2569,6 +2569,33 @@ fn test_decoded_query_params_capability_preserved_with_priority_override() {
 }
 
 #[test]
+fn test_waf_sets_needs_final_request_body_context_capability() {
+    // WAF returns true for `needs_final_request_body_context()` because it
+    // annotates request metadata (`waf.rule_hits`, `waf.action`, etc.) from
+    // the body-scan hook. The proxy hot path reads this bit instead of
+    // iterating plugins per request — make sure the bit is set when WAF is
+    // configured.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_json(
+            "ps1",
+            "waf",
+            json!({}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        caps.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT),
+        "WAF plugin must set NEEDS_FINAL_REQUEST_BODY_CONTEXT so the proxy \
+         passes a mutable RequestContext into on_final_request_body hooks"
+    );
+}
+
+#[test]
 fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["ps1"])],

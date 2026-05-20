@@ -536,7 +536,7 @@ impl RuleSetBuilders {
                 } else if rule.target.is_request_body() {
                     self.body_luhn_rules.push(rule_index);
                 } else {
-                    self.text_cidr_rules.push(rule_index);
+                    unreachable!("validate_rule rejects luhn match_kind on non-body targets");
                 }
                 return Ok(());
             }

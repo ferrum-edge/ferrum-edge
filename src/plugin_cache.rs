@@ -336,6 +336,7 @@ impl PluginCapabilities {
     pub const NEEDS_REQUEST_BODY_BYTES: u8 = 1 << 4;
     pub const HAS_BODY_BEFORE_AUTHENTICATE: u8 = 1 << 5;
     pub const NEEDS_DECODED_QUERY_PARAMS: u8 = 1 << 6;
+    pub const NEEDS_FINAL_REQUEST_BODY_CONTEXT: u8 = 1 << 7;
 
     #[inline(always)]
     pub fn has(self, flag: u8) -> bool {
@@ -385,6 +386,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_decoded_query_params() {
             caps |= PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS;
+        }
+        if p.needs_final_request_body_context() {
+            caps |= PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT;
         }
     }
     PluginPhaseData {
