@@ -702,27 +702,34 @@ pub fn handle_pod_added(
             }
         }
         if attach_ok {
-            let Some(ref iface) = veth_iface else {
+            if let Some(ref iface) = veth_iface {
+                if let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound") {
+                    warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
+                    metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                    if let Err(detach_err) = backend.detach_pod(pod_uid) {
+                        warn!(pod_uid, error = %detach_err, "Failed to clean up partially attached pod");
+                    }
+                    return;
+                }
+            } else if event.pod_pid.is_some() {
                 warn!(
                     pod_uid,
                     pod_name,
                     namespace,
-                    "Could not resolve pod veth interface, skipping attachment"
+                    "Could not resolve pod veth interface for provided pod PID, skipping attachment"
                 );
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = backend.detach_pod(pod_uid) {
                     warn!(pod_uid, error = %e, "Failed to clean up partially attached pod");
                 }
                 return;
-            };
-
-            if let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound") {
-                warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
-                metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-                if let Err(detach_err) = backend.detach_pod(pod_uid) {
-                    warn!(pod_uid, error = %detach_err, "Failed to clean up partially attached pod");
-                }
-                return;
+            } else {
+                debug!(
+                    pod_uid,
+                    pod_name,
+                    namespace,
+                    "Pod PID unavailable; skipping inbound tc attach and continuing with cgroup capture"
+                );
             }
             if let Some(ip) = pod_ip {
                 let info = PodInfo {
