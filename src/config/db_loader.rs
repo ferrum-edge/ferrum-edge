@@ -3323,7 +3323,12 @@ impl DatabaseStore {
     /// or the replica pool has been closed, returns the primary pool.
     fn rpool(&self) -> AnyPool {
         if let Some(ref rp) = self.read_replica_pool {
-            (**rp.load()).clone()
+            let replica = (**rp.load()).clone();
+            if replica.is_closed() {
+                self.pool()
+            } else {
+                replica
+            }
         } else {
             self.pool()
         }
