@@ -416,6 +416,7 @@ pub(crate) fn record_backend_outcome(
     final_cb_target_key: Option<&str>,
     response_status: u16,
     connection_error: bool,
+    error_class: Option<retry::ErrorClass>,
     is_half_open_probe: bool,
     backend_elapsed: Duration,
 ) {
@@ -456,7 +457,9 @@ pub(crate) fn record_backend_outcome(
             state
                 .circuit_breaker_cache
                 .get_or_create(&proxy.id, final_cb_target_key, cb_config);
-        if connection_error {
+        let is_backend_connection_failure =
+            connection_error && error_class.is_none_or(|class| !retry::request_reached_wire(class));
+        if is_backend_connection_failure {
             // Connection errors are controlled by trip_on_connection_errors.
             // When disabled, connection errors are neutral — no state mutation.
             if cb.config().trip_on_connection_errors {

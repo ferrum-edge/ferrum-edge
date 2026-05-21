@@ -9978,6 +9978,7 @@ async fn handle_proxy_request_inner(
         final_cb_target_key.as_deref(),
         response_status,
         backend_resp.connection_error,
+        backend_resp.error_class,
         cb_is_half_open_probe,
         backend_start.elapsed(),
     );
