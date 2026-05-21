@@ -670,7 +670,13 @@ impl MeshSlice {
         let extension_configs: Vec<MeshExtensionConfig> = mesh
             .extension_configs
             .iter()
-            .filter(|ext| ext.namespace == *effective_namespace)
+            .filter(|ext| {
+                resource_namespace_visible(
+                    &service_waypoint_namespaces,
+                    &ext.namespace,
+                    effective_namespace,
+                )
+            })
             .cloned()
             .collect();
         let workloads =
@@ -1937,12 +1943,12 @@ mod tests {
     use crate::config::types::GatewayConfig;
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
     use crate::modes::mesh::config::{
-        AppProtocol, MeshAccessLoggingConfig, MeshConfig, MeshDestinationRule, MeshPolicy,
-        MeshProxyConfig, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
-        MeshSidecarEgress, MeshTelemetryConfig, MeshTelemetryResource, MtlsMode,
-        MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, RemoteCluster,
-        ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet, Workload,
-        WorkloadPort, WorkloadRef, WorkloadSelector,
+        AppProtocol, MeshAccessLoggingConfig, MeshConfig, MeshDestinationRule, MeshExtensionConfig,
+        MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
+        MeshSidecarEgress, MeshTelemetryConfig, MeshTelemetryResource, MeshWaypointBinding,
+        MeshWaypointServiceRef, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction,
+        PolicyScope, RemoteCluster, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle,
+        TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
     };
     use std::collections::HashMap;
 
@@ -2010,6 +2016,66 @@ mod tests {
             .map(|spiffe_id| WorkloadRef { spiffe_id })
             .collect();
         service
+    }
+
+    #[test]
+    fn service_waypoint_slice_keeps_extension_configs_for_bound_service_namespaces() {
+        let mesh = MeshConfig {
+            extension_configs: vec![
+                MeshExtensionConfig {
+                    name: "infra-ext".into(),
+                    namespace: "infra".into(),
+                    type_url: "type.googleapis.com/test".into(),
+                    value: vec![1],
+                },
+                MeshExtensionConfig {
+                    name: "default-ext".into(),
+                    namespace: "default".into(),
+                    type_url: "type.googleapis.com/test".into(),
+                    value: vec![2],
+                },
+                MeshExtensionConfig {
+                    name: "other-ext".into(),
+                    namespace: "other".into(),
+                    type_url: "type.googleapis.com/test".into(),
+                    value: vec![3],
+                },
+                MeshExtensionConfig {
+                    name: "unscoped-ext".into(),
+                    namespace: String::new(),
+                    type_url: "type.googleapis.com/test".into(),
+                    value: vec![4],
+                },
+            ],
+            waypoint_bindings: vec![MeshWaypointBinding {
+                name: "waypoint".into(),
+                namespace: "infra".into(),
+                waypoint_for: "service".into(),
+                services: vec![MeshWaypointServiceRef {
+                    namespace: "default".into(),
+                    name: "reviews".into(),
+                }],
+            }],
+            services: vec![make_service("default", "reviews")],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            MeshSliceRequest {
+                node_id: "node-1".into(),
+                namespace: "infra".into(),
+                waypoint_name: Some("waypoint".into()),
+                ..MeshSliceRequest::default()
+            },
+        );
+        let mut names: Vec<String> = slice
+            .extension_configs
+            .iter()
+            .map(|ext| ext.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["default-ext", "infra-ext"]);
     }
 
     fn make_policy(name: &str, namespace: &str, scope: PolicyScope) -> MeshPolicy {
