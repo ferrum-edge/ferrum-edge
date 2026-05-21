@@ -11597,6 +11597,12 @@ async fn proxy_to_backend(
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     if has_body {
+        // Streaming can preserve fail-before-forward semantics only when
+        // request-size enforcement is either disabled or Content-Length is
+        // present (so oversize can be rejected before contacting backend).
+        let can_stream_body_this_request = stream_request_body
+            && (state.max_request_body_size_bytes == 0 || headers.contains_key("content-length"));
+
         // Enforce request body size limit via Content-Length fast path
         if state.max_request_body_size_bytes > 0
             && let Some(content_length) = headers.get("content-length")
@@ -11657,7 +11663,7 @@ async fn proxy_to_backend(
                     req_builder = req_builder.body(body_bytes);
                 }
             }
-            ClientRequestBody::Streaming(original_req) if stream_request_body => {
+            ClientRequestBody::Streaming(original_req) if can_stream_body_this_request => {
                 // Stream the request body directly to the backend without collecting
                 // into memory. Size limit is enforced during streaming via
                 // SizeLimitedIncoming which sets body_size_exceeded on overflow.
