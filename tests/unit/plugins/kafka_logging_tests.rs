@@ -2,10 +2,6 @@
 
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, kafka_logging::KafkaLogging};
-use ferrum_edge::{
-    config::{BackendAllowIps, DnsConfig, PoolConfig},
-    dns::DnsCache,
-};
 use serde_json::json;
 
 use super::plugin_utils::{
@@ -14,26 +10,6 @@ use super::plugin_utils::{
 
 fn default_http_client() -> PluginHttpClient {
     PluginHttpClient::default()
-}
-
-fn http_client_with_policy(policy: BackendAllowIps) -> PluginHttpClient {
-    let dns_config = DnsConfig {
-        backend_allow_ips: policy.clone(),
-        ..Default::default()
-    };
-    PluginHttpClient::new(
-        &PoolConfig::default(),
-        DnsCache::new(dns_config),
-        1000,
-        0,
-        100,
-        false,
-        None,
-        std::sync::Arc::new(Vec::new()),
-        ferrum_edge::config::types::DEFAULT_NAMESPACE,
-        policy,
-        std::sync::Arc::new(Vec::new()),
-    )
 }
 
 #[tokio::test]
@@ -295,19 +271,6 @@ async fn test_kafka_logging_rejects_bootstrap_override_in_producer_config() {
             }
         }),
         &default_http_client(),
-    );
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn test_kafka_logging_enforces_backend_allow_policy_for_ip_brokers() {
-    let client = http_client_with_policy(BackendAllowIps::Public);
-    let result = KafkaLogging::new(
-        &json!({
-            "broker_list": "127.0.0.1:9092",
-            "topic": "test"
-        }),
-        &client,
     );
     assert!(result.is_err());
 }

@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{BaseRecord, DefaultProducerContext, Producer, ThreadedProducer};
 use serde_json::Value;
-use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::spawn_blocking;
@@ -68,7 +67,6 @@ impl KafkaLogging {
             );
         }
         let broker_list = brokers.join(",");
-        validate_broker_list(&broker_list, http_client.backend_allow_ips())?;
 
         let topic = required_non_empty_string(config, "topic").ok_or_else(|| {
             if config.get("topic").is_some() {
@@ -265,56 +263,6 @@ fn required_non_empty_string(config: &Value, key: &str) -> Option<String> {
         let value = value.trim();
         (!value.is_empty()).then(|| value.to_string())
     })
-}
-
-fn validate_broker_list(
-    broker_list: &str,
-    backend_allow_ips: &crate::config::BackendAllowIps,
-) -> Result<(), String> {
-    for broker in broker_list.split(',').map(str::trim).filter(|b| !b.is_empty()) {
-        let host = if broker.starts_with('[') {
-            broker
-                .split(']')
-                .next()
-                .map(|value| value.trim_start_matches('['))
-                .unwrap_or_default()
-        } else {
-            broker.split(':').next().unwrap_or_default()
-        };
-        if host.is_empty() {
-            return Err(format!("kafka_logging: invalid broker address '{broker}'"));
-        }
-
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            if !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips) {
-                return Err(format!(
-                    "kafka_logging: broker '{broker}' IP is denied by backend allow policy"
-                ));
-            }
-            continue;
-        }
-
-        let resolved = (host, 0u16)
-            .to_socket_addrs()
-            .map_err(|error| format!("kafka_logging: failed to resolve broker '{host}': {error}"))?
-            .map(|addr| addr.ip())
-            .collect::<Vec<IpAddr>>();
-        if resolved.is_empty() {
-            return Err(format!(
-                "kafka_logging: broker '{host}' did not resolve to any IP addresses"
-            ));
-        }
-        if resolved
-            .iter()
-            .any(|ip| !crate::config::check_backend_ip_allowed(ip, backend_allow_ips))
-        {
-            return Err(format!(
-                "kafka_logging: broker '{host}' resolves to IPs denied by backend allow policy"
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>, String> {
