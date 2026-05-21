@@ -223,6 +223,20 @@ impl AuthMechanism for HmacAuth {
         // Enforce digest presence at extraction so we surface the clearest
         // error before consumer lookup. The actual body-vs-digest comparison
         // happens in `verify` once we have the buffered body.
+        //
+        // HBONE CONNECT keeps the request body streaming so the upgrade handle
+        // remains available for relay; request-body bytes are therefore not
+        // available at authenticate time. Fail closed for this shape.
+        let is_hbone_connect = ctx.method.eq_ignore_ascii_case("CONNECT")
+            && ctx
+                .metadata
+                .get("request_protocol")
+                .is_some_and(|protocol| protocol.eq_ignore_ascii_case("hbone"));
+        if is_hbone_connect && ctx.request_body_bytes.is_none() && !ctx.metadata.contains_key("request_body") {
+            return ExtractedCredential::InvalidFormat(
+                r#"{"error":"HBONE CONNECT is incompatible with hmac_auth request-body digest verification"}"#.to_string(),
+            );
+        }
         let digest_header = match Self::extract_digest_header(ctx) {
             Some(header) => header,
             None => {

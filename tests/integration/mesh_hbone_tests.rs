@@ -313,7 +313,7 @@ async fn hbone_connect_relays_data_frames_to_tcp_backend() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn hbone_connect_with_body_auth_plugin_keeps_upgrade_streaming() {
+async fn hbone_connect_with_body_auth_plugin_is_rejected() {
     const HMAC_SECRET: &str = "mesh-hbone-secret";
 
     let (backend_addr, backend_handle) = start_echo_backend().await;
@@ -353,21 +353,7 @@ async fn hbone_connect_with_body_auth_plugin_keeps_upgrade_streaming() {
         .send_data(Bytes::from_static(b"mesh-bytes"), true)
         .expect("send CONNECT data");
     let resp = response_fut.await.expect("CONNECT response");
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let mut response_body = resp.into_body();
-    let body = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let mut body = Vec::new();
-        while let Some(chunk) = response_body.data().await {
-            let chunk = chunk.expect("CONNECT response chunk");
-            let _ = response_body.flow_control().release_capacity(chunk.len());
-            body.extend_from_slice(&chunk);
-        }
-        body
-    })
-    .await
-    .expect("collect CONNECT response");
-    assert_eq!(&body[..], b"echo:mesh-bytes");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     shutdown_tx.send(true).expect("shutdown gateway");
     backend_handle.await.expect("backend task");
