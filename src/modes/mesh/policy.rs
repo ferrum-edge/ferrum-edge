@@ -680,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_mesh_policy_header_names_collapses_conflicting_case_collisions() {
+    fn normalize_mesh_policy_header_names_preserves_fail_closed_for_conflicting_case_collisions() {
         let mut policy = MeshPolicy {
             name: "headers".to_string(),
             namespace: "default".to_string(),
@@ -708,6 +708,10 @@ mod tests {
         assert_eq!(policy.rules[0].to[0].headers.len(), 1);
         assert!(!policy.rules[0].to[0].headers.contains_key("X-Tenant"));
         assert!(policy.rules[0].to[0].headers.contains_key("x-tenant"));
+        assert_eq!(
+            policy.rules[0].to[0].headers["x-tenant"],
+            "\0ferrum-header-case-collision"
+        );
     }
 
     #[test]

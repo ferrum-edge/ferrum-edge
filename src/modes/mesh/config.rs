@@ -2153,13 +2153,18 @@ pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, Str
     let mut entries = headers.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(key, _)| *key);
 
+    const CASE_COLLISION_NEVER_MATCH: &str = "\0ferrum-header-case-collision";
     let mut normalized = HashMap::with_capacity(headers.len());
     for (key, value) in entries {
         let lower = key.to_ascii_lowercase();
-        let prefer_value =
-            key == &lower || !headers.contains_key(&lower) || !normalized.contains_key(&lower);
-        if prefer_value {
-            normalized.insert(lower, value.clone());
+        match normalized.get(&lower) {
+            Some(existing) if existing != value => {
+                normalized.insert(lower, CASE_COLLISION_NEVER_MATCH.to_string());
+            }
+            Some(_) => {}
+            None => {
+                normalized.insert(lower, value.clone());
+            }
         }
     }
 
