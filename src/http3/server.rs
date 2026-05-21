@@ -1507,8 +1507,9 @@ async fn handle_h3_request(
     // content-type/content-length gates. Otherwise it falls back to
     // `std::mem::take(&mut ctx.headers)` — the zero-alloc hot path that the
     // H3 server has used since before the WAF plugin landed.
-    let needs_ctx_headers_for_body_hooks =
-        capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    let needs_ctx_headers_for_body_hooks = plugin_needs_request_buffering
+        && capabilities
+            .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
     let mut proxy_headers: HashMap<String, String> = own_h3_proxy_headers(
         owned_proxy_headers,
         &mut ctx,

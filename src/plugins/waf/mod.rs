@@ -388,15 +388,17 @@ impl Waf {
                 }
             }
         }
-        warn!(
-            target: "waf",
-            proxy = %proxy_id(ctx),
-            client_ip = %ctx.client_ip,
-            path = %ctx.path,
-            method = %ctx.method,
-            action = ?self.config.on_scan_timeout,
-            "WAF scan timed out"
-        );
+        if !matches!(self.config.on_scan_timeout, TimeoutAction::Allow) {
+            warn!(
+                target: "waf",
+                proxy = %proxy_id(ctx),
+                client_ip = %ctx.client_ip,
+                path = %ctx.path,
+                method = %ctx.method,
+                action = ?self.config.on_scan_timeout,
+                "WAF scan timed out"
+            );
+        }
         match self.config.on_scan_timeout {
             TimeoutAction::Allow | TimeoutAction::LogAndAllow => PluginResult::Continue,
             TimeoutAction::Block => PluginResult::Reject {
