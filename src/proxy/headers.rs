@@ -31,6 +31,9 @@
 ///   by the compression plugin to track the pre-compression encoding;
 ///   never forward to the backend.
 ///
+/// - **`x-grpc-web-mode`:** internal grpc_web plugin marker used only between
+///   request header and body plugin phases; never forward to the backend.
+///
 /// `name` is expected to be lowercase.
 #[inline]
 pub fn is_backend_request_strip_header(name: &str) -> bool {
@@ -46,6 +49,7 @@ pub fn is_backend_request_strip_header(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
             | "x-ferrum-original-content-encoding"
+            | "x-grpc-web-mode"
     )
 }
 
