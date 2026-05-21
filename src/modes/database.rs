@@ -936,23 +936,30 @@ pub async fn run(
                     if force_full_reload {
                         match db_poll.load_full_config(&poll_namespace).await {
                             Ok(new_config) => {
-                                // Keep known ID sets and incremental cursor consistent with the
-                                // newly connected database snapshot.
-                                let (
-                                    next_known_proxy_ids,
-                                    next_known_consumer_ids,
-                                    next_known_plugin_config_ids,
-                                    next_known_upstream_ids,
-                                ) = db_backend::extract_known_ids(&new_config);
-                                known_proxy_ids = next_known_proxy_ids;
-                                known_consumer_ids = next_known_consumer_ids;
-                                known_plugin_config_ids = next_known_plugin_config_ids;
-                                known_upstream_ids = next_known_upstream_ids;
-                                last_poll_at = Some(new_config.loaded_at);
-                                force_full_reload = false;
-                                db_available_poll.store(true, Ordering::Relaxed);
                                 if proxy_state_poll.update_config(new_config) {
+                                    let published_config = proxy_state_poll.current_config();
+                                    // Keep known ID sets and incremental cursor consistent with
+                                    // the published database snapshot.
+                                    let (
+                                        next_known_proxy_ids,
+                                        next_known_consumer_ids,
+                                        next_known_plugin_config_ids,
+                                        next_known_upstream_ids,
+                                    ) = db_backend::extract_known_ids(&published_config);
+                                    known_proxy_ids = next_known_proxy_ids;
+                                    known_consumer_ids = next_known_consumer_ids;
+                                    known_plugin_config_ids = next_known_plugin_config_ids;
+                                    known_upstream_ids = next_known_upstream_ids;
+                                    last_poll_at = Some(published_config.loaded_at);
+                                    force_full_reload = false;
+                                    db_available_poll.store(true, Ordering::Relaxed);
                                     debug!("Full config reload complete after DB DNS reconnect");
+                                } else {
+                                    warn!(
+                                        "Full config reload after DB DNS reconnect was rejected; \
+                                         keeping existing config and retrying"
+                                    );
+                                    db_available_poll.store(false, Ordering::Relaxed);
                                 }
                             }
                             Err(e) => {
