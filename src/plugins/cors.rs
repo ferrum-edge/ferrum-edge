@@ -68,6 +68,10 @@ pub struct CorsPlugin {
 }
 
 impl CorsPlugin {
+    fn remove_access_control_headers(response_headers: &mut HashMap<String, String>) {
+        response_headers.retain(|k, _| !k.to_ascii_lowercase().starts_with("access-control-"));
+    }
+
     pub fn new(config: &Value) -> Result<Self, String> {
         let allowed_origins = Self::parse_origins(config)?;
 
@@ -352,6 +356,24 @@ impl Plugin for CorsPlugin {
                     headers: HashMap::new(),
                 };
             }
+            let method_allowed = self
+                .allowed_methods
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(&ctx.method));
+            if !method_allowed {
+                debug!(
+                    "cors: request rejected method '{}' for origin '{}'",
+                    ctx.method, origin
+                );
+                let mut body = String::with_capacity("CORS method not allowed: ".len() + ctx.method.len());
+                body.push_str("CORS method not allowed: ");
+                body.push_str(&ctx.method);
+                return PluginResult::Reject {
+                    status_code: 403,
+                    body,
+                    headers: HashMap::new(),
+                };
+            }
             ctx.metadata
                 .insert("cors_origin".to_string(), origin.clone());
             return PluginResult::Continue;
@@ -421,6 +443,10 @@ impl Plugin for CorsPlugin {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Strip backend-supplied CORS policy headers so the gateway CORS policy
+        // remains authoritative.
+        Self::remove_access_control_headers(response_headers);
+
         // Check if on_request_received marked this as a valid CORS request
         let origin = match ctx.metadata.get("cors_origin") {
             Some(o) => o.clone(),

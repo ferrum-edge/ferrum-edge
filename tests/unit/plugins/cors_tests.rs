@@ -409,6 +409,26 @@ async fn test_non_preflight_disallowed_origin_returns_403() {
 }
 
 #[tokio::test]
+async fn test_non_preflight_disallowed_method_returns_403() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_methods": ["POST"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://example.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert_eq!(body, "CORS method not allowed: GET");
+        }
+        _ => panic!("Expected 403 Reject for disallowed non-preflight method"),
+    }
+}
+
+#[tokio::test]
 async fn test_options_without_request_method_header_disallowed_origin_returns_403() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com"]
@@ -544,6 +564,35 @@ async fn test_non_cors_request_no_headers_added() {
         !response_headers.contains_key("access-control-allow-origin"),
         "No CORS headers without Origin"
     );
+}
+
+#[tokio::test]
+async fn test_after_proxy_removes_backend_access_control_headers_when_origin_not_approved() {
+    let plugin = CorsPlugin::new(&json!({
+        "preflight_continue": true,
+        "allowed_origins": ["https://trusted.example"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://evil.example");
+    let _ = plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers: HashMap<String, String> = HashMap::from([
+        ("access-control-allow-origin".to_string(), "*".to_string()),
+        (
+            "access-control-allow-credentials".to_string(),
+            "true".to_string(),
+        ),
+        ("x-test".to_string(), "ok".to_string()),
+    ]);
+
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+
+    assert!(!response_headers.contains_key("access-control-allow-origin"));
+    assert!(!response_headers.contains_key("access-control-allow-credentials"));
+    assert_eq!(response_headers.get("x-test").map(String::as_str), Some("ok"));
 }
 
 // ── Vary header tests ────────────────────────────────────────────────
