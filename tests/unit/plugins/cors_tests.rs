@@ -409,26 +409,6 @@ async fn test_non_preflight_disallowed_origin_returns_403() {
 }
 
 #[tokio::test]
-async fn test_non_preflight_disallowed_method_returns_403() {
-    let plugin = CorsPlugin::new(&json!({
-        "allowed_methods": ["POST"]
-    }))
-    .unwrap();
-
-    let mut ctx = make_cors_ctx("GET", "https://example.com");
-    let result = plugin.on_request_received(&mut ctx).await;
-    match result {
-        PluginResult::Reject {
-            status_code, body, ..
-        } => {
-            assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS method not allowed: GET");
-        }
-        _ => panic!("Expected 403 Reject for disallowed non-preflight method"),
-    }
-}
-
-#[tokio::test]
 async fn test_options_without_request_method_header_disallowed_origin_returns_403() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com"]

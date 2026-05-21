@@ -356,24 +356,6 @@ impl Plugin for CorsPlugin {
                     headers: HashMap::new(),
                 };
             }
-            let method_allowed = self
-                .allowed_methods
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(&ctx.method));
-            if !method_allowed {
-                debug!(
-                    "cors: request rejected method '{}' for origin '{}'",
-                    ctx.method, origin
-                );
-                let mut body = String::with_capacity("CORS method not allowed: ".len() + ctx.method.len());
-                body.push_str("CORS method not allowed: ");
-                body.push_str(&ctx.method);
-                return PluginResult::Reject {
-                    status_code: 403,
-                    body,
-                    headers: HashMap::new(),
-                };
-            }
             ctx.metadata
                 .insert("cors_origin".to_string(), origin.clone());
             return PluginResult::Continue;
