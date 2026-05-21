@@ -145,6 +145,38 @@ pub fn load_config_from_file(
         for u in &config.upstreams {
             ns_set.insert(u.namespace.clone());
         }
+        if let Some(mesh) = &config.mesh {
+            for item in &mesh.workloads {
+                ns_set.insert(item.namespace.clone());
+            }
+            for item in &mesh.services {
+                ns_set.insert(item.namespace.clone());
+            }
+            for item in &mesh.mesh_policies {
+                ns_set.insert(item.namespace.clone());
+            }
+            for item in &mesh.peer_authentications {
+                ns_set.insert(item.namespace.clone());
+            }
+            for item in &mesh.service_entries {
+                ns_set.insert(item.namespace.clone());
+            }
+            for item in &mesh.request_authentications {
+                ns_set.insert(item.namespace.clone());
+            }
+            for item in &mesh.telemetry_resources {
+                ns_set.insert(item.namespace.clone());
+            }
+            for item in &mesh.destination_rules {
+                ns_set.insert(item.namespace.clone());
+            }
+            for item in &mesh.proxy_configs {
+                ns_set.insert(item.namespace.clone());
+            }
+            for item in &mesh.sidecars {
+                ns_set.insert(item.namespace.clone());
+            }
+        }
         let mut known: Vec<String> = ns_set.into_iter().collect();
         known.sort();
         config.known_namespaces = known;
@@ -175,13 +207,19 @@ pub fn load_config_from_file(
     config.consumers.retain(|c| c.namespace == namespace);
     config.plugin_configs.retain(|pc| pc.namespace == namespace);
     config.upstreams.retain(|u| u.namespace == namespace);
+    let filtered_mesh = config
+        .mesh
+        .as_mut()
+        .map(|mesh| mesh.retain_namespace(namespace))
+        .unwrap_or(0);
 
     let filtered_out = pre_filter_counts.0 - config.proxies.len() + pre_filter_counts.1
         - config.consumers.len()
         + pre_filter_counts.2
         - config.plugin_configs.len()
         + pre_filter_counts.3
-        - config.upstreams.len();
+        - config.upstreams.len()
+        + filtered_mesh;
     if filtered_out > 0 {
         info!(
             "Namespace filter '{}': excluded {} resources from other namespaces",

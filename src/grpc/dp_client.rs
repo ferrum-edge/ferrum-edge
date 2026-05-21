@@ -1068,10 +1068,16 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
     config.consumers.retain(|c| c.namespace == namespace);
     config.plugin_configs.retain(|pc| pc.namespace == namespace);
     config.upstreams.retain(|u| u.namespace == namespace);
+    let filtered_mesh = config
+        .mesh
+        .as_mut()
+        .map(|mesh| mesh.retain_namespace(namespace))
+        .unwrap_or(0);
     (pre.0 - config.proxies.len())
         + (pre.1 - config.consumers.len())
         + (pre.2 - config.plugin_configs.len())
         + (pre.3 - config.upstreams.len())
+        + filtered_mesh
 }
 
 /// Defense-in-depth filter for incremental deltas. Applied to

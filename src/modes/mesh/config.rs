@@ -1450,6 +1450,53 @@ impl Default for MeshConfig {
     }
 }
 
+impl MeshConfig {
+    /// Retain only namespace-scoped mesh resources that belong to `namespace`.
+    ///
+    /// Returns the number of entries removed.
+    pub fn retain_namespace(&mut self, namespace: &str) -> usize {
+        let pre = (
+            self.workloads.len(),
+            self.services.len(),
+            self.mesh_policies.len(),
+            self.peer_authentications.len(),
+            self.service_entries.len(),
+            self.request_authentications.len(),
+            self.telemetry_resources.len(),
+            self.destination_rules.len(),
+            self.proxy_configs.len(),
+            self.sidecars.len(),
+        );
+        self.workloads.retain(|item| item.namespace == namespace);
+        self.services.retain(|item| item.namespace == namespace);
+        self.mesh_policies
+            .retain(|item| item.namespace == namespace);
+        self.peer_authentications
+            .retain(|item| item.namespace == namespace);
+        self.service_entries
+            .retain(|item| item.namespace == namespace);
+        self.request_authentications
+            .retain(|item| item.namespace == namespace);
+        self.telemetry_resources
+            .retain(|item| item.namespace == namespace);
+        self.destination_rules
+            .retain(|item| item.namespace == namespace);
+        self.proxy_configs
+            .retain(|item| item.namespace == namespace);
+        self.sidecars.retain(|item| item.namespace == namespace);
+        (pre.0 - self.workloads.len())
+            + (pre.1 - self.services.len())
+            + (pre.2 - self.mesh_policies.len())
+            + (pre.3 - self.peer_authentications.len())
+            + (pre.4 - self.service_entries.len())
+            + (pre.5 - self.request_authentications.len())
+            + (pre.6 - self.telemetry_resources.len())
+            + (pre.7 - self.destination_rules.len())
+            + (pre.8 - self.proxy_configs.len())
+            + (pre.9 - self.sidecars.len())
+    }
+}
+
 /// One GAMMA Waypoint → services binding. Produced by the K8s translator
 /// from Gateway resources with `gatewayClassName: istio-waypoint` /
 /// `ferrum-waypoint` plus `Service` annotations

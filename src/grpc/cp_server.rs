@@ -595,6 +595,9 @@ impl CpGrpcServer {
             .plugin_configs
             .retain(|pc| pc.namespace == namespace);
         filtered.upstreams.retain(|u| u.namespace == namespace);
+        if let Some(mesh) = filtered.mesh.as_mut() {
+            mesh.retain_namespace(namespace);
+        }
         filtered
     }
 
