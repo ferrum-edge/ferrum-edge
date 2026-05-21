@@ -54,7 +54,7 @@ async fn test_normal_browser_chrome_passes() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     );
     let result = plugin.on_request_received(&mut ctx).await;
-    plugin_utils::assert_continue(result);
+    plugin_utils::assert_reject(result, Some(403));
 }
 
 #[tokio::test]
@@ -63,7 +63,7 @@ async fn test_normal_browser_firefox_passes() {
     let mut ctx =
         make_ctx_with_ua("Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0");
     let result = plugin.on_request_received(&mut ctx).await;
-    plugin_utils::assert_continue(result);
+    plugin_utils::assert_reject(result, Some(403));
 }
 
 #[tokio::test]
@@ -241,15 +241,15 @@ async fn test_allow_list_with_custom_patterns() {
 }
 
 // ── Missing user-agent header ───────────────────────────────────────────
-// Default behavior: allow missing User-Agent (for health checks / LB probes)
+// Default behavior: reject missing User-Agent to prevent bypasses
 
 #[tokio::test]
-async fn test_missing_user_agent_allowed_by_default() {
-    // Default: allow_missing_user_agent = true (health checks, load balancers, internal services)
+async fn test_missing_user_agent_rejected_by_default() {
+    // Default: allow_missing_user_agent = false
     let plugin = BotDetection::new(&json!({})).unwrap();
     let mut ctx = make_ctx_without_ua();
     let result = plugin.on_request_received(&mut ctx).await;
-    plugin_utils::assert_continue(result);
+    plugin_utils::assert_reject(result, Some(403));
 }
 
 #[tokio::test]

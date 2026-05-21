@@ -17,7 +17,7 @@ pub struct BotDetection {
     allow_list: Option<RegexSet>,
     custom_response_code: u16,
     /// Whether to allow requests with no User-Agent header.
-    /// Defaults to true so health checks (which often omit User-Agent) pass.
+    /// Defaults to false to prevent bypass via missing User-Agent.
     allow_missing_user_agent: bool,
 }
 
@@ -27,7 +27,7 @@ impl BotDetection {
             parse_pattern_list(config, "blocked_patterns", Some(default_blocked_patterns()))?;
         let allow_list = parse_pattern_list(config, "allow_list", None)?;
         let custom_response_code = parse_response_code(config)?;
-        let allow_missing_user_agent = parse_bool(config, "allow_missing_user_agent", true)?;
+        let allow_missing_user_agent = parse_bool(config, "allow_missing_user_agent", false)?;
 
         Ok(Self {
             blocked_patterns: compile_literal_pattern_set("blocked_patterns", &blocked_patterns)?,
@@ -165,7 +165,7 @@ impl Plugin for BotDetection {
             None => {
                 // No user-agent header — allow or reject based on configuration.
                 // Health checks, load balancers, and internal services often omit
-                // User-Agent. Default is to allow missing User-Agent.
+                // User-Agent. Default is to reject missing User-Agent.
                 if self.allow_missing_user_agent {
                     return PluginResult::Continue;
                 }
