@@ -234,7 +234,9 @@ fn datadog_provider(name: &str, config: &Value) -> Result<TracingProvider, Strin
 fn lightstep_provider(name: &str, config: &Value) -> Result<TracingProvider, String> {
     let collector_url = trimmed_string_aliased(config, "collectorUrl", &["collector_url"])
         .map(Ok)
-        .unwrap_or_else(|| service_endpoint(config, name, "lightstep", 443))?;
+        .unwrap_or_else(|| {
+            service_endpoint_with_default_scheme(config, name, "lightstep", 443, "https")
+        })?;
     let Some(access_token_env) =
         trimmed_string_aliased(config, "accessTokenEnv", &["access_token_env"])
     else {
@@ -261,13 +263,24 @@ fn service_endpoint(
     provider_kind: &str,
     default_port: u16,
 ) -> Result<String, String> {
+    service_endpoint_with_default_scheme(config, provider_name, provider_kind, default_port, "http")
+}
+
+fn service_endpoint_with_default_scheme(
+    config: &Value,
+    provider_name: &str,
+    provider_kind: &str,
+    default_port: u16,
+    default_scheme: &str,
+) -> Result<String, String> {
     let Some(service) = trimmed_string(config, "service") else {
         return Err(format!(
             "meshConfig.extensionProviders '{provider_name}' {provider_kind} provider requires service or an explicit endpoint URL"
         ));
     };
     let port = optional_u16(config, "port")?.unwrap_or(default_port);
-    let scheme = trimmed_string(config, "scheme").unwrap_or_else(|| "http".to_string());
+    let scheme =
+        trimmed_string(config, "scheme").unwrap_or_else(|| default_scheme.to_string());
     Ok(format!("{scheme}://{service}:{port}"))
 }
 
@@ -481,6 +494,27 @@ defaultProviders:
         assert!(
             err.contains("ConfigMap data.mesh"),
             "error must name data.mesh so operators know where to look, got: {err}"
+        );
+    }
+
+    #[test]
+    fn lightstep_defaults_service_endpoint_to_https() {
+        let parsed = parse(
+            r#"
+extensionProviders:
+- name: lightstep-prod
+  lightstep:
+    service: collector.lightstep.svc.cluster.local
+    accessTokenEnv: LIGHTSTEP_ACCESS_TOKEN
+"#,
+        );
+
+        assert_eq!(
+            parsed.registry.tracing_provider("lightstep-prod"),
+            Some(&TracingProvider::Lightstep {
+                collector_url: "https://collector.lightstep.svc.cluster.local:443".to_string(),
+                access_token_env: "LIGHTSTEP_ACCESS_TOKEN".to_string(),
+            })
         );
     }
 }
