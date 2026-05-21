@@ -753,19 +753,16 @@ pub fn enable_secret_extraction_for_ktls(config: &mut Arc<ServerConfig>) {
 /// Enable TLS 1.3 0-RTT early data on a `ServerConfig` returned by
 /// [`load_tls_config_with_client_auth`].
 ///
-/// Must be called immediately after `load_tls_config_with_client_auth` while
-/// the `Arc` has a single owner (ref count = 1). Only apply to **proxy
-/// frontend** configs — never to admin listeners (which lack the 425 guard).
-pub fn enable_early_data(config: &mut Arc<ServerConfig>, tls_policy: &TlsPolicy) {
+/// NOTE: HTTPS/H2 paths currently cannot reliably recover per-request 0-RTT
+/// state from tokio-rustls after accept. Until that signal is available, we
+/// keep rustls 0-RTT disabled on the TCP/TLS frontend so method allowlists
+/// cannot be bypassed by direct clients. Native HTTP/3 0-RTT remains supported
+/// through quinn's `into_0rtt()` path.
+pub fn enable_early_data(_config: &mut Arc<ServerConfig>, tls_policy: &TlsPolicy) {
     if tls_policy.early_data_max_size > 0 {
-        if let Some(cfg) = Arc::get_mut(config) {
-            cfg.max_early_data_size = tls_policy.early_data_max_size;
-        } else {
-            // Should never happen — called right after construction.
-            tracing::warn!(
-                "Could not enable 0-RTT early data: Arc<ServerConfig> has multiple owners"
-            );
-        }
+        tracing::warn!(
+            "Ignoring HTTPS 0-RTT enablement: per-request early-data state is unavailable on tokio-rustls; keeping TLS early data disabled on the HTTPS frontend"
+        );
     }
 }
 

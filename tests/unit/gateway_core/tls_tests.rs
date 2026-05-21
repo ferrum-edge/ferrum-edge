@@ -651,7 +651,7 @@ fn test_tls_policy_early_data_enabled_multiple_methods() {
 // ── enable_early_data tests ──────────────────────────────────────────
 
 #[test]
-fn test_enable_early_data_sets_max_size() {
+fn test_enable_early_data_keeps_https_frontend_disabled() {
     ensure_crypto_provider();
 
     let dir = TempDir::new().unwrap();
@@ -681,8 +681,8 @@ fn test_enable_early_data_sets_max_size() {
 
     tls::enable_early_data(&mut config, &policy);
     assert_eq!(
-        config.max_early_data_size, 16_384,
-        "enable_early_data should set max_early_data_size"
+        config.max_early_data_size, 0,
+        "HTTPS frontend should keep TLS 0-RTT disabled until per-request early-data state is available"
     );
 }
 
