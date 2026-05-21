@@ -3929,28 +3929,24 @@ impl ProxyState {
             return false;
         }
 
-        let delta = ConfigDelta::compute(&old_config, &new_config);
-
-        if delta.is_empty() {
-            debug!("Config poll: no changes detected, skipping update");
-            // Still update loaded_at timestamp
-            self.config.store(Arc::new(new_config));
-            return false;
-        }
-
-        // Stage all request-facing cache inners before publishing any request-visible epoch.
-        let route_changed = Self::delta_routes_changed(&delta, &old_config);
-        let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
+        let mut applied_delta = None;
+        let mut route_changed = false;
         let staged_config = Arc::new(new_config.clone());
         let publish_result = self.request_epoch.update_config(
             |current| {
-                self.stage_incremental_request_epoch(
+                let delta = ConfigDelta::compute(&current.config, &new_config);
+                if delta.is_empty() {
+                    return Ok(None);
+                }
+                let staged = self.stage_incremental_request_epoch(
                     current,
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
-                )
-                .map(Some)
+                )?;
+                route_changed = staged.route_changed;
+                applied_delta = Some(delta);
+                Ok(Some(staged))
             },
             |published| {
                 self.mirror_request_epoch_wrappers(published, route_changed, false);
@@ -3958,7 +3954,12 @@ impl ProxyState {
         );
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
-            Ok(None) => return false,
+            Ok(None) => {
+                debug!("Config poll: no changes detected, skipping update");
+                // Still update loaded_at timestamp
+                self.config.store(Arc::new(new_config));
+                return false;
+            }
             Err(e) => {
                 error!(
                     "Config reload rejected — security plugin validation failed: {}",
@@ -3968,6 +3969,8 @@ impl ProxyState {
             }
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
+
+        let delta = applied_delta.expect("delta captured when publish_result is Some");
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -4291,24 +4294,24 @@ impl ProxyState {
             return IncrementalApplyOutcome::Rejected;
         }
 
-        // Build a ConfigDelta against old + new to get proper
-        // add/modify/remove classification for the epoch builders.
-        let old_config = self.config.load_full();
-
-        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
-
-        // Stage all request-facing cache inners before publishing any request-visible epoch.
-        let route_changed = Self::delta_routes_changed(&delta, &old_config);
+        let mut applied_delta = None;
+        let mut route_changed = false;
         let staged_config = Arc::new(new_config.clone());
         let publish_result = self.request_epoch.update_config(
             |current| {
-                self.stage_incremental_request_epoch(
+                let delta = crate::config_delta::ConfigDelta::compute(&current.config, &new_config);
+                if delta.is_empty() {
+                    return Ok(None);
+                }
+                let staged = self.stage_incremental_request_epoch(
                     current,
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
-                )
-                .map(Some)
+                )?;
+                route_changed = staged.route_changed;
+                applied_delta = Some(delta);
+                Ok(Some(staged))
             },
             |published| {
                 self.mirror_request_epoch_wrappers(published, route_changed, false);
@@ -4326,6 +4329,8 @@ impl ProxyState {
             }
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
+
+        let delta = applied_delta.expect("delta captured when publish_result is Some");
 
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {
