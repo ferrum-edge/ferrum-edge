@@ -513,6 +513,13 @@ impl MetricsRegistry {
     }
 
     pub fn record(&self, summary: &TransactionSummary) {
+        // Mirror/shadow summaries represent internal backend probes rather
+        // than client-facing proxy results. They must not affect normal
+        // request counters/histograms exposed on unauthenticated /metrics.
+        if summary.mirror {
+            return;
+        }
+
         let proxy_id: Arc<str> = Arc::from(summary.proxy_id.as_deref().unwrap_or("unknown"));
 
         // Increment request counter (composite key — no format!() allocation)

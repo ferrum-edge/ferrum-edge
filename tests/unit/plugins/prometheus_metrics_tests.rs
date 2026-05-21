@@ -133,6 +133,25 @@ async fn test_registry_records_request_counter() {
 }
 
 #[tokio::test]
+async fn test_registry_ignores_mirror_summary() {
+    let registry = MetricsRegistry::new();
+    let mut summary = make_summary("proxy-1", "GET", 503, 777.0, 777.0);
+    summary.mirror = true;
+
+    registry.record(&summary);
+
+    let key = CounterKey {
+        proxy_id: Arc::from("proxy-1"),
+        method: Arc::from("GET"),
+        status_code: 503,
+    };
+    assert!(!registry.request_counter.contains_key(&key));
+    assert!(registry.request_duration_buckets.is_empty());
+    assert!(registry.backend_duration_buckets.is_empty());
+    assert!(registry.gateway_overhead_buckets.is_empty());
+}
+
+#[tokio::test]
 async fn test_registry_renders_mesh_red_metrics_when_metadata_present() {
     let registry = MetricsRegistry::new();
     let mut summary = make_summary("payments-proxy", "GET", 200, 42.0, 35.0);
