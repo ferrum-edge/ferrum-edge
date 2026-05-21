@@ -426,6 +426,9 @@ pub(super) async fn handle_hbone_request(
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
     let relay_proxy_id = proxy.id.clone();
     let relay_buffer_proxy_id = proxy.id.clone();
+    let prometheus_metrics_enabled = plugins
+        .iter()
+        .any(|plugin| plugin.name() == "prometheus_metrics");
     let adaptive_buffer = Arc::clone(&state.adaptive_buffer);
     let relay_buffer_size = adaptive_buffer.get_buffer_size(&relay_buffer_proxy_id);
     let relay_idle_timeout = proxy_idle_timeout(proxy, &state.env_config);
@@ -458,8 +461,10 @@ pub(super) async fn handle_hbone_request(
                         .saturating_add(result.bytes_backend_to_client),
                 );
                 if let Some((direction, class, side, message)) = result.first_failure {
-                    crate::plugins::prometheus_metrics::global_registry()
-                        .record_hbone_relay_failure(&relay_proxy_id, direction, class);
+                    if prometheus_metrics_enabled {
+                        crate::plugins::prometheus_metrics::global_registry()
+                            .record_hbone_relay_failure(&relay_proxy_id, direction, class);
+                    }
                     warn!(
                         proxy_id = %relay_proxy_id,
                         direction = ?direction,
