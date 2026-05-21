@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use tracing::{debug, warn};
 
 use crate::config::types::GatewayConfig;
+use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
     MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource,
@@ -968,13 +969,16 @@ fn narrow_workload_identities(
         .iter()
         .map(|service| (service.namespace.as_str(), service.name.as_str()))
         .collect();
-    let reachable_workloads: HashSet<_> = admitted_services
+    let reachable_workloads: HashSet<(&str, &str, &SpiffeId)> = admitted_services
         .iter()
         .flat_map(|service| {
-            service
-                .workloads
-                .iter()
-                .map(move |workload| (service.namespace.as_str(), service.name.as_str(), workload))
+            service.workloads.iter().map(move |workload| {
+                (
+                    service.namespace.as_str(),
+                    service.name.as_str(),
+                    &workload.spiffe_id,
+                )
+            })
         })
         .collect();
     if !admitted_services.is_empty() && reachable_workloads.is_empty() {
@@ -996,7 +1000,8 @@ fn narrow_workload_identities(
     workloads
         .into_iter()
         .filter(|workload| {
-            admitted_service_keys.contains(&(workload.namespace.as_str(), workload.service_name.as_str()))
+            admitted_service_keys
+                .contains(&(workload.namespace.as_str(), workload.service_name.as_str()))
                 && reachable_workloads.contains(&(
                     workload.namespace.as_str(),
                     workload.service_name.as_str(),
