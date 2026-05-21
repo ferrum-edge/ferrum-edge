@@ -29,6 +29,7 @@ const DNS_HEADER_SIZE: usize = 12;
 const DNS_MAX_UDP_PACKET_SIZE: usize = 4096;
 const DNS_UDP_SAFE_PACKET_SIZE: usize = 512;
 const DNS_MAX_TCP_PACKET_SIZE: usize = u16::MAX as usize;
+const DNS_MAX_CACHEABLE_RESPONSE_SIZE: usize = DNS_MAX_UDP_PACKET_SIZE;
 const DNS_UPSTREAM_TIMEOUT_SECS: u64 = 5;
 const DNS_UPSTREAM_ID_SPACE: usize = u16::MAX as usize + 1;
 const DNS_TCP_QUERY_READ_TIMEOUT_SECS: u64 = 5;
@@ -898,13 +899,22 @@ fn evaluate_dns_query(
     }
 
     let table = table.load();
+    let cacheable_response = max_response_size <= DNS_MAX_CACHEABLE_RESPONSE_SIZE;
     if query.qtype != QTYPE_A && query.qtype != QTYPE_AAAA {
         return match table.resolve_normalized(&query.name) {
             Some(records) => {
-                let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
-                DnsDecision::Respond(table.cached_mesh_response(cache_key, query.id, || {
-                    build_dns_empty_response(&query, records.authoritative, max_response_size)
-                }))
+                if cacheable_response {
+                    let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
+                    DnsDecision::Respond(table.cached_mesh_response(cache_key, query.id, || {
+                        build_dns_empty_response(&query, records.authoritative, max_response_size)
+                    }))
+                } else {
+                    DnsDecision::Respond(build_dns_empty_response(
+                        &query,
+                        records.authoritative,
+                        max_response_size,
+                    ))
+                }
             }
             None => DnsDecision::Forward(query),
         };
@@ -926,14 +936,28 @@ fn evaluate_dns_query(
 
             if filtered.is_empty() {
                 // Have the name but no matching record type -- return empty (not NXDOMAIN)
-                let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
-                let response = table.cached_mesh_response(cache_key, query.id, || {
+                let response = if cacheable_response {
+                    let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
+                    table.cached_mesh_response(cache_key, query.id, || {
+                        build_dns_empty_response(&query, records.authoritative, max_response_size)
+                    })
+                } else {
                     build_dns_empty_response(&query, records.authoritative, max_response_size)
-                });
+                };
                 DnsDecision::Respond(response)
             } else {
-                let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
-                let response = table.cached_mesh_response(cache_key, query.id, || {
+                let response = if cacheable_response {
+                    let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
+                    table.cached_mesh_response(cache_key, query.id, || {
+                        build_dns_response(
+                            &query,
+                            &filtered,
+                            ttl,
+                            records.authoritative,
+                            max_response_size,
+                        )
+                    })
+                } else {
                     build_dns_response(
                         &query,
                         &filtered,
@@ -941,7 +965,7 @@ fn evaluate_dns_query(
                         records.authoritative,
                         max_response_size,
                     )
-                });
+                };
                 trace!(
                     name = %query.name,
                     qtype = query.qtype,
@@ -2013,6 +2037,27 @@ mod tests {
         assert_eq!(&first_response[..2], &0x1234u16.to_be_bytes());
         assert_eq!(&second_response[..2], &0x5678u16.to_be_bytes());
         assert_eq!(&first_response[2..], &second_response[2..]);
+    }
+
+    #[test]
+    fn evaluate_dns_query_does_not_cache_large_tcp_sized_responses() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(
+                vec!["api.example.com"],
+                vec!["10.0.0.1"],
+            )],
+            ..MeshSlice::default()
+        };
+        let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
+        let packet = build_a_query("api.example.com");
+
+        let _ = match evaluate_dns_query(&packet, &table, 60, DNS_MAX_TCP_PACKET_SIZE) {
+            DnsDecision::Respond(response) => response,
+            DnsDecision::Forward(_) => panic!("mesh name should not forward"),
+            DnsDecision::Drop => panic!("valid DNS query should not drop"),
+        };
+
+        assert_eq!(table.load().response_cache_len(), 0);
     }
 
     #[test]
