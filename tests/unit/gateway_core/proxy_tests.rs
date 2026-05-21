@@ -290,6 +290,31 @@ impl Plugin for RejectingAuth {
     }
 }
 
+struct PermissiveMissingMeshAuth;
+
+#[async_trait]
+impl Plugin for PermissiveMissingMeshAuth {
+    fn name(&self) -> &str {
+        "permissive_missing_mesh_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        ctx.metadata.insert(
+            "mesh_request_auth.permissive_missing_token".to_string(),
+            "true".to_string(),
+        );
+        PluginResult::Continue
+    }
+}
+
 struct BodySuffixPlugin {
     suffix: &'static str,
 }
@@ -587,4 +612,46 @@ async fn test_apply_request_body_plugins_preserves_plugin_order() {
     let transformed =
         apply_request_body_plugins(&[first, second], &headers, b"body".to_vec()).await;
     assert_eq!(transformed, b"body-first-second");
+}
+
+#[tokio::test]
+async fn test_single_auth_allows_mesh_request_auth_permissive_missing_token() {
+    let mesh_request_auth: Arc<dyn Plugin> = Arc::new(PermissiveMissingMeshAuth);
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![mesh_request_auth];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mesh".to_string(),
+    );
+
+    let result =
+        run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    assert!(result.is_none());
+    assert!(ctx.identified_consumer.is_none());
+    assert!(ctx.authenticated_identity.is_none());
+}
+
+#[tokio::test]
+async fn test_multi_auth_preserves_reject_even_when_later_plugin_authenticates() {
+    let specific_reject: Arc<dyn Plugin> = Arc::new(RejectingAuth {
+        body: r#"{"error":"Invalid JWT"}"#,
+    });
+    let external: Arc<dyn Plugin> = Arc::new(ExternalIdentityAuth);
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![specific_reject, external];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/jwks".to_string(),
+    );
+
+    let result =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    let (status_code, body, _headers) = result.expect("invalid jwt reject must be preserved");
+    assert_eq!(status_code, 401);
+    assert_eq!(body, br#"{"error":"Invalid JWT"}"#);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
 }

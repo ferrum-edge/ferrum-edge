@@ -517,6 +517,12 @@ impl JwksAuth {
         match credential {
             JwksExtractedCredential::Missing => {
                 debug!("jwks_auth: no credential present");
+                if self.emit_mesh_request_principal_metadata {
+                    ctx.metadata.insert(
+                        "mesh_request_auth.permissive_missing_token".to_string(),
+                        "true".to_string(),
+                    );
+                }
                 PluginResult::Continue
             }
             JwksExtractedCredential::InvalidFormat(body) => reject(401, body),
