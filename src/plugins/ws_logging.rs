@@ -537,12 +537,9 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
     // ws_logging is intentionally write-only. Keep inbound parsing bounded
     // to control resource usage if the remote endpoint (or path to it) sends
     // unexpected payload data.
-    let ws_cfg = WebSocketConfig {
-        max_send_queue: None,
-        max_message_size: Some(64 << 10),
-        max_frame_size: Some(16 << 10),
-        accept_unmasked_frames: false,
-    };
+    let mut ws_cfg = WebSocketConfig::default();
+    ws_cfg.max_message_size = Some(64 << 10);
+    ws_cfg.max_frame_size = Some(16 << 10);
 
     match tokio_tungstenite::connect_async_tls_with_config(
         &cfg.endpoint_url,
