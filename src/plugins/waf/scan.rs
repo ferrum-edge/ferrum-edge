@@ -33,7 +33,7 @@ impl ScanOutcome {
 impl Waf {
     pub(super) fn run_cheap_scan(&self, ctx: &mut RequestContext) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
-        let raw_query = ctx.raw_query_string().map(str::to_string);
+        let raw_query = ctx.raw_query_string();
 
         self.scan_text_set(
             &mut outcome,
@@ -50,7 +50,7 @@ impl Waf {
             |target| matches!(target, RuleTarget::UrlPath),
         );
 
-        if let Some(raw_query) = raw_query.as_deref() {
+        if let Some(raw_query) = raw_query {
             if !raw_query.is_empty() {
                 let mut full_url = String::with_capacity(ctx.path.len() + raw_query.len() + 1);
                 full_url.push_str(&ctx.path);
@@ -123,7 +123,7 @@ impl Waf {
         // value past `query_keys`/`query_values` rules. The parsed HashMap
         // still collapses `?q=<script>&q=ok` to `q=ok`, so relying on the
         // monitor-only HPP rule alone would miss enforced query-value rules.
-        if let Some(raw) = raw_query.as_deref() {
+        if let Some(raw) = raw_query {
             for pair in raw.split('&') {
                 if pair.is_empty() {
                     continue;
