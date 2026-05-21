@@ -2906,9 +2906,11 @@ impl DatabaseStore {
             .q("SELECT 1 FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ? LIMIT 1");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
+        let touch_proxy_sql = self.q("UPDATE proxies SET updated_at = ? WHERE id = ?");
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
             let mut tx = self.pool().begin().await?;
             let mut seen = HashSet::new();
+            let mut touched_proxy_ids: HashSet<&str> = HashSet::new();
             for proxy in chunk {
                 for assoc in &proxy.plugins {
                     if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
@@ -2926,6 +2928,17 @@ impl DatabaseStore {
                     sqlx::query(&assoc_sql)
                         .bind(&proxy.id)
                         .bind(&assoc.plugin_config_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    touched_proxy_ids.insert(proxy.id.as_str());
+                }
+            }
+            if !touched_proxy_ids.is_empty() {
+                let touch_ts = Utc::now().to_rfc3339();
+                for proxy_id in touched_proxy_ids {
+                    sqlx::query(&touch_proxy_sql)
+                        .bind(&touch_ts)
+                        .bind(proxy_id)
                         .execute(&mut *tx)
                         .await?;
                 }
