@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::task::JoinHandle;
 
 use super::{Plugin, PluginResult, StreamConnectionContext, StreamTransactionSummary};
 
@@ -22,6 +23,7 @@ const METADATA_KEY: &str = "tcp_connection_throttle.key";
 pub struct TcpConnectionThrottle {
     max_connections_per_key: u64,
     active_counts: Arc<DashMap<String, Arc<AtomicU64>>>,
+    cleanup_task: Option<JoinHandle<()>>,
 }
 
 impl TcpConnectionThrottle {
@@ -47,9 +49,11 @@ impl TcpConnectionThrottle {
         // Normally entries are cleaned in decrement_key(), but this catches
         // edge cases where connections are dropped without on_stream_disconnect.
         // Guard with Handle::try_current() so new() works in non-tokio test contexts.
-        if cleanup_interval_seconds > 0 && tokio::runtime::Handle::try_current().is_ok() {
+        let cleanup_task = if cleanup_interval_seconds > 0
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
             let counts = active_counts.clone();
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 let mut timer =
                     tokio::time::interval(Duration::from_secs(cleanup_interval_seconds));
                 loop {
@@ -57,12 +61,15 @@ impl TcpConnectionThrottle {
                     counts
                         .retain(|_, count: &mut Arc<AtomicU64>| count.load(Ordering::Relaxed) > 0);
                 }
-            });
-        }
+            }))
+        } else {
+            None
+        };
 
         Ok(Self {
             max_connections_per_key,
             active_counts,
+            cleanup_task,
         })
     }
 
@@ -117,6 +124,14 @@ impl TcpConnectionThrottle {
                 }
                 return;
             }
+        }
+    }
+}
+
+impl Drop for TcpConnectionThrottle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.cleanup_task.take() {
+            handle.abort();
         }
     }
 }
