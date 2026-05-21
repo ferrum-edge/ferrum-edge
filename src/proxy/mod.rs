@@ -7575,14 +7575,13 @@ pub async fn run_authentication_phase(
                     }
                     PluginResult::Continue => {
                         if request_is_authenticated(ctx) {
+                            last_reject = None;
                             break;
                         }
                     }
                 }
             }
-            if let Some(reject) = last_reject {
-                Some(reject)
-            } else if request_is_authenticated(ctx)
+            if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
                 || ctx
                     .metadata
@@ -7591,7 +7590,7 @@ pub async fn run_authentication_phase(
             {
                 None
             } else {
-                Some(missing_authentication_reject())
+                Some(last_reject.unwrap_or_else(missing_authentication_reject))
             }
         }
         AuthMode::Single => {

@@ -634,7 +634,9 @@ async fn test_single_auth_allows_mesh_request_auth_permissive_missing_token() {
 }
 
 #[tokio::test]
-async fn test_multi_auth_preserves_reject_even_when_later_plugin_authenticates() {
+async fn test_multi_auth_clears_reject_when_later_plugin_authenticates() {
+    // Multi-auth first-success-wins: when a later plugin succeeds, the earlier
+    // reject is cleared and the request is allowed through.
     let specific_reject: Arc<dyn Plugin> = Arc::new(RejectingAuth {
         body: r#"{"error":"Invalid JWT"}"#,
     });
@@ -650,8 +652,31 @@ async fn test_multi_auth_preserves_reject_even_when_later_plugin_authenticates()
     let result =
         run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index).await;
 
-    let (status_code, body, _headers) = result.expect("invalid jwt reject must be preserved");
-    assert_eq!(status_code, 401);
-    assert_eq!(body, br#"{"error":"Invalid JWT"}"#);
+    assert!(
+        result.is_none(),
+        "multi-auth first-success-wins: later plugin authenticated so request should pass"
+    );
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
+}
+
+#[tokio::test]
+async fn test_multi_auth_allows_mesh_permissive_missing_token() {
+    let mesh_request_auth: Arc<dyn Plugin> = Arc::new(PermissiveMissingMeshAuth);
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![mesh_request_auth];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mesh".to_string(),
+    );
+
+    let result =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    assert!(
+        result.is_none(),
+        "mesh permissive missing token should pass in multi mode"
+    );
+    assert!(ctx.identified_consumer.is_none());
+    assert!(ctx.authenticated_identity.is_none());
 }
