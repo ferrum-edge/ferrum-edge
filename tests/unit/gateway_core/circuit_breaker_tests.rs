@@ -657,6 +657,35 @@ fn test_connection_error_ignored_in_half_open_when_disabled() {
     assert_eq!(cb.state_name(), "open");
 }
 
+/// With trip_on_connection_errors=false, ignored connection errors during
+/// half-open probes must release the in-flight slot so later probes can run.
+#[test]
+fn test_connection_error_ignored_in_half_open_releases_probe_slot() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: false,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+
+    assert!(cb.can_execute().is_ok());
+    assert_eq!(cb.state_name(), "half_open");
+
+    cb.record_failure(502, true, true);
+    assert_eq!(cb.state_name(), "half_open");
+
+    assert!(
+        cb.can_execute().is_ok(),
+        "ignored connection error must free half-open probe admission"
+    );
+}
+
 /// Connection errors with trip_on_connection_errors=false must be neutral —
 /// they must NOT reset the accumulated failure count (i.e., not call record_success).
 #[test]

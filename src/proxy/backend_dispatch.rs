@@ -457,11 +457,10 @@ pub(crate) fn record_backend_outcome(
                 .circuit_breaker_cache
                 .get_or_create(&proxy.id, final_cb_target_key, cb_config);
         if connection_error {
-            // Connection errors are controlled by trip_on_connection_errors.
-            // When disabled, connection errors are neutral — no state mutation.
-            if cb.config().trip_on_connection_errors {
-                cb.record_failure(response_status, true, is_half_open_probe);
-            }
+            // Always route connection errors through record_failure().
+            // When trip_on_connection_errors=false, record_failure() treats
+            // them as neutral while still releasing half-open probe slots.
+            cb.record_failure(response_status, true, is_half_open_probe);
         } else if cb.config().failure_status_codes.contains(&response_status) {
             cb.record_failure(response_status, false, is_half_open_probe);
         } else {
