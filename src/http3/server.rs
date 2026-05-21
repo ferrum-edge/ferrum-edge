@@ -2604,6 +2604,7 @@ async fn handle_h3_request(
         // correctly reports `false` (no commitment) — that mismatch
         // would suppress `retry_on_connect_failure` and mis-account a
         // pre-wire failure as a 502 status fault on CB / passive health.
+        let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
         let (
             mut response_status,
             response_body,
@@ -2660,8 +2661,9 @@ async fn handle_h3_request(
                     cb.record_failure(
                         result.status,
                         !result.request_on_wire,
-                        cb_is_half_open_probe,
+                        cb_retry_probe_slot_available,
                     );
+                    cb_retry_probe_slot_available = false;
                 }
 
                 let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -2767,7 +2769,7 @@ async fn handle_h3_request(
             final_cb_target_key.as_deref(),
             response_status,
             !h3_request_on_wire,
-            cb_is_half_open_probe,
+            cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );
 

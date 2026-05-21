@@ -701,6 +701,7 @@ where
     let mut current_target = upstream_target.cloned().map(Arc::new);
     let mut current_cb_target_key = cb_target_key.map(str::to_owned);
     let mut current_url = backend_url.to_string();
+    let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
     let retry_config = if crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method) {
         proxy.retry.as_ref()
     } else {
@@ -767,8 +768,9 @@ where
                                 current_cb_target_key.as_deref(),
                                 attempt_result.status_code,
                                 false,
-                                cb_is_half_open_probe,
+                                cb_retry_probe_slot_available,
                             );
+                            cb_retry_probe_slot_available = false;
                             let delay = crate::retry::retry_delay(retry_config, attempt);
                             tokio::time::sleep(delay).await;
                             attempt += 1;
@@ -829,8 +831,9 @@ where
                                 current_cb_target_key.as_deref(),
                                 attempt_result.status_code,
                                 attempt_result.connection_error,
-                                cb_is_half_open_probe,
+                                cb_retry_probe_slot_available,
                             );
+                            cb_retry_probe_slot_available = false;
                             let delay = crate::retry::retry_delay(retry_config, attempt);
                             tokio::time::sleep(delay).await;
                             attempt += 1;
@@ -880,7 +883,7 @@ where
                             current_cb_target_key.as_deref(),
                             attempt_result.status_code,
                             attempt_result.connection_error,
-                            cb_is_half_open_probe,
+                            cb_retry_probe_slot_available,
                             backend_start.elapsed(),
                         );
                         let mut outcome = write_error(
@@ -1094,7 +1097,7 @@ where
                     current_cb_target_key.as_deref(),
                     413,
                     false,
-                    cb_is_half_open_probe,
+                    cb_retry_probe_slot_available,
                     backend_start.elapsed(),
                 );
                 return write_error(
@@ -1133,7 +1136,7 @@ where
                         current_cb_target_key.as_deref(),
                         attempt_result.status_code,
                         attempt_result.connection_error,
-                        cb_is_half_open_probe,
+                        cb_retry_probe_slot_available,
                         backend_start.elapsed(),
                     );
                     let mut outcome = write_error(
@@ -1175,7 +1178,7 @@ where
             current_cb_target_key.as_deref(),
             502,
             false,
-            cb_is_half_open_probe,
+            cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );
         let mut outcome = write_error(
@@ -1210,7 +1213,7 @@ where
             current_cb_target_key.as_deref(),
             reject.status_code,
             false,
-            cb_is_half_open_probe,
+            cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );
         let mut outcome = write_reject_with_headers(
@@ -1256,7 +1259,7 @@ where
                     current_cb_target_key.as_deref(),
                     502,
                     false,
-                    cb_is_half_open_probe,
+                    cb_retry_probe_slot_available,
                     backend_start.elapsed(),
                 );
                 let empty_headers = HashMap::new();
@@ -1375,7 +1378,7 @@ where
             current_cb_target_key.as_deref(),
             response_status,
             false,
-            cb_is_half_open_probe,
+            cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );
 
@@ -1415,7 +1418,7 @@ where
         current_cb_target_key.as_deref(),
         status,
         false,
-        cb_is_half_open_probe,
+        cb_retry_probe_slot_available,
         backend_start.elapsed(),
     );
 

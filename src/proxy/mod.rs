@@ -9866,6 +9866,7 @@ async fn handle_proxy_request_inner(
     let mut current_dispatch_h3 =
         supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
+    let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
@@ -9911,8 +9912,9 @@ async fn handle_proxy_request_inner(
                 cb.record_failure(
                     result.status_code,
                     result.connection_error,
-                    cb_is_half_open_probe,
+                    cb_retry_probe_slot_available,
                 );
+                cb_retry_probe_slot_available = false;
             }
 
             let delay = retry::retry_delay(retry_config, attempt);
@@ -10109,7 +10111,7 @@ async fn handle_proxy_request_inner(
         final_cb_target_key.as_deref(),
         response_status,
         backend_resp.connection_error,
-        cb_is_half_open_probe,
+        cb_retry_probe_slot_available,
         backend_start.elapsed(),
     );
 
