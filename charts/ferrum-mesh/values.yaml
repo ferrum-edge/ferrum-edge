@@ -150,7 +150,7 @@ nodeAgent:
   enabled: false
   image:
     repository: ferrumedge/ferrum-edge
-    tag: latest
+    tag: "0.9.0"
   captureMode: ebpf
   proxyUid: 1337
   cgroupRoot: /sys/fs/cgroup
@@ -191,10 +191,10 @@ nodeAgent:
     # only if an admission webhook rejects PERFMON in your environment.
     addCapPerfmon: true
     # Drop CAP_SYS_ADMIN. Modern kernels (5.8+) cover everything via
-    # CAP_BPF + CAP_PERFMON + CAP_NET_ADMIN. Keep false until your fleet
-    # is uniformly on kernel >= 5.8 — dropping prematurely on 5.7.x will
-    # break BPF program load.
-    dropCapSysAdmin: false
+    # CAP_BPF + CAP_PERFMON + CAP_NET_ADMIN. Default true to minimize
+    # privilege on modern kernels; set to false only if you still run
+    # kernels where BPF operations require SYS_ADMIN.
+    dropCapSysAdmin: true
     # Pod-wide seccomp profile. RuntimeDefault is the containerd default
     # and permits every syscall the agent needs (bpf, setsockopt, sh -c
     # iptables fallback, etc.). Override with type: Localhost and
