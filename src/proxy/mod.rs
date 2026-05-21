@@ -106,7 +106,7 @@ use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
     ProtocolSupport, RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
 };
-pub use self::body::{BackendConnectionGuard, ProxyBody};
+pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::hbone_pool::{HboneConnectionPool, HbonePoolError};
 use self::http2_pool::Http2ConnectionPool;
@@ -9779,14 +9779,13 @@ async fn handle_proxy_request_inner(
     );
     let backend_start = Instant::now();
 
-    // Track connection for least-connections load balancing
-    if let (Some(_upstream_id), Some(target), Some(balancer)) = (
-        &proxy.upstream_id,
-        &upstream_target,
-        upstream_balancer.as_ref(),
-    ) {
-        balancer.record_connection_start(target);
-    }
+    // Track connection for least-connections load balancing. The guard calls
+    // record_connection_start now and record_connection_end on drop. For
+    // streaming responses the guard is attached to ProxyBody so it lives as
+    // long as hyper streams the response; for buffered responses it drops
+    // immediately after body construction.
+    let lb_connection_guard =
+        LoadBalancerConnectionGuard::new(upstream_target.clone(), upstream_balancer.clone());
 
     let should_stream = should_stream_response_body(
         &proxy,
@@ -10523,18 +10522,12 @@ async fn handle_proxy_request_inner(
             } else {
                 crate::proxy::body::coalescing_body(response, cl)
             };
-            let mut base = if let Some(guard) = reqwest_backend_guard {
+            let base = if let Some(guard) = reqwest_backend_guard {
                 base.with_reqwest_backend_guard(guard)
             } else {
                 base
             };
-            if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-                base = base.with_backend_connection_guard(BackendConnectionGuard::new(
-                    Arc::clone(&state.load_balancer_cache),
-                    upstream_id.clone(),
-                    (**target).clone(),
-                ));
-            }
+            let base = base.with_lb_connection_guard(lb_connection_guard);
 
             if state.env_config.enable_streaming_latency_tracking {
                 let (tracked_body, metrics) = base.into_tracked(backend_start);
@@ -10634,14 +10627,7 @@ async fn handle_proxy_request_inner(
                     state.h2_coalesce_target_bytes,
                 )
             };
-            if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-                body = body.with_backend_connection_guard(BackendConnectionGuard::new(
-                    Arc::clone(&state.load_balancer_cache),
-                    upstream_id.clone(),
-                    (**target).clone(),
-                ));
-            }
-            body
+            body.with_lb_connection_guard(lb_connection_guard)
         }
         ResponseBody::StreamingH3(h3_resp) => {
             let cl = response_headers
@@ -10669,21 +10655,12 @@ async fn handle_proxy_request_inner(
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
                 )
             };
-            if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-                body = body.with_backend_connection_guard(BackendConnectionGuard::new(
-                    Arc::clone(&state.load_balancer_cache),
-                    upstream_id.clone(),
-                    (**target).clone(),
-                ));
-            }
-            body
+            body.with_lb_connection_guard(lb_connection_guard)
         }
         ResponseBody::Buffered(data) => {
-            if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-                state
-                    .load_balancer_cache
-                    .record_connection_end(upstream_id, target);
-            }
+            // Buffered response: body is fully consumed, drop the guard
+            // immediately so record_connection_end fires now.
+            drop(lb_connection_guard);
             ProxyBody::full(Bytes::from(data))
         }
     };
