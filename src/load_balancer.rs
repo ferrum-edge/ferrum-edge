@@ -286,20 +286,12 @@ const LATENCY_UNSET: u64 = u64::MAX;
 /// across endpoints in the same matching locality.
 const LOCALITY_DISTRIBUTE_WEIGHT_SCALE: u64 = 1_000_000;
 
-/// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
+/// Warm-up offset applied to `min_known_ewma` for unsampled (late-joiner)
 /// targets during the mixed warm-up phase.
 ///
-/// **Behavioral note:** any nonzero bias value (including `1`) produces the
-/// same selection outcome because `saturating_sub(N)` for any `N >= 1` makes
-/// the unsampled target strictly less than the minimum warmed EWMA when
-/// `min_known_ewma > 0`, and saturates to `0` (a tie broken by iteration
-/// order) when `min_known_ewma == 0`.
-///
-/// The constant exists as a named policy anchor: 1 ms (1 000 us) documents
-/// the intended preference gap in human-readable latency units and makes the
-/// warm-up strategy greppable and self-documenting, replacing a bare magic
-/// literal.
-const LATENCY_WARMUP_BIAS_US: u64 = 1_000;
+/// A zero offset keeps unsampled targets competitive without making them
+/// strictly preferred over already-warmed healthy targets.
+const LATENCY_WARMUP_BIAS_US: u64 = 0;
 
 /// Result of a target selection, indicating whether the selection was from
 /// healthy targets or a degraded-mode fallback (all targets were unhealthy).
