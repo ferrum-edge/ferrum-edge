@@ -509,10 +509,19 @@ impl Plugin for Waf {
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
-        _headers: &HashMap<String, String>,
+        headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.should_buffer_request_body(ctx) {
+        if !self.requires_request_body_buffering()
+            || self.exemptions.request_short_circuits(ctx)
+            || !self
+                .config
+                .body_methods
+                .iter()
+                .any(|method| method.eq_ignore_ascii_case(&ctx.method))
+            || !self
+                .should_inspect_body_content_type(headers.get("content-type").map(String::as_str))
+        {
             return PluginResult::Continue;
         }
         let mut truncated = false;
@@ -596,10 +605,6 @@ impl Plugin for Waf {
             .await;
         outcome.truncated = truncated;
         self.finish_scan(ctx, outcome)
-    }
-
-    fn requires_decoded_query_params(&self) -> bool {
-        self.active && self.config.request_inspection
     }
 }
 
