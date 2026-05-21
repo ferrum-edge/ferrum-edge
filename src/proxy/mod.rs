@@ -9138,7 +9138,7 @@ async fn handle_proxy_request_inner(
                 // body wrapper (non-exceeded streaming path).
                 let deferred_grpc_logger: Option<
                     Arc<crate::proxy::deferred_log::DeferredTransactionLogger>,
-                > = if !plugins.is_empty() || streamed || final_error_class.is_some() {
+                > = if !plugins.is_empty() || final_error_class.is_some() {
                     let grpc_resolved_ip = if !plugins.is_empty() {
                         state
                             .dns_cache
@@ -9200,7 +9200,7 @@ async fn handle_proxy_request_inner(
                         // response body never streams, so log synchronously here.
                         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                         None
-                    } else {
+                    } else if streamed && !plugins.is_empty() {
                         // Streaming gRPC response: defer so the summary reflects
                         // mid-body RST, client cancellation, and partial bytes.
                         // Thread `start_time` so the deferred logger can
@@ -9212,6 +9212,12 @@ async fn handle_proxy_request_inner(
                             Arc::new(ctx.clone()),
                             start_time,
                         ))
+                    } else {
+                        // No logging plugins: avoid retaining/cloning the full
+                        // RequestContext for the stream lifetime just to record
+                        // runtime metrics.
+                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                        None
                     }
                 } else {
                     None
@@ -10155,8 +10161,7 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH2(_)
             | ResponseBody::StreamingH3(_)
     );
-    let needs_transaction_summary =
-        !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
+    let needs_transaction_summary = !plugins.is_empty() || backend_error_class.is_some();
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
         if needs_transaction_summary {
             // Request bytes: read the shared counter populated by the body
@@ -10204,7 +10209,7 @@ async fn handle_proxy_request_inner(
                 ..TransactionSummary::default()
             };
 
-            if body_will_stream {
+            if body_will_stream && !plugins.is_empty() {
                 // Thread `start_time` so `latency_total_ms` / derived gateway
                 // fields are re-derived at body-completion time — closes the
                 // header-flush snapshot gap for streaming responses.
