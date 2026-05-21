@@ -162,6 +162,13 @@ impl HmacAuth {
         }
         ctx.headers.get("digest").cloned()
     }
+
+    fn should_prebuffer_for_request(&self, ctx: &RequestContext) -> bool {
+        let Some(auth_header) = ctx.headers.get("authorization") else {
+            return false;
+        };
+        strip_auth_scheme(auth_header, "hmac").is_some()
+    }
 }
 
 #[async_trait]
@@ -351,8 +358,8 @@ auth_flow::impl_auth_plugin!(
         true
     }
 
-    fn should_buffer_request_body(&self, _ctx: &crate::plugins::RequestContext) -> bool {
-        true
+    fn should_buffer_request_body(&self, ctx: &crate::plugins::RequestContext) -> bool {
+        self.should_prebuffer_for_request(ctx)
     }
 
     fn needs_request_body_bytes(&self) -> bool {

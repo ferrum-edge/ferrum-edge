@@ -200,6 +200,25 @@ async fn test_hmac_auth_always_requires_body() {
     assert!(plugin.needs_request_body_bytes());
 }
 
+#[tokio::test]
+async fn test_hmac_auth_prebuffer_only_for_hmac_authorization() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+
+    let mut missing = make_ctx("POST", "/test");
+    assert!(!plugin.should_buffer_request_body(&missing));
+
+    missing
+        .headers
+        .insert("authorization".to_string(), "Bearer token".to_string());
+    assert!(!plugin.should_buffer_request_body(&missing));
+
+    missing.headers.insert(
+        "authorization".to_string(),
+        r#"hmac username="u", signature="s""#.to_string(),
+    );
+    assert!(plugin.should_buffer_request_body(&missing));
+}
+
 // ── 1. Valid HMAC-SHA256 authentication (digest signing) ─────
 
 #[tokio::test]

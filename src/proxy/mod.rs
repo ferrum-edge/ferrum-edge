@@ -8775,29 +8775,30 @@ async fn handle_proxy_request_inner(
         let grpc_can_use_streaming_fast_path = grpc_should_stream && !grpc_has_retry;
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
-            let request = match client_request_body {
-                ClientRequestBody::Streaming(request) => *request,
-                ClientRequestBody::Buffered(_) => {
-                    record_request(&state, 500);
-                    return Ok(build_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        r#"{"error":"Internal error"}"#,
-                    ));
-                }
-            };
-            let (grpc_method, grpc_headers, grpc_req_body) =
-                match grpc_proxy::collect_grpc_request_body(request, state.max_grpc_recv_size_bytes)
+            let (grpc_method, grpc_headers, grpc_req_body) = match client_request_body {
+                ClientRequestBody::Streaming(request) => {
+                    match grpc_proxy::collect_grpc_request_body(
+                        *request,
+                        state.max_grpc_recv_size_bytes,
+                    )
                     .await
-                {
-                    Ok(parts) => parts,
-                    Err(e) => {
-                        record_request(&state, 500);
-                        return Ok(grpc_proxy::build_grpc_error_response(
-                            13, // INTERNAL
-                            &format!("Failed to read gRPC request body: {:?}", e),
-                        ));
+                    {
+                        Ok(parts) => parts,
+                        Err(e) => {
+                            record_request(&state, 500);
+                            return Ok(grpc_proxy::build_grpc_error_response(
+                                13, // INTERNAL
+                                &format!("Failed to read gRPC request body: {:?}", e),
+                            ));
+                        }
                     }
-                };
+                }
+                ClientRequestBody::Buffered(body) => (
+                    method.clone(),
+                    proxy_headers.clone(),
+                    body.to_vec(),
+                ),
+            };
 
             // Store body metadata for plugins that read via ctx.metadata
             ctx.metadata.insert(
