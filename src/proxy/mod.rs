@@ -9866,6 +9866,19 @@ async fn handle_proxy_request_inner(
                 }
             }
 
+            // Enforce per-target circuit breaker before each retry attempt.
+            // Retries may switch to a different upstream target, so the
+            // breaker gate must be re-evaluated for the currently selected
+            // target rather than relying on the initial attempt's check.
+            if let Some(cb_config) = &proxy.circuit_breaker
+                && state
+                    .circuit_breaker_cache
+                    .can_execute(&proxy.id, current_cb_target_key.as_deref(), cb_config)
+                    .is_err()
+            {
+                break;
+            }
+
             warn!(
                 proxy_id = %proxy.id,
                 attempt = attempt,
