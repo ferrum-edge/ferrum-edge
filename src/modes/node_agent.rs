@@ -666,17 +666,16 @@ pub fn apply_cni_request(
     let event = node_agent_cni_server::pod_event_from_request(request, &labels, &annotations);
     match request.verb {
         RpcVerb::Add => {
-            // `handle_pod_added` short-circuits on empty pod_uid (it's
-            // the DashMap key); the watcher will still pick up the
-            // pod, so this is a soft accept rather than a hard reject.
             if event.pod_uid.is_empty() {
                 return CniRpcResponse::Rejected {
                     reason: "missing K8S_POD_UID in CNI args; kube-rs watcher will reconcile"
                         .to_string(),
                 };
             }
-            handle_pod_added(backend, pod_states, config, metrics, &event);
-            CniRpcResponse::Ok
+            CniRpcResponse::Rejected {
+                reason: "pod metadata unavailable for CNI ADD; refusing unenrolled soft-accept"
+                    .to_string(),
+            }
         }
         RpcVerb::Del => {
             if event.pod_uid.is_empty() {
@@ -2353,13 +2352,12 @@ mod tests {
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
     }
 
-    /// `apply_cni_request` ADD with empty labels intentionally short-circuits
-    /// at `evaluate_enrollment` (no `ferrum.io/mesh=enabled` label / inject
-    /// annotation), so the BPF maps stay untouched but the RPC returns `Ok`.
-    /// The kube-rs watcher fills in the real labels and enrolls the pod a
-    /// moment later. We acknowledge the CNI call so kubelet doesn't retry.
+    /// `apply_cni_request` is the no-metadata fallback used when live pod
+    /// metadata cannot be fetched for a CNI ADD. In that path we now return
+    /// `Rejected` so kubelet retries instead of silently acknowledging an
+    /// unenrolled pod.
     #[test]
-    fn apply_cni_request_add_with_empty_labels_returns_ok_and_skips_enrollment() {
+    fn apply_cni_request_add_with_empty_labels_returns_rejected() {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
@@ -2384,7 +2382,13 @@ mod tests {
             args: HashMap::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
-        assert_eq!(resp, CniRpcResponse::Ok);
+        assert_eq!(
+            resp,
+            CniRpcResponse::Rejected {
+                reason: "pod metadata unavailable for CNI ADD; refusing unenrolled soft-accept"
+                    .to_string()
+            }
+        );
         assert!(
             !pod_states.contains_key("pod-uid-1"),
             "empty labels intentionally short-circuit enrollment; the watcher reconciles later"
