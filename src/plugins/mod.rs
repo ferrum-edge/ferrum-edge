@@ -790,20 +790,15 @@ impl RequestContext {
 
     /// Collect mirror response metadata from the `request_mirror` plugin.
     ///
-    /// Returns `Some(meta)` if a mirror request was dispatched and completed
-    /// before the timeout. The 5-second timeout is a safety net — the mirror
-    /// task always completes within the proxy's `backend_read_timeout_ms`
-    /// (set via `reqwest::RequestBuilder::timeout`). Since this runs after
-    /// the response is sent to the client, the wait has zero impact on
-    /// client-facing latency.
+    /// Returns the latest mirror metadata if it is already available.
+    ///
+    /// This intentionally does not wait for the mirror task because mirror
+    /// delivery is fire-and-forget and must never add latency to client-facing
+    /// response paths.
     pub async fn collect_mirror_result(&self) -> Option<MirrorResponseMeta> {
-        let rx = self.mirror_result_rx.as_ref()?;
-        let mut rx_clone = rx.clone();
-        match tokio::time::timeout(std::time::Duration::from_secs(5), rx_clone.changed()).await {
-            Ok(Ok(())) => rx_clone.borrow().clone(),
-            // Timeout or sender dropped — return whatever is currently available
-            _ => rx.borrow().clone(),
-        }
+        self.mirror_result_rx
+            .as_ref()
+            .and_then(|rx| rx.borrow().clone())
     }
 
     /// Return the stable authenticated identity for downstream policy and
