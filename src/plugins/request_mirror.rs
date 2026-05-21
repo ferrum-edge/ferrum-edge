@@ -77,6 +77,10 @@ use super::{MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult, RequestC
 const DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT_MIRRORS: usize = 256;
 
+fn strip_query_params(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(base, _)| base)
+}
+
 pub struct RequestMirror {
     http_client: PluginHttpClient,
     mirror_host: String,
@@ -376,7 +380,7 @@ impl Plugin for RequestMirror {
         ctx.mirror_result_rx = Some(rx);
 
         let http_client = self.http_client.clone();
-        let mirror_url_for_log = mirror_url.clone();
+        let mirror_url_for_log = strip_query_params(&mirror_url).to_string();
         let max_response_body_bytes = self.max_response_body_bytes;
 
         // Fire-and-forget: spawn an async task to send the mirror request.
@@ -481,5 +485,22 @@ impl Plugin for RequestMirror {
         });
 
         PluginResult::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_query_params;
+
+    #[test]
+    fn strip_query_params_removes_sensitive_query_data() {
+        assert_eq!(
+            strip_query_params("https://mirror.example.com:8443/path?token=secret&sig=abc"),
+            "https://mirror.example.com:8443/path"
+        );
+        assert_eq!(
+            strip_query_params("https://mirror.example.com:8443/path"),
+            "https://mirror.example.com:8443/path"
+        );
     }
 }
