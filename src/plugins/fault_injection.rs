@@ -51,12 +51,18 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use super::utils::fault_roll::FaultRoller;
-use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
+use super::{Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext};
 use runtime_overlay::FaultOverridesSnapshot;
 
 pub mod runtime_overlay;
 
 const MAX_DELAY_MS: u64 = 3_600_000;
+const NON_UDP_PROTOCOLS: &[ProxyProtocol] = &[
+    ProxyProtocol::Http,
+    ProxyProtocol::Grpc,
+    ProxyProtocol::WebSocket,
+    ProxyProtocol::Tcp,
+];
 
 struct AbortFault {
     status_code: u16,
@@ -320,7 +326,7 @@ impl Plugin for FaultInjectionPlugin {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::ALL_PROTOCOLS
+        NON_UDP_PROTOCOLS
     }
 
     async fn before_proxy(

@@ -380,7 +380,12 @@ fn test_supported_protocols() {
     .unwrap();
     assert_eq!(
         plugin.supported_protocols(),
-        ferrum_edge::plugins::ALL_PROTOCOLS
+        &[
+            ferrum_edge::plugins::ProxyProtocol::Http,
+            ferrum_edge::plugins::ProxyProtocol::Grpc,
+            ferrum_edge::plugins::ProxyProtocol::WebSocket,
+            ferrum_edge::plugins::ProxyProtocol::Tcp,
+        ]
     );
 }
 
