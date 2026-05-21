@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 
 /// Global chargeback registry (singleton per process).
 static CHARGEBACK_REGISTRY: OnceLock<Arc<ChargebackRegistry>> = OnceLock::new();
@@ -146,9 +146,12 @@ impl ChargebackEntry {
         bytes_received: u64,
         bw_price_sent: f64,
         bw_price_received: f64,
+        count_call: bool,
         epoch: Instant,
     ) {
-        self.call_count.fetch_add(1, Ordering::Relaxed);
+        if count_call {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+        }
         if call_price > 0.0 {
             add_f64_atomic(&self.charge_total_bits, call_price);
         }
@@ -338,6 +341,7 @@ impl ChargebackRegistry {
             bytes_received,
             bw_price_sent,
             bw_price_received,
+            true,
         );
     }
 
@@ -367,6 +371,33 @@ impl ChargebackRegistry {
             bytes_received,
             bw_price_sent,
             bw_price_received,
+            true,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_websocket_bandwidth(
+        &self,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+    ) {
+        self.record_inner(
+            consumer,
+            proxy_id,
+            proxy_name,
+            STREAM_STATUS_SENTINEL,
+            ProtocolFamily::Http,
+            0.0,
+            bytes_sent,
+            bytes_received,
+            bw_price_sent,
+            bw_price_received,
+            false,
         );
     }
 
@@ -393,6 +424,7 @@ impl ChargebackRegistry {
         bytes_received: u64,
         bw_price_sent: f64,
         bw_price_received: f64,
+        count_call: bool,
     ) {
         thread_local! {
             static KEY_BUF: std::cell::RefCell<String> =
@@ -408,11 +440,12 @@ impl ChargebackRegistry {
 
             if let Some(entry) = self.entries.get(buf.as_str()) {
                 entry.record(
-                    call_price,
+                    if count_call { call_price } else { 0.0 },
                     bytes_sent,
                     bytes_received,
                     bw_price_sent,
                     bw_price_received,
+                    count_call,
                     self.epoch,
                 );
                 return true;
@@ -436,11 +469,12 @@ impl ChargebackRegistry {
                     )
                 })
                 .record(
-                    call_price,
+                    if count_call { call_price } else { 0.0 },
                     bytes_sent,
                     bytes_received,
                     bw_price_sent,
                     bw_price_received,
+                    count_call,
                     self.epoch,
                 );
         }
@@ -1184,6 +1218,31 @@ impl Plugin for ApiChargeback {
             connection_price,
             summary.bytes_sent,
             summary.bytes_received,
+            self.pricing.bandwidth_price_sent,
+            self.pricing.bandwidth_price_received,
+        );
+    }
+
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_ws_disconnect(&self, summary: &WsDisconnectContext) {
+        let consumer = match summary.consumer_username.as_deref() {
+            Some(c) if !c.is_empty() => c,
+            _ => return,
+        };
+        if self.pricing.bandwidth_price_sent == 0.0 && self.pricing.bandwidth_price_received == 0.0
+        {
+            return;
+        }
+        let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
+        self.registry.record_websocket_bandwidth(
+            consumer,
+            &summary.proxy_id,
+            proxy_name,
+            summary.bytes_client_to_backend,
+            summary.bytes_backend_to_client,
             self.pricing.bandwidth_price_sent,
             self.pricing.bandwidth_price_received,
         );

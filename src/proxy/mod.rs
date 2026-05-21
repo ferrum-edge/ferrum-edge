@@ -5790,6 +5790,8 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         duration_ms: disconnect_duration_ms,
         frames_client_to_backend: 0,
         frames_backend_to_client: 0,
+        bytes_client_to_backend: 0,
+        bytes_backend_to_client: 0,
         direction: failure.as_ref().map(|(d, _, _)| *d),
         io_side: failure.as_ref().and_then(|(_, _, side)| *side),
         error_class: failure.map(|(_, c, _)| c),
@@ -5823,6 +5825,20 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 /// on a healthy TCP connection, so 100ms is generous for the happy path while
 /// still bounding teardown for pathological peers.
 const WS_CANCEL_CLOSE_TIMEOUT_MS: u64 = 100;
+
+#[inline]
+fn ws_message_payload_bytes(msg: &Message) -> u64 {
+    match msg {
+        Message::Text(t) => t.len() as u64,
+        Message::Binary(b) => b.len() as u64,
+        Message::Ping(b) | Message::Pong(b) => b.len() as u64,
+        Message::Close(opt) => opt
+            .as_ref()
+            .map(|frame| frame.reason.len() as u64)
+            .unwrap_or(0),
+        Message::Frame(_) => 0,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WsControlKind {
@@ -6016,8 +6032,12 @@ where
     // them without coordination. Reads happen exactly once at teardown.
     let frames_c2b = Arc::new(AtomicU64::new(0));
     let frames_b2c = Arc::new(AtomicU64::new(0));
+    let bytes_c2b = Arc::new(AtomicU64::new(0));
+    let bytes_b2c = Arc::new(AtomicU64::new(0));
     let frames_c2b_task = frames_c2b.clone();
     let frames_b2c_task = frames_b2c.clone();
+    let bytes_c2b_task = bytes_c2b.clone();
+    let bytes_b2c_task = bytes_b2c.clone();
 
     // First-failure recorder. Whichever forward direction hits an error first
     // wins the (Direction, ErrorClass) slot via OnceLock::set(); later errors
@@ -6143,6 +6163,10 @@ where
                                     }
                                     // Count the frame that successfully reached the backend.
                                     frames_c2b_task.fetch_add(1, Ordering::Relaxed);
+                                    bytes_c2b_task.fetch_add(
+                                        ws_message_payload_bytes(&outgoing),
+                                        Ordering::Relaxed,
+                                    );
                                 }
                             }
                         }
@@ -6288,6 +6312,10 @@ where
                                     }
                                     // Count the frame that successfully reached the client.
                                     frames_b2c_task.fetch_add(1, Ordering::Relaxed);
+                                    bytes_b2c_task.fetch_add(
+                                        ws_message_payload_bytes(&outgoing),
+                                        Ordering::Relaxed,
+                                    );
                                 }
                             }
                         }
@@ -6394,6 +6422,8 @@ where
             duration_ms: disconnect_duration_ms,
             frames_client_to_backend: frames_c2b.load(Ordering::Relaxed),
             frames_backend_to_client: frames_b2c.load(Ordering::Relaxed),
+            bytes_client_to_backend: bytes_c2b.load(Ordering::Relaxed),
+            bytes_backend_to_client: bytes_b2c.load(Ordering::Relaxed),
             direction: failure.as_ref().map(|(d, _, _)| *d),
             io_side: failure.as_ref().and_then(|(_, _, side)| *side),
             error_class: failure.map(|(_, c, _)| c),

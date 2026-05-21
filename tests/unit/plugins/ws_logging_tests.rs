@@ -35,6 +35,8 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         duration_ms: 250.0,
         frames_client_to_backend: 3,
         frames_backend_to_client: 4,
+        bytes_client_to_backend: 0,
+        bytes_backend_to_client: 0,
         direction: Some(Direction::ClientToBackend),
         io_side: None,
         error_class: None,

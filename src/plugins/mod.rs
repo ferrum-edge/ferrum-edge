@@ -231,6 +231,12 @@ pub struct WsDisconnectContext {
     pub frames_client_to_backend: u64,
     /// Number of frames proxied from backend toward client.
     pub frames_backend_to_client: u64,
+    /// Total payload bytes proxied from client toward backend over the
+    /// lifetime of this WebSocket session.
+    pub bytes_client_to_backend: u64,
+    /// Total payload bytes proxied from backend toward client over the
+    /// lifetime of this WebSocket session.
+    pub bytes_backend_to_client: u64,
     /// Which direction observed the first terminating error. `None` for
     /// clean close initiated by either peer.
     pub direction: Option<Direction>,
