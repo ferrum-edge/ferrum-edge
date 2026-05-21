@@ -398,21 +398,23 @@ pub async fn start_http3_listener_with_signal(
         }
     }
 
-    // Wait for in-flight HTTP/3 connections to drain, bounded by
-    // FERRUM_SHUTDOWN_DRAIN_SECONDS. Without this, any subsequent
-    // `endpoint.close()` call would forcefully terminate active streams the
-    // moment the listener task exited — exactly the abrupt-abort behaviour
-    // the soft-shutdown sequence is here to avoid.
+    // Wait for in-flight HTTP/3 request streams to drain, bounded by
+    // FERRUM_SHUTDOWN_DRAIN_SECONDS. Draining on open QUIC connections lets an
+    // idle client connection hold shutdown until timeout, so this loop keys off
+    // the request guard counter instead.
     if drain_seconds > 0 {
         let drain_timeout = Duration::from_secs(drain_seconds);
         let drained = tokio::time::timeout(drain_timeout, async {
             loop {
-                if endpoint.open_connections() == 0 {
+                if overload_state
+                    .active_requests
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == 0
+                {
                     break;
                 }
-                // Poll active connections via overload state's notify
-                // signal — the same mechanism the central drain helper
-                // uses, so notifications are coherent across listeners.
+                // Poll request-drain progress via overload state's notify
+                // signal — the same mechanism the central drain helper uses.
                 tokio::select! {
                     _ = overload_state.drain_complete.notified() => {}
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {}
@@ -426,12 +428,15 @@ pub async fn start_http3_listener_with_signal(
             info!(
                 phase = "drain",
                 listener = "http3",
-                "HTTP/3 in-flight connections drained"
+                "HTTP/3 in-flight request streams drained"
             );
         } else {
             warn!(
                 phase = "drain",
                 listener = "http3",
+                remaining_requests = overload_state
+                    .active_requests
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 remaining_connections = endpoint.open_connections(),
                 "HTTP/3 drain timeout — forcing endpoint close"
             );
