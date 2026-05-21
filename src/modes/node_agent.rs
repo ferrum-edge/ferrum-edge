@@ -1649,15 +1649,17 @@ fn initialize_backend(
     // node-global shape (CIDR includes/excludes, port excludes, proxy
     // UID bypass).
 
-    // Best-effort SOCK_OPS attach at cgroup root for TCP-layer observability.
-    // A failure here only loses telemetry; capture (cgroup_sockaddr / tc)
-    // continues to operate.
-    if let Err(e) = backend.attach_sock_ops(&config.cgroup_root) {
-        warn!(
-            cgroup_root = %config.cgroup_root,
-            error = %e,
-            "Failed to attach SOCK_OPS program; mesh-proxy will see zero TCP-layer counters"
-        );
+    if config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint {
+        // Best-effort SOCK_OPS attach at cgroup root for TCP-layer
+        // observability in node-waypoint mode. A failure here only loses
+        // telemetry; capture (cgroup_sockaddr / tc) continues to operate.
+        if let Err(e) = backend.attach_sock_ops(&config.cgroup_root) {
+            warn!(
+                cgroup_root = %config.cgroup_root,
+                error = %e,
+                "Failed to attach SOCK_OPS program; mesh-proxy will see zero TCP-layer counters"
+            );
+        }
     }
 
     info!("BPF programs loaded and maps initialized");
@@ -1788,6 +1790,29 @@ mod tests {
         assert_eq!(
             backend.capture_config,
             Some(config.capture_contract.bpf_capture_config())
+        );
+        assert!(backend.sock_ops_attached_cgroup_root.is_none());
+    }
+
+    #[test]
+    fn initialize_backend_attaches_sock_ops_for_node_waypoint() {
+        let mut config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
+
+        let mut backend = MockEbpfBackend::default();
+        initialize_backend(&mut backend, &config).unwrap();
+
+        assert_eq!(
+            backend.sock_ops_attached_cgroup_root.as_deref(),
+            Some("/sys/fs/cgroup")
         );
     }
 
