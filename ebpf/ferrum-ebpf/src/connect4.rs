@@ -88,6 +88,19 @@ fn outbound_capture_port() -> u32 {
     }
 }
 
+/// Decide whether this connection should be captured for proxying.
+///
+/// When a per-cgroup `includeOutboundPorts` policy exists with explicit
+/// ports, the port list takes precedence over the node-global include CIDR
+/// (which typically contains the implicit `0.0.0.0/0`). Without this
+/// narrowing, the CIDR match short-circuits port-level restrictions and
+/// overcaptures traffic the operator intended to exclude.
+///
+/// Precedence:
+///   1. No per-cgroup policy → fall back to CIDR match (normal path).
+///   2. Wildcard policy (`all_ports`) → always capture.
+///   3. Empty port list (no wildcard) → fall back to CIDR match.
+///   4. Explicit port list → capture only if port matches.
 #[inline(always)]
 fn capture_allowed(dst_port: u16, include_cidr_match: bool) -> bool {
     let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
@@ -107,19 +120,13 @@ fn capture_allowed(dst_port: u16, include_cidr_match: bool) -> bool {
     policy_admits_port(policy, dst_port)
 }
 
+/// Check whether `dst_port` appears in the policy's explicit port list.
+///
+/// Callers (`capture_allowed`) must handle `all_ports` and `count == 0`
+/// before calling — this function only walks the port array.
 #[inline(always)]
 fn policy_admits_port(policy: &IncludePortsPolicy, dst_port: u16) -> bool {
-    if policy.all_ports != 0 {
-        return true;
-    }
     let count = policy.port_count as usize;
-    // Defensive fail-open: an entry without explicit ports and without the
-    // wildcard flag is treated as "no narrowing". Userspace never writes
-    // this shape but kernel-space should not silently drop traffic if the
-    // map is ever populated unexpectedly.
-    if count == 0 {
-        return true;
-    }
     let mut i = 0;
     while i < count && i < policy.ports.len() {
         if policy.ports[i] == dst_port {

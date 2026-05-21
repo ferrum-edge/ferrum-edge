@@ -82,6 +82,10 @@ fn outbound_capture_port() -> u32 {
     }
 }
 
+/// Decide whether this connection should be captured for proxying.
+///
+/// Same semantics as the connect4 helper — see its doc comment for the
+/// full precedence rules.
 #[inline(always)]
 fn capture_allowed(dst_port: u16, include_cidr_match: bool) -> bool {
     let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
@@ -101,15 +105,13 @@ fn capture_allowed(dst_port: u16, include_cidr_match: bool) -> bool {
     policy_admits_port(policy, dst_port)
 }
 
+/// Check whether `dst_port` appears in the policy's explicit port list.
+///
+/// Callers (`capture_allowed`) must handle `all_ports` and `count == 0`
+/// before calling — this function only walks the port array.
 #[inline(always)]
 fn policy_admits_port(policy: &IncludePortsPolicy, dst_port: u16) -> bool {
-    if policy.all_ports != 0 {
-        return true;
-    }
     let count = policy.port_count as usize;
-    if count == 0 {
-        return true;
-    }
     let mut i = 0;
     while i < count && i < policy.ports.len() {
         if policy.ports[i] == dst_port {
