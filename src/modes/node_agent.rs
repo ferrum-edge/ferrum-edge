@@ -657,7 +657,7 @@ fn apply_cni_add_from_pod(
 pub fn apply_cni_request(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
-    config: &NodeAgentConfig,
+    _config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
     request: &CniRpcRequest,
 ) -> CniRpcResponse {
@@ -2411,21 +2411,21 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
         };
-        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 9));
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 9);
         pod_states.insert(
             "pod-uid-1".to_string(),
             PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
                 pod_name: "alpha".to_string(),
                 namespace: "default".to_string(),
                 attached: true,
                 pod_ip: Some(ip),
-                cgroup_id: None,
-                include_outbound_ports: None,
+                cgroup_path: None,
                 veth_iface: None,
-                veth_ifindex: None,
+                include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
-        backend.pod_ips.insert(ip, "pod-uid-1".to_string());
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
             pod_namespace: "default".to_string(),
