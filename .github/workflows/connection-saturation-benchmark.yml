@@ -101,12 +101,18 @@ jobs:
       # exhaustion masquerading as a gateway breaking. For larger N values,
       # point `runner` at a self-hosted runner where you can raise the cap.
       - name: Verify host capacity for requested connection levels
+        env:
+          CONNECTION_LEVELS_INPUT: ${{ inputs.connection_levels }}
         run: |
           set -euo pipefail
 
           SOFT_FD=$(ulimit -Sn)
           HARD_FD=$(ulimit -Hn)
-          HIGHEST_N=$(echo "${{ inputs.connection_levels }}" | tr ' ' '\n' | sort -n | tail -1)
+          if ! [[ "$CONNECTION_LEVELS_INPUT" =~ ^[0-9]+([[:space:]]+[0-9]+)*$ ]]; then
+            echo "::error::Invalid connection_levels input: expected a space-separated list of positive integers."
+            exit 1
+          fi
+          HIGHEST_N=$(tr -s '[:space:]' '\n' <<<"$CONNECTION_LEVELS_INPUT" | sort -n | tail -1)
           # The proto_bench client needs ~1 FD per connection plus ~256 base
           # FDs (stdio, libs, /proc, etc.). Add 1024 for headroom.
           REQUIRED_FD=$((HIGHEST_N + 1024))
