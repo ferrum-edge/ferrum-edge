@@ -74,7 +74,11 @@ impl ReqwestPoolManager {
         .dns_resolver(dns_resolver)
         .tcp_nodelay(true)
         .pool_max_idle_per_host(config.max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds));
+        .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
+        // Never auto-follow backend redirects from this shared client.
+        // Proxy dispatch must surface 3xx to callers as-is, and warmup probes
+        // must only touch configured backend targets (no redirected egress).
+        .redirect(reqwest::redirect::Policy::none());
 
         // NOTE: Neither `backend_connect_timeout_ms` nor `backend_read_timeout_ms`
         // is baked into the client here. The `reqwest::Client` is shared across
