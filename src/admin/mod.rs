@@ -602,14 +602,10 @@ pub async fn handle_admin_request(
             };
 
             if db_connected {
-                let mut db_info = json!({
+                health_status["database"] = json!({
                     "status": "connected",
                     "type": db.db_type()
                 });
-                if let Some(stats) = db.pool_stats() {
-                    db_info["pool"] = serde_json::to_value(&stats).unwrap_or_else(|_| json!(null));
-                }
-                health_status["database"] = db_info;
             } else {
                 health_status["status"] = json!("degraded");
                 health_status["database"] = json!({
