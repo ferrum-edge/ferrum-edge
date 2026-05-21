@@ -28,6 +28,9 @@ use crate::grpc::auth::verify_grpc_jwt_metadata;
 use crate::grpc::proto::ConfigUpdate;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
+const MAX_SUBSCRIPTIONS_PER_STREAM: usize = 32;
+const MAX_RESOURCE_NAMES_PER_REQUEST: usize = 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct XdsSubscription {
     node_id: String,
@@ -987,6 +990,37 @@ impl XdsAdsServer {
     }
 }
 
+fn ensure_supported_type_url(type_url: &str) -> Result<(), Status> {
+    if type_url.is_empty() {
+        return Err(Status::invalid_argument("xDS type_url is required"));
+    }
+    if !super::translator::XDS_TYPE_URLS.contains(&type_url) {
+        return Err(Status::invalid_argument(format!(
+            "unsupported xDS type_url: {type_url}"
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_subscription_limits(
+    subscriptions: &HashMap<String, XdsSubscription>,
+    type_url: &str,
+    resource_name_count: usize,
+) -> Result<(), Status> {
+    if !subscriptions.contains_key(type_url) && subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_STREAM
+    {
+        return Err(Status::resource_exhausted(format!(
+            "xDS subscription limit exceeded (max {MAX_SUBSCRIPTIONS_PER_STREAM})"
+        )));
+    }
+    if resource_name_count > MAX_RESOURCE_NAMES_PER_REQUEST {
+        return Err(Status::resource_exhausted(format!(
+            "xDS resource name limit exceeded (max {MAX_RESOURCE_NAMES_PER_REQUEST})"
+        )));
+    }
+    Ok(())
+}
+
 fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
     // This serializes the full GatewayConfig, including HashMap fields whose
     // iteration order is process-local. That is fine for the in-memory xDS
@@ -1066,8 +1100,16 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             node_id = Some(current_node_id.clone());
                         };
 
-                        if request.type_url.is_empty() {
-                            let _ = tx.send(Err(Status::invalid_argument("xDS type_url is required"))).await;
+                        if let Err(status) = ensure_supported_type_url(&request.type_url) {
+                            let _ = tx.send(Err(status)).await;
+                            return;
+                        }
+                        if let Err(status) = enforce_subscription_limits(
+                            &subscriptions,
+                            &request.type_url,
+                            request.resource_names.len(),
+                        ) {
+                            let _ = tx.send(Err(status)).await;
                             return;
                         }
                         if subscriptions.is_empty() {
@@ -1198,8 +1240,16 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             node_id = Some(current_node_id.clone());
                         };
 
-                        if request.type_url.is_empty() {
-                            let _ = tx.send(Err(Status::invalid_argument("xDS type_url is required"))).await;
+                        if let Err(status) = ensure_supported_type_url(&request.type_url) {
+                            let _ = tx.send(Err(status)).await;
+                            return;
+                        }
+                        if let Err(status) = enforce_subscription_limits(
+                            &subscriptions,
+                            &request.type_url,
+                            request.resource_names_subscribe.len(),
+                        ) {
+                            let _ = tx.send(Err(status)).await;
                             return;
                         }
                         if subscriptions.is_empty() {
@@ -1707,6 +1757,36 @@ mod tests {
         );
         assert!(resolve_stream_node_id(Some("node-a"), Some("node-a".to_string())).is_ok());
         assert!(resolve_stream_node_id(Some("node-a"), Some("node-b".to_string())).is_err());
+    }
+
+    #[test]
+    fn ensure_supported_type_url_rejects_unknown_values() {
+        assert!(ensure_supported_type_url(super::super::translator::CDS_TYPE_URL).is_ok());
+        assert!(ensure_supported_type_url("type.googleapis.com/example.Unknown").is_err());
+    }
+
+    #[test]
+    fn enforce_subscription_limits_rejects_new_type_url_beyond_limit() {
+        let mut subscriptions = HashMap::new();
+        for idx in 0..MAX_SUBSCRIPTIONS_PER_STREAM {
+            subscriptions.insert(
+                format!("type.googleapis.com/envoy.test.{idx}"),
+                XdsSubscription {
+                    node_id: "node-a".to_string(),
+                    type_url: format!("type.googleapis.com/envoy.test.{idx}"),
+                    resource_names: Vec::new(),
+                    wildcard: true,
+                },
+            );
+        }
+        assert!(
+            enforce_subscription_limits(&subscriptions, "type.googleapis.com/envoy.new", 0)
+                .is_err()
+        );
+        assert!(
+            enforce_subscription_limits(&subscriptions, "type.googleapis.com/envoy.test.0", 0)
+                .is_ok()
+        );
     }
 
     #[test]
