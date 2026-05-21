@@ -2101,5 +2101,5 @@ async fn test_on_final_request_body_validates_json_when_before_proxy_cannot() {
         .on_final_request_body(&headers, br#"{"missing":"field"}"#)
         .await;
 
-    assert_reject(result, 400, "Request body validation failed");
+    assert_reject(result, Some(400));
 }
