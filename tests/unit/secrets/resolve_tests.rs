@@ -183,9 +183,13 @@ fn test_resolve_all_env_secrets_rejects_unsupported_cloud_suffixes() {
             let result = resolve_all_env_secrets().await;
             #[cfg(not(feature = "secrets-aws"))]
             {
-                let err = result.expect_err("expected unsupported _AWS suffix to fail");
-                assert!(err.contains("Unsupported secret suffix _AWS"));
-                assert!(err.contains("FERRUM_TEST_SECRET_UNSUPPORTED_AWS"));
+                match result {
+                    Err(err) => {
+                        assert!(err.contains("Unsupported secret suffix _AWS"));
+                        assert!(err.contains("FERRUM_TEST_SECRET_UNSUPPORTED_AWS"));
+                    }
+                    Ok(_) => panic!("expected unsupported _AWS suffix to fail"),
+                }
             }
             #[cfg(feature = "secrets-aws")]
             {
@@ -203,9 +207,13 @@ fn test_resolve_secret_rejects_unsupported_cloud_suffixes() {
             let result = resolve_secret("FERRUM_TEST_SECRET_UNSUPPORTED").await;
             #[cfg(not(feature = "secrets-gcp"))]
             {
-                let err = result.expect_err("expected unsupported _GCP suffix to fail");
-                assert!(err.contains("Unsupported secret suffix _GCP"));
-                assert!(err.contains("FERRUM_TEST_SECRET_UNSUPPORTED_GCP"));
+                match result {
+                    Err(err) => {
+                        assert!(err.contains("Unsupported secret suffix _GCP"));
+                        assert!(err.contains("FERRUM_TEST_SECRET_UNSUPPORTED_GCP"));
+                    }
+                    Ok(_) => panic!("expected unsupported _GCP suffix to fail"),
+                }
             }
             #[cfg(feature = "secrets-gcp")]
             {
