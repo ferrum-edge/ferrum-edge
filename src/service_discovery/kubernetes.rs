@@ -3,10 +3,8 @@
 //! Polls the Kubernetes API server for EndpointSlice resources matching a
 //! service name and converts ready endpoints into upstream targets.
 //!
-//! Uses the gateway's shared `PluginHttpClient` (via its underlying
-//! `reqwest::Client`) so that Kubernetes API calls inherit the gateway's
-//! connection pool settings, DNS cache, trust store, and
-//! `FERRUM_TLS_NO_VERIFY` setting.
+//! Builds a Kubernetes API client per poll so in-cluster CA changes are
+//! observed promptly and CA-loading failures fail closed.
 
 use crate::config::types::UpstreamTarget;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -56,7 +54,6 @@ const QUERY_VALUE_ENCODE: &AsciiSet = &CONTROLS
 /// `reqwest::Client` from the gateway's `PluginHttpClient` for connection
 /// reuse and consistent TLS configuration.
 pub struct KubernetesDiscoverer {
-    client: reqwest::Client,
     namespace: String,
     service_name: String,
     port_name: Option<String>,
@@ -67,7 +64,7 @@ pub struct KubernetesDiscoverer {
 
 impl KubernetesDiscoverer {
     pub fn new(
-        client: reqwest::Client,
+        _client: reqwest::Client,
         namespace: String,
         service_name: String,
         port_name: Option<String>,
@@ -75,7 +72,6 @@ impl KubernetesDiscoverer {
         default_weight: u32,
     ) -> Self {
         Self {
-            client,
             namespace,
             service_name,
             port_name,
@@ -145,6 +141,37 @@ impl KubernetesDiscoverer {
         std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token").ok()
     }
 
+    /// Build an HTTP client for Kubernetes API requests.
+    ///
+    /// When running in-cluster (service-account CA file present), this fails
+    /// closed if CA loading/parsing/client construction fails.
+    fn build_client() -> Result<reqwest::Client, anyhow::Error> {
+        let mut builder = reqwest::Client::builder();
+
+        if let Some(ca_path) = Self::ca_cert_path() {
+            let ca_cert = std::fs::read(&ca_path).map_err(|e| {
+                anyhow::anyhow!("failed to read Kubernetes CA cert at {}: {}", ca_path, e)
+            })?;
+            let cert = reqwest::Certificate::from_pem(&ca_cert).map_err(|e| {
+                anyhow::anyhow!("failed to parse Kubernetes CA cert at {}: {}", ca_path, e)
+            })?;
+            builder = builder.add_root_certificate(cert);
+        }
+
+        builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build Kubernetes HTTP client: {}", e))
+    }
+
+    fn ca_cert_path() -> Option<String> {
+        let default = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+        if std::path::Path::new(default).exists() {
+            Some(default.to_string())
+        } else {
+            None
+        }
+    }
+
     /// Extract the matching port from an EndpointSlice item.
     fn extract_port(&self, item: &serde_json::Value) -> Option<u16> {
         let ports = item.get("ports").and_then(|v| v.as_array())?;
@@ -174,7 +201,8 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
     async fn discover(&self) -> Result<Vec<UpstreamTarget>, anyhow::Error> {
         let url = self.api_url();
 
-        let mut request = self.client.get(&url);
+        let client = Self::build_client()?;
+        let mut request = client.get(&url);
 
         // Add bearer token auth (re-read each poll — tokens can rotate)
         if let Some(token) = Self::read_sa_token() {
@@ -268,7 +296,6 @@ mod tests {
         label_selector: Option<&str>,
     ) -> KubernetesDiscoverer {
         KubernetesDiscoverer {
-            client: reqwest::Client::new(),
             namespace: namespace.to_string(),
             service_name: service_name.to_string(),
             port_name: port_name.map(|s| s.to_string()),
@@ -312,7 +339,6 @@ mod tests {
         // Without KUBERNETES_SERVICE_HOST/PORT env vars and without override,
         // should fall back to https://kubernetes.default.svc
         let d = KubernetesDiscoverer {
-            client: reqwest::Client::new(),
             namespace: "default".to_string(),
             service_name: "test".to_string(),
             port_name: None,
