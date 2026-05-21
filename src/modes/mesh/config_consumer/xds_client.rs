@@ -838,6 +838,15 @@ fn reverse_translate(
             &inner.value,
         ) {
             Ok(dr) => {
+                if dr.namespace != config.namespace {
+                    debug!(
+                        name = %dr.name,
+                        namespace = %dr.namespace,
+                        workload_namespace = %config.namespace,
+                        "Skipping xDS ECDS DR-carrier outside workload namespace"
+                    );
+                    continue;
+                }
                 debug!(
                     name = %dr.name,
                     namespace = %dr.namespace,
@@ -1986,6 +1995,29 @@ mod tests {
         let slice = accumulator
             .try_build_mesh_slice(&test_config())
             .expect("reverse translate should not fail on bad inner JSON")
+            .expect("all required types present");
+        assert!(slice.destination_rules.is_empty());
+    }
+
+    #[test]
+    fn ecds_dr_carrier_cross_namespace_is_skipped() {
+        let dr_json = r#"{
+            "name": "api-dr",
+            "namespace": "other",
+            "host": "api.default.svc.cluster.local"
+        }"#;
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[dr_carrier_resource("api-dr", dr_json)],
+                "v1",
+            )
+            .expect("ECDS apply");
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate")
             .expect("all required types present");
         assert!(slice.destination_rules.is_empty());
     }
