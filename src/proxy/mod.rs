@@ -4701,6 +4701,7 @@ async fn handle_websocket_request_authenticated(
     start_time: Instant,
     is_h2_websocket: bool,
     is_tls: bool,
+    cb_target_key: Option<String>,
     cb_is_half_open_probe: bool,
     requires_ws_frame_hooks: bool,
     query_string: String,
@@ -4879,12 +4880,13 @@ async fn handle_websocket_request_authenticated(
                     // value keeps the invariant readable and survives a
                     // future refactor that moves this block.)
                     if let Some(cb_config) = &proxy.circuit_breaker {
-                        let cb_key = current_target
+                        let current_cb_key = current_target
                             .as_ref()
-                            .map(|t| crate::circuit_breaker::target_key(&t.host, t.port));
+                            .map(|t| crate::circuit_breaker::target_key(&t.host, t.port))
+                            .or_else(|| cb_target_key.clone());
                         let cb = state.circuit_breaker_cache.get_or_create(
                             &proxy.id,
-                            cb_key.as_deref(),
+                            current_cb_key.as_deref(),
                             cb_config,
                         );
                         cb.record_failure(502, ws_is_pre_wire, cb_is_half_open_probe);
@@ -8700,6 +8702,7 @@ async fn handle_proxy_request_inner(
             start_time,
             is_h2_ws,
             is_tls,
+            cb_target_key,
             cb_is_half_open_probe,
             requires_ws_frame_hooks,
             effective_query_string.to_string(),
