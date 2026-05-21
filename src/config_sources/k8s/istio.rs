@@ -30,8 +30,9 @@ use super::{
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
-    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_TARGET_WEIGHT, PluginConfig, Proxy,
-    RetryConfig, validate_backend_tls_san_allow_list_entry, validate_backend_tls_sni,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, MAX_RETRIES, MAX_TARGET_WEIGHT, MAX_TIMEOUT_MS,
+    PluginConfig, Proxy, RetryConfig, validate_backend_tls_san_allow_list_entry,
+    validate_backend_tls_sni,
 };
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
@@ -2530,7 +2531,7 @@ fn route_retry_config(http: &Value) -> Option<RetryConfig> {
     }
 
     let mut retry = RetryConfig {
-        max_retries: attempts.min(u64::from(u32::MAX)) as u32,
+        max_retries: attempts.min(u64::from(MAX_RETRIES)) as u32,
         ..RetryConfig::default()
     };
 
@@ -2584,7 +2585,7 @@ fn retriable_status_codes(retries: &Value) -> impl Iterator<Item = u16> + '_ {
 
 fn route_timeout_ms(http: &Value) -> Option<u64> {
     let raw = string_field(http, "timeout")?;
-    parse_istio_duration_ms(raw)
+    parse_istio_duration_ms(raw).map(|ms| ms.min(MAX_TIMEOUT_MS))
 }
 
 fn parse_istio_duration_secs(raw: &str) -> Option<u64> {
@@ -6998,6 +6999,34 @@ extensionProviders:
     }
 
     #[test]
+    fn virtual_service_clamps_retries_to_ferrum_max() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "retries": {
+                            "attempts": 101,
+                            "retryOn": "5xx"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let retry = result.config.proxies[0]
+            .retry
+            .as_ref()
+            .expect("retry config should be set");
+        assert_eq!(retry.max_retries, MAX_RETRIES);
+    }
+
+    #[test]
     fn virtual_service_maps_retries_to_proxy_retry_config() {
         let result = translate_k8s_objects(
             &[object(
@@ -7270,6 +7299,30 @@ extensionProviders:
         .expect("translation succeeds");
 
         assert_eq!(result.config.proxies[0].backend_read_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn virtual_service_clamps_timeout_to_ferrum_max() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "timeout": "25h"
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies[0].backend_read_timeout_ms,
+            MAX_TIMEOUT_MS
+        );
     }
 
     #[test]
