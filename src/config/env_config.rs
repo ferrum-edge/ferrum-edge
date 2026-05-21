@@ -1742,6 +1742,15 @@ impl Default for EnvConfig {
 }
 
 impl EnvConfig {
+    const LEGACY_DB_TLS_ALIAS_KEYS: [&'static str; 6] = [
+        "FERRUM_DB_SSL_MODE",
+        "FERRUM_DB_SSL_ROOT_CERT",
+        "FERRUM_DB_SSL_CLIENT_CERT",
+        "FERRUM_DB_SSL_CLIENT_KEY",
+        "FERRUM_DB_TLS_ENABLED",
+        "FERRUM_DB_TLS_INSECURE",
+    ];
+
     /// Load configuration from environment variables and validate.
     ///
     /// When using external secret sources (`_FILE`, `_VAULT`, `_AWS`, `_GCP`,
@@ -2810,6 +2819,8 @@ impl EnvConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        Self::reject_legacy_db_tls_aliases()?;
+
         match &self.mode {
             OperatingMode::Database | OperatingMode::ControlPlane => {
                 if self.db_type.is_none() {
@@ -3129,6 +3140,24 @@ impl EnvConfig {
 
         Ok(())
     }
+
+    fn reject_legacy_db_tls_aliases() -> Result<(), String> {
+        let used_aliases: Vec<&'static str> = Self::LEGACY_DB_TLS_ALIAS_KEYS
+            .iter()
+            .copied()
+            .filter(|key| std::env::var_os(key).is_some())
+            .collect();
+        if used_aliases.is_empty() {
+            return Ok(());
+        }
+
+        Err(format!(
+            "Deprecated DB TLS environment aliases are no longer supported: {}. \
+             Use canonical FERRUM_DB_TLS_MODE, FERRUM_DB_TLS_CA_CERT_PATH, \
+             FERRUM_DB_TLS_CLIENT_CERT_PATH, and FERRUM_DB_TLS_CLIENT_KEY_PATH.",
+            used_aliases.join(", ")
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -3366,6 +3395,20 @@ mod tests {
             err.contains("`*`"),
             "error should explain the `*` constraint, got: {err}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_legacy_db_tls_alias_env_vars() {
+        with_env_lock(&[("FERRUM_DB_SSL_MODE", Some("require"))], || {
+            let mut config = file_mode_config();
+            let err = config
+                .validate()
+                .expect_err("legacy DB TLS aliases must be rejected");
+            assert!(
+                err.contains("FERRUM_DB_SSL_MODE"),
+                "error should list the offending legacy alias, got: {err}"
+            );
+        });
     }
 
     // ── T2-B: in-cluster default for K8s controller / pod discovery ────────
