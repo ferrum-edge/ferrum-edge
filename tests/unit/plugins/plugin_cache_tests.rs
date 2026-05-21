@@ -662,10 +662,10 @@ fn test_full_plugin_priority_chain() {
     assert_eq!(
         names,
         vec![
+            "rate_limiting",        // 90   — Early
             "cors",                 // 100  — Early
             "key_auth",             // 1200 — AuthN
             "access_control",       // 2000 — AuthZ
-            "rate_limiting",        // 2900 — AuthZ (tail)
             "request_transformer",  // 3000 — Transform
             "response_transformer", // 4000 — Response
             "stdout_logging",       // 9000 — Logging

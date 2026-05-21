@@ -222,9 +222,9 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
-| **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
+| **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `rate_limiting` (90), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `ai_semantic_cache` (2700), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `fault_injection` (2940), `body_validator` (2950), `ai_request_guard` (2975), `ai_federation` (2985), `mesh_route_dispatch` (2995) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `ai_semantic_cache` (2700), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `fault_injection` (2940), `body_validator` (2950), `ai_request_guard` (2975), `ai_federation` (2985), `mesh_route_dispatch` (2995) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `load_testing` (3080), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_response_guard` (4075), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
@@ -246,10 +246,11 @@ Given all built-in plugins enabled, the execution order is:
 |---|--------|----------|---------------|
 | 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect |
 | 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, on_stream_connect |
-| 3 | `cors` | 100 | on_request_received, after_proxy |
-| 4 | `request_termination` | 125 | on_request_received |
-| 5 | `mesh_outbound_registry` | 130 | on_request_received |
-| 6 | `ip_restriction` | 150 | on_request_received, on_stream_connect |
+| 3 | `rate_limiting` | 90 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
+| 4 | `cors` | 100 | on_request_received, after_proxy |
+| 5 | `request_termination` | 125 | on_request_received |
+| 6 | `mesh_outbound_registry` | 130 | on_request_received |
+| 7 | `ip_restriction` | 150 | on_request_received, on_stream_connect |
 | 7 | `geo_restriction` | 175 | on_request_received, on_stream_connect, before_proxy |
 | 8 | `bot_detection` | 200 | on_request_received |
 | 9 | `spec_expose` | 210 | on_request_received |
@@ -273,7 +274,6 @@ Given all built-in plugins enabled, the execution order is:
 | 27 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
 | 28 | `ws_message_size_limiting` | 2810 | on_ws_frame |
 | 29 | `graphql` | 2850 | before_proxy |
-| 30 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
 | 31 | `ws_rate_limiting` | 2910 | on_ws_frame |
 | 32 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 33 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
@@ -328,9 +328,9 @@ That ordering has a few practical effects:
 
 OpenTelemetry tracing runs at priority 25 — the earliest of any plugin — so it can capture trace context before any other plugin runs. This ensures accurate timing: the gateway span's start time reflects the true moment the request was received, not the time after CORS/auth/etc. have executed. The `before_proxy` phase injects traceparent into backend requests, `after_proxy` echoes it to clients, and `log` exports the completed span to the OTLP collector.
 
-### CORS runs next (priority 100)
+### Rate limiting runs before CORS (priority 90)
 
-Browser preflight (`OPTIONS`) requests must be answered before authentication. If an auth plugin ran first, it would reject the preflight with `401` and the browser would never complete the CORS handshake. CORS at priority 100 ensures preflight responses are returned immediately.
+Rate limiting runs at priority 90 so requests that are later short-circuited by CORS still consume quota and cannot bypass gateway throttling.
 
 ### Request termination runs immediately after CORS (priority 125)
 
@@ -350,9 +350,9 @@ Authentication plugins identify *who* the caller is (setting `ctx.identified_con
 
 After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller. `X-Consumer-Username` uses the mapped Consumer username when available, otherwise an external auth header/display identity (for example from `jwks_auth`), otherwise the raw external authenticated identity.
 
-### Rate limiting runs after auth (priority 2900)
+### CORS runs after rate limiting (priority 100)
 
-Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforce limits by **authenticated identity**, not just by IP address. When `limit_by: "consumer"`, the plugin uses the mapped Consumer username when available, otherwise external `ctx.authenticated_identity`; those values only exist after the authenticate phase. When `limit_by: "spiffe_identity"`, the plugin uses `ctx.peer_spiffe_id`, populated earlier by the `spiffe_identity` plugin.
+CORS runs at priority 100 so browser preflight requests are still handled early, but only after gateway rate limiting has a chance to account for the request.
 
 **Dual-phase behavior:**
 - `limit_by: "ip"` — enforces IP-based limits in `on_request_received` (phase 1, before auth). This protects auth endpoints from brute-force attacks.
