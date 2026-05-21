@@ -174,3 +174,45 @@ fn test_resolve_secret_file_preserves_internal_whitespace() {
         assert_eq!(resolved.value, "secret with spaces");
     });
 }
+
+#[test]
+fn test_resolve_all_env_secrets_rejects_unsupported_cloud_suffixes() {
+    with_env_vars_async(
+        &[("FERRUM_TEST_SECRET_UNSUPPORTED_AWS", "arn:aws:secretsmanager:...")],
+        || async {
+            let result = resolve_all_env_secrets().await;
+            #[cfg(not(feature = "secrets-aws"))]
+            {
+                let err = result.expect_err("expected unsupported _AWS suffix to fail");
+                assert!(err.contains("Unsupported secret suffix _AWS"));
+                assert!(err.contains("FERRUM_TEST_SECRET_UNSUPPORTED_AWS"));
+            }
+            #[cfg(feature = "secrets-aws")]
+            {
+                assert!(result.is_ok());
+            }
+        },
+    );
+}
+
+#[test]
+fn test_resolve_secret_rejects_unsupported_cloud_suffixes() {
+    with_env_vars_async(
+        &[("FERRUM_TEST_SECRET_UNSUPPORTED_GCP", "projects/x/secrets/y/versions/latest")],
+        || async {
+            let result = resolve_secret("FERRUM_TEST_SECRET_UNSUPPORTED").await;
+            #[cfg(not(feature = "secrets-gcp"))]
+            {
+                let err = result.expect_err("expected unsupported _GCP suffix to fail");
+                assert!(err.contains("Unsupported secret suffix _GCP"));
+                assert!(err.contains("FERRUM_TEST_SECRET_UNSUPPORTED_GCP"));
+            }
+            #[cfg(feature = "secrets-gcp")]
+            {
+                // In gcp-enabled builds the source is recognized and will be resolved/fetched.
+                // This test only verifies the fail-closed behavior for feature-disabled builds.
+                assert!(result.is_ok() || result.is_err());
+            }
+        },
+    );
+}

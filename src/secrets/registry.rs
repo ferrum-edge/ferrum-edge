@@ -275,12 +275,59 @@ fn match_suffix(raw_key: &str) -> Option<(&'static dyn SecretBackend, &str)> {
     None
 }
 
+fn unsupported_cloud_suffix(raw_key: &str) -> Option<(&'static str, &'static str)> {
+    const KNOWN: [(&str, &str, bool); 4] = [
+        ("_AZURE", "Azure Key Vault", cfg!(feature = "secrets-azure")),
+        ("_VAULT", "Vault", cfg!(feature = "secrets-vault")),
+        (
+            "_AWS",
+            "AWS Secrets Manager",
+            cfg!(feature = "secrets-aws"),
+        ),
+        (
+            "_GCP",
+            "GCP Secret Manager",
+            cfg!(feature = "secrets-gcp"),
+        ),
+    ];
+
+    for (suffix, backend_name, enabled) in KNOWN {
+        if raw_key.ends_with(suffix) && !enabled {
+            return Some((suffix, backend_name));
+        }
+    }
+
+    None
+}
+
+fn unsupported_cloud_suffix_for_base_key(key: &str) -> Option<(&'static str, &'static str)> {
+    for suffix in ["_AZURE", "_VAULT", "_AWS", "_GCP"] {
+        let suffixed_key = format!("{key}{suffix}");
+        let is_set = std::env::var(&suffixed_key)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some();
+        if is_set {
+            if let Some(unsupported) = unsupported_cloud_suffix(&suffixed_key) {
+                return Some(unsupported);
+            }
+        }
+    }
+    None
+}
+
 pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     let mut to_resolve: HashMap<String, Vec<(String, String, BackendKind)>> = HashMap::new();
 
     for (raw_key, value) in std::env::vars() {
         if !raw_key.starts_with(FERRUM_PREFIX) {
             continue;
+        }
+        if let Some((suffix, backend_name)) = unsupported_cloud_suffix(&raw_key) {
+            return Err(format!(
+                "Unsupported secret suffix {} on {}: {} support is not enabled in this build.",
+                suffix, raw_key, backend_name
+            ));
         }
         if let Some((backend, base_key)) = match_suffix(&raw_key) {
             if base_key.is_empty() || value.is_empty() {
@@ -368,6 +415,15 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
 /// Startup uses `resolve_all_env_secrets()` for bulk env injection; this helper
 /// remains for the existing single-key tests and ad-hoc secret lookups.
 pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String> {
+    if let Some((suffix, backend_name)) = unsupported_cloud_suffix_for_base_key(key) {
+        return Err(format!(
+            "Unsupported secret suffix {} on {}: {} support is not enabled in this build.",
+            suffix,
+            format!("{key}{suffix}"),
+            backend_name
+        ));
+    }
+
     let mut sources: Vec<(&'static dyn SecretBackend, String)> = Vec::new();
 
     for backend in all_backends() {
