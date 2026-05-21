@@ -3123,6 +3123,7 @@ fn poll_copy_direction<R, W>(
     last_activity: Option<&AtomicU64>,
     read_watermark: Option<&AtomicU64>,
     write_watermark: Option<&AtomicU64>,
+    write_activity_watermark: Option<&AtomicU64>,
 ) -> Poll<Result<(), (StreamIoSide, std::io::Error)>>
 where
     R: AsyncRead + Unpin,
@@ -3189,8 +3190,12 @@ where
                         }
                         Poll::Ready(Ok(nw)) => {
                             state.pos += nw;
+                            let now = coarse_now_ms();
                             if let Some(wm) = write_watermark {
-                                wm.store(coarse_now_ms(), Ordering::Relaxed);
+                                wm.store(now, Ordering::Relaxed);
+                            }
+                            if let Some(wm) = write_activity_watermark {
+                                wm.store(now, Ordering::Relaxed);
                             }
                         }
                         Poll::Ready(Err(e)) => {
@@ -3220,6 +3225,7 @@ async fn copy_direction_to_completion<R, W>(
     last_activity: Option<&AtomicU64>,
     read_watermark: Option<&AtomicU64>,
     write_watermark: Option<&AtomicU64>,
+    write_activity_watermark: Option<&AtomicU64>,
 ) -> Result<(), (StreamIoSide, std::io::Error)>
 where
     R: AsyncRead + Unpin,
@@ -3235,6 +3241,7 @@ where
             last_activity,
             read_watermark,
             write_watermark,
+            write_activity_watermark,
         )
     })
     .await
@@ -3516,6 +3523,7 @@ where
                 last_activity,
                 None,
                 c2b_write_watermark,
+                b2c_read_watermark,
             ) {
                 Poll::Ready(result) => return Poll::Ready(Phase1Outcome::ClientToBackend(result)),
                 Poll::Pending => {}
@@ -3530,6 +3538,7 @@ where
                 &b2c_bytes,
                 last_activity,
                 b2c_read_watermark,
+                None,
                 None,
             ) {
                 Poll::Ready(result) => return Poll::Ready(Phase1Outcome::BackendToClient(result)),
@@ -3546,6 +3555,7 @@ where
                 last_activity,
                 None,
                 c2b_write_watermark,
+                b2c_read_watermark,
             ) {
                 Poll::Ready(result) => return Poll::Ready(Phase1Outcome::ClientToBackend(result)),
                 Poll::Pending => {}
@@ -3645,6 +3655,7 @@ where
                     last_activity,
                     None,
                     c2b_write_watermark,
+                    b2c_read_watermark,
                 ),
             )
             .await
@@ -3706,6 +3717,7 @@ where
                     &b2c_bytes,
                     last_activity,
                     b2c_read_watermark,
+                    None,
                     None,
                 ),
             )
@@ -3799,6 +3811,7 @@ where
             } else {
                 None
             },
+            None,
         ) {
             Poll::Ready(result) => {
                 if let Err((side, e)) = result {
