@@ -4704,6 +4704,7 @@ async fn handle_websocket_request_authenticated(
     cb_is_half_open_probe: bool,
     requires_ws_frame_hooks: bool,
     query_string: String,
+    strip_len: usize,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -4723,6 +4724,7 @@ async fn handle_websocket_request_authenticated(
         &query_string,
         effective_host,
         effective_port,
+        strip_len,
         upstream_target.as_ref().and_then(|t| t.path.as_deref()),
     );
 
@@ -4914,6 +4916,7 @@ async fn handle_websocket_request_authenticated(
                             &query_string,
                             &next.host,
                             next.port,
+                            strip_len,
                             next.path.as_deref(),
                         );
                         current_target = Some(next);
@@ -5420,6 +5423,7 @@ pub(crate) fn build_websocket_backend_url_with_target(
     query_string: &str,
     host: &str,
     port: u16,
+    strip_len: usize,
     target_path: Option<&str>,
 ) -> String {
     use std::fmt::Write;
@@ -5435,12 +5439,10 @@ pub(crate) fn build_websocket_backend_url_with_target(
     // Host-only proxies (listen_path == None) have no prefix to strip.
     // Exact listen_paths carry a leading '=' marker for routing; strip only
     // the literal path part so WebSocket forwarding matches HTTP forwarding.
-    let remaining_path = match (proxy.strip_listen_path, proxy.listen_path.as_deref()) {
-        (true, Some(lp)) if !lp.starts_with('~') => {
-            let literal = lp.strip_prefix('=').unwrap_or(lp);
-            incoming_path.strip_prefix(literal).unwrap_or("")
-        }
-        _ => incoming_path,
+    let remaining_path = if proxy.strip_listen_path {
+        &incoming_path[strip_len.min(incoming_path.len())..]
+    } else {
+        incoming_path
     };
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
@@ -8703,6 +8705,7 @@ async fn handle_proxy_request_inner(
             cb_is_half_open_probe,
             requires_ws_frame_hooks,
             effective_query_string.to_string(),
+            strip_len,
         )
         .await;
     }
@@ -14507,10 +14510,32 @@ mod tests {
             "token=1",
             "backend.local",
             8080,
+            "/ws".len(),
             None,
         );
 
         assert_eq!(url, "ws://backend.local:8080/?token=1");
+    }
+
+    #[test]
+    fn websocket_backend_url_strips_regex_route_by_matched_length() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.listen_path = Some("~/public/ws/.*".to_string());
+        proxy.strip_listen_path = true;
+
+        let incoming_path = "/public/ws/admin";
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            incoming_path,
+            "token=1",
+            "backend.local",
+            8080,
+            incoming_path.len(),
+            Some("/internal"),
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/internal?token=1");
     }
 
     #[test]
