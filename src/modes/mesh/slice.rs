@@ -1714,7 +1714,7 @@ fn sidecar_egress_port_admission(
     if resource_port_set.is_empty() {
         return sidecar_egress
             .iter()
-            .any(host_matches)
+            .any(|egress_entry| egress_entry.port.is_none() && host_matches(egress_entry))
             .then_some(SidecarPortAdmission::All);
     }
 
@@ -6089,6 +6089,32 @@ mod tests {
         let config = config_with_mesh(mesh);
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.service_entries.len(), 1);
+    }
+
+    #[test]
+    fn sidecar_port_specific_egress_does_not_admit_portless_service_entry() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar_with_ports(
+                "port-only",
+                "alpha",
+                None,
+                vec![(vec!["./api.example.com"], Some(443))],
+            )],
+            service_entries: vec![make_se_with_host_and_ports(
+                "api",
+                "alpha",
+                "api.example.com",
+                &[],
+                vec!["*".into()],
+            )],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert!(
+            slice.service_entries.is_empty(),
+            "port-specific sidecar egress must not widen a portless ServiceEntry into any-port admission"
+        );
     }
 
     #[test]
