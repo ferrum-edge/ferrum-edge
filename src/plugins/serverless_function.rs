@@ -530,9 +530,8 @@ impl ServerlessFunction {
             && let Some(error_type) = response_headers.get("x-amz-function-error")
         {
             return Err(format!(
-                "serverless_function: Lambda function error ({}): {}",
+                "serverless_function: Lambda function error ({})",
                 error_type,
-                String::from_utf8_lossy(&body),
             ));
         }
 

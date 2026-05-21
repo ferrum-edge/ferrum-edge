@@ -752,6 +752,54 @@ async fn test_pre_proxy_mode_allows_grpc_requests() {
     }
 }
 
+#[tokio::test]
+async fn test_aws_lambda_function_error_does_not_leak_response_body_in_reject_details() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let lambda_error_body = r#"{"errorMessage":"db_password=supersecret","stackTrace":["/var/task/app.py:42"]}"#;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(lambda_error_body)
+                .insert_header("x-amz-function-error", "Unhandled"),
+        )
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "aws_function_name": "my-function",
+            "aws_endpoint_url": server.uri(),
+            "on_error": "reject",
+            "error_status_code": 502,
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("Lambda function error (Unhandled)"));
+            assert!(!body.contains("db_password=supersecret"));
+            assert!(!body.contains("/var/task/app.py:42"));
+        }
+        other => panic!("Expected Reject, got {:?}", other),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SigV4 session token support
 // ---------------------------------------------------------------------------
