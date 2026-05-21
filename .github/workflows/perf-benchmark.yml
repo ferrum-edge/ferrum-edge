@@ -178,8 +178,14 @@ jobs:
 
       - name: Run benchmark suite (${{ inputs.iterations }} iteration(s))
         timeout-minutes: 45
+        env:
+          BENCH_ITERATIONS: ${{ inputs.iterations }}
+          BENCH_PROTOCOLS: ${{ inputs.protocols }}
+          BENCH_DURATION: ${{ inputs.duration }}
+          BENCH_CONCURRENCY: ${{ inputs.concurrency }}
+          BENCH_PAYLOAD_SIZE: ${{ inputs.payload_size }}
         run: |
-          ITERATIONS=${{ inputs.iterations }}
+          ITERATIONS="$BENCH_ITERATIONS"
           for run in $(seq 1 "$ITERATIONS"); do
             echo ""
             echo "============================================"
@@ -196,11 +202,11 @@ jobs:
 
             cd ${{ github.workspace }}/tests/performance/multi_protocol
             bash run_protocol_test.sh \
-              "${{ inputs.protocols }}" \
+              "$BENCH_PROTOCOLS" \
               --skip-build \
-              --duration "${{ inputs.duration }}" \
-              --concurrency "${{ inputs.concurrency }}" \
-              --payload-size "${{ inputs.payload_size }}" \
+              --duration "$BENCH_DURATION" \
+              --concurrency "$BENCH_CONCURRENCY" \
+              --payload-size "$BENCH_PAYLOAD_SIZE" \
               --json 2>&1 | tee /tmp/bench_output_run${run}.txt
 
             echo ""
@@ -265,6 +271,10 @@ jobs:
         if: always()
         env:
           NUM_ITERATIONS: ${{ inputs.iterations }}
+          BENCH_BUILD_PROFILE: ${{ inputs.build_profile }}
+          BENCH_DURATION: ${{ inputs.duration }}
+          BENCH_CONCURRENCY: ${{ inputs.concurrency }}
+          BENCH_PROTOCOLS: ${{ inputs.protocols }}
         run: |
           python3 - benchmark-results/results.json <<'PYEOF'
           import json, sys, os, math
@@ -318,10 +328,15 @@ jobs:
           lines.append("## Multi Protocol Performance Benchmark Results\n")
           num_iterations = int(os.environ.get("NUM_ITERATIONS", "1"))
 
-          lines.append(f"**Profile:** `${{ inputs.build_profile }}` | "
-                       f"**Duration:** ${{ inputs.duration }}s | "
-                       f"**Concurrency:** ${{ inputs.concurrency }} | "
-                       f"**Protocols:** ${{ inputs.protocols }} | "
+          build_profile = os.environ.get("BENCH_BUILD_PROFILE", "unknown")
+          duration = os.environ.get("BENCH_DURATION", "unknown")
+          concurrency = os.environ.get("BENCH_CONCURRENCY", "unknown")
+          protocols = os.environ.get("BENCH_PROTOCOLS", "unknown")
+
+          lines.append(f"**Profile:** `{build_profile}` | "
+                       f"**Duration:** {duration}s | "
+                       f"**Concurrency:** {concurrency} | "
+                       f"**Protocols:** {protocols} | "
                        f"**Iterations:** {num_iterations}\n")
 
           # Per-run tables
