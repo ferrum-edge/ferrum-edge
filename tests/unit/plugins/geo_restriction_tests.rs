@@ -192,6 +192,25 @@ fn test_validate_mmdb_file_is_directory() {
     assert!(result.err().unwrap().contains("not a regular file"));
 }
 
+#[test]
+fn test_validate_mmdb_file_rejects_invalid_mmdb_contents() {
+    let temp_path = std::env::temp_dir().join(format!(
+        "ferrum-edge-invalid-geo-{}.mmdb",
+        std::process::id()
+    ));
+    std::fs::write(&temp_path, b"not a maxmind database").unwrap();
+
+    let result = validate_mmdb_file(
+        "geo_restriction.db_path",
+        temp_path.to_str().expect("temp path utf-8"),
+    );
+
+    let _ = std::fs::remove_file(&temp_path);
+
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("not a valid readable .mmdb"));
+}
+
 // --- validate_plugin_file_dependencies tests ---
 
 #[test]

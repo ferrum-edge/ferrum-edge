@@ -2843,10 +2843,11 @@ pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String>
     Ok(())
 }
 
-/// Validate that a MaxMind `.mmdb` database file exists and is readable.
-/// This mirrors the cert file validation pattern — per-mode callers decide
-/// whether a failure is fatal (file mode), a warning (db mode), or a
-/// config-rejection (dp mode).
+/// Validate that a MaxMind `.mmdb` database file exists and can be parsed.
+/// This catches unreadable/corrupt/empty files so file-mode startup doesn't
+/// silently fail open when geo_restriction falls back to `on_lookup_failure`.
+/// Per-mode callers decide whether a failure is fatal (file mode), a warning
+/// (db mode), or a config-rejection (dp mode).
 pub fn validate_mmdb_file(field_name: &str, path: &str) -> Result<(), String> {
     let metadata = std::fs::metadata(path).map_err(|e| {
         format!(
@@ -2860,6 +2861,14 @@ pub fn validate_mmdb_file(field_name: &str, path: &str) -> Result<(), String> {
             field_name, path
         ));
     }
+    // SAFETY: Validation is read-only and the file descriptor is scoped to
+    // this function. We do not mutate or truncate the file while mapped.
+    unsafe { maxminddb::Reader::open_mmap(path) }.map_err(|e| {
+        format!(
+            "{}: MaxMind database file '{}' is not a valid readable .mmdb: {}",
+            field_name, path, e
+        )
+    })?;
     Ok(())
 }
 
