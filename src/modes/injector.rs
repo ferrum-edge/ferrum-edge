@@ -458,9 +458,13 @@ pub async fn run(
     let config = InjectorConfig::from_env_config(&env_config)
         .map_err(|e| anyhow::anyhow!("invalid injector configuration: {e}"))?;
     let tls_acceptor = build_tls_acceptor(&env_config, &config)?;
-    let max_connections = env_config.max_connections.max(1);
+    let max_connections = env_config.max_connections;
     let config = Arc::new(config);
-    let connection_limiter = Arc::new(Semaphore::new(max_connections));
+    let connection_limiter = if max_connections > 0 {
+        Some(Arc::new(Semaphore::new(max_connections)))
+    } else {
+        None
+    };
     let listener = TcpListener::bind(config.listen_addr).await?;
     info!(
         listen_addr = %config.listen_addr,
@@ -477,14 +481,20 @@ pub async fn run(
                     Ok((stream, remote_addr)) => {
                         let config = Arc::clone(&config);
                         let tls_acceptor = tls_acceptor.clone();
-                        let limiter = Arc::clone(&connection_limiter);
-                        let Ok(connection_permit) = limiter.try_acquire_owned() else {
-                            warn!(
-                                remote_addr = %remote_addr,
-                                max_connections,
-                                "Injector connection rejected: max concurrent connections reached"
-                            );
-                            continue;
+                        let connection_permit = match &connection_limiter {
+                            Some(limiter) => {
+                                let limiter = Arc::clone(limiter);
+                                let Ok(connection_permit) = limiter.try_acquire_owned() else {
+                                    warn!(
+                                        remote_addr = %remote_addr,
+                                        max_connections,
+                                        "Injector connection rejected: max concurrent connections reached"
+                                    );
+                                    continue;
+                                };
+                                Some(connection_permit)
+                            }
+                            None => None,
                         };
                         tokio::spawn(async move {
                             let _connection_permit = connection_permit;
