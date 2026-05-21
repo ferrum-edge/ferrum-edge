@@ -736,7 +736,13 @@ impl MeshSlice {
             destination_rules,
             proxy_configs,
             trust_bundles: mesh.trust_bundles.clone(),
-            multi_cluster: mesh.multi_cluster.clone(),
+            multi_cluster: mesh.multi_cluster.as_ref().map(|multi_cluster| {
+                let mut scoped = multi_cluster.clone();
+                scoped
+                    .east_west_gateways
+                    .retain(|gateway| gateway.namespace == request.namespace);
+                scoped
+            }),
             outbound_traffic_policy: mesh.outbound_traffic_policy,
             sidecar_egress_scope,
             extension_configs,
@@ -2785,9 +2791,31 @@ mod tests {
 
     #[test]
     fn from_gateway_config_trust_bundles_and_multi_cluster_propagated() {
+        let mut multi_cluster = make_multi_cluster();
+        multi_cluster.east_west_gateways = vec![
+            EastWestGateway {
+                name: "gw-ns".into(),
+                namespace: "ns".into(),
+                host: "eastwest-ns.svc.cluster.local".into(),
+                port: 15443,
+                sni_hosts: vec!["*.ns.svc.cluster.local".into()],
+                trust_domain: Some(td()),
+                network: Some("network-ns".into()),
+            },
+            EastWestGateway {
+                name: "gw-other".into(),
+                namespace: "other".into(),
+                host: "eastwest-other.svc.cluster.local".into(),
+                port: 15443,
+                sni_hosts: vec!["*.other.svc.cluster.local".into()],
+                trust_domain: Some(td()),
+                network: Some("network-other".into()),
+            },
+        ];
+
         let mesh = MeshConfig {
             trust_bundles: Some(make_trust_bundle_set()),
-            multi_cluster: Some(make_multi_cluster()),
+            multi_cluster: Some(multi_cluster),
             outbound_traffic_policy: None,
             ..MeshConfig::default()
         };
@@ -2798,6 +2826,17 @@ mod tests {
         assert_eq!(
             slice.multi_cluster.as_ref().unwrap().local_cluster,
             Some("cluster-a".into())
+        );
+        assert_eq!(
+            slice
+                .multi_cluster
+                .as_ref()
+                .unwrap()
+                .east_west_gateways
+                .iter()
+                .map(|gateway| gateway.namespace.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ns"]
         );
     }
 
