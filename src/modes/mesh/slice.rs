@@ -1255,16 +1255,27 @@ fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
     mesh: &MeshConfig,
     workload_namespace: &str,
     workload_labels: &L,
-) -> BTreeSet<String> {
-    let mut hosts = BTreeSet::new();
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut hosts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for entry in &mesh.service_entries {
         if !service_entry_applies_to_workload(entry, workload_namespace, workload_labels) {
+            continue;
+        }
+        let entry_namespace = entry
+            .namespace
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if entry_namespace.is_empty() {
             continue;
         }
         for host in &entry.hosts {
             let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
             if !host.is_empty() {
-                hosts.insert(host);
+                hosts
+                    .entry(host)
+                    .or_default()
+                    .insert(entry_namespace.clone());
             }
         }
     }
@@ -1297,7 +1308,7 @@ fn destination_rule_host_scope(
     rule: &MeshDestinationRule,
     cluster_domain: &str,
     mesh_service_identities: &BTreeSet<(String, String)>,
-    service_entry_hosts: &BTreeSet<String>,
+    service_entry_hosts: &BTreeMap<String, BTreeSet<String>>,
 ) -> (String, Vec<String>) {
     let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
     let rule_namespace = rule
@@ -1329,12 +1340,23 @@ fn destination_rule_service_ref_from_host(
     rule_namespace: &str,
     cluster_domain: &str,
     mesh_service_identities: &BTreeSet<(String, String)>,
-    service_entry_hosts: &BTreeSet<String>,
+    service_entry_hosts: &BTreeMap<String, BTreeSet<String>>,
 ) -> Option<(String, String)> {
     if host.is_empty() || rule_namespace.is_empty() || host.contains('*') {
         return None;
     }
-    if service_entry_hosts.contains(host) {
+    if let Some(namespaces) = service_entry_hosts.get(host) {
+        // A ServiceEntry host can be declared in multiple namespaces. For
+        // Sidecar egress host matching, evaluate all namespace-qualified host
+        // aliases so client-namespace and target-namespace DestinationRules
+        // remain admissible without losing cross-namespace imports.
+        if let Some(namespace) = namespaces
+            .iter()
+            .find(|candidate| candidate.as_str() == rule_namespace)
+            .or_else(|| namespaces.iter().next())
+        {
+            return Some((host.to_string(), namespace.clone()));
+        }
         return None;
     }
     if !host.contains('.') {
@@ -5266,6 +5288,37 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.destination_rules.len(), 1);
         assert_eq!(slice.destination_rules[0].name, "beta-foo-dr");
+    }
+
+    #[test]
+    fn sidecar_narrowing_admits_client_namespace_dr_for_imported_service_entry() {
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["beta/*"]],
+            )],
+            service_entries: vec![make_se_with_host(
+                "external-api",
+                "beta",
+                "api.external.test",
+                vec!["alpha".into()],
+            )],
+            destination_rules: vec![MeshDestinationRule {
+                name: "client-dr".into(),
+                namespace: "alpha".into(),
+                host: "api.external.test".into(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "client-dr");
     }
 
     #[test]
