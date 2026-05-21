@@ -232,7 +232,7 @@ impl Waf {
 
     fn should_inspect_body_content_type(&self, content_type: Option<&str>) -> bool {
         let Some(content_type) = content_type else {
-            return false;
+            return self.config.inspect_binary_body;
         };
         let base = content_type
             .split(';')
