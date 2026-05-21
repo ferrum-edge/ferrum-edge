@@ -1320,7 +1320,8 @@ struct TcpConnParams {
     /// Whether TCP Fast Open is enabled (gated on `FERRUM_TCP_FASTOPEN_ENABLED`).
     tcp_fastopen_enabled: bool,
     /// Flattened per-port dispatch overrides used by retry attempts.
-    dispatch_port_overrides: Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>,
+    dispatch_port_overrides:
+        Option<std::collections::HashMap<u16, crate::config::types::ResolvedPortOverride>>,
 }
 
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
@@ -1800,8 +1801,9 @@ async fn handle_tcp_connection_inner(
         // the passthrough path. The cap is checked before connect so we don't
         // count failed handshakes against the cap. The guard's RAII drop
         // covers every relay exit (graceful EOF, idle timeout, error).
+        let passthrough_port_override = resolve_port_override(&params, params.backend_port);
         let _backend_inflight_guard = match acquire_backend_inflight_slot(
-            &params,
+            passthrough_port_override,
             metrics,
             &params.backend_host,
             params.backend_port,
@@ -1845,7 +1847,11 @@ async fn handle_tcp_connection_inner(
         // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected
         // backend socket. Best-effort: a `setsockopt` failure logs and
         // continues rather than dropping the connection.
-        apply_backend_tcp_keepalive(proxy_id, &backend_stream, params.tcp_keepalive.as_ref());
+        apply_backend_tcp_keepalive(
+            proxy_id,
+            &backend_stream,
+            passthrough_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
+        );
 
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
 
