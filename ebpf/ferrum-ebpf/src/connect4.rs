@@ -55,10 +55,10 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     let include_key = LpmKey::new(32, CidrKey4::host(dst_ip));
     let include_cidr_match = FERRUM_CIDR_INCLUDE4.get(&include_key).is_some();
 
-    // Include CIDRs and includeOutboundPorts are additive: capture when either
-    // the destination IP matches include CIDRs OR the destination port is
-    // admitted by the per-cgroup includeOutboundPorts policy.
-    if !include_cidr_match && !include_port_allowed(dst_port) {
+    // When a pod has explicit includeOutboundPorts entries (non-wildcard),
+    // that per-cgroup policy narrows capture and must not be widened by the
+    // node-global implicit include CIDR default (0.0.0.0/0).
+    if !capture_allowed(dst_port, include_cidr_match) {
         return Ok(1);
     }
 
@@ -88,18 +88,22 @@ fn outbound_capture_port() -> u32 {
     }
 }
 
-/// Honor `traffic.sidecar.istio.io/includeOutboundPorts`. Returns `true`
-/// only when a per-cgroup policy exists and admits the destination port
-/// (wildcard policy or explicit allow-list match). Lookup is keyed by the calling
-/// task's cgroup id, so each annotated pod gets its own per-cgroup
-/// policy.
 #[inline(always)]
-fn include_port_allowed(dst_port: u16) -> bool {
+fn capture_allowed(dst_port: u16, include_cidr_match: bool) -> bool {
     let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
     let Some(policy) = (unsafe { FERRUM_INCLUDE_PORTS.get(&cgroup_id) }) else {
-        // No per-cgroup policy means no annotation-driven port expansion.
-        return false;
+        return include_cidr_match;
     };
+
+    if policy.all_ports != 0 {
+        return true;
+    }
+
+    let count = policy.port_count as usize;
+    if count == 0 {
+        return include_cidr_match;
+    }
+
     policy_admits_port(policy, dst_port)
 }
 
