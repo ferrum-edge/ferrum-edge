@@ -427,13 +427,10 @@ pub(crate) fn record_backend_outcome(
     // Record backend TTFB for least-latency load balancing (passive path).
     // Only record when:
     //   1. No connection error (timeouts/refused don't reflect real latency)
-    //   2. Response is non-5xx (error responses may have artificially low latency
-    //      from fast-failing backends, which would skew the EWMA toward broken targets)
-    //   3. No active health checks configured for this upstream — when active probes
+    //   2. No active health checks configured for this upstream — when active probes
     //      exist, they provide consistent, controlled RTT measurements and take
     //      precedence over passive TTFB which includes variable application processing time
     if !connection_error
-        && response_status < 500
         && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
     {
         let upstream = LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id);
