@@ -470,13 +470,17 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Failed to create Redis client for rate limiting"
                 );
+                self.mark_unavailable();
                 self.start_health_checker_if_needed();
                 return None;
             }
         };
 
-        match redis::aio::ConnectionManager::new(client).await {
-            Ok(manager) => {
+        let connect_timeout = Duration::from_secs(self.config.connect_timeout_seconds);
+        match tokio::time::timeout(connect_timeout, redis::aio::ConnectionManager::new(client))
+            .await
+        {
+            Ok(Ok(manager)) => {
                 self.available.store(true, Ordering::Relaxed);
                 info!(
                     redis_url = %self.config.url,
@@ -487,12 +491,23 @@ impl RedisRateLimitClient {
                 self.connection.store(Arc::new(Some(manager.clone())));
                 Some(manager)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(
                     redis_url = %self.config.url,
                     error = %e,
                     "Failed to connect to Redis for rate limiting — falling back to local"
                 );
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                None
+            }
+            Err(_) => {
+                warn!(
+                    redis_url = %self.config.url,
+                    timeout_seconds = self.config.connect_timeout_seconds,
+                    "Timed out connecting to Redis for rate limiting — falling back to local"
+                );
+                self.mark_unavailable();
                 self.start_health_checker_if_needed();
                 None
             }
