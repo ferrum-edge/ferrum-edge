@@ -18,7 +18,9 @@ use super::{
 };
 use crate::config::types::{PluginConfig, Proxy};
 
-const ZERO_WEIGHT_BACKEND_HOST: &str = "ferrum-zero-weight.invalid";
+// Use an absolute DNS name (trailing dot) so resolvers must query this exact
+// label and cannot append search domains from resolv.conf.
+const ZERO_WEIGHT_BACKEND_HOST: &str = "ferrum-zero-weight.invalid.";
 const ZERO_WEIGHT_BACKEND_PORT: u16 = 65535;
 const GATEWAY_API_DISPATCH_PRECEDENCE_KEY: &str = "_ferrum_gateway_api_precedence";
 
