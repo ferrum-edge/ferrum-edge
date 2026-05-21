@@ -736,6 +736,13 @@ pub enum MtlsMode {
     IstioMutual,
 }
 
+impl MtlsMode {
+    #[inline]
+    pub fn is_peer_auth_mode(self) -> bool {
+        matches!(self, Self::Strict | Self::Permissive | Self::Disable)
+    }
+}
+
 // ── ServiceEntry ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1762,6 +1769,20 @@ fn validate_mesh_config_internal(
                 "PeerAuthentication '{}': namespace must not be empty",
                 pa.name
             ));
+        }
+        if !pa.mtls_mode.is_peer_auth_mode() {
+            errors.push(format!(
+                "PeerAuthentication '{}': mtls_mode '{:?}' is invalid for server-side policy",
+                pa.name, pa.mtls_mode
+            ));
+        }
+        for (port, mode) in &pa.port_overrides {
+            if !mode.is_peer_auth_mode() {
+                errors.push(format!(
+                    "PeerAuthentication '{}': port_overrides[{port}] mode '{mode:?}' is invalid for server-side policy",
+                    pa.name
+                ));
+            }
         }
     }
 

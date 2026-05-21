@@ -338,6 +338,48 @@ fn peer_authentication_requires_namespace() {
 }
 
 #[test]
+fn peer_authentication_rejects_client_side_mtls_mode() {
+    let pa = PeerAuthentication {
+        name: "pa".into(),
+        namespace: "default".into(),
+        scope: None,
+        selector: None,
+        mtls_mode: ferrum_edge::modes::mesh::config::MtlsMode::Simple,
+        port_overrides: HashMap::new(),
+    };
+    let errors = validate_mesh_config(&[], &[], &[], &[pa], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("mtls_mode") && e.contains("invalid for server-side policy")),
+        "expected invalid mtls_mode error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(15006, ferrum_edge::modes::mesh::config::MtlsMode::IstioMutual);
+    let pa = PeerAuthentication {
+        name: "pa".into(),
+        namespace: "default".into(),
+        scope: None,
+        selector: None,
+        mtls_mode: ferrum_edge::modes::mesh::config::MtlsMode::Strict,
+        port_overrides,
+    };
+    let errors = validate_mesh_config(&[], &[], &[], &[pa], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("port_overrides[15006]") && e.contains("invalid for server-side policy")),
+        "expected invalid port override mtls_mode error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
 fn request_authentication_accepts_inline_jwks_multi_audience_and_custom_locations() {
     let ra = MeshRequestAuthentication {
         name: "jwt".into(),
