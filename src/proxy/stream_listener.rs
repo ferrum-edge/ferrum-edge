@@ -101,14 +101,10 @@ pub struct StreamListenerManager {
     /// loaded after `ProxyState::new()` (e.g., file mode where TLS certs are
     /// validated after the proxy state is built).
     frontend_tls_config: Arc<arc_swap::ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
-    /// DTLS cert/key paths for frontend DTLS termination on UDP proxies.
-    /// When a UDP proxy has `frontend_tls: true`, these paths are used to build
-    /// the DTLS server config. Requires ECDSA P-256 or P-384 certificates.
-    frontend_dtls_cert_key: arc_swap::ArcSwap<Option<(String, String)>>,
-    /// Optional DTLS client CA certificate path for frontend mTLS.
-    /// When set, the gateway requires and verifies client DTLS certificates
-    /// using this trust store (separate from TCP TLS client CA).
-    frontend_dtls_client_ca_path: arc_swap::ArcSwap<Option<String>>,
+    /// DTLS frontend material for UDP stream proxies with `frontend_tls: true`.
+    /// Stored as a single ArcSwap payload so cert/key and optional client-CA
+    /// path are published atomically to reconcile() and listener startup.
+    frontend_dtls_material: arc_swap::ArcSwap<Option<(String, String, Option<String>)>>,
     /// Global override to disable backend TLS certificate verification.
     tls_no_verify: bool,
     /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
@@ -350,8 +346,7 @@ impl StreamListenerManager {
             request_epoch,
             circuit_breaker_cache,
             frontend_tls_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(frontend_tls_config))),
-            frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
-            frontend_dtls_client_ca_path: arc_swap::ArcSwap::new(Arc::new(None)),
+            frontend_dtls_material: arc_swap::ArcSwap::new(Arc::new(None)),
             tls_no_verify,
             tls_ca_bundle_path,
             tcp_idle_timeout_seconds,
@@ -426,10 +421,11 @@ impl StreamListenerManager {
         key_path: String,
         client_ca_cert_path: Option<String>,
     ) {
-        self.frontend_dtls_cert_key
-            .store(Arc::new(Some((cert_path, key_path))));
-        self.frontend_dtls_client_ca_path
-            .store(Arc::new(client_ca_cert_path));
+        self.frontend_dtls_material.store(Arc::new(Some((
+            cert_path,
+            key_path,
+            client_ca_cert_path,
+        ))));
         // Reconcile to start any listeners that were deferred due to missing DTLS config.
         let failures = self.reconcile().await;
         for (proxy_id, port, err) in &failures {
@@ -709,7 +705,7 @@ impl StreamListenerManager {
             // Passthrough proxies never terminate TLS, so they skip this check entirely.
             if *frontend_tls && !*passthrough {
                 if scheme.is_udp() {
-                    if self.frontend_dtls_cert_key.load().is_none() {
+                    if self.frontend_dtls_material.load().is_none() {
                         info!(
                             proxy_id = %proxy_id,
                             port = port,
@@ -770,15 +766,13 @@ impl StreamListenerManager {
                 // UDP or DTLS listener
                 // Passthrough proxies forward raw encrypted datagrams — no DTLS termination.
                 let frontend_dtls_config = if *frontend_tls && !*passthrough {
-                    let paths = self.frontend_dtls_cert_key.load();
-                    match paths.as_ref() {
-                        Some((cert_path, key_path)) => {
-                            let client_ca = self.frontend_dtls_client_ca_path.load();
-                            let client_ca_ref = client_ca.as_deref();
+                    let dtls_material = self.frontend_dtls_material.load();
+                    match dtls_material.as_ref() {
+                        Some((cert_path, key_path, client_ca_cert_path)) => {
                             match crate::dtls::build_frontend_dtls_config(
                                 cert_path,
                                 key_path,
-                                client_ca_ref,
+                                client_ca_cert_path.as_deref(),
                                 &self.crls,
                             ) {
                                 Ok(cfg) => Some(cfg),
