@@ -232,7 +232,10 @@ impl AuthMechanism for HmacAuth {
                 .metadata
                 .get("request_protocol")
                 .is_some_and(|protocol| protocol.eq_ignore_ascii_case("hbone"));
-        if is_hbone_connect && ctx.request_body_bytes.is_none() && !ctx.metadata.contains_key("request_body") {
+        if is_hbone_connect
+            && ctx.request_body_bytes.is_none()
+            && !ctx.metadata.contains_key("request_body")
+        {
             return ExtractedCredential::InvalidFormat(
                 r#"{"error":"HBONE CONNECT is incompatible with hmac_auth request-body digest verification"}"#.to_string(),
             );
