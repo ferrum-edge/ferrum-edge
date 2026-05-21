@@ -3,12 +3,12 @@ use std::net::IpAddr;
 
 use percent_encoding::percent_decode_str;
 
+use super::Waf;
 use super::decode;
 use super::rules::{
     BytesRuleSet, JsonPathMatcher, JsonPathRule, JsonPathSegment, RuleHit, RuleRef, RuleTarget,
     TextRuleSet, extract_ip_tokens,
 };
-use super::{WAF_INTERNAL_EXEMPT_KEY, Waf};
 use crate::plugins::RequestContext;
 
 #[derive(Debug, Default)]
@@ -521,9 +521,6 @@ impl Waf {
         ctx: &RequestContext,
         header_name: Option<&str>,
     ) {
-        if ctx.metadata.contains_key(WAF_INTERNAL_EXEMPT_KEY) {
-            return;
-        }
         let rule = &self.compiled.rules[rule_ref.rule_index];
         if rule_ref.matches_header(header_name)
             && rule.matches_conditions(ctx)
@@ -544,9 +541,6 @@ impl Waf {
         rule_ref: &RuleRef,
         ctx: &RequestContext,
     ) {
-        if ctx.metadata.contains_key(WAF_INTERNAL_EXEMPT_KEY) {
-            return;
-        }
         let rule = &self.compiled.rules[rule_ref.rule_index];
         if rule.matches_conditions(ctx) && !self.exemptions.suppresses_rule_for_request(ctx) {
             outcome.push(RuleHit {

@@ -34,8 +34,6 @@ use self::scan::ScanOutcome;
 use super::utils::sse::is_sse_request;
 use super::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
 
-pub(super) const WAF_INTERNAL_EXEMPT_KEY: &str = "__waf.exempt";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalMode {
     Enforce,
@@ -228,17 +226,8 @@ impl Waf {
         })
     }
 
-    fn request_is_exempt(&self, ctx: &mut RequestContext) -> bool {
-        let exempt = self.exemptions.request_short_circuits(ctx);
-        if exempt {
-            ctx.metadata
-                .insert(WAF_INTERNAL_EXEMPT_KEY.to_string(), "true".to_string());
-        }
-        exempt
-    }
-
-    fn remove_internal_metadata(ctx: &mut RequestContext) {
-        ctx.metadata.remove(WAF_INTERNAL_EXEMPT_KEY);
+    fn request_is_exempt(&self, ctx: &RequestContext) -> bool {
+        self.exemptions.request_short_circuits(ctx)
     }
 
     fn should_inspect_body_content_type(&self, content_type: Option<&str>) -> bool {
@@ -472,11 +461,9 @@ impl Plugin for Waf {
             return PluginResult::Continue;
         }
         if self.request_is_exempt(ctx) {
-            Self::remove_internal_metadata(ctx);
             return PluginResult::Continue;
         }
         let outcome = self.run_cheap_scan(ctx);
-        Self::remove_internal_metadata(ctx);
         self.finish_scan(ctx, outcome)
     }
 

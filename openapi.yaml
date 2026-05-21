@@ -8112,6 +8112,25 @@ components:
         target:
           oneOf:
             - type: string
+              enum:
+                - header_names
+                - header_values
+                - request_headers
+                - query_keys
+                - query_values
+                - request_query
+                - cookies
+                - url_path
+                - request_path
+                - full_url
+                - request_url
+                - method
+                - request_method
+                - body_text
+                - request_body
+                - body_json_path
+                - response_headers
+                - response_body
             - type: object
               required: [type]
               properties:
