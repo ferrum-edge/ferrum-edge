@@ -1394,15 +1394,33 @@ impl Plugin for BodyValidator {
         }
 
         if body.is_empty() {
-            return PluginResult::Continue;
+            if matches!(response_status, 100..=199 | 204 | 304) {
+                return PluginResult::Continue;
+            }
+            return PluginResult::Reject {
+                status_code: 502,
+                body: serde_json::json!({
+                    "error": "Response body validation failed",
+                    "details": "body_validator: response body is empty"
+                })
+                .to_string(),
+                headers: HashMap::new(),
+            };
         }
 
         // Convert body bytes to string for validation
         let body_str = match std::str::from_utf8(body) {
             Ok(s) => s,
             Err(_) => {
-                debug!("body_validator: response body is not valid UTF-8, skipping validation");
-                return PluginResult::Continue;
+                return PluginResult::Reject {
+                    status_code: 502,
+                    body: serde_json::json!({
+                        "error": "Response body validation failed",
+                        "details": "body_validator: response body is not valid UTF-8"
+                    })
+                    .to_string(),
+                    headers: HashMap::new(),
+                };
             }
         };
 

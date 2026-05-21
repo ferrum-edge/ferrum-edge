@@ -1201,17 +1201,44 @@ async fn test_response_json_invalid_json() {
 }
 
 #[tokio::test]
-async fn test_response_json_empty_body_skipped() {
+async fn test_response_json_empty_body_rejected_for_body_status() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    let mut ctx = make_response_ctx();
+    let headers = response_json_headers();
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, b"")
+            .await,
+        Some(502),
+    );
+}
+
+
+#[tokio::test]
+async fn test_response_json_empty_body_allowed_for_204() {
     let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
     let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, b"")
+            .on_final_response_body(&mut ctx, 204, &headers, b"")
             .await,
     );
 }
 
+#[tokio::test]
+async fn test_response_json_invalid_utf8_rejected() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    let mut ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = &[0xff, 0xfe, 0xfd];
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .await,
+        Some(502),
+    );
+}
 #[tokio::test]
 async fn test_response_json_non_matching_content_type_skipped() {
     let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
