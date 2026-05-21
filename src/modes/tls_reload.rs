@@ -121,7 +121,6 @@ fn build_proxy_rebuild_fn(
     crls: &CrlList,
 ) -> FrontendTlsRebuildFn {
     let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.clone();
-    let no_verify = env_config.tls_no_verify;
     let warning_days = env_config.tls_cert_expiry_warning_days;
     let ktls_could_be_enabled = env_config.ktls_enabled.could_be_enabled();
     let policy = tls_policy.clone();
@@ -139,7 +138,7 @@ fn build_proxy_rebuild_fn(
                 cert_path_str,
                 key_path_str,
                 client_ca_bundle_path.as_deref(),
-                no_verify,
+                false,
                 &policy,
                 warning_days,
                 &crls,
