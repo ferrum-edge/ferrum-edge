@@ -706,6 +706,7 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
 /// or 1, e.g. tokio's `LocalSet`-based tests), this falls back to the original
 /// single-task probe.
 async fn measure_event_loop_latency() -> Duration {
+    const EVENT_LOOP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
     let num_workers = tokio::runtime::Handle::current().metrics().num_workers();
 
     // Single-threaded fallback: just measure our own reschedule.
@@ -725,14 +726,22 @@ async fn measure_event_loop_latency() -> Duration {
     }
 
     let mut max_latency = Duration::ZERO;
-    while let Some(result) = probes.join_next().await {
-        // A probe task panicking is unexpected (yield_now never panics) but if
-        // it ever happens, prefer continuing over aborting the monitor cycle.
-        if let Ok(latency) = result
-            && latency > max_latency
-        {
-            max_latency = latency;
+    let drain_result = tokio::time::timeout(EVENT_LOOP_PROBE_TIMEOUT, async {
+        while let Some(result) = probes.join_next().await {
+            // A probe task panicking is unexpected (yield_now never panics) but if
+            // it ever happens, prefer continuing over aborting the monitor cycle.
+            if let Ok(latency) = result
+                && latency > max_latency
+            {
+                max_latency = latency;
+            }
         }
+    })
+    .await;
+
+    if drain_result.is_err() {
+        probes.abort_all();
+        return max_latency.max(EVENT_LOOP_PROBE_TIMEOUT);
     }
     max_latency
 }
