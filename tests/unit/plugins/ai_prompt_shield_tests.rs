@@ -633,7 +633,7 @@ async fn test_regex_set_detects_multiple_pattern_types_in_one_pass() {
 // ─── ScanMode::All — structural keys are protected ─────────────────────
 
 #[tokio::test]
-async fn test_all_mode_does_not_redact_structural_keys() {
+async fn test_all_mode_redacts_nonstructural_and_sensitive_fields() {
     let plugin = AiPromptShield::new(&json!({
         "patterns": ["ip_address"],
         "scan_fields": "all",
@@ -656,7 +656,14 @@ async fn test_all_mode_does_not_redact_structural_keys() {
 
     let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
     assert_eq!(v["model"], "10.0.0.1", "structural model preserved");
-    assert_eq!(v["user"], "192.168.1.1", "structural user preserved");
+    assert!(
+        v["user"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:ip_address]"),
+        "user should be redacted in all-mode: {}",
+        v["user"]
+    );
     assert!(
         v["notes"]
             .as_str()

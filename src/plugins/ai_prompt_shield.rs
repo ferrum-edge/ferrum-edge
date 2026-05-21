@@ -31,10 +31,7 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "max_tokens",
     "max_output_tokens",
     "max_completion_tokens",
-    "user",
-    "name",
     "tool_call_id",
-    "function_call",
 ];
 
 /// Action to take when PII is detected.
