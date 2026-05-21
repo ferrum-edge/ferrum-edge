@@ -1261,6 +1261,20 @@ async fn process_datagram(
         .await?
     };
 
+    if !udp_datagram_allowed(
+        session.datagram_plugins.as_ref(),
+        client_addr,
+        &session.proxy_id,
+        session.proxy_name.as_deref(),
+        session.listen_port,
+        data.len(),
+        UdpDatagramDirection::ClientToBackend,
+    )
+    .await
+    {
+        return Ok(());
+    }
+
     // Record the per-datagram local (destination) address on the session the
     // first time the kernel exposes one. `OnceLock::set` is a no-op if already
     // set, so this is cheap on subsequent datagrams.
