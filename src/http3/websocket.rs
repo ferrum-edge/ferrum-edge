@@ -323,6 +323,7 @@ pub(crate) async fn handle_h3_websocket(
     proxy_headers: HashMap<String, String>,
     requires_ws_frame_hooks: bool,
     is_early_data: bool,
+    strip_len: usize,
 ) -> Result<(), anyhow::Error> {
     // Defense in depth: dispatcher already checked this. If the flag
     // got toggled mid-flight, return 501 rather than half-bridging.
@@ -477,6 +478,7 @@ pub(crate) async fn handle_h3_websocket(
                             &query_string,
                             &next.host,
                             next.port,
+                            strip_len,
                             next.path.as_deref(),
                         );
                         current_cb_target_key =
