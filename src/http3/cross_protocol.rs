@@ -1613,6 +1613,12 @@ where
     );
     let body_bytes = Bytes::from(body);
     record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
+    // `hmap` already contains the complete backend-bound header set
+    // (plugin-transformed end-to-end headers + canonical forwarding
+    // headers synthesized by this bridge). Passing the original
+    // `proxy_headers` again would let the shared gRPC core overwrite
+    // canonical forwarding values (`x-forwarded-*`, `via`, `forwarded`).
+    let empty_proxy_headers: HashMap<String, String> = HashMap::new();
     let mut result = proxy_grpc_request_from_bytes(
         hyper_method.clone(),
         hmap.clone(),
@@ -1621,7 +1627,7 @@ where
         &current_url,
         &state.grpc_pool,
         &state.dns_cache,
-        proxy_headers,
+        &empty_proxy_headers,
         stream_grpc_response,
         state.max_response_body_size_bytes,
     )
@@ -1721,7 +1727,7 @@ where
                 &current_url,
                 &state.grpc_pool,
                 &state.dns_cache,
-                proxy_headers,
+                &empty_proxy_headers,
                 stream_grpc_response,
                 state.max_response_body_size_bytes,
             )
