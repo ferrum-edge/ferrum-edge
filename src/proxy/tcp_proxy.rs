@@ -1319,18 +1319,8 @@ struct TcpConnParams {
     passthrough: bool,
     /// Whether TCP Fast Open is enabled (gated on `FERRUM_TCP_FASTOPEN_ENABLED`).
     tcp_fastopen_enabled: bool,
-    /// DestinationRule `connectionPool.tcp.maxConnections` for the resolved
-    /// destination port. When `Some(cap)`, the per-target inflight counter is
-    /// CAS-bumped before connect and `Err`s with a typed
-    /// [`BackendInflightAcquireError`] when the cap is already reached.
-    /// When `None`, the inflight counter is not consulted at all and the
-    /// hot path saves a DashMap lookup.
-    max_backend_connections: Option<u32>,
-    /// DestinationRule `connectionPool.tcp.tcpKeepalive` for the resolved
-    /// destination port. Applied via `socket_opts::apply_tcp_keepalive` after
-    /// the backend socket is connected (best-effort: a `setsockopt` failure
-    /// logs and continues rather than dropping the connection).
-    tcp_keepalive: Option<crate::config::types::TcpKeepaliveCfg>,
+    /// Flattened per-port dispatch overrides used by retry attempts.
+    dispatch_port_overrides: Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>,
 }
 
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
@@ -1659,10 +1649,6 @@ async fn handle_tcp_connection_inner(
         let effective_backend_connect_timeout_ms = port_override
             .and_then(|override_config| override_config.connect_timeout_ms)
             .unwrap_or(proxy.backend_connect_timeout_ms);
-        let max_backend_connections =
-            port_override.and_then(|override_config| override_config.max_connections);
-        let tcp_keepalive = port_override.and_then(|c| c.tcp_keepalive.clone());
-
         let params = TcpConnParams {
             backend_host,
             backend_port,
@@ -1681,8 +1667,7 @@ async fn handle_tcp_connection_inner(
             upstream_subset: proxy.upstream_subset.clone(),
             passthrough: proxy.passthrough,
             tcp_fastopen_enabled: tcp_fastopen,
-            max_backend_connections,
-            tcp_keepalive,
+            dispatch_port_overrides: proxy.dispatch_port_overrides.clone(),
         };
 
         (params, cb_info)
@@ -2184,63 +2169,60 @@ async fn handle_tcp_connection_inner(
         // target counts against the new target's counter, not the failed
         // one. `_backend_inflight_guard_attempt` is shadowed at every loop
         // entry — only the latest successful guard survives past the `break`.
-        let backend_inflight_guard_attempt =
-            match acquire_backend_inflight_slot(&params, metrics, &current_host, current_port) {
-                Ok(guard) => guard,
-                Err(reason) => {
-                    warn!(
-                        proxy_id = %proxy_id,
-                        backend = %format_backend_target(&current_host, current_port),
-                        reason = %reason,
-                        "TCP backend rejected: maxConnections reached"
-                    );
-                    if can_retry
-                        && attempt < max_retries
-                        && let Some(next) = try_next_target(
-                            &params,
-                            &current_host,
-                            current_port,
-                            &epoch.load_balancer,
+        let current_port_override = resolve_port_override(&params, current_port);
+        let backend_inflight_guard_attempt = match acquire_backend_inflight_slot(
+            current_port_override,
+            metrics,
+            &current_host,
+            current_port,
+        ) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                warn!(
+                    proxy_id = %proxy_id,
+                    backend = %format_backend_target(&current_host, current_port),
+                    reason = %reason,
+                    "TCP backend rejected: maxConnections reached"
+                );
+                if can_retry
+                    && attempt < max_retries
+                    && let Some(next) =
+                        try_next_target(&params, &current_host, current_port, &epoch.load_balancer)
+                {
+                    current_host = next.0;
+                    current_port = next.1;
+                    current_cb_info = TcpConnCbInfo {
+                        cb_config: current_cb_info.cb_config.clone(),
+                        cb_target_key: params.upstream_id.as_ref().map(|_| {
+                            crate::circuit_breaker::target_key(&current_host, current_port)
+                        }),
+                        is_half_open_probe: false,
+                    };
+                    backend_info.backend_target =
+                        format_backend_target(&current_host, current_port);
+                    backend_info.backend_resolved_ip = None;
+                    last_connect_err = Some(
+                        StreamSetupError::with_source(
+                            StreamSetupKind::BackendMaxConnectionsExceeded,
+                            format!("for {}", format_backend_target(&current_host, current_port)),
+                            reason,
                         )
-                    {
-                        current_host = next.0;
-                        current_port = next.1;
-                        current_cb_info = TcpConnCbInfo {
-                            cb_config: current_cb_info.cb_config.clone(),
-                            cb_target_key: params.upstream_id.as_ref().map(|_| {
-                                crate::circuit_breaker::target_key(&current_host, current_port)
-                            }),
-                            is_half_open_probe: false,
-                        };
-                        backend_info.backend_target =
-                            format_backend_target(&current_host, current_port);
-                        backend_info.backend_resolved_ip = None;
-                        last_connect_err = Some(
-                            StreamSetupError::with_source(
-                                StreamSetupKind::BackendMaxConnectionsExceeded,
-                                format!(
-                                    "for {}",
-                                    format_backend_target(&current_host, current_port)
-                                ),
-                                reason,
-                            )
-                            .into(),
-                        );
-                        attempt += 1;
-                        if let Some(ref retry_config) = params.retry {
-                            tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt))
-                                .await;
-                        }
-                        continue;
+                        .into(),
+                    );
+                    attempt += 1;
+                    if let Some(ref retry_config) = params.retry {
+                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
                     }
-                    return Err(StreamSetupError::with_source(
-                        StreamSetupKind::BackendMaxConnectionsExceeded,
-                        format!("for {}", format_backend_target(&current_host, current_port)),
-                        reason,
-                    )
-                    .into());
+                    continue;
                 }
-            };
+                return Err(StreamSetupError::with_source(
+                    StreamSetupKind::BackendMaxConnectionsExceeded,
+                    format!("for {}", format_backend_target(&current_host, current_port)),
+                    reason,
+                )
+                .into());
+            }
+        };
 
         // Attempt backend TCP connection (with optional TLS origination)
         let connect_result = if is_backend_tls {
@@ -2251,7 +2233,7 @@ async fn handle_tcp_connection_inner(
                 cached_backend_tls,
                 params.tcp_fastopen_enabled,
                 overload,
-                params.tcp_keepalive.as_ref(),
+                current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
                 proxy_id,
             )
             .await
@@ -2260,7 +2242,11 @@ async fn handle_tcp_connection_inner(
             connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
                 .await
                 .inspect(|stream| {
-                    apply_backend_tcp_keepalive(proxy_id, stream, params.tcp_keepalive.as_ref());
+                    apply_backend_tcp_keepalive(
+                        proxy_id,
+                        stream,
+                        current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
+                    );
                 })
                 .map(BackendStream::Plain)
         };
@@ -2680,13 +2666,24 @@ fn try_next_target(
 ///   * `Ok(Some(guard))` when a slot was acquired. The guard's `Drop` impl
 ///     decrements the counter.
 ///   * `Err(BackendInflightAcquireError)` when the cap is already reached.
-fn acquire_backend_inflight_slot(
+fn resolve_port_override(
     params: &TcpConnParams,
+    port: u16,
+) -> Option<&crate::config::types::ResolvedPortOverride> {
+    params
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|m| m.get(&port))
+}
+
+fn acquire_backend_inflight_slot(
+    port_override: Option<&crate::config::types::ResolvedPortOverride>,
     metrics: &TcpProxyMetrics,
     host: &str,
     port: u16,
 ) -> Result<Option<BackendInflightGuard>, BackendInflightAcquireError> {
-    let Some(cap) = params.max_backend_connections else {
+    let Some(cap) = port_override.and_then(|override_config| override_config.max_connections)
+    else {
         return Ok(None);
     };
     let guard = BackendInflightGuard::try_acquire(&metrics.backend_inflight, host, port, cap)?;
