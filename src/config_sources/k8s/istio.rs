@@ -2372,16 +2372,18 @@ fn route_backends(
     }
     if skipped_zero > 0 {
         if backends.is_empty() && !active_route_without_backend {
-            acc.warnings.push(format!(
-                "VirtualService '{}' HTTP route {} has only zero-weight split destinations; no proxy was materialized",
-                object.metadata.name, route_index
-            ));
-        } else {
-            acc.warnings.push(format!(
-                "VirtualService '{}' HTTP route {} skipped {} zero-weight split destination(s)",
-                object.metadata.name, route_index, skipped_zero
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService '{}' HTTP route {} has only zero-weight split destinations",
+                    object.metadata.name, route_index
+                ),
             ));
         }
+        acc.warnings.push(format!(
+            "VirtualService '{}' HTTP route {} skipped {} zero-weight split destination(s)",
+            object.metadata.name, route_index, skipped_zero
+        ));
     }
     Ok(backends)
 }
@@ -4739,8 +4741,8 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_skips_all_omitted_weights_in_multi_destination_split() {
-        let result = translate_k8s_objects(
+    fn virtual_service_rejects_all_omitted_weights_in_multi_destination_split() {
+        let err = translate_k8s_objects(
             &[object(
                 "VirtualService",
                 serde_json::json!({
@@ -4756,15 +4758,10 @@ mod tests {
             )],
             options(),
         )
-        .expect("translation succeeds");
-
-        assert!(result.config.proxies.is_empty());
-        assert!(result.config.upstreams.is_empty());
+        .expect_err("translation rejects all omitted split weights");
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("only zero-weight"))
+            err.to_string()
+                .contains("has only zero-weight split destinations")
         );
     }
 
