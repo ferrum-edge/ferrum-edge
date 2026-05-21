@@ -32,6 +32,7 @@ const DNS_MAX_TCP_PACKET_SIZE: usize = u16::MAX as usize;
 const DNS_UPSTREAM_TIMEOUT_SECS: u64 = 5;
 const DNS_UPSTREAM_ID_SPACE: usize = u16::MAX as usize + 1;
 const DNS_TCP_QUERY_READ_TIMEOUT_SECS: u64 = 5;
+const DNS_TCP_WRITE_TIMEOUT_SECS: u64 = 5;
 pub const DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES: usize = 4096;
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
@@ -867,14 +868,28 @@ async fn write_dns_tcp_response(stream: &mut TcpStream, response: &[u8]) -> bool
         );
         return false;
     }
-    if stream
-        .write_all(&(response.len() as u16).to_be_bytes())
-        .await
-        .is_err()
+    let write_timeout = Duration::from_secs(DNS_TCP_WRITE_TIMEOUT_SECS);
+    match tokio::time::timeout(
+        write_timeout,
+        stream.write_all(&(response.len() as u16).to_be_bytes()),
+    )
+    .await
     {
-        return false;
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => return false,
+        Err(_) => {
+            warn!("Timed out writing DNS TCP response length");
+            return false;
+        }
     }
-    stream.write_all(response).await.is_ok()
+    match tokio::time::timeout(write_timeout, stream.write_all(response)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            warn!(response_bytes = response.len(), "Timed out writing DNS TCP response payload");
+            false
+        }
+    }
 }
 
 fn evaluate_dns_query(
