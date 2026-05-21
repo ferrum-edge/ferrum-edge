@@ -83,7 +83,7 @@ struct IndexedRegexRoutes {
     entries: Vec<RegexRouteEntry>,
     /// All patterns compiled into a single DFA for O(1) multi-pattern matching.
     /// Index correspondence: `regex_set` pattern at index i matches `entries[i]`.
-    regex_set: RegexSet,
+    regex_set: Option<RegexSet>,
 }
 
 impl IndexedRegexRoutes {
@@ -91,12 +91,16 @@ impl IndexedRegexRoutes {
     /// The RegexSet is compiled from the same anchored patterns used by individual entries.
     fn new(entries: Vec<RegexRouteEntry>) -> Self {
         let patterns: Vec<&str> = entries.iter().map(|e| e.pattern.as_str()).collect();
-        // RegexSet::new cannot fail here because all patterns were already individually
-        // compiled as Regex (invalid patterns were skipped with a warning during build_route_table).
-        let regex_set = RegexSet::new(&patterns).unwrap_or_else(|e| {
-            warn!(error = %e, "RegexSet compilation failed — falling back to empty set");
-            RegexSet::empty()
-        });
+        let regex_set = match RegexSet::new(&patterns) {
+            Ok(set) => Some(set),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "RegexSet compilation failed — falling back to linear regex matching"
+                );
+                None
+            }
+        };
         Self { entries, regex_set }
     }
 
@@ -1149,14 +1153,24 @@ fn find_regex_match_indexed(routes: &IndexedRegexRoutes, path: &str) -> Option<R
         return None;
     }
 
-    // O(1) amortized: single DFA pass tests all patterns simultaneously
-    let matches = routes.regex_set.matches(path);
-    // First matching index preserves config-order semantics (first-match-wins)
-    let winner_idx = matches.iter().next()?;
+    let (entry, captures) = if let Some(regex_set) = &routes.regex_set {
+        // O(1) amortized: single DFA pass tests all patterns simultaneously
+        let matches = regex_set.matches(path);
+        // First matching index preserves config-order semantics (first-match-wins)
+        let winner_idx = matches.iter().next()?;
+        let entry = &routes.entries[winner_idx];
+        // Only run captures() on the single winning pattern
+        let captures = entry.pattern.captures(path)?;
+        (entry, captures)
+    } else {
+        // Fallback preserves route behavior when aggregate RegexSet compilation fails.
+        let (entry, captures) = routes
+            .entries
+            .iter()
+            .find_map(|entry| entry.pattern.captures(path).map(|caps| (entry, caps)))?;
+        (entry, captures)
+    };
 
-    let entry = &routes.entries[winner_idx];
-    // Only run captures() on the single winning pattern
-    let captures = entry.pattern.captures(path)?;
     let matched_len = captures.get(0).map(|m| m.end()).unwrap_or(0);
 
     let path_params: Vec<(String, String)> = entry
