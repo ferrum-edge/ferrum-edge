@@ -122,13 +122,8 @@ fn namespaces_referenced_by_config(config: &GatewayConfig) -> Vec<String> {
     normalize_namespace_list(&namespaces)
 }
 
-fn retained_polled_namespaces(
-    config: &GatewayConfig,
-    broadcast_namespaces: &[String],
-) -> Vec<String> {
-    let mut namespaces = namespaces_referenced_by_config(config);
-    namespaces.extend(normalize_namespace_list(broadcast_namespaces));
-    normalize_namespace_list(&namespaces)
+fn retained_polled_namespaces(config: &GatewayConfig) -> Vec<String> {
+    namespaces_referenced_by_config(config)
 }
 
 /// Multi-namespace incremental poll. Calls `load_incremental_config` once
@@ -1161,9 +1156,7 @@ pub async fn run(
                         // without dropping namespaces still present in the
                         // current snapshot if discovery temporarily shrinks.
                         let current_snapshot = config_poll.load_full();
-                        let broadcast_namespaces = poll_broadcasts.namespaces();
-                        let retained_namespaces =
-                            retained_polled_namespaces(&current_snapshot, &broadcast_namespaces);
+                        let retained_namespaces = retained_polled_namespaces(&current_snapshot);
                         let nslist = resolve_polled_namespaces(
                             db_poll.as_ref(),
                             &poll_scope,
@@ -1229,9 +1222,7 @@ pub async fn run(
                         // dominate poll time. Snapshot the current config
                         // for per-namespace deletion routing.
                         let current_snapshot = config_poll.load_full();
-                        let broadcast_namespaces = poll_broadcasts.namespaces();
-                        let retained_namespaces =
-                            retained_polled_namespaces(&current_snapshot, &broadcast_namespaces);
+                        let retained_namespaces = retained_polled_namespaces(&current_snapshot);
                         let nslist = resolve_polled_namespaces(
                             db_poll.as_ref(),
                             &poll_scope,
@@ -1810,7 +1801,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_polled_namespaces_includes_resources_known_namespaces_and_subscribers() {
+    fn retained_polled_namespaces_includes_resources_and_known_namespaces() {
         let mut proxy = make_proxy("p1");
         proxy.namespace = "tenant-a".to_string();
         let config = GatewayConfig {
@@ -1819,8 +1810,8 @@ mod tests {
             ..Default::default()
         };
 
-        let retained = retained_polled_namespaces(&config, &["tenant-c".to_string()]);
-        assert_eq!(retained, vec!["tenant-a", "tenant-b", "tenant-c"]);
+        let retained = retained_polled_namespaces(&config);
+        assert_eq!(retained, vec!["tenant-a", "tenant-b"]);
     }
 
     #[test]
