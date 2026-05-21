@@ -2087,17 +2087,8 @@ impl EnvConfig {
             so_busy_poll_us: u32 = "FERRUM_SO_BUSY_POLL_US" => 0u32;
         }
 
-        // Keep this hand-written: the CP gRPC listener inherits the admin bind
-        // address when unset, so the default depends on another parsed field.
         let cp_grpc_listen_addr =
-            match env_config_macro::resolve_optional::<String>(conf, "FERRUM_CP_GRPC_LISTEN_ADDR")?
-            {
-                Some(addr) => Some(addr),
-                None if matches!(mode, OperatingMode::ControlPlane) => {
-                    Some(format!("{}:50051", admin_bind_address))
-                }
-                None => None,
-            };
+            env_config_macro::resolve_optional::<String>(conf, "FERRUM_CP_GRPC_LISTEN_ADDR")?;
 
         // Keep this hand-written: failover URLs are part of a broader
         // cross-variable validation path (TLS consistency vs. the primary).
@@ -2970,11 +2961,8 @@ impl EnvConfig {
             );
         }
 
-        if self.mode == OperatingMode::ControlPlane {
-            assert!(
-                self.cp_grpc_listen_addr.is_some(),
-                "cp_grpc_listen_addr is populated during from_env_with_conf()"
-            );
+        if self.mode == OperatingMode::ControlPlane && self.cp_grpc_listen_addr.is_none() {
+            return Err("FERRUM_CP_GRPC_LISTEN_ADDR is required in cp mode".into());
         }
 
         // Validate bind addresses are valid IP addresses

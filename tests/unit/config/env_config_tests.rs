@@ -394,11 +394,9 @@ fn test_env_config_cp_mode_missing_grpc_listen() {
         ],
         || {
             remove_var("FERRUM_CP_GRPC_LISTEN_ADDR");
-            let config = EnvConfig::from_env().unwrap();
-            assert_eq!(
-                config.cp_grpc_listen_addr,
-                Some("0.0.0.0:50051".to_string())
-            );
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("FERRUM_CP_GRPC_LISTEN_ADDR"));
         },
     );
 }
