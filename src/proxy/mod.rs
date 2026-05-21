@@ -5944,7 +5944,7 @@ where
         // a frame-level plugin or disable `FERRUM_WEBSOCKET_TUNNEL_MODE`).
         let mut backend = backend_ws_stream.into_inner();
         let mut client_io = client_io;
-        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+        let buf_size = adaptive_buffer.get_stream_copy_buffer_size(proxy_id);
         let result = tokio::io::copy_bidirectional_with_sizes(
             &mut client_io,
             &mut backend,

@@ -1862,7 +1862,7 @@ async fn handle_tcp_connection_inner(
         // continues rather than dropping the connection.
         apply_backend_tcp_keepalive(proxy_id, &backend_stream, params.tcp_keepalive.as_ref());
 
-        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+        let buf_size = adaptive_buffer.get_stream_copy_buffer_size(proxy_id);
 
         // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
         // Passthrough mode is always plain-to-plain (no TLS termination/origination).
@@ -2319,7 +2319,7 @@ async fn handle_tcp_connection_inner(
     let copy_result = match client_stream {
         ClientRelayStream::Tls(tls_stream) => {
             let tls_stream = *tls_stream;
-            let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+            let buf_size = adaptive_buffer.get_stream_copy_buffer_size(proxy_id);
             match backend_stream {
                 BackendStream::Tls(bs) => {
                     bidirectional_copy(
@@ -2420,7 +2420,7 @@ async fn handle_tcp_connection_inner(
             }
         }
         ClientRelayStream::Plain(client_stream) => {
-            let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+            let buf_size = adaptive_buffer.get_stream_copy_buffer_size(proxy_id);
             match backend_stream {
                 BackendStream::Tls(bs) => {
                     used_splice = false;

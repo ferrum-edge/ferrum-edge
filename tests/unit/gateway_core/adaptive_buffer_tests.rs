@@ -143,6 +143,19 @@ fn test_independent_proxy_state() {
     assert_eq!(tracker.get_buffer_size("proxy-2"), 256 * 1024); // Tier 3
 }
 
+#[test]
+fn test_stream_copy_buffer_size_is_capped_for_bulk_tier() {
+    let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 6000);
+    for _ in 0..5 {
+        tracker.record_connection("proxy-1", 10 * 1024 * 1024);
+    }
+
+    // Adaptive tiering still learns bulk class.
+    assert_eq!(tracker.get_buffer_size("proxy-1"), 256 * 1024);
+    // Stream copy paths are capped to historical 64 KiB to bound per-connection memory.
+    assert_eq!(tracker.get_stream_copy_buffer_size("proxy-1"), 64 * 1024);
+}
+
 // ── Batch limit tests ───────────────────────────────────────────────────────
 
 #[test]

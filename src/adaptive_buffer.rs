@@ -35,6 +35,12 @@ const BUFFER_TIER_SIZES: [usize; 4] = [
     256 * 1024, // Tier 3: bulk transfers
 ];
 
+/// Security cap for per-direction stream copy buffers.
+///
+/// Keeps TCP/WebSocket tunnel allocations bounded to the historical 64 KiB
+/// class even when adaptive EWMA is trained into higher tiers.
+const STREAM_COPY_BUFFER_CAP: usize = 64 * 1024;
+
 /// Upper bounds (exclusive) for bytes-per-connection EWMA → tier selection.
 const BUFFER_TIER_THRESHOLDS: [u64; 3] = [
     16 * 1024,  // < 16 KiB  → Tier 0
@@ -224,6 +230,15 @@ impl AdaptiveBufferTracker {
             }
         }
         BUFFER_TIER_SIZES[tier].clamp(self.min_buffer_size, self.max_buffer_size)
+    }
+
+    /// Returns the buffer size for stream copy loops (TCP / WebSocket tunnel).
+    ///
+    /// This applies a hard upper bound so remote traffic patterns cannot
+    /// amplify per-connection memory beyond the historical 64 KiB tier.
+    #[inline]
+    pub fn get_stream_copy_buffer_size(&self, proxy_id: &str) -> usize {
+        self.get_buffer_size(proxy_id).min(STREAM_COPY_BUFFER_CAP)
     }
 
     /// Record total bytes transferred on a completed connection.
