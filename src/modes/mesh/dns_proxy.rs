@@ -886,7 +886,10 @@ async fn write_dns_tcp_response(stream: &mut TcpStream, response: &[u8]) -> bool
         Ok(Ok(_)) => true,
         Ok(Err(_)) => false,
         Err(_) => {
-            warn!(response_bytes = response.len(), "Timed out writing DNS TCP response payload");
+            warn!(
+                response_bytes = response.len(),
+                "Timed out writing DNS TCP response payload"
+            );
             false
         }
     }
