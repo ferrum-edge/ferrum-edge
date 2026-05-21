@@ -200,7 +200,8 @@ async fn test_rate_limiting_ip_mode_authorize_is_noop() {
 
 #[tokio::test]
 async fn test_rate_limiting_consumer_mode_on_request_received_is_noop() {
-    // In consumer mode, on_request_received() should be a no-op (authorize handles limiting)
+    // In consumer mode, on_request_received() enforces an IP safety-net while
+    // authorize() enforces the consumer-specific limit.
     let config = json!({
         "window_seconds": 60,
         "max_requests": 1,
@@ -210,14 +211,14 @@ async fn test_rate_limiting_consumer_mode_on_request_received_is_noop() {
 
     let consumer = create_test_consumer();
 
-    // on_request_received should pass through in consumer mode
+    // on_request_received applies IP limiting
     let mut ctx = create_test_context();
     ctx.identified_consumer = Some(Arc::new(consumer.clone()));
     let result = plugin.on_request_received(&mut ctx).await;
     assert_continue(result);
     let result = plugin.on_request_received(&mut ctx).await;
-    assert_continue(result);
-    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    assert_reject(result, Some(429));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
 
     // authorize uses the limit for consumer mode
     let result = plugin.authorize(&mut ctx).await;

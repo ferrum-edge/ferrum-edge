@@ -260,11 +260,14 @@ impl Plugin for RateLimiting {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        if self.limit_by != LimitBy::Ip {
+        if self.limit_by == LimitBy::SpiffeIdentity {
             return PluginResult::Continue;
         }
 
-        let ip_key = self.request_key(ctx);
+        // Always enforce an early IP safety-net for IP and consumer modes so
+        // unauthenticated/auth-failed traffic is still throttled before
+        // authorize() has a resolved identity.
+        let ip_key = ip_key(&ctx.client_ip);
         self.check_rate(ip_key, ctx).await
     }
 
