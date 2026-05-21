@@ -2246,7 +2246,7 @@ fn test_env_config_db_tls_mode_parsed() {
 }
 
 #[test]
-fn test_env_config_ignores_removed_db_tls_aliases() {
+fn test_env_config_rejects_removed_db_tls_aliases() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
@@ -2267,15 +2267,9 @@ fn test_env_config_ignores_removed_db_tls_aliases() {
             remove_var("FERRUM_DB_TLS_CLIENT_CERT_PATH");
             remove_var("FERRUM_DB_TLS_CLIENT_KEY_PATH");
 
-            let config = EnvConfig::from_env().unwrap();
-            assert!(config.db_tls_mode.is_none());
-            assert!(config.db_tls_ca_cert_path.is_none());
-            assert!(config.db_tls_client_cert_path.is_none());
-            assert!(config.db_tls_client_key_path.is_none());
-            assert_eq!(
-                config.effective_db_url().unwrap().unwrap(),
-                "postgres://localhost/ferrum"
-            );
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(err.contains("Deprecated database TLS environment variables"));
+            assert!(err.contains("FERRUM_DB_SSL_MODE"));
         },
     );
 }

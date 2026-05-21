@@ -2723,6 +2723,26 @@ impl EnvConfig {
     }
 
     fn validate_db_tls_config(&self) -> Result<(), String> {
+        const DEPRECATED_DB_TLS_ENV_VARS: [&str; 6] = [
+            "FERRUM_DB_TLS_ENABLED",
+            "FERRUM_DB_TLS_INSECURE",
+            "FERRUM_DB_SSL_MODE",
+            "FERRUM_DB_SSL_ROOT_CERT",
+            "FERRUM_DB_SSL_CLIENT_CERT",
+            "FERRUM_DB_SSL_CLIENT_KEY",
+        ];
+
+        let deprecated_tls_vars: Vec<&str> = DEPRECATED_DB_TLS_ENV_VARS
+            .into_iter()
+            .filter(|name| std::env::var_os(name).is_some())
+            .collect();
+        if !deprecated_tls_vars.is_empty() {
+            return Err(format!(
+                "Deprecated database TLS environment variables are no longer supported: {}. Use FERRUM_DB_TLS_MODE and FERRUM_DB_TLS_{{CA_CERT_PATH,CLIENT_CERT_PATH,CLIENT_KEY_PATH}} instead.",
+                deprecated_tls_vars.join(", ")
+            ));
+        }
+
         let Some(db_type) = self.db_type.as_deref() else {
             return Ok(());
         };
