@@ -1280,7 +1280,7 @@ impl Plugin for BodyValidator {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.has_protobuf_request_validation {
+        if !self.has_request_validation {
             return PluginResult::Continue;
         }
 
@@ -1288,11 +1288,52 @@ impl Plugin for BodyValidator {
             .get("content-type")
             .map(String::as_str)
             .unwrap_or("");
-        if !is_grpc_content_type(content_type) {
+
+        if body.is_empty() {
             return PluginResult::Continue;
         }
 
-        if body.is_empty() {
+        if !is_grpc_content_type(content_type) {
+            if !content_type_matches(&self.content_types, content_type) {
+                return PluginResult::Continue;
+            }
+
+            let body_str = match std::str::from_utf8(body) {
+                Ok(value) => value,
+                Err(_) => {
+                    debug!("body_validator: request body is not valid UTF-8, skipping validation");
+                    return PluginResult::Continue;
+                }
+            };
+
+            let result = if is_json_like_content_type(content_type) {
+                self.validate_json_body(
+                    body_str,
+                    &self.required_fields,
+                    self.json_schema.as_ref(),
+                    &self.compiled_patterns,
+                )
+            } else if is_xml_like_content_type(content_type) && self.validate_xml {
+                Self::validate_xml_body(body_str, &self.required_xml_elements)
+            } else {
+                Ok(())
+            };
+
+            return match result {
+                Ok(()) => PluginResult::Continue,
+                Err(msg) => PluginResult::Reject {
+                    status_code: 400,
+                    body: serde_json::json!({
+                        "error": "Request body validation failed",
+                        "details": msg
+                    })
+                    .to_string(),
+                    headers: HashMap::new(),
+                },
+            };
+        }
+
+        if !self.has_protobuf_request_validation {
             return PluginResult::Continue;
         }
 

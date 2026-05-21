@@ -2091,3 +2091,15 @@ fn test_no_response_validation_never_buffers_even_for_non_sse() {
 
     assert!(!plugin.should_buffer_response_body(&ctx));
 }
+
+#[tokio::test]
+async fn test_on_final_request_body_validates_json_when_before_proxy_cannot() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let headers = make_json_headers();
+
+    let result = plugin
+        .on_final_request_body(&headers, br#"{"missing":"field"}"#)
+        .await;
+
+    assert_reject(result, 400, "Request body validation failed");
+}
