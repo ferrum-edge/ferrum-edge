@@ -18,7 +18,7 @@ env:
 jobs:
   fmt:
     name: Format Check
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -34,7 +34,7 @@ jobs:
 
   test-unit:
     name: Unit Tests
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -50,7 +50,7 @@ jobs:
 
   test-lib:
     name: Inline Lib Tests
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -71,7 +71,7 @@ jobs:
 
   test-integration:
     name: Integration Tests
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -87,7 +87,7 @@ jobs:
 
   test-conformance:
     name: Mesh Conformance Tests
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -115,7 +115,7 @@ jobs:
 
   build-gateway-binary:
     name: Build Gateway Binary (functional tests)
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -141,7 +141,7 @@ jobs:
 
   test-functional:
     name: Functional Tests (${{ matrix.shard }})
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: build-gateway-binary
     runs-on: ubuntu-latest
     strategy:
@@ -334,7 +334,7 @@ jobs:
 
   gateway-api-conformance:
     name: Gateway API Conformance
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -551,7 +551,7 @@ jobs:
 
   test:
     name: Tests
-    if: always() && github.event_name == 'pull_request'
+    if: always() && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     needs:
       - test-unit
       - test-lib
@@ -588,7 +588,7 @@ jobs:
 
   lint:
     name: Lint
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -603,7 +603,7 @@ jobs:
 
   build-ebpf:
     name: Build eBPF Programs
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -657,7 +657,7 @@ jobs:
 
   performance-regression:
     name: Performance Regression Check
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -762,6 +762,7 @@ jobs:
   build-binaries:
     name: Build (${{ matrix.asset_name }})
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: [fmt, test, lint, performance-regression]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
