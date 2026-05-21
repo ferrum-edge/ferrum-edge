@@ -23,6 +23,7 @@ use crate::k8s_controller::resource_store::ResourceStoreSet;
 use crate::k8s_controller::status::{GatewayApiStatusWriter, plan_gateway_api_status_updates};
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = 256;
 
 pub struct ReconcilerConfig {
     pub namespace: String,
@@ -430,9 +431,17 @@ async fn patch_gateway_api_statuses(
     let Some(writer) = writer else {
         return;
     };
-    let updates = plan_gateway_api_status_updates(objects, options, route_conflicts);
+    let mut updates = plan_gateway_api_status_updates(objects, options, route_conflicts);
     if updates.is_empty() {
         return;
+    }
+    if updates.len() > GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP {
+        warn!(
+            updates = updates.len(),
+            cap = GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP,
+            "Capping Gateway API status updates for this reconcile round"
+        );
+        updates.truncate(GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP);
     }
     if let Err(error) = writer.patch_updates(&updates).await {
         warn!(

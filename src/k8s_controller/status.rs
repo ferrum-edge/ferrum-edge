@@ -1,4 +1,4 @@
-use futures_util::future::join_all;
+use futures_util::StreamExt;
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
@@ -12,6 +12,7 @@ use crate::config_sources::k8s::{
 };
 
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
+const GATEWAY_API_STATUS_PATCH_PARALLELISM: usize = 32;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayApiStatusUpdate {
@@ -91,12 +92,12 @@ impl GatewayApiStatusWriter {
                 (kind, namespace, name, result)
             })
         });
-        // Patch each Gateway API status in parallel. The Kubernetes API server
-        // serializes mutations through resourceVersion conflicts; this only
-        // pipelines independent objects so each round-trip's RTT does not
-        // serialize the reconciler loop on large clusters.
         let mut first_error: Option<kube::Error> = None;
-        for (kind, namespace, name, result) in join_all(futures).await {
+        // Patch Gateway API status updates with bounded concurrency so bursty
+        // reconcile rounds cannot fan out unbounded API requests.
+        let mut stream = futures_util::stream::iter(futures)
+            .buffer_unordered(GATEWAY_API_STATUS_PATCH_PARALLELISM);
+        while let Some((kind, namespace, name, result)) = stream.next().await {
             if let Err(error) = result {
                 warn!(
                     %kind,
