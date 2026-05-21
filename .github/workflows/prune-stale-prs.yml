@@ -45,10 +45,12 @@ jobs:
         run: |
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
           echo "Dry run mode: $DRY_RUN"
+          REPO_OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
           
-          # Get all merged PRs (both merged and closed)
-          MERGED_PRS=$(gh pr list --state merged --json headRefName,number --jq '.[].headRefName')
-          CLOSED_PRS=$(gh pr list --state closed --json headRefName,number --jq '.[].headRefName')
+          # Get merged/closed PRs whose head repo is this repository (exclude forks)
+          MERGED_PRS=$(gh pr list --state merged --json headRefName,headRepositoryOwner,headRepository --jq "map(select(.headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[].headRefName")
+          CLOSED_PRS=$(gh pr list --state closed --json headRefName,headRepositoryOwner,headRepository --jq "map(select(.headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[].headRefName")
           
           # Combine and remove duplicates
           ALL_PR_BRANCHES=$(echo -e "$MERGED_PRS\n$CLOSED_PRS" | sort -u)
@@ -114,13 +116,15 @@ jobs:
           
           echo "Dry run mode: $DRY_RUN"
           echo "Stale threshold: $DAYS_STALE days"
+          REPO_OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
           
           # Calculate cutoff date
           CUTOFF_DATE=$(date -d "$DAYS_STALE days ago" +%Y-%m-%dT%H:%M:%SZ)
           echo "Cutoff date: $CUTOFF_DATE"
           
           # Get closed PRs older than threshold that weren't merged
-          STALE_PRS=$(gh pr list --state closed --json headRefName,number,closedAt,mergedAt --jq "map(select(.mergedAt == null and .closedAt < \"$CUTOFF_DATE\")) | .[].headRefName")
+          STALE_PRS=$(gh pr list --state closed --json headRefName,number,closedAt,mergedAt,headRepositoryOwner,headRepository --jq "map(select(.mergedAt == null and .closedAt < \"$CUTOFF_DATE\" and .headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[].headRefName")
           
           DELETED_COUNT=0
           
