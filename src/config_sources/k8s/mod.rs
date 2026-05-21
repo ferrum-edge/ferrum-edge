@@ -1147,13 +1147,6 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     route_policy: MeshRouteDispatchPolicy<'_>,
     uri_less_only: bool,
 ) -> (Vec<Value>, bool) {
-    let Some(matches) = http.get("match").and_then(Value::as_array) else {
-        return (Vec::new(), false);
-    };
-    if matches.is_empty() {
-        return (Vec::new(), false);
-    }
-
     // VirtualService `headers.{request,response}.{set,add,remove}` is a
     // per-http[] (not per-match) block. Project it onto each emitted rule so
     // the same transforms fire regardless of which match-branch wins. The
@@ -1161,6 +1154,16 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     // time; we only emit the JSON shape here.
     let route_request_transform = vs_route_header_transform_rules(http, "request");
     let route_response_transform = vs_route_header_transform_rules(http, "response");
+    let Some(matches) = http.get("match").and_then(Value::as_array) else {
+        let has_route_transforms =
+            !route_request_transform.is_empty() || !route_response_transform.is_empty();
+        return (Vec::new(), has_route_transforms);
+    };
+    if matches.is_empty() {
+        let has_route_transforms =
+            !route_request_transform.is_empty() || !route_response_transform.is_empty();
+        return (Vec::new(), has_route_transforms);
+    }
     let mut rules = Vec::new();
     let mut has_uri_only_match = false;
     for entry in matches {
@@ -2275,5 +2278,36 @@ mod tests {
             workload_entry_service_key_from_host("example.com", "default", "cluster.local",),
             None
         );
+    }
+
+    #[test]
+    fn mesh_route_dispatch_marks_transform_only_matchless_route_as_uri_only() {
+        let http = serde_json::json!({
+            "headers": {
+                "request": {
+                    "set": {
+                        "x-user": "alice"
+                    }
+                }
+            }
+        });
+        let destination = MeshRouteDispatchDestination {
+            upstream_id: None,
+            backend_host: "example.internal",
+            backend_port: 8080,
+        };
+        let policy = MeshRouteDispatchPolicy {
+            timeout_ms: None,
+            timeout_disabled: false,
+            retry: None,
+            retry_disabled: false,
+            fault: None,
+        };
+
+        let (rules, has_uri_only_match) =
+            mesh_route_dispatch_rules_for_proxy(&http, Some("/"), destination, policy, false);
+
+        assert!(rules.is_empty());
+        assert!(has_uri_only_match);
     }
 }
