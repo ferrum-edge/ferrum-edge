@@ -854,11 +854,13 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         1
     };
     let reuse_port = actual_accept_threads > 1;
-    let tfo_queue = if tcp_fastopen_enabled {
-        Some(tcp_fastopen_queue_len)
-    } else {
-        None
-    };
+    if tcp_fastopen_enabled {
+        warn!(
+            proxy_id = %proxy_id,
+            "TCP Fast Open listener support is disabled for stream proxies to prevent replayable SYN payloads"
+        );
+    }
+    let tfo_queue = None;
 
     // Create the first listener up front; additional listeners bind below via
     // SO_REUSEPORT so the kernel can distribute stream accepts across workers.
