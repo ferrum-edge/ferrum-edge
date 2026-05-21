@@ -3823,7 +3823,11 @@ fn hash_basic_auth_password(password: &str) -> Result<String, String> {
 
     let secret = crate::config::conf_file::resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| crate::plugins::basic_auth::DEFAULT_HMAC_SECRET.to_string());
+        .ok_or_else(|| {
+            "FERRUM_BASIC_AUTH_HMAC_SECRET must be set to hash basic-auth passwords. \
+             Set it to a unique, random value (>= 32 characters recommended)."
+                .to_string()
+        })?;
 
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .map_err(|e| format!("Failed to create HMAC instance: {}", e))?;

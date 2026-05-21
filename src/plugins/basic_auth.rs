@@ -1,18 +1,19 @@
 //! HTTP Basic Authentication plugin with HMAC-SHA256 password verification.
 //!
-//! Supports `hmac_sha256:<hex>` password hashes using a server secret. This
-//! keeps verification fast and avoids variable-time password-hash work on the
-//! request path.
+//! Supports `hmac_sha256:<hex>` password hashes using a server secret.
+//! This keeps verification fast and avoids variable-time password-hash
+//! work on the request path.
 //!
-//! The server secret (`FERRUM_BASIC_AUTH_HMAC_SECRET`) MUST be set to a unique,
-//! random value in production. The default value is public and insecure.
+//! The server secret (`FERRUM_BASIC_AUTH_HMAC_SECRET`) MUST be set to a
+//! unique, random value. The plugin rejects construction if the secret
+//! is missing or empty — there is no insecure default.
 
 use async_trait::async_trait;
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use sha2::Sha256;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::consumer_index::ConsumerIndex;
 
@@ -23,16 +24,8 @@ use super::{RequestContext, strip_auth_scheme};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Default HMAC secret used when FERRUM_BASIC_AUTH_HMAC_SECRET is not set.
-/// This enables HMAC-SHA256 mode by default for performance.
-///
-/// IMPORTANT: Operators MUST override this in production by setting
-/// FERRUM_BASIC_AUTH_HMAC_SECRET to a unique, random value. Using the default
-/// means any attacker who knows it can compute valid HMAC hashes.
-pub const DEFAULT_HMAC_SECRET: &str = "ferrum-edge-change-me-in-production";
-
 pub struct BasicAuth {
-    /// Pre-computed HMAC key from FERRUM_BASIC_AUTH_HMAC_SECRET (or default).
+    /// Pre-computed HMAC key from FERRUM_BASIC_AUTH_HMAC_SECRET.
     hmac_secret: Vec<u8>,
 }
 
@@ -53,24 +46,19 @@ impl BasicAuth {
             }
         }
 
-        let (hmac_secret, is_default) = match resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
+        let hmac_secret = resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
             .filter(|s| !s.is_empty())
-        {
-            Some(s) => (s.into_bytes(), false),
-            None => {
-                error!(
-                    "basic_auth: FERRUM_BASIC_AUTH_HMAC_SECRET is not set — using insecure default. \
-                     Set this to a unique, random value in production to secure HMAC-SHA256 password verification."
-                );
-                (DEFAULT_HMAC_SECRET.as_bytes().to_vec(), true)
-            }
-        };
+            .ok_or_else(|| {
+                "basic_auth: FERRUM_BASIC_AUTH_HMAC_SECRET must be set to a unique, random value \
+                 (>= 32 characters recommended). The plugin cannot operate without a secret."
+                    .to_string()
+            })?;
 
-        if !is_default {
-            debug!("basic_auth: HMAC-SHA256 configured with custom secret");
-        }
+        debug!("basic_auth: HMAC-SHA256 configured with operator-provided secret");
 
-        Ok(Self { hmac_secret })
+        Ok(Self {
+            hmac_secret: hmac_secret.into_bytes(),
+        })
     }
 
     /// Verify a password against a stored hash.

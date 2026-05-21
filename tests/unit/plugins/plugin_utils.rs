@@ -4,16 +4,18 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, Proxy, default_namespace,
 };
-use ferrum_edge::plugins::basic_auth::DEFAULT_HMAC_SECRET;
 use ferrum_edge::plugins::{PluginResult, RequestContext};
 use hmac::{KeyInit, Mac};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
+/// Test-only HMAC secret matching the value set in test env vars.
+const TEST_HMAC_SECRET: &str = "test-hmac-secret-for-basic-auth-unit-tests";
+
 fn hmac_sha256_password_hash(password: &str) -> String {
     type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
-    let mut mac = HmacSha256::new_from_slice(DEFAULT_HMAC_SECRET.as_bytes()).unwrap();
+    let mut mac = HmacSha256::new_from_slice(TEST_HMAC_SECRET.as_bytes()).unwrap();
     mac.update(password.as_bytes());
     format!("hmac_sha256:{}", hex::encode(mac.finalize().into_bytes()))
 }
