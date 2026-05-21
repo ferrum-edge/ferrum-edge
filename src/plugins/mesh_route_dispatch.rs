@@ -1133,11 +1133,13 @@ fn normalize_header_match_keys(
 /// plugin-config-validation rule.
 ///
 /// HTTP methods are conventionally uppercase ASCII (RFC 9110 §9.1). `Prefix`
-/// and `Regex` patterns are uppercased here at compile time so the hot path
-/// can do a single case-sensitive compare against the request method.
-/// `Exact` deliberately preserves the operator's casing so the existing
-/// `method_match_is_case_sensitive` test continues to pass (operators who
-/// write `"get"` continue to match only literal `"get"` requests).
+/// patterns are uppercased here at compile time so the hot path can do a
+/// single case-sensitive compare against the request method. Regex patterns
+/// are compiled verbatim because changing their casing can rewrite regex
+/// syntax (for example `\d` -> `\D`). `Exact` deliberately preserves the
+/// operator's casing so the existing `method_match_is_case_sensitive` test
+/// continues to pass (operators who write `"get"` continue to match only
+/// literal `"get"` requests).
 fn compile_method_matchers(
     rule_idx: usize,
     methods: &[MethodMatchOp],
@@ -1165,8 +1167,7 @@ fn compile_method_matchers(
                          must not be empty"
                     ));
                 }
-                let uppercased = pattern.to_ascii_uppercase();
-                let re = Regex::new(&uppercased).map_err(|e| {
+                let re = Regex::new(pattern).map_err(|e| {
                     format!(
                         "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].regex \
                          is invalid: {e}"
@@ -1912,6 +1913,30 @@ mod tests {
         let mut headers = HashMap::new();
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("lowercase"));
+    }
+
+    #[tokio::test]
+    async fn method_regex_preserves_escape_semantics() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"regex": "^POST\\d$"}]},
+                "destination": {"upstream_id": "digits-only"}
+            }]
+        }))
+        .unwrap();
+
+        let mut ctx = ctx_with("POST1", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            ctx.route_override_upstream_id.as_deref(),
+            Some("digits-only")
+        );
+
+        let mut ctx = ctx_with("POSTA", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
     }
 
     #[tokio::test]
