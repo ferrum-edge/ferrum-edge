@@ -1,10 +1,10 @@
 //! Stdout access logging plugin.
 //!
-//! Serializes the `TransactionSummary` to JSON and emits it via `tracing::info!`
-//! on the `access_log` target. This allows structured log collectors (Fluentd,
-//! Vector, etc.) to capture per-request access logs without additional I/O.
+//! Serializes the `TransactionSummary` to JSON and writes one JSON line to
+//! stdout for each transaction, matching the plugin's documented behavior.
 //! Supports all proxy protocols (HTTP, gRPC, WebSocket, TCP, UDP).
 
+use std::io::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -48,7 +48,10 @@ impl Plugin for StdoutLogging {
             None => serde_json::to_string(summary),
         };
         match result {
-            Ok(json) => tracing::info!(target: "access_log", "{}", json),
+            Ok(json) => {
+                let mut stdout = std::io::stdout().lock();
+                let _ = writeln!(stdout, "{json}");
+            }
             Err(e) => warn!("stdout_logging: failed to serialize transaction summary: {e}"),
         }
     }
@@ -59,7 +62,10 @@ impl Plugin for StdoutLogging {
             None => serde_json::to_string(summary),
         };
         match result {
-            Ok(json) => tracing::info!(target: "access_log", "{}", json),
+            Ok(json) => {
+                let mut stdout = std::io::stdout().lock();
+                let _ = writeln!(stdout, "{json}");
+            }
             Err(e) => warn!("stdout_logging: failed to serialize stream summary: {e}"),
         }
     }
