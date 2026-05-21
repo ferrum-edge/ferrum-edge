@@ -1954,11 +1954,7 @@ async fn handle_h3_request(
                         .backend_capabilities
                         .mark_h3_unsupported(&proxy, upstream_target.as_deref());
                 }
-                let h3_error_body = if h3_error_class == crate::retry::ErrorClass::DnsLookupError {
-                    r#"{"error":"DNS resolution for backend failed"}"#
-                } else {
-                    r#"{"error":"Backend unavailable"}"#
-                };
+                let h3_error_body = r#"{"error":"Backend unavailable"}"#;
                 send_h3_response(&mut stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
 
                 // Record outcome for CB/health even on failure
@@ -3346,11 +3342,7 @@ async fn proxy_to_backend_h3_streaming(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
-            let h3_error_body = if h3_error_class == crate::retry::ErrorClass::DnsLookupError {
-                r#"{"error":"DNS resolution for backend failed"}"#
-            } else {
-                r#"{"error":"Backend unavailable"}"#
-            };
+            let h3_error_body = r#"{"error":"Backend unavailable"}"#;
             send_h3_response(h3_stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
             return Ok(H3StreamResult {
                 status: 502,
@@ -3756,11 +3748,7 @@ async fn proxy_to_backend_h3(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
-            let error_body: &[u8] = if h3_error_class == crate::retry::ErrorClass::DnsLookupError {
-                br#"{"error":"DNS resolution for backend failed"}"#
-            } else {
-                br#"{"error":"Backend unavailable"}"#
-            };
+            let error_body: &[u8] = br#"{"error":"Backend unavailable"}"#;
             H3BufferedDispatchResult {
                 status: 502,
                 body: error_body.to_vec(),
