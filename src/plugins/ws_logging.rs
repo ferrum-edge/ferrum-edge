@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use futures_util::SinkExt;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -110,6 +111,8 @@ struct WsConfig {
     retry_delay: Duration,
     reconnect_delay: Duration,
     schema: Option<Arc<SummarySchema>>,
+    http_client: PluginHttpClient,
+    endpoint_host: String,
 }
 
 /// Serialize-time wrapper: emits the LogEntry slice as a JSON array,
@@ -222,6 +225,8 @@ impl WsLogging {
             retry_delay: Duration::from_millis(retry_delay_ms),
             reconnect_delay: Duration::from_millis(reconnect_delay_ms),
             schema,
+            http_client,
+            endpoint_host: parsed_url.host_str().unwrap_or_default().to_string(),
         };
 
         let endpoint_hostname = parsed_url.host_str().map(|h| h.to_string());
@@ -530,8 +535,46 @@ async fn send_batch(
 /// with the data. The task's abort handle rides along with the sink in
 /// [`WsConnection`] so a sink-side failure tears down both halves in
 /// lock-step (see the type's doc-comment for the race it prevents).
+
+async fn endpoint_allowed_by_policy(cfg: &WsConfig) -> bool {
+    if let Ok(ip) = cfg.endpoint_host.parse::<IpAddr>() {
+        if !crate::config::check_backend_ip_allowed(&ip, cfg.http_client.backend_allow_ips()) {
+            warn!(
+                "WebSocket logging: endpoint {} denied by FERRUM_BACKEND_ALLOW_IPS={}",
+                cfg.endpoint_url,
+                cfg.http_client.backend_allow_ips()
+            );
+            return false;
+        }
+        return true;
+    }
+
+    let Some(dns_cache) = cfg.http_client.dns_cache() else {
+        warn!(
+            "WebSocket logging: no DNS cache is available to validate endpoint policy for {}",
+            cfg.endpoint_url
+        );
+        return false;
+    };
+
+    if let Err(e) = dns_cache.resolve(&cfg.endpoint_host, None, None).await {
+        warn!(
+            "WebSocket logging: endpoint {} denied by DNS/IP policy: {}",
+            cfg.endpoint_url, e
+        );
+        return false;
+    }
+
+    true
+}
+
 async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
     use futures_util::StreamExt;
+
+    if !endpoint_allowed_by_policy(cfg).await {
+        tokio::time::sleep(cfg.reconnect_delay).await;
+        return None;
+    }
 
     match tokio_tungstenite::connect_async_tls_with_config(
         &cfg.endpoint_url,
