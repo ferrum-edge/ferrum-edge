@@ -81,15 +81,27 @@ fn cache_key_vary_value(header: &str, value: &str) -> String {
 
 /// Cache keys use `:` as a structural delimiter, but URL paths legitimately
 /// contain `:` (e.g. `/users:1/details`, matrix params, FHIR `$everything`).
-/// Percent-encode `:` in the path segment before joining so that path/query
-/// boundaries can be recovered unambiguously and invalidation matches the
-/// full path rather than truncating at the first `:`.
+/// Encode path bytes into a cache-key-safe representation before joining so
+/// path/query boundaries can be recovered unambiguously and invalidation
+/// matches the full path rather than truncating at the first `:`.
+///
+/// The encoding must be bijective for raw URI paths. In particular, `%` must
+/// be escaped before `:` so `/users:1/details` and `/users%3A1/details` remain
+/// distinct cache keys.
 fn encode_path_for_cache_key(path: &str) -> Cow<'_, str> {
-    if path.contains(':') {
-        Cow::Owned(path.replace(':', "%3A"))
-    } else {
-        Cow::Borrowed(path)
+    if !path.as_bytes().iter().any(|b| matches!(b, b'%' | b':')) {
+        return Cow::Borrowed(path);
     }
+
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'%' => encoded.push_str("%25"),
+            b':' => encoded.push_str("%3A"),
+            _ => encoded.push(char::from(byte)),
+        }
+    }
+    Cow::Owned(encoded)
 }
 
 /// A cached response entry.
@@ -1252,6 +1264,19 @@ mod tests {
     fn encode_path_for_cache_key_percent_encodes_colons() {
         let encoded = encode_path_for_cache_key("/users:1/details");
         assert_eq!(encoded.as_ref(), "/users%3A1/details");
+    }
+
+    #[test]
+    fn encode_path_for_cache_key_percent_encodes_literal_percent() {
+        let encoded = encode_path_for_cache_key("/users%3A1/details");
+        assert_eq!(encoded.as_ref(), "/users%253A1/details");
+    }
+
+    #[test]
+    fn encode_path_for_cache_key_is_bijective_for_colon_and_percent_forms() {
+        let colon = encode_path_for_cache_key("/users:1/details");
+        let pct = encode_path_for_cache_key("/users%3A1/details");
+        assert_ne!(colon.as_ref(), pct.as_ref());
     }
 
     #[test]
