@@ -72,9 +72,11 @@
 //! | `gateway_tls` | bool | `false` | Use HTTPS for local loopback synthetic requests |
 //! | `gateway_tls_no_verify` | bool | `true` when `gateway_tls` is enabled | Skip TLS certificate verification for loopback connections (the gateway cert typically won't match `127.0.0.1`) |
 //! | `request_timeout_ms` | u64 | `30000` | Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll). Must be > 0 |
+//! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Maximum synthetic response bytes consumed per request. Larger responses are truncated to cap per-worker memory |
 //! | `gateway_addresses` | string[] | (none) | Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header so it starts its own local load test |
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,6 +101,7 @@ pub struct LoadTesting {
     concurrent_clients: u32,
     duration_seconds: u64,
     ramp: bool,
+    max_response_body_bytes: u64,
     /// Local base URL for synthetic requests (e.g., `http://127.0.0.1:8000`
     /// or `https://127.0.0.1:8443`).
     gateway_base_url: String,
@@ -143,6 +146,14 @@ impl LoadTesting {
         let request_timeout_ms = optional_u64(config, "request_timeout_ms")?.unwrap_or(30_000);
         if request_timeout_ms == 0 {
             return Err("load_testing: 'request_timeout_ms' must be greater than 0".to_string());
+        }
+
+        let max_response_body_bytes =
+            optional_u64(config, "max_response_body_bytes")?.unwrap_or(1_048_576);
+        if max_response_body_bytes == 0 {
+            return Err(
+                "load_testing: 'max_response_body_bytes' must be greater than 0".to_string(),
+            );
         }
 
         let gateway_tls = optional_bool(config, "gateway_tls")?.unwrap_or(false);
@@ -249,6 +260,7 @@ impl LoadTesting {
             concurrent_clients: concurrent_clients as u32,
             duration_seconds,
             ramp,
+            max_response_body_bytes,
             gateway_base_url,
             gateway_addresses,
             is_running: Arc::new(AtomicBool::new(false)),
@@ -383,6 +395,7 @@ impl Plugin for LoadTesting {
         let duration = Duration::from_secs(self.duration_seconds);
         let duration_secs = self.duration_seconds;
         let ramp = self.ramp;
+        let max_response_body_bytes = self.max_response_body_bytes;
         let gateway_base_url = self.gateway_base_url.clone();
         let load_test_client = self.load_test_client.clone();
         let is_running = Arc::clone(&self.is_running);
@@ -456,7 +469,7 @@ impl Plugin for LoadTesting {
 
                         // Send request and consume response body to completion
                         if let Ok(resp) = req.send().await {
-                            let _ = resp.bytes().await;
+                            consume_response_with_cap(resp, max_response_body_bytes).await;
                         }
 
                         request_count += 1;
@@ -487,6 +500,7 @@ impl Plugin for LoadTesting {
                 total_requests = total_requests,
                 elapsed_seconds = %format_args!("{:.2}", elapsed.as_secs_f64()),
                 requests_per_second = %format_args!("{:.1}", rps),
+                max_response_body_bytes = max_response_body_bytes,
                 "load_testing: load test finished"
             );
 
@@ -537,4 +551,20 @@ fn build_request(
     }
 
     req
+}
+
+async fn consume_response_with_cap(resp: reqwest::Response, max_bytes: u64) {
+    let mut stream = resp.bytes_stream();
+    let mut consumed: u64 = 0;
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                consumed = consumed.saturating_add(chunk.len() as u64);
+                if consumed >= max_bytes {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }

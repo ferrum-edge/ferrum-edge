@@ -224,6 +224,15 @@ fn test_invalid_field_types_are_error() {
                 "key": "test",
                 "concurrent_clients": 5,
                 "duration_seconds": 10,
+                "max_response_body_bytes": "5000"
+            }),
+            "'max_response_body_bytes' must be an unsigned integer",
+        ),
+        (
+            json!({
+                "key": "test",
+                "concurrent_clients": 5,
+                "duration_seconds": 10,
                 "gateway_tls": "true"
             }),
             "'gateway_tls' must be a boolean",
@@ -381,6 +390,31 @@ fn test_custom_request_timeout_accepted() {
         "concurrent_clients": 5,
         "duration_seconds": 10,
         "request_timeout_ms": 5000
+    });
+    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
+}
+
+#[test]
+fn test_zero_max_response_body_bytes_is_error() {
+    let config = json!({
+        "key": "test",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "max_response_body_bytes": 0
+    });
+    let err = LoadTesting::new(&config, PluginHttpClient::default())
+        .err()
+        .unwrap();
+    assert!(err.contains("greater than 0"), "got: {}", err);
+}
+
+#[test]
+fn test_custom_max_response_body_bytes_accepted() {
+    let config = json!({
+        "key": "test",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "max_response_body_bytes": 8192
     });
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
 }
