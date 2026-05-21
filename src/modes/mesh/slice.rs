@@ -1464,12 +1464,9 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
         .or(root_namespace_default)?;
     if selected.egress_inherits_defaults {
         if let Some(namespace_default) = namespace_default {
-            // Intentional Istio divergence for partial snapshots: once a
-            // workload namespace declares its own default Sidecar, an
-            // inheriting Sidecar in that namespace does not fall through to
-            // the root namespace default. If the namespace default also
-            // inherits, we leave the slice unnarrowed rather than guessing
-            // which outbound defaults the control plane omitted.
+            // Namespace defaults retain precedence over root defaults. When
+            // the namespace default inherits and a root default exists, keep
+            // walking the inheritance chain rather than failing open.
             if !std::ptr::eq(selected, namespace_default)
                 && !namespace_default.egress_inherits_defaults
             {
@@ -1482,7 +1479,21 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
                     egress: &namespace_default.egress,
                 });
             }
-            return None;
+            if namespace_default.egress_inherits_defaults {
+                if let Some(root_namespace_default) = root_namespace_default
+                    && !root_namespace_default.egress_inherits_defaults
+                {
+                    return Some(ResolvedSidecarEgress {
+                        namespace: sidecar_host_match_namespace(
+                            root_namespace_default,
+                            workload_namespace,
+                            root_namespace,
+                        ),
+                        egress: &root_namespace_default.egress,
+                    });
+                }
+                return None;
+            }
         }
         if let Some(root_namespace_default) = root_namespace_default
             && !std::ptr::eq(selected, root_namespace_default)
@@ -5657,7 +5668,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_namespace_default_with_omitted_egress_blocks_root_default_fallback() {
+    fn sidecar_namespace_default_with_omitted_egress_falls_back_to_root_default() {
         let mesh = MeshConfig {
             sidecars: vec![
                 make_sidecar("mesh-default", "istio-system", None, vec![vec!["beta/*"]]),
@@ -5692,7 +5703,7 @@ mod tests {
             .iter()
             .map(|entry| entry.name.as_str())
             .collect();
-        assert_eq!(names, BTreeSet::from(["reviews-alpha", "reviews-beta"]));
+        assert_eq!(names, BTreeSet::from(["reviews-beta"]));
     }
 
     #[test]
