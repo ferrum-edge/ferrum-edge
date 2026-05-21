@@ -9786,11 +9786,10 @@ async fn handle_proxy_request_inner(
             stream_request_body,
             "mesh.hbone=true target requires HBONE dispatch; refusing direct-backend fallback"
         );
-        return build_response(
-            502,
+        return Ok(build_response(
+            StatusCode::BAD_GATEWAY,
             r#"{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}"#,
-            None,
-        );
+        ));
     }
     let mut current_dispatch_h3 =
         supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
