@@ -1685,6 +1685,38 @@ fn test_env_config_max_grpc_recv_size_bytes_custom() {
 }
 
 #[test]
+fn test_env_config_max_grpc_recv_size_bytes_deprecated_env_alias() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MAX_GRPC_MESSAGE_SIZE_BYTES", "1024"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_GRPC_RECV_SIZE_BYTES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_grpc_recv_size_bytes, 1024);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_grpc_recv_size_bytes_prefers_new_env_key() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MAX_GRPC_RECV_SIZE_BYTES", "2048"),
+            ("FERRUM_MAX_GRPC_MESSAGE_SIZE_BYTES", "1024"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_grpc_recv_size_bytes, 2048);
+        },
+    );
+}
+
+#[test]
 fn test_env_config_max_websocket_frame_size_bytes_default() {
     with_env_vars(
         &[

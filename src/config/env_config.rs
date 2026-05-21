@@ -310,6 +310,25 @@ fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
     conf.get(key).map(|v| v.to_string())
 }
 
+fn resolve_grpc_recv_size_bytes(conf: &ConfFile) -> usize {
+    const NEW_KEY: &str = "FERRUM_MAX_GRPC_RECV_SIZE_BYTES";
+    const OLD_KEY: &str = "FERRUM_MAX_GRPC_MESSAGE_SIZE_BYTES";
+    const DEFAULT_VALUE: usize = 4_194_304;
+
+    if let Some(value) = resolve_var(conf, NEW_KEY) {
+        return value.parse::<usize>().unwrap_or(DEFAULT_VALUE);
+    }
+
+    if let Some(value) = resolve_var(conf, OLD_KEY) {
+        tracing::warn!(
+            "{OLD_KEY} is deprecated; use {NEW_KEY} instead. Falling back to deprecated key."
+        );
+        return value.parse::<usize>().unwrap_or(DEFAULT_VALUE);
+    }
+
+    DEFAULT_VALUE
+}
+
 /// Detect whether this process is running inside a Kubernetes pod.
 ///
 /// The Kubernetes API server injects `KUBERNETES_SERVICE_HOST` and
@@ -1941,6 +1960,8 @@ impl EnvConfig {
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
             frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
         }
+
+        let max_grpc_recv_size_bytes = resolve_grpc_recv_size_bytes(conf);
 
         env_config! {
             conf = conf, mode = &mode;
