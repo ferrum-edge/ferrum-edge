@@ -401,6 +401,22 @@ fn test_apply_run_overrides_explicit_mode_not_overridden_by_spec() {
     );
 }
 
+#[test]
+fn test_apply_run_overrides_does_not_infer_file_mode_from_env_spec() {
+    without_env_vars(&["FERRUM_MODE", "FERRUM_LOG_LEVEL", "FERRUM_CONF_PATH"], || {
+        with_env_vars(&[("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml")], || {
+            let args = RunArgs {
+                settings: None,
+                spec: None,
+                mode: None,
+                verbose: 0,
+            };
+            ferrum_edge::cli::apply_run_overrides(&args);
+            assert!(std::env::var("FERRUM_MODE").is_err());
+        });
+    });
+}
+
 // ── apply_validate_overrides tests ──────────────────────────────────────────
 
 #[test]
@@ -424,6 +440,20 @@ fn test_apply_validate_overrides_sets_spec_path() {
             };
         },
     );
+}
+
+#[test]
+fn test_apply_validate_overrides_does_not_infer_file_mode_from_env_spec() {
+    without_env_vars(&["FERRUM_MODE", "FERRUM_CONF_PATH"], || {
+        with_env_vars(&[("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml")], || {
+            let args = ValidateArgs {
+                settings: None,
+                spec: None,
+            };
+            ferrum_edge::cli::apply_validate_overrides(&args);
+            assert!(std::env::var("FERRUM_MODE").is_err());
+        });
+    });
 }
 
 // ── execute_version tests ───────────────────────────────────────────────────

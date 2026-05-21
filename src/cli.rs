@@ -190,8 +190,8 @@ pub fn apply_run_overrides(args: &RunArgs) {
         unsafe { std::env::set_var("FERRUM_LOG_LEVEL", level) };
     }
 
-    // Infer file mode when a spec is available but no mode is configured.
-    if std::env::var("FERRUM_MODE").is_err() && std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok() {
+    // Infer file mode only when an explicit --spec is provided and no mode is configured.
+    if args.spec.is_some() && std::env::var("FERRUM_MODE").is_err() {
         // SAFETY: single-threaded context.
         unsafe { std::env::set_var("FERRUM_MODE", "file") };
     }
@@ -201,8 +201,8 @@ pub fn apply_run_overrides(args: &RunArgs) {
 pub fn apply_validate_overrides(args: &ValidateArgs) {
     apply_common_overrides(args.settings.as_deref(), args.spec.as_deref());
 
-    // Infer file mode when a spec is available but no mode is configured.
-    if std::env::var("FERRUM_MODE").is_err() && std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok() {
+    // Infer file mode only when an explicit --spec is provided and no mode is configured.
+    if args.spec.is_some() && std::env::var("FERRUM_MODE").is_err() {
         // SAFETY: single-threaded context.
         unsafe { std::env::set_var("FERRUM_MODE", "file") };
     }
