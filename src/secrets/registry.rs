@@ -21,6 +21,7 @@ use super::{env, file};
 
 /// Only scan environment variables with this prefix.
 const FERRUM_PREFIX: &str = "FERRUM_";
+const NON_SECRET_FILE_SUFFIX_KEYS: &[&str] = &["FERRUM_DNS_RESOLVER_HOSTS_FILE"];
 
 /// Default timeout (seconds) for individual secret fetch operations from cloud backends.
 const DEFAULT_SECRET_FETCH_TIMEOUT_SECS: u64 = 30;
@@ -267,6 +268,9 @@ where
 }
 
 fn match_suffix(raw_key: &str) -> Option<(&'static dyn SecretBackend, &str)> {
+    if NON_SECRET_FILE_SUFFIX_KEYS.contains(&raw_key) {
+        return None;
+    }
     for backend in suffix_backends() {
         if let Some(base) = backend.matches_suffix(raw_key) {
             return Some((backend, base));
@@ -721,6 +725,7 @@ mod tests {
     fn match_suffix_no_match() {
         assert!(match_suffix("FERRUM_DB_URL").is_none());
         assert!(match_suffix("FERRUM_DB_URL_ETCD").is_none());
+        assert!(match_suffix("FERRUM_DNS_RESOLVER_HOSTS_FILE").is_none());
         assert!(match_suffix("").is_none());
         assert!(match_suffix("RANDOM_KEY").is_none());
     }
