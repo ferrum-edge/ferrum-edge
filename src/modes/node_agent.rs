@@ -666,16 +666,17 @@ pub fn apply_cni_request(
     let event = node_agent_cni_server::pod_event_from_request(request, &labels, &annotations);
     match request.verb {
         RpcVerb::Add => {
-            // `handle_pod_added` short-circuits on empty pod_uid (it's
-            // the DashMap key); the watcher will still pick up the
-            // pod, so this is a soft accept rather than a hard reject.
+            // Metadata-free ADD requests must not drive enrollment
+            // decisions. They arrive before we can reliably evaluate
+            // labels/annotations, so we acknowledge and let either
+            // `apply_cni_request_with_kube_metadata` (when available)
+            // or the kube-rs watcher perform authoritative reconcile.
             if event.pod_uid.is_empty() {
                 return CniRpcResponse::Rejected {
                     reason: "missing K8S_POD_UID in CNI args; kube-rs watcher will reconcile"
                         .to_string(),
                 };
             }
-            handle_pod_added(backend, pod_states, config, metrics, &event);
             CniRpcResponse::Ok
         }
         RpcVerb::Del => {
@@ -2353,11 +2354,9 @@ mod tests {
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
     }
 
-    /// `apply_cni_request` ADD with empty labels intentionally short-circuits
-    /// at `evaluate_enrollment` (no `ferrum.io/mesh=enabled` label / inject
-    /// annotation), so the BPF maps stay untouched but the RPC returns `Ok`.
-    /// The kube-rs watcher fills in the real labels and enrolls the pod a
-    /// moment later. We acknowledge the CNI call so kubelet doesn't retry.
+    /// `apply_cni_request` ADD without Kubernetes metadata is a no-op and
+    /// returns `Ok`. The kube-rs watcher (or the metadata-enriched ADD path)
+    /// performs the real enrollment once labels/annotations are available.
     #[test]
     fn apply_cni_request_add_with_empty_labels_returns_ok_and_skips_enrollment() {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
@@ -2392,8 +2391,56 @@ mod tests {
         assert_eq!(
             metrics.pods_enrolled.load(Ordering::Relaxed),
             0,
-            "no BPF attach should fire on the empty-label path"
+            "no BPF attach should fire on the metadata-free fallback path"
         );
+    }
+
+    #[test]
+    fn apply_cni_request_add_with_empty_labels_does_not_unenroll_existing_pod() {
+        use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 9));
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_name: "alpha".to_string(),
+                namespace: "default".to_string(),
+                attached: true,
+                pod_ip: Some(ip),
+                cgroup_id: None,
+                include_outbound_ports: None,
+                veth_iface: None,
+                veth_ifindex: None,
+            },
+        );
+        backend.pod_ips.insert(ip, "pod-uid-1".to_string());
+        let req = CniRpcRequest {
+            verb: RpcVerb::Add,
+            pod_namespace: "default".to_string(),
+            pod_name: "alpha".to_string(),
+            pod_uid: Some("pod-uid-1".to_string()),
+            container_id: "ctr-1".to_string(),
+            netns_path: Some("/var/run/netns/cni-1".to_string()),
+            args: HashMap::new(),
+        };
+
+        let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
+        assert_eq!(resp, CniRpcResponse::Ok);
+        assert!(pod_states.contains_key("pod-uid-1"));
+        assert!(backend.detached_pods.is_empty());
+        assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
     }
 
     /// `apply_cni_request` ADD without a pod_uid maps to `Rejected` (we
