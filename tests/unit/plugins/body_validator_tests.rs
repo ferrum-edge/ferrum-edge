@@ -1501,6 +1501,7 @@ fn protobuf_plugin_reject_unknown() -> BodyValidator {
 #[test]
 fn test_protobuf_config_sets_validation_flags() {
     let plugin = protobuf_plugin();
+    assert!(!plugin.requires_request_body_before_before_proxy());
     assert!(plugin.requires_request_body_buffering());
     assert!(plugin.requires_response_body_buffering());
 }
@@ -1512,6 +1513,7 @@ fn test_protobuf_request_only_config() {
         "protobuf_request_type": "test.HelloRequest"
     }))
     .unwrap();
+    assert!(!plugin.requires_request_body_before_before_proxy());
     assert!(plugin.requires_request_body_buffering());
     assert!(!plugin.requires_response_body_buffering());
 }

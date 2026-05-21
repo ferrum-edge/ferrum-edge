@@ -87,6 +87,8 @@ pub struct BodyValidator {
     has_protobuf_request_validation: bool,
     /// Whether protobuf response validation is configured.
     has_protobuf_response_validation: bool,
+    /// Whether request validation must run in before_proxy (JSON/XML only).
+    has_pre_proxy_request_validation: bool,
 }
 
 impl BodyValidator {
@@ -192,6 +194,7 @@ impl BodyValidator {
             has_response_validation,
             has_protobuf_request_validation,
             has_protobuf_response_validation,
+            has_pre_proxy_request_validation: has_json_xml_request,
         })
     }
 
@@ -1174,8 +1177,8 @@ impl Plugin for BodyValidator {
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
         // JSON/XML validation reads request_body from metadata in before_proxy.
-        // Protobuf validation uses on_final_request_body, but still needs body collected.
-        self.has_request_validation
+        // Protobuf validation runs in on_final_request_body and should not force pre-before_proxy buffering.
+        self.has_pre_proxy_request_validation
     }
 
     fn requires_request_body_buffering(&self) -> bool {
