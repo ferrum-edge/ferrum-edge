@@ -1101,7 +1101,7 @@ fn http2_pool_sender_error_response(
     if matches!(h2_error_class, retry::ErrorClass::PortExhaustion) {
         state.overload.record_port_exhaustion();
     }
-    let error_body = format!(r#"{{"error":"Backend unavailable: {}"}}"#, msg);
+    let error_body = r#"{"error":"Backend unavailable"}"#.to_string();
     error!(proxy_id = %proxy.id, error = %msg, "HTTP/2 pool connection failed");
     retry::BackendResponse {
         status_code: 502,
@@ -9582,21 +9582,25 @@ async fn handle_proxy_request_inner(
                 if grpc_error_class == retry::ErrorClass::PortExhaustion {
                     state.overload.record_port_exhaustion();
                 }
-                let (grpc_code, original_msg) = match &e {
-                    GrpcProxyError::BackendUnavailable { message: m, .. } => {
-                        (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
+                let grpc_code = match &e {
+                    GrpcProxyError::BackendUnavailable { .. } => {
+                        grpc_proxy::grpc_status::UNAVAILABLE
                     }
-                    GrpcProxyError::BackendTimeout { message: m, .. } => {
-                        (grpc_proxy::grpc_status::DEADLINE_EXCEEDED, m.as_str())
+                    GrpcProxyError::BackendTimeout { .. } => {
+                        grpc_proxy::grpc_status::DEADLINE_EXCEEDED
                     }
-                    GrpcProxyError::ResourceExhausted(m) => {
-                        (grpc_proxy::grpc_status::RESOURCE_EXHAUSTED, m.as_str())
+                    GrpcProxyError::ResourceExhausted(_) => {
+                        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
                     }
-                    GrpcProxyError::Internal(m) => {
-                        (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
-                    }
+                    GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE,
                 };
-                let msg = original_msg;
+                // Use a generic client-facing message to avoid leaking
+                // internal backend details (hostnames, DNS errors, etc.).
+                let msg = match grpc_code {
+                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED => "Backend deadline exceeded",
+                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED => "Resource exhausted",
+                    _ => "Backend unavailable",
+                };
 
                 // Log with error_class for gRPC backend failures
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
