@@ -938,6 +938,14 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         None
                                     };
 
+                                    // Reject datagrams from new clients under critical overload.
+                                    // Existing sessions continue to be served.
+                                    if overload.reject_new_connections.load(Ordering::Relaxed)
+                                        && !sessions.contains_key(&addr2)
+                                    {
+                                        continue;
+                                    }
+
                                     // GRO splitting: if the kernel coalesced multiple same-size
                                     // datagrams into one buffer, split by segment size.
                                     if let Some(seg_size) = recv_batch.gro_segment_size(i) {
@@ -1035,6 +1043,14 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     for _ in 0..batch_limit {
                         match frontend_socket.try_recv_from(&mut buf) {
                             Ok((len2, addr2)) => {
+                                // Reject datagrams from new clients under critical overload.
+                                // Existing sessions continue to be served.
+                                if overload.reject_new_connections.load(Ordering::Relaxed)
+                                    && !sessions.contains_key(&addr2)
+                                {
+                                    continue;
+                                }
+
                                 batch_dgrams_in += 1;
                                 batch_bytes_in += len2 as u64;
 
