@@ -1769,6 +1769,21 @@ fn apply_payload_namespace(payload: &mut RestorePayload, namespace: &str) {
     }
 }
 
+fn normalize_restore_payload_timestamps(payload: &mut RestorePayload, restored_at: DateTime<Utc>) {
+    for proxy in &mut payload.proxies {
+        proxy.updated_at = restored_at;
+    }
+    for consumer in &mut payload.consumers {
+        consumer.updated_at = restored_at;
+    }
+    for plugin_config in &mut payload.plugin_configs {
+        plugin_config.updated_at = restored_at;
+    }
+    for upstream in &mut payload.upstreams {
+        upstream.updated_at = restored_at;
+    }
+}
+
 fn hash_payload_consumers(consumers: &mut [Consumer], errors: &mut Vec<String>) {
     for consumer in consumers {
         if let Err(e) = crud::hash_consumer_credentials(consumer) {
@@ -3091,6 +3106,7 @@ async fn handle_restore(
     // transactions to keep WAL/redo size bounded.
     let mut payload = payload;
     let mut errors = Vec::new();
+    normalize_restore_payload_timestamps(&mut payload, Utc::now());
     apply_payload_namespace(&mut payload, namespace);
     hash_payload_consumers(&mut payload.consumers, &mut errors);
     let (created, mut persist_errors) =
@@ -3743,5 +3759,41 @@ mod tests {
         let (window, limit) = parse_mesh_policy_denies_query(Some("rule=foo&window=10m")).unwrap();
         assert_eq!(window, Duration::from_secs(600));
         assert_eq!(limit, MESH_POLICY_DENIES_DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn normalize_restore_payload_timestamps_sets_uniform_updated_at() {
+        let old = Utc::now() - chrono::Duration::days(90);
+        let restored_at = Utc::now();
+        let mut payload = RestorePayload {
+            proxies: vec![Proxy {
+                id: "p1".to_string(),
+                updated_at: old,
+                ..Default::default()
+            }],
+            consumers: vec![Consumer {
+                id: "c1".to_string(),
+                updated_at: old,
+                ..Default::default()
+            }],
+            plugin_configs: vec![PluginConfig {
+                id: "pc1".to_string(),
+                updated_at: old,
+                ..Default::default()
+            }],
+            upstreams: vec![Upstream {
+                id: "u1".to_string(),
+                updated_at: old,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        normalize_restore_payload_timestamps(&mut payload, restored_at);
+
+        assert_eq!(payload.proxies[0].updated_at, restored_at);
+        assert_eq!(payload.consumers[0].updated_at, restored_at);
+        assert_eq!(payload.plugin_configs[0].updated_at, restored_at);
+        assert_eq!(payload.upstreams[0].updated_at, restored_at);
     }
 }
