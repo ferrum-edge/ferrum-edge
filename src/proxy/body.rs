@@ -42,6 +42,10 @@ pub struct ProxyBody {
     /// Dropped when a reqwest-backed response body finishes, so the
     /// runtime port-pressure estimate tracks streaming backend sockets too.
     _reqwest_backend_guard: Option<crate::runtime_metrics::ReqwestBackendRequestGuard>,
+    /// Dropped when a streaming backend response body reaches terminal state
+    /// (EOF, error, or client disconnect), ensuring least-connections
+    /// accounting decrements when the backend stream actually ends.
+    _backend_connection_guard: Option<BackendConnectionGuard>,
     /// Deferred logger that fires after body completion, allowing
     /// `TransactionSummary.body_completed` / `body_error_class` /
     /// `client_disconnected` / `bytes_streamed` to reflect the
@@ -208,6 +212,7 @@ impl ProxyBody {
             kind: ProxyBodyKind::Full(Full::new(data.into())),
             _request_guard: None,
             _reqwest_backend_guard: None,
+            _backend_connection_guard: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),
@@ -225,6 +230,7 @@ impl ProxyBody {
             kind: ProxyBodyKind::Full(Full::default()),
             _request_guard: None,
             _reqwest_backend_guard: None,
+            _backend_connection_guard: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),
@@ -243,6 +249,11 @@ impl ProxyBody {
         guard: crate::runtime_metrics::ReqwestBackendRequestGuard,
     ) -> Self {
         self._reqwest_backend_guard = Some(guard);
+        self
+    }
+
+    pub fn with_backend_connection_guard(mut self, guard: BackendConnectionGuard) -> Self {
+        self._backend_connection_guard = Some(guard);
         self
     }
 
@@ -340,6 +351,34 @@ impl ProxyBody {
             }
         };
         (self, metrics)
+    }
+}
+
+/// RAII guard for least-connections accounting of streaming backend bodies.
+pub struct BackendConnectionGuard {
+    load_balancer_cache: Arc<crate::load_balancer::LoadBalancerCache>,
+    upstream_id: String,
+    target: crate::config::types::UpstreamTarget,
+}
+
+impl BackendConnectionGuard {
+    pub fn new(
+        load_balancer_cache: Arc<crate::load_balancer::LoadBalancerCache>,
+        upstream_id: String,
+        target: crate::config::types::UpstreamTarget,
+    ) -> Self {
+        Self {
+            load_balancer_cache,
+            upstream_id,
+            target,
+        }
+    }
+}
+
+impl Drop for BackendConnectionGuard {
+    fn drop(&mut self) {
+        self.load_balancer_cache
+            .record_connection_end(&self.upstream_id, &self.target);
     }
 }
 

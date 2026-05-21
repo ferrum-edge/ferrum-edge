@@ -106,7 +106,7 @@ use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
     ProtocolSupport, RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
 };
-pub use self::body::ProxyBody;
+pub use self::body::{BackendConnectionGuard, ProxyBody};
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::hbone_pool::{HboneConnectionPool, HbonePoolError};
 use self::http2_pool::Http2ConnectionPool;
@@ -10523,11 +10523,18 @@ async fn handle_proxy_request_inner(
             } else {
                 crate::proxy::body::coalescing_body(response, cl)
             };
-            let base = if let Some(guard) = reqwest_backend_guard {
+            let mut base = if let Some(guard) = reqwest_backend_guard {
                 base.with_reqwest_backend_guard(guard)
             } else {
                 base
             };
+            if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
+                base = base.with_backend_connection_guard(BackendConnectionGuard::new(
+                    Arc::clone(&state.load_balancer_cache),
+                    upstream_id.clone(),
+                    (**target).clone(),
+                ));
+            }
 
             if state.env_config.enable_streaming_latency_tracking {
                 let (tracked_body, metrics) = base.into_tracked(backend_start);
@@ -10599,7 +10606,9 @@ async fn handle_proxy_request_inner(
                 state.max_response_body_size_bytes,
             );
 
-            if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
+            let mut body = if state.response_buffer_cutoff_bytes == 0
+                && state.max_response_body_size_bytes == 0
+            {
                 crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce response-size limits while
@@ -10624,13 +10633,23 @@ async fn handle_proxy_request_inner(
                     cl,
                     state.h2_coalesce_target_bytes,
                 )
+            };
+            if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
+                body = body.with_backend_connection_guard(BackendConnectionGuard::new(
+                    Arc::clone(&state.load_balancer_cache),
+                    upstream_id.clone(),
+                    (**target).clone(),
+                ));
             }
+            body
         }
         ResponseBody::StreamingH3(h3_resp) => {
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
-            if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
+            let mut body = if state.response_buffer_cutoff_bytes == 0
+                && state.max_response_body_size_bytes == 0
+            {
                 crate::proxy::body::direct_streaming_h3_body(h3_resp.recv_stream, cl)
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 crate::proxy::body::size_limited_streaming_h3_body(
@@ -10649,9 +10668,24 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
                 )
+            };
+            if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
+                body = body.with_backend_connection_guard(BackendConnectionGuard::new(
+                    Arc::clone(&state.load_balancer_cache),
+                    upstream_id.clone(),
+                    (**target).clone(),
+                ));
             }
+            body
         }
-        ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
+        ResponseBody::Buffered(data) => {
+            if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
+                state
+                    .load_balancer_cache
+                    .record_connection_end(upstream_id, target);
+            }
+            ProxyBody::full(Bytes::from(data))
+        }
     };
 
     // Attach deferred logger to the body so `log_with_mirror` fires when the
