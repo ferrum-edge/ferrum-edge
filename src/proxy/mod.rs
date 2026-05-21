@@ -9767,6 +9767,9 @@ async fn handle_proxy_request_inner(
     // pool), and reqwest's client pool is keyed per-target, so a
     // `dispatch_h3=false` rotation already picks up the new target's warmed
     // reqwest client without extra plumbing here.
+    let hbone_required = upstream_target
+        .as_deref()
+        .is_some_and(hbone_pool::target_hbone_enabled);
     let current_dispatch_hbone = !has_retry
         && can_use_hbone_pool(
             has_retry,
@@ -9774,6 +9777,21 @@ async fn handle_proxy_request_inner(
             stream_request_body,
         )
         && supports_hbone_backend(&state, &proxy, upstream_target.as_deref());
+    if hbone_required && !current_dispatch_hbone {
+        warn!(
+            proxy_id = %proxy.id,
+            upstream_target = ?upstream_target,
+            has_retry,
+            requires_request_body_buffering,
+            stream_request_body,
+            "mesh.hbone=true target requires HBONE dispatch; refusing direct-backend fallback"
+        );
+        return build_response(
+            502,
+            r#"{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}"#,
+            None,
+        );
+    }
     let mut current_dispatch_h3 =
         supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
