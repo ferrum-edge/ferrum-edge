@@ -12181,13 +12181,21 @@ async fn collect_response_with_limit(
 }
 
 /// Build a `Set-Cookie` header value for sticky session cookie injection.
+///
+/// The cookie value is a SHA-256 hash of the backend `host:port`, not the
+/// raw address itself. This prevents leaking internal backend topology to
+/// clients while remaining deterministic across gateway instances and
+/// restarts (no keyed HMAC, no per-process state).
 pub(crate) fn build_sticky_cookie_header(
     cookie_name: &str,
     target: &UpstreamTarget,
     config: &crate::config::types::HashOnCookieConfig,
 ) -> String {
     use crate::load_balancer::target_host_port_key;
-    let value = target_host_port_key(target);
+    use sha2::{Digest, Sha256};
+
+    let raw = target_host_port_key(target);
+    let value = hex::encode(Sha256::digest(raw.as_bytes()));
     let mut cookie = format!(
         "{}={}; Path={}; Max-Age={}",
         cookie_name, value, config.path, config.ttl_seconds
