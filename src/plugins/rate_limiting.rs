@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -12,6 +13,7 @@ use super::utils::rate_limit::{
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const MAX_STATE_ENTRIES: usize = 100_000;
+const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LimitBy {
@@ -24,6 +26,7 @@ pub struct RateLimiting {
     limit_by: LimitBy,
     expose_headers: bool,
     limiter: RateLimitBackend<String, HttpRateLimitAlgorithm>,
+    request_counter: AtomicU64,
 }
 
 impl RateLimiting {
@@ -110,10 +113,16 @@ impl RateLimiting {
             limit_by,
             expose_headers,
             limiter,
+            request_counter: AtomicU64::new(0),
         })
     }
 
-    fn evict_stale_entries(&self) {
+    fn maybe_evict_stale_entries(&self) {
+        let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        if request % EVICTION_CHECK_INTERVAL_REQUESTS != 0 {
+            return;
+        }
+
         if self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES {
             self.limiter
                 .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
@@ -203,7 +212,7 @@ impl RateLimiting {
 
     async fn check_rate(&self, key: String, ctx: &mut RequestContext) -> PluginResult {
         let outcome = self.limiter.check(key.clone(), &key, &RequestUnit).await;
-        self.evict_stale_entries();
+        self.maybe_evict_stale_entries();
         if !outcome.allowed {
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
             return self.reject(&key, &outcome);
@@ -215,7 +224,7 @@ impl RateLimiting {
 
     async fn check_rate_stream(&self, key: String) -> PluginResult {
         let outcome = self.limiter.check(key.clone(), &key, &RequestUnit).await;
-        self.evict_stale_entries();
+        self.maybe_evict_stale_entries();
         if !outcome.allowed {
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded (stream)");
             return self.reject(&key, &outcome);
