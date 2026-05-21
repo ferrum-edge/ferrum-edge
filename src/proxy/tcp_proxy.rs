@@ -107,9 +107,6 @@ fn is_post_eof_benign_write_error(side: StreamIoSide, kind: std::io::ErrorKind) 
 /// error per 70 KB / 500 KB payload after the full request *and*
 /// response delivered cleanly) trivially passes the guard — both
 /// directions have non-zero counters by the time the close race fires.
-fn both_directions_transferred(c2b_bytes: &AtomicU64, b2c_bytes: &AtomicU64) -> bool {
-    c2b_bytes.load(Ordering::Relaxed) > 0 && b2c_bytes.load(Ordering::Relaxed) > 0
-}
 
 // Legacy stream-error message prefixes.
 //
@@ -3495,7 +3492,6 @@ where
     // NOT admit). `WriteZero` collapses to `ErrorClass::RequestError` and
     // would otherwise be missed entirely. Storing the precise admission
     // decision here keeps Phase 2 in lockstep with `is_post_eof_benign_write_error`.
-    let mut phase1_benign_write_candidate: bool = false;
     let mut c2b_done = false;
     let mut b2c_done = false;
     let mut poll_c2b_first = true;
@@ -3574,19 +3570,17 @@ where
         Phase1Outcome::ClientToBackend(result) => {
             c2b_done = true;
             if let Err((side, e)) = result {
-                let (failure, benign_write) =
+                let (failure, _benign_write) =
                     classify_phase1_copy_failure(Direction::ClientToBackend, side, e);
                 first_failure = Some(failure);
-                phase1_benign_write_candidate = benign_write;
             }
         }
         Phase1Outcome::BackendToClient(result) => {
             b2c_done = true;
             if let Err((side, e)) = result {
-                let (failure, benign_write) =
+                let (failure, _benign_write) =
                     classify_phase1_copy_failure(Direction::BackendToClient, side, e);
                 first_failure = Some(failure);
-                phase1_benign_write_candidate = benign_write;
             }
         }
         Phase1Outcome::Watchdog(failure) => {
@@ -3630,8 +3624,6 @@ where
                 Direction::ClientToBackend,
                 c2b_write_watermark,
                 backend_write_timeout_ms,
-                &c2b_bytes,
-                &b2c_bytes,
             )
             .await;
         } else {
@@ -3661,11 +3653,14 @@ where
                     //       and "connection never carried traffic" cases
                     //       that would otherwise be silently re-labelled
                     //       as graceful (see `both_directions_transferred`).
-                    if phase1_benign_write_candidate
-                        && both_directions_transferred(&c2b_bytes, &b2c_bytes)
-                    {
-                        first_failure = None;
-                    }
+                    // SECURITY: do not clear Phase 1 failures here.
+                    //
+                    // `opposite-half EOF + benign write errno + any bytes in
+                    // both directions` can still represent application-data
+                    // truncation, which must remain a transport failure for
+                    // circuit-breaker and error accounting.
+                    //
+                    // Keep the original first_failure classification.
                 }
                 Ok(Err((side, e))) => {
                     if first_failure.is_none() {
@@ -3692,8 +3687,6 @@ where
                 Direction::BackendToClient,
                 b2c_read_watermark,
                 backend_read_timeout_ms,
-                &c2b_bytes,
-                &b2c_bytes,
             )
             .await;
         } else {
@@ -3713,11 +3706,14 @@ where
             {
                 Ok(Ok(())) => {
                     // Symmetric to the c2b grace path — see comment above.
-                    if phase1_benign_write_candidate
-                        && both_directions_transferred(&c2b_bytes, &b2c_bytes)
-                    {
-                        first_failure = None;
-                    }
+                    // SECURITY: do not clear Phase 1 failures here.
+                    //
+                    // `opposite-half EOF + benign write errno + any bytes in
+                    // both directions` can still represent application-data
+                    // truncation, which must remain a transport failure for
+                    // circuit-breaker and error accounting.
+                    //
+                    // Keep the original first_failure classification.
                 }
                 Ok(Err((side, e))) => {
                     if first_failure.is_none() {
@@ -3763,8 +3759,6 @@ async fn drain_half_close_direction<R, W>(
     direction: Direction,
     direction_watermark: Option<&AtomicU64>,
     direction_timeout_ms: u64,
-    c2b_bytes: &AtomicU64,
-    b2c_bytes: &AtomicU64,
 ) -> Option<(Direction, ErrorClass, Option<StreamIoSide>, String)>
 where
     R: AsyncRead + Unpin,
@@ -3810,11 +3804,9 @@ where
                     // immediately half-closed" or "backend died before
                     // responding" (asymmetric truncation) as graceful and
                     // hide real failures from operator dashboards.
-                    if is_post_eof_benign_write_error(side, e.kind())
-                        && both_directions_transferred(c2b_bytes, b2c_bytes)
-                    {
-                        return Poll::Ready(None);
-                    }
+                    // SECURITY: do not suppress write-side drain errors as
+                    // graceful shutdown. Partial-transfer truncations can
+                    // present as close-race tails at the TCP layer.
                     let msg = e.to_string();
                     let dir_label = direction_label(direction);
                     let err: anyhow::Error = anyhow::Error::new(e).context(format!(
