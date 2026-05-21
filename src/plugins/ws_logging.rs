@@ -532,10 +532,21 @@ async fn send_batch(
 /// lock-step (see the type's doc-comment for the race it prevents).
 async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
     use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+
+    // ws_logging is intentionally write-only. Keep inbound parsing bounded
+    // to control resource usage if the remote endpoint (or path to it) sends
+    // unexpected payload data.
+    let ws_cfg = WebSocketConfig {
+        max_send_queue: None,
+        max_message_size: Some(64 << 10),
+        max_frame_size: Some(16 << 10),
+        accept_unmasked_frames: false,
+    };
 
     match tokio_tungstenite::connect_async_tls_with_config(
         &cfg.endpoint_url,
-        None,
+        Some(ws_cfg),
         false,
         cfg.connector.clone(),
     )
@@ -547,7 +558,20 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
             // and server-initiated Close frames. Exits cleanly when the
             // peer closes — at that point `sink.send(...)` errors and
             // the main loop reconnects.
-            let drain = tokio::spawn(async move { while read.next().await.is_some() {} });
+            let drain = tokio::spawn(async move {
+                while let Some(item) = read.next().await {
+                    match item {
+                        Ok(Message::Text(_)) | Ok(Message::Binary(_)) => {
+                            // Unexpected application data for a write-only
+                            // channel: stop draining and let reconnect logic
+                            // establish a fresh socket.
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
             Some(WsConnection {
                 sink,
                 drain: drain.abort_handle(),
