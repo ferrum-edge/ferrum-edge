@@ -207,10 +207,12 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
     let (stdout_writer, stdout_guard) =
         tracing_appender::non_blocking::NonBlockingBuilder::default()
             .buffered_lines_limit(log_buffer_capacity)
+            .lossy(false)
             .finish(std::io::stdout());
     let (stderr_writer, stderr_guard) =
         tracing_appender::non_blocking::NonBlockingBuilder::default()
             .buffered_lines_limit(log_buffer_capacity)
+            .lossy(false)
             .finish(std::io::stderr());
     let log_level =
         config::conf_file::resolve_ferrum_var("FERRUM_LOG_LEVEL").unwrap_or_else(|| "error".into());
