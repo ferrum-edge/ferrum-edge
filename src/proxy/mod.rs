@@ -1357,11 +1357,19 @@ pub(crate) async fn apply_request_body_plugins(
 
 pub(crate) async fn run_final_request_body_hooks(
     plugins: &[Arc<dyn Plugin>],
+    mut ctx: Option<&mut RequestContext>,
     headers: &HashMap<String, String>,
     body: &[u8],
 ) -> PluginResult {
     for plugin in plugins {
-        match plugin.on_final_request_body(headers, body).await {
+        let result = if let Some(ctx) = ctx.as_deref_mut() {
+            plugin
+                .on_final_request_body_with_context(ctx, headers, body)
+                .await
+        } else {
+            plugin.on_final_request_body(headers, body).await
+        };
+        match result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 return reject;
@@ -3601,6 +3609,9 @@ impl ProxyState {
         if let Err(errs) = config.validate_regex_listen_paths() {
             errors.extend(errs);
         }
+        if let Err(errs) = config.validate_listen_path_encodings() {
+            errors.extend(errs);
+        }
         if let Err(errs) = config.validate_unique_listen_paths() {
             errors.extend(errs);
         }
@@ -4701,6 +4712,7 @@ async fn handle_websocket_request_authenticated(
     start_time: Instant,
     is_h2_websocket: bool,
     is_tls: bool,
+    cb_target_key: Option<String>,
     cb_is_half_open_probe: bool,
     requires_ws_frame_hooks: bool,
     query_string: String,
@@ -4879,12 +4891,13 @@ async fn handle_websocket_request_authenticated(
                     // value keeps the invariant readable and survives a
                     // future refactor that moves this block.)
                     if let Some(cb_config) = &proxy.circuit_breaker {
-                        let cb_key = current_target
+                        let current_cb_key = current_target
                             .as_ref()
-                            .map(|t| crate::circuit_breaker::target_key(&t.host, t.port));
+                            .map(|t| crate::circuit_breaker::target_key(&t.host, t.port))
+                            .or_else(|| cb_target_key.clone());
                         let cb = state.circuit_breaker_cache.get_or_create(
                             &proxy.id,
-                            cb_key.as_deref(),
+                            current_cb_key.as_deref(),
                             cb_config,
                         );
                         cb.record_failure(502, ws_is_pre_wire, cb_is_half_open_probe);
@@ -5790,6 +5803,8 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         duration_ms: disconnect_duration_ms,
         frames_client_to_backend: 0,
         frames_backend_to_client: 0,
+        bytes_client_to_backend: 0,
+        bytes_backend_to_client: 0,
         direction: failure.as_ref().map(|(d, _, _)| *d),
         io_side: failure.as_ref().and_then(|(_, _, side)| *side),
         error_class: failure.map(|(_, c, _)| c),
@@ -5823,6 +5838,20 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 /// on a healthy TCP connection, so 100ms is generous for the happy path while
 /// still bounding teardown for pathological peers.
 const WS_CANCEL_CLOSE_TIMEOUT_MS: u64 = 100;
+
+#[inline]
+fn ws_message_payload_bytes(msg: &Message) -> u64 {
+    match msg {
+        Message::Text(t) => t.len() as u64,
+        Message::Binary(b) => b.len() as u64,
+        Message::Ping(b) | Message::Pong(b) => b.len() as u64,
+        Message::Close(opt) => opt
+            .as_ref()
+            .map(|frame| frame.reason.len() as u64)
+            .unwrap_or(0),
+        Message::Frame(_) => 0,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WsControlKind {
@@ -6016,8 +6045,12 @@ where
     // them without coordination. Reads happen exactly once at teardown.
     let frames_c2b = Arc::new(AtomicU64::new(0));
     let frames_b2c = Arc::new(AtomicU64::new(0));
+    let bytes_c2b = Arc::new(AtomicU64::new(0));
+    let bytes_b2c = Arc::new(AtomicU64::new(0));
     let frames_c2b_task = frames_c2b.clone();
     let frames_b2c_task = frames_b2c.clone();
+    let bytes_c2b_task = bytes_c2b.clone();
+    let bytes_b2c_task = bytes_b2c.clone();
 
     // First-failure recorder. Whichever forward direction hits an error first
     // wins the (Direction, ErrorClass) slot via OnceLock::set(); later errors
@@ -6143,6 +6176,10 @@ where
                                     }
                                     // Count the frame that successfully reached the backend.
                                     frames_c2b_task.fetch_add(1, Ordering::Relaxed);
+                                    bytes_c2b_task.fetch_add(
+                                        ws_message_payload_bytes(&outgoing),
+                                        Ordering::Relaxed,
+                                    );
                                 }
                             }
                         }
@@ -6288,6 +6325,10 @@ where
                                     }
                                     // Count the frame that successfully reached the client.
                                     frames_b2c_task.fetch_add(1, Ordering::Relaxed);
+                                    bytes_b2c_task.fetch_add(
+                                        ws_message_payload_bytes(&outgoing),
+                                        Ordering::Relaxed,
+                                    );
                                 }
                             }
                         }
@@ -6394,6 +6435,8 @@ where
             duration_ms: disconnect_duration_ms,
             frames_client_to_backend: frames_c2b.load(Ordering::Relaxed),
             frames_backend_to_client: frames_b2c.load(Ordering::Relaxed),
+            bytes_client_to_backend: bytes_c2b.load(Ordering::Relaxed),
+            bytes_backend_to_client: bytes_b2c.load(Ordering::Relaxed),
             direction: failure.as_ref().map(|(d, _, _)| *d),
             io_side: failure.as_ref().and_then(|(_, _, side)| *side),
             error_class: failure.map(|(_, c, _)| c),
@@ -8580,6 +8623,11 @@ async fn handle_proxy_request_inner(
         &ctx.headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+    // Pre-computed at config reload (see `PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT`)
+    // so the proxy hot path does not re-scan the plugin list per request.
+    let needs_final_request_body_context = requires_request_body_buffering
+        && capabilities
+            .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
     let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
@@ -8700,6 +8748,7 @@ async fn handle_proxy_request_inner(
             start_time,
             is_h2_ws,
             is_tls,
+            cb_target_key,
             cb_is_half_open_probe,
             requires_ws_frame_hooks,
             effective_query_string.to_string(),
@@ -8775,30 +8824,29 @@ async fn handle_proxy_request_inner(
         let grpc_can_use_streaming_fast_path = grpc_should_stream && !grpc_has_retry;
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
-            let (grpc_method, grpc_headers, grpc_req_body) = match client_request_body {
-                ClientRequestBody::Streaming(request) => {
-                    match grpc_proxy::collect_grpc_request_body(
-                        *request,
-                        state.max_grpc_recv_size_bytes,
-                    )
-                    .await
-                    {
-                        Ok(parts) => parts,
-                        Err(e) => {
-                            record_request(&state, 500);
-                            return Ok(grpc_proxy::build_grpc_error_response(
-                                13, // INTERNAL
-                                &format!("Failed to read gRPC request body: {:?}", e),
-                            ));
-                        }
-                    }
+            let request = match client_request_body {
+                ClientRequestBody::Streaming(request) => *request,
+                ClientRequestBody::Buffered(_) => {
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
                 }
-                ClientRequestBody::Buffered(body) => (
-                    method.clone(),
-                    proxy_headers.clone(),
-                    body.to_vec(),
-                ),
             };
+            let (grpc_method, grpc_headers, grpc_req_body) =
+                match grpc_proxy::collect_grpc_request_body(request, state.max_grpc_recv_size_bytes)
+                    .await
+                {
+                    Ok(parts) => parts,
+                    Err(e) => {
+                        record_request(&state, 500);
+                        return Ok(grpc_proxy::build_grpc_error_response(
+                            13, // INTERNAL
+                            &format!("Failed to read gRPC request body: {:?}", e),
+                        ));
+                    }
+                };
 
             // Store body metadata for plugins that read via ctx.metadata
             ctx.metadata.insert(
@@ -8825,7 +8873,22 @@ async fn handle_proxy_request_inner(
             );
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
-            match run_final_request_body_hooks(&plugins, &hook_headers, &grpc_req_body).await {
+            let mut body_hook_ctx = if needs_final_request_body_context {
+                Some(ctx.clone_for_final_request_body_hooks())
+            } else {
+                None
+            };
+            let final_body_result = run_final_request_body_hooks(
+                &plugins,
+                body_hook_ctx.as_mut(),
+                &hook_headers,
+                &grpc_req_body,
+            )
+            .await;
+            if let Some(body_hook_ctx) = body_hook_ctx {
+                ctx.metadata = body_hook_ctx.metadata;
+            }
+            match final_body_result {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
@@ -9768,6 +9831,9 @@ async fn handle_proxy_request_inner(
     // pool), and reqwest's client pool is keyed per-target, so a
     // `dispatch_h3=false` rotation already picks up the new target's warmed
     // reqwest client without extra plumbing here.
+    let hbone_required = upstream_target
+        .as_deref()
+        .is_some_and(hbone_pool::target_hbone_enabled);
     let current_dispatch_hbone = !has_retry
         && can_use_hbone_pool(
             has_retry,
@@ -9775,13 +9841,33 @@ async fn handle_proxy_request_inner(
             stream_request_body,
         )
         && supports_hbone_backend(&state, &proxy, upstream_target.as_deref());
+    if hbone_required && !current_dispatch_hbone {
+        warn!(
+            proxy_id = %proxy.id,
+            upstream_target = ?upstream_target,
+            has_retry,
+            requires_request_body_buffering,
+            stream_request_body,
+            "mesh.hbone=true target requires HBONE dispatch; refusing direct-backend fallback"
+        );
+        return Ok(build_response(
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}"#,
+        ));
+    }
     let mut current_dispatch_h3 =
         supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
+    let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
+        let mut body_hook_ctx = if needs_final_request_body_context {
+            Some(ctx.clone_for_final_request_body_hooks())
+        } else {
+            None
+        };
         let (mut result, retained_body) = proxy_to_backend(
             &state,
             &proxy,
@@ -9791,6 +9877,7 @@ async fn handle_proxy_request_inner(
             client_request_body,
             upstream_target.as_deref(),
             &plugins,
+            body_hook_ctx.as_mut(),
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
@@ -9799,7 +9886,7 @@ async fn handle_proxy_request_inner(
             is_tls,
             false,
             current_dispatch_h3,
-            &ctx.bytes_sent_observed,
+            &bytes_sent_observed,
             inbound_version,
         )
         .await;
@@ -9924,8 +10011,16 @@ async fn handle_proxy_request_inner(
                     .mark_h3_unsupported(&proxy, current_target.as_deref());
             }
         }
+        if let Some(body_hook_ctx) = body_hook_ctx {
+            ctx.metadata = body_hook_ctx.metadata;
+        }
         (result, current_cb_target_key)
     } else {
+        let mut body_hook_ctx = if needs_final_request_body_context {
+            Some(ctx.clone_for_final_request_body_hooks())
+        } else {
+            None
+        };
         let resp = proxy_to_backend(
             &state,
             &proxy,
@@ -9935,6 +10030,7 @@ async fn handle_proxy_request_inner(
             client_request_body,
             upstream_target.as_deref(),
             &plugins,
+            body_hook_ctx.as_mut(),
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
@@ -9943,11 +10039,14 @@ async fn handle_proxy_request_inner(
             is_tls,
             current_dispatch_hbone,
             current_dispatch_h3,
-            &ctx.bytes_sent_observed,
+            &bytes_sent_observed,
             inbound_version,
         )
         .await
         .0;
+        if let Some(body_hook_ctx) = body_hook_ctx {
+            ctx.metadata = body_hook_ctx.metadata;
+        }
         (resp, cb_target_key.clone())
     };
     let mut response_status = backend_resp.status_code;
@@ -11172,6 +11271,7 @@ async fn proxy_to_backend(
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     #[allow(unused_variables)] plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&mut RequestContext>,
     stream_response: bool,
     requires_request_body_buffering: bool,
     stream_request_body: bool,
@@ -11280,6 +11380,7 @@ async fn proxy_to_backend(
             headers,
             client_request_body,
             plugins,
+            ctx,
             upstream_target,
             client_ip,
             stream_request_body,
@@ -11637,7 +11738,7 @@ async fn proxy_to_backend(
                     std::sync::atomic::Ordering::Release,
                 );
                 let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
-                match run_final_request_body_hooks(plugins, headers, &body_bytes).await {
+                match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -11754,7 +11855,7 @@ async fn proxy_to_backend(
 
                 // Transform request body via plugins (JSON field rename, add, remove, etc.)
                 let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
-                match run_final_request_body_hooks(plugins, headers, &body_bytes).await {
+                match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -13453,6 +13554,7 @@ async fn proxy_to_backend_http3(
     headers: &HashMap<String, String>,
     client_request_body: ClientRequestBody,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&mut RequestContext>,
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
     stream_request_body: bool,
@@ -13849,7 +13951,7 @@ async fn proxy_to_backend_http3(
     ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
 
     let request_body = apply_request_body_plugins(plugins, headers, request_body).await;
-    match run_final_request_body_hooks(plugins, headers, &request_body).await {
+    match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
         PluginResult::Continue => {}
         reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
             return (
