@@ -705,7 +705,7 @@ pub async fn serve(
             cert_path,
             key_path,
             client_ca_bundle_path,
-            env_config.tls_no_verify,
+            false,
             &tls_policy,
             env_config.tls_cert_expiry_warning_days,
             &crls,
