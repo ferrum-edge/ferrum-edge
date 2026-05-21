@@ -1430,7 +1430,7 @@ pub struct EnvConfig {
     /// Requires Linux 4.11+ and `net.ipv4.tcp_fastopen` sysctl bit 0x1 (server)
     /// or 0x2 (client) enabled. No-op on non-Linux.
     /// Values: `auto` (check sysctl at startup), `true` (force on), `false` (force off).
-    /// Default: `auto`.
+    /// Default: `false`.
     pub tcp_fastopen_enabled: AutoBool,
     /// TCP Fast Open server queue length — maximum pending TFO connections.
     /// Only used when `tcp_fastopen_enabled` is true. Default: 256.
@@ -1449,26 +1449,26 @@ pub struct EnvConfig {
     /// Uses IORING_OP_SPLICE submission queue entries instead of direct libc splice
     /// syscalls. Falls back to libc splice if io_uring is unavailable.
     /// Values: `auto` (detect kernel support), `true` (force on), `false` (force off).
-    /// Default: `auto`.
+    /// Default: `false`.
     pub io_uring_splice_enabled: AutoBool,
     /// Enable UDP GRO (Generic Receive Offload) on frontend UDP sockets (Linux 5.0+).
     /// Kernel coalesces multiple same-size UDP datagrams into a single large buffer,
     /// more efficient than recvmmsg.
     /// Values: `auto` (probe setsockopt on temp socket), `true`, `false`.
-    /// Default: `auto`.
+    /// Default: `false`.
     pub udp_gro_enabled: AutoBool,
     /// Enable UDP GSO (Generic Segmentation Offload) for batched UDP sending (Linux 4.18+).
     /// Sends multiple datagrams in a single sendmsg() by specifying a segment size via
     /// ancillary data. The kernel splits them at the NIC level.
     /// Values: `auto` (probe sendmsg with UDP_SEGMENT on temp socket), `true`, `false`.
-    /// Default: `auto`.
+    /// Default: `false`.
     pub udp_gso_enabled: AutoBool,
     /// Enable IP_PKTINFO / IPV6_PKTINFO on frontend UDP sockets (Linux only).
     /// Captures the per-datagram local destination address on recv and reuses
     /// it as the reply source on send, so the kernel skips the routing-table
     /// lookup. Complements UDP_SEGMENT (GSO) — both cmsgs ride in one sendmsg.
     /// Values: `auto` (probe setsockopt on temp socket), `true`, `false`.
-    /// Default: `auto`.
+    /// Default: `false`.
     pub udp_pktinfo_enabled: AutoBool,
     /// SO_BUSY_POLL duration in microseconds for latency-sensitive UDP sockets (Linux 3.11+).
     /// When > 0, the kernel spins for this many microseconds waiting for incoming data
@@ -1729,7 +1729,7 @@ impl Default for EnvConfig {
             shutdown_drain_seconds: 30,
             status_metrics_window_seconds: 30,
             tls_offload_threads: 0,
-            tcp_fastopen_enabled: AutoBool::Auto,
+            tcp_fastopen_enabled: AutoBool::False,
             tcp_fastopen_queue_len: 256,
             ktls_enabled: AutoBool::Auto,
             io_uring_splice_enabled: AutoBool::Auto,
@@ -2165,7 +2165,7 @@ impl EnvConfig {
         let tcp_fastopen_enabled = env_config_macro::resolve_default::<AutoBool, _>(
             conf,
             "FERRUM_TCP_FASTOPEN_ENABLED",
-            || AutoBool::Auto,
+            || AutoBool::False,
         )?;
         let ktls_enabled =
             env_config_macro::resolve_default::<AutoBool, _>(conf, "FERRUM_KTLS_ENABLED", || {
