@@ -150,7 +150,7 @@ nodeAgent:
   enabled: false
   image:
     repository: ferrumedge/ferrum-edge
-    tag: "0.9.0"
+    tag: latest
   captureMode: ebpf
   proxyUid: 1337
   cgroupRoot: /sys/fs/cgroup
