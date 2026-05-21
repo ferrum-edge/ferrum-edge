@@ -2987,32 +2987,18 @@ fn telemetry(
                                     .or_else(|| {
                                         let env_tag = val.get("environment")?;
                                         let name = env_tag.get("name").and_then(Value::as_str)?;
-                                        if telemetry_custom_tag_env_var_is_sensitive(name) {
-                                            tracing::warn!(
+                                        let default_value = env_tag
+                                            .get("defaultValue")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_string);
+                                        if default_value.is_none() {
+                                            tracing::debug!(
                                                 tag = %key,
                                                 env_var = %name,
-                                                "dropping telemetry custom tag that references a sensitive environment variable"
+                                                "dropping telemetry custom tag environment reference without defaultValue"
                                             );
-                                            return None;
                                         }
-                                        match std::env::var(name) {
-                                            Ok(value) => Some(value),
-                                            Err(error) => {
-                                                let default_value = env_tag
-                                                    .get("defaultValue")
-                                                    .and_then(Value::as_str)
-                                                    .map(str::to_string);
-                                                if default_value.is_none() {
-                                                    tracing::debug!(
-                                                        tag = %key,
-                                                        env_var = %name,
-                                                        %error,
-                                                        "dropping telemetry custom tag with unresolved environment value"
-                                                    );
-                                                }
-                                                default_value
-                                            }
-                                        }
+                                        default_value
                                     });
                                 value.map(|v| (key.clone(), v))
                             })
@@ -3164,39 +3150,6 @@ fn telemetry_sampling_percentage(
         ));
     }
     Ok(Some(sampling))
-}
-
-fn telemetry_custom_tag_env_var_is_sensitive(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    if [
-        "SECRET",
-        "PASSWORD",
-        "PASSWD",
-        "TOKEN",
-        "PRIVATE_KEY",
-        "CLIENT_KEY",
-        "API_KEY",
-        "CREDENTIAL",
-    ]
-    .iter()
-    .any(|marker| upper.contains(marker))
-    {
-        return true;
-    }
-    if matches!(
-        upper.as_str(),
-        "DATABASE_URL"
-            | "DB_URL"
-            | "AWS_SECRET_ACCESS_KEY"
-            | "GOOGLE_APPLICATION_CREDENTIALS"
-            | "KUBECONFIG"
-    ) {
-        return true;
-    }
-    upper.starts_with("FERRUM_")
-        && ["DB_URL", "DATABASE_URL"]
-            .iter()
-            .any(|marker| upper.contains(marker))
 }
 
 fn extend_unique_tracing_providers(
@@ -5242,7 +5195,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_environment_custom_tag_uses_default_when_env_missing() {
+    fn telemetry_environment_custom_tag_uses_default_value() {
         let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
@@ -5277,35 +5230,19 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_environment_custom_tag_drops_sensitive_env_reference() {
+    fn telemetry_environment_custom_tag_ignores_process_environment_values() {
+        std::env::set_var("FERRUM_TEST_TELEMETRY_ENV_TAG", "live-env-value");
+
         let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
                 serde_json::json!({
                     "tracing": [{
                         "customTags": {
-                            "admin_secret": {
+                            "env_tag": {
                                 "environment": {
-                                    "name": "FERRUM_ADMIN_JWT_SECRET",
-                                    "defaultValue": "must-not-leak"
-                                }
-                            },
-                            "redis_password": {
-                                "environment": {
-                                    "name": "REDIS_PASSWORD",
-                                    "defaultValue": "must-not-leak"
-                                }
-                            },
-                            "vendor_api_key": {
-                                "environment": {
-                                    "name": "DATADOG_API_KEY",
-                                    "defaultValue": "must-not-leak"
-                                }
-                            },
-                            "cloud_credentials": {
-                                "environment": {
-                                    "name": "MY_APP_CREDENTIALS",
-                                    "defaultValue": "must-not-leak"
+                                    "name": "FERRUM_TEST_TELEMETRY_ENV_TAG",
+                                    "defaultValue": "fallback-value"
                                 }
                             }
                         }
@@ -5323,10 +5260,10 @@ mod tests {
             .as_ref()
             .expect("tracing config");
 
-        assert!(!tracing.custom_tags.contains_key("admin_secret"));
-        assert!(!tracing.custom_tags.contains_key("redis_password"));
-        assert!(!tracing.custom_tags.contains_key("vendor_api_key"));
-        assert!(!tracing.custom_tags.contains_key("cloud_credentials"));
+        assert_eq!(
+            tracing.custom_tags.get("env_tag").map(String::as_str),
+            Some("fallback-value")
+        );
     }
 
     #[test]
