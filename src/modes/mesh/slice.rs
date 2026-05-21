@@ -949,8 +949,7 @@ fn host_matches_admitted_service(host: &str, admitted_hosts: &BTreeSet<String>) 
     admitted_hosts.contains(host.trim_end_matches('.'))
 }
 
-/// Filter `workloads` down to the SPIFFE identities referenced by admitted
-/// services.
+/// Filter `workloads` down to identities referenced by admitted services.
 ///
 /// The local workload running this sidecar is usually not in any admitted
 /// service's `workloads[]` and can therefore be removed from `slice.workloads`.
@@ -965,11 +964,20 @@ fn narrow_workload_identities(
     admitted_services: &[MeshService],
     request: &MeshSliceRequest,
 ) -> Vec<Workload> {
-    let reachable_identities: HashSet<_> = admitted_services
+    let admitted_service_keys: HashSet<_> = admitted_services
         .iter()
-        .flat_map(|service| service.workloads.iter().map(|workload| &workload.spiffe_id))
+        .map(|service| (service.namespace.as_str(), service.name.as_str()))
         .collect();
-    if !admitted_services.is_empty() && reachable_identities.is_empty() {
+    let reachable_workloads: HashSet<_> = admitted_services
+        .iter()
+        .flat_map(|service| {
+            service
+                .workloads
+                .iter()
+                .map(move |workload| (service.namespace.as_str(), service.name.as_str(), workload))
+        })
+        .collect();
+    if !admitted_services.is_empty() && reachable_workloads.is_empty() {
         warn!(
             node_id = request.node_id.as_str(),
             namespace = request.namespace.as_str(),
@@ -987,7 +995,14 @@ fn narrow_workload_identities(
     }
     workloads
         .into_iter()
-        .filter(|workload| reachable_identities.contains(&workload.spiffe_id))
+        .filter(|workload| {
+            admitted_service_keys.contains(&(workload.namespace.as_str(), workload.service_name.as_str()))
+                && reachable_workloads.contains(&(
+                    workload.namespace.as_str(),
+                    workload.service_name.as_str(),
+                    &workload.spiffe_id,
+                ))
+        })
         .collect()
 }
 
@@ -4496,10 +4511,53 @@ mod tests {
             .iter()
             .map(|workload| workload.spiffe_id.as_str())
             .collect();
-        assert_eq!(
-            identities,
-            vec![reviews.spiffe_id.as_str(), checkout.spiffe_id.as_str()]
+        assert_eq!(identities, vec![reviews.spiffe_id.as_str()]);
+        assert!(
+            !slice
+                .workloads
+                .iter()
+                .any(|workload| workload.spiffe_id == checkout.spiffe_id),
+            "workloads from non-admitted services must not be retained even if an admitted service references their SPIFFE ID"
         );
+    }
+
+    #[test]
+    fn sidecar_identity_narrowing_drops_non_admitted_workloads_with_same_spiffe_id() {
+        let mut reviews = make_workload("alpha", "reviews", HashMap::new());
+        let mut checkout = make_workload("alpha", "checkout", HashMap::new());
+        let shared = reviews.spiffe_id.clone();
+        checkout.spiffe_id = shared.clone();
+        reviews.addresses = vec!["10.10.0.10".into()];
+        checkout.addresses = vec!["10.10.0.20".into()];
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./reviews"]],
+            )],
+            services: vec![
+                make_service_with_workload_refs("alpha", "reviews", vec![shared]),
+                make_service_with_workload_refs(
+                    "alpha",
+                    "checkout",
+                    vec![checkout.spiffe_id.clone()],
+                ),
+            ],
+            workloads: vec![reviews.clone(), checkout.clone()],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_identity_narrowing("alpha"),
+        );
+
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(slice.services[0].name, "reviews");
+        assert_eq!(slice.workloads.len(), 1);
+        assert_eq!(slice.workloads[0].service_name, "reviews");
+        assert_eq!(slice.workloads[0].addresses, vec!["10.10.0.10"]);
     }
 
     #[test]
