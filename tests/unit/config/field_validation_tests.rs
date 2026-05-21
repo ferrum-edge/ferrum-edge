@@ -280,6 +280,17 @@ fn test_proxy_too_many_hosts() {
 }
 
 #[test]
+fn test_proxy_overlong_unicode_host_reports_error_without_panicking() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.hosts = vec!["€".repeat(90)];
+
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("host entry") && e.contains("must not exceed")));
+}
+
+#[test]
 fn test_proxy_timeout_zero_rejected() {
     let mut proxy = make_proxy("test", "/api");
     proxy.backend_connect_timeout_ms = 0;

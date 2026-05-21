@@ -3038,7 +3038,7 @@ impl Proxy {
             if host.len() > MAX_HOST_LENGTH {
                 errors.push(format!(
                     "host entry '{}...' must not exceed {} characters",
-                    &host[..40.min(host.len())],
+                    &host.chars().take(40).collect::<String>(),
                     MAX_HOST_LENGTH
                 ));
             }
