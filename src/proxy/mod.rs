@@ -5704,7 +5704,7 @@ pub(crate) async fn connect_websocket_backend(
             Err(_) => {
                 error!(
                     proxy_id = %proxy.id,
-                    backend_url = %backend_url,
+                    backend_url = %strip_query_params(&backend_url),
                     timeout_ms = proxy.backend_connect_timeout_ms,
                     error_kind = "connect_timeout",
                     "WebSocket backend connect timeout"
@@ -11123,7 +11123,7 @@ pub(crate) async fn proxy_to_backend_retry(
             let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,
-                backend_url = %backend_url,
+                backend_url = %strip_query_params(&backend_url),
                 error_kind = error_kind,
                 error = %e,
                 "Backend retry request failed"
@@ -11721,7 +11721,7 @@ async fn proxy_to_backend(
                         Err(e) => {
                             error!(
                                 proxy_id = %proxy.id,
-                                backend_url = %backend_url,
+                                backend_url = %strip_query_params(&backend_url),
                                 error_kind = "client_disconnect",
                                 error = %e,
                                 "Client disconnected while sending request body"
@@ -11977,7 +11977,7 @@ async fn proxy_to_backend(
             if body_size_exceeded.load(Ordering::Acquire) {
                 warn!(
                     proxy_id = %proxy.id,
-                    backend_url = %backend_url,
+                    backend_url = %strip_query_params(&backend_url),
                     max_body_size = state.max_request_body_size_bytes,
                     "Streaming request body exceeded maximum size"
                 );
@@ -12012,7 +12012,7 @@ async fn proxy_to_backend(
             let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,
-                backend_url = %backend_url,
+                backend_url = %strip_query_params(&backend_url),
                 error_kind = error_kind,
                 error = %e,
                 "Backend request failed"
@@ -13132,7 +13132,7 @@ async fn proxy_to_backend_http2(
     // `ctx.bytes_sent_observed` once the response completes.
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> retry::BackendResponse {
-    debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request via HTTP/2 pool");
+    debug!(proxy_id = %proxy.id, backend_url = %strip_query_params(&backend_url), "Proxying request via HTTP/2 pool");
 
     // Parse the backend URL
     let uri: hyper::Uri = match backend_url.parse() {
@@ -13459,7 +13459,7 @@ async fn proxy_to_backend_http3(
     stream_response: bool,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (retry::BackendResponse, Option<Bytes>) {
-    debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request to HTTP/3 backend");
+    debug!(proxy_id = %proxy.id, backend_url = %strip_query_params(&backend_url), "Proxying request to HTTP/3 backend");
 
     // Resolve backend IP from DNS cache for the effective host
     let effective_host = upstream_target
@@ -13596,7 +13596,7 @@ async fn proxy_to_backend_http3(
                                 }) => {
                                     error!(
                                         proxy_id = %proxy.id,
-                                        backend_url = %backend_url,
+                                        backend_url = %strip_query_params(&backend_url),
                                         max_response_body_size_bytes = state.max_response_body_size_bytes,
                                         "HTTP/3 backend response body exceeded configured maximum"
                                     );
@@ -13635,7 +13635,7 @@ async fn proxy_to_backend_http3(
                                     // `drain_h3_response_body` and never reaches here.
                                     error!(
                                         proxy_id = %proxy.id,
-                                        backend_url = %backend_url,
+                                        backend_url = %strip_query_params(&backend_url),
                                         error_kind = error_kind,
                                         error = %e,
                                         "HTTP/3 backend buffered response read failed"
@@ -13701,7 +13701,7 @@ async fn proxy_to_backend_http3(
                         {
                             error!(
                                 proxy_id = %proxy.id,
-                                backend_url = %backend_url,
+                                backend_url = %strip_query_params(&backend_url),
                                 error = %e,
                                 "Client disconnected while sending request body (HTTP/3 streaming)"
                             );
@@ -13739,7 +13739,7 @@ async fn proxy_to_backend_http3(
                             record_port_exhaustion_if_class(&state.overload, error_class);
                             error!(
                                 proxy_id = %proxy.id,
-                                backend_url = %backend_url,
+                                backend_url = %strip_query_params(&backend_url),
                                 error_kind = error_kind,
                                 error = %e,
                                 "HTTP/3 backend streaming request failed"
@@ -13821,7 +13821,7 @@ async fn proxy_to_backend_http3(
                     Err(e) => {
                         error!(
                             proxy_id = %proxy.id,
-                            backend_url = %backend_url,
+                            backend_url = %strip_query_params(&backend_url),
                             error_kind = "client_disconnect",
                             error = %e,
                             "Client disconnected while sending request body (HTTP/3)"
@@ -13945,7 +13945,7 @@ async fn proxy_to_backend_http3(
                 record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
-                    backend_url = %backend_url,
+                    backend_url = %strip_query_params(&backend_url),
                     error_kind = error_kind,
                     error = %e,
                     "HTTP/3 backend streaming request failed"
@@ -14023,7 +14023,7 @@ async fn proxy_to_backend_http3(
                 record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
-                    backend_url = %backend_url,
+                    backend_url = %strip_query_params(&backend_url),
                     error_kind = error_kind,
                     error = %e,
                     "HTTP/3 backend request failed"
@@ -14311,7 +14311,7 @@ async fn proxy_to_backend_http3_retry(
             record_port_exhaustion_if_class(&state.overload, error_class);
             error!(
                 proxy_id = %proxy.id,
-                backend_url = %backend_url,
+                backend_url = %strip_query_params(&backend_url),
                 target = %format!("{}:{}", effective_host, effective_port),
                 error_kind = error_kind,
                 error = %e,
