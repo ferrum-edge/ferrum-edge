@@ -3971,6 +3971,7 @@ impl ProxyState {
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
         let delta = applied_delta.expect("delta captured when publish_result is Some");
+        let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
