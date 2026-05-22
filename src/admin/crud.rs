@@ -12,7 +12,7 @@ use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{DatabaseBackend, PaginatedResult};
 use crate::config::types::{
-    Consumer, GatewayConfig, PluginConfig, Proxy, Upstream, validate_resource_id,
+    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 
@@ -399,6 +399,45 @@ pub(crate) fn hash_basic_auth_credentials(cred: &mut Value) -> Result<(), String
 
 pub(crate) fn validate_plugin_config_definition(pc: &PluginConfig) -> Result<(), String> {
     super::validate_plugin_config_definition(pc)
+}
+
+async fn validate_openapi_validator_precondition(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    resource: &PluginConfig,
+) -> Result<(), AfterValidateError> {
+    if resource.plugin_name != "openapi_validator" {
+        return Ok(());
+    }
+    if resource.scope != PluginScope::Proxy {
+        return Err(AfterValidateError::BadRequest(vec![
+            "openapi_validator requires scope 'proxy'".to_string(),
+        ]));
+    }
+    let Some(proxy_id) = resource.proxy_id.as_deref() else {
+        return Err(AfterValidateError::BadRequest(vec![
+            "openapi_validator requires proxy_id".to_string(),
+        ]));
+    };
+    match db.get_proxy(proxy_id).await {
+        Ok(Some(proxy)) if proxy.namespace != namespace => {
+            Err(AfterValidateError::BadRequest(vec![format!(
+                "Cross-namespace reference forbidden: proxy_id '{}' belongs to namespace '{}' but plugin_config is in namespace '{}'",
+                proxy_id, proxy.namespace, namespace
+            )]))
+        }
+        Ok(Some(proxy)) if proxy.api_spec_id.is_none() => {
+            Err(AfterValidateError::BadRequest(vec![
+                "openapi_validator requires a proxy with an attached api_spec".to_string(),
+            ]))
+        }
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(AfterValidateError::BadRequest(vec![format!(
+            "proxy_id '{}' does not exist",
+            proxy_id
+        )])),
+        Err(error) => Err(AfterValidateError::Db(error)),
+    }
 }
 
 pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
@@ -923,6 +962,8 @@ impl AdminResource for PluginConfig {
                 error
             )]));
         }
+
+        validate_openapi_validator_precondition(db, namespace, resource).await?;
 
         let upstream_errors =
             validate_mesh_route_dispatch_plugin_upstream_references(db, namespace, resource, None)
