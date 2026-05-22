@@ -741,9 +741,10 @@ plugin_configs:
     plugin_name: "rate_limiting"
     config:
       limit_by: "consumer"
-      requests_per_second: 10
-      requests_per_minute: 100
-      burst_size: 20
+      limits:
+        - scope: "default"
+          requests_per_second: 10
+          requests_per_minute: 100
     scope: global
     enabled: true
 "#;
@@ -760,8 +761,10 @@ plugin_configs:
     assert_eq!(config.plugin_configs.len(), 1);
     let plugin_cfg = &config.plugin_configs[0];
     assert_eq!(plugin_cfg.config["limit_by"].as_str(), Some("consumer"));
-    assert_eq!(plugin_cfg.config["requests_per_second"].as_i64(), Some(10));
-    assert_eq!(plugin_cfg.config["requests_per_minute"].as_i64(), Some(100));
+    let default_limit = &plugin_cfg.config["limits"][0];
+    assert_eq!(default_limit["scope"].as_str(), Some("default"));
+    assert_eq!(default_limit["requests_per_second"].as_i64(), Some(10));
+    assert_eq!(default_limit["requests_per_minute"].as_i64(), Some(100));
 }
 
 // ============================================================================
@@ -1107,7 +1110,9 @@ plugin_configs:
   - id: "plugin-ratelimit"
     plugin_name: "rate_limiting"
     config:
-      requests_per_second: 10
+      limits:
+        - scope: "default"
+          requests_per_second: 10
     scope: proxy
     proxy_id: "proxy-1"
     enabled: true

@@ -52,9 +52,11 @@ plugin_configs:
     plugin_name: rate_limiting
     scope: proxy_group
     config:
-      window_seconds: 60
-      max_requests: 500
       limit_by: consumer
+      limits:
+        - scope: default
+          window_seconds: 60
+          max_requests: 500
 
   - id: internal-key-auth
     plugin_name: key_auth
@@ -1783,11 +1785,13 @@ Enforces request rate limits per time window. Supports limiting by client IP, au
 
 **Priority:** 2900
 
-**Configure rate windows in one of two ways:**
+Configure one or more rules in `limits`. Exactly one rule must use `scope: default`; it applies to every IP/SPIFFE key, every consumer without a specific rule, and the IP fallback when `limit_by: consumer` has no identity. Additional `scope: consumers` rules are only valid with `limit_by: consumer`; each rule can name one or many consumer identities in `consumers`, and each listed identity gets its own independent counter using that rule's windows.
+
+Each `limits[]` rule configures rate windows in one of two ways:
 1. `window_seconds` + `max_requests` — exact custom window of any duration
 2. One or more of `requests_per_second` / `requests_per_minute` / `requests_per_hour`
 
-At least one rate window must be configured (the plugin rejects empty configs at load time). When multiple windows are configured, each request must satisfy ALL windows.
+At least one rate window must be configured in every rule. Do not combine the custom-window pair with preset `requests_per_*` fields in the same rule. When multiple preset windows are configured in a rule, each request must satisfy ALL windows. Consumer identities are matched against the effective identity used by the plugin: mapped Consumer username first, then external authenticated identity.
 
 **Algorithm selection** (automatic):
 - Windows ≤ 5 seconds → token bucket (O(1) memory, ideal for TPS limiting)
@@ -1797,11 +1801,14 @@ At least one rate window must be configured (the plugin rejects empty configs at
 |---|---|---|---|
 | `limit_by` | String | `ip` | Rate limit key: `ip`, `consumer`, or `spiffe_identity` (`spiffe` alias accepted) |
 | `expose_headers` | bool | `false` | Inject `x-ratelimit-*` headers |
-| `window_seconds` | u64 (optional) | — | Custom window duration in seconds. Use with `max_requests` as an alternative to the preset per-second/minute/hour fields |
-| `max_requests` | u64 | `10` | Maximum requests allowed within `window_seconds`. Only used when `window_seconds` is set. Must be greater than zero |
-| `requests_per_second` | u64 (optional) | — | Max requests per second |
-| `requests_per_minute` | u64 (optional) | — | Max requests per minute |
-| `requests_per_hour` | u64 (optional) | — | Max requests per hour |
+| `limits` | Array | required | One default rule plus optional consumer-scoped rules |
+| `limits[].scope` | String | required | `default` or `consumers`; exactly one `default` rule is required |
+| `limits[].consumers` | String array | — | Required for `scope: consumers`; one or many effective consumer identities, each with an independent counter using this rule's windows |
+| `limits[].window_seconds` | u64 (optional) | — | Custom window duration in seconds. Must be paired with `max_requests` |
+| `limits[].max_requests` | u64 (optional) | — | Maximum requests allowed within `window_seconds`. Must be paired with `window_seconds` and greater than zero |
+| `limits[].requests_per_second` | u64 (optional) | — | Max requests per second |
+| `limits[].requests_per_minute` | u64 (optional) | — | Max requests per minute |
+| `limits[].requests_per_hour` | u64 (optional) | — | Max requests per hour |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
@@ -1824,6 +1831,10 @@ At least one rate window must be configured (the plugin rejects empty configs at
 
 Returns HTTP `429 Too Many Requests` when exceeded.
 
+**Counter storage** (`sync_mode`): only `local` and `redis` are supported. There is intentionally no database-backed counter policy; database writes on the hot path are non-performant and can cause operational issues.
+
+For grouped consumer rules, the list is not a shared budget. For example, `consumers: [premium-app, partner-app]` with `requests_per_minute: 1000` gives `premium-app` 1000/minute and `partner-app` 1000/minute independently.
+
 **Centralized mode** (`sync_mode: "redis"`): Rate limit counters are stored in Redis so multiple gateway instances (e.g., multiple data planes) share a single global rate limit. Uses a two-window weighted approximation algorithm with native Redis commands (`INCR`, `GET`, `EXPIRE` pipelined) for smooth sliding window semantics. If Redis becomes unreachable, the plugin automatically falls back to local in-memory rate limiting and switches back when connectivity is restored. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
 > **Namespace isolation:** When `FERRUM_NAMESPACE` is set to a non-default value, the default `redis_key_prefix` automatically includes the namespace (e.g., `staging:rate_limiting` instead of `ferrum:rate_limiting`). This prevents key collisions when multiple gateway instances with different namespaces share the same Redis cluster. An explicit `redis_key_prefix` in the plugin config overrides this behavior entirely.
@@ -1832,12 +1843,21 @@ Returns HTTP `429 Too Many Requests` when exceeded.
 plugin_name: rate_limiting
 config:
   limit_by: consumer
-  requests_per_minute: 100
   expose_headers: true
   sync_mode: redis
   redis_url: "redis://redis-host:6379/0"
   redis_tls: true
   redis_key_prefix: "myapp:rate_limiting"
+  limits:
+    - scope: default
+      requests_per_minute: 100
+    - scope: consumers
+      consumers: [premium-app, partner-app]
+      requests_per_minute: 1000
+    - scope: consumers
+      consumers: [batch-worker]
+      window_seconds: 60
+      max_requests: 250
 ```
 
 ### `request_deduplication`
@@ -2660,12 +2680,23 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer`. Other values are rejected at plugin load time. |
 | `type_rate_limits` | Object | `{}` | Rate limits by operation type (`query`, `mutation`, `subscription`) |
 | `operation_rate_limits` | Object | `{}` | Rate limits by named operation |
+| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) for GraphQL rate-limit counters |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
+| `redis_tls` | bool | `false` | Enable TLS for Redis connection |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql` | Redis key namespace prefix. Defaults to `ferrum:graphql` when namespace is `"ferrum"` |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
+| `redis_password` | String (optional) | — | Redis password |
 
 Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit.
 
 The plugin requires at least one rule (`max_depth`, `max_complexity`, `max_aliases`, `introspection_allowed: false`, `type_rate_limits`, or `operation_rate_limits`) — an empty config is rejected so it cannot be a no-op.
 
 Populates `ctx.metadata` with `graphql_operation_type`, `graphql_operation_name`, `graphql_depth`, and `graphql_complexity`.
+
+**Counter storage** (`sync_mode`): GraphQL rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode uses the shared failover limiter, so an unavailable Redis endpoint falls back to local counters and recovers automatically.
 
 ```yaml
 plugin_name: graphql
@@ -2677,6 +2708,8 @@ config:
     mutation:
       max_requests: 20
       window_seconds: 60
+  sync_mode: redis
+  redis_url: "redis://redis-host:6379/3"
 ```
 
 ---
@@ -2721,12 +2754,23 @@ Parses the gRPC path (`/package.Service/Method`) and enables per-method access c
 | `deny_methods` | String[] | `[]` | These gRPC methods are explicitly blocked (checked before allow) |
 | `method_rate_limits` | Object | `{}` | Per-method rate limits keyed by full method path |
 | `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer`. Other values are rejected at plugin load time. |
+| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) for method rate-limit counters |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
+| `redis_tls` | bool | `false` | Enable TLS for Redis connection |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:grpc_method_router` | Redis key namespace prefix. Defaults to `ferrum:grpc_method_router` when namespace is `"ferrum"` |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
+| `redis_password` | String (optional) | — | Redis password |
 
 Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit.
 
 The plugin requires at least one rule (`allow_methods`, `deny_methods`, or `method_rate_limits`) — an empty config is rejected. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
 
 Populates `ctx.metadata` with `grpc_service`, `grpc_method`, and `grpc_full_method` in the `on_request_received` phase.
+
+**Counter storage** (`sync_mode`): gRPC method rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode uses the shared failover limiter and falls back to local counters while Redis is unavailable.
 
 ```yaml
 plugin_name: grpc_method_router
@@ -2741,6 +2785,8 @@ config:
       max_requests: 100
       window_seconds: 60
   limit_by: consumer
+  sync_mode: redis
+  redis_url: "redis://redis-host:6379/4"
 ```
 
 ### `grpc_deadline`
@@ -3127,7 +3173,7 @@ Rate-limits consumers by LLM token consumption instead of request count. Support
 
 `provider` is parsed case-insensitively and ignores surrounding whitespace.
 
-**Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
+**Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster. Database-backed token counters are intentionally unsupported.
 
 **Streaming token accounting**: SSE responses (Anthropic `message_start` / `message_delta`, OpenAI `stream_options.include_usage`) are counted as they arrive. When only a partial token signal is observed (e.g., a `message_delta` carrying `output_tokens` without a preceding `message_start`), the available count is still recorded against the budget — partial information is preferred over dropping the request entirely. Token sums use saturating arithmetic.
 
@@ -3330,7 +3376,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `frames_per_second` | u64 | `100` | Maximum frames per second per connection. Must be greater than zero — `frames_per_second: 0` is rejected at config load time. |
-| `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance). Setting this to `0` causes the bucket to start empty and reject all frames. |
+| `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance). Must be greater than zero and greater than or equal to `frames_per_second`. |
 | `close_reason` | String | `"Frame rate exceeded"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
@@ -3344,7 +3390,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
-**Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, the plugin prepends a per-instance UUID to every Redis key (e.g., `{redis_key_prefix}:{instance_uuid}:{proxy_id}:{connection_id}:{window_index}`) so two gateways sharing the same Redis cluster never collide. This mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different gateway instance. Uses 1-second fixed windows with native Redis `INCR`/`EXPIRE` commands (no Lua). If Redis becomes unreachable the plugin falls back to local in-memory token-bucket rate limiting and a background health check pings Redis every `redis_health_check_interval_seconds` to switch back automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+**Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, the plugin prepends a per-instance UUID to every Redis key (e.g., `{redis_key_prefix}:{instance_uuid}:{proxy_id}:{connection_id}:{window_index}`) so two gateways sharing the same Redis cluster never collide. This mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different gateway instance. Uses Redis-native counters (no Lua). If Redis becomes unreachable the plugin falls back to local in-memory token-bucket rate limiting and a background health check pings Redis every `redis_health_check_interval_seconds` to switch back automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Database-backed frame counters are intentionally unsupported.
 
 ```yaml
 plugin_name: ws_rate_limiting
@@ -3399,8 +3445,19 @@ Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm 
 | `datagrams_per_second` | u64 (optional) | — | Maximum datagrams per `window_seconds` per client IP |
 | `bytes_per_second` | u64 (optional) | — | Maximum bytes per `window_seconds` per client IP (sum of datagram payload sizes) |
 | `window_seconds` | u64 | `1` | Window length in seconds (minimum 1). The effective per-window cap is `datagrams_per_second × window_seconds` (and similarly for bytes). |
+| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
+| `redis_tls` | bool | `false` | Enable TLS for Redis connection |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:udp_rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:udp_rate_limiting` when namespace is `"ferrum"` |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
+| `redis_password` | String (optional) | — | Redis password |
 
 At least one of `datagrams_per_second` or `bytes_per_second` must be set; if both are configured each is enforced independently and the first to trip drops the datagram.
+
+**Counter storage** (`sync_mode`): UDP rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode centralizes datagram and byte counters across data planes and falls back to local counters while Redis is unavailable.
 
 ```yaml
 plugin_name: udp_rate_limiting

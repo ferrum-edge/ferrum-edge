@@ -88,8 +88,10 @@ x-ferrum-plugins:        # OPTIONAL — array (all must be proxy-scoped)
   - id: rl-orders
     plugin_name: rate_limiting
     config:
-      window_size: 60
-      window_count: 100
+      limits:
+        - scope: default
+          window_seconds: 60
+          max_requests: 100
 
 paths:
   /orders:
@@ -364,7 +366,9 @@ x-ferrum-plugins:
     plugin_name: rate_limiting
     config:
       limit_by: consumer
-      minute: 1000
+      limits:
+        - scope: default
+          requests_per_minute: 1000
 ```
 
 ```bash

@@ -127,7 +127,9 @@ fn make_plugin(
         id: id.to_string(),
         namespace: namespace.to_string(),
         plugin_name: "rate_limiting".to_string(),
-        config: serde_json::json!({"limit": 100}),
+        config: serde_json::json!({
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
         scope: PluginScope::Proxy,
         proxy_id: Some(proxy_id.to_string()),
         enabled: true,
@@ -2864,7 +2866,9 @@ async fn replace_removes_removed_spec_declared_external_proxy_plugin_association
         id: group_plugin_id.clone(),
         namespace: ns.to_string(),
         plugin_name: "rate_limiting".to_string(),
-        config: serde_json::json!({"limit": 100}),
+        config: serde_json::json!({
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
         scope: PluginScope::ProxyGroup,
         proxy_id: None,
         enabled: true,

@@ -158,6 +158,7 @@ fn config_rejects_invalid_numeric_types() {
         json!({"datagrams_per_second": "100"}),
         json!({"bytes_per_second": "1000"}),
         json!({"datagrams_per_second": 100, "window_seconds": "5"}),
+        json!({"datagrams_per_second": 100, "sync_mode": "database"}),
     ] {
         let result = ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
             &config,

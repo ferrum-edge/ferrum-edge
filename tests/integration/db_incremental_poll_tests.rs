@@ -153,7 +153,7 @@ async fn incremental_poll_boundary_all_four_tables() {
     // Plugin config
     sqlx::query(
         "INSERT INTO plugin_configs (id, namespace, plugin_name, config, enabled, created_at, updated_at) \
-         VALUES ('pc1', 'ferrum', 'rate_limiting', '{\"minute\":100}', 1, ?, ?)",
+         VALUES ('pc1', 'ferrum', 'rate_limiting', '{\"limits\":[{\"scope\":\"default\",\"requests_per_minute\":100}]}', 1, ?, ?)",
     )
     .bind(&boundary_ts)
     .bind(&boundary_ts)

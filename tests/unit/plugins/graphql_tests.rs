@@ -94,10 +94,33 @@ fn test_graphql_rejects_invalid_rate_limit_shapes() {
         json!({"operation_rate_limits": {"bad-name": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {"query": "bad"}}),
         json!({"type_rate_limits": {"query": {"max_requests": "1", "window_seconds": 60}}}),
+        json!({"max_depth": 5, "sync_mode": "database"}),
+        json!({"max_depth": 5, "sync_mode": "redis"}),
     ] {
         let result = create_plugin("graphql", &config);
         assert!(result.is_err(), "config should be rejected: {config:?}");
     }
+}
+
+#[test]
+fn test_graphql_warmup_hostnames_for_redis() {
+    let plugin = create_plugin(
+        "graphql",
+        &json!({
+            "type_rate_limits": {
+                "query": { "max_requests": 10, "window_seconds": 60 }
+            },
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["cache.internal".to_string()]
+    );
 }
 
 #[test]
