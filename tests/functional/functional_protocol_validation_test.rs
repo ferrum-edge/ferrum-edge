@@ -25,6 +25,7 @@
 //! - `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` rejection on H3
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H3
 //! - `FERRUM_MAX_QUERY_PARAMS` rejection on H3
+//! - `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` rejection on H3
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
 //! - `CONNECT` method rejection on H2 unless `:protocol = "websocket"`
@@ -138,6 +139,34 @@ async fn start_header_echo_server_on(listener: TcpListener) {
                 len = body.len(),
                 content_type = content_type,
                 body = body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+}
+
+async fn start_fixed_body_server_on(listener: TcpListener, body: &'static str) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let Ok(n) = stream.read(&mut buf).await else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Length: {len}\r\n\
+                 Content-Type: text/plain\r\n\
+                 \r\n\
+                 {body}",
+                len = body.len(),
             );
             let _ = stream.write_all(response.as_bytes()).await;
             let _ = stream.shutdown().await;
@@ -1010,6 +1039,15 @@ async fn functional_protocol_validation_h3_query_param_limit_rejects_from_env() 
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+// --- 9. Response body size on H3 ------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_response_body_limit_rejects_from_env() {
+    let backend_body = "this backend response body exceeds the configured limit";
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_task = tokio::spawn(start_fixed_body_server_on(backend_listener, backend_body));
     sleep(Duration::from_millis(150)).await;
 
     let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1018,6 +1056,7 @@ async fn functional_protocol_validation_h3_query_param_limit_rejects_from_env() 
 
     let mut gateway = TestGateway::builder()
         .mode_file(build_config(echo_port, false))
+        .mode_file(build_config(backend_port, false))
         .log_level("warn")
         .env("FERRUM_ENABLE_HTTP3", "true")
         .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
@@ -1026,6 +1065,7 @@ async fn functional_protocol_validation_h3_query_param_limit_rejects_from_env() 
         .env("FERRUM_MAX_QUERY_PARAMS", "2")
         .env("FERRUM_MAX_URL_LENGTH_BYTES", "5")
         .env("FERRUM_MAX_QUERY_PARAMS", "1")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "8")
         .spawn()
         .await
         .expect("start gateway with h3");
@@ -1034,6 +1074,7 @@ async fn functional_protocol_validation_h3_query_param_limit_rejects_from_env() 
     let url = format!("https://localhost:{https_port}/?a=1&&b=2");
     let url = format!("https://localhost:{https_port}/abcdef");
     let url = format!("https://localhost:{https_port}/?one=1&two=2");
+    let url = format!("https://localhost:{https_port}/");
     let mut last_err = None;
     let resp = {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1049,6 +1090,7 @@ async fn functional_protocol_validation_h3_query_param_limit_rejects_from_env() 
                         "H3 request with empty query segment did not complete; last startup error={last_err:?}; final error={err}"
                         "H3 over-limit URL request did not complete; last startup error={last_err:?}; final error={err}"
                         "H3 request with too many query parameters did not complete; last startup error={last_err:?}; final error={err}"
+                        "H3 request for oversized backend response did not complete; last startup error={last_err:?}; final error={err}"
                     );
                 }
             }
@@ -1128,6 +1170,10 @@ async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_
     assert!(
         resp.body_text()
             .contains("Query parameter count (2) exceeds maximum of 1"),
+    assert_eq!(resp.status.as_u16(), 502, "body={}", resp.body_text());
+    assert!(
+        resp.body_text()
+            .contains("Backend response body exceeds maximum size"),
         "unexpected body: {}",
         resp.body_text()
     );
@@ -1238,6 +1284,9 @@ async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env()
 
 // --- 9. CONNECT on H1 -------------------------------------------------------
 // --- 9. CONNECT on H1/H2 ----------------------------------------------------
+    backend_task.abort();
+}
+
 // --- 10. CONNECT on H1 ------------------------------------------------------
 
 #[ignore]
