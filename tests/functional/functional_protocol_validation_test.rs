@@ -25,6 +25,7 @@
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
 //!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
 //! - Response-side hop-by-hop header stripping on H1 and H3 (client must not see
+//! - Response-side hop-by-hop header stripping on H1 and H2 (client must not see
 //!   `Proxy-Authenticate`, `Keep-Alive`, `Trailer`, etc. from the backend)
 //!
 //! HTTP/3 validation is covered by unit tests in `tests/unit/gateway_core/protocol_validation_tests.rs`
@@ -1401,4 +1402,70 @@ async fn functional_protocol_validation_h3_response_hop_by_hop_stripped() {
 
     gateway.shutdown();
     echo_task.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h2_response_hop_by_hop_stripped() {
+    // Same backend response as the H1 test above, but through an HTTP/2
+    // frontend. H2 forbids these hop-by-hop fields entirely; leaking one can
+    // corrupt the stream instead of merely exposing an unwanted header.
+    let h = Harness::new(false).await;
+
+    let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
+        .await
+        .expect("connect");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("http://example.com/")
+        .header("host", "example.com")
+        .body(Full::new(Bytes::new()))
+        .expect("build request");
+    let resp = sender.send_request(req).await.expect("send GET");
+    let (parts, body) = resp.into_parts();
+    let body = body
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .expect("collect H2 body");
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert_eq!(parts.status.as_u16(), 200, "body={body_str}");
+    let hdrs = parts.headers;
+
+    for banned in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        assert!(
+            hdrs.get(banned).is_none(),
+            "hop-by-hop header `{banned}` should be absent from H2 response; \
+             all_headers={hdrs:?}"
+        );
+    }
+
+    assert!(
+        hdrs.get("x-backend-marker").is_some(),
+        "non-hop-by-hop backend header should pass through; headers={hdrs:?}"
+    );
+
+    drop(sender);
+    conn_task.abort();
+    h.cleanup();
 }
