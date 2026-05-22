@@ -14,6 +14,7 @@
 //! - `FERRUM_MAX_QUERY_PARAMS` rejection and unlimited (`0`) behavior
 //! - `FERRUM_MAX_URL_LENGTH_BYTES` rejection and unlimited (`0`) behavior
 //! - `FERRUM_MAX_HEADER_COUNT` rejection and unlimited (`0`) behavior
+//! - `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` rejection on H1
 //! - `TRACE` method rejection (XST) on H1 and H2
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H2
 //! - `TRACE` method rejection (XST) on H1, H2, and H3
@@ -1109,6 +1110,11 @@ async fn functional_protocol_validation_h3_response_body_limit_rejects_from_env(
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_env() {
+// --- 9. Single header size on H1 ------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h1_single_header_size_limit_rejects_from_env() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -1119,6 +1125,7 @@ async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_
         .log_level("warn")
         .env("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "64")
         .env("FERRUM_MAX_HEADER_SIZE_BYTES", "20")
+        .env("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "12")
         .spawn()
         .await
         .expect("start gateway");
@@ -1131,6 +1138,7 @@ async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_
                 Host: x\r\n\
                 X-One: 1234567890\r\n\
                 X-Two: abcdefghij\r\n\
+                X-Over: value-that-exceeds\r\n\
                 \r\n";
     let resp = send_raw_h1(gateway.proxy_port, req).await;
 
@@ -1177,6 +1185,14 @@ async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_
             .contains("Backend response body exceeds maximum size"),
         "unexpected body: {}",
         resp.body_text()
+        resp.body.contains("Request header"),
+        "unexpected body: {}",
+        resp.body
+    );
+    assert!(
+        resp.body.contains("exceeds maximum size of 12 bytes"),
+        "unexpected body: {}",
+        resp.body
     );
 
     gateway.shutdown();
