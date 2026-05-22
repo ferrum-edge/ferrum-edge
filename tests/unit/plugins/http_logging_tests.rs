@@ -109,6 +109,33 @@ async fn test_http_logging_rejects_non_http_scheme() {
 }
 
 #[tokio::test]
+async fn test_http_logging_rejects_empty_endpoint_authority() {
+    let result = HttpLogging::new(
+        &json!({
+            "endpoint_url": "https:///logs"
+        }),
+        default_client(),
+    );
+    let err = result
+        .err()
+        .expect("empty endpoint authority must be rejected");
+    assert!(err.contains("hostname"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_http_logging_warmup_unbrackets_ipv6_endpoint() {
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "https://[2001:db8::50]:9200/logs"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.warmup_hostnames(), vec!["2001:db8::50"]);
+}
+
+#[tokio::test]
 async fn test_http_logging_with_custom_headers() {
     // custom_headers supports arbitrary key-value pairs for services like Datadog, New Relic
     let plugin = HttpLogging::new(

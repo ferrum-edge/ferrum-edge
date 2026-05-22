@@ -68,6 +68,33 @@ async fn test_loki_logging_rejects_non_http_scheme() {
 }
 
 #[tokio::test]
+async fn test_loki_logging_rejects_empty_endpoint_authority() {
+    let result = LokiLogging::new(
+        &json!({
+            "endpoint_url": "https:///loki/api/v1/push"
+        }),
+        default_client(),
+    );
+    let err = result
+        .err()
+        .expect("empty endpoint authority must be rejected");
+    assert!(err.contains("hostname"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_loki_logging_warmup_unbrackets_ipv6_endpoint() {
+    let plugin = LokiLogging::new(
+        &json!({
+            "endpoint_url": "https://[2001:db8::51]:3100/loki/api/v1/push"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.warmup_hostnames(), vec!["2001:db8::51"]);
+}
+
+#[tokio::test]
 async fn test_loki_logging_rejects_invalid_config_shapes() {
     let cases = [
         json!(null),

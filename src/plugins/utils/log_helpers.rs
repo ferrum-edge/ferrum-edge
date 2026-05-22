@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use serde_json::Value;
-use url::Url;
+use url::{Host, Url};
 
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
@@ -143,11 +143,33 @@ pub fn parse_http_endpoint(
         }
     }
 
-    let hostname = parsed_url.host_str().ok_or_else(|| {
+    if !has_non_empty_authority(&endpoint_url) {
+        return Err(format!(
+            "{plugin_name}: 'endpoint_url' must include a hostname or IP address"
+        ));
+    }
+
+    let hostname = normalized_url_hostname(&parsed_url).ok_or_else(|| {
         format!("{plugin_name}: 'endpoint_url' must include a hostname or IP address")
     })?;
 
-    Ok((endpoint_url, hostname.to_string()))
+    Ok((endpoint_url, hostname))
+}
+
+fn has_non_empty_authority(raw_url: &str) -> bool {
+    raw_url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| !authority.is_empty())
+}
+
+fn normalized_url_hostname(url: &Url) -> Option<String> {
+    match url.host()? {
+        Host::Domain(host) if !host.is_empty() => Some(host.to_string()),
+        Host::Ipv4(host) => Some(host.to_string()),
+        Host::Ipv6(host) => Some(host.to_string()),
+        _ => None,
+    }
 }
 
 pub fn handle_http_batch_response(
