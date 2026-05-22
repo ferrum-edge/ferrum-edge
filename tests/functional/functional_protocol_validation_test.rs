@@ -21,6 +21,7 @@
 //! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
 //! - `CONNECT` method rejection on H2 unless `:protocol = "websocket"`
 //! - `CONNECT` method rejection on H3 for unsupported Extended CONNECT protocols
+//! - `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` rejection on H1 and H2
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
 //!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
@@ -358,6 +359,7 @@ impl Harness {
     }
 
     async fn new_with_env(with_host: bool, extra_env: &[(&str, &str)]) -> Self {
+    async fn new_with_env(with_host: bool, envs: &[(&str, &str)]) -> Self {
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -367,6 +369,7 @@ impl Harness {
             .mode_file(build_config(echo_port, with_host))
             .log_level("warn");
         for (key, value) in extra_env {
+        for (key, value) in envs {
             builder = builder.env(*key, *value);
         }
 
@@ -1211,6 +1214,77 @@ async fn functional_protocol_validation_connect_rejected_http2_non_websocket_pro
 
 // --- 12. Backend sees sanitized request (hop-by-hop headers stripped) ------
 // --- 10. Backend sees sanitized request (hop-by-hop headers stripped) -------
+// --- 10. Global request body size limit ------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_env_request_body_limit_rejects_http1() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "8")]).await;
+
+    let req = b"POST /upload HTTP/1.1\r\n\
+                Host: example.com\r\n\
+                Content-Length: 16\r\n\
+                \r\n\
+                0123456789abcdef";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 413, "body={}", resp.body);
+    assert!(
+        resp.body.contains("Request body exceeds maximum size"),
+        "unexpected body: {}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_env_request_body_limit_rejects_http2() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "8")]).await;
+
+    let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
+        .await
+        .expect("connect");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("http://example.com/upload")
+        .header("host", "example.com")
+        .header("content-length", "16")
+        .body(Full::new(Bytes::from_static(b"0123456789abcdef")))
+        .expect("build oversized H2 request");
+    let resp = sender.send_request(req).await.expect("send oversized POST");
+    let status = resp.status().as_u16();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert_eq!(status, 413, "body={body_str}");
+    assert!(
+        body_str.contains("Request body exceeds maximum size"),
+        "unexpected body: {body_str}"
+    );
+
+    drop(sender);
+    conn_task.abort();
+    h.cleanup();
+}
+
+// --- 11. Backend sees sanitized request (hop-by-hop headers stripped) ------
 
 #[ignore]
 #[tokio::test]
