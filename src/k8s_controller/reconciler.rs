@@ -895,11 +895,13 @@ mod tests {
     #[test]
     fn content_change_detects_same_count_plugin_edit() {
         let mut old_config = GatewayConfig::default();
-        old_config
-            .plugin_configs
-            .push(plugin_config("rate", json!({"max_requests": 100})));
+        old_config.plugin_configs.push(plugin_config(
+            "rate",
+            json!({"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}),
+        ));
         let mut new_config = old_config.clone();
-        new_config.plugin_configs[0].config = json!({"max_requests": 200});
+        new_config.plugin_configs[0].config =
+            json!({"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 200}]});
 
         assert!(gateway_config_content_changed(&new_config, &old_config));
     }
@@ -907,9 +909,10 @@ mod tests {
     #[test]
     fn content_change_ignores_volatile_timestamps() {
         let mut old_config = GatewayConfig::default();
-        old_config
-            .plugin_configs
-            .push(plugin_config("rate", json!({"max_requests": 100})));
+        old_config.plugin_configs.push(plugin_config(
+            "rate",
+            json!({"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}),
+        ));
         let mut new_config = old_config.clone();
         new_config.loaded_at = old_config.loaded_at + ChronoDuration::seconds(5);
         new_config.plugin_configs[0].updated_at =
@@ -1032,7 +1035,7 @@ mod tests {
         active.proxies.push(proxy("db-proxy", "db.internal"));
         active.plugin_configs.push(plugin_config(
             "operator-rate-limit",
-            json!({"max_requests": 100}),
+            json!({"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}),
         ));
         active
             .proxies

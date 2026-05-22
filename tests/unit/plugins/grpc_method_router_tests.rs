@@ -572,6 +572,27 @@ fn test_empty_allow_list_is_valid_block_all_config() {
     assert!(result.is_ok());
 }
 
+#[test]
+fn test_warmup_hostnames_for_redis() {
+    let plugin = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "method_rate_limits": {
+                "/svc/M": { "max_requests": 5, "window_seconds": 60 }
+            },
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["cache.internal".to_string()]
+    );
+}
+
 // ── Constructor validation: rate-limit specs ──
 
 #[test]
@@ -665,6 +686,24 @@ fn test_invalid_method_rate_limit_key_rejected() {
         .err()
         .expect("invalid rate-limit method key must be rejected");
     assert!(err.contains("invalid gRPC method path"), "got: {err}");
+}
+
+#[test]
+fn test_database_sync_mode_rejected() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "method_rate_limits": {
+                "/svc/M": { "max_requests": 5, "window_seconds": 60 }
+            },
+            "sync_mode": "database"
+        }),
+    );
+    let err = result.err().expect("database sync_mode must be rejected");
+    assert!(
+        err.contains("'sync_mode' must be 'local' or 'redis'"),
+        "got: {err}"
+    );
 }
 
 // ── Path edge cases ──

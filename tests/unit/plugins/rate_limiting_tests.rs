@@ -4,13 +4,45 @@ use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, priority, rate_limiting::RateLimiting,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::plugin_utils::{
     assert_continue, assert_reject, create_test_consumer, create_test_context,
 };
+
+fn rate_limiting_config(mut config: Value) -> Value {
+    let Some(object) = config.as_object_mut() else {
+        return config;
+    };
+    if object.contains_key("limits") {
+        return config;
+    }
+
+    let mut default_rule = serde_json::Map::new();
+    default_rule.insert("scope".to_string(), json!("default"));
+    for field in [
+        "requests_per_second",
+        "requests_per_minute",
+        "requests_per_hour",
+        "window_seconds",
+        "max_requests",
+    ] {
+        if let Some(value) = object.remove(field) {
+            default_rule.insert(field.to_string(), value);
+        }
+    }
+    object.insert(
+        "limits".to_string(),
+        Value::Array(vec![Value::Object(default_rule)]),
+    );
+    config
+}
+
+fn make_rate_limiter(config: Value) -> RateLimiting {
+    RateLimiting::new(&rate_limiting_config(config), PluginHttpClient::default()).unwrap()
+}
 
 #[tokio::test]
 async fn test_rate_limiting_plugin_creation() {
@@ -19,7 +51,7 @@ async fn test_rate_limiting_plugin_creation() {
         "max_requests": 10,
         "limit_by": "consumer"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
     assert_eq!(plugin.name(), "rate_limiting");
     assert_eq!(plugin.priority(), priority::RATE_LIMITING);
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
@@ -38,7 +70,7 @@ async fn test_rate_limiting_plugin_consumer_limiting() {
         "max_requests": 3,
         "limit_by": "consumer"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let consumer = create_test_consumer();
 
@@ -79,7 +111,7 @@ async fn test_rate_limiting_plugin_ip_limiting() {
         "max_requests": 5,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     // First request should pass
     let mut ctx = create_test_context();
@@ -110,7 +142,7 @@ async fn test_rate_limiting_plugin_short_window() {
         "max_requests": 2,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -134,7 +166,7 @@ async fn test_rate_limiting_plugin_zero_limit() {
         "max_requests": 0,
         "limit_by": "ip"
     });
-    let result = RateLimiting::new(&config, PluginHttpClient::default());
+    let result = RateLimiting::new(&rate_limiting_config(config), PluginHttpClient::default());
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("must be greater than zero"));
 }
@@ -154,6 +186,7 @@ async fn test_rate_limiting_plugin_invalid_config() {
         json!({"window_seconds": 60, "max_requests": 1, "limit_by": false}),
         json!({"window_seconds": 60, "max_requests": 1, "expose_headers": "true"}),
         json!({"window_seconds": 60, "max_requests": 1, "sync_mode": "redsi"}),
+        json!({"window_seconds": 60, "max_requests": 1, "sync_mode": "database"}),
         json!({"window_seconds": 60, "max_requests": 1, "sync_mode": "redis"}),
         json!({"window_seconds": 60, "max_requests": 1, "sync_mode": "redis", "redis_url": ""}),
         json!({
@@ -162,6 +195,197 @@ async fn test_rate_limiting_plugin_invalid_config() {
             "sync_mode": "redis",
             "redis_url": "redis://localhost:6379/0",
             "redis_health_check_interval_seconds": 0
+        }),
+    ];
+
+    for config in cases {
+        assert!(
+            RateLimiting::new(
+                &rate_limiting_config(config.clone()),
+                PluginHttpClient::default()
+            )
+            .is_err(),
+            "config should fail validation: {config}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_rate_limiting_consumer_rules_override_default_for_many_consumers() {
+    let config = json!({
+        "limit_by": "consumer",
+        "limits": [
+            { "scope": "default", "window_seconds": 60, "max_requests": 3 },
+            { "scope": "consumers", "consumers": ["testuser"], "window_seconds": 60, "max_requests": 1 },
+            { "scope": "consumers", "consumers": ["partner", "batch-worker"], "window_seconds": 60, "max_requests": 2 }
+        ]
+    });
+    let plugin = make_rate_limiter(config);
+
+    let mut testuser_1 = create_test_context();
+    assert_continue(plugin.authorize(&mut testuser_1).await);
+    let mut testuser_2 = create_test_context();
+    assert_reject(plugin.authorize(&mut testuser_2).await, Some(429));
+
+    let mut partner = create_test_consumer();
+    partner.username = "partner".to_string();
+    for _ in 0..2 {
+        let mut ctx = create_test_context();
+        ctx.identified_consumer = Some(Arc::new(partner.clone()));
+        assert_continue(plugin.authorize(&mut ctx).await);
+    }
+    let mut partner_over = create_test_context();
+    partner_over.identified_consumer = Some(Arc::new(partner));
+    assert_reject(plugin.authorize(&mut partner_over).await, Some(429));
+
+    let mut batch_worker = create_test_consumer();
+    batch_worker.username = "batch-worker".to_string();
+    for _ in 0..2 {
+        let mut ctx = create_test_context();
+        ctx.identified_consumer = Some(Arc::new(batch_worker.clone()));
+        assert_continue(plugin.authorize(&mut ctx).await);
+    }
+    let mut batch_over = create_test_context();
+    batch_over.identified_consumer = Some(Arc::new(batch_worker));
+    assert_reject(plugin.authorize(&mut batch_over).await, Some(429));
+
+    for _ in 0..3 {
+        let mut ctx = create_test_context();
+        ctx.identified_consumer = None;
+        ctx.authenticated_identity = Some("unlisted-consumer".to_string());
+        assert_continue(plugin.authorize(&mut ctx).await);
+    }
+    let mut unlisted_over = create_test_context();
+    unlisted_over.identified_consumer = None;
+    unlisted_over.authenticated_identity = Some("unlisted-consumer".to_string());
+    assert_reject(plugin.authorize(&mut unlisted_over).await, Some(429));
+}
+
+#[tokio::test]
+async fn test_rate_limiting_consumer_rules_apply_default_to_ip_fallback() {
+    let config = json!({
+        "limit_by": "consumer",
+        "limits": [
+            { "scope": "default", "window_seconds": 60, "max_requests": 2 },
+            { "scope": "consumers", "consumers": ["testuser"], "window_seconds": 60, "max_requests": 1 }
+        ]
+    });
+    let plugin = make_rate_limiter(config);
+
+    for _ in 0..2 {
+        let mut ctx = create_test_context();
+        ctx.identified_consumer = None;
+        ctx.authenticated_identity = None;
+        assert_continue(plugin.authorize(&mut ctx).await);
+    }
+    let mut over = create_test_context();
+    over.identified_consumer = None;
+    over.authenticated_identity = None;
+    assert_reject(plugin.authorize(&mut over).await, Some(429));
+}
+
+#[tokio::test]
+async fn test_rate_limiting_limit_scope_is_case_insensitive() {
+    let config = json!({
+        "limit_by": "Consumer",
+        "limits": [
+            { "scope": "Default", "window_seconds": 60, "max_requests": 2 },
+            { "scope": "Consumers", "consumers": ["testuser"], "window_seconds": 60, "max_requests": 1 }
+        ]
+    });
+
+    let plugin = make_rate_limiter(config);
+
+    let mut ctx = create_test_context();
+    assert_continue(plugin.authorize(&mut ctx).await);
+    let mut over = create_test_context();
+    assert_reject(plugin.authorize(&mut over).await, Some(429));
+}
+
+#[tokio::test]
+async fn test_rate_limiting_limits_invalid_config() {
+    let cases = [
+        json!({
+            "limit_by": "ip",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10 },
+                { "scope": "consumers", "consumers": ["testuser"], "window_seconds": 60, "max_requests": 1 }
+            ]
+        }),
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10 },
+                { "scope": "consumers", "consumers": [], "window_seconds": 60, "max_requests": 1 }
+            ]
+        }),
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10 },
+                { "scope": "consumers", "consumers": ["testuser"], "sync_mode": "database", "max_requests": 1, "window_seconds": 60 }
+            ]
+        }),
+        json!({
+            "limit_by": "ip",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10, "requests_per_minute": 5 }
+            ]
+        }),
+        json!({
+            "limit_by": "ip",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10, "limit_by": "consumer" }
+            ]
+        }),
+        json!({
+            "limit_by": "ip",
+            "limits": [
+                { "scope": "default", "requests_per_minute": 10, "requests_per_minutes": 20 }
+            ]
+        }),
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                { "scope": "consumers", "consumers": ["testuser"], "window_seconds": 60, "max_requests": 1 }
+            ]
+        }),
+        json!({
+            "limit_by": "ip",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10 },
+                { "scope": "default", "window_seconds": 60, "max_requests": 20 }
+            ]
+        }),
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10 },
+                { "scope": "consumers", "consumers": ["alice"], "window_seconds": 60, "max_requests": 1 },
+                { "scope": "consumers", "consumers": ["alice"], "window_seconds": 60, "max_requests": 2 }
+            ]
+        }),
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10 },
+                { "scope": "consumers", "consumers": ["alice", "alice"], "window_seconds": 60, "max_requests": 1 }
+            ]
+        }),
+        json!({
+            "limit_by": "ip",
+            "limits": [
+                { "scope": "default", "window_seconds": 60 }
+            ]
+        }),
+        json!({
+            "limit_by": "ip",
+            "limits": []
+        }),
+        json!({
+            "limit_by": "ip",
+            "window_seconds": 60,
+            "max_requests": 10
         }),
     ];
 
@@ -181,7 +405,7 @@ async fn test_rate_limiting_ip_mode_authorize_is_noop() {
         "max_requests": 1,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -206,7 +430,7 @@ async fn test_rate_limiting_consumer_mode_on_request_received_is_noop() {
         "max_requests": 1,
         "limit_by": "consumer"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let consumer = create_test_consumer();
 
@@ -238,7 +462,7 @@ async fn test_rate_limiting_consumer_fallback_to_ip() {
         "max_requests": 1,
         "limit_by": "consumer"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     // No consumer set — should fall back to IP-based key
     let mut ctx = create_test_context();
@@ -260,7 +484,7 @@ async fn test_rate_limiting_spiffe_mode_on_request_received_is_noop() {
         "max_requests": 1,
         "limit_by": "spiffe_identity"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
     ctx.peer_spiffe_id = Some(SpiffeId::new("spiffe://example.test/ns/app/sa/api").unwrap());
@@ -279,7 +503,7 @@ async fn test_rate_limiting_spiffe_identity_limits_by_spiffe_id() {
         "max_requests": 1,
         "limit_by": "spiffe"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx1 = create_test_context();
     ctx1.client_ip = "10.0.0.1".to_string();
@@ -304,7 +528,7 @@ async fn test_rate_limiting_spiffe_identity_fallback_to_ip() {
         "max_requests": 1,
         "limit_by": "spiffe_identity"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx1 = create_test_context();
     ctx1.peer_spiffe_id = None;
@@ -323,7 +547,7 @@ async fn test_rate_limiting_warmup_hostnames_for_redis() {
         "sync_mode": "redis",
         "redis_url": "redis://cache.internal:6379/0"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
     assert_eq!(
         plugin.warmup_hostnames(),
         vec!["cache.internal".to_string()]
@@ -337,7 +561,7 @@ async fn test_rate_limiting_different_ips_independent() {
         "max_requests": 1,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     // IP 1: first request passes
     let mut ctx1 = create_test_context();
@@ -362,7 +586,7 @@ async fn test_rate_limiting_explicit_rate_config() {
         "requests_per_second": 2,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -388,7 +612,7 @@ async fn test_rate_limiting_non_standard_window_exact() {
         "max_requests": 10,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -413,7 +637,7 @@ async fn test_rate_limiting_non_standard_window_7s() {
         "max_requests": 3,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -436,7 +660,7 @@ async fn test_rate_limiting_non_standard_window_90s() {
         "max_requests": 5,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -460,7 +684,7 @@ async fn test_rate_limiting_tps_uses_token_bucket() {
         "requests_per_second": 5,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -481,7 +705,7 @@ async fn test_rate_limiting_tps_refills_over_time() {
         "requests_per_second": 10,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -514,7 +738,7 @@ async fn test_rate_limiting_high_tps_limit() {
         "requests_per_second": 10000,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -552,7 +776,7 @@ async fn test_rate_limiting_tps_zero_limit() {
         "requests_per_second": 0,
         "limit_by": "ip"
     });
-    let result = RateLimiting::new(&config, PluginHttpClient::default());
+    let result = RateLimiting::new(&rate_limiting_config(config), PluginHttpClient::default());
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("must be greater than zero"));
 }
@@ -565,7 +789,7 @@ async fn test_rate_limiting_combined_tps_and_per_minute() {
         "requests_per_minute": 10,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -588,7 +812,7 @@ async fn test_rate_limiting_window_1s_uses_token_bucket() {
         "max_requests": 3,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -609,7 +833,7 @@ async fn test_rate_limiting_window_5s_uses_token_bucket() {
         "max_requests": 10,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -630,7 +854,7 @@ async fn test_rate_limiting_window_6s_uses_sliding_window() {
         "max_requests": 3,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
 
@@ -652,7 +876,7 @@ async fn test_expose_headers_disabled_by_default() {
         "max_requests": 10,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
     assert!(!plugin.modifies_request_headers());
 }
 
@@ -664,7 +888,7 @@ async fn test_expose_headers_enabled() {
         "limit_by": "ip",
         "expose_headers": true
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
     assert!(plugin.modifies_request_headers());
 }
 
@@ -676,7 +900,7 @@ async fn test_expose_headers_on_success_response() {
         "limit_by": "ip",
         "expose_headers": true
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
     let result = plugin.on_request_received(&mut ctx).await;
@@ -715,7 +939,7 @@ async fn test_expose_headers_on_success_request_to_backend() {
         "limit_by": "ip",
         "expose_headers": true
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
     let result = plugin.on_request_received(&mut ctx).await;
@@ -742,7 +966,7 @@ async fn test_expose_headers_on_rejection() {
         "limit_by": "ip",
         "expose_headers": true
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     // Use up the limit
     let mut ctx = create_test_context();
@@ -776,7 +1000,7 @@ async fn test_expose_headers_disabled_no_headers_on_rejection() {
         "limit_by": "ip",
         "expose_headers": false
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
     plugin.on_request_received(&mut ctx).await;
@@ -802,7 +1026,7 @@ async fn test_expose_headers_disabled_no_headers_on_success() {
         "limit_by": "ip",
         "expose_headers": false
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
     plugin.on_request_received(&mut ctx).await;
@@ -826,7 +1050,7 @@ async fn test_expose_headers_consumer_identity() {
         "limit_by": "consumer",
         "expose_headers": true
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let consumer = create_test_consumer();
     let mut ctx = create_test_context();
@@ -859,7 +1083,7 @@ async fn test_expose_headers_spiffe_identity() {
         "limit_by": "spiffe_identity",
         "expose_headers": true
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx = create_test_context();
     ctx.peer_spiffe_id = Some(SpiffeId::new("spiffe://example.test/ns/app/sa/api").unwrap());
@@ -890,7 +1114,7 @@ async fn test_expose_headers_remaining_decrements() {
         "limit_by": "ip",
         "expose_headers": true
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     // Request 1: remaining should be 4
     let mut ctx1 = create_test_context();
@@ -918,7 +1142,7 @@ async fn test_expose_headers_reports_tightest_window() {
         "limit_by": "ip",
         "expose_headers": true
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin = make_rate_limiter(config);
 
     let mut ctx1 = create_test_context();
     plugin.on_request_received(&mut ctx1).await;

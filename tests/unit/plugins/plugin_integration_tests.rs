@@ -304,7 +304,9 @@ async fn test_plugin_creation_all_plugins() {
             "kafka_logging" => {
                 json!({"broker_list": "localhost:9092", "topic": "test-logs"})
             }
-            "rate_limiting" => json!({"window_seconds": 60, "max_requests": 100}),
+            "rate_limiting" => json!({
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+            }),
             "request_transformer" => {
                 json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
             }
@@ -471,9 +473,8 @@ async fn test_plugin_complex_configurations() {
         (
             "rate_limiting",
             json!({
-                "window_seconds": 3600,
-                "max_requests": 1000,
                 "limit_by": "consumer",
+                "limits": [{"scope": "default", "window_seconds": 3600, "max_requests": 1000}],
                 "skip_successful_requests": false,
                 "skip_failed_requests": true
             }),

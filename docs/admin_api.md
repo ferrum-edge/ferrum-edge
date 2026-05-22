@@ -151,7 +151,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "plugin_name": "rate_limiting",
-    "config": {"limit_by": "ip", "requests_per_minute": 60},
+    "config": {"limit_by": "ip", "limits": [{"scope": "default", "requests_per_minute": 60}]},
     "scope": "global",
     "enabled": true
   }' \

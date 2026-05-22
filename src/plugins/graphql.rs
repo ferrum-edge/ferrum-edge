@@ -13,68 +13,28 @@
 //! containing `{"query": "...", "operationName": "..."}`.
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-use super::{Plugin, PluginResult, RequestContext};
+use super::utils::rate_limit::{
+    DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
+    RateLimitWindowSpec,
+};
+use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 /// Maximum rate-limit state entries before triggering stale eviction.
 const MAX_STATE_ENTRIES: usize = 100_000;
+const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 
 /// A rate window spec parsed from config.
 #[derive(Debug, Clone)]
 struct RateSpec {
     max_requests: u64,
-    window: Duration,
-}
-
-/// Token bucket for per-operation rate limiting.
-#[derive(Debug)]
-struct TokenBucket {
-    tokens: f64,
-    capacity: f64,
-    refill_rate: f64,
-    last_refill: Instant,
-}
-
-impl TokenBucket {
-    fn new(limit: u64, window: Duration) -> Self {
-        let capacity = limit as f64;
-        let window_secs = window.as_secs_f64().max(0.001);
-        Self {
-            tokens: capacity,
-            capacity,
-            refill_rate: capacity / window_secs,
-            last_refill: Instant::now(),
-        }
-    }
-
-    fn check_and_consume(&mut self) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.last_refill = now;
-        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn remaining(&self) -> u64 {
-        self.tokens.max(0.0) as u64
-    }
-
-    fn has_recent_activity(&self, now: Instant) -> bool {
-        let window_secs = self.capacity / self.refill_rate;
-        now.duration_since(self.last_refill).as_secs_f64() < window_secs
-    }
+    op: DynamicRateLimitOp,
 }
 
 /// Parsed GraphQL operation info.
@@ -104,13 +64,13 @@ pub struct GraphqlPlugin {
     type_rate_limits: HashMap<String, RateSpec>,
     /// Rate limits by named operation
     operation_rate_limits: HashMap<String, RateSpec>,
-    /// Token bucket state: key -> bucket
-    state: Arc<DashMap<String, TokenBucket>>,
+    limiter: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>,
+    request_counter: AtomicU64,
     has_any_config: bool,
 }
 
 impl GraphqlPlugin {
-    pub fn new(config: &Value) -> Result<Self, String> {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         if !config.is_object() {
             return Err("graphql: config must be an object".to_string());
         }
@@ -165,34 +125,33 @@ impl GraphqlPlugin {
             limit_by,
             type_rate_limits,
             operation_rate_limits,
-            state: Arc::new(DashMap::new()),
+            limiter: RateLimitBackend::from_plugin_config(
+                "graphql",
+                config,
+                &http_client,
+                DynamicHttpRateLimitAlgorithm::new(),
+            )?,
+            request_counter: AtomicU64::new(0),
             has_any_config,
         })
     }
 
     /// Evict entries with no recent activity to bound memory.
     fn evict_stale_entries(&self) {
-        if self.state.len() <= MAX_STATE_ENTRIES {
+        let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
             return;
         }
-        let now = Instant::now();
-        self.state
-            .retain(|_, bucket| bucket.has_recent_activity(now));
+        if self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES {
+            self.limiter
+                .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
+        }
     }
 
     /// Check a rate limit by key, creating a bucket if needed.
-    fn check_rate(&self, key: &str, spec: &RateSpec) -> bool {
+    async fn check_rate(&self, key: &str, spec: &RateSpec) -> RateLimitOutcome {
         self.evict_stale_entries();
-        let mut entry = self
-            .state
-            .entry(key.to_string())
-            .or_insert_with(|| TokenBucket::new(spec.max_requests, spec.window));
-        entry.check_and_consume()
-    }
-
-    /// Get remaining count for a key (for metadata/headers).
-    fn get_remaining(&self, key: &str) -> Option<u64> {
-        self.state.get(key).map(|bucket| bucket.remaining())
+        self.limiter.check(key.to_string(), key, &spec.op).await
     }
 
     /// Build the rate limit key based on `limit_by` config.
@@ -290,9 +249,13 @@ fn parse_rate_spec(field: &str, key: &str, spec: &Value) -> Result<RateSpec, Str
     }
     let max_requests = required_positive_u64(spec, field, key, "max_requests")?;
     let window_seconds = required_positive_u64(spec, field, key, "window_seconds")?;
+    let window = Duration::from_secs(window_seconds);
     Ok(RateSpec {
         max_requests,
-        window: Duration::from_secs(window_seconds),
+        op: DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+            limit: max_requests,
+            duration: window,
+        }]),
     })
 }
 
@@ -587,6 +550,14 @@ impl Plugin for GraphqlPlugin {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    fn tracked_keys_count(&self) -> Option<usize> {
+        Some(self.limiter.tracked_keys_count())
+    }
+
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.limiter.warmup_hostname().into_iter().collect()
+    }
+
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.has_any_config
     }
@@ -719,13 +690,14 @@ impl Plugin for GraphqlPlugin {
         // Check operation type rate limit
         if let Some(spec) = self.type_rate_limits.get(op.op_type) {
             let key = self.rate_key(ctx, "type", op.op_type);
-            if !self.check_rate(&key, spec) {
+            let outcome = self.check_rate(&key, spec).await;
+            if !outcome.allowed {
                 warn!(
                     op_type = %op.op_type,
                     plugin = "graphql",
                     "GraphQL operation type rate limit exceeded"
                 );
-                let remaining = self.get_remaining(&key).unwrap_or(0);
+                let remaining = outcome.remaining.unwrap_or(0);
                 let mut headers = json_content_type_header();
                 headers.insert(
                     "x-graphql-ratelimit-limit".to_string(),
@@ -748,13 +720,14 @@ impl Plugin for GraphqlPlugin {
             && let Some(spec) = self.operation_rate_limits.get(op_name)
         {
             let key = self.rate_key(ctx, "op", op_name);
-            if !self.check_rate(&key, spec) {
+            let outcome = self.check_rate(&key, spec).await;
+            if !outcome.allowed {
                 warn!(
                     operation = %op_name,
                     plugin = "graphql",
                     "GraphQL named operation rate limit exceeded"
                 );
-                let remaining = self.get_remaining(&key).unwrap_or(0);
+                let remaining = outcome.remaining.unwrap_or(0);
                 let mut headers = json_content_type_header();
                 headers.insert(
                     "x-graphql-ratelimit-limit".to_string(),

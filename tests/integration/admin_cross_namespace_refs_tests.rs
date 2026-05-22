@@ -194,7 +194,7 @@ fn proxy_scoped_plugin(id: &str, proxy_id: &str) -> Value {
         "scope": "proxy",
         "proxy_id": proxy_id,
         "config": {
-            "requests_per_minute": 60,
+            "limits": [{"scope": "default", "requests_per_minute": 60}],
         },
         "enabled": true,
     })

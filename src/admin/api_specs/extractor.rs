@@ -2176,7 +2176,7 @@ x-ferrum-proxy:
             "id": "plugin-1",
             "plugin_name": "rate_limiting",
             "scope": "proxy",
-            "config": {"limit": 100, "window": "minute"}
+            "config": {"limits": [{"scope": "default", "requests_per_minute": 100}]}
         },
         {
             "id": "plugin-2",
@@ -2457,7 +2457,7 @@ x-ferrum-proxy:
                 "x-ferrum-plugins": [{{
                     "id": "rl-1",
                     "plugin_name": "rate_limiting",
-                    "config": {{"window_size": 60, "window_count": 100}}
+                    "config": {{"limits": [{{"scope": "default", "window_seconds": 60, "max_requests": 100}}]}}
                 }}]
             }}"#,
             minimal_proxy()
@@ -2568,7 +2568,7 @@ x-ferrum-proxy:
                         "id": "dup-id",
                         "plugin_name": "rate_limiting",
                         "scope": "proxy",
-                        "config": {{"per_second": 10}}
+                        "config": {{"limits": [{{"scope": "default", "requests_per_second": 10}}]}}
                     }},
                     {{
                         "id": "dup-id",
@@ -2892,7 +2892,7 @@ x-ferrum-proxy:
                 {
                     "id": "plugin-a",
                     "plugin_name": "rate_limiting",
-                    "config": {"window_size": 60, "window_count": 100}
+                    "config": {"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}
                 }
             ]
         }"#;
@@ -3024,7 +3024,7 @@ x-ferrum-proxy:
                 "backend_port": 443
             },
             "x-ferrum-plugins": [
-                {"id": "p1", "plugin_name": "rate_limiting", "config": {}},
+                {"id": "p1", "plugin_name": "rate_limiting", "config": {"limits": [{"scope": "default", "requests_per_minute": 100}]}},
                 {"id": "p2", "plugin_name": "cors", "config": {}}
             ]
         }"#;

@@ -448,8 +448,7 @@ async fn test_admin_plugin_config_crud() {
         "proxy_id": "plugin-crud-proxy",
         "enabled": true,
         "config": {
-            "window_seconds": 60,
-                "max_requests": 100
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
         }
     });
 
@@ -490,8 +489,7 @@ async fn test_admin_plugin_config_crud() {
         "proxy_id": "plugin-crud-proxy",
         "enabled": false,
         "config": {
-            "window_seconds": 120,
-                "max_requests": 200
+            "limits": [{"scope": "default", "window_seconds": 120, "max_requests": 200}]
         }
     });
 
