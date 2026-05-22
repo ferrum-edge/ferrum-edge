@@ -24,6 +24,7 @@
 //! - `FERRUM_MAX_HEADER_COUNT` rejection on H3
 //! - `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` rejection on H3
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H3
+//! - `FERRUM_MAX_QUERY_PARAMS` rejection on H3
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
 //! - `CONNECT` method rejection on H2 unless `:protocol = "websocket"`
@@ -1001,6 +1002,11 @@ async fn functional_protocol_validation_h3_single_header_size_limit_rejects_from
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_total_header_size_limit_rejects_from_env() {
+// --- 9. Query parameter count on H3 ---------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_query_param_limit_rejects_from_env() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -1019,6 +1025,7 @@ async fn functional_protocol_validation_h3_total_header_size_limit_rejects_from_
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .env("FERRUM_MAX_QUERY_PARAMS", "2")
         .env("FERRUM_MAX_URL_LENGTH_BYTES", "5")
+        .env("FERRUM_MAX_QUERY_PARAMS", "1")
         .spawn()
         .await
         .expect("start gateway with h3");
@@ -1026,6 +1033,7 @@ async fn functional_protocol_validation_h3_total_header_size_limit_rejects_from_
     let client = Http3Client::insecure().expect("H3 client");
     let url = format!("https://localhost:{https_port}/?a=1&&b=2");
     let url = format!("https://localhost:{https_port}/abcdef");
+    let url = format!("https://localhost:{https_port}/?one=1&two=2");
     let mut last_err = None;
     let resp = {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1040,6 +1048,7 @@ async fn functional_protocol_validation_h3_total_header_size_limit_rejects_from_
                     panic!(
                         "H3 request with empty query segment did not complete; last startup error={last_err:?}; final error={err}"
                         "H3 over-limit URL request did not complete; last startup error={last_err:?}; final error={err}"
+                        "H3 request with too many query parameters did not complete; last startup error={last_err:?}; final error={err}"
                     );
                 }
             }
@@ -1115,6 +1124,12 @@ async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_
             .contains("Query parameter count (3) exceeds maximum of 2"),
         "unexpected body: {}",
         rejected.body_text()
+    assert_eq!(resp.status.as_u16(), 400, "body={}", resp.body_text());
+    assert!(
+        resp.body_text()
+            .contains("Query parameter count (2) exceeds maximum of 1"),
+        "unexpected body: {}",
+        resp.body_text()
     );
 
     gateway.shutdown();
