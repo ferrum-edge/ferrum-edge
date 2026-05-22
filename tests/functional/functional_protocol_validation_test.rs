@@ -24,6 +24,8 @@
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
 //!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
+//! - Response-side hop-by-hop header stripping on H1 and H3 (client must not see
+//!   `Proxy-Authenticate`, `Keep-Alive`, `Trailer`, etc. from the backend)
 //!
 //! HTTP/3 validation is covered by unit tests in `tests/unit/gateway_core/protocol_validation_tests.rs`
 //! plus targeted functional QUIC/H3 checks here.
@@ -1318,6 +1320,7 @@ async fn functional_protocol_validation_response_hop_by_hop_stripped_http2() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_response_hop_by_hop_stripped_http3() {
+async fn functional_protocol_validation_h3_response_hop_by_hop_stripped() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -1341,6 +1344,8 @@ async fn functional_protocol_validation_response_hop_by_hop_stripped_http3() {
     let client = Http3Client::insecure().expect("H3 client");
     let url = format!("https://localhost:{https_port}/");
     let response = {
+    let mut last_err = None;
+    let resp = {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             match client.get(&url).await {
@@ -1350,6 +1355,14 @@ async fn functional_protocol_validation_response_hop_by_hop_stripped_http3() {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(err) => panic!("H3 request did not complete: {err}"),
+                    last_err = Some(err.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "H3 hop-by-hop response probe did not complete; last startup error={last_err:?}; final error={err}"
+                    );
+                }
             }
         }
     };
@@ -1361,6 +1374,30 @@ async fn functional_protocol_validation_response_hop_by_hop_stripped_http3() {
         response.body_text()
     );
     assert_hop_by_hop_response_headers_stripped(&response.headers);
+    assert_eq!(resp.status.as_u16(), 200, "body={}", resp.body_text());
+    for banned in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        assert!(
+            resp.headers.get(banned).is_none(),
+            "hop-by-hop header `{banned}` should be stripped from H3 response; \
+             all_headers={:?}",
+            resp.headers
+        );
+    }
+
+    assert!(
+        resp.headers.get("x-backend-marker").is_some(),
+        "non-hop-by-hop backend header should pass through on H3; headers={:?}",
+        resp.headers
+    );
 
     gateway.shutdown();
     echo_task.abort();
