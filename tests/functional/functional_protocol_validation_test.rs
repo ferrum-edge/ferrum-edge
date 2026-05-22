@@ -22,6 +22,7 @@
 //! - Query parameter counting parity on H3
 //! - `FERRUM_MAX_URL_LENGTH_BYTES` rejection on H3
 //! - `FERRUM_MAX_HEADER_COUNT` rejection on H3
+//! - `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` rejection on H3
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
 //! - `CONNECT` method rejection on H2 unless `:protocol = "websocket"`
@@ -989,6 +990,11 @@ async fn functional_protocol_validation_h3_query_param_limit_ignores_empty_segme
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_url_length_limit_rejects_from_env() {
+// --- 9. Single header size on H3 ------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_single_header_size_limit_rejects_from_env() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -1136,6 +1142,7 @@ async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env()
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .env("FERRUM_MAX_HEADER_COUNT", "1")
+        .env("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "12")
         .spawn()
         .await
         .expect("start gateway with h3");
@@ -1145,6 +1152,7 @@ async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env()
     let options = GetOptions::default()
         .header("x-extra-one", "one")
         .header("x-extra-two", "two");
+    let options = GetOptions::default().header("x-over", "value-that-exceeds");
     let mut last_err = None;
     let resp = {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1163,6 +1171,7 @@ async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env()
                     panic!(
                         "H3 CONNECT-UDP request did not complete; last startup error={last_err:?}; final error={err}"
                         "H3 header-count limit request did not complete; last startup error={last_err:?}; final error={err}"
+                        "H3 request with oversized header did not complete; last startup error={last_err:?}; final error={err}"
                     );
                 }
             }
@@ -1179,6 +1188,9 @@ async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env()
     assert_eq!(resp.status.as_u16(), 431, "body={}", resp.body_text());
     assert!(
         resp.body_text().contains("Request header count"),
+    assert_eq!(resp.status.as_u16(), 431, "body={}", resp.body_text());
+    assert!(
+        resp.body_text().contains("Request header"),
         "unexpected body: {}",
         resp.body_text()
     );
@@ -1186,6 +1198,9 @@ async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env()
         resp.body_text().contains("exceeds maximum of 5 bytes"),
         resp.body_text().contains("exceeds maximum of 1"),
         "body did not reflect env limit: {}",
+        resp.body_text()
+            .contains("exceeds maximum size of 12 bytes"),
+        "unexpected body: {}",
         resp.body_text()
     );
 
