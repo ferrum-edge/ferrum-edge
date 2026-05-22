@@ -23,6 +23,7 @@
 //! - `FERRUM_MAX_URL_LENGTH_BYTES` rejection on H2
 //! - `FERRUM_MAX_HEADER_COUNT` rejection and zero-unlimited behavior on H2
 //! - `FERRUM_MAX_QUERY_PARAMS=0` unlimited behavior on H2
+//! - `FERRUM_MAX_URL_LENGTH_BYTES=0` unlimited behavior on H2
 //! - `Transfer-Encoding` rejection on H3
 //! - Empty query segments are ignored by HTTP/3 query-param limit counting
 //! - Query parameter counting parity on H3
@@ -433,6 +434,10 @@ impl Harness {
     async fn new_with_env(with_host: bool, extra_env: &[(&str, &str)]) -> Self {
     async fn new_with_env(with_host: bool, envs: &[(&str, &str)]) -> Self {
     async fn new_with_env(with_host: bool, env: &[(&str, &str)]) -> Self {
+        Self::with_env(with_host, &[]).await
+    }
+
+    async fn with_env(with_host: bool, env: &[(&str, &str)]) -> Self {
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -947,6 +952,57 @@ async fn functional_protocol_validation_h2_total_header_size_limit_rejects_from_
 // --- 8. URL length on H2 ---------------------------------------------------
 // --- 8. Header count on H2 -------------------------------------------------
 // --- 8. Query parameter count zero on H2 ----------------------------------
+// --- 8. URL length zero on H2 ---------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h2_url_length_zero_allows_long_url() {
+    let h = Harness::with_env(false, &[("FERRUM_MAX_URL_LENGTH_BYTES", "0")]).await;
+
+    let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
+        .await
+        .expect("connect");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let long_path = "long-h2".repeat(1300);
+    let uri = format!("http://example.com/{long_path}");
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("host", "example.com")
+        .header("x-url-zero", "forwarded")
+        .body(Full::new(Bytes::new()))
+        .expect("build request");
+    let resp = sender.send_request(req).await.expect("send long URL");
+    let status = resp.status().as_u16();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert_eq!(status, 200, "body={body_str}");
+    assert!(
+        body_str.contains("x-url-zero"),
+        "backend should receive request when URL-length limit is disabled; body={body_str}"
+    );
+
+    drop(sender);
+    conn_task.abort();
+    h.cleanup();
+}
+
+// --- 9. Transfer-Encoding on H3 -------------------------------------------
 
 #[ignore]
 #[tokio::test]
