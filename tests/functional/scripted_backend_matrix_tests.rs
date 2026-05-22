@@ -81,6 +81,7 @@ gateway_matrix! {
         let backend_handle = backend.spawn_refuse_connect().await?;
         let yaml = backend.file_mode_yaml(backend_handle.port());
         let harness = GatewayHarness::builder()
+            .mode_in_process()
             .file_config(yaml)
             .log_level("info")
             .spawn()
@@ -129,6 +130,7 @@ gateway_matrix! {
         let backend_handle = backend.spawn_accept_then_rst().await?;
         let yaml = backend.file_mode_yaml(backend_handle.port());
         let harness = GatewayHarness::builder()
+            .mode_in_process()
             .file_config(yaml)
             .log_level("info")
             .spawn()

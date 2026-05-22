@@ -52,6 +52,14 @@ impl CrdResourceStore {
         })
     }
 
+    /// Owned-`Arc` variant of `wait_until_ready` so callers can `.await` it
+    /// without holding a `&CrdResourceStore` borrow across the suspension
+    /// point. Holding such a borrow trips rustc's HRTB Send analysis when
+    /// the outer future is `tokio::spawn`-ed (see `reconciler.rs`).
+    pub async fn wait_until_ready_owned(self: Arc<Self>) -> Result<(), String> {
+        self.wait_until_ready().await
+    }
+
     pub fn len(&self) -> usize {
         self.store.state().len()
     }

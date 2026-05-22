@@ -4280,7 +4280,8 @@ components:
         1008 — Policy Violation) to both client and backend. Both directions
         (client→backend and backend→client) consume from the same per-connection
         bucket. Supports centralized Redis-backed mode for cross-instance
-        coordination of frame counters.
+        coordination of frame counters. Counter storage supports only local
+        memory and Redis; database-backed counters are intentionally unsupported.
       properties:
         frames_per_second:
           type: integer
@@ -4293,10 +4294,11 @@ components:
         burst_size:
           type: integer
           format: uint64
+          minimum: 1
           description: >-
             Maximum burst capacity (tokens). Defaults to the value of
-            `frames_per_second` when not explicitly set. A value of `0` causes
-            the bucket to start empty and reject every frame.
+            `frames_per_second` when not explicitly set. Must be greater than
+            zero and greater than or equal to `frames_per_second`.
         close_reason:
           type: string
           default: "Frame rate exceeded"
@@ -4308,7 +4310,7 @@ components:
           type: string
           enum: [local, redis]
           default: local
-          description: "Frame counter storage: 'local' (in-memory) or 'redis' (centralized). Any RESP-compatible server works."
+          description: "Frame counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported. Any RESP-compatible server works."
         redis_url:
           type: string
           description: "Redis connection URL. Required when sync_mode is 'redis'."
@@ -4346,7 +4348,9 @@ components:
         datagrams per resolved client IP using a fixed-window algorithm with
         atomic counters. Excess datagrams are silently dropped (standard UDP
         flood mitigation). Operates on both client→backend and backend→client
-        datagrams within the same window per client IP.
+        datagrams within the same window per client IP. Counter storage supports
+        only local memory and Redis; database-backed counters are intentionally
+        unsupported.
       anyOf:
         - required: [datagrams_per_second]
         - required: [bytes_per_second]
@@ -4373,6 +4377,40 @@ components:
             Window length in seconds. Defaults to 1 second. The effective
             per-window cap is `datagrams_per_second × window_seconds` (and
             similarly for bytes).
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "Datagram/byte counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
+        redis_url:
+          type: string
+          description: "Redis connection URL. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          default: "ferrum:udp_rate_limiting"
+          description: Key prefix for all Redis keys
+        redis_pool_size:
+          type: integer
+          default: 4
+          description: Number of multiplexed Redis connections
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
+        redis_connect_timeout_seconds:
+          type: integer
+          default: 5
+          description: Redis connection timeout in seconds
+        redis_health_check_interval_seconds:
+          type: integer
+          default: 5
+          description: Health check ping interval when Redis is unavailable
 
     # ── Circuit Breaker ─────────────────────────────────────────────
     CircuitBreakerConfig:
@@ -8358,23 +8396,56 @@ components:
           default: false
           description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering)"
 
-    RateLimitingConfig:
+    RateLimitingRuleConfig:
       type: object
-      description: "Plugin: rate_limiting — Per-IP, per-consumer, or per-SPIFFE-identity request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. At least one of the preset fields (`requests_per_second`/`requests_per_minute`/`requests_per_hour`) or the custom-window pair (`window_seconds` + `max_requests`) must be configured."
+      required: [scope]
+      additionalProperties: false
+      oneOf:
+        - allOf:
+            - required: [window_seconds, max_requests]
+            - not:
+                anyOf:
+                  - required: [requests_per_second]
+                  - required: [requests_per_minute]
+                  - required: [requests_per_hour]
+        - allOf:
+            - anyOf:
+                - required: [requests_per_second]
+                - required: [requests_per_minute]
+                - required: [requests_per_hour]
+            - not:
+                anyOf:
+                  - required: [window_seconds]
+                  - required: [max_requests]
+      allOf:
+        - if:
+            properties:
+              scope:
+                pattern: "^[cC][oO][nN][sS][uU][mM][eE][rR][sS]$"
+            required: [scope]
+          then:
+            required: [consumers]
+        - if:
+            properties:
+              scope:
+                pattern: "^[dD][eE][fF][aA][uU][lL][tT]$"
+            required: [scope]
+          then:
+            not:
+              required: [consumers]
+      description: "One rate_limiting rule. Every rule must set either one or more preset fields (`requests_per_second`/`requests_per_minute`/`requests_per_hour`) or the custom-window pair (`window_seconds` + `max_requests`), but not both styles in the same rule. Exactly one rule in the plugin config must use `scope: default`. `scope: consumers` is only valid with `limit_by: consumer`; each listed identity gets its own independent counter using this rule's windows."
       properties:
-        limit_by:
+        scope:
           type: string
-          enum: [ip, consumer, spiffe_identity, spiffe]
-          default: ip
-          description: |
-            Rate limit key:
-            - `ip` (default) — client IP.
-            - `consumer` — identified consumer (HTTP) or stream consumer (TCP/UDP); falls back to client IP when no consumer is present.
-            - `spiffe_identity` — SPIFFE ID extracted from peer certificate (mesh authn). `spiffe` is accepted as an alias.
-        expose_headers:
-          type: boolean
-          default: false
-          description: Inject x-ratelimit-* headers on requests and responses
+          pattern: "^([dD][eE][fF][aA][uU][lL][tT]|[cC][oO][nN][sS][uU][mM][eE][rR][sS])$"
+          description: "`default` applies to all keys without a more specific consumer rule and to IP fallback. `consumers` selects the identities listed in `consumers`; each identity has its own counter. Parsed case-insensitively."
+        consumers:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            minLength: 1
+          description: "Effective consumer identities for `scope: consumers` rules. Each listed identity gets an independent counter using this rule's windows. Matched against mapped Consumer username first, then external authenticated identity."
         requests_per_second:
           type: integer
           format: uint64
@@ -8394,17 +8465,43 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: Custom rate-limit window length in seconds. Must be paired with `max_requests`. Use instead of the per-second/minute/hour presets when a non-standard window is needed.
+          description: Custom rate-limit window length in seconds. Must be paired with `max_requests`.
         max_requests:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum requests permitted within `window_seconds`. Must be paired with `window_seconds`.
+          description: Maximum requests permitted within `window_seconds`.
+
+    RateLimitingConfig:
+      type: object
+      required: [limits]
+      additionalProperties: false
+      description: "Plugin: rate_limiting — Per-IP, per-consumer, or per-SPIFFE-identity request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. `limits` must contain exactly one `scope: default` rule for generic keys and fallback IPs, plus optional `scope: consumers` rules that apply the same rate rule to one or many consumer identities, each with an independent counter. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      properties:
+        limit_by:
+          type: string
+          enum: [ip, consumer, spiffe_identity, spiffe]
+          default: ip
+          description: |
+            Rate limit key:
+            - `ip` (default) — client IP.
+            - `consumer` — identified consumer (HTTP) or stream consumer (TCP/UDP); falls back to client IP when no consumer is present.
+            - `spiffe_identity` — SPIFFE ID extracted from peer certificate (mesh authn). `spiffe` is accepted as an alias.
+        expose_headers:
+          type: boolean
+          default: false
+          description: Inject x-ratelimit-* headers on requests and responses
+        limits:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RateLimitingRuleConfig"
+          description: "Rate-limit rules. Must include exactly one `scope: default` rule. `scope: consumers` rules are only valid when `limit_by` is `consumer`."
         sync_mode:
           type: string
           enum: [local, redis]
           default: local
-          description: "Rate limit state storage: 'local' (in-memory per instance) or 'redis' (centralized across instances). Any RESP-compatible server works (Redis, Valkey, DragonflyDB, KeyDB, Garnet)."
+          description: "Rate limit state storage: 'local' (in-memory per instance) or 'redis' (centralized across instances). Database-backed counters are unsupported. Any RESP-compatible server works (Redis, Valkey, DragonflyDB, KeyDB, Garnet)."
         redis_url:
           type: string
           description: "Redis connection URL (e.g., redis://host:6379/0). Required when sync_mode is 'redis'."
@@ -9249,7 +9346,7 @@ components:
 
     GraphqlConfig:
       type: object
-      description: "Plugin: graphql — Query depth/complexity limiting, introspection control, per-operation rate limiting."
+      description: "Plugin: graphql — Query depth/complexity limiting, introspection control, per-operation rate limiting. Rate-limit counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       properties:
         max_depth:
           type: integer
@@ -9282,13 +9379,49 @@ components:
           additionalProperties:
             $ref: "#/components/schemas/RateSpec"
           description: Rate limits by named operation
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "GraphQL rate-limit counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
+        redis_url:
+          type: string
+          description: "Redis connection URL. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          default: "ferrum:graphql"
+          description: Key prefix for all Redis keys
+        redis_pool_size:
+          type: integer
+          default: 4
+          description: Number of multiplexed Redis connections
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
+        redis_connect_timeout_seconds:
+          type: integer
+          default: 5
+          description: Redis connection timeout in seconds
+        redis_health_check_interval_seconds:
+          type: integer
+          default: 5
+          description: Health check ping interval when Redis is unavailable
 
     GrpcMethodRouterConfig:
       type: object
       description: >-
         Plugin: grpc_method_router — Per-method access control and rate limiting
         for gRPC services. Parses the gRPC path (/package.Service/Method) and
-        populates grpc_service, grpc_method, grpc_full_method metadata.
+        populates grpc_service, grpc_method, grpc_full_method metadata. Rate-limit
+        counter storage supports only local memory and Redis; database-backed
+        counters are intentionally unsupported.
       properties:
         allow_methods:
           type: array
@@ -9319,6 +9452,40 @@ components:
           description: >-
             Rate limit key. When consumer, uses identified_consumer then
             authenticated_identity then client IP as fallback.
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "gRPC method rate-limit counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
+        redis_url:
+          type: string
+          description: "Redis connection URL. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          default: "ferrum:grpc_method_router"
+          description: Key prefix for all Redis keys
+        redis_pool_size:
+          type: integer
+          default: 4
+          description: Number of multiplexed Redis connections
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
+        redis_connect_timeout_seconds:
+          type: integer
+          default: 5
+          description: Redis connection timeout in seconds
+        redis_health_check_interval_seconds:
+          type: integer
+          default: 5
+          description: Health check ping interval when Redis is unavailable
 
     GrpcWebConfig:
       type: object
@@ -9524,7 +9691,7 @@ components:
 
     AiRateLimiterConfig:
       type: object
-      description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination."
+      description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       properties:
         token_limit:
           type: integer
@@ -9556,7 +9723,7 @@ components:
           type: string
           enum: [local, redis]
           default: local
-          description: "Token budget storage: 'local' (in-memory) or 'redis' (centralized). Any RESP-compatible server works."
+          description: "Token budget storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported. Any RESP-compatible server works."
         redis_url:
           type: string
           description: "Redis connection URL. Required when sync_mode is 'redis'."

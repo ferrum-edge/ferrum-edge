@@ -714,6 +714,10 @@ fn test_invalid_config_shapes_rejected() {
             json!({"token_limit": 100, "provider": "unknown"}),
             "provider",
         ),
+        (
+            json!({"token_limit": 100, "sync_mode": "database"}),
+            "'sync_mode' must be 'local' or 'redis'",
+        ),
     ] {
         let err = AiRateLimiter::new(&config, PluginHttpClient::default())
             .err()

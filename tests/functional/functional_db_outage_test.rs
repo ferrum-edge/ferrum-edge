@@ -881,7 +881,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
             "scope": "proxy",
             "proxy_id": "admin-test-proxy",
             "enabled": true,
-            "config": { "requests_per_minute": 10 }
+            "config": { "limits": [{"scope": "default", "requests_per_minute": 10}] }
         }))
         .send()
         .await
@@ -1286,8 +1286,8 @@ async fn test_db_outage_rate_limiting_continues() {
             "proxy_id": "rate-proxy",
             "enabled": true,
             "config": {
-                "requests_per_minute": 5,
-                "limit_by": "ip"
+                "limit_by": "ip",
+                "limits": [{"scope": "default", "requests_per_minute": 5}]
             }
         }))
         .send()

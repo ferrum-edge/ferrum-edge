@@ -5232,7 +5232,13 @@ mod tests {
 
     #[test]
     fn telemetry_environment_custom_tag_ignores_process_environment_values() {
-        std::env::set_var("FERRUM_TEST_TELEMETRY_ENV_TAG", "live-env-value");
+        // SAFETY: this test is single-threaded — `mod tests` here doesn't
+        // touch `FERRUM_TEST_TELEMETRY_ENV_TAG` from any other thread, so
+        // the Rust 2024 unsafe contract on `set_var` is satisfied. We do not
+        // unset because the assertion is that the translation IGNORES it.
+        unsafe {
+            std::env::set_var("FERRUM_TEST_TELEMETRY_ENV_TAG", "live-env-value");
+        }
 
         let result = translate_k8s_objects(
             &[object(

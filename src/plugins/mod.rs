@@ -2054,9 +2054,13 @@ pub fn create_plugin_with_http_client(
             response_transformer::ResponseTransformer::new(config)?,
         ))),
         "sse" => Ok(Some(Arc::new(sse::SsePlugin::new(config)?))),
-        "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(config)?))),
+        "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(
+            config,
+            http_client.clone(),
+        )?))),
         "grpc_method_router" => Ok(Some(Arc::new(grpc_method_router::GrpcMethodRouter::new(
             config,
+            http_client.clone(),
         )?))),
         "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)?))),
         "grpc_web" => Ok(Some(Arc::new(grpc_web::GrpcWebPlugin::new(config)?))),

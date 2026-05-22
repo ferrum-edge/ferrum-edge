@@ -728,8 +728,8 @@ async fn provision_resources(
             "proxy_id": proxy_id,
             "enabled": true,
             "config": {
-                "requests_per_second": 10000,
-                "limit_by": "consumer"
+                "limit_by": "consumer",
+                "limits": [{"scope": "default", "requests_per_second": 10000}]
             }
         }));
     }

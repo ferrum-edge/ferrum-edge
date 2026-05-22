@@ -4241,7 +4241,9 @@ mod inner {
                 namespace: crate::config::types::default_namespace(),
                 plugin_name: "rate_limiting".to_string(),
                 enabled: true,
-                config: serde_json::json!({"window_seconds": 60, "max_requests": 100}),
+                config: serde_json::json!({
+                    "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+                }),
                 scope: crate::config::types::PluginScope::Proxy,
                 proxy_id: Some("proxy-1".to_string()),
                 priority_override: Some(500),

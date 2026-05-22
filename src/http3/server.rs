@@ -4433,16 +4433,28 @@ mod h3_backend_url_tests {
     #[test]
     fn websocket_backend_url_uses_wss_scheme_for_https_backends() {
         let proxy = proxy_with_scheme(BackendScheme::Https);
-        let url =
-            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::WebSocket, "/ws", "token=1", 0, None);
+        let url = build_h3_backend_url_for_flavor(
+            &proxy,
+            HttpFlavor::WebSocket,
+            "/ws",
+            "token=1",
+            0,
+            None,
+        );
         assert_eq!(url, "wss://backend.example:8443/ws?token=1");
     }
 
     #[test]
     fn websocket_backend_url_uses_ws_scheme_for_http_backends() {
         let proxy = proxy_with_scheme(BackendScheme::Http);
-        let url =
-            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::WebSocket, "/ws", "token=1", 0, None);
+        let url = build_h3_backend_url_for_flavor(
+            &proxy,
+            HttpFlavor::WebSocket,
+            "/ws",
+            "token=1",
+            0,
+            None,
+        );
         assert_eq!(url, "ws://backend.example:8443/ws?token=1");
     }
 

@@ -29,7 +29,9 @@ fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "access_control" => json!({"allowed_consumers": ["testuser"]}),
         "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
         "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
-        "rate_limiting" => json!({"window_seconds": 60, "max_requests": 100}),
+        "rate_limiting" => json!({
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+        }),
         "request_transformer" => {
             json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
         }
@@ -401,14 +403,20 @@ fn test_request_view_precomputes_authorize_plugins() {
             make_plugin_config_with_json(
                 "rate_ip",
                 "rate_limiting",
-                json!({"window_seconds": 60, "max_requests": 100, "limit_by": "ip"}),
+                json!({
+                    "limit_by": "ip",
+                    "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+                }),
                 PluginScope::Proxy,
                 Some("p1"),
             ),
             make_plugin_config_with_json(
                 "rate_consumer",
                 "rate_limiting",
-                json!({"window_seconds": 60, "max_requests": 100, "limit_by": "consumer"}),
+                json!({
+                    "limit_by": "consumer",
+                    "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+                }),
                 PluginScope::Proxy,
                 Some("p1"),
             ),
@@ -782,9 +790,8 @@ async fn test_rate_limiter_state_persists_across_calls() {
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
             config: json!({
-                "window_seconds": 60,
-                "max_requests": 2,
-                "limit_by": "ip"
+                "limit_by": "ip",
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 2}]
             }),
             scope: PluginScope::Global,
             proxy_id: None,
@@ -1438,10 +1445,21 @@ async fn test_pre_auth_body_buffering_plugins_are_explicitly_tracked_for_hbone()
 
     const HBONE_PRE_AUTH_BODY_PLUGINS: &[&str] = &["hmac_auth"];
 
-    let ctx = RequestContext::new(
+    // PR #1067 narrowed `hmac_auth.should_buffer_request_body` to only ask
+    // for body buffering when the request is actually carrying an HMAC
+    // authorization header. So this enumeration must hand each candidate
+    // plugin a request that *could* trigger its pre-auth buffering — for
+    // hmac_auth that means an `Authorization: hmac …` header — otherwise
+    // hmac_auth (the only currently-tracked plugin) returns false and the
+    // assertion below sees an empty list.
+    let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "CONNECT".to_string(),
         "/".to_string(),
+    );
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "hmac username=\"u\", algorithm=\"hmac-sha256\", headers=\"\", signature=\"\"".to_string(),
     );
     let mut pre_auth_body_plugins = Vec::new();
 

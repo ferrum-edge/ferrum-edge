@@ -570,6 +570,30 @@ async fn parsed_query_params_are_scanned_when_raw_query_is_absent() {
 }
 
 #[tokio::test]
+async fn plus_encoded_query_space_is_detected_by_query_value_rules() {
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-SQLI-001": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select".into());
+    ctx.materialize_query_params();
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected reject, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-SQLI-001")
+    );
+}
+
+#[tokio::test]
 async fn disabled_default_rules_are_skipped() {
     let plugin = Waf::new(&json!({
         "disabled_default_rules": ["FE-XSS-001"],

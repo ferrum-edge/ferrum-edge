@@ -384,9 +384,8 @@ async fn test_plugin_rate_limiting() {
             "proxy_id": "proxy-ratelimit",
             "enabled": true,
             "config": {
-                "window_seconds": 60,
-                "max_requests": 3,
-                "expose_headers": true
+                "expose_headers": true,
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 3}]
             }
         })],
     )

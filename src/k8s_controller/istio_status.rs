@@ -95,9 +95,14 @@ impl IstioStatusWriter {
     /// logged and skipped — they never abort reconcile. Returns the
     /// first error so callers can metric / alert on the failure rate
     /// without losing the rest of the batch.
-    pub async fn patch_updates(&self, updates: &[IstioStatusUpdate]) -> Result<(), kube::Error> {
-        let futures = updates.iter().filter_map(|update| {
-            let Some(ar) = istio_api_resource(update) else {
+    pub async fn patch_updates(&self, updates: Vec<IstioStatusUpdate>) -> Result<(), kube::Error> {
+        // Take `updates` by value and consume via `into_iter` so the per-
+        // update closure / async block owns its `update` rather than
+        // capturing `&IstioStatusUpdate`. Otherwise the spawned reconciler
+        // future fails rustc's HRTB Send check on `&IstioStatusUpdate`.
+        let client = self.client.clone();
+        let futures = updates.into_iter().filter_map(move |update| {
+            let Some(ar) = istio_api_resource(&update) else {
                 warn!(
                     api_version = %update.api_version,
                     kind = %update.kind,
@@ -109,14 +114,14 @@ impl IstioStatusWriter {
             };
             // All Istio CRDs we patch in this PR are namespaced.
             let api: Api<DynamicObject> =
-                Api::namespaced_with(self.client.clone(), &update.namespace, &ar);
+                Api::namespaced_with(client.clone(), &update.namespace, &ar);
             let name = update.name.clone();
             let kind = update.kind.clone();
             let namespace = update.namespace.clone();
             Some(async move {
                 let result = async {
                     let live = api.get_status(&name).await?;
-                    let patch = istio_status_patch(update, live.data.get("status"));
+                    let patch = istio_status_patch(&update, live.data.get("status"));
                     // JSON Merge Patch over server-side apply: matches the
                     // Gateway API path. See [`status.rs`] for the SSA TODO.
                     let params = PatchParams {

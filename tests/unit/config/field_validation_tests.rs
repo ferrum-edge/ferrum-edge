@@ -336,9 +336,10 @@ fn test_proxy_overlong_unicode_host_reports_error_without_panicking() {
     proxy.hosts = vec!["€".repeat(90)];
 
     let errs = proxy.validate_fields().unwrap_err();
-    assert!(errs
-        .iter()
-        .any(|e| e.contains("host entry") && e.contains("must not exceed")));
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("host entry") && e.contains("must not exceed"))
+    );
 }
 
 #[test]

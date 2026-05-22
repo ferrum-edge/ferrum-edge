@@ -163,7 +163,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             id: "plugin-cfg-1".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
-            config: json!({"rate": 100}),
+            config: json!({"limits": [{"scope": "default", "requests_per_minute": 100}]}),
             scope: PluginScope::Global,
             enabled: true,
             proxy_id: None,
@@ -1031,7 +1031,7 @@ fn create_pagination_test_config() -> GatewayConfig {
             id: format!("plugin-cfg-{}", i),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
-            config: json!({"rate": 100}),
+            config: json!({"limits": [{"scope": "default", "requests_per_minute": 100}]}),
             scope: PluginScope::Global,
             enabled: true,
             proxy_id: None,
@@ -1437,7 +1437,7 @@ async fn test_batch_create_plugin_configs() {
     let plugin_batch = json!({
         "plugin_configs": [
             {"id": "pc1", "plugin_name": "key_auth", "scope": "proxy", "proxy_id": "bp1", "enabled": true, "config": {"key_location": "header:X-API-Key"}},
-            {"id": "pc2", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
+            {"id": "pc2", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}}
         ]
     });
 
@@ -1566,7 +1566,7 @@ async fn test_backup_returns_full_config() {
             {"id": "bp1", "listen_path": "/backup1", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true, "upstream_id": "bu1"}
         ],
         "plugin_configs": [
-            {"id": "bpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
+            {"id": "bpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}}
         ]
     });
     let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
@@ -1628,7 +1628,7 @@ async fn test_backup_resource_filter() {
             {"id": "fp1", "listen_path": "/filter", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ],
         "plugin_configs": [
-            {"id": "fpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
+            {"id": "fpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}}
         ]
     });
     let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
@@ -1795,7 +1795,7 @@ async fn test_backup_then_restore_roundtrip() {
             {"id": "rt_p1", "listen_path": "/roundtrip", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ],
         "plugin_configs": [
-            {"id": "rt_pc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
+            {"id": "rt_pc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}}
         ]
     });
     let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
@@ -1984,6 +1984,28 @@ async fn test_batch_create_upstreams_persists_service_discovery() {
 
 #[tokio::test]
 async fn test_restore_hashes_consumer_secrets() {
+    // `hash_basic_auth_password` (in `src/config/types.rs`) reads
+    // `FERRUM_BASIC_AUTH_HMAC_SECRET` from the environment via
+    // `resolve_ferrum_var`. The previous single-process libtest run
+    // happened to inherit this from whatever test happened to set it
+    // first; under nextest's process-per-test model (now used by the
+    // sharded `test-integration` job) every test starts with a clean
+    // env, so the restore handler errors with the "must be set" message
+    // and the assertion below trips on the bubbled-up error string.
+    // Set it explicitly here — the value is irrelevant beyond being
+    // ≥32 chars; we only assert that the plaintext password was hashed
+    // out of the credential, not the hash value itself.
+    //
+    // SAFETY: this test owns its own admin server, started below after
+    // the env var is in place, so no other thread is reading the
+    // environment at the moment of mutation.
+    unsafe {
+        std::env::set_var(
+            "FERRUM_BASIC_AUTH_HMAC_SECRET",
+            "ferrum-test-basic-auth-hmac-secret-32chars-or-more-aaaaaaaaaa",
+        );
+    }
+
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -2581,7 +2603,7 @@ async fn test_create_plugin_config_returns_503_when_db_unavailable() {
         "plugin_name": "rate_limiting",
         "scope": "global",
         "enabled": true,
-        "config": {"rate": 100}
+        "config": {"limits": [{"scope": "default", "requests_per_minute": 100}]}
     });
     let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
     assert_eq!(

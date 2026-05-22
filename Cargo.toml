@@ -234,6 +234,18 @@ codegen-units = 256     # maximise codegen parallelism
 strip = true
 opt-level = 2           # still optimised, but less aggressive
 
+# PR platform verification: fastest linked binary build.
+#
+# Pull requests only need to prove that each target links with the selected
+# feature set. Shipping artifacts are built from `release` on main/tag flows.
+[profile.pr-build]
+inherits = "dev"
+opt-level = 0
+debug = 0               # avoid expensive debuginfo emission/linking
+incremental = false     # let sccache cache crate outputs across CI runs
+lto = "off"
+codegen-units = 256
+
 # Maximum-performance: for production shipping builds and benchmarks.
 # Fat LTO + single codegen unit enables whole-program optimisation across
 # all crates. Compile time is 3-5× slower than `release` but yields 5-10%

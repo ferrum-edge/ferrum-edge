@@ -233,6 +233,65 @@ fn test_non_http_url_rejects() {
     assert!(err.contains("http:// or https://"));
 }
 
+// Regression: a malformed `aws_endpoint_url` must be rejected at plugin
+// construction (parity with `function_url` on Azure / GCP). Pre-fix the
+// override flowed straight into the Lambda invoke URL builder, so a
+// scheme-less value like `localhost:4566` only surfaced at request time
+// as an opaque reqwest invoke error instead of a deterministic config
+// rejection.
+#[test]
+fn test_aws_endpoint_url_missing_scheme_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "AKIATEST",
+            "aws_secret_access_key": "secret",
+            "aws_function_name": "fn",
+            "aws_endpoint_url": "localhost:4566",
+        }),
+        default_client(),
+    ));
+    assert!(
+        err.contains("aws_endpoint_url"),
+        "error should reference the field that was rejected: {err}"
+    );
+}
+
+#[test]
+fn test_aws_endpoint_url_non_http_scheme_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "AKIATEST",
+            "aws_secret_access_key": "secret",
+            "aws_function_name": "fn",
+            "aws_endpoint_url": "tcp://localhost:4566",
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("aws_endpoint_url"));
+    assert!(err.contains("http:// or https://"));
+}
+
+#[test]
+fn test_aws_endpoint_url_valid_accepts() {
+    // Happy path — the override must work as the test harness relies on it.
+    ServerlessFunction::new(
+        &json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "AKIATEST",
+            "aws_secret_access_key": "secret",
+            "aws_function_name": "fn",
+            "aws_endpoint_url": "http://localhost:4566",
+        }),
+        default_client(),
+    )
+    .expect("valid http aws_endpoint_url should be accepted");
+}
+
 #[test]
 fn test_zero_timeout_rejects() {
     let err = expect_err(ServerlessFunction::new(
@@ -758,7 +817,8 @@ async fn test_aws_lambda_function_error_does_not_leak_response_body_in_reject_de
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
-    let lambda_error_body = r#"{"errorMessage":"db_password=supersecret","stackTrace":["/var/task/app.py:42"]}"#;
+    let lambda_error_body =
+        r#"{"errorMessage":"db_password=supersecret","stackTrace":["/var/task/app.py:42"]}"#;
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)

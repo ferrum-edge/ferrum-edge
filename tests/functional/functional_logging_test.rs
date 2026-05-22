@@ -227,21 +227,31 @@ fn parse_log_lines(raw: &str) -> Vec<Value> {
 }
 
 /// Extract access_log entries and parse their nested TransactionSummary JSON.
+///
+/// Handles both wire shapes:
+///
+/// 1. Legacy tracing-wrapped: `{"target":"access_log","fields":{"message":"…"}}`,
+///    where the `message` field is itself a serialized `TransactionSummary`.
+/// 2. Direct-write (PR #1131 `stdout_logging`): one JSON line per transaction
+///    that *is* the serialized `TransactionSummary`, with no tracing envelope.
+///    Discriminated by the presence of a top-level `proxy_id` field — every
+///    transaction summary serialization includes it, and tracing log records
+///    on this stream never put `proxy_id` at the top level.
 fn extract_access_logs(log_lines: &[Value]) -> Vec<Value> {
     log_lines
         .iter()
-        .filter(|entry| {
-            entry
-                .get("target")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| t == "access_log")
-        })
         .filter_map(|entry| {
-            let msg = entry
-                .get("fields")
-                .and_then(|f| f.get("message"))
-                .and_then(|m| m.as_str())?;
-            serde_json::from_str::<Value>(msg).ok()
+            if entry.get("target").and_then(|t| t.as_str()) == Some("access_log") {
+                let msg = entry
+                    .get("fields")
+                    .and_then(|f| f.get("message"))
+                    .and_then(|m| m.as_str())?;
+                return serde_json::from_str::<Value>(msg).ok();
+            }
+            if entry.is_object() && entry.get("proxy_id").is_some() {
+                return Some(entry.clone());
+            }
+            None
         })
         .collect()
 }

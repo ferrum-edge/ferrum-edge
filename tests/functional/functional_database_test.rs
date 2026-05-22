@@ -199,8 +199,8 @@ async fn test_database_mode_comprehensive() {
         "proxy_id": "test-proxy-1",
         "enabled": true,
         "config": {
-            "requests_per_minute": 100,
-            "limit_by": "ip"
+            "limit_by": "ip",
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
         }
     });
 

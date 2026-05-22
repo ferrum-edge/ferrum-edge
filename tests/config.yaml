@@ -199,8 +199,10 @@ plugin_configs:
     plugin_name: "rate_limiting"
     config:
       limit_by: "consumer"
-      requests_per_second: 10
-      requests_per_minute: 100
+      limits:
+        - scope: "default"
+          requests_per_second: 10
+          requests_per_minute: 100
     scope: proxy
     proxy_id: "proxy-protected"
     enabled: true
