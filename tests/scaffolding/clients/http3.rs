@@ -67,6 +67,28 @@ impl Http3Client {
         url: &str,
         options: GetOptions,
     ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+        self.request_with_body(http::Method::GET, url, options, Bytes::new())
+            .await
+    }
+
+    /// Fire a single `POST <url>` via QUIC with DATA bytes and no explicit
+    /// `Content-Length`. This exercises H3 streaming request-body paths.
+    pub async fn post_bytes(
+        &self,
+        url: &str,
+        body: impl Into<Bytes>,
+    ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+        self.request_with_body(http::Method::POST, url, GetOptions::default(), body.into())
+            .await
+    }
+
+    async fn request_with_body(
+        &self,
+        method: http::Method,
+        url: &str,
+        options: GetOptions,
+        body: Bytes,
+    ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
         let parsed: http::Uri = url.parse()?;
         let host = parsed.host().ok_or("missing host in url")?.to_string();
         let port = parsed.port_u16().unwrap_or(443);
@@ -122,6 +144,12 @@ impl Http3Client {
                 .await
                 .map_err(|_| "send_request timed out")?
                 .map_err(|e| format!("send_request: {e}"))?;
+        if !body.is_empty() {
+            tokio::time::timeout(Duration::from_secs(15), stream.send_data(body))
+                .await
+                .map_err(|_| "send request body timed out")?
+                .map_err(|e| format!("send request body: {e}"))?;
+        }
         stream
             .finish()
             .await
