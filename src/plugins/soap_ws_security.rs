@@ -1919,11 +1919,27 @@ fn parse_ws_datetime(s: &str) -> Option<DateTime<Utc>> {
 
 /// Escape special characters for JSON string interpolation.
 fn escape_json_chars(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            ch if ch <= '\u{1f}' => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let value = ch as usize;
+                out.push_str("\\u00");
+                out.push(HEX[(value >> 4) & 0x0f] as char);
+                out.push(HEX[value & 0x0f] as char);
+            }
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Escape XML special characters for safe interpolation.
@@ -1938,6 +1954,23 @@ fn escape_xml_chars(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_error_escape_handles_all_control_characters() {
+        assert_eq!(
+            escape_json_chars("bad \"field\"\n\u{08}\u{0c}\u{00}\u{1f}"),
+            "bad \\\"field\\\"\\n\\b\\f\\u0000\\u001f"
+        );
+    }
+
+    #[test]
+    fn escaped_json_error_remains_parseable_when_interpolated() {
+        let original = "timestamp failed:\n\"bad\"\u{00}";
+        let body = format!(r#"{{"error":"{}"}}"#, escape_json_chars(original));
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+
+        assert_eq!(parsed["error"], original);
+    }
 
     /// Iterating over multiple `<Reference>` elements with
     /// `find_element_block_from_with_end` must advance the cursor far enough
