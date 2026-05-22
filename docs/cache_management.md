@@ -112,7 +112,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Stale entries (where all windows have expired) are evicted on a piggyback sweep triggered during normal request processing. When the entry count exceeds 100,000, eviction runs unconditionally. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Stale entries (where all windows have expired) are evicted on a piggyback sweep triggered during normal request processing. When the entry count exceeds 100,000, eviction runs unconditionally. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback. `sync_mode` supports only `local` and `redis`; database-backed counters are intentionally unsupported.
 
 ### AI Rate Limiter
 
@@ -122,7 +122,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Same as rate limiting -- stale entry eviction on piggyback sweep.
+**Cleanup mechanism:** Same as rate limiting -- stale entry eviction on piggyback sweep. When using `sync_mode: "redis"`, token counters are stored in Redis and the local DashMap is only used as a fallback.
 
 ### WebSocket Rate Limiting
 
@@ -132,7 +132,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Capacity-triggered eviction when exceeding 50,000 entries, plus stale entry cleanup.
+**Cleanup mechanism:** Capacity-triggered eviction when exceeding 50,000 entries, plus stale entry cleanup. When using `sync_mode: "redis"`, frame counters are stored in Redis and the local DashMap is only used as a fallback.
 
 ### UDP Rate Limiting
 
@@ -142,7 +142,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Capacity-triggered eviction when exceeding 100,000 entries.
+**Cleanup mechanism:** Capacity-triggered eviction when exceeding 100,000 entries. When using `sync_mode: "redis"`, datagram and byte counters are stored in Redis and the local DashMap is only used as a fallback.
 
 ### GraphQL Rate Limiting
 
@@ -152,7 +152,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Stale entry eviction on piggyback sweep.
+**Cleanup mechanism:** Stale entry eviction on piggyback sweep. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback.
 
 ### gRPC Method Router Rate Limiting
 
@@ -162,7 +162,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Stale entry eviction on piggyback sweep.
+**Cleanup mechanism:** Stale entry eviction on piggyback sweep. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback.
 
 ### Response Caching
 
@@ -286,4 +286,4 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 | `api_chargeback` | `render_cache_ttl_seconds` | `60` | Rendered output cache TTL |
 | `prometheus_metrics` | `render_cache_ttl_seconds` | `60` | Rendered output cache TTL |
 
-Rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `graphql`, `grpc_method_router`) use hardcoded maximum entry constants (50,000-100,000) and are not configurable via plugin config. These limits are intentionally high to avoid false rejections under normal traffic patterns while still preventing unbounded growth from IP/key churn.
+Rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `graphql`, `grpc_method_router`) use hardcoded maximum entry constants (50,000-100,000) and are not configurable via plugin config. These limits are intentionally high to avoid false rejections under normal traffic patterns while still preventing unbounded growth from IP/key churn. Counter storage supports only local memory and Redis; there is no database-backed counter policy.

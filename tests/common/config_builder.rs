@@ -582,12 +582,15 @@ mod tests {
         let pc = PluginConfigBuilder::new("pc1", "rate_limiting")
             .scope("proxy")
             .proxy_id("p1")
-            .config_field("minute", json!(60))
+            .config_field(
+                "limits",
+                json!([{"scope": "default", "requests_per_minute": 60}]),
+            )
             .config_field("limit_by", json!("ip"))
             .build();
         assert_eq!(pc["scope"], "proxy");
         assert_eq!(pc["proxy_id"], "p1");
-        assert_eq!(pc["config"]["minute"], 60);
+        assert_eq!(pc["config"]["limits"][0]["requests_per_minute"], 60);
         assert_eq!(pc["config"]["limit_by"], "ip");
     }
 

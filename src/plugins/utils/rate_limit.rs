@@ -568,7 +568,7 @@ impl TokenBucket {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateLimitWindowSpec {
     pub limit: u64,
     pub duration: Duration,
@@ -596,14 +596,132 @@ impl HttpWindowState {
     }
 }
 
+fn new_http_window_states(specs: &[RateLimitWindowSpec]) -> Vec<HttpWindowState> {
+    specs
+        .iter()
+        .map(|spec| {
+            if spec.duration.as_secs() <= 5 {
+                HttpWindowState::Bucket(TokenBucket::from_window(spec.limit, spec.duration))
+            } else {
+                HttpWindowState::Sliding(SlidingWindow::new(spec.limit, spec.duration))
+            }
+        })
+        .collect()
+}
+
+fn check_http_windows(
+    specs: &[RateLimitWindowSpec],
+    state: &mut [HttpWindowState],
+    now: Instant,
+) -> RateLimitOutcome {
+    // Two-pass approach to prevent phantom counter increments.
+    // Without this, if window 0 allows+increments but window 1 denies,
+    // window 0's counter is inflated — the request was never served but
+    // the rate limit budget is consumed.
+
+    // First pass: check all windows without modifying counters.
+    for (idx, window) in state.iter_mut().enumerate() {
+        let spec = &specs[idx];
+        let allowed = match window {
+            HttpWindowState::Sliding(sliding) => sliding.would_allow(now),
+            HttpWindowState::Bucket(bucket) => bucket.would_allow(now, 1),
+        };
+        if !allowed {
+            return RateLimitOutcome::deny()
+                .with_limit(spec.limit)
+                .with_window(spec.duration.as_secs());
+        }
+    }
+
+    // Second pass: all windows allow — now increment all counters.
+    let mut tightest: Option<(u64, u64, u64)> = None;
+    for (idx, window) in state.iter_mut().enumerate() {
+        let spec = &specs[idx];
+        match window {
+            HttpWindowState::Sliding(sliding) => sliding.increment(now),
+            HttpWindowState::Bucket(bucket) => bucket.consume(1),
+        }
+
+        let remaining = window.remaining();
+        match tightest {
+            Some((current_remaining, _, _)) if remaining >= current_remaining => {}
+            _ => {
+                tightest = Some((remaining, spec.limit, spec.duration.as_secs()));
+            }
+        }
+    }
+
+    let mut outcome = RateLimitOutcome::allow();
+    if let Some((remaining, limit, window_seconds)) = tightest {
+        outcome = outcome
+            .with_remaining(remaining)
+            .with_limit(limit)
+            .with_window(window_seconds);
+    }
+    outcome
+}
+
+async fn check_http_windows_redis(
+    specs: &[RateLimitWindowSpec],
+    redis: &RedisRateLimitClient,
+    key: &str,
+) -> Result<RateLimitOutcome, ()> {
+    let mut tightest: Option<(u64, u64, u64)> = None;
+
+    // Redis must couple the admission decision to the increment because
+    // multiple gateway instances can race on the same key. For multi-window
+    // configs this may consume an earlier window before a later window
+    // denies, but it prevents cross-instance over-admission without Lua.
+    for spec in specs {
+        let window = FixedWindow::new(spec.limit, spec.duration.as_secs());
+        let curr_idx = RedisRateLimitClient::window_index(window.window_seconds);
+        let prev_idx = curr_idx.saturating_sub(1);
+        let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(window.window_seconds);
+        let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
+        let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
+        let ttl = window.window_seconds * 2 + 1;
+
+        let (prev_count, curr_count) = redis
+            .sliding_window_increment(&prev_key, &curr_key, ttl)
+            .await?;
+        let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
+        if weighted > spec.limit as f64 {
+            return Ok(RateLimitOutcome::deny()
+                .with_limit(spec.limit)
+                .with_window(spec.duration.as_secs()));
+        }
+
+        let remaining = (spec.limit as f64 - weighted).max(0.0) as u64;
+
+        match tightest {
+            Some((current_remaining, _, _)) if remaining >= current_remaining => {}
+            _ => {
+                tightest = Some((remaining, spec.limit, spec.duration.as_secs()));
+            }
+        }
+    }
+
+    let mut outcome = RateLimitOutcome::allow();
+    if let Some((remaining, limit, window_seconds)) = tightest {
+        outcome = outcome
+            .with_remaining(remaining)
+            .with_limit(limit)
+            .with_window(window_seconds);
+    }
+    Ok(outcome)
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct RequestUnit;
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct HttpRateLimitAlgorithm {
     specs: Arc<[RateLimitWindowSpec]>,
 }
 
+#[cfg(test)]
 impl HttpRateLimitAlgorithm {
     pub fn new(specs: Vec<RateLimitWindowSpec>) -> Self {
         Self {
@@ -612,22 +730,14 @@ impl HttpRateLimitAlgorithm {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
     type State = Vec<HttpWindowState>;
     type Op = RequestUnit;
 
     fn new_state(&self) -> Self::State {
-        self.specs
-            .iter()
-            .map(|spec| {
-                if spec.duration.as_secs() <= 5 {
-                    HttpWindowState::Bucket(TokenBucket::from_window(spec.limit, spec.duration))
-                } else {
-                    HttpWindowState::Sliding(SlidingWindow::new(spec.limit, spec.duration))
-                }
-            })
-            .collect()
+        new_http_window_states(&self.specs)
     }
 
     fn check_local(
@@ -636,51 +746,7 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
         _op: &Self::Op,
         now: Instant,
     ) -> RateLimitOutcome {
-        // Two-pass approach to prevent phantom counter increments.
-        // Without this, if window 0 allows+increments but window 1 denies,
-        // window 0's counter is inflated — the request was never served but
-        // the rate limit budget is consumed.
-
-        // First pass: check all windows without modifying counters.
-        for (idx, window) in state.iter_mut().enumerate() {
-            let spec = &self.specs[idx];
-            let allowed = match window {
-                HttpWindowState::Sliding(sliding) => sliding.would_allow(now),
-                HttpWindowState::Bucket(bucket) => bucket.would_allow(now, 1),
-            };
-            if !allowed {
-                return RateLimitOutcome::deny()
-                    .with_limit(spec.limit)
-                    .with_window(spec.duration.as_secs());
-            }
-        }
-
-        // Second pass: all windows allow — now increment all counters.
-        let mut tightest: Option<(u64, u64, u64)> = None;
-        for (idx, window) in state.iter_mut().enumerate() {
-            let spec = &self.specs[idx];
-            match window {
-                HttpWindowState::Sliding(sliding) => sliding.increment(now),
-                HttpWindowState::Bucket(bucket) => bucket.consume(1),
-            }
-
-            let remaining = window.remaining();
-            match tightest {
-                Some((current_remaining, _, _)) if remaining >= current_remaining => {}
-                _ => {
-                    tightest = Some((remaining, spec.limit, spec.duration.as_secs()));
-                }
-            }
-        }
-
-        let mut outcome = RateLimitOutcome::allow();
-        if let Some((remaining, limit, window_seconds)) = tightest {
-            outcome = outcome
-                .with_remaining(remaining)
-                .with_limit(limit)
-                .with_window(window_seconds);
-        }
-        outcome
+        check_http_windows(&self.specs, state, now)
     }
 
     async fn check_redis(
@@ -689,53 +755,87 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
         key: &str,
         _op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
-        let mut tightest: Option<(u64, u64, u64)> = None;
-
-        // Redis must couple the admission decision to the increment because
-        // multiple gateway instances can race on the same key. For multi-window
-        // configs this may consume an earlier window before a later window
-        // denies, but it prevents cross-instance over-admission without Lua.
-        for spec in self.specs.iter() {
-            let window = FixedWindow::new(spec.limit, spec.duration.as_secs());
-            let curr_idx = RedisRateLimitClient::window_index(window.window_seconds);
-            let prev_idx = curr_idx.saturating_sub(1);
-            let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(window.window_seconds);
-            let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
-            let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
-            let ttl = window.window_seconds * 2 + 1;
-
-            let (prev_count, curr_count) = redis
-                .sliding_window_increment(&prev_key, &curr_key, ttl)
-                .await?;
-            let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
-            if weighted > spec.limit as f64 {
-                return Ok(RateLimitOutcome::deny()
-                    .with_limit(spec.limit)
-                    .with_window(spec.duration.as_secs()));
-            }
-
-            let remaining = (spec.limit as f64 - weighted).max(0.0) as u64;
-
-            match tightest {
-                Some((current_remaining, _, _)) if remaining >= current_remaining => {}
-                _ => {
-                    tightest = Some((remaining, spec.limit, spec.duration.as_secs()));
-                }
-            }
-        }
-
-        let mut outcome = RateLimitOutcome::allow();
-        if let Some((remaining, limit, window_seconds)) = tightest {
-            outcome = outcome
-                .with_remaining(remaining)
-                .with_limit(limit)
-                .with_window(window_seconds);
-        }
-        Ok(outcome)
+        check_http_windows_redis(&self.specs, redis, key).await
     }
 
     fn is_state_active(&self, state: &Self::State, now: Instant) -> bool {
         state.iter().any(|window| window.is_active(now))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DynamicRateLimitOp {
+    specs: Arc<[RateLimitWindowSpec]>,
+}
+
+impl DynamicRateLimitOp {
+    pub fn new(specs: Vec<RateLimitWindowSpec>) -> Self {
+        Self {
+            specs: specs.into(),
+        }
+    }
+
+    pub fn specs(&self) -> &[RateLimitWindowSpec] {
+        &self.specs
+    }
+}
+
+#[derive(Debug)]
+pub struct DynamicHttpRateLimitState {
+    specs: Arc<[RateLimitWindowSpec]>,
+    windows: Vec<HttpWindowState>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DynamicHttpRateLimitAlgorithm;
+
+impl DynamicHttpRateLimitAlgorithm {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
+    type State = DynamicHttpRateLimitState;
+    type Op = DynamicRateLimitOp;
+
+    fn new_state(&self) -> Self::State {
+        DynamicHttpRateLimitState {
+            specs: Vec::new().into(),
+            windows: Vec::new(),
+        }
+    }
+
+    fn check_local(
+        &self,
+        state: &mut Self::State,
+        op: &Self::Op,
+        now: Instant,
+    ) -> RateLimitOutcome {
+        if !Arc::ptr_eq(&state.specs, &op.specs) {
+            if !state.windows.is_empty() {
+                warn!(
+                    "DynamicHttpRateLimitAlgorithm: spec change detected for in-progress key; counter state will be reset"
+                );
+            }
+            state.specs = Arc::clone(&op.specs);
+            state.windows = new_http_window_states(op.specs());
+        }
+        check_http_windows(op.specs(), &mut state.windows, now)
+    }
+
+    async fn check_redis(
+        &self,
+        redis: &RedisRateLimitClient,
+        key: &str,
+        op: &Self::Op,
+    ) -> Result<RateLimitOutcome, ()> {
+        check_http_windows_redis(op.specs(), redis, key).await
+    }
+
+    fn is_state_active(&self, state: &Self::State, now: Instant) -> bool {
+        state.windows.iter().any(|window| window.is_active(now))
     }
 }
 

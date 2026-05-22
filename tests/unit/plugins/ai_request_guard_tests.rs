@@ -201,6 +201,89 @@ async fn test_max_tokens_clamp_mode() {
 }
 
 #[tokio::test]
+async fn test_before_proxy_writes_clamped_max_tokens_to_metadata() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 1000,
+        "enforce_max_tokens": "clamp"
+    }))
+    .unwrap();
+
+    let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "max_tokens": 5000}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    // The metadata body should now contain the clamped value
+    let updated_body: serde_json::Value =
+        serde_json::from_str(ctx.metadata.get("request_body").unwrap()).unwrap();
+    assert_eq!(
+        updated_body["max_tokens"], 1000,
+        "before_proxy must eagerly write clamped max_tokens back to metadata"
+    );
+}
+
+#[tokio::test]
+async fn test_before_proxy_writes_default_max_tokens_to_metadata() {
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096})).unwrap();
+
+    let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    let updated_body: serde_json::Value =
+        serde_json::from_str(ctx.metadata.get("request_body").unwrap()).unwrap();
+    assert_eq!(
+        updated_body["max_tokens"], 4096,
+        "before_proxy must eagerly inject default_max_tokens into metadata"
+    );
+}
+
+#[tokio::test]
+async fn test_before_proxy_clamps_max_output_tokens_in_metadata() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 500,
+        "enforce_max_tokens": "clamp"
+    }))
+    .unwrap();
+
+    let mut ctx = make_post_ctx(&json!({"model": "claude-3", "max_output_tokens": 2000}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    let updated_body: serde_json::Value =
+        serde_json::from_str(ctx.metadata.get("request_body").unwrap()).unwrap();
+    assert_eq!(
+        updated_body["max_output_tokens"], 500,
+        "before_proxy must eagerly clamp max_output_tokens in metadata"
+    );
+}
+
+#[tokio::test]
+async fn test_before_proxy_no_metadata_write_when_under_limit() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 5000,
+        "enforce_max_tokens": "clamp"
+    }))
+    .unwrap();
+
+    let original_body = json!({"model": "gpt-4", "max_tokens": 1000});
+    let mut ctx = make_post_ctx(&original_body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    // Body should be unchanged since max_tokens is within the limit
+    let body_after: serde_json::Value =
+        serde_json::from_str(ctx.metadata.get("request_body").unwrap()).unwrap();
+    assert_eq!(
+        body_after["max_tokens"], 1000,
+        "max_tokens within limit should remain unchanged"
+    );
+}
+
+#[tokio::test]
 async fn test_max_output_tokens_clamped() {
     let plugin = AiRequestGuard::new(&json!({
         "max_tokens_limit": 500,

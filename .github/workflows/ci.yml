@@ -926,7 +926,10 @@ jobs:
             echo "Performance tests did not produce results." >> $GITHUB_STEP_SUMMARY
           fi
 
-  # ── Cross-platform builds (PR + main), release & Docker (main push only) ──
+  # ── Cross-platform builds ────────────────────────────────────────────────
+  # PRs run a fast linked build (`pr-build`) to prove each platform compiles.
+  # Main pushes build production `release` artifacts consumed by latest release
+  # and Docker publication. Versioned tags are handled by release.yml.
 
   build-binaries:
     name: Build (${{ matrix.asset_name }})
@@ -1013,17 +1016,28 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo install cross
 
+      - name: Build PR verification binary (cross)
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && github.event_name == 'pull_request'
+        run: cross build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+        env:
+          RUSTC_WRAPPER: ""
+
       - name: Build release binary (cross)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && github.event_name == 'push'
         run: cross build --features cloud-secrets --release --target ${{ matrix.target }}
         env:
           RUSTC_WRAPPER: ""
 
+      - name: Build PR verification binary (cargo)
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && github.event_name == 'pull_request'
+        run: cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+
       - name: Build release binary (cargo)
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && github.event_name == 'push'
         run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}
 
       - name: Prepare release assets
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         run: |
           mkdir -p release-assets
@@ -1043,6 +1057,7 @@ jobs:
           done
 
       - name: Upload artifacts
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: binary-${{ matrix.target }}

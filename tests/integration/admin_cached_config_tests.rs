@@ -163,7 +163,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             id: "plugin-cfg-1".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
-            config: json!({"rate": 100}),
+            config: json!({"limits": [{"scope": "default", "requests_per_minute": 100}]}),
             scope: PluginScope::Global,
             enabled: true,
             proxy_id: None,
@@ -1031,7 +1031,7 @@ fn create_pagination_test_config() -> GatewayConfig {
             id: format!("plugin-cfg-{}", i),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
-            config: json!({"rate": 100}),
+            config: json!({"limits": [{"scope": "default", "requests_per_minute": 100}]}),
             scope: PluginScope::Global,
             enabled: true,
             proxy_id: None,
@@ -1437,7 +1437,7 @@ async fn test_batch_create_plugin_configs() {
     let plugin_batch = json!({
         "plugin_configs": [
             {"id": "pc1", "plugin_name": "key_auth", "scope": "proxy", "proxy_id": "bp1", "enabled": true, "config": {"key_location": "header:X-API-Key"}},
-            {"id": "pc2", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
+            {"id": "pc2", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}}
         ]
     });
 
@@ -1566,7 +1566,7 @@ async fn test_backup_returns_full_config() {
             {"id": "bp1", "listen_path": "/backup1", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true, "upstream_id": "bu1"}
         ],
         "plugin_configs": [
-            {"id": "bpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
+            {"id": "bpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}}
         ]
     });
     let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
@@ -1628,7 +1628,7 @@ async fn test_backup_resource_filter() {
             {"id": "fp1", "listen_path": "/filter", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ],
         "plugin_configs": [
-            {"id": "fpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
+            {"id": "fpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}}
         ]
     });
     let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
@@ -1795,7 +1795,7 @@ async fn test_backup_then_restore_roundtrip() {
             {"id": "rt_p1", "listen_path": "/roundtrip", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ],
         "plugin_configs": [
-            {"id": "rt_pc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
+            {"id": "rt_pc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}}
         ]
     });
     let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
@@ -2603,7 +2603,7 @@ async fn test_create_plugin_config_returns_503_when_db_unavailable() {
         "plugin_name": "rate_limiting",
         "scope": "global",
         "enabled": true,
-        "config": {"rate": 100}
+        "config": {"limits": [{"scope": "default", "requests_per_minute": 100}]}
     });
     let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
     assert_eq!(
