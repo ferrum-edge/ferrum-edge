@@ -13,6 +13,7 @@
 //! - Configured request header count limits and `0` disable semantics
 //! - `FERRUM_MAX_QUERY_PARAMS` rejection and unlimited (`0`) behavior
 //! - `FERRUM_MAX_URL_LENGTH_BYTES` rejection and unlimited (`0`) behavior
+//! - `FERRUM_MAX_HEADER_COUNT` rejection and unlimited (`0`) behavior
 //! - `TRACE` method rejection (XST) on H1 and H2
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H2
 //! - `TRACE` method rejection (XST) on H1, H2, and H3
@@ -648,6 +649,16 @@ async fn functional_protocol_validation_h1_header_count_env_rejects_excess_heade
                 Host: example.com\r\n\
                 X-One: 1\r\n\
                 X-Two: 2\r\n\
+// --- 7. Header count limits from ENV ---------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_header_count_limit_rejects_from_env() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_HEADER_COUNT", "1")]).await;
+
+    let req = b"GET / HTTP/1.1\r\n\
+                Host: example.com\r\n\
+                X-Extra: one\r\n\
                 \r\n";
     let resp = send_raw_h1(h.proxy_port, req).await;
 
@@ -716,6 +727,8 @@ async fn functional_protocol_validation_url_length_limit_rejects_from_env() {
     assert!(
         resp.body.contains("exceeds maximum of 1"),
         resp.body.contains("exceeds maximum of 5 bytes"),
+    assert!(
+        resp.body.contains("exceeds maximum of 1"),
         "body did not reflect env limit: {}",
         resp.body
     );
@@ -744,6 +757,13 @@ async fn functional_protocol_validation_url_length_limit_zero_is_unlimited() {
 
     let req = b"GET /abcdef?long=query HTTP/1.1\r\n\
                 Host: example.com\r\n\
+async fn functional_protocol_validation_header_count_limit_zero_is_unlimited() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_HEADER_COUNT", "0")]).await;
+
+    let req = b"GET / HTTP/1.1\r\n\
+                Host: example.com\r\n\
+                X-Extra-One: one\r\n\
+                X-Extra-Two: two\r\n\
                 \r\n";
     let resp = send_raw_h1(h.proxy_port, req).await;
 
@@ -751,6 +771,7 @@ async fn functional_protocol_validation_url_length_limit_zero_is_unlimited() {
         resp.status_code, 200,
         "FERRUM_MAX_QUERY_PARAMS=0 should disable query-param rejection; body={}",
         "FERRUM_MAX_URL_LENGTH_BYTES=0 should disable URL-length rejection; body={}",
+        "FERRUM_MAX_HEADER_COUNT=0 should disable header-count rejection; body={}",
         resp.body
     );
 
