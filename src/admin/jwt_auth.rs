@@ -168,10 +168,13 @@ impl JwtManager {
 
     /// Extract token from Authorization header
     pub fn extract_token_from_header(auth_header: &str) -> Option<String> {
-        if !auth_header.starts_with("Bearer ") {
+        let mut parts = auth_header.split_whitespace();
+        let scheme = parts.next()?;
+        let token = parts.next()?;
+        if parts.next().is_some() || !scheme.eq_ignore_ascii_case("Bearer") {
             return None;
         }
-        Some(auth_header[7..].to_string())
+        Some(token.to_string())
     }
 
     /// Verify JWT from request

@@ -41,6 +41,46 @@ fn test_jwt_verification() {
 }
 
 #[test]
+fn test_extract_token_from_header_accepts_case_insensitive_bearer_scheme() {
+    assert_eq!(
+        JwtManager::extract_token_from_header("Bearer header.payload.signature").as_deref(),
+        Some("header.payload.signature")
+    );
+    assert_eq!(
+        JwtManager::extract_token_from_header("bearer header.payload.signature").as_deref(),
+        Some("header.payload.signature")
+    );
+    assert_eq!(
+        JwtManager::extract_token_from_header("BEARER header.payload.signature").as_deref(),
+        Some("header.payload.signature")
+    );
+}
+
+#[test]
+fn test_extract_token_from_header_trims_outer_whitespace() {
+    assert_eq!(
+        JwtManager::extract_token_from_header("  Bearer header.payload.signature  ").as_deref(),
+        Some("header.payload.signature")
+    );
+}
+
+#[test]
+fn test_extract_token_from_header_rejects_empty_or_ambiguous_values() {
+    for header in [
+        "",
+        "Bearer",
+        "Bearer ",
+        "Basic header.payload.signature",
+        "Bearer header.payload.signature extra",
+    ] {
+        assert!(
+            JwtManager::extract_token_from_header(header).is_none(),
+            "Authorization header {header:?} must not produce a token"
+        );
+    }
+}
+
+#[test]
 fn test_admin_role_claim_parses_and_requires_explicit_role() {
     let now = Utc::now();
     let mut claims = AdminClaims {
@@ -80,6 +120,36 @@ fn test_admin_role_claim_rejects_unknown_role() {
         additional: json!({"role": "root"}),
     };
     assert!(claims.admin_role().is_err());
+}
+
+#[test]
+fn test_jwt_missing_required_claim_rejected() {
+    let config = JwtConfig {
+        secret: "test-secret".to_string(),
+        issuer: "test-issuer".to_string(),
+        max_ttl_seconds: 3600,
+        algorithm: Algorithm::HS256,
+    };
+
+    let manager = JwtManager::new(config);
+    let now = Utc::now();
+    let claims = json!({
+        "iss": "test-issuer",
+        "sub": "admin-user",
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + Duration::seconds(1800)).timestamp(),
+        "role": "admin"
+    });
+
+    let header = Header::new(Algorithm::HS256);
+    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let token = encode(&header, &claims, &key).unwrap();
+
+    assert!(
+        manager.verify_token(&token).is_err(),
+        "admin JWTs missing required jti claim must be rejected"
+    );
 }
 
 #[test]
