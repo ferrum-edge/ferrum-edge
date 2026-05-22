@@ -846,6 +846,16 @@ pub(crate) fn should_bypass_h2_coalesce_for_large_response(
     len >= LARGE_H2_BYPASS_THRESHOLD && within_limit
 }
 
+/// Hyper's HTTP/1 parser closes the connection when `max_buf_size` is smaller
+/// than the request head, bypassing Ferrum's protocol-aware 431 response.
+/// Keep the parser buffer reasonably sized and enforce the configured total
+/// header limit in `handle_proxy_request_inner`.
+fn http1_parser_max_buf_size(max_header_size_bytes: usize) -> usize {
+    const MIN_HTTP1_PARSER_BUF_SIZE: usize = 8 * 1024;
+
+    max_header_size_bytes.max(MIN_HTTP1_PARSER_BUF_SIZE)
+}
+
 fn warn_if_h3_backend_tls_policy_incompatible(
     config: &GatewayConfig,
     tls_policy: Option<&TlsPolicy>,
@@ -4616,7 +4626,7 @@ async fn handle_connection(
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     {
         let mut http1 = builder.http1();
-        http1.max_buf_size(state.max_header_size_bytes);
+        http1.max_buf_size(http1_parser_max_buf_size(state.max_header_size_bytes));
         http1.writev(true);
         // Slowloris protection: close connections that take too long to send headers.
         if state.env_config.http_header_read_timeout_seconds > 0 {
@@ -7231,7 +7241,7 @@ async fn handle_tls_connection(
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     {
         let mut http1 = builder.http1();
-        http1.max_buf_size(state.max_header_size_bytes);
+        http1.max_buf_size(http1_parser_max_buf_size(state.max_header_size_bytes));
         http1.writev(true);
         // Slowloris protection: close connections that take too long to send headers.
         if state.env_config.http_header_read_timeout_seconds > 0 {

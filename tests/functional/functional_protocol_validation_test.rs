@@ -9,6 +9,7 @@
 //! - Non-numeric `Content-Length` (negative, decimal, hex, alpha)
 //! - Multiple `Host` headers (HTTP/1.1)
 //! - `Host` trailing-dot normalization
+//! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H1
 //! - `TRACE` method rejection (XST) on H1 and H2
 //! - `Transfer-Encoding` rejection on H3
 //! - Empty query segments are ignored by HTTP/3 query-param limit counting
@@ -672,7 +673,49 @@ async fn functional_protocol_validation_h3_empty_query_segments_do_not_count_aga
     echo_task.abort();
 }
 
-// --- 10. CONNECT on H1 ------------------------------------------------------
+// --- 10. Total header size on H1 -------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "64")
+        .env("FERRUM_MAX_HEADER_SIZE_BYTES", "20")
+        .spawn()
+        .await
+        .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port did not become ready");
+
+    let req = b"GET / HTTP/1.1\r\n\
+                Host: x\r\n\
+                X-One: 1234567890\r\n\
+                X-Two: abcdefghij\r\n\
+                \r\n";
+    let resp = send_raw_h1(gateway.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 431, "body={}", resp.body);
+    assert!(
+        resp.body
+            .contains("Total request headers exceed maximum size"),
+        "unexpected body: {}",
+        resp.body
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 11. CONNECT on H1 ------------------------------------------------------
 
 #[ignore]
 #[tokio::test]
