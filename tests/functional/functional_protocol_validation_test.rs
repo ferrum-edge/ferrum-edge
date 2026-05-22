@@ -24,6 +24,7 @@
 //! - `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` rejection on H1 and H2
 //! - `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` rejection on H1 and H2
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
+//! - HTTP/2 request-side hop-by-hop header stripping (backend must not see valid H2 `TE`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
 //!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
 //! - Response-side hop-by-hop header stripping on H1 and H3 (client must not see
@@ -1372,6 +1373,64 @@ async fn functional_protocol_validation_request_te_stripped_before_backend() {
 
 // --- 12. Response hop-by-hop headers stripped before client ----------------
 // --- 13. Response hop-by-hop headers stripped before client ----------------
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h2_request_te_stripped_before_backend() {
+    let h = Harness::new(false).await;
+
+    // HTTP/2 permits exactly one TE value, `trailers`. It is still hop-by-hop
+    // for generic proxying to the backend and must not be forwarded to the
+    // raw HTTP/1.1 backend.
+    let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
+        .await
+        .expect("connect");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("http://example.com/")
+        .header("host", "example.com")
+        .header("te", "trailers")
+        .body(Full::new(Bytes::new()))
+        .expect("build H2 request");
+    let resp = sender.send_request(req).await.expect("send H2 request");
+
+    assert_eq!(resp.status().as_u16(), 200);
+    let hdrs = resp.headers().clone();
+    assert!(
+        hdrs.get("x-backend-marker").is_some(),
+        "non-hop-by-hop backend header should pass through; headers={hdrs:?}"
+    );
+
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&body);
+    let reflected: serde_json::Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("backend body not JSON: {body_str} ({e})"));
+
+    assert!(
+        reflected.get("te").is_none(),
+        "backend MUST NOT see H2 TE: trailers; reflected={reflected}"
+    );
+
+    drop(sender);
+    conn_task.abort();
+    h.cleanup();
+}
+
+// --- 11. Response hop-by-hop headers stripped before client ----------------
 
 #[ignore]
 #[tokio::test]
