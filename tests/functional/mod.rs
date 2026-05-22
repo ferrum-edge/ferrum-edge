@@ -39,6 +39,7 @@ mod functional_plugin_extended_test;
 mod functional_plugin_test;
 mod functional_plugins_network_test;
 mod functional_prometheus_test;
+mod functional_protocol_body_limit_config_test;
 mod functional_protocol_validation_test;
 mod functional_redis_rate_limiting_test;
 mod functional_regex_routing_test;
