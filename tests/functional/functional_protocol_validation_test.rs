@@ -12,6 +12,7 @@
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H1
 //! - Configured request header count limits and `0` disable semantics
 //! - `TRACE` method rejection (XST) on H1 and H2
+//! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H2
 //! - `Transfer-Encoding` rejection on H3
 //! - Empty query segments are ignored by HTTP/3 query-param limit counting
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
@@ -673,6 +674,75 @@ async fn functional_protocol_validation_trace_rejected_http2() {
     drop(sender);
     conn_task.abort();
     h.cleanup();
+}
+
+// --- 8. Total header size on H2 -------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h2_total_header_size_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "8192")
+        .env("FERRUM_MAX_HEADER_SIZE_BYTES", "9000")
+        .spawn()
+        .await
+        .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port did not become ready");
+
+    let stream = TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+        .await
+        .expect("connect");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("http://example.com/")
+        .header("host", "example.com")
+        .header("x-one", "1".repeat(5000))
+        .header("x-two", "2".repeat(5000))
+        .body(Full::new(Bytes::new()))
+        .expect("build request");
+    let resp = sender
+        .send_request(req)
+        .await
+        .expect("send total-header request");
+    let status = resp.status().as_u16();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert_eq!(status, 431, "body={body_str}");
+    assert!(
+        body_str.contains("Total request headers exceed maximum size"),
+        "unexpected body: {body_str}"
+    );
+
+    drop(sender);
+    conn_task.abort();
+    gateway.shutdown();
+    echo_task.abort();
 }
 
 // --- 9. Transfer-Encoding on H3 -------------------------------------------

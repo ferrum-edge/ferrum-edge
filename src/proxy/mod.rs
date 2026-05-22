@@ -854,6 +854,14 @@ fn http1_parser_max_buf_size(max_header_size_bytes: usize) -> usize {
     const MIN_HTTP1_PARSER_BUF_SIZE: usize = 8 * 1024;
 
     max_header_size_bytes.max(MIN_HTTP1_PARSER_BUF_SIZE)
+/// Keep H2 transport header-list enforcement from resetting the stream before
+/// Ferrum's configured total-header validator can produce a protocol-aware 431.
+fn h2_parser_max_header_list_size(max_header_size_bytes: usize) -> u32 {
+    const MIN_H2_HEADER_LIST_SIZE: usize = 16 * 1024;
+
+    max_header_size_bytes
+        .max(MIN_H2_HEADER_LIST_SIZE)
+        .min(u32::MAX as usize) as u32
 }
 
 fn warn_if_h3_backend_tls_policy_incompatible(
@@ -4638,7 +4646,7 @@ async fn handle_connection(
     }
     builder
         .http2()
-        .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
+        .max_header_list_size(h2_parser_max_header_list_size(state.max_header_size_bytes))
         .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
         .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
         .adaptive_window(false)
@@ -7253,7 +7261,7 @@ async fn handle_tls_connection(
     }
     builder
         .http2()
-        .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
+        .max_header_list_size(h2_parser_max_header_list_size(state.max_header_size_bytes))
         .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
         .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
         .adaptive_window(false)
