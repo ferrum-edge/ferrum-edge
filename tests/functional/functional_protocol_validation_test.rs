@@ -20,6 +20,7 @@
 //! - `Transfer-Encoding` rejection on H3
 //! - Empty query segments are ignored by HTTP/3 query-param limit counting
 //! - Query parameter counting parity on H3
+//! - `FERRUM_MAX_URL_LENGTH_BYTES` rejection on H3
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
 //! - `CONNECT` method rejection on H2 unless `:protocol = "websocket"`
@@ -982,6 +983,11 @@ async fn functional_protocol_validation_h3_empty_query_segments_do_not_count_aga
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_query_param_limit_ignores_empty_segments() {
+// --- 9. URL length limits on H3 --------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_url_length_limit_rejects_from_env() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -999,12 +1005,14 @@ async fn functional_protocol_validation_h3_query_param_limit_ignores_empty_segme
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .env("FERRUM_MAX_QUERY_PARAMS", "2")
+        .env("FERRUM_MAX_URL_LENGTH_BYTES", "5")
         .spawn()
         .await
         .expect("start gateway with h3");
 
     let client = Http3Client::insecure().expect("H3 client");
     let url = format!("https://localhost:{https_port}/?a=1&&b=2");
+    let url = format!("https://localhost:{https_port}/abcdef");
     let mut last_err = None;
     let resp = {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1018,6 +1026,7 @@ async fn functional_protocol_validation_h3_query_param_limit_ignores_empty_segme
                 Err(err) => {
                     panic!(
                         "H3 request with empty query segment did not complete; last startup error={last_err:?}; final error={err}"
+                        "H3 over-limit URL request did not complete; last startup error={last_err:?}; final error={err}"
                     );
                 }
             }
@@ -1152,6 +1161,15 @@ async fn functional_protocol_validation_h3_connect_udp_rejected() {
     assert!(
         resp.body_text().contains("CONNECT"),
         "unexpected body: {}",
+    assert_eq!(resp.status.as_u16(), 414, "body={}", resp.body_text());
+    assert!(
+        resp.body_text().contains("Request URL length"),
+        "unexpected body: {}",
+        resp.body_text()
+    );
+    assert!(
+        resp.body_text().contains("exceeds maximum of 5 bytes"),
+        "body did not reflect env limit: {}",
         resp.body_text()
     );
 
