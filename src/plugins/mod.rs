@@ -2222,6 +2222,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "mesh_outbound_registry"
             | "access_control"
             | "tcp_connection_throttle"
+            | "rate_limiting"
             | "ip_restriction"
             | "waf"
             | "soap_ws_security"
