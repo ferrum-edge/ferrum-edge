@@ -622,15 +622,59 @@ fn parse_forward_headers(config: &Value) -> Result<Vec<String>, String> {
 
 /// Escape special characters for safe JSON string interpolation.
 fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            ch if ch <= '\u{1f}' => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let value = ch as usize;
+                out.push_str("\\u00");
+                out.push(HEX[(value >> 4) & 0x0f] as char);
+                out.push(HEX[value & 0x0f] as char);
+            }
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Validate a function URL (Azure/GCP `function_url`).
 fn validate_function_url(url: &str) -> Result<(), String> {
     validate_http_url_field(url, "function_url")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serverless_error_details_escape_json_controls() {
+        assert_eq!(
+            escape_json_string("bad \"field\"\n<script>\u{00}"),
+            "bad \\\"field\\\"\\n\\u003cscript\\u003e\\u0000"
+        );
+    }
+
+    #[test]
+    fn serverless_error_details_remain_valid_json_when_interpolated() {
+        let original = "lambda failed:\n\"boom\"\u{1f}";
+        let body = format!(
+            r#"{{"error":"serverless function invocation failed","details":"{}"}}"#,
+            escape_json_string(original)
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+
+        assert_eq!(parsed["details"], original);
+    }
 }
 
 /// Shared HTTP(S) URL validator for `function_url` (Azure/GCP) and the AWS
