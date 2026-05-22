@@ -6,6 +6,8 @@
 //! classification, missing-trailer fallback, gRPC status preservation,
 //! gRPC trailer sanitization, flow-control write timeouts, and H2-pool
 //! connection reuse.
+//! gRPC request header sanitization, flow-control write timeouts, and
+//! H2-pool connection reuse.
 //!
 //! Run with: `cargo build --bin ferrum-edge && cargo test --test
 //! functional_tests scripted_backend_h2 -- --ignored --nocapture`.
@@ -1070,5 +1072,84 @@ async fn h2_grpc_preserve_false_buffered_path_overrides_host_to_target() {
          the upstream target host (127.0.0.1). Drift between proxy_grpc_request_streaming \
          and proxy_grpc_request_core would surface here. received headers: {:?}",
         streams[0].headers
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Request-side gRPC metadata sanitization.
+// ────────────────────────────────────────────────────────────────────────────
+//
+// `proxy-authorization` is hop-by-hop on backend-bound requests and must not
+// leak to the gRPC upstream. Normal end-to-end metadata must still pass, and
+// the gRPC-specific `te: trailers` requirement must be present on the backend
+// request even if the generic hop-by-hop strip removes client-supplied `te`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_grpc_request_headers_strip_hop_by_hop_metadata() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"ok")))
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = grpc_file_config(backend_port, Value::Null);
+    let harness = spawn_grpc_harness(yaml).await;
+
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let response = client
+        .unary_with_headers(
+            "/grpc/ferrum.Echo/Ping",
+            Bytes::from_static(b""),
+            &[
+                ("authorization", "Bearer keep".to_string()),
+                ("x-application-header", "kept".to_string()),
+                ("proxy-authorization", "Bearer strip".to_string()),
+            ],
+        )
+        .await
+        .expect("unary completes");
+    assert_eq!(
+        response.grpc_status(),
+        Some(0),
+        "RPC must succeed for backend header assertions; response={response:?}"
+    );
+
+    let streams = backend.received_streams().await;
+    assert_eq!(streams.len(), 1, "expected exactly one RPC at backend");
+    let stream = &streams[0];
+    assert_eq!(
+        stream.header("authorization"),
+        Some("Bearer keep"),
+        "end-to-end authorization metadata must be forwarded; headers={:?}",
+        stream.headers
+    );
+    assert_eq!(
+        stream.header("x-application-header"),
+        Some("kept"),
+        "application metadata must be forwarded; headers={:?}",
+        stream.headers
+    );
+    assert_eq!(
+        stream.header("te"),
+        Some("trailers"),
+        "gRPC backend requests must include te: trailers; headers={:?}",
+        stream.headers
+    );
+    assert!(
+        stream.header("proxy-authorization").is_none(),
+        "backend MUST NOT see hop-by-hop proxy-authorization metadata; headers={:?}",
+        stream.headers
     );
 }
