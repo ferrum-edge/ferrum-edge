@@ -13,6 +13,7 @@
 //! - Configured request header count limits and `0` disable semantics
 //! - `TRACE` method rejection (XST) on H1 and H2
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H2
+//! - `TRACE` method rejection (XST) on H1, H2, and H3
 //! - `Transfer-Encoding` rejection on H3
 //! - Empty query segments are ignored by HTTP/3 query-param limit counting
 //! - Query parameter counting parity on H3
@@ -34,6 +35,7 @@ use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 
 use bytes::Bytes;
 use http::HeaderMap;
+use http::Method;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -787,6 +789,63 @@ async fn functional_protocol_validation_h2_total_header_size_limit_rejects_from_
 }
 
 // --- 9. Transfer-Encoding on H3 -------------------------------------------
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_trace_rejected_http3() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let https_port = https_reservation.local_addr().unwrap().port();
+    drop(https_reservation);
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start gateway with h3");
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let options = GetOptions::default().method(Method::TRACE);
+    let mut last_err = None;
+    let resp = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match client.get_with_options(&url, options.clone()).await {
+                Ok(resp) => break resp,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    last_err = Some(err.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "H3 TRACE request did not complete; last startup error={last_err:?}; final error={err}"
+                    );
+                }
+            }
+        }
+    };
+
+    assert_eq!(resp.status.as_u16(), 405, "body={}", resp.body_text());
+    assert!(
+        resp.body_text().contains("TRACE"),
+        "unexpected body: {}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 8. Transfer-Encoding on H3 -------------------------------------------
 
 #[ignore]
 #[tokio::test]

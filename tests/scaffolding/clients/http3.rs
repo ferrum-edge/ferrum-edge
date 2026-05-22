@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
-use http::{HeaderMap, Request, StatusCode};
+use http::{HeaderMap, Method, Request, StatusCode};
 use quinn::{ClientConfig, Endpoint};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -59,9 +59,9 @@ impl Http3Client {
         self.get_with_options(url, GetOptions::default()).await
     }
 
-    /// Fire a single `GET` with caller-controlled header overrides. Used by
-    /// host-header tests that need to force "only `:authority`" or
-    /// "explicit Host that contradicts `:authority`" wire shapes.
+    /// Fire a single request with caller-controlled method/header overrides.
+    /// Used by protocol validation tests that need to force non-default
+    /// request shapes without hand-rolling the QUIC/H3 handshake.
     pub async fn get_with_options(
         &self,
         url: &str,
@@ -94,7 +94,8 @@ impl Http3Client {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
-        let mut req_builder = Request::builder().method(http::Method::GET).uri(url);
+        let method = options.method.clone().unwrap_or(Method::GET);
+        let mut req_builder = Request::builder().method(method).uri(url);
         match &options.host_header {
             HostHeader::Auto => {
                 // Mirror what production H3 clients (curl, Chromium, Firefox)
@@ -592,11 +593,17 @@ fn try_parse_ws_frame(
 /// Per-request overrides for `Http3Client::get_with_options`.
 #[derive(Debug, Default, Clone)]
 pub struct GetOptions {
+    pub method: Option<Method>,
     pub host_header: HostHeader,
     pub headers: Vec<(String, String)>,
 }
 
 impl GetOptions {
+    pub fn method(mut self, method: Method) -> Self {
+        self.method = Some(method);
+        self
+    }
+
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
         self
