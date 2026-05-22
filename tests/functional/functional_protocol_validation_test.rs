@@ -21,6 +21,7 @@
 //! - `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` rejection on H2
 //! - `FERRUM_MAX_QUERY_PARAMS` rejection on H2
 //! - `FERRUM_MAX_URL_LENGTH_BYTES` rejection on H2
+//! - `FERRUM_MAX_HEADER_COUNT` rejection and zero-unlimited behavior on H2
 //! - `Transfer-Encoding` rejection on H3
 //! - Empty query segments are ignored by HTTP/3 query-param limit counting
 //! - Query parameter counting parity on H3
@@ -330,6 +331,7 @@ async fn send_h2_prior_knowledge(
     req: Request<Full<Bytes>>,
     label: &str,
 ) -> (u16, String) {
+async fn send_h2_get(proxy_port: u16, uri: &str, headers: &[(&str, &str)]) -> (u16, String) {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect");
@@ -355,6 +357,14 @@ async fn send_h2_prior_knowledge(
         .send_request(req)
         .await
         .unwrap_or_else(|e| panic!("send {label}: {e}"));
+    let mut req = Request::builder().method("GET").uri(uri);
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    let resp = sender
+        .send_request(req.body(Full::new(Bytes::new())).expect("build request"))
+        .await
+        .expect("send h2 request");
     let status = resp.status().as_u16();
     let body = resp
         .into_body()
@@ -930,6 +940,93 @@ async fn functional_protocol_validation_h2_total_header_size_limit_rejects_from_
 // --- 8. Single header size on H2 ------------------------------------------
 // --- 8. Query parameter count on H2 ---------------------------------------
 // --- 8. URL length on H2 ---------------------------------------------------
+// --- 8. Header count on H2 -------------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h2_header_count_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_MAX_HEADER_COUNT", "1")
+        .spawn()
+        .await
+        .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port did not become ready");
+
+    let (status, body) = send_h2_get(
+        gateway.proxy_port,
+        "http://example.com/",
+        &[("host", "example.com"), ("x-one", "1"), ("x-two", "2")],
+    )
+    .await;
+
+    assert_eq!(status, 431, "body={body}");
+    assert!(
+        body.contains("Request header count"),
+        "unexpected body: {body}"
+    );
+    assert!(
+        body.contains("exceeds maximum of 1"),
+        "unexpected body: {body}"
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h2_header_count_zero_allows_extra_headers() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_MAX_HEADER_COUNT", "0")
+        .spawn()
+        .await
+        .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port did not become ready");
+
+    let (status, body) = send_h2_get(
+        gateway.proxy_port,
+        "http://example.com/",
+        &[
+            ("host", "example.com"),
+            ("x-one", "1"),
+            ("x-two", "2"),
+            ("x-three", "3"),
+            ("x-four", "4"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 200, "body={body}");
+    assert!(
+        body.contains("x-four"),
+        "backend should receive extra headers when count limit is disabled; body={body}"
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. Transfer-Encoding on H3 -------------------------------------------
 
 #[ignore]
 #[tokio::test]
