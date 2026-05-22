@@ -1147,22 +1147,32 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     route_policy: MeshRouteDispatchPolicy<'_>,
     uri_less_only: bool,
 ) -> (Vec<Value>, bool) {
-    let Some(matches) = http.get("match").and_then(Value::as_array) else {
-        return (Vec::new(), false);
-    };
-    if matches.is_empty() {
-        return (Vec::new(), false);
-    }
-
     // VirtualService `headers.{request,response}.{set,add,remove}` is a
     // per-http[] (not per-match) block. Project it onto each emitted rule so
     // the same transforms fire regardless of which match-branch wins. The
     // mesh_route_dispatch plugin parses and validates these at construction
     // time; we only emit the JSON shape here.
+    //
+    // Extract transforms BEFORE the match-check early returns so that a
+    // matchless http[] entry with header transforms still reaches the
+    // `needs_catch_all` block below instead of being silently dropped.
     let route_request_transform = vs_route_header_transform_rules(http, "request");
     let route_response_transform = vs_route_header_transform_rules(http, "response");
+    let has_transforms_or_fault = !route_request_transform.is_empty()
+        || !route_response_transform.is_empty()
+        || route_policy.fault.is_some();
+
+    let empty_matches = Vec::new();
+    let matches = http
+        .get("match")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty_matches);
+    if matches.is_empty() && !has_transforms_or_fault {
+        return (Vec::new(), false);
+    }
+
     let mut rules = Vec::new();
-    let mut has_uri_only_match = false;
+    let mut has_uri_only_match = matches.is_empty();
     for entry in matches {
         if uri_less_only && entry.get("uri").is_some() {
             continue;

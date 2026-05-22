@@ -2033,3 +2033,140 @@ async fn mesh_l7_routing_virtual_service_ignore_uri_case_with_method_and_headers
         }
     ));
 }
+
+// ── Matchless VirtualService routes with header transforms ────────────────
+//
+// A VirtualService http[] entry may omit the `match` key entirely while still
+// defining `headers.{request,response}.{set,add,remove}` transforms. The
+// translator must emit a catch-all dispatch rule that carries those transforms
+// rather than silently dropping them via early return.
+
+#[tokio::test]
+async fn matchless_virtualservice_preserves_header_transforms() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    // No "match" key at all — this is a matchless route.
+                    "headers": {
+                        "request": {
+                            "set": {"X-Injected": "yes"},
+                            "add": {"X-Extra": "added"},
+                            "remove": ["X-Strip"]
+                        }
+                    },
+                    "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    // A matchless http[] produces a "/" proxy.
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/"))
+        .expect("/ proxy must exist for matchless VS");
+
+    // The dispatch plugin must exist and carry the transforms on a catch-all rule.
+    let dispatch = result
+        .config
+        .plugin_configs
+        .iter()
+        .find(|p| {
+            p.plugin_name == "mesh_route_dispatch"
+                && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+        })
+        .expect("mesh_route_dispatch plugin must be emitted for matchless route with transforms");
+
+    let rules = dispatch.config["rules"].as_array().expect("rules array");
+    assert!(
+        !rules.is_empty(),
+        "matchless route with transforms must emit at least one rule"
+    );
+
+    // The catch-all rule should have an empty match (no predicates) and carry
+    // request_transform with the three operations (set → update, add, remove).
+    let catch_all = &rules[rules.len() - 1];
+    let match_obj = catch_all["match"]
+        .as_object()
+        .expect("match object on catch-all rule");
+    assert!(
+        match_obj.is_empty(),
+        "catch-all rule match must be empty (no predicates)"
+    );
+
+    let transforms = catch_all["request_transform"]
+        .as_array()
+        .expect("request_transform array on catch-all rule");
+    assert_eq!(transforms.len(), 3, "set + add + remove → 3 transform ops");
+    assert!(
+        transforms
+            .iter()
+            .any(|r| r["operation"] == "update" && r["key"] == "X-Injected"),
+        "set must emit as update operation"
+    );
+    assert!(
+        transforms
+            .iter()
+            .any(|r| r["operation"] == "add" && r["key"] == "X-Extra"),
+        "add must emit as add operation"
+    );
+    assert!(
+        transforms
+            .iter()
+            .any(|r| r["operation"] == "remove" && r["key"] == "X-Strip"),
+        "remove must emit as remove operation"
+    );
+
+    // Translator must auto-emit a request_transformer instance so the
+    // per-rule overrides have a consumer at runtime.
+    let auto_xform = result
+        .config
+        .plugin_configs
+        .iter()
+        .find(|p| {
+            p.plugin_name == "request_transformer"
+                && p.proxy_id.as_deref() == Some(proxy.id.as_str())
+        })
+        .expect("auto-emitted request_transformer plugin for matchless route proxy");
+    assert_eq!(
+        auto_xform.config["apply_route_overrides"].as_bool(),
+        Some(true)
+    );
+
+    // End-to-end: the dispatch catch-all rule matches any request, and the
+    // auto-emitted transformer applies the per-rule header overrides.
+    use ferrum_edge::plugins::request_transformer::RequestTransformer;
+    let mrd = MeshRouteDispatch::new(&dispatch.config).expect("mrd plugin");
+    let req_xform = RequestTransformer::new(&auto_xform.config).expect("auto request_transformer");
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/anything".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("x-strip".to_string(), "should-go".to_string());
+    let _ = mrd.before_proxy(&mut ctx, &mut headers).await;
+    let _ = req_xform.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        headers.get("x-injected").map(String::as_str),
+        Some("yes"),
+        "set transform must inject X-Injected header"
+    );
+    assert_eq!(
+        headers.get("x-extra").map(String::as_str),
+        Some("added"),
+        "add transform must inject X-Extra header"
+    );
+    assert!(
+        !headers.contains_key("x-strip"),
+        "remove transform must strip X-Strip header"
+    );
+}
