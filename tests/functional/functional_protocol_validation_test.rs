@@ -11,6 +11,7 @@
 //! - `Host` trailing-dot normalization
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H1
 //! - Configured request header count limits and `0` disable semantics
+//! - `FERRUM_MAX_QUERY_PARAMS` rejection and unlimited (`0`) behavior
 //! - `TRACE` method rejection (XST) on H1 and H2
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H2
 //! - `TRACE` method rejection (XST) on H1, H2, and H3
@@ -375,6 +376,7 @@ impl Harness {
 
     async fn new_with_env(with_host: bool, extra_env: &[(&str, &str)]) -> Self {
     async fn new_with_env(with_host: bool, envs: &[(&str, &str)]) -> Self {
+    async fn new_with_env(with_host: bool, env: &[(&str, &str)]) -> Self {
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -388,6 +390,9 @@ impl Harness {
             builder = builder.env(*key, *value);
         }
 
+        for (key, value) in env {
+            builder = builder.env(*key, *value);
+        }
         let gateway = builder.spawn().await.expect("start gateway");
         // `wait_for_health` only verifies the admin port. The proxy listener
         // is bound on a separate spawned task; on a loaded CI runner there is
@@ -678,6 +683,29 @@ async fn functional_protocol_validation_h1_header_count_zero_disables_limit() {
         reflected.get("x-extra-15").is_some(),
         "backend should receive the high-count request when count limit is disabled; reflected={reflected}"
     );
+// --- 7. Query parameter limits from ENV ------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_query_param_limit_rejects_from_env() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_QUERY_PARAMS", "1")]).await;
+
+    let req = b"GET /?a=1&b=2 HTTP/1.1\r\n\
+                Host: example.com\r\n\
+                \r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+    assert!(
+        resp.body.contains("Query parameter count"),
+        "unexpected body: {}",
+        resp.body
+    );
+    assert!(
+        resp.body.contains("exceeds maximum of 1"),
+        "body did not reflect env limit: {}",
+        resp.body
+    );
 
     h.cleanup();
 }
@@ -694,6 +722,18 @@ async fn functional_protocol_validation_h2_header_count_env_rejects_excess_heade
     assert!(
         body.contains("Request header count"),
         "unexpected body: {body}"
+async fn functional_protocol_validation_query_param_limit_zero_is_unlimited() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_QUERY_PARAMS", "0")]).await;
+
+    let req = b"GET /?a=1&b=2&c=3 HTTP/1.1\r\n\
+                Host: example.com\r\n\
+                \r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(
+        resp.status_code, 200,
+        "FERRUM_MAX_QUERY_PARAMS=0 should disable query-param rejection; body={}",
+        resp.body
     );
 
     h.cleanup();
@@ -810,6 +850,7 @@ async fn functional_protocol_validation_h2_total_header_size_limit_rejects_from_
 }
 
 // --- 9. Transfer-Encoding on H3 -------------------------------------------
+
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_trace_rejected_http3() {
@@ -1081,6 +1122,7 @@ async fn functional_protocol_validation_h3_connect_udp_rejected() {
 
 // --- 9. CONNECT on H1 -------------------------------------------------------
 // --- 9. CONNECT on H1/H2 ----------------------------------------------------
+// --- 10. CONNECT on H1 ------------------------------------------------------
 
 #[ignore]
 #[tokio::test]
