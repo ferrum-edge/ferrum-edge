@@ -35,6 +35,7 @@
 //! - `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` rejection on H3
 //! - `FERRUM_MAX_HEADER_COUNT=0` unlimited behavior on H3
 //! - `FERRUM_MAX_QUERY_PARAMS=0` unlimited behavior on H3
+//! - `FERRUM_MAX_URL_LENGTH_BYTES=0` unlimited behavior on H3
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
 //! - `CONNECT` method rejection on H2 unless `:protocol = "websocket"`
@@ -1580,6 +1581,11 @@ async fn functional_protocol_validation_h3_header_count_zero_allows_extra_header
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_query_param_zero_allows_extra_params() {
+// --- 9. URL length zero on H3 ---------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_url_length_zero_allows_long_url() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -1601,6 +1607,7 @@ async fn functional_protocol_validation_h3_query_param_zero_allows_extra_params(
         .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "8")
         .env("FERRUM_MAX_HEADER_COUNT", "0")
         .env("FERRUM_MAX_QUERY_PARAMS", "0")
+        .env("FERRUM_MAX_URL_LENGTH_BYTES", "0")
         .spawn()
         .await
         .expect("start gateway with h3");
@@ -1619,6 +1626,8 @@ async fn functional_protocol_validation_h3_query_param_zero_allows_extra_params(
         .header("x-four", "4");
     let url = format!("https://localhost:{https_port}/?one=1&two=2&three=3");
     let options = GetOptions::default().header("x-query-zero", "forwarded");
+    let url = format!("https://localhost:{https_port}/{}", "long-path".repeat(32));
+    let options = GetOptions::default().header("x-url-zero", "forwarded");
     let mut last_err = None;
     let resp = {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1646,6 +1655,7 @@ async fn functional_protocol_validation_h3_query_param_zero_allows_extra_params(
                         "H3 request with oversized body did not complete; last startup error={last_err:?}; final error={err}"
                         "H3 request with header-count limit disabled did not complete; last startup error={last_err:?}; final error={err}"
                         "H3 request with query-param limit disabled did not complete; last startup error={last_err:?}; final error={err}"
+                        "H3 request with URL-length limit disabled did not complete; last startup error={last_err:?}; final error={err}"
                     );
                 }
             }
@@ -1691,6 +1701,10 @@ async fn functional_protocol_validation_h3_query_param_zero_allows_extra_params(
     assert!(
         resp.body_text().contains("x-query-zero"),
         "backend should receive request when query-param limit is disabled; body={}",
+    assert_eq!(resp.status.as_u16(), 200, "body={}", resp.body_text());
+    assert!(
+        resp.body_text().contains("x-url-zero"),
+        "backend should receive request when URL-length limit is disabled; body={}",
         resp.body_text()
     );
 
