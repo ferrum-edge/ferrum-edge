@@ -355,7 +355,14 @@ where
                 local,
             ))),
             Ok(None) => Ok(Self::Local(local)),
-            Err(err) => Err(err),
+            Err(err) => {
+                warn!(
+                    plugin = plugin_name,
+                    error = %err,
+                    "Redis rate limiter initialization failed; using local-only fallback"
+                );
+                Ok(Self::Local(local))
+            }
         }
     }
 
