@@ -367,6 +367,7 @@ jobs:
               scripted_backend_network_sim_tests
               scripted_backend_tests
               scripted_backend_udp_tests
+              functional_websocket_limits_test
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and
             # race when nextest runs this shard in parallel.
