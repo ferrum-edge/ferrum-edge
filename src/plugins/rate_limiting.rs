@@ -2,13 +2,14 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
 use super::utils::rate_limit::{
-    HttpRateLimitAlgorithm, RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, RequestUnit,
+    DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
+    RateLimitWindowSpec,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
@@ -25,7 +26,9 @@ enum LimitBy {
 pub struct RateLimiting {
     limit_by: LimitBy,
     expose_headers: bool,
-    limiter: RateLimitBackend<String, HttpRateLimitAlgorithm>,
+    default_limit: DynamicRateLimitOp,
+    consumer_overrides: HashMap<String, DynamicRateLimitOp>,
+    limiter: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>,
     request_counter: AtomicU64,
 }
 
@@ -37,67 +40,10 @@ impl RateLimiting {
         let limit_by = parse_limit_by(object)?;
         let expose_headers = parse_optional_bool(object, "expose_headers")?.unwrap_or(false);
 
-        let window_specs = if let Some(window_seconds) =
-            parse_optional_u64(object, "window_seconds")?
-        {
-            if window_seconds == 0 {
-                return Err("rate_limiting: 'window_seconds' must be greater than zero".to_string());
-            }
-            let max_requests = parse_optional_u64(object, "max_requests")?.unwrap_or(10);
-            if max_requests == 0 {
-                return Err("rate_limiting: 'max_requests' must be greater than zero".to_string());
-            }
-            vec![RateLimitWindowSpec {
-                limit: max_requests,
-                duration: Duration::from_secs(window_seconds),
-            }]
-        } else {
-            let mut specs = Vec::new();
-
-            if let Some(limit) = parse_optional_u64(object, "requests_per_second")? {
-                if limit == 0 {
-                    return Err(
-                        "rate_limiting: 'requests_per_second' must be greater than zero"
-                            .to_string(),
-                    );
-                }
-                specs.push(RateLimitWindowSpec {
-                    limit,
-                    duration: Duration::from_secs(1),
-                });
-            }
-
-            if let Some(limit) = parse_optional_u64(object, "requests_per_minute")? {
-                if limit == 0 {
-                    return Err(
-                        "rate_limiting: 'requests_per_minute' must be greater than zero"
-                            .to_string(),
-                    );
-                }
-                specs.push(RateLimitWindowSpec {
-                    limit,
-                    duration: Duration::from_secs(60),
-                });
-            }
-
-            if let Some(limit) = parse_optional_u64(object, "requests_per_hour")? {
-                if limit == 0 {
-                    return Err(
-                        "rate_limiting: 'requests_per_hour' must be greater than zero".to_string(),
-                    );
-                }
-                specs.push(RateLimitWindowSpec {
-                    limit,
-                    duration: Duration::from_secs(3600),
-                });
-            }
-
-            specs
-        };
-
-        if window_specs.is_empty() {
+        let parsed_limits = parse_limits(object)?;
+        if !parsed_limits.consumer_overrides.is_empty() && limit_by != LimitBy::Consumer {
             return Err(
-                "rate_limiting: no rate limit windows configured — set 'window_seconds'+'max_requests', or 'requests_per_second'/'requests_per_minute'/'requests_per_hour'"
+                "rate_limiting: consumer-scoped limits can only be used with limit_by='consumer'"
                     .to_string(),
             );
         }
@@ -106,12 +52,14 @@ impl RateLimiting {
             "rate_limiting",
             config,
             &http_client,
-            HttpRateLimitAlgorithm::new(window_specs),
+            DynamicHttpRateLimitAlgorithm::new(),
         )?;
 
         Ok(Self {
             limit_by,
             expose_headers,
+            default_limit: parsed_limits.default_limit,
+            consumer_overrides: parsed_limits.consumer_overrides,
             limiter,
             request_counter: AtomicU64::new(0),
         })
@@ -147,6 +95,17 @@ impl RateLimiting {
         ip_key(&ctx.client_ip)
     }
 
+    fn request_limit_op(&self, ctx: &RequestContext) -> &DynamicRateLimitOp {
+        if self.limit_by == LimitBy::Consumer
+            && let Some(identity) = ctx.effective_identity()
+            && let Some(limit) = self.consumer_overrides.get(identity)
+        {
+            return limit;
+        }
+
+        &self.default_limit
+    }
+
     fn stream_key(&self, ctx: &super::StreamConnectionContext) -> String {
         match self.limit_by {
             LimitBy::Consumer => {
@@ -167,6 +126,17 @@ impl RateLimiting {
         }
 
         ip_key(&ctx.client_ip)
+    }
+
+    fn stream_limit_op(&self, ctx: &super::StreamConnectionContext) -> &DynamicRateLimitOp {
+        if self.limit_by == LimitBy::Consumer
+            && let Some(identity) = ctx.effective_identity()
+            && let Some(limit) = self.consumer_overrides.get(identity)
+        {
+            return limit;
+        }
+
+        &self.default_limit
     }
 
     fn reject(&self, key: &str, outcome: &RateLimitOutcome) -> PluginResult {
@@ -210,8 +180,13 @@ impl RateLimiting {
             .insert("ratelimit_identity".to_string(), key.to_string());
     }
 
-    async fn check_rate(&self, key: String, ctx: &mut RequestContext) -> PluginResult {
-        let outcome = self.limiter.check(key.clone(), &key, &RequestUnit).await;
+    async fn check_rate(
+        &self,
+        key: String,
+        limit_op: &DynamicRateLimitOp,
+        ctx: &mut RequestContext,
+    ) -> PluginResult {
+        let outcome = self.limiter.check(key.clone(), &key, limit_op).await;
         self.maybe_evict_stale_entries();
         if !outcome.allowed {
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
@@ -222,8 +197,8 @@ impl RateLimiting {
         PluginResult::Continue
     }
 
-    async fn check_rate_stream(&self, key: String) -> PluginResult {
-        let outcome = self.limiter.check(key.clone(), &key, &RequestUnit).await;
+    async fn check_rate_stream(&self, key: String, limit_op: &DynamicRateLimitOp) -> PluginResult {
+        let outcome = self.limiter.check(key.clone(), &key, limit_op).await;
         self.maybe_evict_stale_entries();
         if !outcome.allowed {
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded (stream)");
@@ -265,7 +240,8 @@ impl Plugin for RateLimiting {
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
         let key = self.stream_key(ctx);
-        self.check_rate_stream(key).await
+        let limit_op = self.stream_limit_op(ctx);
+        self.check_rate_stream(key, limit_op).await
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -274,7 +250,8 @@ impl Plugin for RateLimiting {
         }
 
         let ip_key = self.request_key(ctx);
-        self.check_rate(ip_key, ctx).await
+        let limit_op = self.request_limit_op(ctx);
+        self.check_rate(ip_key, limit_op, ctx).await
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -283,7 +260,8 @@ impl Plugin for RateLimiting {
         }
 
         let key = self.request_key(ctx);
-        self.check_rate(key, ctx).await
+        let limit_op = self.request_limit_op(ctx);
+        self.check_rate(key, limit_op, ctx).await
     }
 
     fn is_authorize_plugin(&self) -> bool {
@@ -359,6 +337,276 @@ fn parse_optional_u64(
                 .ok_or_else(|| format!("rate_limiting: '{field}' must be an integer"))
         })
         .transpose()
+}
+
+fn parse_window_specs(
+    label: &str,
+    object: &serde_json::Map<String, Value>,
+) -> Result<Vec<RateLimitWindowSpec>, String> {
+    let has_preset = [
+        "requests_per_second",
+        "requests_per_minute",
+        "requests_per_hour",
+    ]
+    .iter()
+    .any(|field| object.contains_key(*field));
+    let has_custom = object.contains_key("window_seconds") || object.contains_key("max_requests");
+    if has_preset && has_custom {
+        return Err(format!(
+            "{label}: cannot combine 'window_seconds'/'max_requests' with 'requests_per_second'/'requests_per_minute'/'requests_per_hour' in the same rule"
+        ));
+    }
+
+    if let Some(window_seconds) = parse_optional_u64(object, "window_seconds")? {
+        if window_seconds == 0 {
+            return Err(format!(
+                "{label}: 'window_seconds' must be greater than zero"
+            ));
+        }
+        let max_requests = parse_optional_u64(object, "max_requests")?.ok_or_else(|| {
+            format!("{label}: 'max_requests' is required when 'window_seconds' is set")
+        })?;
+        if max_requests == 0 {
+            return Err(format!("{label}: 'max_requests' must be greater than zero"));
+        }
+        return Ok(vec![RateLimitWindowSpec {
+            limit: max_requests,
+            duration: Duration::from_secs(window_seconds),
+        }]);
+    }
+
+    if object.contains_key("max_requests") {
+        return Err(format!("{label}: 'max_requests' requires 'window_seconds'"));
+    }
+
+    let mut specs = Vec::new();
+
+    if let Some(limit) = parse_optional_u64(object, "requests_per_second")? {
+        if limit == 0 {
+            return Err(format!(
+                "{label}: 'requests_per_second' must be greater than zero"
+            ));
+        }
+        specs.push(RateLimitWindowSpec {
+            limit,
+            duration: Duration::from_secs(1),
+        });
+    }
+
+    if let Some(limit) = parse_optional_u64(object, "requests_per_minute")? {
+        if limit == 0 {
+            return Err(format!(
+                "{label}: 'requests_per_minute' must be greater than zero"
+            ));
+        }
+        specs.push(RateLimitWindowSpec {
+            limit,
+            duration: Duration::from_secs(60),
+        });
+    }
+
+    if let Some(limit) = parse_optional_u64(object, "requests_per_hour")? {
+        if limit == 0 {
+            return Err(format!(
+                "{label}: 'requests_per_hour' must be greater than zero"
+            ));
+        }
+        specs.push(RateLimitWindowSpec {
+            limit,
+            duration: Duration::from_secs(3600),
+        });
+    }
+
+    Ok(specs)
+}
+
+struct ParsedLimits {
+    default_limit: DynamicRateLimitOp,
+    consumer_overrides: HashMap<String, DynamicRateLimitOp>,
+}
+
+fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits, String> {
+    reject_legacy_window_fields(object)?;
+
+    let limits = object
+        .get("limits")
+        .ok_or_else(|| "rate_limiting: 'limits' is required".to_string())?
+        .as_array()
+        .ok_or_else(|| "rate_limiting: 'limits' must be an array".to_string())?;
+    if limits.is_empty() {
+        return Err("rate_limiting: 'limits' must contain at least one rule".to_string());
+    }
+
+    let mut default_limit = None;
+    let mut consumer_overrides = HashMap::new();
+    for (idx, raw_rule) in limits.iter().enumerate() {
+        let label = format!("rate_limiting: limits[{idx}]");
+        let rule = raw_rule
+            .as_object()
+            .ok_or_else(|| format!("{label} must be an object"))?;
+        validate_limit_rule_fields(&label, rule)?;
+
+        let specs = parse_window_specs(&label, rule)?;
+        if specs.is_empty() {
+            return Err(format!(
+                "{label}: no rate limit windows configured — set 'window_seconds'+'max_requests', or 'requests_per_second'/'requests_per_minute'/'requests_per_hour'"
+            ));
+        }
+        let limit = DynamicRateLimitOp::new(specs);
+
+        match parse_limit_scope(&label, rule)? {
+            LimitScope::Default => {
+                if let Some((first_idx, _)) = default_limit.replace((idx, limit)) {
+                    return Err(format!(
+                        "rate_limiting: limits[{idx}] is a second 'scope: default' rule; limits[{first_idx}] already defines the default rule"
+                    ));
+                }
+            }
+            LimitScope::Consumers(consumers) => {
+                // Each listed consumer gets an independent counter keyed by
+                // consumer:<identity>; the rule only shares the window template.
+                for consumer in consumers {
+                    match consumer_overrides.entry(consumer) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert((idx, limit.clone()));
+                        }
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            let first_idx = entry.get().0;
+                            return Err(format!(
+                                "rate_limiting: limits[{idx}] duplicates consumer-specific limit for {:?}; first defined in limits[{first_idx}]",
+                                entry.key()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let Some((_, default_limit)) = default_limit else {
+        return Err(
+            "rate_limiting: 'limits' must include one rule with scope='default'".to_string(),
+        );
+    };
+
+    Ok(ParsedLimits {
+        default_limit,
+        consumer_overrides: consumer_overrides
+            .into_iter()
+            .map(|(consumer, (_, limit))| (consumer, limit))
+            .collect(),
+    })
+}
+
+enum LimitScope {
+    Default,
+    Consumers(Vec<String>),
+}
+
+fn parse_limit_scope(
+    label: &str,
+    object: &serde_json::Map<String, Value>,
+) -> Result<LimitScope, String> {
+    let scope = object
+        .get("scope")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label}: 'scope' is required and must be a string"))?;
+    let scope = scope.to_ascii_lowercase();
+
+    match scope.as_str() {
+        "default" => {
+            if object.contains_key("consumers") {
+                return Err(format!(
+                    "{label}: 'consumers' is only valid when scope='consumers'"
+                ));
+            }
+            Ok(LimitScope::Default)
+        }
+        "consumers" => {
+            let consumers = object
+                .get("consumers")
+                .ok_or_else(|| format!("{label}: 'consumers' is required"))?
+                .as_array()
+                .ok_or_else(|| format!("{label}: 'consumers' must be an array"))?;
+            if consumers.is_empty() {
+                return Err(format!(
+                    "{label}: 'consumers' must contain at least one identity"
+                ));
+            }
+            let mut parsed = Vec::with_capacity(consumers.len());
+            let mut seen = HashSet::with_capacity(consumers.len());
+            for (idx, raw_consumer) in consumers.iter().enumerate() {
+                let consumer = raw_consumer
+                    .as_str()
+                    .ok_or_else(|| format!("{label}: 'consumers[{idx}]' must be a string"))?;
+                if consumer.is_empty() {
+                    return Err(format!(
+                        "{label}: 'consumers[{idx}]' must be a non-empty string"
+                    ));
+                }
+                if !seen.insert(consumer) {
+                    return Err(format!(
+                        "{label}: 'consumers[{idx}]' duplicates consumer identity {consumer:?} in the same rule"
+                    ));
+                }
+                parsed.push(consumer.to_string());
+            }
+            Ok(LimitScope::Consumers(parsed))
+        }
+        other => Err(format!(
+            "{label}: 'scope' must be 'default' or 'consumers', got: {other:?}"
+        )),
+    }
+}
+
+fn reject_legacy_window_fields(object: &serde_json::Map<String, Value>) -> Result<(), String> {
+    static LEGACY_FIELDS: &[&str] = &[
+        "requests_per_second",
+        "requests_per_minute",
+        "requests_per_hour",
+        "window_seconds",
+        "max_requests",
+        "consumer_limits",
+    ];
+
+    for field in LEGACY_FIELDS {
+        if object.contains_key(*field) {
+            return Err(format!(
+                "rate_limiting: '{field}' must be configured inside 'limits' rules"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_limit_rule_fields(
+    label: &str,
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    static ALLOWED_FIELDS: &[&str] = &[
+        "scope",
+        "consumers",
+        "requests_per_second",
+        "requests_per_minute",
+        "requests_per_hour",
+        "window_seconds",
+        "max_requests",
+    ];
+
+    for key in object.keys() {
+        if key == "sync_mode" || key.starts_with("redis_") {
+            return Err(format!(
+                "{label}: '{key}' is not valid inside 'limits'; configure counter storage once at the rate_limiting plugin level"
+            ));
+        }
+        if !ALLOWED_FIELDS.contains(&key.as_str()) {
+            return Err(format!(
+                "{label}: '{key}' is not valid inside 'limits'; allowed fields are scope, consumers, requests_per_second, requests_per_minute, requests_per_hour, window_seconds, max_requests"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn prefixed_key(prefix: &str, value: &str) -> String {

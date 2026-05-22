@@ -516,6 +516,7 @@ fn test_invalid_numeric_config_returns_error() {
         json!({"frames_per_second": "100"}),
         json!({"burst_size": "10"}),
         json!({"frames_per_second": -1}),
+        json!({"frames_per_second": 100, "sync_mode": "database"}),
     ] {
         let result = WsRateLimiting::new(&config, PluginHttpClient::default());
         assert!(result.is_err(), "config should be rejected: {config:?}");

@@ -554,8 +554,8 @@ async fn run_crud_and_proxy_tests(
             "proxy_id": &proxy_id,
             "enabled": true,
             "config": {
-                "requests_per_minute": 100,
-                "limit_by": "ip"
+                "limit_by": "ip",
+                "limits": [{"scope": "default", "requests_per_minute": 100}]
             }
         }))
         .send()

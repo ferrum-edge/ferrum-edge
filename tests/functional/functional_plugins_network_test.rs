@@ -107,7 +107,7 @@ async fn rate_limiting_survives_slow_backend() {
         "rate_limiting",
         json!({
             "limit_by": "ip",
-            "requests_per_minute": 5,
+            "limits": [{"scope": "default", "requests_per_minute": 5}],
         }),
     );
     let harness = GatewayHarness::builder()

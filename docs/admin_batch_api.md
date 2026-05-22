@@ -244,7 +244,7 @@ curl -X POST http://localhost:9000/batch \
         "name": "rate_limiting",
         "enabled": true,
         "proxy_id": "payments-proxy",
-        "config": {"requests_per_second": 100}
+        "config": {"limits": [{"scope": "default", "requests_per_second": 100}]}
       }
     ]
   }'

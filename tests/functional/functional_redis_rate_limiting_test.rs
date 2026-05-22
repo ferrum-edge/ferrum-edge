@@ -484,9 +484,8 @@ async fn test_rate_limiting_redis_centralized() {
             "proxy_id": "proxy-redis-rl",
             "enabled": true,
             "config": {
-                "window_seconds": 60,
-                "max_requests": 3,
                 "expose_headers": true,
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 3}],
                 "sync_mode": "redis",
                 "redis_url": REDIS_URL,
                 "redis_key_prefix": unique_prefix
@@ -580,9 +579,8 @@ async fn test_rate_limiting_redis_fallback_to_local() {
             "proxy_id": "proxy-redis-fb",
             "enabled": true,
             "config": {
-                "window_seconds": 60,
-                "max_requests": 3,
                 "expose_headers": true,
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 3}],
                 "sync_mode": "redis",
                 "redis_url": "redis://127.0.0.1:19999/0",
                 "redis_key_prefix": "ferrum:test:fallback"
@@ -1151,9 +1149,11 @@ plugin_configs:
     proxy_id: "shared-rl-proxy"
     enabled: true
     config:
-      window_seconds: 60
-      max_requests: 4
       expose_headers: true
+      limits:
+        - scope: "default"
+          window_seconds: 60
+          max_requests: 4
       sync_mode: "redis"
       redis_url: "{REDIS_URL}"
       redis_key_prefix: "{prefix}"
@@ -1307,9 +1307,11 @@ plugin_configs:
     proxy_id: "ns-iso-proxy"
     enabled: true
     config:
-      window_seconds: 60
-      max_requests: 2
       expose_headers: true
+      limits:
+        - scope: "default"
+          window_seconds: 60
+          max_requests: 2
       sync_mode: "redis"
       redis_url: "{REDIS_URL}"
 "#
