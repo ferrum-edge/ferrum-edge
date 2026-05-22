@@ -367,7 +367,7 @@ impl Plugin for AiRequestGuard {
         };
 
         // Parse JSON
-        let json: Value = match serde_json::from_str(body) {
+        let mut json: Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(_) => {
                 // Let the backend handle malformed JSON
@@ -390,6 +390,39 @@ impl Plugin for AiRequestGuard {
                 .to_string(),
                 headers: HashMap::new(),
             };
+        }
+
+        // Eagerly apply max_tokens transformations so downstream plugins
+        // (e.g. ai_federation) see the modified body if they short-circuit
+        // before the transform_request_body phase runs.
+        let mut body_modified = false;
+
+        // Clamp max_tokens if over limit
+        if let Some(limit) = self.max_tokens_limit
+            && self.enforce_max_tokens == MaxTokensAction::Clamp
+        {
+            for field_name in &["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+                if let Some(current) = json.get(*field_name).and_then(|v| v.as_u64())
+                    && current > limit
+                {
+                    json[*field_name] = Value::Number(limit.into());
+                    body_modified = true;
+                }
+            }
+        }
+
+        // Inject default_max_tokens if not present
+        if let Some(default) = self.default_max_tokens
+            && json.get("max_tokens").is_none()
+            && json.get("max_output_tokens").is_none()
+            && json.get("max_completion_tokens").is_none()
+        {
+            json["max_tokens"] = Value::Number(default.into());
+            body_modified = true;
+        }
+
+        if body_modified && let Ok(new_body) = serde_json::to_string(&json) {
+            ctx.metadata.insert("request_body".to_string(), new_body);
         }
 
         PluginResult::Continue

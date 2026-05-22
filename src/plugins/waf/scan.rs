@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -129,8 +130,8 @@ impl Waf {
                     continue;
                 }
                 let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
-                let key = percent_decode_str(raw_k).decode_utf8_lossy();
-                let value = percent_decode_str(raw_v).decode_utf8_lossy();
+                let key = decode_query_component_for_waf(raw_k);
+                let value = decode_query_component_for_waf(raw_v);
                 self.scan_query_pair(&mut outcome, &key, &value, ctx);
             }
         } else {
@@ -548,6 +549,15 @@ impl Waf {
                 target_name: rule_ref.target_name,
             });
         }
+    }
+}
+
+fn decode_query_component_for_waf(raw: &str) -> Cow<'_, str> {
+    let decoded = percent_decode_str(raw).decode_utf8_lossy();
+    if decoded.contains('+') {
+        Cow::Owned(decoded.replace('+', " "))
+    } else {
+        decoded
     }
 }
 

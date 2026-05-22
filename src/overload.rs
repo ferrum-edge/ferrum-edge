@@ -707,6 +707,7 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
 /// single-task probe.
 async fn measure_event_loop_latency() -> Duration {
     const EVENT_LOOP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+    const EVENT_LOOP_TIMEOUT_FAIL_CLOSED_LATENCY: Duration = Duration::from_micros(500_000);
     let num_workers = tokio::runtime::Handle::current().metrics().num_workers();
 
     // Single-threaded fallback: just measure our own reschedule.
@@ -741,7 +742,7 @@ async fn measure_event_loop_latency() -> Duration {
 
     if drain_result.is_err() {
         probes.abort_all();
-        return max_latency.max(EVENT_LOOP_PROBE_TIMEOUT);
+        return max_latency.max(EVENT_LOOP_TIMEOUT_FAIL_CLOSED_LATENCY);
     }
     max_latency
 }
