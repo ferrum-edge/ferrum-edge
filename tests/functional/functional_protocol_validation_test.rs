@@ -23,6 +23,7 @@
 //! - `FERRUM_MAX_URL_LENGTH_BYTES` rejection on H3
 //! - `FERRUM_MAX_HEADER_COUNT` rejection on H3
 //! - `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` rejection on H3
+//! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H3
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
 //! - `CONNECT` method rejection on H2 unless `:protocol = "websocket"`
@@ -995,6 +996,11 @@ async fn functional_protocol_validation_h3_url_length_limit_rejects_from_env() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_single_header_size_limit_rejects_from_env() {
+// --- 9. Total header size on H3 -------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_total_header_size_limit_rejects_from_env() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -1153,6 +1159,8 @@ async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env()
         .header("x-extra-one", "one")
         .header("x-extra-two", "two");
     let options = GetOptions::default().header("x-over", "value-that-exceeds");
+        .header("x-one", "1234567890")
+        .header("x-two", "abcdefghij");
     let mut last_err = None;
     let resp = {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1172,6 +1180,7 @@ async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env()
                         "H3 CONNECT-UDP request did not complete; last startup error={last_err:?}; final error={err}"
                         "H3 header-count limit request did not complete; last startup error={last_err:?}; final error={err}"
                         "H3 request with oversized header did not complete; last startup error={last_err:?}; final error={err}"
+                        "H3 request with oversized total headers did not complete; last startup error={last_err:?}; final error={err}"
                     );
                 }
             }
@@ -1200,6 +1209,10 @@ async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env()
         "body did not reflect env limit: {}",
         resp.body_text()
             .contains("exceeds maximum size of 12 bytes"),
+    assert_eq!(resp.status.as_u16(), 431, "body={}", resp.body_text());
+    assert!(
+        resp.body_text()
+            .contains("Total request headers exceed maximum size"),
         "unexpected body: {}",
         resp.body_text()
     );
