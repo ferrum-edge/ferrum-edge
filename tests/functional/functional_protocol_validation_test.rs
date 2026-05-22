@@ -18,6 +18,7 @@
 //! - Query parameter counting parity on H3
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
+//! - `CONNECT` method rejection on H2 unless `:protocol = "websocket"`
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
 //!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
@@ -260,6 +261,11 @@ fn parse_status_from_response_prefix(bytes: &[u8]) -> Option<u16> {
     let text = String::from_utf8_lossy(bytes);
     text.lines().next()?.split_whitespace().nth(1)?.parse().ok()
 async fn send_h2_with_headers(proxy_port: u16, headers: &[(&str, &str)]) -> (u16, String) {
+async fn send_h2_prior_knowledge(
+    proxy_port: u16,
+    req: Request<Full<Bytes>>,
+    label: &str,
+) -> (u16, String) {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect");
@@ -281,6 +287,10 @@ async fn send_h2_with_headers(proxy_port: u16, headers: &[(&str, &str)]) -> (u16
         .body(Full::new(Bytes::new()))
         .expect("build h2 request");
     let resp = sender.send_request(req).await.expect("send h2 request");
+    let resp = sender
+        .send_request(req)
+        .await
+        .unwrap_or_else(|e| panic!("send {label}: {e}"));
     let status = resp.status().as_u16();
     let body = resp
         .into_body()
@@ -293,6 +303,12 @@ async fn send_h2_with_headers(proxy_port: u16, headers: &[(&str, &str)]) -> (u16
     drop(sender);
     conn_task.abort();
     (status, body)
+    let body_str = String::from_utf8_lossy(&body).into_owned();
+
+    drop(sender);
+    conn_task.abort();
+
+    (status, body_str)
 }
 
 // ============================================================================
@@ -686,41 +702,17 @@ async fn functional_protocol_validation_trace_rejected_http1() {
 async fn functional_protocol_validation_trace_rejected_http2() {
     let h = Harness::new(false).await;
 
-    // Speak HTTP/2 with prior knowledge (no ALPN/TLS).
-    let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
-        .await
-        .expect("connect");
-    let _ = stream.set_nodelay(true);
-    let io = TokioIo::new(stream);
-
-    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-        .await
-        .expect("h2 handshake");
-    let conn_task = tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
     let req = Request::builder()
         .method("TRACE")
         .uri("http://example.com/")
         .header("host", "example.com")
         .body(Full::new(Bytes::new()))
         .expect("build request");
-    let resp = sender.send_request(req).await.expect("send TRACE");
-    let status = resp.status().as_u16();
-    let body = resp
-        .into_body()
-        .collect()
-        .await
-        .map(|b| b.to_bytes().to_vec())
-        .unwrap_or_default();
-    let body_str = String::from_utf8_lossy(&body);
+    let (status, body_str) = send_h2_prior_knowledge(h.proxy_port, req, "TRACE").await;
 
     assert_eq!(status, 405, "body={body_str}");
     assert!(body_str.contains("TRACE"), "unexpected body: {body_str}");
 
-    drop(sender);
-    conn_task.abort();
     h.cleanup();
 }
 
@@ -949,6 +941,7 @@ async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_
 // --- 11. CONNECT on H1 ------------------------------------------------------
 // --- 10. CONNECT on H1 ------------------------------------------------------
 // --- 9. CONNECT on H1 -------------------------------------------------------
+// --- 9. CONNECT on H1/H2 ----------------------------------------------------
 
 #[ignore]
 #[tokio::test]
@@ -1027,6 +1020,21 @@ async fn functional_protocol_validation_h1_header_timeout_closes_incomplete_requ
         "gateway should continue serving valid H1 requests after timing out a slow header; body={}",
         resp.body
     );
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_connect_rejected_http2_without_protocol() {
+    let h = Harness::new(false).await;
+
+    let req = Request::builder()
+        .method("CONNECT")
+        .version(hyper::Version::HTTP_2)
+        .uri("example.com:443")
+        .body(Full::new(Bytes::new()))
+        .expect("build H2 CONNECT request");
+    let (status, body_str) = send_h2_prior_knowledge(h.proxy_port, req, "CONNECT").await;
+
+    assert_eq!(status, 405, "body={body_str}");
+    assert!(body_str.contains("CONNECT"), "unexpected body: {body_str}");
 
     h.cleanup();
 }
@@ -1059,11 +1067,29 @@ async fn functional_protocol_validation_h1_header_timeout_zero_disables_timer() 
         "gateway should still accept valid H1 requests when header timeout is disabled; body={}",
         resp.body
     );
+async fn functional_protocol_validation_connect_rejected_http2_non_websocket_protocol() {
+    let h = Harness::new(false).await;
+
+    let mut req = Request::builder()
+        .method("CONNECT")
+        .version(hyper::Version::HTTP_2)
+        .uri("http://example.com/")
+        .header("host", "example.com")
+        .body(Full::new(Bytes::new()))
+        .expect("build H2 Extended CONNECT request");
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("connect-udp"));
+    let (status, body_str) =
+        send_h2_prior_knowledge(h.proxy_port, req, "CONNECT connect-udp").await;
+
+    assert_eq!(status, 405, "body={body_str}");
+    assert!(body_str.contains("CONNECT"), "unexpected body: {body_str}");
 
     h.cleanup();
 }
 
 // --- 12. Backend sees sanitized request (hop-by-hop headers stripped) ------
+// --- 10. Backend sees sanitized request (hop-by-hop headers stripped) -------
 
 #[ignore]
 #[tokio::test]
