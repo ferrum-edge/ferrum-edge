@@ -161,6 +161,81 @@ impl Http3Client {
         })
     }
 
+    /// Send an HTTP/3 Extended CONNECT request with a caller-selected
+    /// `:protocol` value and buffer the regular response body. This is for
+    /// negative protocol tests such as unsupported CONNECT-UDP rejection; use
+    /// [`Self::websocket`] for successful RFC 9220 WebSocket sessions.
+    pub async fn extended_connect(
+        &self,
+        url: &str,
+        protocol: h3::ext::Protocol,
+    ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: http::Uri = url.parse()?;
+        let host = parsed.host().ok_or("missing host in url")?.to_string();
+        let port = parsed.port_u16().unwrap_or(443);
+        let addr = resolve_loopback(&host, port)?;
+
+        let server_name = parsed.host().unwrap_or("localhost").to_string();
+        let conn = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.endpoint.connect(addr, &server_name)?,
+        )
+        .await
+        .map_err(|_| "QUIC handshake timed out")??;
+        let h3_conn = h3_quinn::Connection::new(conn);
+        let (mut driver, mut send_request) = h3::client::new(h3_conn)
+            .await
+            .map_err(|e| format!("h3 new: {e}"))?;
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let mut req = Request::builder()
+            .method(http::Method::CONNECT)
+            .version(http::Version::HTTP_3)
+            .uri(url)
+            .body(())
+            .map_err(|e| format!("build request: {e}"))?;
+        req.extensions_mut().insert(protocol);
+
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(15), send_request.send_request(req))
+                .await
+                .map_err(|_| "send_request timed out")?
+                .map_err(|e| format!("send_request: {e}"))?;
+
+        let resp = tokio::time::timeout(Duration::from_secs(15), stream.recv_response())
+            .await
+            .map_err(|_| "recv_response timed out")?
+            .map_err(|e| format!("recv_response: {e}"))?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+
+        let mut body_bytes = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(15), stream.recv_data()).await {
+                Ok(Ok(Some(mut chunk))) => {
+                    while chunk.has_remaining() {
+                        let take = chunk.chunk().to_vec();
+                        body_bytes.extend_from_slice(&take);
+                        chunk.advance(take.len());
+                    }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        drop(send_request);
+        driver_task.abort();
+
+        Ok(Http3Response {
+            status,
+            headers,
+            body_bytes: Bytes::from(body_bytes),
+        })
+    }
+
     /// Open an RFC 9220 WebSocket-over-HTTP/3 Extended CONNECT stream.
     ///
     /// The returned stream works with raw WebSocket frames in HTTP/3 DATA

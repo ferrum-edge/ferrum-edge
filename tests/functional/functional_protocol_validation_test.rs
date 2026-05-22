@@ -19,6 +19,7 @@
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
 //! - `CONNECT` method rejection on H2 unless `:protocol = "websocket"`
+//! - `CONNECT` method rejection on H3 for unsupported Extended CONNECT protocols
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
 //!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
@@ -940,6 +941,64 @@ async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_
 
 // --- 11. CONNECT on H1 ------------------------------------------------------
 // --- 10. CONNECT on H1 ------------------------------------------------------
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_connect_udp_rejected() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let https_port = https_reservation.local_addr().unwrap().port();
+    drop(https_reservation);
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start gateway with h3");
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let mut last_err = None;
+    let resp = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match client
+                .extended_connect(&url, h3::ext::Protocol::CONNECT_UDP)
+                .await
+            {
+                Ok(resp) => break resp,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    last_err = Some(err.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "H3 CONNECT-UDP request did not complete; last startup error={last_err:?}; final error={err}"
+                    );
+                }
+            }
+        }
+    };
+
+    assert_eq!(resp.status.as_u16(), 405, "body={}", resp.body_text());
+    assert!(
+        resp.body_text().contains("CONNECT"),
+        "unexpected body: {}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
 // --- 9. CONNECT on H1 -------------------------------------------------------
 // --- 9. CONNECT on H1/H2 ----------------------------------------------------
 
