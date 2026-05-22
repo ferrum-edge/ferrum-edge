@@ -117,7 +117,13 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
-const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+/// Metadata key set on the request context for the duration of
+/// `apply_after_proxy_hooks_to_rejection`. Plugins that wire
+/// `applies_after_proxy_on_reject() -> true` can read this key from
+/// `ctx.metadata` to tell apart "after_proxy invoked on a plugin rejection"
+/// (response_headers are plugin-supplied) from the normal "after_proxy
+/// invoked on a backend response" path (response_headers came from upstream).
+pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
 fn record_node_waypoint_identity_drop(
     overload: &crate::overload::OverloadState,
@@ -3937,7 +3943,13 @@ impl ProxyState {
         }
 
         let mut applied_delta = None;
-        let mut route_changed = false;
+        // `Cell` so both `update_config` closures can share access — closure 1
+        // writes via `set()` (requires only `&Cell`), closure 2 reads via
+        // `get()`. A plain `let mut route_changed = false` would force closure
+        // 1 to capture `&mut bool` and closure 2 `&bool` simultaneously, which
+        // the borrow checker rejects even though both closures are `FnOnce`
+        // and never run concurrently.
+        let route_changed = std::cell::Cell::new(false);
         let staged_config = Arc::new(new_config.clone());
         let publish_result = self.request_epoch.update_config(
             |current| {
@@ -3951,12 +3963,12 @@ impl ProxyState {
                     Arc::clone(&staged_config),
                     &delta,
                 )?;
-                route_changed = staged.route_changed;
+                route_changed.set(staged.route_changed);
                 applied_delta = Some(delta);
                 Ok(Some(staged))
             },
             |published| {
-                self.mirror_request_epoch_wrappers(published, route_changed, false);
+                self.mirror_request_epoch_wrappers(published, route_changed.get(), false);
             },
         );
         let published = match publish_result {
@@ -4165,8 +4177,11 @@ impl ProxyState {
             return IncrementalApplyOutcome::NoChanges;
         }
 
-        // Patch the stored GatewayConfig: clone current, apply mutations, store
-        let mut new_config = (*self.config.load_full()).clone();
+        // Patch the stored GatewayConfig: clone current, apply mutations, store.
+        // Hold the pre-mutation snapshot so we can interrogate removed proxies'
+        // `dispatch_kind` after `new_config.proxies` has had them retained-out.
+        let old_config = self.config.load_full();
+        let mut new_config = (*old_config).clone();
 
         // Remove deleted resources
         if !result.removed_proxy_ids.is_empty() {
@@ -4303,7 +4318,9 @@ impl ProxyState {
         }
 
         let mut applied_delta = None;
-        let mut route_changed = false;
+        // See `update_config` rustdoc nearby for why this is a `Cell` and not
+        // a plain `let mut bool`.
+        let route_changed = std::cell::Cell::new(false);
         let staged_config = Arc::new(new_config.clone());
         let publish_result = self.request_epoch.update_config(
             |current| {
@@ -4317,12 +4334,12 @@ impl ProxyState {
                     Arc::clone(&staged_config),
                     &delta,
                 )?;
-                route_changed = staged.route_changed;
+                route_changed.set(staged.route_changed);
                 applied_delta = Some(delta);
                 Ok(Some(staged))
             },
             |published| {
-                self.mirror_request_epoch_wrappers(published, route_changed, false);
+                self.mirror_request_epoch_wrappers(published, route_changed.get(), false);
             },
         );
         let published = match publish_result {
@@ -5712,7 +5729,7 @@ pub(crate) async fn connect_websocket_backend(
             Err(_) => {
                 error!(
                     proxy_id = %proxy.id,
-                    backend_url = %strip_query_params(&backend_url),
+                    backend_url = %strip_query_params(backend_url),
                     timeout_ms = proxy.backend_connect_timeout_ms,
                     error_kind = "connect_timeout",
                     "WebSocket backend connect timeout"
@@ -6150,6 +6167,12 @@ where
                             // Overhead is one atomic load per frame (CancellationToken state
                             // check); the send future is polled first on wakeup so successful
                             // sends pay no extra latency. No heap allocation, no timer wheel.
+                            //
+                            // Snapshot the payload byte count before `send(outgoing)` moves
+                            // the frame into the future so the success-arm accounting still
+                            // has a usable value. `ws_message_payload_bytes` reads
+                            // `Message::len()`, no allocation.
+                            let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_ctb.cancelled() => {
@@ -6172,7 +6195,7 @@ where
                                     // Count the frame that successfully reached the backend.
                                     frames_c2b_task.fetch_add(1, Ordering::Relaxed);
                                     bytes_c2b_task.fetch_add(
-                                        ws_message_payload_bytes(&outgoing),
+                                        outgoing_payload_bytes,
                                         Ordering::Relaxed,
                                     );
                                 }
@@ -6299,6 +6322,11 @@ where
                             // client socket is backpressured so our `ws_sink.send()` would
                             // otherwise block indefinitely. One atomic load per frame; send
                             // polled first so successful frames pay no extra latency.
+                            //
+                            // Snapshot the payload byte count before `send(outgoing)` moves
+                            // the frame into the future so the success-arm accounting still
+                            // has a usable value.
+                            let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_btc.cancelled() => {
@@ -6321,7 +6349,7 @@ where
                                     // Count the frame that successfully reached the client.
                                     frames_b2c_task.fetch_add(1, Ordering::Relaxed);
                                     bytes_b2c_task.fetch_add(
-                                        ws_message_payload_bytes(&outgoing),
+                                        outgoing_payload_bytes,
                                         Ordering::Relaxed,
                                     );
                                 }
@@ -7621,10 +7649,11 @@ pub async fn run_authentication_phase(
             }
             if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
-                || ctx
-                    .metadata
-                    .get("mesh_request_auth.permissive_missing_token")
-                    .is_some_and(|v| v == "true")
+                || (last_reject.is_none()
+                    && ctx
+                        .metadata
+                        .get("mesh_request_auth.permissive_missing_token")
+                        .is_some_and(|v| v == "true"))
             {
                 None
             } else {
@@ -10601,7 +10630,7 @@ async fn handle_proxy_request_inner(
                 state.max_response_body_size_bytes,
             );
 
-            let mut body = if state.response_buffer_cutoff_bytes == 0
+            let body = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
             {
                 crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
@@ -10635,7 +10664,7 @@ async fn handle_proxy_request_inner(
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
-            let mut body = if state.response_buffer_cutoff_bytes == 0
+            let body = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
             {
                 crate::proxy::body::direct_streaming_h3_body(h3_resp.recv_stream, cl)
@@ -11267,7 +11296,7 @@ pub(crate) async fn proxy_to_backend_retry(
             let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,
-                backend_url = %strip_query_params(&backend_url),
+                backend_url = %strip_query_params(backend_url),
                 error_kind = error_kind,
                 error = %e,
                 "Backend retry request failed"
@@ -11863,7 +11892,7 @@ async fn proxy_to_backend(
                         Err(e) => {
                             error!(
                                 proxy_id = %proxy.id,
-                                backend_url = %strip_query_params(&backend_url),
+                                backend_url = %strip_query_params(backend_url),
                                 error_kind = "client_disconnect",
                                 error = %e,
                                 "Client disconnected while sending request body"
@@ -12119,7 +12148,7 @@ async fn proxy_to_backend(
             if body_size_exceeded.load(Ordering::Acquire) {
                 warn!(
                     proxy_id = %proxy.id,
-                    backend_url = %strip_query_params(&backend_url),
+                    backend_url = %strip_query_params(backend_url),
                     max_body_size = state.max_request_body_size_bytes,
                     "Streaming request body exceeded maximum size"
                 );
@@ -12154,7 +12183,7 @@ async fn proxy_to_backend(
             let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,
-                backend_url = %strip_query_params(&backend_url),
+                backend_url = %strip_query_params(backend_url),
                 error_kind = error_kind,
                 error = %e,
                 "Backend request failed"
@@ -13278,7 +13307,7 @@ async fn proxy_to_backend_http2(
     // `ctx.bytes_sent_observed` once the response completes.
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> retry::BackendResponse {
-    debug!(proxy_id = %proxy.id, backend_url = %strip_query_params(&backend_url), "Proxying request via HTTP/2 pool");
+    debug!(proxy_id = %proxy.id, backend_url = %strip_query_params(backend_url), "Proxying request via HTTP/2 pool");
 
     // Parse the backend URL
     let uri: hyper::Uri = match backend_url.parse() {
@@ -13606,7 +13635,7 @@ async fn proxy_to_backend_http3(
     stream_response: bool,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (retry::BackendResponse, Option<Bytes>) {
-    debug!(proxy_id = %proxy.id, backend_url = %strip_query_params(&backend_url), "Proxying request to HTTP/3 backend");
+    debug!(proxy_id = %proxy.id, backend_url = %strip_query_params(backend_url), "Proxying request to HTTP/3 backend");
 
     // Resolve backend IP from DNS cache for the effective host
     let effective_host = upstream_target
@@ -13743,7 +13772,7 @@ async fn proxy_to_backend_http3(
                                 }) => {
                                     error!(
                                         proxy_id = %proxy.id,
-                                        backend_url = %strip_query_params(&backend_url),
+                                        backend_url = %strip_query_params(backend_url),
                                         max_response_body_size_bytes = state.max_response_body_size_bytes,
                                         "HTTP/3 backend response body exceeded configured maximum"
                                     );
@@ -13782,7 +13811,7 @@ async fn proxy_to_backend_http3(
                                     // `drain_h3_response_body` and never reaches here.
                                     error!(
                                         proxy_id = %proxy.id,
-                                        backend_url = %strip_query_params(&backend_url),
+                                        backend_url = %strip_query_params(backend_url),
                                         error_kind = error_kind,
                                         error = %e,
                                         "HTTP/3 backend buffered response read failed"
@@ -13848,7 +13877,7 @@ async fn proxy_to_backend_http3(
                         {
                             error!(
                                 proxy_id = %proxy.id,
-                                backend_url = %strip_query_params(&backend_url),
+                                backend_url = %strip_query_params(backend_url),
                                 error = %e,
                                 "Client disconnected while sending request body (HTTP/3 streaming)"
                             );
@@ -13886,7 +13915,7 @@ async fn proxy_to_backend_http3(
                             record_port_exhaustion_if_class(&state.overload, error_class);
                             error!(
                                 proxy_id = %proxy.id,
-                                backend_url = %strip_query_params(&backend_url),
+                                backend_url = %strip_query_params(backend_url),
                                 error_kind = error_kind,
                                 error = %e,
                                 "HTTP/3 backend streaming request failed"
@@ -13968,7 +13997,7 @@ async fn proxy_to_backend_http3(
                     Err(e) => {
                         error!(
                             proxy_id = %proxy.id,
-                            backend_url = %strip_query_params(&backend_url),
+                            backend_url = %strip_query_params(backend_url),
                             error_kind = "client_disconnect",
                             error = %e,
                             "Client disconnected while sending request body (HTTP/3)"
@@ -14092,7 +14121,7 @@ async fn proxy_to_backend_http3(
                 record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
-                    backend_url = %strip_query_params(&backend_url),
+                    backend_url = %strip_query_params(backend_url),
                     error_kind = error_kind,
                     error = %e,
                     "HTTP/3 backend streaming request failed"
@@ -14170,7 +14199,7 @@ async fn proxy_to_backend_http3(
                 record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
-                    backend_url = %strip_query_params(&backend_url),
+                    backend_url = %strip_query_params(backend_url),
                     error_kind = error_kind,
                     error = %e,
                     "HTTP/3 backend request failed"
@@ -14458,7 +14487,7 @@ async fn proxy_to_backend_http3_retry(
             record_port_exhaustion_if_class(&state.overload, error_class);
             error!(
                 proxy_id = %proxy.id,
-                backend_url = %strip_query_params(&backend_url),
+                backend_url = %strip_query_params(backend_url),
                 target = %format!("{}:{}", effective_host, effective_port),
                 error_kind = error_kind,
                 error = %e,

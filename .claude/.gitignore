@@ -1,3 +1,6 @@
 # Ignore all Claude Code runtime artifacts (lock files, session state, etc.)
 *
 !.gitignore
+# Git must unignore the directory before it can unignore tracked rule contents.
+!rules/
+!rules/**

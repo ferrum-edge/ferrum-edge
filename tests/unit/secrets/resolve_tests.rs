@@ -178,7 +178,10 @@ fn test_resolve_secret_file_preserves_internal_whitespace() {
 #[test]
 fn test_resolve_all_env_secrets_rejects_unsupported_cloud_suffixes() {
     with_env_vars_async(
-        &[("FERRUM_TEST_SECRET_UNSUPPORTED_AWS", "arn:aws:secretsmanager:...")],
+        &[(
+            "FERRUM_TEST_SECRET_UNSUPPORTED_AWS",
+            "arn:aws:secretsmanager:...",
+        )],
         || async {
             let result = resolve_all_env_secrets().await;
             #[cfg(not(feature = "secrets-aws"))]
@@ -202,7 +205,10 @@ fn test_resolve_all_env_secrets_rejects_unsupported_cloud_suffixes() {
 #[test]
 fn test_resolve_secret_rejects_unsupported_cloud_suffixes() {
     with_env_vars_async(
-        &[("FERRUM_TEST_SECRET_UNSUPPORTED_GCP", "projects/x/secrets/y/versions/latest")],
+        &[(
+            "FERRUM_TEST_SECRET_UNSUPPORTED_GCP",
+            "projects/x/secrets/y/versions/latest",
+        )],
         || async {
             let result = resolve_secret("FERRUM_TEST_SECRET_UNSUPPORTED").await;
             #[cfg(not(feature = "secrets-gcp"))]

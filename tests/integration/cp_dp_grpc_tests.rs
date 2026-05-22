@@ -359,30 +359,47 @@ async fn test_dp_receives_initial_config_from_cp() {
     let proxy_state = create_test_proxy_state();
     assert_eq!(proxy_state.config.load().proxies.len(), 0);
 
-    // Connect to CP and receive initial config (DP generates JWT from shared secret)
+    // Connect to CP and receive initial config (DP generates JWT from shared secret).
+    //
+    // `connect_and_subscribe` is a long-lived streaming subscription — it
+    // only returns when the stream ends or errors. The previous
+    // `timeout(5s, connect_and_subscribe(...))` therefore *always* burned
+    // the full 5 s timeout window: the stream stays open, the timeout
+    // fires, the test treats `Err(_)` as "success after we already saw
+    // the config." Switching to spawn-and-poll drops this test from
+    // ~5 s to under 100 ms.
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
     let node_id = "test-node-1";
 
-    let result = timeout(
-        Duration::from_secs(5),
+    let ps = proxy_state.clone();
+    let cp_url_clone = cp_url.clone();
+    let secret = test_secret();
+    let node_id_owned = node_id.to_string();
+    let client_handle = tokio::spawn(async move {
         dp_client::connect_and_subscribe(
-            &cp_url,
-            &test_secret(),
-            node_id,
-            &proxy_state,
+            &cp_url_clone,
+            &secret,
+            &node_id_owned,
+            &ps,
             None,
             "ferrum",
-        ),
-    )
+        )
+        .await
+    });
+
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
     .await;
-
-    // The stream will end when the server shuts down, or we'll timeout.
-    // Either way, the initial config should have been received.
-    // connect_and_subscribe returns Ok(()) when the stream ends, or an error.
-    // We check that the proxy_state was updated.
-
-    // Give a moment for the initial config to be processed
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        received.is_ok(),
+        "DP did not receive initial config within 5s"
+    );
 
     let current_config = proxy_state.config.load();
     assert_eq!(
@@ -393,12 +410,7 @@ async fn test_dp_receives_initial_config_from_cp() {
     assert_eq!(current_config.proxies[0].id, "proxy-0");
     assert_eq!(current_config.proxies[1].id, "proxy-1");
 
-    // Verify the result was Ok (stream ended gracefully or we timed out after receiving config)
-    match result {
-        Ok(Ok(())) => {} // Stream ended gracefully
-        Ok(Err(e)) => panic!("connect_and_subscribe failed: {}", e),
-        Err(_) => {} // Timeout is acceptable - we already verified config was received
-    }
+    client_handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1617,20 +1629,37 @@ async fn test_dp_connects_to_cp_with_tls() {
         no_verify: false,
     };
 
-    let result = timeout(
-        Duration::from_secs(5),
+    // See `test_dp_receives_initial_config_from_cp` for why this is
+    // spawn-and-poll rather than `timeout(secs(5), connect_and_subscribe)`.
+    let ps = proxy_state.clone();
+    let cp_url_clone = cp_url.clone();
+    let secret = test_secret();
+    let tls = tls_config.clone();
+    let client_handle = tokio::spawn(async move {
         dp_client::connect_and_subscribe(
-            &cp_url,
-            &test_secret(),
+            &cp_url_clone,
+            &secret,
             "tls-node-1",
-            &proxy_state,
-            Some(&tls_config),
+            &ps,
+            Some(&tls),
             "ferrum",
-        ),
-    )
-    .await;
+        )
+        .await
+    });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        received.is_ok(),
+        "DP did not receive initial config over TLS within 5s"
+    );
 
     let current_config = proxy_state.config.load();
     assert_eq!(
@@ -1639,11 +1668,7 @@ async fn test_dp_connects_to_cp_with_tls() {
         "DP should have received 2 proxies from CP over TLS"
     );
 
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("TLS connect_and_subscribe failed: {}", e),
-        Err(_) => {} // Timeout acceptable after receiving config
-    }
+    client_handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1699,20 +1724,37 @@ async fn test_dp_connects_to_cp_with_mtls() {
         no_verify: false,
     };
 
-    let result = timeout(
-        Duration::from_secs(5),
+    // See `test_dp_receives_initial_config_from_cp` for why this is
+    // spawn-and-poll rather than `timeout(secs(5), connect_and_subscribe)`.
+    let ps = proxy_state.clone();
+    let cp_url_clone = cp_url.clone();
+    let secret = test_secret();
+    let tls = tls_config.clone();
+    let client_handle = tokio::spawn(async move {
         dp_client::connect_and_subscribe(
-            &cp_url,
-            &test_secret(),
+            &cp_url_clone,
+            &secret,
             "mtls-node-1",
-            &proxy_state,
-            Some(&tls_config),
+            &ps,
+            Some(&tls),
             "ferrum",
-        ),
-    )
-    .await;
+        )
+        .await
+    });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        received.is_ok(),
+        "DP did not receive initial config over mTLS within 5s"
+    );
 
     let current_config = proxy_state.config.load();
     assert_eq!(
@@ -1721,11 +1763,7 @@ async fn test_dp_connects_to_cp_with_mtls() {
         "DP should have received 3 proxies from CP over mTLS"
     );
 
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("mTLS connect_and_subscribe failed: {}", e),
-        Err(_) => {}
-    }
+    client_handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]

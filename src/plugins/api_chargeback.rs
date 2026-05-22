@@ -139,6 +139,7 @@ impl ChargebackEntry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         call_price: f64,

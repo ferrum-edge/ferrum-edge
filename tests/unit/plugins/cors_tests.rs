@@ -572,7 +572,10 @@ async fn test_after_proxy_removes_backend_access_control_headers_when_origin_not
 
     assert!(!response_headers.contains_key("access-control-allow-origin"));
     assert!(!response_headers.contains_key("access-control-allow-credentials"));
-    assert_eq!(response_headers.get("x-test").map(String::as_str), Some("ok"));
+    assert_eq!(
+        response_headers.get("x-test").map(String::as_str),
+        Some("ok")
+    );
 }
 
 // ── Vary header tests ────────────────────────────────────────────────

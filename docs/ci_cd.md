@@ -26,7 +26,7 @@ Two main workflows handle different aspects of the development lifecycle:
 ```
 Pull Request
     ├─► Format
-    ├─► Unit / inline-lib / integration / functional-shard tests
+    ├─► Unit / inline-lib / integration-shard / functional-shard tests
     ├─► Lint, eBPF change check, performance regression check
     └─► Five target release builds
 
@@ -84,8 +84,14 @@ cargo test --test unit_tests
 # test-lib
 cargo test --lib
 
-# test-integration
-cargo test --test integration_tests
+# test-integration-{admin-api,admin-config,mesh-routing,mesh-platform,protocols-data-plane}
+cargo nextest run --test integration_tests \
+  --no-fail-fast \
+  <shard filters>
+
+# test-integration-coverage (sanity check job; needs test-integration)
+# Diffs `ls tests/integration/*.rs` against the union of shard filters and
+# fails the PR if a file is missing from / not declared in any shard.
 
 # build-gateway-binary
 cargo build --bin ferrum-edge
@@ -100,7 +106,8 @@ cargo nextest run --test functional_tests \
 **What it tests**:
 - Unit tests in `tests/unit_tests.rs`
 - Inline `#[cfg(test)]` modules in `src/`
-- Integration tests
+- Integration tests split across five shards (`admin-api`, `admin-config`, `mesh-routing`, `mesh-platform`, `protocols-data-plane`). Each shard runs `cargo nextest run --test integration_tests` with a per-shard list of `integration::<file_module>` positional filters that nextest ORs together. The shard split balances ~583 in-process tests across 57 files roughly by test count (admin-api ~153, admin-config ~152, mesh-routing ~158, mesh-platform ~60 — lower count offset by heavier k8s/telemetry setup per test, protocols-data-plane ~150). Integration tests are in-process (no gateway binary, no Redis/Mongo services); each shard runs on its own `ubuntu-latest` runner with the standard Rust toolchain and a 30-minute cap.
+- `test-integration-coverage` runs after `test-integration` and diffs `ls tests/integration/*.rs` against the union of declared shard filters in `ci.yml`. Adding a new `mod foo_tests` to `tests/integration/mod.rs` without wiring it into a shard fails this guard — silent-skip protection.
 - Functional tests split across six shards (harness, admin-routing, data-plane, plugins, protocols, and resilience). CI builds the gateway binary once in `build-gateway-binary`, uploads it as an artifact, and each functional shard downloads it with `FERRUM_SKIP_GATEWAY_BUILD=1`. The data-plane shard runs serialized with `nextest_jobs: 1`, and Redis/MongoDB service containers are attached to every functional shard job for tests that need them.
 
 **Output**:

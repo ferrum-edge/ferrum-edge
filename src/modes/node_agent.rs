@@ -36,7 +36,7 @@ use crate::ebpf::pod_watcher::{self, EnrollmentDecision};
 use crate::ebpf::veth;
 use crate::ebpf::{
     CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, INCLUDE_PORTS_MAX,
-    IncludePortsPolicy, NodeAgentMetrics, PodAttachmentState, PodInfo,
+    IncludePortsPolicy, NodeAgentMetrics, NodeAgentProxyMode, PodAttachmentState, PodInfo,
 };
 use crate::modes::node_agent_cni_server::{
     self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,

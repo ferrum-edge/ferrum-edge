@@ -2401,12 +2401,14 @@ mod tests {
     }
 
     #[test]
-    fn accepts_regex_method_match_at_load_and_uppercases_pattern() {
-        // Same uppercase-at-load contract as Prefix: operator casing is not
-        // load-bearing because the request method is uppercase ASCII.
+    fn regex_method_match_compiles_verbatim_at_load() {
+        // PR #1026 reverted the regex-uppercasing-at-load behaviour because it
+        // rewrites escape sequences (`\d` -> `\D`, etc.). Regex patterns are
+        // now compiled verbatim. `Prefix` continues to uppercase so the hot
+        // path stays case-sensitive against uppercase methods.
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
-                "match": {"methods": [{"regex": "^(post|put|patch)$"}]},
+                "match": {"methods": [{"regex": "^(POST|PUT|PATCH)$"}]},
                 "destination": {"upstream_id": "writes"}
             }]
         }))
@@ -2419,9 +2421,32 @@ mod tests {
                 assert!(!re.is_match("GET"));
                 assert!(
                     !re.is_match("post"),
-                    "regex was uppercased at compile time — \
-                     hot path stays case-sensitive against uppercase methods"
+                    "regex pattern keeps operator casing — hot path is case-sensitive"
                 );
+            }
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowercase_regex_method_match_does_not_match_uppercase_method() {
+        // Counter-test to the above: operators who write a lowercase regex
+        // must understand it won't match the (uppercase) request methods.
+        // We don't reject such patterns at load — the operator may want to
+        // route on a non-standard lowercase method — but we document the
+        // expectation here so a future change that re-introduces silent
+        // uppercasing is caught by CI.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": [{"regex": "^(post|put|patch)$"}]},
+                "destination": {"upstream_id": "writes"}
+            }]
+        }))
+        .unwrap();
+        match &plugin.rules()[0].methods_compiled[0] {
+            MethodMatcher::Regex(re) => {
+                assert!(!re.is_match("POST"));
+                assert!(re.is_match("post"));
             }
             other => panic!("expected Regex, got {other:?}"),
         }

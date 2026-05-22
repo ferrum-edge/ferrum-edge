@@ -726,9 +726,15 @@ impl MeshSlice {
             waypoint_resources
         };
 
+        // Bind `request.namespace` so we can both move it into `self` and
+        // borrow it inside the `multi_cluster` `.retain` closure below without
+        // E0382. `String: Clone` is cheap relative to a slice-apply cycle and
+        // happens once per slice; the alternative (reordering field
+        // initialization) is fragile across future struct changes.
+        let request_namespace = request.namespace;
         Self {
             node_id: request.node_id,
-            namespace: request.namespace,
+            namespace: request_namespace.clone(),
             workload_spiffe_id: request.workload_spiffe_id,
             waypoint_name: request.waypoint_name,
             labels: effective_labels,
@@ -747,7 +753,7 @@ impl MeshSlice {
                 let mut scoped = multi_cluster.clone();
                 scoped
                     .east_west_gateways
-                    .retain(|gateway| gateway.namespace == request.namespace);
+                    .retain(|gateway| gateway.namespace == request_namespace);
                 scoped
             }),
             outbound_traffic_policy: mesh.outbound_traffic_policy,
@@ -1980,7 +1986,7 @@ mod tests {
     use crate::config::types::GatewayConfig;
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
     use crate::modes::mesh::config::{
-        AppProtocol, MeshAccessLoggingConfig, MeshConfig, MeshDestinationRule, MeshExtensionConfig,
+        AppProtocol, EastWestGateway, MeshAccessLoggingConfig, MeshConfig, MeshDestinationRule,
         MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
         MeshSidecarEgress, MeshTelemetryConfig, MeshTelemetryResource, MeshWaypointBinding,
         MeshWaypointServiceRef, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction,

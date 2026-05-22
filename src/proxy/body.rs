@@ -252,7 +252,10 @@ impl ProxyBody {
         self
     }
 
-    pub fn with_lb_connection_guard(mut self, guard: super::LoadBalancerConnectionGuard) -> Self {
+    pub(crate) fn with_lb_connection_guard(
+        mut self,
+        guard: super::LoadBalancerConnectionGuard,
+    ) -> Self {
         self._lb_connection_guard = Some(guard);
         self
     }
@@ -297,6 +300,7 @@ impl ProxyBody {
             kind: ProxyBodyKind::Stream(body),
             _request_guard: None,
             _reqwest_backend_guard: None,
+            _lb_connection_guard: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),

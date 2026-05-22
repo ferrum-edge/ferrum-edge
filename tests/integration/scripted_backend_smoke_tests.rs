@@ -396,6 +396,15 @@ async fn serve_blocks_until_shutdown_when_no_listener_handles() {
         ..EnvConfig::default()
     };
 
+    // Override `BACKGROUND_DRAIN_TIMEOUT` (production default 5 s) to a
+    // small test-friendly value so the regression check below can use a
+    // proportional sleep. The bug we're guarding against is "join()
+    // returns after only the background-drain timeout instead of waiting
+    // for shutdown" — the asymmetry is what matters (sleep > drain
+    // timeout), not the absolute wall-clock. With 200 ms here the test
+    // drops from ~10.6 s to under 0.5 s without losing the regression
+    // signal.
+    let drain_timeout = Duration::from_millis(200);
     let opts = ServeOptions {
         // No pre-bound listeners. Combined with the all-zero ports above,
         // `serve()` must hand back a ServeHandles with empty
@@ -407,6 +416,7 @@ async fn serve_blocks_until_shutdown_when_no_listener_handles() {
             algorithm: jsonwebtoken::Algorithm::HS256,
         })),
         skip_initial_capability_refresh: true,
+        background_drain_timeout: Some(drain_timeout),
         ..ServeOptions::default()
     };
 
@@ -417,19 +427,19 @@ async fn serve_blocks_until_shutdown_when_no_listener_handles() {
 
     let join_task = tokio::spawn(async move { handles.join().await });
 
-    // The bug surfaces at exactly the background-drain timeout
-    // (`BACKGROUND_DRAIN_TIMEOUT` = 5 s in `src/modes/file.rs`):
-    // pre-fix, the empty listener loop is a no-op, the drain is skipped
+    // The bug surfaces at exactly the background-drain timeout: pre-fix,
+    // the empty listener loop is a no-op, the drain is skipped
     // (`shutdown_drain_seconds = 0`), and `join_background_handles` falls
     // through after its 5 s timeout because the DNS / overload / metrics
-    // tasks never see a shutdown signal. So we have to wait *past* that
-    // 5 s mark to prove `join()` is genuinely blocking on shutdown
+    // tasks never see a shutdown signal. So we have to wait *past* the
+    // drain timeout to prove `join()` is genuinely blocking on shutdown
     // (with the fix) rather than just slow to time out (without it).
     //
-    // 6 s wall-clock is the price of this regression test; lowering it
-    // would require exposing the timeout constant to tests, which is a
-    // worse trade than the slower test.
-    tokio::time::sleep(Duration::from_millis(6_000)).await;
+    // We use 3× the configured `drain_timeout` above as the proof
+    // window — gives a comfortable margin over jitter / runtime
+    // scheduling on slow CI runners while staying small in absolute
+    // terms.
+    tokio::time::sleep(drain_timeout * 3).await;
     assert!(
         !join_task.is_finished(),
         "join() returned before shutdown was signalled — stream-only \

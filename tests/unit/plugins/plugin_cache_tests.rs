@@ -1438,10 +1438,21 @@ async fn test_pre_auth_body_buffering_plugins_are_explicitly_tracked_for_hbone()
 
     const HBONE_PRE_AUTH_BODY_PLUGINS: &[&str] = &["hmac_auth"];
 
-    let ctx = RequestContext::new(
+    // PR #1067 narrowed `hmac_auth.should_buffer_request_body` to only ask
+    // for body buffering when the request is actually carrying an HMAC
+    // authorization header. So this enumeration must hand each candidate
+    // plugin a request that *could* trigger its pre-auth buffering — for
+    // hmac_auth that means an `Authorization: hmac …` header — otherwise
+    // hmac_auth (the only currently-tracked plugin) returns false and the
+    // assertion below sees an empty list.
+    let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "CONNECT".to_string(),
         "/".to_string(),
+    );
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "hmac username=\"u\", algorithm=\"hmac-sha256\", headers=\"\", signature=\"\"".to_string(),
     );
     let mut pre_auth_body_plugins = Vec::new();
 

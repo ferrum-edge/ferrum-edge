@@ -9,7 +9,7 @@ pub mod mesh_config_drift;
 pub mod spec_codec;
 
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -3765,31 +3765,40 @@ mod tests {
 
     #[test]
     fn normalize_restore_payload_timestamps_sets_uniform_updated_at() {
+        // `Proxy`, `Consumer`, `PluginConfig`, `Upstream`, and `RestorePayload`
+        // do not impl `Default`, so build the test payload through serde — the
+        // domain structs already carry `#[serde(default)]` on every field we
+        // don't care about for this test.
         let old = Utc::now() - chrono::Duration::days(90);
         let restored_at = Utc::now();
-        let mut payload = RestorePayload {
-            proxies: vec![Proxy {
-                id: "p1".to_string(),
-                updated_at: old,
-                ..Default::default()
+        let old_ts = old.to_rfc3339();
+        let payload_json = serde_json::json!({
+            "proxies": [{
+                "id": "p1",
+                "updated_at": old_ts,
+                "backend_host": "example.test",
+                "backend_port": 8080,
             }],
-            consumers: vec![Consumer {
-                id: "c1".to_string(),
-                updated_at: old,
-                ..Default::default()
+            "consumers": [{
+                "id": "c1",
+                "username": "alice",
+                "updated_at": old_ts,
             }],
-            plugin_configs: vec![PluginConfig {
-                id: "pc1".to_string(),
-                updated_at: old,
-                ..Default::default()
+            "plugin_configs": [{
+                "id": "pc1",
+                "plugin_name": "noop",
+                "scope": "global",
+                "updated_at": old_ts,
             }],
-            upstreams: vec![Upstream {
-                id: "u1".to_string(),
-                updated_at: old,
-                ..Default::default()
+            "upstreams": [{
+                "id": "u1",
+                "name": "u1",
+                "targets": [],
+                "updated_at": old_ts,
             }],
-            ..Default::default()
-        };
+        });
+        let mut payload: RestorePayload = serde_json::from_value(payload_json)
+            .expect("test RestorePayload deserializes from minimal JSON");
 
         normalize_restore_payload_timestamps(&mut payload, restored_at);
 
