@@ -22,6 +22,7 @@
 //! - `FERRUM_MAX_QUERY_PARAMS` rejection on H2
 //! - `FERRUM_MAX_URL_LENGTH_BYTES` rejection on H2
 //! - `FERRUM_MAX_HEADER_COUNT` rejection and zero-unlimited behavior on H2
+//! - `FERRUM_MAX_QUERY_PARAMS=0` unlimited behavior on H2
 //! - `Transfer-Encoding` rejection on H3
 //! - Empty query segments are ignored by HTTP/3 query-param limit counting
 //! - Query parameter counting parity on H3
@@ -54,6 +55,7 @@
 
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
+use crate::scaffolding::clients::{GetOptions, Http2Client, Http3Client};
 
 use bytes::Bytes;
 use http::HeaderMap;
@@ -942,6 +944,49 @@ async fn functional_protocol_validation_h2_total_header_size_limit_rejects_from_
 // --- 8. Query parameter count on H2 ---------------------------------------
 // --- 8. URL length on H2 ---------------------------------------------------
 // --- 8. Header count on H2 -------------------------------------------------
+// --- 8. Query parameter count zero on H2 ----------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h2_query_param_zero_allows_extra_params() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_MAX_QUERY_PARAMS", "0")
+        .spawn()
+        .await
+        .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port did not become ready");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2 client");
+    let resp = client
+        .get(&format!(
+            "http://127.0.0.1:{}/?one=1&two=2&three=3",
+            gateway.proxy_port
+        ))
+        .await
+        .expect("send h2 request");
+    let body = resp.body_text();
+
+    assert_eq!(resp.status.as_u16(), 200, "body={body}");
+    assert!(
+        body.contains("host"),
+        "backend should receive request when query-param limit is disabled; body={body}"
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. Transfer-Encoding on H3 -------------------------------------------
 
 #[ignore]
 #[tokio::test]
