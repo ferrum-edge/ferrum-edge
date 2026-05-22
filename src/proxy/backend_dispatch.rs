@@ -417,6 +417,7 @@ pub(crate) fn record_backend_outcome(
     response_status: u16,
     connection_error: bool,
     is_half_open_probe: bool,
+    skip_circuit_breaker_record: bool,
     backend_elapsed: Duration,
 ) {
     // End connection tracking for least-connections
@@ -451,7 +452,7 @@ pub(crate) fn record_backend_outcome(
     // Record circuit breaker result against the final target's breaker.
     // For retries, intermediate failures were already recorded per-target inside
     // the retry loop, so this only records the final attempt's outcome.
-    if let Some(cb_config) = &proxy.circuit_breaker {
+    if !skip_circuit_breaker_record && let Some(cb_config) = &proxy.circuit_breaker {
         let cb =
             state
                 .circuit_breaker_cache
