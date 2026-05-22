@@ -7,6 +7,8 @@
 //! 4. Verifies end-to-end echo round-trips for text and binary messages
 //! 5. Tests plaintext (ws://), TLS (wss://), and HTTP/3 Extended CONNECT
 //!    WebSocket connections
+//! 6. Verifies configured WebSocket Origin allowlists across H1 Upgrade and
+//!    H3 Extended CONNECT envelopes
 //!
 //! This test is marked with #[ignore] as it requires the binary to be built
 //! and should be run with: cargo test --test functional_tests functional_websocket -- --ignored --nocapture
@@ -216,6 +218,32 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: true
+
+consumers: []
+plugin_configs: []
+"#,
+        backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+/// Write a YAML config with a WebSocket proxy protected by an Origin allowlist.
+fn write_ws_origin_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-origin-proxy"
+    listen_path: "/ws-echo"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {}
+    strip_listen_path: true
+    allowed_ws_origins:
+      - "https://app.example.com"
 
 consumers: []
 plugin_configs: []
@@ -594,6 +622,82 @@ async fn test_websocket_plaintext_echo() {
     println!("test_websocket_plaintext_echo PASSED");
 }
 
+/// Origin allowlists should fail closed for browser WebSocket handshakes while
+/// preserving the documented case-insensitive match behavior.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
+    let backend_port = free_port().await;
+
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_origin_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let missing_origin = match tokio_tungstenite::connect_async(&url).await {
+        Ok(_) => panic!("WebSocket handshake without Origin should be rejected"),
+        Err(err) => err,
+    };
+    match missing_origin {
+        WsError::Http(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+        other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
+    }
+
+    let mut blocked_request = url
+        .as_str()
+        .into_client_request()
+        .expect("valid WebSocket request");
+    blocked_request
+        .headers_mut()
+        .insert("origin", "https://evil.example.com".parse().unwrap());
+    let blocked_origin = match tokio_tungstenite::connect_async(blocked_request).await {
+        Ok(_) => panic!("WebSocket handshake from disallowed Origin should be rejected"),
+        Err(err) => err,
+    };
+    match blocked_origin {
+        WsError::Http(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+        other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
+    }
+
+    let mut allowed_request = url
+        .as_str()
+        .into_client_request()
+        .expect("valid WebSocket request");
+    allowed_request
+        .headers_mut()
+        .insert("origin", "HTTPS://APP.EXAMPLE.COM".parse().unwrap());
+    let (mut ws, response) = tokio_tungstenite::connect_async(allowed_request)
+        .await
+        .expect("WebSocket handshake from allowed Origin should succeed");
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    ws.send(Message::Text("origin ok".into()))
+        .await
+        .expect("Failed to send text");
+    let reply = ws
+        .next()
+        .await
+        .expect("No reply")
+        .expect("Error reading reply");
+    assert_eq!(reply, Message::Text("Echo: origin ok".into()));
+
+    ws.send(Message::Close(None))
+        .await
+        .expect("Failed to send close");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    println!("test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1 PASSED");
+}
+
 /// End-to-end test: WebSocket handshakes are rejected by key_auth without a key.
 #[ignore]
 #[tokio::test]
@@ -933,6 +1037,87 @@ async fn test_h3_websocket_subprotocol_forwarding_and_none() {
         "Echo: plain"
     );
     without_subprotocol.send_close().await.expect("close");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// Origin allowlists are enforced before the H3 Extended CONNECT stream is
+/// upgraded to backend WebSocket transport.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_origin_allowlist_enforced_before_backend_connect() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_origin_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+
+    let mut missing_origin = client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket missing-origin response");
+    assert_eq!(missing_origin.status, StatusCode::FORBIDDEN);
+    assert!(
+        missing_origin
+            .recv_body_text()
+            .await
+            .expect("missing-origin body")
+            .contains("WebSocket Origin not allowed")
+    );
+
+    let mut blocked_origin = client
+        .websocket(
+            &url,
+            WebSocketOptions {
+                headers: vec![("origin".to_string(), "https://evil.example.com".to_string())],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("H3 WebSocket disallowed-origin response");
+    assert_eq!(blocked_origin.status, StatusCode::FORBIDDEN);
+    assert!(
+        blocked_origin
+            .recv_body_text()
+            .await
+            .expect("disallowed-origin body")
+            .contains("WebSocket Origin not allowed")
+    );
+
+    let mut allowed_origin = client
+        .websocket(
+            &url,
+            WebSocketOptions {
+                headers: vec![("origin".to_string(), "HTTPS://APP.EXAMPLE.COM".to_string())],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("H3 WebSocket allowed-origin connect");
+    assert_eq!(allowed_origin.status, StatusCode::OK);
+    allowed_origin
+        .send_text("origin h3")
+        .await
+        .expect("send text");
+    assert_eq!(
+        allowed_origin.recv_text().await.expect("text echo"),
+        "Echo: origin h3"
+    );
+    allowed_origin.send_close().await.expect("close");
 
     let _ = gateway.kill();
     let _ = gateway.wait();
