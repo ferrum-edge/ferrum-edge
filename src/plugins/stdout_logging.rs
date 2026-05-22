@@ -4,12 +4,11 @@
 //! stdout for each transaction, matching the plugin's documented behavior.
 //! Supports all proxy protocols (HTTP, gRPC, WebSocket, TCP, UDP).
 
-use std::io::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
 use super::{Plugin, TransactionSummary};
@@ -48,10 +47,7 @@ impl Plugin for StdoutLogging {
             None => serde_json::to_string(summary),
         };
         match result {
-            Ok(json) => {
-                let mut stdout = std::io::stdout().lock();
-                let _ = writeln!(stdout, "{json}");
-            }
+            Ok(json) => info!(target: "access_log", "{}", json),
             Err(e) => warn!("stdout_logging: failed to serialize transaction summary: {e}"),
         }
     }
@@ -62,10 +58,7 @@ impl Plugin for StdoutLogging {
             None => serde_json::to_string(summary),
         };
         match result {
-            Ok(json) => {
-                let mut stdout = std::io::stdout().lock();
-                let _ = writeln!(stdout, "{json}");
-            }
+            Ok(json) => info!(target: "access_log", "{}", json),
             Err(e) => warn!("stdout_logging: failed to serialize stream summary: {e}"),
         }
     }
