@@ -774,6 +774,30 @@ fn forwarded_h3_proto() {
     assert_eq!(val, "for=10.0.0.1;proto=h3;host=api.example.com");
 }
 
+#[test]
+fn forwarded_host_with_port_is_quoted() {
+    let val = build_forwarded_value("10.0.0.1", "https", Some("api.example.com:8443"));
+    assert_eq!(
+        val,
+        "for=10.0.0.1;proto=https;host=\"api.example.com:8443\""
+    );
+}
+
+#[test]
+fn forwarded_ipv6_host_is_quoted() {
+    let val = build_forwarded_value("10.0.0.1", "https", Some("[2001:db8::1]:443"));
+    assert_eq!(val, "for=10.0.0.1;proto=https;host=\"[2001:db8::1]:443\"");
+}
+
+#[test]
+fn forwarded_host_escapes_quoted_string_delimiters() {
+    let val = build_forwarded_value("10.0.0.1", "https", Some(r#"evil"\host;proto=http"#));
+    assert_eq!(
+        val,
+        r#"for=10.0.0.1;proto=https;host="evil\"\\host;proto=http""#
+    );
+}
+
 // ============================================================================
 // H4: H2.CL downgrade smuggling verification
 // Verify that Content-Length from HTTP/2 requests cannot poison HTTP/1.1 backends.
