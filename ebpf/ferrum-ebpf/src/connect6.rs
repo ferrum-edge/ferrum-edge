@@ -102,7 +102,7 @@ fn capture_allowed(dst_port: u16, include_cidr_match: bool) -> bool {
         return include_cidr_match;
     }
 
-    policy_admits_port(policy, dst_port)
+    include_cidr_match || policy_admits_port(policy, dst_port)
 }
 
 /// Check whether `dst_port` appears in the policy's explicit port list.

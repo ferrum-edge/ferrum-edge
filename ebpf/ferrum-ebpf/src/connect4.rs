@@ -100,7 +100,7 @@ fn outbound_capture_port() -> u32 {
 ///   1. No per-cgroup policy → fall back to CIDR match (normal path).
 ///   2. Wildcard policy (`all_ports`) → always capture.
 ///   3. Empty port list (no wildcard) → fall back to CIDR match.
-///   4. Explicit port list → capture only if port matches.
+///   4. Explicit port list → capture if CIDR matches OR port matches.
 #[inline(always)]
 fn capture_allowed(dst_port: u16, include_cidr_match: bool) -> bool {
     let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
@@ -117,7 +117,7 @@ fn capture_allowed(dst_port: u16, include_cidr_match: bool) -> bool {
         return include_cidr_match;
     }
 
-    policy_admits_port(policy, dst_port)
+    include_cidr_match || policy_admits_port(policy, dst_port)
 }
 
 /// Check whether `dst_port` appears in the policy's explicit port list.
