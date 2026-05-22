@@ -35,12 +35,16 @@ impl GatewayApiStatusWriter {
 
     pub async fn patch_updates(
         &self,
-        updates: &[GatewayApiStatusUpdate],
+        updates: Vec<GatewayApiStatusUpdate>,
     ) -> Result<(), kube::Error> {
-        // Build one future per update that captures its identity so partial
-        // failures can be logged with the resource they failed on.
-        let futures = updates.iter().filter_map(|update| {
-            let Some(ar) = api_resource_for_update(update) else {
+        // Build one future per update that captures its identity by *move* so
+        // partial failures can be logged with the resource they failed on,
+        // and so the resulting futures stay `Send + 'static` for
+        // `tokio::spawn` (no `&GatewayApiStatusUpdate` borrows held across
+        // awaits — that would trip rustc's HRTB Send check).
+        let client = self.client.clone();
+        let futures = updates.into_iter().filter_map(move |update| {
+            let Some(ar) = api_resource_for_update(&update) else {
                 warn!(
                     api_version = %update.api_version,
                     kind = %update.kind,
@@ -51,9 +55,9 @@ impl GatewayApiStatusWriter {
                 return None;
             };
             let api: Api<DynamicObject> = if update.kind == "GatewayClass" {
-                Api::all_with(self.client.clone(), &ar)
+                Api::all_with(client.clone(), &ar)
             } else {
-                Api::namespaced_with(self.client.clone(), &update.namespace, &ar)
+                Api::namespaced_with(client.clone(), &update.namespace, &ar)
             };
             let name = update.name.clone();
             let kind = update.kind.clone();
@@ -74,7 +78,7 @@ impl GatewayApiStatusWriter {
                             None
                         }
                     };
-                    let patch = status_patch_for_update(update, live_status.as_ref());
+                    let patch = status_patch_for_update(&update, live_status.as_ref());
                     // TODO(ssa): switch to Patch::Apply once the chart guarantees the
                     // status subresource accepts server-side apply. JSON Merge Patch
                     // (RFC 7396) replaces arrays wholesale, leaving a narrow TOCTOU

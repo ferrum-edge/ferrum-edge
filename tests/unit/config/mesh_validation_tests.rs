@@ -555,7 +555,10 @@ fn peer_authentication_rejects_client_side_mtls_mode() {
 #[test]
 fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
     let mut port_overrides = HashMap::new();
-    port_overrides.insert(15006, ferrum_edge::modes::mesh::config::MtlsMode::IstioMutual);
+    port_overrides.insert(
+        15006,
+        ferrum_edge::modes::mesh::config::MtlsMode::IstioMutual,
+    );
     let pa = PeerAuthentication {
         name: "pa".into(),
         namespace: "default".into(),
@@ -568,7 +571,8 @@ fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("port_overrides[15006]") && e.contains("invalid for server-side policy")),
+            .any(|e| e.contains("port_overrides[15006]")
+                && e.contains("invalid for server-side policy")),
         "expected invalid port override mtls_mode error, got: {:?}",
         errors
     );

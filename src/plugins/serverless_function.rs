@@ -268,6 +268,23 @@ impl ServerlessFunction {
 
                     let qualifier = optional_config_string(config, "aws_qualifier")?;
 
+                    // Optional override for the AWS Lambda endpoint base URL.
+                    // Defaults to the public Lambda endpoint for the region.
+                    // Primarily used by integration tests against a mock
+                    // server; supports LocalStack / VPC-internal Lambda endpoints
+                    // too. Must be a fully-formed http(s) URL with no path.
+                    //
+                    // Validate at plugin construction (same `validate_function_url`
+                    // used by the Azure/GCP `function_url` paths) so a malformed
+                    // value — e.g. `localhost:4566` without a scheme, or
+                    // `tcp://…` — surfaces as a deterministic startup/config
+                    // error instead of a per-request invoke failure later.
+                    let endpoint_override = optional_config_string(config, "aws_endpoint_url")?
+                        .or_else(|| env_non_empty("AWS_LAMBDA_ENDPOINT_URL"));
+                    if let Some(ref endpoint) = endpoint_override {
+                        validate_http_url_field(endpoint, "aws_endpoint_url")?;
+                    }
+
                     // Log which values came from env vars (without leaking secrets)
                     if config["aws_region"]
                         .as_str()
@@ -286,11 +303,16 @@ impl ServerlessFunction {
                         );
                     }
 
-                    // Build the Lambda Invoke API URL
-                    let mut url = format!(
-                        "https://lambda.{}.amazonaws.com/2015-03-31/functions/{}/invocations",
-                        region, function_name
-                    );
+                    // Build the Lambda Invoke API URL. `aws_endpoint_url`
+                    // (or `AWS_LAMBDA_ENDPOINT_URL`) overrides the public
+                    // Lambda host so tests and on-prem/LocalStack deployments
+                    // can route invocations to a mock or VPC-internal endpoint.
+                    let base = endpoint_override
+                        .as_deref()
+                        .map(|s| s.trim_end_matches('/').to_string())
+                        .unwrap_or_else(|| format!("https://lambda.{region}.amazonaws.com"));
+                    let mut url =
+                        format!("{base}/2015-03-31/functions/{function_name}/invocations");
                     if let Some(ref q) = qualifier {
                         url.push_str("?Qualifier=");
                         url.push_str(&aws_sigv4::uri_encode(q, true));
@@ -606,24 +628,31 @@ fn escape_json_string(s: &str) -> String {
         .replace('>', "\\u003e")
 }
 
-/// Validate a function URL (Azure/GCP).
+/// Validate a function URL (Azure/GCP `function_url`).
 fn validate_function_url(url: &str) -> Result<(), String> {
+    validate_http_url_field(url, "function_url")
+}
+
+/// Shared HTTP(S) URL validator for `function_url` (Azure/GCP) and the AWS
+/// Lambda `aws_endpoint_url` override. Surfaces the field name in the error
+/// so operators see exactly which config key was rejected.
+fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
     let parsed =
-        Url::parse(url).map_err(|e| format!("serverless_function: invalid function_url: {e}"))?;
+        Url::parse(url).map_err(|e| format!("serverless_function: invalid {field}: {e}"))?;
 
     match parsed.scheme() {
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "serverless_function: function_url must use http:// or https:// (got '{scheme}')"
+                "serverless_function: {field} must use http:// or https:// (got '{scheme}')"
             ));
         }
     }
 
     if parsed.host_str().is_none() {
-        return Err(
-            "serverless_function: function_url must include a hostname or IP address".to_string(),
-        );
+        return Err(format!(
+            "serverless_function: {field} must include a hostname or IP address"
+        ));
     }
 
     Ok(())

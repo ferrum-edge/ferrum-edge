@@ -279,8 +279,7 @@ fn service_endpoint_with_default_scheme(
         ));
     };
     let port = optional_u16(config, "port")?.unwrap_or(default_port);
-    let scheme =
-        trimmed_string(config, "scheme").unwrap_or_else(|| default_scheme.to_string());
+    let scheme = trimmed_string(config, "scheme").unwrap_or_else(|| default_scheme.to_string());
     Ok(format!("{scheme}://{service}:{port}"))
 }
 

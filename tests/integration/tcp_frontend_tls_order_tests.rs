@@ -5,10 +5,9 @@
 //! That keeps frontend TLS failures and plugin rejects from consuming upstream
 //! capacity or being misclassified as backend failures.
 
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -17,7 +16,6 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use tracing_subscriber::fmt::MakeWriter;
 
 use ferrum_edge::adaptive_buffer::AdaptiveBufferTracker;
 use ferrum_edge::circuit_breaker::CircuitBreakerCache;
@@ -44,42 +42,6 @@ const STDOUT_LOGGING_PLUGIN_ID: &str = "stdout-logging";
 const MAX_GATEWAY_ATTEMPTS: u32 = 3;
 const PER_ATTEMPT_STARTED_TIMEOUT: Duration = Duration::from_secs(2);
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Clone, Default)]
-struct SharedWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
-    }
-}
-
-struct SharedGuard {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl io::Write for SharedGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedWriter {
-    type Writer = SharedGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedGuard {
-            buffer: Arc::clone(&self.buffer),
-        }
-    }
-}
 
 fn tcp_tls_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[String]) -> Proxy {
     Proxy {
@@ -466,36 +428,75 @@ async fn assert_backend_was_dialed(accepted: &AtomicUsize) {
     panic!("successful TCP/TLS setup should open a backend connection");
 }
 
-fn extract_access_log_summaries(logs: &str) -> Vec<Value> {
-    logs.lines()
+/// Pulls a direct-write stream summary out of stdout captured by
+/// [`StdoutRedirect`]. PR #1131 made `stdout_logging` `writeln!` to
+/// `std::io::stdout()` instead of going through `tracing::info!(target:
+/// "access_log", …)`, so a `tracing_subscriber::fmt`-backed buffer no
+/// longer sees the summary — it only shows up on the process's stdout
+/// fd. The matching summary is the JSON line carrying our proxy id.
+fn parse_direct_write_stream_summary(captured: &str) -> Option<Value> {
+    captured
+        .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|line| line.get("target").and_then(Value::as_str) == Some("access_log"))
-        .filter_map(|line| {
-            line.get("fields")
-                .and_then(|fields| fields.get("message"))
-                .and_then(Value::as_str)
-                .and_then(|message| serde_json::from_str::<Value>(message).ok())
+        .find(|line| {
+            line.is_object() && line.get("proxy_id").and_then(Value::as_str) == Some(PROXY_ID)
         })
-        .collect()
 }
 
-async fn wait_for_access_log_summary(writer: &SharedWriter) -> Value {
-    for _ in 0..100 {
-        let logs = writer.contents();
-        if let Some(summary) = extract_access_log_summaries(&logs)
-            .into_iter()
-            .find(|summary| summary.get("proxy_id").and_then(Value::as_str) == Some(PROXY_ID))
-        {
-            return summary;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+/// `libc::dup2` redirect of `STDOUT_FILENO` into a tempfile, so a test can
+/// observe what `stdout_logging` (which writes directly to
+/// `std::io::stdout()` post-#1131) emits. The returned guard restores the
+/// original stdout fd on drop, even on panic.
+///
+/// Safe under nextest's process-per-test model: the redirect is process-
+/// global, but nextest gives every test its own process so the redirect
+/// can't bleed into another test. The single-threaded `current_thread`
+/// runtime keeps gateway/listener tasks on the same process whose stdout
+/// is redirected, so their `writeln!(std::io::stdout(), …)` lands in the
+/// tempfile.
+#[cfg(unix)]
+struct StdoutRedirect {
+    file: tempfile::NamedTempFile,
+    saved_fd: std::os::fd::RawFd,
+}
+
+#[cfg(unix)]
+impl StdoutRedirect {
+    fn install() -> Self {
+        use std::os::fd::AsRawFd;
+        let file = tempfile::NamedTempFile::new().expect("temp file for stdout capture");
+        let target_fd = file.as_file().as_raw_fd();
+        // SAFETY: `STDOUT_FILENO` is always a valid file descriptor in a
+        // hosted Rust program; the dup/dup2 pair is the standard
+        // stdout-redirect dance and is undone in `Drop`.
+        let saved_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        assert!(saved_fd >= 0, "dup(STDOUT_FILENO) failed");
+        let rc = unsafe { libc::dup2(target_fd, libc::STDOUT_FILENO) };
+        assert!(rc >= 0, "dup2(target, STDOUT_FILENO) failed");
+        Self { file, saved_fd }
     }
 
-    panic!(
-        "stdout_logging did not emit a stream summary within {:?}; logs:\n{}",
-        TEST_TIMEOUT,
-        writer.contents()
-    );
+    fn drain(&self) -> String {
+        // Flush libc's stdout buffer and Rust's stdout buffer so anything
+        // pending lands in the file before we read it.
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+        }
+        std::fs::read_to_string(self.file.path()).unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StdoutRedirect {
+    fn drop(&mut self) {
+        // SAFETY: `saved_fd` came from `libc::dup(STDOUT_FILENO)` in
+        // `install()` and we close it after restoring.
+        unsafe {
+            libc::dup2(self.saved_fd, libc::STDOUT_FILENO);
+            libc::close(self.saved_fd);
+        }
+    }
 }
 
 #[tokio::test]
@@ -568,16 +569,17 @@ async fn tcp_tls_frontend_handshake_failure_does_not_connect_backend() {
     shutdown_gateway_or_panic(shutdown_tx, join).await;
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn tcp_tls_frontend_handshake_failure_logs_client_side_disconnect_summary() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(writer.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    // PR #1131 moved `stdout_logging` from `tracing::info!(target:
+    // "access_log", …)` to a direct `writeln!(std::io::stdout(), …)`,
+    // so the stream summary no longer flows through a
+    // `tracing_subscriber::fmt` writer. Capture stdout at the libc fd
+    // level instead. Safe under nextest's process-per-test (this is
+    // the model `test-integration` uses); the redirect is undone on
+    // `Drop` for resilience against panic.
+    let stdout_capture = StdoutRedirect::install();
 
     let backend = reserve_port().await.expect("reserve backend port");
     let backend_port = backend.local_addr().expect("backend addr").port();
@@ -602,7 +604,25 @@ async fn tcp_tls_frontend_handshake_failure_logs_client_side_disconnect_summary(
     );
     assert_backend_never_dialed(&backend_accepts).await;
 
-    let summary = wait_for_access_log_summary(&writer).await;
+    // Poll the redirected stdout until the gateway has flushed the
+    // stream summary (or we exceed `TEST_TIMEOUT`).
+    let summary = {
+        let mut summary = None;
+        for _ in 0..100 {
+            if let Some(found) = parse_direct_write_stream_summary(&stdout_capture.drain()) {
+                summary = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        summary.unwrap_or_else(|| {
+            panic!(
+                "stdout_logging did not emit a stream summary within {:?}; captured stdout:\n{}",
+                TEST_TIMEOUT,
+                stdout_capture.drain()
+            )
+        })
+    };
     assert_eq!(
         summary.get("disconnect_direction").and_then(Value::as_str),
         Some("client_to_backend"),
@@ -629,6 +649,7 @@ async fn tcp_tls_frontend_handshake_failure_logs_client_side_disconnect_summary(
     backend_task.abort();
     let _ = backend_task.await;
     shutdown_gateway_or_panic(shutdown_tx, join).await;
+    drop(stdout_capture);
 }
 
 #[tokio::test]

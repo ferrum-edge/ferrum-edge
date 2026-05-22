@@ -1297,6 +1297,19 @@ impl Plugin for BodyValidator {
         }
 
         if !is_grpc_content_type(content_type) {
+            // Only run the JSON/XML branch when JSON or XML validation is
+            // actually configured. A protobuf-only plugin must Continue on
+            // non-grpc content types (the gRPC branch below is the one that
+            // applies to it). `has_request_validation` alone isn't enough —
+            // it's also true for protobuf-only configs, which would otherwise
+            // mis-treat a non-gRPC payload as malformed JSON.
+            let has_json_validation =
+                self.json_schema.is_some() || !self.required_fields.is_empty();
+            let has_xml_validation = self.validate_xml || !self.required_xml_elements.is_empty();
+            if !has_json_validation && !has_xml_validation {
+                return PluginResult::Continue;
+            }
+
             if !content_type_matches(&self.content_types, content_type) {
                 return PluginResult::Continue;
             }
@@ -1309,7 +1322,7 @@ impl Plugin for BodyValidator {
                 }
             };
 
-            let result = if is_json_like_content_type(content_type) {
+            let result = if is_json_like_content_type(content_type) && has_json_validation {
                 self.validate_json_body(
                     body_str,
                     &self.required_fields,

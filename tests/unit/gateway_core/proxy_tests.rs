@@ -675,8 +675,37 @@ async fn test_multi_auth_allows_mesh_permissive_missing_token() {
 
     assert!(
         result.is_none(),
-        "mesh permissive missing token should pass in multi mode"
+        "mesh permissive missing token should pass in multi mode when no other plugin rejects"
     );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
+}
+
+#[tokio::test]
+async fn test_multi_auth_rejects_when_mandatory_plugin_rejects_despite_mesh_permissive_marker() {
+    let rejecting_auth: Arc<dyn Plugin> = Arc::new(RejectingAuth {
+        body: r#"{"error":"API key required"}"#,
+    });
+    let mesh_request_auth: Arc<dyn Plugin> = Arc::new(PermissiveMissingMeshAuth);
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![rejecting_auth, mesh_request_auth];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mesh".to_string(),
+    );
+
+    let result =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    assert!(
+        result.is_some(),
+        "mesh permissive marker must not bypass another plugin's rejection in Multi mode"
+    );
+    let (status, body, _headers) = result.unwrap();
+    assert_eq!(status, 401);
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        r#"{"error":"API key required"}"#
+    );
 }

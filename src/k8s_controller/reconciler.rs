@@ -52,125 +52,153 @@ pub fn spawn_reconcile_loop(
     gateway_status_writer: Option<GatewayApiStatusWriter>,
     istio_status_writer: Option<IstioStatusWriter>,
     metrics: Arc<ControllerMetrics>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut change_rx = {
-            let set = store_set.lock().await;
-            set.subscribe()
-        };
+    // Funnel the loop through a named `async fn` so the spawned future has a
+    // concrete type signature (no anonymous future generated from an
+    // `async move { ... }`). The previous inline form tripped a rustc HRTB
+    // limitation on `tokio::spawn`'s `Send + 'static` bound for the
+    // `&Arc<tokio::sync::Mutex<ResourceStoreSet>>` borrows held across the
+    // `do_reconcile(...).await` calls.
+    tokio::spawn(run_reconcile_loop(
+        store_set,
+        config_arc,
+        broadcasters,
+        reconciler_config,
+        gateway_status_writer,
+        istio_status_writer,
+        metrics,
+        shutdown,
+    ))
+}
 
-        let debounce = Duration::from_millis(reconciler_config.debounce_ms);
-        let full_sync_interval =
-            full_sync_interval_duration(reconciler_config.full_sync_interval_secs);
-        if reconciler_config.full_sync_interval_secs == 0 {
-            warn!(
-                "FERRUM_K8S_FULL_SYNC_INTERVAL_SECS=0 is invalid, clamping K8s full-sync interval to 1s"
+#[allow(clippy::too_many_arguments)]
+async fn run_reconcile_loop(
+    store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
+    config_arc: Arc<ArcSwap<GatewayConfig>>,
+    broadcasters: ReconcileBroadcasters,
+    reconciler_config: ReconcilerConfig,
+    gateway_status_writer: Option<GatewayApiStatusWriter>,
+    istio_status_writer: Option<IstioStatusWriter>,
+    metrics: Arc<ControllerMetrics>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut change_rx = {
+        let set = store_set.lock().await;
+        set.subscribe()
+    };
+
+    let debounce = Duration::from_millis(reconciler_config.debounce_ms);
+    let full_sync_interval = full_sync_interval_duration(reconciler_config.full_sync_interval_secs);
+    if reconciler_config.full_sync_interval_secs == 0 {
+        warn!(
+            "FERRUM_K8S_FULL_SYNC_INTERVAL_SECS=0 is invalid, clamping K8s full-sync interval to 1s"
+        );
+    }
+    let mut full_sync_timer = tokio::time::interval(full_sync_interval);
+    full_sync_timer.tick().await; // skip first immediate tick
+
+    let trust_domain = match TrustDomain::new(&reconciler_config.trust_domain) {
+        Ok(td) => td,
+        Err(e) => {
+            error!(
+                trust_domain = reconciler_config.trust_domain,
+                error = %e,
+                "Invalid trust domain for K8s controller, stopping reconciler"
             );
-        }
-        let mut full_sync_timer = tokio::time::interval(full_sync_interval);
-        full_sync_timer.tick().await; // skip first immediate tick
-
-        let trust_domain = match TrustDomain::new(&reconciler_config.trust_domain) {
-            Ok(td) => td,
-            Err(e) => {
-                error!(
-                    trust_domain = reconciler_config.trust_domain,
-                    error = %e,
-                    "Invalid trust domain for K8s controller, stopping reconciler"
-                );
-                return;
-            }
-        };
-
-        if !wait_for_initial_store_readiness(&store_set, &mut change_rx, &mut shutdown).await {
             return;
         }
+    };
 
-        // Initial reconciliation — block until first success.
-        do_reconcile(
-            &store_set,
-            ReconcileContext {
-                config_arc: &config_arc,
-                update_tx: &broadcasters.update_tx,
-                dp_registry: &broadcasters.dp_registry,
-                mesh_update_tx: &broadcasters.mesh_update_tx,
-                mesh_registry: &broadcasters.mesh_registry,
-                namespace: &reconciler_config.namespace,
-                cluster_domain: &reconciler_config.cluster_domain,
-                istio_root_namespace: &reconciler_config.istio_root_namespace,
-                watch_namespaces: &reconciler_config.watch_namespaces,
-                trust_domain: &trust_domain,
-                pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
-                gateway_status_writer: gateway_status_writer.as_ref(),
-                istio_status_writer: istio_status_writer.as_ref(),
-                metrics: &metrics,
-            },
-        )
-        .await;
+    if !wait_for_initial_store_readiness(Arc::clone(&store_set), &mut change_rx, &mut shutdown)
+        .await
+    {
+        return;
+    }
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        info!("K8s reconciler shutting down");
-                        return;
-                    }
-                }
-                _ = full_sync_timer.tick() => {
-                    debug!("Periodic full-sync reconciliation");
-                    metrics.full_syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    do_reconcile(
-                        &store_set,
-                        ReconcileContext {
-                            config_arc: &config_arc,
-                            update_tx: &broadcasters.update_tx,
-                            dp_registry: &broadcasters.dp_registry,
-                            mesh_update_tx: &broadcasters.mesh_update_tx,
-                            mesh_registry: &broadcasters.mesh_registry,
-                            namespace: &reconciler_config.namespace,
-                            cluster_domain: &reconciler_config.cluster_domain,
-                            istio_root_namespace: &reconciler_config.istio_root_namespace,
-                            watch_namespaces: &reconciler_config.watch_namespaces,
-                            trust_domain: &trust_domain,
-                            pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
-                            gateway_status_writer: gateway_status_writer.as_ref(),
-                            istio_status_writer: istio_status_writer.as_ref(),
-                            metrics: &metrics,
-                        },
-                    ).await;
-                }
-                result = change_rx.changed() => {
-                    if result.is_err() {
-                        info!("Change channel closed, stopping reconciler");
-                        return;
-                    }
-                    // Debounce: wait for events to settle before reconciling.
-                    debounce_events(&mut change_rx, debounce).await;
-                    do_reconcile(
-                        &store_set,
-                        ReconcileContext {
-                            config_arc: &config_arc,
-                            update_tx: &broadcasters.update_tx,
-                            dp_registry: &broadcasters.dp_registry,
-                            mesh_update_tx: &broadcasters.mesh_update_tx,
-                            mesh_registry: &broadcasters.mesh_registry,
-                            namespace: &reconciler_config.namespace,
-                            cluster_domain: &reconciler_config.cluster_domain,
-                            istio_root_namespace: &reconciler_config.istio_root_namespace,
-                            watch_namespaces: &reconciler_config.watch_namespaces,
-                            trust_domain: &trust_domain,
-                            pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
-                            gateway_status_writer: gateway_status_writer.as_ref(),
-                            istio_status_writer: istio_status_writer.as_ref(),
-                            metrics: &metrics,
-                        },
-                    ).await;
+    // Initial reconciliation — block until first success.
+    do_reconcile(
+        Arc::clone(&store_set),
+        ReconcileContext {
+            config_arc: Arc::clone(&config_arc),
+            update_tx: broadcasters.update_tx.clone(),
+            dp_registry: Arc::clone(&broadcasters.dp_registry),
+            mesh_update_tx: broadcasters.mesh_update_tx.clone(),
+            mesh_registry: Arc::clone(&broadcasters.mesh_registry),
+            namespace: reconciler_config.namespace.clone(),
+            cluster_domain: reconciler_config.cluster_domain.clone(),
+            istio_root_namespace: reconciler_config.istio_root_namespace.clone(),
+            watch_namespaces: reconciler_config.watch_namespaces.clone(),
+            trust_domain: trust_domain.clone(),
+            pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+            gateway_status_writer: gateway_status_writer.clone(),
+            istio_status_writer: istio_status_writer.clone(),
+            metrics: Arc::clone(&metrics),
+        },
+    )
+    .await;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    info!("K8s reconciler shutting down");
+                    return;
                 }
             }
+            _ = full_sync_timer.tick() => {
+                debug!("Periodic full-sync reconciliation");
+                metrics.full_syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                do_reconcile(
+                    Arc::clone(&store_set),
+                    ReconcileContext {
+                        config_arc: Arc::clone(&config_arc),
+                        update_tx: broadcasters.update_tx.clone(),
+                        dp_registry: Arc::clone(&broadcasters.dp_registry),
+                        mesh_update_tx: broadcasters.mesh_update_tx.clone(),
+                        mesh_registry: Arc::clone(&broadcasters.mesh_registry),
+                        namespace: reconciler_config.namespace.clone(),
+                        cluster_domain: reconciler_config.cluster_domain.clone(),
+                        istio_root_namespace: reconciler_config.istio_root_namespace.clone(),
+                        watch_namespaces: reconciler_config.watch_namespaces.clone(),
+                        trust_domain: trust_domain.clone(),
+                        pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                        gateway_status_writer: gateway_status_writer.clone(),
+                        istio_status_writer: istio_status_writer.clone(),
+                        metrics: Arc::clone(&metrics),
+                    },
+                ).await;
+            }
+            result = change_rx.changed() => {
+                if result.is_err() {
+                    info!("Change channel closed, stopping reconciler");
+                    return;
+                }
+                // Debounce: wait for events to settle before reconciling.
+                debounce_events(&mut change_rx, debounce).await;
+                do_reconcile(
+                    Arc::clone(&store_set),
+                    ReconcileContext {
+                        config_arc: Arc::clone(&config_arc),
+                        update_tx: broadcasters.update_tx.clone(),
+                        dp_registry: Arc::clone(&broadcasters.dp_registry),
+                        mesh_update_tx: broadcasters.mesh_update_tx.clone(),
+                        mesh_registry: Arc::clone(&broadcasters.mesh_registry),
+                        namespace: reconciler_config.namespace.clone(),
+                        cluster_domain: reconciler_config.cluster_domain.clone(),
+                        istio_root_namespace: reconciler_config.istio_root_namespace.clone(),
+                        watch_namespaces: reconciler_config.watch_namespaces.clone(),
+                        trust_domain: trust_domain.clone(),
+                        pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                        gateway_status_writer: gateway_status_writer.clone(),
+                        istio_status_writer: istio_status_writer.clone(),
+                        metrics: Arc::clone(&metrics),
+                    },
+                ).await;
+            }
         }
-    })
+    }
 }
 
 async fn debounce_events(change_rx: &mut watch::Receiver<u64>, window: Duration) {
@@ -214,7 +242,7 @@ fn full_sync_interval_duration(configured_secs: u64) -> Duration {
 }
 
 async fn wait_for_initial_store_readiness(
-    store_set: &Arc<tokio::sync::Mutex<ResourceStoreSet>>,
+    store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     change_rx: &mut watch::Receiver<u64>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
@@ -228,7 +256,7 @@ async fn wait_for_initial_store_readiness(
 }
 
 async fn wait_for_initial_store_readiness_with_timeout(
-    store_set: &Arc<tokio::sync::Mutex<ResourceStoreSet>>,
+    store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     change_rx: &mut watch::Receiver<u64>,
     shutdown: &mut watch::Receiver<bool>,
     timeout: Duration,
@@ -245,7 +273,9 @@ async fn wait_for_initial_store_readiness_with_timeout(
         }
 
         let stores = {
-            let set = store_set.lock().await;
+            // See `do_reconcile` rustdoc on `lock_owned` for the HRTB Send
+            // reasoning: same constraint here, same fix.
+            let set = Arc::clone(&store_set).lock_owned().await;
             set.stores()
         };
 
@@ -260,7 +290,10 @@ async fn wait_for_initial_store_readiness_with_timeout(
                     return true;
                 }
                 tokio::select! {
-                    result = tokio::time::timeout(remaining, store.wait_until_ready()) => {
+                    // `wait_until_ready_owned` captures the `Arc<CrdResourceStore>`
+                    // by value so no `&CrdResourceStore` borrow is held across
+                    // the timeout's `.await`. See `CrdResourceStore::wait_until_ready_owned`.
+                    result = tokio::time::timeout(remaining, store.wait_until_ready_owned()) => {
                         match result {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => {
@@ -314,50 +347,57 @@ async fn wait_for_initial_store_readiness_with_timeout(
     }
 }
 
-struct ReconcileContext<'a> {
-    config_arc: &'a Arc<ArcSwap<GatewayConfig>>,
-    update_tx: &'a broadcast::Sender<ConfigUpdate>,
-    dp_registry: &'a Arc<DpNodeRegistry>,
-    mesh_update_tx: &'a broadcast::Sender<MeshConfigBroadcast>,
-    mesh_registry: &'a Arc<MeshNodeRegistry>,
-    namespace: &'a str,
-    cluster_domain: &'a str,
-    istio_root_namespace: &'a str,
-    watch_namespaces: &'a [String],
-    trust_domain: &'a TrustDomain,
+/// Owned ReconcileContext — every field is an owned value or a cheap-to-clone
+/// `Arc`. Previously this struct carried `&'a` references with a lifetime
+/// parameter, which tripped a rustc HRTB inference bug on `tokio::spawn`'s
+/// `Send + 'static` bound: the compiler proved `Send` for `&'0 T` for a
+/// specific `'0` but not for all lifetimes, so the spawned future was rejected.
+/// Cloning `Arc`s (refcount bumps) and the small `Clone` writer/notifier
+/// values once per reconcile is cheap relative to the reconciliation work.
+struct ReconcileContext {
+    config_arc: Arc<ArcSwap<GatewayConfig>>,
+    update_tx: broadcast::Sender<ConfigUpdate>,
+    dp_registry: Arc<DpNodeRegistry>,
+    mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
+    mesh_registry: Arc<MeshNodeRegistry>,
+    namespace: String,
+    cluster_domain: String,
+    istio_root_namespace: String,
+    watch_namespaces: Vec<String>,
+    trust_domain: TrustDomain,
     pod_discovery_enabled: bool,
-    gateway_status_writer: Option<&'a GatewayApiStatusWriter>,
+    gateway_status_writer: Option<GatewayApiStatusWriter>,
     /// T2-B: Istio CRD status sub-resource patcher. `None` when the
     /// controller couldn't be built (no Istio CRD watching, or the
     /// kube client isn't available). The reconciler short-circuits to
     /// a no-op when None — every other code path stays unchanged.
-    istio_status_writer: Option<&'a IstioStatusWriter>,
-    metrics: &'a ControllerMetrics,
+    istio_status_writer: Option<IstioStatusWriter>,
+    metrics: Arc<ControllerMetrics>,
 }
 
-async fn do_reconcile(
-    store_set: &Arc<tokio::sync::Mutex<ResourceStoreSet>>,
-    ctx: ReconcileContext<'_>,
-) {
+async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx: ReconcileContext) {
     let start = std::time::Instant::now();
     ctx.metrics
         .reconciliations
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let objects = {
-        let set = store_set.lock().await;
+        // `lock_owned` keeps the guard from holding a `&Mutex<…>` borrow across
+        // the `.await`, which would otherwise force rustc into an HRTB Send
+        // analysis it can't satisfy when the future is `tokio::spawn`-ed.
+        let set = Arc::clone(&store_set).lock_owned().await;
         set.snapshot_all()
     };
 
     let resource_count = objects.len();
     debug!(resource_count, "Starting reconciliation");
 
-    let options = K8sTranslationOptions::new(ctx.namespace.to_string(), ctx.trust_domain.clone())
-        .with_cluster_domain(ctx.cluster_domain.to_string())
-        .with_istio_root_namespace(ctx.istio_root_namespace.to_string())
-        .with_source_namespaces(ctx.watch_namespaces.to_vec())
+    let options = K8sTranslationOptions::new(ctx.namespace.clone(), ctx.trust_domain.clone())
+        .with_cluster_domain(ctx.cluster_domain.clone())
+        .with_istio_root_namespace(ctx.istio_root_namespace.clone())
+        .with_source_namespaces(ctx.watch_namespaces.clone())
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled);
-    let Some(translation) = translate_with_skip_retries(&objects, options.clone(), ctx.metrics)
+    let Some(translation) = translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
     else {
         return;
     };
@@ -367,22 +407,32 @@ async fn do_reconcile(
     }
 
     let managed_namespaces = managed_k8s_namespaces(
-        ctx.namespace,
-        ctx.watch_namespaces,
+        &ctx.namespace,
+        &ctx.watch_namespaces,
         &translation.config.known_namespaces,
     );
     let Some(new_config) =
-        swap_merged_k8s_translation(ctx.config_arc, &translation.config, &managed_namespaces)
+        swap_merged_k8s_translation(&ctx.config_arc, &translation.config, &managed_namespaces)
     else {
         debug!("No config changes detected, skipping swap");
-        patch_gateway_api_statuses(
+        // Owned `Vec<...>` parameters keep the patch futures Send across
+        // `tokio::spawn`'s HRTB analysis — `&[T]` parameters previously
+        // tripped the same "Send not general enough" error as the
+        // `&Mutex<...>` borrow above. But the helpers immediately return
+        // when their writer is `None`, so gate the calls on the writer
+        // existing before paying for the deep-clone of `objects`
+        // (`K8sObject` carries serde-cloned `spec`/`status` JSON) or for
+        // `options` / `route_conflicts`. Deployments that don't watch
+        // Gateway API / Istio CRDs (the default) get zero per-reconcile
+        // clone cost.
+        run_status_patchers(
             ctx.gateway_status_writer,
+            ctx.istio_status_writer,
             &objects,
-            options.clone(),
-            &translation.route_conflicts,
+            &options,
+            Some(&translation.route_conflicts),
         )
         .await;
-        patch_istio_statuses(ctx.istio_status_writer, &objects, options).await;
         let elapsed = start.elapsed();
         ctx.metrics.last_reconcile_duration_ms.store(
             elapsed.as_millis() as u64,
@@ -392,20 +442,22 @@ async fn do_reconcile(
     };
 
     // Notify DPs and mesh subscribers of the config change.
-    CpGrpcServer::broadcast_update_with_registry(ctx.update_tx, &new_config, ctx.dp_registry);
+    CpGrpcServer::broadcast_update_with_registry(&ctx.update_tx, &new_config, &ctx.dp_registry);
     MeshGrpcServer::broadcast_full_with_registry(
-        ctx.mesh_update_tx,
+        &ctx.mesh_update_tx,
         new_config.clone(),
-        ctx.mesh_registry,
+        &ctx.mesh_registry,
     );
-    patch_gateway_api_statuses(
+    // Same clone-elision contract as the no-change branch above; see the
+    // comment over `run_status_patchers` there.
+    run_status_patchers(
         ctx.gateway_status_writer,
+        ctx.istio_status_writer,
         &objects,
-        options.clone(),
-        &translation.route_conflicts,
+        &options,
+        Some(&translation.route_conflicts),
     )
     .await;
-    patch_istio_statuses(ctx.istio_status_writer, &objects, options).await;
 
     let elapsed = start.elapsed();
     ctx.metrics.last_reconcile_duration_ms.store(
@@ -422,16 +474,43 @@ async fn do_reconcile(
     );
 }
 
-async fn patch_gateway_api_statuses(
-    writer: Option<&GatewayApiStatusWriter>,
+/// Dispatch to whichever status patchers are configured, paying the
+/// `objects` / `options` / `route_conflicts` clone cost only for the writers
+/// that actually exist. Callers in `do_reconcile` previously always cloned —
+/// a regression in deployments that don't watch Gateway API or Istio CRDs
+/// (the default), since `K8sObject` carries serde-cloned `spec`/`status`
+/// JSON and the clone is O(snapshot size) per reconcile. Both writers are
+/// taken by value so they can be moved into the helper futures (required
+/// for `tokio::spawn`'s HRTB Send check — see the `Send is not general
+/// enough` history in `spawn_reconcile_loop`).
+async fn run_status_patchers(
+    gateway_writer: Option<GatewayApiStatusWriter>,
+    istio_writer: Option<IstioStatusWriter>,
     objects: &[K8sObject],
-    options: K8sTranslationOptions,
-    route_conflicts: &[crate::config_sources::k8s::GatewayApiRouteConflict],
+    options: &K8sTranslationOptions,
+    route_conflicts: Option<&[crate::config_sources::k8s::GatewayApiRouteConflict]>,
 ) {
-    let Some(writer) = writer else {
-        return;
-    };
-    let mut updates = plan_gateway_api_status_updates(objects, options, route_conflicts);
+    if let Some(writer) = gateway_writer {
+        patch_gateway_api_statuses(
+            writer,
+            objects.to_vec(),
+            options.clone(),
+            route_conflicts.map(<[_]>::to_vec).unwrap_or_default(),
+        )
+        .await;
+    }
+    if let Some(writer) = istio_writer {
+        patch_istio_statuses(writer, objects.to_vec(), options.clone()).await;
+    }
+}
+
+async fn patch_gateway_api_statuses(
+    writer: GatewayApiStatusWriter,
+    objects: Vec<K8sObject>,
+    options: K8sTranslationOptions,
+    route_conflicts: Vec<crate::config_sources::k8s::GatewayApiRouteConflict>,
+) {
+    let mut updates = plan_gateway_api_status_updates(&objects, options, &route_conflicts);
     if updates.is_empty() {
         return;
     }
@@ -443,10 +522,11 @@ async fn patch_gateway_api_statuses(
         );
         updates.truncate(GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP);
     }
-    if let Err(error) = writer.patch_updates(&updates).await {
+    let updates_len = updates.len();
+    if let Err(error) = writer.patch_updates(updates).await {
         warn!(
             error = %error,
-            updates = updates.len(),
+            updates = updates_len,
             "Failed to patch Gateway API status"
         );
     }
@@ -458,21 +538,19 @@ async fn patch_gateway_api_statuses(
 /// plan is empty (no supported Istio CRDs in the snapshot). Failures
 /// are logged and never abort reconcile.
 async fn patch_istio_statuses(
-    writer: Option<&IstioStatusWriter>,
-    objects: &[K8sObject],
+    writer: IstioStatusWriter,
+    objects: Vec<K8sObject>,
     options: K8sTranslationOptions,
 ) {
-    let Some(writer) = writer else {
-        return;
-    };
-    let updates = plan_istio_status_updates(objects, options);
+    let updates = plan_istio_status_updates(&objects, options);
     if updates.is_empty() {
         return;
     }
-    if let Err(error) = writer.patch_updates(&updates).await {
+    let updates_len = updates.len();
+    if let Err(error) = writer.patch_updates(updates).await {
         warn!(
             error = %error,
-            updates = updates.len(),
+            updates = updates_len,
             "Failed to patch Istio status (CRD may not have a status subresource)"
         );
     }
@@ -1196,7 +1274,7 @@ mod tests {
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let ready = wait_for_initial_store_readiness_with_timeout(
-            &store_set,
+            Arc::clone(&store_set),
             &mut change_rx,
             &mut shutdown_rx,
             Duration::from_millis(5),

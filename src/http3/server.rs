@@ -1075,7 +1075,7 @@ async fn handle_h3_request(
         &path,
     );
 
-    let proxy = match route_match {
+    let (proxy, strip_len) = match route_match {
         Some(rm) => {
             // Materialize headers now — path param injection writes to ctx.headers,
             // and all subsequent code (plugins, backend dispatch) needs the HashMap.
@@ -1121,7 +1121,7 @@ async fn handle_h3_request(
                 ctx.headers
                     .insert(format!("x-path-param-{}", name), value.clone());
             }
-            rm.proxy
+            (rm.proxy, rm.matched_prefix_len)
         }
         None => {
             record_request(&state, 404);
@@ -1624,7 +1624,6 @@ async fn handle_h3_request(
             }
         };
 
-    let strip_len = proxy.listen_path.as_deref().map(str::len).unwrap_or(0);
     let backend_url = build_h3_backend_url_for_flavor(
         &proxy,
         http_flavor,
@@ -3022,8 +3021,6 @@ fn build_h3_backend_url_for_flavor(
         );
     }
 
-    // Host-only proxies (listen_path None) have no prefix to strip; use 0.
-    let strip_len = proxy.listen_path.as_deref().map(str::len).unwrap_or(0);
     if let Some(target) = upstream_target {
         crate::proxy::build_backend_url_with_target(
             proxy,
@@ -4436,16 +4433,28 @@ mod h3_backend_url_tests {
     #[test]
     fn websocket_backend_url_uses_wss_scheme_for_https_backends() {
         let proxy = proxy_with_scheme(BackendScheme::Https);
-        let url =
-            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::WebSocket, "/ws", "token=1", 0, None);
+        let url = build_h3_backend_url_for_flavor(
+            &proxy,
+            HttpFlavor::WebSocket,
+            "/ws",
+            "token=1",
+            0,
+            None,
+        );
         assert_eq!(url, "wss://backend.example:8443/ws?token=1");
     }
 
     #[test]
     fn websocket_backend_url_uses_ws_scheme_for_http_backends() {
         let proxy = proxy_with_scheme(BackendScheme::Http);
-        let url =
-            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::WebSocket, "/ws", "token=1", 0, None);
+        let url = build_h3_backend_url_for_flavor(
+            &proxy,
+            HttpFlavor::WebSocket,
+            "/ws",
+            "token=1",
+            0,
+            None,
+        );
         assert_eq!(url, "ws://backend.example:8443/ws?token=1");
     }
 

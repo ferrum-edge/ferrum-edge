@@ -283,16 +283,8 @@ fn unsupported_cloud_suffix(raw_key: &str) -> Option<(&'static str, &'static str
     const KNOWN: [(&str, &str, bool); 4] = [
         ("_AZURE", "Azure Key Vault", cfg!(feature = "secrets-azure")),
         ("_VAULT", "Vault", cfg!(feature = "secrets-vault")),
-        (
-            "_AWS",
-            "AWS Secrets Manager",
-            cfg!(feature = "secrets-aws"),
-        ),
-        (
-            "_GCP",
-            "GCP Secret Manager",
-            cfg!(feature = "secrets-gcp"),
-        ),
+        ("_AWS", "AWS Secrets Manager", cfg!(feature = "secrets-aws")),
+        ("_GCP", "GCP Secret Manager", cfg!(feature = "secrets-gcp")),
     ];
 
     for (suffix, backend_name, enabled) in KNOWN {
@@ -311,10 +303,8 @@ fn unsupported_cloud_suffix_for_base_key(key: &str) -> Option<(&'static str, &'s
             .ok()
             .filter(|s| !s.is_empty())
             .is_some();
-        if is_set {
-            if let Some(unsupported) = unsupported_cloud_suffix(&suffixed_key) {
-                return Some(unsupported);
-            }
+        if is_set && let Some(unsupported) = unsupported_cloud_suffix(&suffixed_key) {
+            return Some(unsupported);
         }
     }
     None
@@ -421,10 +411,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
 pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String> {
     if let Some((suffix, backend_name)) = unsupported_cloud_suffix_for_base_key(key) {
         return Err(format!(
-            "Unsupported secret suffix {} on {}: {} support is not enabled in this build.",
-            suffix,
-            format!("{key}{suffix}"),
-            backend_name
+            "Unsupported secret suffix {suffix} on {key}{suffix}: {backend_name} support is not enabled in this build."
         ));
     }
 

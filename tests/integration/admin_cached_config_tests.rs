@@ -1984,6 +1984,28 @@ async fn test_batch_create_upstreams_persists_service_discovery() {
 
 #[tokio::test]
 async fn test_restore_hashes_consumer_secrets() {
+    // `hash_basic_auth_password` (in `src/config/types.rs`) reads
+    // `FERRUM_BASIC_AUTH_HMAC_SECRET` from the environment via
+    // `resolve_ferrum_var`. The previous single-process libtest run
+    // happened to inherit this from whatever test happened to set it
+    // first; under nextest's process-per-test model (now used by the
+    // sharded `test-integration` job) every test starts with a clean
+    // env, so the restore handler errors with the "must be set" message
+    // and the assertion below trips on the bubbled-up error string.
+    // Set it explicitly here — the value is irrelevant beyond being
+    // ≥32 chars; we only assert that the plaintext password was hashed
+    // out of the credential, not the hash value itself.
+    //
+    // SAFETY: this test owns its own admin server, started below after
+    // the env var is in place, so no other thread is reading the
+    // environment at the moment of mutation.
+    unsafe {
+        std::env::set_var(
+            "FERRUM_BASIC_AUTH_HMAC_SECRET",
+            "ferrum-test-basic-auth-hmac-secret-32chars-or-more-aaaaaaaaaa",
+        );
+    }
+
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
     let (base_url, _shutdown) = start_test_admin(state).await;

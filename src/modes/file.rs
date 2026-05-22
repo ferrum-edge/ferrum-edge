@@ -94,6 +94,16 @@ pub struct ServeOptions {
     /// `serve()` returns, so the test gets a deterministic snapshot
     /// rather than racing the background refresh.
     pub skip_initial_capability_refresh: bool,
+    /// Optional override for the background-task drain cap used by
+    /// [`ServeHandles::join`]. Defaults to [`BACKGROUND_DRAIN_TIMEOUT`]
+    /// (5 s) for production, which mirrors the pre-refactor binary
+    /// behaviour. Tests that need to assert on join-blocking can shrink
+    /// it to keep wall-clock cost low without losing the regression
+    /// signal — e.g.
+    /// `tests/integration/scripted_backend_smoke_tests.rs::serve_blocks_until_shutdown_when_no_listener_handles`
+    /// shrinks it to a few hundred ms and sleeps just past it, instead
+    /// of paying the full 5 s twice.
+    pub background_drain_timeout: Option<Duration>,
 }
 
 /// Handles returned by [`serve`].
@@ -141,6 +151,9 @@ pub struct ServeHandles {
     /// request drain that runs between listener exit and background-task
     /// drain.
     drain_seconds: u64,
+    /// Resolved background-task drain cap — [`ServeOptions::background_drain_timeout`]
+    /// when set, otherwise [`BACKGROUND_DRAIN_TIMEOUT`] (5 s).
+    background_drain_timeout: Duration,
 }
 
 /// Hard cap on background-task drain (DNS refresh, overload monitor,
@@ -238,7 +251,7 @@ impl ServeHandles {
         }
         let mut background_handles = self.background_handles;
         background_handles.extend(self.proxy_state.health_checker.take_active_check_handles());
-        join_background_handles(background_handles, BACKGROUND_DRAIN_TIMEOUT).await;
+        join_background_handles(background_handles, self.background_drain_timeout).await;
         listener_result
     }
 
@@ -1150,6 +1163,9 @@ pub async fn serve(
         background_handles,
         shutdown_tx,
         drain_seconds: env_config.shutdown_drain_seconds,
+        background_drain_timeout: prebound
+            .background_drain_timeout
+            .unwrap_or(BACKGROUND_DRAIN_TIMEOUT),
     };
 
     // Stream proxy listeners (TCP/UDP) — fatal if any binds fail in file mode.

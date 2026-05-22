@@ -425,9 +425,27 @@ impl Plugin for CorsPlugin {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Strip backend-supplied CORS policy headers so the gateway CORS policy
-        // remains authoritative.
-        Self::remove_access_control_headers(response_headers);
+        // When `after_proxy` is being run as part of a plugin *rejection*
+        // (`apply_after_proxy_hooks_to_rejection`), the response headers are
+        // plugin-supplied, not backend-supplied. The strip step exists to
+        // prevent backend-supplied `access-control-*` from leaking through —
+        // running it on a rejection erases this plugin's own preflight reply
+        // (e.g. the `204` headers from `on_request_received`). Skip the strip
+        // on the rejection path so the preflight headers survive, but keep
+        // running the re-inject pass below so the gateway can still attach
+        // CORS headers onto a *different* plugin's rejection (e.g.
+        // `request_termination` 503 → still gets `Allow-Origin` for allowed
+        // origins). See `crate::proxy::apply_after_proxy_hooks_to_rejection`
+        // for the marker.
+        let is_rejection_path = ctx
+            .metadata
+            .get(crate::proxy::REJECTION_RESPONSE_METADATA_KEY)
+            .is_some_and(|v| v == "true");
+        if !is_rejection_path {
+            // Strip backend-supplied CORS policy headers so the gateway CORS
+            // policy remains authoritative.
+            Self::remove_access_control_headers(response_headers);
+        }
 
         // Check if on_request_received marked this as a valid CORS request
         let origin = match ctx.metadata.get("cors_origin") {

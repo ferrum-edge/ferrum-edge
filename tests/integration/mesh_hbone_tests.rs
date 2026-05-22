@@ -356,7 +356,14 @@ async fn hbone_connect_with_body_auth_plugin_is_rejected() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     shutdown_tx.send(true).expect("shutdown gateway");
-    backend_handle.await.expect("backend task");
+    // PR #1052 changed this test from "auth allows tunnel" to "auth rejects
+    // tunnel" → the gateway never dials the backend, so `start_echo_backend`'s
+    // `listener.accept()` hangs forever. The previous `backend_handle.await`
+    // therefore blocked the test indefinitely (the mesh-platform shard hit
+    // the 30-minute GHA job timeout on this exact test). Abort instead —
+    // the rejection path is what's under test; the backend's accept loop
+    // never running is the *expected* state.
+    backend_handle.abort();
     conn_task.abort();
 }
 
