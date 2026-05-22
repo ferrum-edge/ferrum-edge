@@ -2,6 +2,10 @@
 //! Provides env/ferrum.conf defaults and proxy-level overrides.
 
 use super::conf_file::resolve_ferrum_var;
+use super::types::{
+    MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_WINDOW_SIZE, MIN_HTTP2_MAX_FRAME_SIZE,
+    MIN_HTTP2_WINDOW_SIZE,
+};
 
 /// Minimum allowed value for `max_idle_per_host`.
 ///
@@ -151,13 +155,15 @@ impl PoolConfig {
         if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE")
             && let Ok(parsed) = val.parse::<u32>()
         {
-            config.http2_initial_stream_window_size = parsed.clamp(65_535, 128 * 1024 * 1024);
+            config.http2_initial_stream_window_size =
+                parsed.clamp(MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE);
         }
 
         if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE")
             && let Ok(parsed) = val.parse::<u32>()
         {
-            config.http2_initial_connection_window_size = parsed.clamp(65_535, 128 * 1024 * 1024);
+            config.http2_initial_connection_window_size =
+                parsed.clamp(MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE);
         }
 
         if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW") {
@@ -167,7 +173,8 @@ impl PoolConfig {
         if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE")
             && let Ok(parsed) = val.parse::<u32>()
         {
-            config.http2_max_frame_size = parsed.clamp(16_384, 1_048_576);
+            config.http2_max_frame_size =
+                parsed.clamp(MIN_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_MAX_FRAME_SIZE);
         }
 
         if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS")
@@ -225,11 +232,13 @@ impl PoolConfig {
         }
 
         if let Some(val) = proxy.pool_http2_initial_stream_window_size {
-            config.http2_initial_stream_window_size = val.max(65_535);
+            config.http2_initial_stream_window_size =
+                val.clamp(MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE);
         }
 
         if let Some(val) = proxy.pool_http2_initial_connection_window_size {
-            config.http2_initial_connection_window_size = val.max(65_535);
+            config.http2_initial_connection_window_size =
+                val.clamp(MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE);
         }
 
         if let Some(val) = proxy.pool_http2_adaptive_window {
@@ -237,7 +246,8 @@ impl PoolConfig {
         }
 
         if let Some(val) = proxy.pool_http2_max_frame_size {
-            config.http2_max_frame_size = val.clamp(16_384, 1_048_576);
+            config.http2_max_frame_size =
+                val.clamp(MIN_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_MAX_FRAME_SIZE);
         }
 
         if let Some(val) = proxy.pool_http2_max_concurrent_streams {
