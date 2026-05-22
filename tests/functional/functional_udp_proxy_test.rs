@@ -10,6 +10,11 @@
 //! 7. DTLS backend with multiple clients
 //! 8. Frontend DTLS termination (DTLS client → gateway → plain UDP echo server)
 //! 9. Full DTLS: frontend DTLS + backend DTLS (DTLS client → gateway → DTLS echo server)
+//! 5. DTLS backend encryption (plain UDP → gateway → DTLS echo server)
+//! 6. DTLS backend with multiple clients
+//! 7. Frontend DTLS termination (DTLS client → gateway → plain UDP echo server)
+//! 8. Full DTLS: frontend DTLS + backend DTLS (DTLS client → gateway → DTLS echo server)
+//! 9. `FERRUM_UDP_MAX_SESSIONS` rejects new clients once the per-proxy session cap is full
 //!
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_udp_proxy --ignored --nocapture
@@ -283,6 +288,95 @@ plugin_configs: []
     assert_eq!(completed.len(), num_clients, "All clients should complete");
 
     // Cleanup
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_server.abort();
+}
+
+/// Test 2b: UDP max session cap — once one client owns the only configured
+/// session slot, a second client is dropped while the original session still works.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_max_sessions_env_limits_new_clients() {
+    let backend_port = 19826u16;
+    let proxy_port = 19827u16;
+    let gateway_http_port = 18218u16;
+
+    let echo_server = start_udp_echo_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-max-sessions"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_idle_timeout_seconds: 30
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway = start_gateway_with_extra_env(
+        config_path.to_str().unwrap(),
+        gateway_http_port,
+        &[("FERRUM_UDP_MAX_SESSIONS", "1")],
+    )
+    .expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let client1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client1.connect(&proxy_addr).await.unwrap();
+    let client2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client2.connect(&proxy_addr).await.unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let first_msg = b"client-one";
+    client1.send(first_msg).await.expect("client1 send failed");
+    let first_len = tokio::time::timeout(Duration::from_secs(5), client1.recv(&mut buf))
+        .await
+        .expect("client1 initial recv timed out")
+        .expect("client1 initial recv error");
+    assert_eq!(
+        &buf[..first_len],
+        first_msg,
+        "first client should establish the only UDP session"
+    );
+
+    let second_msg = b"client-two";
+    client2.send(second_msg).await.expect("client2 send failed");
+    let mut second_buf = vec![0u8; 1024];
+    let second_recv =
+        tokio::time::timeout(Duration::from_secs(2), client2.recv(&mut second_buf)).await;
+    assert!(
+        second_recv.is_err(),
+        "second client should not receive an echo while FERRUM_UDP_MAX_SESSIONS=1"
+    );
+
+    let followup_msg = b"client-one-still-active";
+    client1
+        .send(followup_msg)
+        .await
+        .expect("client1 followup send failed");
+    let followup_len = tokio::time::timeout(Duration::from_secs(5), client1.recv(&mut buf))
+        .await
+        .expect("client1 followup recv timed out")
+        .expect("client1 followup recv error");
+    assert_eq!(
+        &buf[..followup_len],
+        followup_msg,
+        "existing UDP session should continue after a new client is rejected"
+    );
+
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_server.abort();
