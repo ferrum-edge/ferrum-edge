@@ -546,11 +546,11 @@ fn auto_inject_openapi_validator(
     config.insert("validate_response".to_string(), Value::Bool(true));
     config.insert(
         "request_content_types".to_string(),
-        json!(["application/json"]),
+        json!(OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES),
     );
     config.insert(
         "response_content_types".to_string(),
-        json!(["application/json"]),
+        json!(OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES),
     );
     config.insert("fail_on_unknown_operation".to_string(), Value::Bool(true));
     config.insert(
@@ -977,6 +977,15 @@ fn swagger_media_types(
 
 const MAX_SCHEMA_REF_DEPTH: usize = 32;
 type ExtractedRequestBodySchemas = Option<(bool, Map<String, Value>)>;
+const OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES: &[&str] = &[
+    "application/json",
+    "application/xml",
+    "text/xml",
+    "application/x-www-form-urlencoded",
+    "multipart/form-data",
+    "text/plain",
+    "application/octet-stream",
+];
 
 fn resolve_refs(
     root: &Value,

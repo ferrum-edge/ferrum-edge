@@ -521,7 +521,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions) |
 | `response_mock` | ✓ | ✓ | | | | Returns mock responses for API testing before backends are ready |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
-| `openapi_validator` | ✓ | | | | | Validates JSON bodies against generated OpenAPI operation schemas |
+| `openapi_validator` | ✓ | | | | | Validates bodies against generated OpenAPI operation schemas |
 | `spec_expose` | ✓ | | | | | HTTP-only; requires prefix listen_path |
 | `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |
 | `response_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy response body size limits |

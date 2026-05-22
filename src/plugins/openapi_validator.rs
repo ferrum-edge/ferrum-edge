@@ -1,10 +1,10 @@
 //! OpenAPI contract validation plugin.
 //!
-//! Validates JSON request and response bodies against operation schemas
-//! extracted from an attached OpenAPI document. All regexes and JSON Schema
-//! validators are compiled at plugin construction time; request-time work is
-//! limited to operation matching, optional decompression, JSON parsing, and
-//! schema validation.
+//! Validates request and response bodies against operation schemas extracted
+//! from an attached OpenAPI document. All regexes and JSON Schema validators
+//! are compiled at plugin construction time; request-time work is limited to
+//! operation matching, optional decompression, media-type parsing, and schema
+//! validation.
 
 use ahash::AHashMap;
 use async_trait::async_trait;
@@ -18,6 +18,15 @@ use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
+const DEFAULT_CONTENT_TYPES: &[&str] = &[
+    "application/json",
+    "application/xml",
+    "text/xml",
+    "application/x-www-form-urlencoded",
+    "multipart/form-data",
+    "text/plain",
+    "application/octet-stream",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnforcementMode {
@@ -53,9 +62,14 @@ struct OperationEntry {
     operation_label: String,
     path_regex: Regex,
     literal_segments: u16,
-    request_validators: AHashMap<String, jsonschema::Validator>,
+    request_validators: AHashMap<String, MediaValidator>,
     request_required: bool,
-    response_validators: AHashMap<u16, AHashMap<String, jsonschema::Validator>>,
+    response_validators: AHashMap<u16, AHashMap<String, MediaValidator>>,
+}
+
+struct MediaValidator {
+    schema: Value,
+    validator: jsonschema::Validator,
 }
 
 impl OperationEntry {
@@ -73,7 +87,7 @@ impl OperationEntry {
         &self,
         status: u16,
         content_type: Option<&str>,
-    ) -> Option<&jsonschema::Validator> {
+    ) -> Option<&MediaValidator> {
         self.response_validators
             .get(&status)
             .or_else(|| self.response_validators.get(&0))
@@ -124,12 +138,12 @@ impl OpenapiValidator {
             );
         }
         let request_content_types = optional_string_vec(object, "request_content_types")?
-            .unwrap_or_else(|| vec!["application/json".to_string()])
+            .unwrap_or_else(default_content_types)
             .into_iter()
             .map(|value| normalize_media_type(&value))
             .collect();
         let response_content_types = optional_string_vec(object, "response_content_types")?
-            .unwrap_or_else(|| vec!["application/json".to_string()])
+            .unwrap_or_else(default_content_types)
             .into_iter()
             .map(|value| normalize_media_type(&value))
             .collect();
@@ -367,7 +381,7 @@ impl OpenapiValidator {
         &'a self,
         operation: &'a OperationEntry,
         content_type: Option<&str>,
-    ) -> Option<&'a jsonschema::Validator> {
+    ) -> Option<&'a MediaValidator> {
         if !content_type_in_scope(&self.request_content_types, content_type) {
             return None;
         }
@@ -496,8 +510,14 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "content_type");
             return PluginResult::Continue;
         };
-        let decoded = match decode_body(headers, body, self.max_body_bytes) {
-            Ok(body) => body,
+        let instance = match body_to_schema_instance(
+            headers,
+            body,
+            content_type,
+            &validator.schema,
+            self.max_body_bytes,
+        ) {
+            Ok(value) => value,
             Err(error) => {
                 return self.handle_violation(
                     ctx,
@@ -507,18 +527,7 @@ impl Plugin for OpenapiValidator {
                 );
             }
         };
-        let json: Value = match serde_json::from_slice(decoded.as_ref()) {
-            Ok(value) => value,
-            Err(error) => {
-                return self.handle_violation(
-                    ctx,
-                    ValidationSide::Request,
-                    Some(&operation.operation_label),
-                    format!("Invalid JSON body: {error}"),
-                );
-            }
-        };
-        match validator.validate(&json) {
+        match validator.validator.validate(&instance) {
             Ok(()) => PluginResult::Continue,
             Err(error) => self.handle_violation(
                 ctx,
@@ -601,8 +610,14 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "no_schema");
             return PluginResult::Continue;
         };
-        let decoded = match decode_body(response_headers, body, self.max_body_bytes) {
-            Ok(body) => body,
+        let instance = match body_to_schema_instance(
+            response_headers,
+            body,
+            content_type,
+            &validator.schema,
+            self.max_body_bytes,
+        ) {
+            Ok(value) => value,
             Err(error) => {
                 return self.handle_violation(
                     ctx,
@@ -612,18 +627,7 @@ impl Plugin for OpenapiValidator {
                 );
             }
         };
-        let json: Value = match serde_json::from_slice(decoded.as_ref()) {
-            Ok(value) => value,
-            Err(error) => {
-                return self.handle_violation(
-                    ctx,
-                    ValidationSide::Response,
-                    Some(&operation.operation_label),
-                    format!("Invalid JSON body: {error}"),
-                );
-            }
-        };
-        match validator.validate(&json) {
+        match validator.validator.validate(&instance) {
             Ok(()) => PluginResult::Continue,
             Err(error) => self.handle_violation(
                 ctx,
@@ -688,7 +692,7 @@ fn parse_request_validators(
     value: Option<&Value>,
     operation_index: usize,
     schema_draft: SchemaDraft,
-) -> Result<AHashMap<String, jsonschema::Validator>, String> {
+) -> Result<AHashMap<String, MediaValidator>, String> {
     let Some(value) = value else {
         return Ok(AHashMap::new());
     };
@@ -705,7 +709,7 @@ fn parse_request_validators(
     ) {
         validators.insert(
             normalize_media_type(content_type),
-            compile_schema(schema, schema_draft).map_err(|error| {
+            compile_media_validator(schema, schema_draft).map_err(|error| {
                 format!(
                     "openapi_validator: operations[{operation_index}].request_body schema for {content_type} is invalid: {error}"
                 )
@@ -723,7 +727,7 @@ fn parse_request_validators(
         }
         validators.insert(
             normalize_media_type(content_type),
-            compile_schema(schema, schema_draft).map_err(|error| {
+            compile_media_validator(schema, schema_draft).map_err(|error| {
                 format!(
                     "openapi_validator: operations[{operation_index}].request_body schema for {content_type} is invalid: {error}"
                 )
@@ -737,7 +741,7 @@ fn parse_response_validators(
     value: Option<&Value>,
     operation_index: usize,
     schema_draft: SchemaDraft,
-) -> Result<AHashMap<u16, AHashMap<String, jsonschema::Validator>>, String> {
+) -> Result<AHashMap<u16, AHashMap<String, MediaValidator>>, String> {
     let Some(value) = value else {
         return Ok(AHashMap::new());
     };
@@ -774,7 +778,7 @@ fn parse_response_validators(
             }
             validators.insert(
                 normalize_media_type(content_type),
-                compile_schema(schema, schema_draft).map_err(|error| {
+                compile_media_validator(schema, schema_draft).map_err(|error| {
                     format!(
                         "openapi_validator: operations[{operation_index}].responses['{status_raw}'] schema for {content_type} is invalid: {error}"
                     )
@@ -795,6 +799,17 @@ fn compile_schema(
         SchemaDraft::Draft7 => jsonschema::draft7::options().build(schema),
         SchemaDraft::Draft202012 => jsonschema::draft202012::options().build(schema),
     }
+}
+
+fn compile_media_validator(
+    schema: &Value,
+    schema_draft: SchemaDraft,
+) -> Result<MediaValidator, String> {
+    let validator = compile_schema(schema, schema_draft).map_err(|error| error.to_string())?;
+    Ok(MediaValidator {
+        schema: schema.clone(),
+        validator,
+    })
 }
 
 fn decode_body<'a>(
@@ -850,15 +865,452 @@ fn read_bounded<R: std::io::Read>(
     Ok(decoded)
 }
 
-fn validator_for_content_type<'a>(
-    validators: &'a AHashMap<String, jsonschema::Validator>,
+fn body_to_schema_instance(
+    headers: &HashMap<String, String>,
+    body: &[u8],
     content_type: Option<&str>,
-) -> Option<&'a jsonschema::Validator> {
+    schema: &Value,
+    max_body_bytes: usize,
+) -> Result<Value, String> {
+    let decoded = decode_body(headers, body, max_body_bytes)?;
+    let media_type = content_type_base(content_type)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if is_json_media_type(&media_type) {
+        return serde_json::from_slice(decoded.as_ref())
+            .map_err(|error| format!("Invalid JSON body: {error}"));
+    }
+    if is_xml_media_type(&media_type) {
+        let body = std::str::from_utf8(decoded.as_ref())
+            .map_err(|error| format!("Invalid XML body encoding: {error}"))?;
+        return xml_body_to_value(body, schema);
+    }
+    if media_type == "application/x-www-form-urlencoded" {
+        let body = std::str::from_utf8(decoded.as_ref())
+            .map_err(|error| format!("Invalid form body encoding: {error}"))?;
+        return form_urlencoded_to_value(body, schema);
+    }
+    if media_type == "multipart/form-data" {
+        let boundary = multipart_boundary(content_type.unwrap_or(""))
+            .ok_or_else(|| "Multipart body is missing boundary parameter".to_string())?;
+        return multipart_to_value(decoded.as_ref(), &boundary, schema);
+    }
+    if is_text_media_type(&media_type) {
+        let body = std::str::from_utf8(decoded.as_ref())
+            .map_err(|error| format!("Invalid text body encoding: {error}"))?;
+        return scalar_to_schema_value(body, schema);
+    }
+    Ok(binary_to_schema_value(decoded.as_ref(), schema))
+}
+
+fn xml_body_to_value(body: &str, schema: &Value) -> Result<Value, String> {
+    reject_xml_entities(body)?;
+    let doc =
+        roxmltree::Document::parse(body).map_err(|error| format!("Invalid XML body: {error}"))?;
+    let root = doc.root_element();
+    if let Some(expected_root) = xml_name(schema, None)
+        && root.tag_name().name() != expected_root
+    {
+        return Err(format!(
+            "XML root element '{}' does not match schema xml.name '{}'",
+            root.tag_name().name(),
+            expected_root
+        ));
+    }
+    xml_node_to_value(root, schema)
+}
+
+fn reject_xml_entities(body: &str) -> Result<(), String> {
+    if contains_ascii_case_insensitive(body, "<!doctype")
+        || contains_ascii_case_insensitive(body, "<!entity")
+    {
+        return Err("XML bodies with DOCTYPE or ENTITY declarations are not supported".to_string());
+    }
+    Ok(())
+}
+
+fn xml_node_to_value(node: roxmltree::Node<'_, '_>, schema: &Value) -> Result<Value, String> {
+    let schema = conversion_schema(schema);
+    if schema_type_contains(schema, "array") {
+        let item_schema = schema.get("items").unwrap_or(&Value::Null);
+        let values = node
+            .children()
+            .filter(roxmltree::Node::is_element)
+            .map(|child| xml_node_to_value(child, item_schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Value::Array(values));
+    }
+    if schema_type_contains(schema, "object") || schema.get("properties").is_some() {
+        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+            return Ok(generic_xml_node_to_value(node));
+        };
+        let mut out = serde_json::Map::new();
+        let mut modeled_children = HashSet::new();
+        let mut modeled_attributes = HashSet::new();
+        for (property_name, property_schema) in properties {
+            let property_schema = conversion_schema(property_schema);
+            if xml_attribute(property_schema) {
+                let attr_name = xml_name(property_schema, Some(property_name.as_str()))
+                    .unwrap_or(property_name.as_str());
+                modeled_attributes.insert(attr_name.to_string());
+                if let Some(value) = node.attribute(attr_name) {
+                    out.insert(
+                        property_name.clone(),
+                        scalar_to_schema_value(value, property_schema)?,
+                    );
+                }
+                continue;
+            }
+            if schema_type_contains(property_schema, "array") {
+                let values = xml_array_values(node, property_name, property_schema)?;
+                if !values.is_empty() {
+                    out.insert(property_name.clone(), Value::Array(values));
+                }
+                continue;
+            }
+            let child_name = xml_name(property_schema, Some(property_name.as_str()))
+                .unwrap_or(property_name.as_str());
+            modeled_children.insert(child_name.to_string());
+            if let Some(child) = first_child_element(node, child_name) {
+                out.insert(
+                    property_name.clone(),
+                    xml_node_to_value(child, property_schema)?,
+                );
+            }
+        }
+        if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
+            for attr in node.attributes() {
+                let name = attr.name();
+                if !modeled_attributes.contains(name) && !out.contains_key(name) {
+                    out.insert(name.to_string(), Value::String(attr.value().to_string()));
+                }
+            }
+            for child in node.children().filter(roxmltree::Node::is_element) {
+                let name = child.tag_name().name();
+                if !modeled_children.contains(name) && !out.contains_key(name) {
+                    out.insert(name.to_string(), generic_xml_node_to_value(child));
+                }
+            }
+        }
+        return Ok(Value::Object(out));
+    }
+    let text = node.text().unwrap_or("").trim();
+    scalar_to_schema_value(text, schema)
+}
+
+fn xml_array_values(
+    node: roxmltree::Node<'_, '_>,
+    property_name: &str,
+    property_schema: &Value,
+) -> Result<Vec<Value>, String> {
+    let item_schema = property_schema.get("items").unwrap_or(&Value::Null);
+    let item_schema = conversion_schema(item_schema);
+    let item_name = xml_name(item_schema, None)
+        .or_else(|| xml_name(property_schema, Some(property_name)))
+        .unwrap_or(property_name);
+    let mut values = Vec::new();
+    if xml_wrapped(property_schema) {
+        let wrapper_name = xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
+        for wrapper in child_elements(node, wrapper_name) {
+            for child in child_elements(wrapper, item_name) {
+                values.push(xml_node_to_value(child, item_schema)?);
+            }
+        }
+    } else {
+        for child in child_elements(node, item_name) {
+            values.push(xml_node_to_value(child, item_schema)?);
+        }
+    }
+    Ok(values)
+}
+
+fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Value {
+    let mut out = serde_json::Map::new();
+    for attr in node.attributes() {
+        out.insert(
+            attr.name().to_string(),
+            Value::String(attr.value().to_string()),
+        );
+    }
+    let children: Vec<_> = node
+        .children()
+        .filter(roxmltree::Node::is_element)
+        .collect();
+    if children.is_empty() {
+        return Value::String(node.text().unwrap_or("").trim().to_string());
+    }
+    for child in children {
+        let value = generic_xml_node_to_value(child);
+        let name = child.tag_name().name().to_string();
+        match out.get_mut(&name) {
+            Some(Value::Array(values)) => values.push(value),
+            Some(existing) => {
+                let first = std::mem::take(existing);
+                *existing = Value::Array(vec![first, value]);
+            }
+            None => {
+                out.insert(name, value);
+            }
+        }
+    }
+    if let Some(text) = node.text().map(str::trim)
+        && !text.is_empty()
+    {
+        out.insert("#text".to_string(), Value::String(text.to_string()));
+    }
+    Value::Object(out)
+}
+
+fn form_urlencoded_to_value(body: &str, schema: &Value) -> Result<Value, String> {
+    let mut fields: HashMap<String, Vec<String>> = HashMap::new();
+    for (key, value) in url::form_urlencoded::parse(body.as_bytes()) {
+        fields
+            .entry(key.into_owned())
+            .or_default()
+            .push(value.into_owned());
+    }
+    fields_to_schema_object(fields, schema, "form")
+}
+
+#[derive(Debug)]
+struct MultipartPart {
+    name: String,
+    filename: Option<String>,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+fn multipart_to_value(body: &[u8], boundary: &str, schema: &Value) -> Result<Value, String> {
+    let parts = parse_multipart_parts(body, boundary)?;
+    let mut grouped: HashMap<String, Vec<MultipartPart>> = HashMap::new();
+    for part in parts {
+        grouped.entry(part.name.clone()).or_default().push(part);
+    }
+    multipart_parts_to_schema_object(grouped, schema)
+}
+
+fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPart>, String> {
+    if boundary.is_empty() || boundary.len() > 200 {
+        return Err("Invalid multipart boundary".to_string());
+    }
+    let delimiter = format!("--{boundary}");
+    let mut parts = Vec::new();
+    for raw_segment in split_bytes(body, delimiter.as_bytes()).into_iter().skip(1) {
+        let mut segment = trim_leading_line_break(raw_segment);
+        if segment.starts_with(b"--") {
+            break;
+        }
+        segment = trim_trailing_line_break(segment);
+        if segment.is_empty() {
+            continue;
+        }
+        let Some((header_bytes, part_body)) = split_header_body(segment) else {
+            return Err("Malformed multipart part: missing header/body separator".to_string());
+        };
+        let headers = parse_part_headers(header_bytes)?;
+        let Some(disposition) = headers.get("content-disposition") else {
+            return Err("Malformed multipart part: missing Content-Disposition".to_string());
+        };
+        let params = parse_header_params(disposition);
+        let Some(name) = params.get("name").filter(|value| !value.is_empty()) else {
+            return Err("Malformed multipart part: missing form-data name".to_string());
+        };
+        parts.push(MultipartPart {
+            name: name.clone(),
+            filename: params.get("filename").cloned(),
+            content_type: headers.get("content-type").cloned(),
+            body: part_body.to_vec(),
+        });
+    }
+    Ok(parts)
+}
+
+fn fields_to_schema_object(
+    fields: HashMap<String, Vec<String>>,
+    schema: &Value,
+    label: &'static str,
+) -> Result<Value, String> {
+    let schema = conversion_schema(schema);
+    if !(schema_type_contains(schema, "object") || schema.get("properties").is_some()) {
+        let Some(values) = fields.values().next() else {
+            return Ok(Value::Null);
+        };
+        return values_to_schema_value(values, schema);
+    }
+    let mut out = serde_json::Map::new();
+    let properties = schema.get("properties").and_then(Value::as_object);
+    if let Some(properties) = properties {
+        for (property, property_schema) in properties {
+            if let Some(values) = fields.get(property) {
+                out.insert(
+                    property.clone(),
+                    values_to_schema_value(values, conversion_schema(property_schema))?,
+                );
+            }
+        }
+    }
+    for (key, values) in fields {
+        if !out.contains_key(&key)
+            && (schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
+                || properties.is_none_or(|props| !props.contains_key(&key)))
+        {
+            out.insert(key, values_to_schema_value(&values, &Value::Null)?);
+        }
+    }
+    if out.is_empty() && schema_has_required(schema) {
+        return Err(format!("{label} body did not contain any schema fields"));
+    }
+    Ok(Value::Object(out))
+}
+
+fn multipart_parts_to_schema_object(
+    parts: HashMap<String, Vec<MultipartPart>>,
+    schema: &Value,
+) -> Result<Value, String> {
+    let schema = conversion_schema(schema);
+    if !(schema_type_contains(schema, "object") || schema.get("properties").is_some()) {
+        let Some(values) = parts.values().next() else {
+            return Ok(Value::Null);
+        };
+        let Some(first) = values.first() else {
+            return Ok(Value::Null);
+        };
+        return multipart_part_to_schema_value(first, schema);
+    }
+    let mut out = serde_json::Map::new();
+    let properties = schema.get("properties").and_then(Value::as_object);
+    if let Some(properties) = properties {
+        for (property, property_schema) in properties {
+            if let Some(values) = parts.get(property) {
+                let property_schema = conversion_schema(property_schema);
+                if schema_type_contains(property_schema, "array") {
+                    let item_schema = property_schema.get("items").unwrap_or(&Value::Null);
+                    let array = values
+                        .iter()
+                        .map(|part| multipart_part_to_schema_value(part, item_schema))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    out.insert(property.clone(), Value::Array(array));
+                } else if let Some(first) = values.first() {
+                    out.insert(
+                        property.clone(),
+                        multipart_part_to_schema_value(first, property_schema)?,
+                    );
+                }
+            }
+        }
+    }
+    for (key, values) in parts {
+        if !out.contains_key(&key) {
+            let value = if values.len() == 1 {
+                multipart_part_to_schema_value(&values[0], &Value::Null)?
+            } else {
+                Value::Array(
+                    values
+                        .iter()
+                        .map(|part| multipart_part_to_schema_value(part, &Value::Null))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            };
+            out.insert(key, value);
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+fn multipart_part_to_schema_value(part: &MultipartPart, schema: &Value) -> Result<Value, String> {
+    let schema = conversion_schema(schema);
+    if schema_type_contains(schema, "object") || schema.get("properties").is_some() {
+        let mut out = serde_json::Map::new();
+        if let Some(filename) = &part.filename {
+            out.insert("filename".to_string(), Value::String(filename.clone()));
+        }
+        if let Some(content_type) = &part.content_type {
+            out.insert(
+                "content_type".to_string(),
+                Value::String(content_type.clone()),
+            );
+        }
+        out.insert(
+            "size".to_string(),
+            Value::Number(serde_json::Number::from(part.body.len() as u64)),
+        );
+        if let Ok(text) = std::str::from_utf8(&part.body) {
+            out.insert("content".to_string(), Value::String(text.to_string()));
+        }
+        return Ok(Value::Object(out));
+    }
+    if schema_format(schema) == Some("binary") || part.filename.is_some() {
+        return Ok(binary_to_schema_value(&part.body, schema));
+    }
+    let text = std::str::from_utf8(&part.body)
+        .map_err(|error| format!("Multipart field '{}' is not UTF-8: {error}", part.name))?;
+    scalar_to_schema_value(text, schema)
+}
+
+fn values_to_schema_value(values: &[String], schema: &Value) -> Result<Value, String> {
+    if schema_type_contains(schema, "array") {
+        let item_schema = schema.get("items").unwrap_or(&Value::Null);
+        return values
+            .iter()
+            .map(|value| scalar_to_schema_value(value, item_schema))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array);
+    }
+    if values.len() > 1 {
+        return Ok(Value::Array(
+            values
+                .iter()
+                .map(|value| scalar_to_schema_value(value, &Value::Null))
+                .collect::<Result<Vec<_>, _>>()?,
+        ));
+    }
+    let value = values.first().map(String::as_str).unwrap_or("");
+    scalar_to_schema_value(value, schema)
+}
+
+fn scalar_to_schema_value(value: &str, schema: &Value) -> Result<Value, String> {
+    let schema = conversion_schema(schema);
+    if schema_type_contains(schema, "integer") {
+        let value = value
+            .parse::<i64>()
+            .map_err(|error| format!("Invalid integer value '{value}': {error}"))?;
+        return Ok(Value::Number(serde_json::Number::from(value)));
+    }
+    if schema_type_contains(schema, "number") {
+        let value = value
+            .parse::<f64>()
+            .map_err(|error| format!("Invalid number value '{value}': {error}"))?;
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| format!("Invalid finite number value '{value}'"))?;
+        return Ok(Value::Number(number));
+    }
+    if schema_type_contains(schema, "boolean") {
+        return match value {
+            "true" | "1" => Ok(Value::Bool(true)),
+            "false" | "0" => Ok(Value::Bool(false)),
+            _ => Err(format!("Invalid boolean value '{value}'")),
+        };
+    }
+    Ok(Value::String(value.to_string()))
+}
+
+fn binary_to_schema_value(body: &[u8], _schema: &Value) -> Value {
+    match std::str::from_utf8(body) {
+        Ok(value) => Value::String(value.to_string()),
+        Err(_) => Value::String("x".repeat(body.len())),
+    }
+}
+
+fn validator_for_content_type<'a>(
+    validators: &'a AHashMap<String, MediaValidator>,
+    content_type: Option<&str>,
+) -> Option<&'a MediaValidator> {
     let base = content_type_base(content_type)?;
     validators
         .iter()
         .find(|(expected, _)| expected.eq_ignore_ascii_case(base))
         .map(|(_, validator)| validator)
+        .or_else(|| fallback_validator_for_media_type(validators, base))
 }
 
 fn content_type_in_scope(configured: &[String], content_type: Option<&str>) -> bool {
@@ -868,7 +1320,7 @@ fn content_type_in_scope(configured: &[String], content_type: Option<&str>) -> b
     configured.is_empty()
         || configured
             .iter()
-            .any(|expected| expected.eq_ignore_ascii_case(base))
+            .any(|expected| media_type_matches(expected, base))
 }
 
 fn content_type_base(content_type: Option<&str>) -> Option<&str> {
@@ -883,6 +1335,244 @@ fn normalize_media_type(value: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase()
+}
+
+fn default_content_types() -> Vec<String> {
+    DEFAULT_CONTENT_TYPES
+        .iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn fallback_validator_for_media_type<'a>(
+    validators: &'a AHashMap<String, MediaValidator>,
+    actual: &str,
+) -> Option<&'a MediaValidator> {
+    if is_json_media_type(actual) {
+        return validators.get("application/json");
+    }
+    if is_xml_media_type(actual) {
+        return validators
+            .get("application/xml")
+            .or_else(|| validators.get("text/xml"));
+    }
+    if actual == "application/x-www-form-urlencoded" {
+        return validators.get("application/x-www-form-urlencoded");
+    }
+    if actual == "multipart/form-data" {
+        return validators.get("multipart/form-data");
+    }
+    if is_text_media_type(actual) {
+        return validators.get("text/plain");
+    }
+    validators.get("application/octet-stream")
+}
+
+fn media_type_matches(expected: &str, actual: &str) -> bool {
+    expected.eq_ignore_ascii_case(actual)
+        || (expected == "application/json" && is_json_media_type(actual))
+        || ((expected == "application/xml" || expected == "text/xml") && is_xml_media_type(actual))
+        || (expected == "text/plain" && is_text_media_type(actual))
+        || (expected == "application/octet-stream" && is_binary_media_type(actual))
+}
+
+fn is_json_media_type(media_type: &str) -> bool {
+    media_type == "application/json" || media_type.ends_with("+json")
+}
+
+fn is_xml_media_type(media_type: &str) -> bool {
+    media_type == "application/xml" || media_type == "text/xml" || media_type.ends_with("+xml")
+}
+
+fn is_text_media_type(media_type: &str) -> bool {
+    media_type == "text/plain" || media_type.starts_with("text/")
+}
+
+fn is_binary_media_type(media_type: &str) -> bool {
+    media_type == "application/octet-stream"
+        || media_type.starts_with("image/")
+        || media_type.starts_with("audio/")
+        || media_type.starts_with("video/")
+        || (media_type.starts_with("application/")
+            && !is_json_media_type(media_type)
+            && !is_xml_media_type(media_type)
+            && media_type != "application/x-www-form-urlencoded")
+}
+
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    parse_header_params(content_type).remove("boundary")
+}
+
+fn parse_header_params(value: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    for piece in value.split(';').skip(1) {
+        let Some((key, value)) = piece.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        params.insert(key, unquote_header_value(value.trim()));
+    }
+    params
+}
+
+fn unquote_header_value(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        value[1..value.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    } else {
+        value.to_string()
+    }
+}
+
+fn parse_part_headers(header_bytes: &[u8]) -> Result<HashMap<String, String>, String> {
+    let headers = std::str::from_utf8(header_bytes)
+        .map_err(|error| format!("Multipart headers are not UTF-8: {error}"))?;
+    let mut out = HashMap::new();
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        out.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+    Ok(out)
+}
+
+fn split_header_body(segment: &[u8]) -> Option<(&[u8], &[u8])> {
+    if let Some(index) = find_subsequence(segment, b"\r\n\r\n") {
+        return Some((&segment[..index], &segment[index + 4..]));
+    }
+    find_subsequence(segment, b"\n\n").map(|index| (&segment[..index], &segment[index + 2..]))
+}
+
+fn split_bytes<'a>(body: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while let Some(offset) = find_subsequence(&body[start..], delimiter) {
+        let index = start + offset;
+        out.push(&body[start..index]);
+        start = index + delimiter.len();
+    }
+    out.push(&body[start..]);
+    out
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn trim_leading_line_break(mut value: &[u8]) -> &[u8] {
+    if value.starts_with(b"\r\n") {
+        value = &value[2..];
+    } else if value.starts_with(b"\n") {
+        value = &value[1..];
+    }
+    value
+}
+
+fn trim_trailing_line_break(mut value: &[u8]) -> &[u8] {
+    if value.ends_with(b"\r\n") {
+        value = &value[..value.len() - 2];
+    } else if value.ends_with(b"\n") {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn conversion_schema(schema: &Value) -> &Value {
+    if schema.get("type").is_some()
+        || schema.get("properties").is_some()
+        || schema.get("items").is_some()
+    {
+        return schema;
+    }
+    for key in ["allOf", "oneOf", "anyOf"] {
+        if let Some(values) = schema.get(key).and_then(Value::as_array)
+            && let Some(candidate) = values
+                .iter()
+                .find(|candidate| !schema_type_contains(candidate, "null"))
+        {
+            return candidate;
+        }
+    }
+    schema
+}
+
+fn schema_type_contains(schema: &Value, expected: &str) -> bool {
+    match schema.get("type") {
+        Some(Value::String(value)) => value == expected,
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
+        _ => false,
+    }
+}
+
+fn schema_format(schema: &Value) -> Option<&str> {
+    schema.get("format").and_then(Value::as_str)
+}
+
+fn schema_has_required(schema: &Value) -> bool {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(Value::is_string))
+}
+
+fn xml_name<'a>(schema: &'a Value, default: Option<&'a str>) -> Option<&'a str> {
+    schema
+        .get("xml")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or(default)
+}
+
+fn xml_attribute(schema: &Value) -> bool {
+    schema
+        .get("xml")
+        .and_then(|value| value.get("attribute"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn xml_wrapped(schema: &Value) -> bool {
+    schema
+        .get("xml")
+        .and_then(|value| value.get("wrapped"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn first_child_element<'a>(
+    node: roxmltree::Node<'a, 'a>,
+    local_name: &str,
+) -> Option<roxmltree::Node<'a, 'a>> {
+    node.children()
+        .find(|child| child.is_element() && child.tag_name().name() == local_name)
+}
+
+fn child_elements<'a>(
+    node: roxmltree::Node<'a, 'a>,
+    local_name: &str,
+) -> Vec<roxmltree::Node<'a, 'a>> {
+    node.children()
+        .filter(move |child| child.is_element() && child.tag_name().name() == local_name)
+        .collect()
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {

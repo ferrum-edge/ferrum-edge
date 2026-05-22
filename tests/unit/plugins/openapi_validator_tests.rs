@@ -53,6 +53,10 @@ fn json_headers() -> HashMap<String, String> {
     HashMap::from([("content-type".to_string(), "application/json".to_string())])
 }
 
+fn content_type_headers(content_type: &str) -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), content_type.to_string())])
+}
+
 fn post_ctx(path: &str) -> RequestContext {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), path.into());
     ctx.headers = json_headers();
@@ -250,4 +254,248 @@ async fn response_validation_uses_default_and_strict_missing_schema() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn xml_request_validation_honors_xml_metadata() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/orders",
+            "path_regex": "^/orders$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "order"},
+                        "required": ["id", "quantity"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "id": {"type": "string", "xml": {"attribute": true}},
+                            "quantity": {"type": "integer", "xml": {"name": "qty"}}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/orders");
+    ctx.headers = content_type_headers("application/xml");
+    let headers = ctx.headers.clone();
+
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<order id="A-1"><qty>3</qty></order>"#,
+            )
+            .await,
+    );
+
+    let mut ctx = post_ctx("/orders");
+    ctx.headers = content_type_headers("application/xml");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("application/xml"),
+                br#"<order><qty>bad</qty></order>"#,
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/orders");
+    ctx.headers = content_type_headers("application/xml");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("application/xml"),
+                br#"<order id="A-1" extra="nope"><qty>3</qty></order>"#,
+            )
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn urlencoded_request_validation_converts_fields_to_schema_types() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/login",
+            "path_regex": "^/login$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {
+                        "type": "object",
+                        "required": ["username", "remember"],
+                        "properties": {
+                            "username": {"type": "string", "minLength": 3},
+                            "remember": {"type": "boolean"}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/login");
+    ctx.headers = content_type_headers("application/x-www-form-urlencoded");
+
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("application/x-www-form-urlencoded"),
+                b"username=alice&remember=true",
+            )
+            .await,
+    );
+
+    let mut ctx = post_ctx("/login");
+    ctx.headers = content_type_headers("application/x-www-form-urlencoded");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("application/x-www-form-urlencoded"),
+                b"username=al&remember=maybe",
+            )
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn multipart_request_validation_checks_fields_and_file_metadata() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["title", "file"],
+                        "properties": {
+                            "title": {"type": "string"},
+                            "file": {
+                                "type": "object",
+                                "required": ["filename", "content_type", "size"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": "a.txt"},
+                                    "content_type": {"type": "string", "const": "text/plain"},
+                                    "size": {"type": "integer", "minimum": 5}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n\r\n",
+        "Upload\r\n",
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n",
+        "Content-Type: text/plain\r\n\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = content_type_headers("multipart/form-data; boundary=abc");
+
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("multipart/form-data; boundary=abc"),
+                body.as_bytes(),
+            )
+            .await,
+    );
+
+    let bad_body = body.replace("filename=\"a.txt\"", "filename=\"b.txt\"");
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = content_type_headers("multipart/form-data; boundary=abc");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("multipart/form-data; boundary=abc"),
+                bad_body.as_bytes(),
+            )
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn text_and_binary_response_validation_use_matching_schema_rules() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/download",
+            "path_regex": "^/download$",
+            "responses": {
+                "200": {
+                    "text/plain": {"type": "string", "pattern": "^ok:"},
+                    "application/octet-stream": {"type": "string", "format": "binary", "minLength": 3, "maxLength": 3},
+                    "application/pdf": {"type": "string", "format": "binary", "minLength": 4, "maxLength": 4}
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/download");
+
+    assert_continue(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("text/plain"),
+                b"ok: ready",
+            )
+            .await,
+    );
+    let mut ctx = post_ctx("/download");
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &content_type_headers("text/plain"), b"bad")
+            .await,
+        Some(502),
+    );
+    let mut ctx = post_ctx("/download");
+    assert_continue(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("application/octet-stream"),
+                &[0, 159, 255],
+            )
+            .await,
+    );
+    let mut ctx = post_ctx("/download");
+    assert_continue(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("application/pdf"),
+                &[0, 159, 255, 42],
+            )
+            .await,
+    );
 }

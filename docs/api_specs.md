@@ -117,17 +117,31 @@ An array of `PluginConfig` objects. Fields follow the same schema as `POST /plug
 
 ### `x-ferrum-validate` (optional)
 
-Set `x-ferrum-validate: true` to generate a proxy-scoped `openapi_validator` plugin from the spec's operation schemas. The generated plugin config embeds the resolved request and response JSON Schemas; the gateway runtime never reads the `api_specs` row on the request path.
+Set `x-ferrum-validate: true` to generate a proxy-scoped `openapi_validator` plugin from the spec's operation schemas. The generated plugin config embeds the resolved request and response schemas plus their media types; the gateway runtime never reads the `api_specs` row on the request path.
 
 ```yaml
 x-ferrum-validate:
   mode: block
   request:
     enabled: true
-    content_types: [application/json]
+    content_types:
+      - application/json
+      - application/xml
+      - text/xml
+      - application/x-www-form-urlencoded
+      - multipart/form-data
+      - text/plain
+      - application/octet-stream
   response:
     enabled: true
-    content_types: [application/json]
+    content_types:
+      - application/json
+      - application/xml
+      - text/xml
+      - application/x-www-form-urlencoded
+      - multipart/form-data
+      - text/plain
+      - application/octet-stream
   fail_on_unknown_operation: true
   fail_on_missing_response_schema: false
   max_body_bytes: 1048576
@@ -153,6 +167,8 @@ The importer walks `paths.{path}.{method}`, resolves local `$ref`s, and extracts
 - Swagger 2.0 response schemas from `responses.{status}.schema`, using `consumes`/`produces` media types.
 
 External `$ref`s are rejected with HTTP 422 `UnsupportedExternalRef`, and deeply recursive refs are rejected with HTTP 422 `SchemaTooDeep`. Swagger 2.0 and OpenAPI 3.0 schemas are normalized for Draft 7 compatibility; OpenAPI 3.1+ schemas use Draft 2020-12.
+
+Runtime validation supports JSON and `+json`, XML and `+xml` with OpenAPI `xml` metadata, `application/x-www-form-urlencoded`, `multipart/form-data` fields and file metadata, `text/*`, and binary payloads such as `application/octet-stream`, other non-JSON/XML `application/*`, `image/*`, `audio/*`, and `video/*`.
 
 If `x-ferrum-plugins` already includes an `openapi_validator`, the importer merges it with the generated config: operator scalar fields win, `bypass.paths` / `bypass.methods` / `bypass.consumers` are unioned, `bypass.header_present` maps are merged, and `operations` is always regenerated from the spec.
 
