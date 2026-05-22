@@ -820,9 +820,11 @@ async fn handle_h3_request(
         }
     }
 
-    // Validate query parameter count
+    // Validate query parameter count (skip empty segments from consecutive '&').
+    // Keep this in sync with the H1/H2 proxy path so `?a=1&&b=2` counts as
+    // two parameters across all frontend protocols.
     if state.max_query_params > 0 && !query_string.is_empty() {
-        let param_count = query_string.split('&').count();
+        let param_count = query_string.split('&').filter(|s| !s.is_empty()).count();
         if param_count > state.max_query_params {
             record_request(&state, 400);
             let body = format!(
