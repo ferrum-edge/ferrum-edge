@@ -155,10 +155,10 @@ The generated plugin config has this shape:
 - JSON and `+json` bodies are parsed as JSON.
 - XML and `+xml` bodies are parsed into schema-shaped objects. OpenAPI `xml.name`, `xml.attribute`, and wrapped array metadata are honored when mapping elements and attributes.
 - `application/x-www-form-urlencoded` bodies are parsed into object fields and repeated fields become arrays when the schema property is an array.
-- `multipart/form-data` bodies are parsed into fields. File parts can validate as binary strings or as metadata objects with `filename`, `content_type`, `size`, and UTF-8 `content`.
-- `text/*` bodies validate as UTF-8 strings; binary bodies validate as strings so `minLength`/`maxLength` enforce payload size, and `pattern` applies when bytes are valid UTF-8.
+- `multipart/form-data` bodies are parsed into fields. File parts can validate as UTF-8 binary strings or as metadata objects with `filename`, `content_type`, `size`, and UTF-8 `content`; use the metadata-object shape for arbitrary non-UTF-8 file bytes.
+- `text/*` bodies validate as UTF-8 strings. UTF-8 binary bodies validate as strings, so `pattern` and `enum` can apply. Non-UTF-8 binary bodies enforce `minLength` and `maxLength` directly against byte length and skip string-only JSON Schema keywords.
 - gzip and brotli bodies are decompressed before validation and still respect `max_body_bytes`.
-- Response status lookup uses the exact status first, then the OpenAPI `default` response if present.
+- Response status lookup uses the exact status first, then OpenAPI wildcard ranges such as `4XX`, then the OpenAPI `default` response if present.
 - Path templates are generated as full-match regexes. Path parameter constraints are not interpreted; `{id}` becomes `[^/]+`.
 
 ## Metadata

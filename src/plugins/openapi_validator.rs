@@ -13,20 +13,14 @@ use regex::{Regex, RegexSet};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
 
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
-const DEFAULT_CONTENT_TYPES: &[&str] = &[
-    "application/json",
-    "application/xml",
-    "text/xml",
-    "application/x-www-form-urlencoded",
-    "multipart/form-data",
-    "text/plain",
-    "application/octet-stream",
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnforcementMode {
@@ -60,16 +54,39 @@ enum ValidationSide {
 
 struct OperationEntry {
     operation_label: String,
-    path_regex: Regex,
     literal_segments: u16,
     request_validators: AHashMap<String, MediaValidator>,
     request_required: bool,
-    response_validators: AHashMap<u16, AHashMap<String, MediaValidator>>,
+    response_validators: ResponseValidators,
+}
+
+struct OperationBucket {
+    path_regexes: RegexSet,
+    entries: Vec<OperationEntry>,
 }
 
 struct MediaValidator {
-    schema: Value,
+    schema: Arc<Value>,
     validator: jsonschema::Validator,
+}
+
+#[derive(Default)]
+struct ResponseValidators {
+    exact: AHashMap<u16, AHashMap<String, MediaValidator>>,
+    ranges: Vec<ResponseRangeValidators>,
+    default: Option<AHashMap<String, MediaValidator>>,
+}
+
+struct ResponseRangeValidators {
+    start: u16,
+    end: u16,
+    validators: AHashMap<String, MediaValidator>,
+}
+
+struct ParsedOperation {
+    method: String,
+    path_regex: String,
+    entry: OperationEntry,
 }
 
 impl OperationEntry {
@@ -78,9 +95,7 @@ impl OperationEntry {
     }
 
     fn has_response_schema(&self) -> bool {
-        self.response_validators
-            .values()
-            .any(|validators| !validators.is_empty())
+        !self.response_validators.is_empty()
     }
 
     fn response_validator(
@@ -88,10 +103,35 @@ impl OperationEntry {
         status: u16,
         content_type: Option<&str>,
     ) -> Option<&MediaValidator> {
-        self.response_validators
+        self.response_validators.validator(status, content_type)
+    }
+}
+
+impl ResponseValidators {
+    fn is_empty(&self) -> bool {
+        self.exact.values().all(|validators| validators.is_empty())
+            && self.ranges.iter().all(|range| range.validators.is_empty())
+            && self
+                .default
+                .as_ref()
+                .is_none_or(|validators| validators.is_empty())
+    }
+
+    fn validator(&self, status: u16, content_type: Option<&str>) -> Option<&MediaValidator> {
+        self.exact
             .get(&status)
-            .or_else(|| self.response_validators.get(&0))
             .and_then(|validators| validator_for_content_type(validators, content_type))
+            .or_else(|| {
+                self.ranges
+                    .iter()
+                    .find(|range| (range.start..=range.end).contains(&status))
+                    .and_then(|range| validator_for_content_type(&range.validators, content_type))
+            })
+            .or_else(|| {
+                self.default
+                    .as_ref()
+                    .and_then(|validators| validator_for_content_type(validators, content_type))
+            })
     }
 }
 
@@ -104,7 +144,7 @@ pub struct OpenapiValidator {
     max_body_bytes: usize,
     request_content_types: Vec<String>,
     response_content_types: Vec<String>,
-    ops_by_method: AHashMap<String, Vec<OperationEntry>>,
+    ops_by_method: AHashMap<String, OperationBucket>,
     has_any_request_schema: bool,
     has_any_response_schema: bool,
     bypass_paths: Option<RegexSet>,
@@ -164,27 +204,38 @@ impl OpenapiValidator {
             return Err("openapi_validator: 'operations' must not be empty".to_string());
         }
 
-        let mut ops_by_method: AHashMap<String, Vec<OperationEntry>> = AHashMap::new();
+        let mut grouped_ops: AHashMap<String, Vec<(String, OperationEntry)>> = AHashMap::new();
         let mut has_any_request_schema = false;
         let mut has_any_response_schema = false;
         for (index, operation) in operations.iter().enumerate() {
-            let entry = parse_operation(operation, index, schema_draft)?;
-            has_any_request_schema |= entry.has_request_schema();
-            has_any_response_schema |= entry.has_response_schema();
-            let method = operation
-                .get("method")
-                .and_then(Value::as_str)
-                .map(str::to_ascii_uppercase)
-                .unwrap_or_default();
-            ops_by_method.entry(method).or_default().push(entry);
+            let parsed = parse_operation(operation, index, schema_draft)?;
+            has_any_request_schema |= parsed.entry.has_request_schema();
+            has_any_response_schema |= parsed.entry.has_response_schema();
+            grouped_ops
+                .entry(parsed.method)
+                .or_default()
+                .push((parsed.path_regex, parsed.entry));
         }
-        for bucket in ops_by_method.values_mut() {
-            bucket.sort_by(|left, right| {
+        let mut ops_by_method: AHashMap<String, OperationBucket> = AHashMap::new();
+        for (method, mut entries) in grouped_ops {
+            entries.sort_by(|(_, left), (_, right)| {
                 right
                     .literal_segments
                     .cmp(&left.literal_segments)
                     .then_with(|| right.operation_label.len().cmp(&left.operation_label.len()))
             });
+            let patterns = entries.iter().map(|(pattern, _)| pattern.as_str());
+            let path_regexes = RegexSet::new(patterns).map_err(|error| {
+                format!("openapi_validator: failed to compile path regex set for {method}: {error}")
+            })?;
+            let entries = entries.into_iter().map(|(_, entry)| entry).collect();
+            ops_by_method.insert(
+                method,
+                OperationBucket {
+                    path_regexes,
+                    entries,
+                },
+            );
         }
         if !has_any_request_schema && !has_any_response_schema && !fail_on_unknown_operation {
             return Err(
@@ -247,13 +298,18 @@ impl OpenapiValidator {
     }
 
     fn match_operation(&self, method: &str, path: &str) -> Option<&OperationEntry> {
-        if let Some(bucket) = self.ops_by_method.get(method) {
-            return bucket.iter().find(|op| op.path_regex.is_match(path));
-        }
-        let upper = method.to_ascii_uppercase();
-        self.ops_by_method
-            .get(upper.as_str())
-            .and_then(|bucket| bucket.iter().find(|op| op.path_regex.is_match(path)))
+        let bucket = self.ops_by_method.get(method).or_else(|| {
+            self.ops_by_method
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(method))
+                .map(|(_, bucket)| bucket)
+        })?;
+        bucket
+            .path_regexes
+            .matches(path)
+            .into_iter()
+            .next()
+            .and_then(|index| bucket.entries.get(index))
     }
 
     fn bypass_reason(&self, ctx: &RequestContext) -> Option<&'static str> {
@@ -266,7 +322,8 @@ impl OpenapiValidator {
         }
         if self
             .bypass_methods
-            .contains(&ctx.method.to_ascii_uppercase())
+            .iter()
+            .any(|method| method.eq_ignore_ascii_case(&ctx.method))
         {
             return Some("bypass_method");
         }
@@ -510,30 +567,13 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "content_type");
             return PluginResult::Continue;
         };
-        let instance = match body_to_schema_instance(
-            headers,
-            body,
-            content_type,
-            &validator.schema,
-            self.max_body_bytes,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                return self.handle_violation(
-                    ctx,
-                    ValidationSide::Request,
-                    Some(&operation.operation_label),
-                    error,
-                );
-            }
-        };
-        match validator.validator.validate(&instance) {
+        match validate_media_body(headers, body, content_type, validator, self.max_body_bytes) {
             Ok(()) => PluginResult::Continue,
             Err(error) => self.handle_violation(
                 ctx,
                 ValidationSide::Request,
                 Some(&operation.operation_label),
-                format_schema_error(&error),
+                error,
             ),
         }
     }
@@ -610,30 +650,19 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "no_schema");
             return PluginResult::Continue;
         };
-        let instance = match body_to_schema_instance(
+        match validate_media_body(
             response_headers,
             body,
             content_type,
-            &validator.schema,
+            validator,
             self.max_body_bytes,
         ) {
-            Ok(value) => value,
-            Err(error) => {
-                return self.handle_violation(
-                    ctx,
-                    ValidationSide::Response,
-                    Some(&operation.operation_label),
-                    error,
-                );
-            }
-        };
-        match validator.validator.validate(&instance) {
             Ok(()) => PluginResult::Continue,
             Err(error) => self.handle_violation(
                 ctx,
                 ValidationSide::Response,
                 Some(&operation.operation_label),
-                format_schema_error(&error),
+                error,
             ),
         }
     }
@@ -643,7 +672,7 @@ fn parse_operation(
     value: &Value,
     index: usize,
     schema_draft: SchemaDraft,
-) -> Result<OperationEntry, String> {
+) -> Result<ParsedOperation, String> {
     let object = value
         .as_object()
         .ok_or_else(|| format!("openapi_validator: operations[{index}] must be an object"))?;
@@ -660,31 +689,31 @@ fn parse_operation(
         .to_string();
     let path_regex_raw = optional_string(object, "path_regex")?
         .ok_or_else(|| format!("openapi_validator: operations[{index}].path_regex is required"))?;
-    let path_regex = Regex::new(path_regex_raw).map_err(|error| {
+    Regex::new(path_regex_raw).map_err(|error| {
         format!("openapi_validator: operations[{index}].path_regex is invalid: {error}")
     })?;
     let operation_label = optional_string(object, "operation_label")?
         .map(str::to_string)
         .unwrap_or_else(|| format!("{method} {path_template}"));
-    let request_required = optional_bool_from_object(Some(object), "request_required")?
-        .or_else(|| {
-            optional_bool_from_object(Some(object), "request_body_required")
-                .ok()
-                .flatten()
-        })
-        .unwrap_or(false);
+    let request_required = match optional_bool_from_object(Some(object), "request_required")? {
+        Some(value) => value,
+        None => optional_bool_from_object(Some(object), "request_body_required")?.unwrap_or(false),
+    };
     let request_validators =
         parse_request_validators(object.get("request_body"), index, schema_draft)?;
     let response_validators =
         parse_response_validators(object.get("responses"), index, schema_draft)?;
 
-    Ok(OperationEntry {
-        operation_label,
-        path_regex,
-        literal_segments: literal_segment_count(&path_template),
-        request_validators,
-        request_required,
-        response_validators,
+    Ok(ParsedOperation {
+        method,
+        path_regex: path_regex_raw.to_string(),
+        entry: OperationEntry {
+            operation_label,
+            literal_segments: literal_segment_count(&path_template),
+            request_validators,
+            request_required,
+            response_validators,
+        },
     })
 }
 
@@ -741,27 +770,19 @@ fn parse_response_validators(
     value: Option<&Value>,
     operation_index: usize,
     schema_draft: SchemaDraft,
-) -> Result<AHashMap<u16, AHashMap<String, MediaValidator>>, String> {
+) -> Result<ResponseValidators, String> {
     let Some(value) = value else {
-        return Ok(AHashMap::new());
+        return Ok(ResponseValidators::default());
     };
     if value.is_null() {
-        return Ok(AHashMap::new());
+        return Ok(ResponseValidators::default());
     }
     let object = value.as_object().ok_or_else(|| {
         format!("openapi_validator: operations[{operation_index}].responses must be an object")
     })?;
-    let mut statuses = AHashMap::new();
+    let mut statuses = ResponseValidators::default();
     for (status_raw, response_value) in object {
-        let status = if status_raw.eq_ignore_ascii_case("default") {
-            0
-        } else {
-            status_raw.parse::<u16>().map_err(|_| {
-                format!(
-                    "openapi_validator: operations[{operation_index}].responses contains invalid status '{status_raw}'"
-                )
-            })?
-        };
+        let status = parse_response_status_key(status_raw, operation_index)?;
         let response_object = response_value.as_object().ok_or_else(|| {
             format!(
                 "openapi_validator: operations[{operation_index}].responses['{status_raw}'] must be an object"
@@ -785,9 +806,56 @@ fn parse_response_validators(
                 })?,
             );
         }
-        statuses.insert(status, validators);
+        match status {
+            ResponseStatusKey::Exact(status) => {
+                statuses.exact.insert(status, validators);
+            }
+            ResponseStatusKey::Range(start, end) => {
+                statuses.ranges.push(ResponseRangeValidators {
+                    start,
+                    end,
+                    validators,
+                });
+            }
+            ResponseStatusKey::Default => {
+                statuses.default = Some(validators);
+            }
+        }
     }
     Ok(statuses)
+}
+
+enum ResponseStatusKey {
+    Exact(u16),
+    Range(u16, u16),
+    Default,
+}
+
+fn parse_response_status_key(
+    status_raw: &str,
+    operation_index: usize,
+) -> Result<ResponseStatusKey, String> {
+    if status_raw.eq_ignore_ascii_case("default") {
+        return Ok(ResponseStatusKey::Default);
+    }
+    let bytes = status_raw.as_bytes();
+    if bytes.len() == 3
+        && matches!(bytes[0], b'1'..=b'5')
+        && bytes[1].eq_ignore_ascii_case(&b'X')
+        && bytes[2].eq_ignore_ascii_case(&b'X')
+    {
+        let class = u16::from(bytes[0] - b'0');
+        let start = class * 100;
+        return Ok(ResponseStatusKey::Range(start, start + 99));
+    }
+    status_raw
+        .parse::<u16>()
+        .map(ResponseStatusKey::Exact)
+        .map_err(|_| {
+            format!(
+                "openapi_validator: operations[{operation_index}].responses contains invalid status '{status_raw}'"
+            )
+        })
 }
 
 fn compile_schema(
@@ -807,7 +875,7 @@ fn compile_media_validator(
 ) -> Result<MediaValidator, String> {
     let validator = compile_schema(schema, schema_draft).map_err(|error| error.to_string())?;
     Ok(MediaValidator {
-        schema: schema.clone(),
+        schema: Arc::new(schema.clone()),
         validator,
     })
 }
@@ -865,46 +933,73 @@ fn read_bounded<R: std::io::Read>(
     Ok(decoded)
 }
 
+enum SchemaInstance {
+    Value(Value),
+    BinaryLengthOnly,
+}
+
+fn validate_media_body(
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    content_type: Option<&str>,
+    validator: &MediaValidator,
+    max_body_bytes: usize,
+) -> Result<(), String> {
+    match body_to_schema_instance(
+        headers,
+        body,
+        content_type,
+        validator.schema.as_ref(),
+        max_body_bytes,
+    )? {
+        SchemaInstance::Value(instance) => validator
+            .validator
+            .validate(&instance)
+            .map_err(|error| format_schema_error(&error)),
+        SchemaInstance::BinaryLengthOnly => Ok(()),
+    }
+}
+
 fn body_to_schema_instance(
     headers: &HashMap<String, String>,
     body: &[u8],
     content_type: Option<&str>,
     schema: &Value,
     max_body_bytes: usize,
-) -> Result<Value, String> {
+) -> Result<SchemaInstance, String> {
     let decoded = decode_body(headers, body, max_body_bytes)?;
     let media_type = content_type_base(content_type)
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     if is_json_media_type(&media_type) {
         return serde_json::from_slice(decoded.as_ref())
+            .map(SchemaInstance::Value)
             .map_err(|error| format!("Invalid JSON body: {error}"));
     }
     if is_xml_media_type(&media_type) {
         let body = std::str::from_utf8(decoded.as_ref())
             .map_err(|error| format!("Invalid XML body encoding: {error}"))?;
-        return xml_body_to_value(body, schema);
+        return xml_body_to_value(body, schema).map(SchemaInstance::Value);
     }
     if media_type == "application/x-www-form-urlencoded" {
         let body = std::str::from_utf8(decoded.as_ref())
             .map_err(|error| format!("Invalid form body encoding: {error}"))?;
-        return form_urlencoded_to_value(body, schema);
+        return form_urlencoded_to_value(body, schema).map(SchemaInstance::Value);
     }
     if media_type == "multipart/form-data" {
         let boundary = multipart_boundary(content_type.unwrap_or(""))
             .ok_or_else(|| "Multipart body is missing boundary parameter".to_string())?;
-        return multipart_to_value(decoded.as_ref(), &boundary, schema);
+        return multipart_to_value(decoded.as_ref(), &boundary, schema).map(SchemaInstance::Value);
     }
     if is_text_media_type(&media_type) {
         let body = std::str::from_utf8(decoded.as_ref())
             .map_err(|error| format!("Invalid text body encoding: {error}"))?;
-        return scalar_to_schema_value(body, schema);
+        return scalar_to_schema_value(body, schema).map(SchemaInstance::Value);
     }
-    Ok(binary_to_schema_value(decoded.as_ref(), schema))
+    binary_body_to_schema_instance(decoded.as_ref(), schema)
 }
 
 fn xml_body_to_value(body: &str, schema: &Value) -> Result<Value, String> {
-    reject_xml_entities(body)?;
     let doc =
         roxmltree::Document::parse(body).map_err(|error| format!("Invalid XML body: {error}"))?;
     let root = doc.root_element();
@@ -918,15 +1013,6 @@ fn xml_body_to_value(body: &str, schema: &Value) -> Result<Value, String> {
         ));
     }
     xml_node_to_value(root, schema)
-}
-
-fn reject_xml_entities(body: &str) -> Result<(), String> {
-    if contains_ascii_case_insensitive(body, "<!doctype")
-        || contains_ascii_case_insensitive(body, "<!entity")
-    {
-        return Err("XML bodies with DOCTYPE or ENTITY declarations are not supported".to_string());
-    }
-    Ok(())
 }
 
 fn xml_node_to_value(node: roxmltree::Node<'_, '_>, schema: &Value) -> Result<Value, String> {
@@ -1150,10 +1236,7 @@ fn fields_to_schema_object(
         }
     }
     for (key, values) in fields {
-        if !out.contains_key(&key)
-            && (schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
-                || properties.is_none_or(|props| !props.contains_key(&key)))
-        {
+        if !out.contains_key(&key) {
             out.insert(key, values_to_schema_value(&values, &Value::Null)?);
         }
     }
@@ -1240,7 +1323,7 @@ fn multipart_part_to_schema_value(part: &MultipartPart, schema: &Value) -> Resul
         return Ok(Value::Object(out));
     }
     if schema_format(schema) == Some("binary") || part.filename.is_some() {
-        return Ok(binary_to_schema_value(&part.body, schema));
+        return binary_to_schema_value(&part.body, schema);
     }
     let text = std::str::from_utf8(&part.body)
         .map_err(|error| format!("Multipart field '{}' is not UTF-8: {error}", part.name))?;
@@ -1285,20 +1368,79 @@ fn scalar_to_schema_value(value: &str, schema: &Value) -> Result<Value, String> 
         return Ok(Value::Number(number));
     }
     if schema_type_contains(schema, "boolean") {
-        return match value {
-            "true" | "1" => Ok(Value::Bool(true)),
-            "false" | "0" => Ok(Value::Bool(false)),
-            _ => Err(format!("Invalid boolean value '{value}'")),
-        };
+        let value = value.trim();
+        if value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+        {
+            return Ok(Value::Bool(true));
+        }
+        if value == "0"
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("no")
+            || value.eq_ignore_ascii_case("off")
+        {
+            return Ok(Value::Bool(false));
+        }
+        return Err(format!("Invalid boolean value '{value}'"));
     }
     Ok(Value::String(value.to_string()))
 }
 
-fn binary_to_schema_value(body: &[u8], _schema: &Value) -> Value {
+fn binary_body_to_schema_instance(body: &[u8], schema: &Value) -> Result<SchemaInstance, String> {
     match std::str::from_utf8(body) {
-        Ok(value) => Value::String(value.to_string()),
-        Err(_) => Value::String("x".repeat(body.len())),
+        Ok(value) => Ok(SchemaInstance::Value(Value::String(value.to_string()))),
+        Err(_) => {
+            validate_binary_length(body.len(), schema)?;
+            Ok(SchemaInstance::BinaryLengthOnly)
+        }
     }
+}
+
+fn binary_to_schema_value(body: &[u8], schema: &Value) -> Result<Value, String> {
+    match std::str::from_utf8(body) {
+        Ok(value) => Ok(Value::String(value.to_string())),
+        Err(_) => {
+            validate_binary_length(body.len(), schema)?;
+            Err(
+                "Non-UTF-8 multipart binary fields require an object schema to validate metadata"
+                    .to_string(),
+            )
+        }
+    }
+}
+
+fn validate_binary_length(len: usize, schema: &Value) -> Result<(), String> {
+    let schema = conversion_schema(schema);
+    if schema.get("type").is_some() && !schema_type_contains(schema, "string") {
+        return Err(
+            "Non-UTF-8 binary bodies require a string schema with optional minLength/maxLength"
+                .to_string(),
+        );
+    }
+    if let Some(min_length) = schema_usize(schema, "minLength")
+        && len < min_length
+    {
+        return Err(format!(
+            "Binary body length {len} is shorter than minLength {min_length}"
+        ));
+    }
+    if let Some(max_length) = schema_usize(schema, "maxLength")
+        && len > max_length
+    {
+        return Err(format!(
+            "Binary body length {len} exceeds maxLength {max_length}"
+        ));
+    }
+    Ok(())
+}
+
+fn schema_usize(schema: &Value, key: &str) -> Option<usize> {
+    schema
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 fn validator_for_content_type<'a>(
@@ -1338,7 +1480,7 @@ fn normalize_media_type(value: &str) -> String {
 }
 
 fn default_content_types() -> Vec<String> {
-    DEFAULT_CONTENT_TYPES
+    OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES
         .iter()
         .map(|value| value.to_string())
         .collect()
@@ -1443,31 +1585,23 @@ fn parse_part_headers(header_bytes: &[u8]) -> Result<HashMap<String, String>, St
 }
 
 fn split_header_body(segment: &[u8]) -> Option<(&[u8], &[u8])> {
-    if let Some(index) = find_subsequence(segment, b"\r\n\r\n") {
+    if let Some(index) = memchr::memmem::find(segment, b"\r\n\r\n") {
         return Some((&segment[..index], &segment[index + 4..]));
     }
-    find_subsequence(segment, b"\n\n").map(|index| (&segment[..index], &segment[index + 2..]))
+    memchr::memmem::find(segment, b"\n\n").map(|index| (&segment[..index], &segment[index + 2..]))
 }
 
 fn split_bytes<'a>(body: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
     let mut out = Vec::new();
     let mut start = 0;
-    while let Some(offset) = find_subsequence(&body[start..], delimiter) {
+    let finder = memchr::memmem::Finder::new(delimiter);
+    while let Some(offset) = finder.find(&body[start..]) {
         let index = start + offset;
         out.push(&body[start..index]);
         start = index + delimiter.len();
     }
     out.push(&body[start..]);
     out
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 fn trim_leading_line_break(mut value: &[u8]) -> &[u8] {
@@ -1566,13 +1700,6 @@ fn child_elements<'a>(
     node.children()
         .filter(move |child| child.is_element() && child.tag_name().name() == local_name)
         .collect()
-}
-
-fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {

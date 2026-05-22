@@ -17,7 +17,10 @@
 // Re-export so Wave 3 handlers can `use crate::admin::api_specs::SpecFormat`
 // without knowing that the canonical definition lives in config::types.
 pub use crate::config::types::SpecFormat;
-use crate::config::types::validate_resource_id;
+use crate::config::types::{
+    MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH, MAX_OPENAPI_VALIDATOR_CONFIG_SIZE,
+    OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES, json_depth, validate_resource_id,
+};
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
 use chrono::Utc;
 use serde_json::{Map, Value, json};
@@ -569,10 +572,13 @@ fn auto_inject_openapi_validator(
         .iter_mut()
         .find(|plugin| plugin.plugin_name == "openapi_validator")
     {
-        existing.config = merge_openapi_validator_config(auto_config, &existing.config)?;
+        let merged = merge_openapi_validator_config(auto_config, &existing.config)?;
+        validate_openapi_validator_config_budget(&merged)?;
+        existing.config = merged;
         return Ok(());
     }
 
+    validate_openapi_validator_config_budget(&auto_config)?;
     let now = Utc::now();
     plugins.push(PluginConfig {
         id: String::new(),
@@ -598,6 +604,33 @@ fn schema_draft_for_openapi(version: &str) -> String {
     }
 }
 
+fn validate_openapi_validator_config_budget(config: &Value) -> Result<(), ExtractError> {
+    let size = serde_json::to_vec(config)
+        .map_err(|error| ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            error: format!("generated openapi_validator config could not be serialized: {error}"),
+        })?
+        .len();
+    if size > MAX_OPENAPI_VALIDATOR_CONFIG_SIZE {
+        return Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            error: format!(
+                "generated openapi_validator config must not exceed {MAX_OPENAPI_VALIDATOR_CONFIG_SIZE} bytes (got {size})"
+            ),
+        });
+    }
+    let depth = json_depth(config);
+    if depth > MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH {
+        return Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            error: format!(
+                "generated openapi_validator config depth must not exceed {MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH} (got {depth})"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn apply_validate_extension(
     config: &mut Map<String, Value>,
     validate_ext: Value,
@@ -616,6 +649,10 @@ fn apply_validate_extension(
             }
             "response" => {
                 apply_validate_side_extension(config, "response", value)?;
+            }
+            "bypass" => {
+                validate_openapi_validator_bypass("x-ferrum-validate", &value)?;
+                config.insert(key, value);
             }
             _ => {
                 config.insert(key, value);
@@ -648,6 +685,37 @@ fn apply_validate_side_extension(
                 config.insert(key, value);
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_openapi_validator_bypass(
+    which: &'static str,
+    value: &Value,
+) -> Result<(), ExtractError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ExtractError::MalformedExtension {
+            which,
+            error: "openapi_validator bypass config must be an object".to_string(),
+        })?;
+    for key in ["paths", "methods", "consumers"] {
+        if let Some(value) = object.get(key)
+            && !value.is_array()
+        {
+            return Err(ExtractError::MalformedExtension {
+                which,
+                error: format!("openapi_validator bypass.{key} must be an array"),
+            });
+        }
+    }
+    if let Some(value) = object.get("header_present")
+        && !value.is_object()
+    {
+        return Err(ExtractError::MalformedExtension {
+            which,
+            error: "openapi_validator bypass.header_present must be an object".to_string(),
+        });
     }
     Ok(())
 }
@@ -686,6 +754,7 @@ fn merge_bypass_config(
     base: &mut Map<String, Value>,
     operator_bypass: &Value,
 ) -> Result<(), ExtractError> {
+    validate_openapi_validator_bypass("x-ferrum-plugins", operator_bypass)?;
     let operator = operator_bypass
         .as_object()
         .ok_or_else(|| ExtractError::MalformedExtension {
@@ -705,11 +774,16 @@ fn merge_bypass_config(
     for (key, value) in operator {
         match key.as_str() {
             "paths" | "methods" | "consumers" => {
-                let mut values = base_object
-                    .get(key)
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
+                let mut values = match base_object.get(key) {
+                    Some(Value::Array(values)) => values.clone(),
+                    Some(_) => {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "x-ferrum-validate",
+                            error: format!("openapi_validator bypass.{key} must be an array"),
+                        });
+                    }
+                    None => Vec::new(),
+                };
                 if let Some(operator_values) = value.as_array() {
                     for candidate in operator_values {
                         if !values.iter().any(|existing| existing == candidate) {
@@ -725,11 +799,17 @@ fn merge_bypass_config(
                 }
             }
             "header_present" => {
-                let mut headers = base_object
-                    .get(key)
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .unwrap_or_default();
+                let mut headers = match base_object.get(key) {
+                    Some(Value::Object(headers)) => headers.clone(),
+                    Some(_) => {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "x-ferrum-validate",
+                            error: "openapi_validator bypass.header_present must be an object"
+                                .to_string(),
+                        });
+                    }
+                    None => Map::new(),
+                };
                 let Some(operator_headers) = value.as_object() else {
                     return Err(ExtractError::MalformedExtension {
                         which: "x-ferrum-plugins",
@@ -977,15 +1057,6 @@ fn swagger_media_types(
 
 const MAX_SCHEMA_REF_DEPTH: usize = 32;
 type ExtractedRequestBodySchemas = Option<(bool, Map<String, Value>)>;
-const OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES: &[&str] = &[
-    "application/json",
-    "application/xml",
-    "text/xml",
-    "application/x-www-form-urlencoded",
-    "multipart/form-data",
-    "text/plain",
-    "application/octet-stream",
-];
 
 fn resolve_refs(
     root: &Value,
@@ -2340,6 +2411,81 @@ x-ferrum-proxy:
         assert_eq!(
             plugin.config["request_content_types"],
             json!(["application/json", "application/problem+json"])
+        );
+    }
+
+    #[test]
+    fn test_x_ferrum_validate_rejects_malformed_spec_bypass() {
+        let spec = r#"
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Contract API", "version": "1.0.0"},
+  "x-ferrum-validate": {
+    "bypass": {"paths": "^/health$"}
+  },
+  "x-ferrum-proxy": {
+    "id": "contract-proxy",
+    "backend_host": "backend.internal",
+    "backend_port": 443
+  },
+  "paths": {
+    "/orders": {
+      "get": {
+        "responses": {"200": {"description": "ok"}}
+      }
+    }
+  }
+}
+"#;
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").unwrap_err();
+        assert!(matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "x-ferrum-validate",
+                ..
+            }
+        ));
+        assert!(
+            err.to_string()
+                .contains("openapi_validator bypass.paths must be an array")
+        );
+    }
+
+    #[test]
+    fn test_x_ferrum_validate_preserves_wildcard_response_statuses() {
+        let spec = r#"
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Contract API", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "contract-proxy",
+    "backend_host": "backend.internal",
+    "backend_port": 443
+  },
+  "paths": {
+    "/orders": {
+      "get": {
+        "responses": {
+          "4XX": {
+            "description": "client error",
+            "content": {
+              "application/json": {
+                "schema": {"type": "object", "required": ["error"]}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+        let (bundle, _meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").unwrap();
+        let plugin = &bundle.plugins[0];
+        assert_eq!(
+            plugin.config["operations"][0]["responses"]["4XX"]["application/json"]["required"],
+            json!(["error"])
         );
     }
 

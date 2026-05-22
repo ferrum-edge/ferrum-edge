@@ -168,9 +168,9 @@ The importer walks `paths.{path}.{method}`, resolves local `$ref`s, and extracts
 
 External `$ref`s are rejected with HTTP 422 `UnsupportedExternalRef`, and deeply recursive refs are rejected with HTTP 422 `SchemaTooDeep`. Swagger 2.0 and OpenAPI 3.0 schemas are normalized for Draft 7 compatibility; OpenAPI 3.1+ schemas use Draft 2020-12.
 
-Runtime validation supports JSON and `+json`, XML and `+xml` with OpenAPI `xml` metadata, `application/x-www-form-urlencoded`, `multipart/form-data` fields and file metadata, `text/*`, and binary payloads such as `application/octet-stream`, other non-JSON/XML `application/*`, `image/*`, `audio/*`, and `video/*`.
+Runtime validation supports JSON and `+json`, XML and `+xml` with OpenAPI `xml` metadata, `application/x-www-form-urlencoded`, `multipart/form-data` fields and file metadata, `text/*`, and binary payloads such as `application/octet-stream`, other non-JSON/XML `application/*`, `image/*`, `audio/*`, and `video/*`. OpenAPI response wildcard status keys such as `4XX` and `5XX` are preserved in the generated config and matched after exact status codes.
 
-If `x-ferrum-plugins` already includes an `openapi_validator`, the importer merges it with the generated config: operator scalar fields win, `bypass.paths` / `bypass.methods` / `bypass.consumers` are unioned, `bypass.header_present` maps are merged, and `operations` is always regenerated from the spec.
+If `x-ferrum-plugins` already includes an `openapi_validator`, the importer merges it with the generated config: operator scalar fields win, `bypass.paths` / `bypass.methods` / `bypass.consumers` are unioned, `bypass.header_present` maps are merged with operator entries overriding spec entries on header-name conflicts, and `operations` is always regenerated from the spec. Malformed spec-side bypass shapes are rejected during extraction instead of being silently dropped.
 
 For full runtime settings and metadata keys, see [openapi_validator.md](openapi_validator.md).
 

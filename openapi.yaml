@@ -9037,7 +9037,7 @@ components:
             type: object
             additionalProperties:
               type: object
-          description: Status code to media type to JSON Schema map. `default` is used as a fallback.
+          description: Status code to media type to JSON Schema map. Exact status codes are checked first, OpenAPI wildcard ranges such as `4XX` are checked next, and `default` is used as the final fallback.
 
     RequestTerminationConfig:
       type: object

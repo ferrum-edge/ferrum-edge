@@ -2115,6 +2115,7 @@ dependencies = [
  "ldap3",
  "libc",
  "maxminddb",
+ "memchr",
  "mongodb",
  "paste",
  "percent-encoding",

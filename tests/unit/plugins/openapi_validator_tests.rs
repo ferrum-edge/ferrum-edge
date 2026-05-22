@@ -87,6 +87,14 @@ fn invalid_configs_are_rejected() {
                 "method": "POST",
                 "path_template": "/x",
                 "path_regex": "^/x$",
+                "request_body_required": "true"
+            }]
+        }),
+        json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/x",
+                "path_regex": "^/x$",
                 "request_body": {"content": {"application/json": {"type": "not-a-type"}}}
             }]
         }),
@@ -96,6 +104,23 @@ fn invalid_configs_are_rejected() {
             "config should fail: {config:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn disabled_mode_skips_matching_and_buffering() {
+    let plugin = OpenapiValidator::new(&validator_config("disabled")).unwrap();
+    let mut ctx = post_ctx("/missing");
+    let mut headers = json_headers();
+
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.mode")
+            .map(String::as_str),
+        Some("disabled")
+    );
 }
 
 #[tokio::test]
@@ -319,6 +344,37 @@ async fn xml_request_validation_honors_xml_metadata() {
             .await,
         Some(400),
     );
+
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/docs",
+            "path_regex": "^/docs$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "doc"},
+                        "properties": {
+                            "body": {"type": "string"}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/docs");
+    ctx.headers = content_type_headers("application/xml");
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("application/xml"),
+                br#"<doc><body><![CDATA[<!doctype html>]]></body></doc>"#,
+            )
+            .await,
+    );
 }
 
 #[tokio::test]
@@ -352,7 +408,7 @@ async fn urlencoded_request_validation_converts_fields_to_schema_types() {
             .on_final_request_body_with_context(
                 &mut ctx,
                 &content_type_headers("application/x-www-form-urlencoded"),
-                b"username=alice&remember=true",
+                b"username=alice&remember=on",
             )
             .await,
     );
@@ -452,6 +508,9 @@ async fn text_and_binary_response_validation_use_matching_schema_rules() {
                     "text/plain": {"type": "string", "pattern": "^ok:"},
                     "application/octet-stream": {"type": "string", "format": "binary", "minLength": 3, "maxLength": 3},
                     "application/pdf": {"type": "string", "format": "binary", "minLength": 4, "maxLength": 4}
+                },
+                "4XX": {
+                    "application/json": {"type": "object", "required": ["error"]}
                 }
             }
         }]
@@ -496,6 +555,24 @@ async fn text_and_binary_response_validation_use_matching_schema_rules() {
                 &content_type_headers("application/pdf"),
                 &[0, 159, 255, 42],
             )
+            .await,
+    );
+    let mut ctx = post_ctx("/download");
+    assert_reject(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("application/pdf"),
+                &[0, 159, 255, 42, 100],
+            )
+            .await,
+        Some(502),
+    );
+    let mut ctx = post_ctx("/download");
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 404, &json_headers(), br#"{"error":"missing"}"#)
             .await,
     );
 }

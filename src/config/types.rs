@@ -55,7 +55,25 @@ pub const MAX_TAG_LENGTH: usize = 255;
 pub const MAX_LOCALITY_LENGTH: usize = 255;
 /// Maximum size of plugin config JSON in bytes.
 pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
-pub const MAX_OPENAPI_VALIDATOR_CONFIG_SIZE: usize = 14 * 1024 * 1024;
+/// Maximum OpenAPI validator config JSON size in bytes.
+///
+/// Generated validator configs embed resolved operation schemas, so they need
+/// a larger budget than ordinary plugin configs. Keep this safely below
+/// MongoDB's 16 MiB BSON document ceiling because database mode may store a
+/// generated validator as one plugin row.
+pub const MAX_OPENAPI_VALIDATOR_CONFIG_SIZE: usize = 14_680_064; // 14 MiB
+/// Maximum OpenAPI validator config JSON nesting depth.
+pub const MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH: usize = 64;
+/// Default OpenAPI validator media types for generated and direct configs.
+pub const OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES: &[&str] = &[
+    "application/json",
+    "application/xml",
+    "text/xml",
+    "application/x-www-form-urlencoded",
+    "multipart/form-data",
+    "text/plain",
+    "application/octet-stream",
+];
 /// Maximum size of consumer credentials JSON in bytes.
 pub const MAX_CREDENTIALS_SIZE: usize = 65_536; // 64 KiB
 /// Maximum length for individual credential string values (API keys, secrets, identities).
@@ -4442,7 +4460,7 @@ impl PluginConfig {
 
         // Config JSON nesting depth
         let max_config_depth = if self.plugin_name == "openapi_validator" {
-            64
+            MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH
         } else {
             10
         };
@@ -5159,7 +5177,7 @@ impl GatewayConfig {
 }
 
 /// Compute the maximum nesting depth of a JSON value.
-fn json_depth(value: &serde_json::Value) -> usize {
+pub(crate) fn json_depth(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Array(arr) => 1 + arr.iter().map(json_depth).max().unwrap_or(0),
         serde_json::Value::Object(map) => 1 + map.values().map(json_depth).max().unwrap_or(0),

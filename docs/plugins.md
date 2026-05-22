@@ -2584,7 +2584,7 @@ Validates request and response bodies against operation schemas generated from a
 | `bypass.consumers` | String[] | `[]` | Consumer identities that skip validation |
 | `bypass.header_present` | object | `{}` | Header presence/value checks that skip validation |
 
-`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses, skips SSE responses, supports gzip and brotli decompression, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata, and records `openapi_validator.*` metadata for logging. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
+`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses, skips SSE responses, supports gzip and brotli decompression, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata, supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
 
 See [openapi_validator.md](openapi_validator.md) for the full generated config shape, `x-ferrum-validate` options, and emergency override behavior.
 
