@@ -861,6 +861,48 @@ async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
     echo_handle.abort();
 }
 
+/// `FERRUM_HTTP3_WEBSOCKET_ENABLED=false` must disable RFC 9220 Extended
+/// CONNECT without disabling the rest of the H3 listener.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_disabled_by_env_returns_501() {
+    let backend_port = free_port().await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry_extra_env(
+            config_path.to_str().unwrap(),
+            cert_path,
+            key_path,
+            &[("FERRUM_HTTP3_WEBSOCKET_ENABLED", "false")],
+        )
+        .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+    let mut ws = client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket disabled response");
+    assert_eq!(ws.status, StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        ws.recv_body_text()
+            .await
+            .expect("disabled H3 WebSocket body")
+            .contains("WebSocket over HTTP/3 is disabled"),
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+}
+
 /// The H3 bridge forwards the client's offered subprotocols to the backend
 /// H1 Upgrade handshake and mirrors the backend's selected protocol on the
 /// RFC 9220 200 response.
