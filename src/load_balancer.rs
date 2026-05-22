@@ -521,6 +521,15 @@ impl LoadBalancerCache {
         algorithm: LoadBalancerAlgorithm,
         hash_on: Option<String>,
     ) -> Arc<LoadBalancerCacheInner> {
+        if !current.upstreams.contains_key(upstream_id) {
+            let mut new_balancers = current.balancers.clone();
+            new_balancers.remove(upstream_id);
+            return Arc::new(LoadBalancerCacheInner {
+                balancers: new_balancers,
+                upstreams: current.upstreams.clone(),
+            });
+        }
+
         // Clone-and-patch both maps, then swap as a single unit
         let mut new_balancers = current.balancers.clone();
         let existing_subsets = current

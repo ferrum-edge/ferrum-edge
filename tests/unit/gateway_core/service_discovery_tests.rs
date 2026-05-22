@@ -1511,6 +1511,14 @@ fn test_load_balancer_cache_update_targets_nonexistent_upstream() {
     // Original upstream should be untouched
     let u1 = cache.get_upstream("up-1").unwrap();
     assert_eq!(u1.targets.len(), 1);
+    assert!(
+        cache.get_upstream("does-not-exist").is_none(),
+        "unknown target updates must not create an upstream index entry"
+    );
+    assert!(
+        cache.select_target("does-not-exist", "key", None).is_none(),
+        "unknown target updates must not create an orphan selectable balancer"
+    );
 }
 
 #[test]
