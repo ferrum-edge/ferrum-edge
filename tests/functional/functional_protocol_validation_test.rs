@@ -18,6 +18,7 @@
 //! - `TRACE` method rejection (XST) on H1 and H2
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H2
 //! - `TRACE` method rejection (XST) on H1, H2, and H3
+//! - `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` rejection on H2
 //! - `Transfer-Encoding` rejection on H3
 //! - Empty query segments are ignored by HTTP/3 query-param limit counting
 //! - Query parameter counting parity on H3
@@ -915,6 +916,77 @@ async fn functional_protocol_validation_h2_total_header_size_limit_rejects_from_
     assert_eq!(status, 431, "body={body_str}");
     assert!(
         body_str.contains("Total request headers exceed maximum size"),
+        "unexpected body: {body_str}"
+    );
+
+    drop(sender);
+    conn_task.abort();
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 8. Single header size on H2 ------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h2_single_header_size_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "12")
+        .spawn()
+        .await
+        .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port did not become ready");
+
+    let stream = TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+        .await
+        .expect("connect");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("http://example.com/")
+        .header("host", "example.com")
+        .header("x-over", "value-that-exceeds")
+        .body(Full::new(Bytes::new()))
+        .expect("build request");
+    let resp = sender
+        .send_request(req)
+        .await
+        .expect("send oversized-header request");
+    let status = resp.status().as_u16();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert_eq!(status, 431, "body={body_str}");
+    assert!(
+        body_str.contains("Request header"),
+        "unexpected body: {body_str}"
+    );
+    assert!(
+        body_str.contains("exceeds maximum size of 12 bytes"),
         "unexpected body: {body_str}"
     );
 
