@@ -22,6 +22,7 @@
 //! - `CONNECT` method rejection on H2 unless `:protocol = "websocket"`
 //! - `CONNECT` method rejection on H3 for unsupported Extended CONNECT protocols
 //! - `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` rejection on H1 and H2
+//! - `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` rejection on H1 and H2
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
 //!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
@@ -69,6 +70,11 @@ async fn start_header_echo_server_on(listener: TcpListener) {
                 _ => return,
             };
             let request = String::from_utf8_lossy(&buf[..n]);
+            let request_path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
 
             let mut headers_json = serde_json::Map::new();
             for line in request.lines().skip(1) {
@@ -96,13 +102,20 @@ async fn start_header_echo_server_on(listener: TcpListener) {
                 }
             }
 
-            let body = serde_json::to_string(&headers_json).unwrap_or_default();
+            let (content_type, body) = if request_path == "/large-response" {
+                ("text/plain", "0123456789abcdef".to_string())
+            } else {
+                (
+                    "application/json",
+                    serde_json::to_string(&headers_json).unwrap_or_default(),
+                )
+            };
             // Include hop-by-hop-ish headers in the response so we can assert the
             // gateway strips them before handing the response to the client.
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
                  Content-Length: {len}\r\n\
-                 Content-Type: application/json\r\n\
+                 Content-Type: {content_type}\r\n\
                  X-Backend-Marker: echoed\r\n\
                  Connection: keep-alive, Upgrade, Keep-Alive\r\n\
                  Keep-Alive: timeout=5\r\n\
@@ -114,6 +127,7 @@ async fn start_header_echo_server_on(listener: TcpListener) {
                  \r\n\
                  {body}",
                 len = body.len(),
+                content_type = content_type,
                 body = body
             );
             let _ = stream.write_all(response.as_bytes()).await;
@@ -1233,6 +1247,29 @@ async fn functional_protocol_validation_env_request_body_limit_rejects_http1() {
         resp.body.contains("Request body exceeds maximum size"),
         "unexpected body: {}",
         resp.body
+// --- 10. Global response body size limit -----------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_env_response_body_limit_rejects_http1() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "8")]).await;
+
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .expect("reqwest client");
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/large-response", h.proxy_port))
+        .header("Host", "example.com")
+        .send()
+        .await
+        .expect("request through gateway");
+
+    assert_eq!(resp.status().as_u16(), 502);
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.contains("Backend response body exceeds maximum size"),
+        "unexpected body: {body}"
     );
 
     h.cleanup();
@@ -1242,6 +1279,8 @@ async fn functional_protocol_validation_env_request_body_limit_rejects_http1() {
 #[tokio::test]
 async fn functional_protocol_validation_env_request_body_limit_rejects_http2() {
     let h = Harness::new_with_env(false, &[("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "8")]).await;
+async fn functional_protocol_validation_env_response_body_limit_rejects_http2() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "8")]).await;
 
     let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
         .await
@@ -1264,6 +1303,12 @@ async fn functional_protocol_validation_env_request_body_limit_rejects_http2() {
         .body(Full::new(Bytes::from_static(b"0123456789abcdef")))
         .expect("build oversized H2 request");
     let resp = sender.send_request(req).await.expect("send oversized POST");
+        .method("GET")
+        .uri("http://example.com/large-response")
+        .header("host", "example.com")
+        .body(Full::new(Bytes::new()))
+        .expect("build request");
+    let resp = sender.send_request(req).await.expect("send GET");
     let status = resp.status().as_u16();
     let body = resp
         .into_body()
@@ -1276,6 +1321,9 @@ async fn functional_protocol_validation_env_request_body_limit_rejects_http2() {
     assert_eq!(status, 413, "body={body_str}");
     assert!(
         body_str.contains("Request body exceeds maximum size"),
+    assert_eq!(status, 502, "body={body_str}");
+    assert!(
+        body_str.contains("Backend response body exceeds maximum size"),
         "unexpected body: {body_str}"
     );
 
