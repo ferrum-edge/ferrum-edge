@@ -6,6 +6,7 @@
 //! 3. Backend TLS origination (TcpTls protocol — gateway connects to backend over TLS)
 //! 4. Full TLS: frontend termination + backend origination simultaneously
 //! 5. TCP idle timeout via per-proxy config and global `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`
+//! 5. TCP backend-read inactivity timeout
 //!
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_tcp_proxy --ignored --nocapture
@@ -36,6 +37,23 @@ async fn start_tcp_echo_server_on(listener: TcpListener) -> tokio::task::JoinHan
                             }
                         }
                         Err(_) => break,
+                    }
+                }
+            });
+        }
+    })
+}
+
+/// Start a TCP backend that accepts data but never writes a response.
+async fn start_tcp_silent_reader_server_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((mut stream, _addr)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => sleep(Duration::from_secs(60)).await,
                     }
                 }
             });
@@ -726,16 +744,29 @@ async fn test_tcp_proxy_global_idle_timeout_env() {
     let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry_and_env(
+/// Test 5b: TCP backend-read timeout — if the backend accepts the request bytes
+/// but stops producing response bytes, the relay closes the client connection.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_backend_read_timeout() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let silent_backend = start_tcp_silent_reader_server_on(backend_listener).await;
+
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
         |proxy_port| {
             format!(
                 r#"
 version: "1"
 proxies:
   - id: "tcp-global-idle-timeout"
+  - id: "tcp-backend-read-timeout"
     listen_port: {proxy_port}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
+    backend_read_timeout_ms: 500
+    tcp_idle_timeout_seconds: 30
 
 consumers: []
 plugin_configs: []
@@ -764,6 +795,12 @@ plugin_configs: []
 
     sleep(Duration::from_secs(3)).await;
 
+    stream
+        .write_all(b"backend-read-timeout")
+        .await
+        .expect("Failed to send");
+
+    let mut buf = vec![0u8; 64];
     let read_result = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
     match read_result {
         Ok(Ok(0)) => {}
@@ -779,11 +816,14 @@ plugin_configs: []
             }
         }
         Err(_) => panic!("timed out waiting for global idle-timeout closure"),
+        Ok(Ok(n)) => panic!("silent backend should not send {n} bytes before timeout"),
+        Err(_) => panic!("timed out waiting for backend-read-timeout closure"),
     }
 
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_server.abort();
+    silent_backend.abort();
 }
 
 /// Test 6: Active TCP relay keeps its accepted connection epoch across config reload.
