@@ -5,6 +5,8 @@ use tokio::net::UdpSocket;
 
 use crate::dns::DnsCache;
 
+use super::socket_addr_lookup_input;
+
 pub const UDP_RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Resolve `host:port` to a `SocketAddr` via the gateway's shared `DnsCache`.
@@ -34,7 +36,7 @@ pub async fn resolve_udp_endpoint(
             });
     }
 
-    let addr = format!("{host}:{port}");
+    let addr = socket_addr_lookup_input(host, port);
     tokio::net::lookup_host(&addr)
         .await
         .map_err(|error| format!("{plugin_name}: DNS resolution failed for {addr}: {error}"))?

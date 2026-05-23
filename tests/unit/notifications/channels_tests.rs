@@ -123,6 +123,49 @@ fn parse_channels_rejects_non_http_webhook_url() {
 }
 
 #[test]
+fn parse_channels_rejects_urls_with_userinfo() {
+    let cases = [
+        (
+            "slack",
+            json!({
+                "type": "slack",
+                "webhook_url": "https://hooks.slack.com@evil.example/services/T/B/X",
+            }),
+        ),
+        (
+            "teams",
+            json!({
+                "type": "teams",
+                "webhook_url": "https://user:secret@outlook.office.com/webhook/x",
+            }),
+        ),
+        (
+            "discord",
+            json!({
+                "type": "discord",
+                "webhook_url": "https://discord.com@evil.example/api/webhooks/x",
+            }),
+        ),
+        (
+            "webhook",
+            json!({
+                "type": "webhook",
+                "url": "https://events.pagerduty.com@evil.example/v2/enqueue",
+                "body_template": "{}",
+            }),
+        ),
+    ];
+
+    for (name, config) in cases {
+        let err = parse_channels(&json!({ name: config })).unwrap_err();
+        assert!(
+            err.contains("must not include username or password credentials"),
+            "expected userinfo rejection for {name}, got: {err}"
+        );
+    }
+}
+
+#[test]
 fn parse_channels_rejects_missing_webhook_url() {
     let err = parse_channels(&json!({
         "ops": { "type": "slack" }

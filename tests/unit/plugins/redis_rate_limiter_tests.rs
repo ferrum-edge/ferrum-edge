@@ -22,6 +22,12 @@ fn test_hostname_uses_url_parser_and_preserves_credentials() {
 }
 
 #[test]
+fn test_hostname_skips_ipv6_literals() {
+    let config = make_config("redis://[2001:db8::10]:6379/0", false);
+    assert_eq!(config.hostname(), None);
+}
+
+#[test]
 fn test_url_with_resolved_ip_replaces_host_not_scheme() {
     let config = make_config("redis://redis:6379/0", false);
     let url = redis_config_url_with_ip(&config, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
@@ -168,6 +174,25 @@ fn test_from_plugin_config_rejects_invalid_redis_mode() {
         assert!(
             RedisConfig::from_plugin_config(&config, "ferrum:test").is_err(),
             "config should fail validation: {config}"
+        );
+    }
+}
+
+#[test]
+fn test_from_plugin_config_rejects_malformed_redis_urls() {
+    for redis_url in [
+        "not a url",
+        "http://cache.internal:6379/0",
+        "redis:///0",
+        "rediss:///0",
+    ] {
+        let config = json!({
+            "sync_mode": "redis",
+            "redis_url": redis_url
+        });
+        assert!(
+            RedisConfig::from_plugin_config(&config, "ferrum:test").is_err(),
+            "redis_url should fail validation: {redis_url}"
         );
     }
 }

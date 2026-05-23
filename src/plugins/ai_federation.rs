@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+use url::{Host, Url};
 
 use super::utils::aws_sigv4;
 use super::utils::body_transform::is_json_content_type;
@@ -360,7 +361,7 @@ fn validate_base_url(
     allow_plaintext: bool,
     backend_allow_ips: &crate::config::BackendAllowIps,
 ) -> Result<(), String> {
-    let parsed = url::Url::parse(base_url).map_err(|e| {
+    let parsed = Url::parse(base_url).map_err(|e| {
         format!("ai_federation: provider '{provider_name}' invalid base_url '{base_url}': {e}")
     })?;
 
@@ -380,20 +381,19 @@ fn validate_base_url(
         }
     }
 
-    let host = parsed.host_str().ok_or_else(|| {
+    if !has_non_empty_authority(base_url) {
+        return Err(format!(
+            "ai_federation: provider '{provider_name}' base_url '{base_url}' has no host"
+        ));
+    }
+
+    let host = normalized_url_hostname(&parsed).ok_or_else(|| {
         format!("ai_federation: provider '{provider_name}' base_url '{base_url}' has no host")
     })?;
 
     // If the host is a literal IP, enforce the gateway IP policy at config
     // time. Hostnames are checked at runtime by `DnsCacheResolver`.
-    //
-    // `url::Url::host_str()` keeps the brackets on bracketed IPv6 literals
-    // (e.g. `https://[::1]/` → `"[::1]"`), so strip them before parsing.
-    let host_for_ip = host
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(host);
-    if let Ok(ip) = host_for_ip.parse::<std::net::IpAddr>()
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
         && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
     {
         return Err(format!(
@@ -402,6 +402,22 @@ fn validate_base_url(
     }
 
     Ok(())
+}
+
+fn has_non_empty_authority(raw_url: &str) -> bool {
+    raw_url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| !authority.is_empty())
+}
+
+fn normalized_url_hostname(url: &Url) -> Option<String> {
+    match url.host()? {
+        Host::Domain(host) if !host.is_empty() => Some(host.to_string()),
+        Host::Ipv4(host) => Some(host.to_string()),
+        Host::Ipv6(host) => Some(host.to_string()),
+        _ => None,
+    }
 }
 
 /// Build the URL template for a provider at config-load time.
@@ -1770,10 +1786,10 @@ impl Plugin for AiFederation {
             // Use a representative model name for URL building
             let model = provider.default_model.as_deref().unwrap_or("placeholder");
             let url = build_provider_url(provider, model);
-            if let Ok(parsed) = url::Url::parse(&url)
-                && let Some(host) = parsed.host_str()
+            if let Ok(parsed) = Url::parse(&url)
+                && let Some(host) = normalized_url_hostname(&parsed)
             {
-                hostnames.push(host.to_string());
+                hostnames.push(host);
             }
         }
         hostnames

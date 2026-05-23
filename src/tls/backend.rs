@@ -191,6 +191,38 @@ pub fn backend_tls_pool_key_has_svid_generation(key: &str, svid_generation: u64)
     SvidGenerationMatcher::new(svid_generation).matches(key)
 }
 
+/// Append a user/config-controlled pool-key component without letting reserved
+/// pool-key separators bleed into adjacent fields or shard suffixes.
+///
+/// Pool keys are opaque strings, but several hot-path helpers append `|` field
+/// separators and `#N` shard suffixes. Escaping `%` as well makes the encoding
+/// canonical, so a literal `%7C` cannot collide with a literal `|`.
+pub fn append_pool_key_component(buf: &mut String, component: &str) {
+    if !component
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'|' | b'#' | b'%'))
+    {
+        buf.push_str(component);
+        return;
+    }
+
+    for ch in component.chars() {
+        match ch {
+            '|' => buf.push_str("%7C"),
+            '#' => buf.push_str("%23"),
+            '%' => buf.push_str("%25"),
+            _ => buf.push(ch),
+        }
+    }
+}
+
+pub fn append_optional_pool_key_component(buf: &mut String, component: Option<&str>) {
+    if let Some(component) = component {
+        append_pool_key_component(buf, component);
+    }
+}
+
 /// Append the backend TLS identity fields that partition runtime client caches.
 ///
 /// Keep this in one place so HTTP, H2, H3, gRPC, and backend capability probes
@@ -213,13 +245,13 @@ pub fn append_backend_tls_pool_key_fields(
         BackendTlsConfig::compute_san_digest(&tls.san_allow_list),
         "BackendTlsConfig.san_allow_list_key_digest is stale; call recompute_san_digest() after mutating san_allow_list"
     );
-    buf.push_str(tls.server_ca_cert_path.as_deref().unwrap_or_default());
+    append_optional_pool_key_component(buf, tls.server_ca_cert_path.as_deref());
     buf.push('|');
-    buf.push_str(client_cert_path.unwrap_or_default());
+    append_optional_pool_key_component(buf, client_cert_path);
     buf.push('|');
-    buf.push_str(client_key_path.unwrap_or_default());
+    append_optional_pool_key_component(buf, client_key_path);
     buf.push('|');
-    buf.push_str(tls.sni.as_deref().unwrap_or_default());
+    append_optional_pool_key_component(buf, tls.sni.as_deref());
     buf.push('|');
     buf.push_str(tls.san_allow_list_key_digest.as_deref().unwrap_or_default());
     buf.push('|');
@@ -1127,6 +1159,36 @@ mod tests {
 
         assert!(key.ends_with("|svidg=static"));
         assert!(!backend_tls_pool_key_has_svid_generation(&key, 0));
+    }
+
+    #[test]
+    fn backend_tls_pool_key_fields_escape_reserved_components() {
+        let mut tls = BackendTlsConfig {
+            server_ca_cert_path: Some("/ca|with|pipes".to_string()),
+            sni: Some("backend#blue%canary.example.com".to_string()),
+            ..Default::default()
+        };
+        tls.recompute_san_digest();
+
+        let mut key = String::from("backend|443|");
+        append_backend_tls_pool_key_fields(
+            &mut key,
+            &tls,
+            Some("/client|svidg=42#cert.pem"),
+            Some("/client%key.pem"),
+            true,
+            Some(7),
+        );
+
+        assert!(key.contains("/ca%7Cwith%7Cpipes"), "{key}");
+        assert!(key.contains("backend%23blue%25canary.example.com"), "{key}");
+        assert!(key.contains("/client%7Csvidg=42%23cert.pem"), "{key}");
+        assert!(key.contains("/client%25key.pem"), "{key}");
+        assert!(backend_tls_pool_key_has_svid_generation(&key, 7));
+        assert!(
+            !backend_tls_pool_key_has_svid_generation(&key, 42),
+            "escaped client cert path must not look like an SVID generation marker: {key}"
+        );
     }
 
     #[test]

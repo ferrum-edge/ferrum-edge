@@ -348,6 +348,140 @@ mod tests {
     }
 
     #[test]
+    fn constructor_clamps_config_mutations_to_safe_bounds() {
+        let low = AdaptiveBufferTracker::new(true, true, 0, 1, 512, 64, 0);
+        assert_eq!(low.alpha_fp, 1);
+        assert_eq!(low.min_buffer_size, 1024);
+        assert_eq!(low.max_buffer_size, 1024);
+        assert_eq!(low.default_buffer_size, 1024);
+        assert_eq!(low.default_batch_limit, 1);
+
+        let high = AdaptiveBufferTracker::new(
+            true,
+            true,
+            1000,
+            2 * 1024 * 1024,
+            3 * 1024 * 1024,
+            4 * 1024 * 1024,
+            256,
+        );
+        assert_eq!(high.alpha_fp, 999);
+        assert_eq!(high.min_buffer_size, 1_048_576);
+        assert_eq!(high.max_buffer_size, 1_048_576);
+        assert_eq!(high.default_buffer_size, 1_048_576);
+        assert_eq!(high.default_batch_limit, 256);
+
+        let inverted = AdaptiveBufferTracker::new(true, true, 300, 65_536, 8192, 16_384, 64);
+        assert_eq!(inverted.min_buffer_size, 8192);
+        assert_eq!(inverted.max_buffer_size, 8192);
+        assert_eq!(inverted.default_buffer_size, 8192);
+    }
+
+    #[test]
+    fn get_buffer_size_uses_default_until_enabled_samples_exist() {
+        let tracker = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 64);
+
+        assert_eq!(tracker.get_buffer_size("missing"), 65_536);
+        tracker.record_batch_cycle("p1", 500);
+
+        assert_eq!(tracker.get_buffer_size("p1"), 65_536);
+        assert_eq!(tracker.get_batch_limit("p1"), 2000);
+    }
+
+    #[test]
+    fn disabled_buffer_recording_keeps_default_and_does_not_allocate_state() {
+        let tracker = AdaptiveBufferTracker::new(false, true, 300, 8192, 262_144, 65_536, 64);
+
+        tracker.record_connection("p1", 8 * 1024 * 1024);
+
+        assert_eq!(tracker.get_buffer_size("p1"), 65_536);
+        assert!(tracker.state.get("p1").is_none());
+    }
+
+    #[test]
+    fn connection_samples_seed_then_smooth_into_buffer_tiers() {
+        let tracker = AdaptiveBufferTracker::new(true, true, 500, 8192, 262_144, 65_536, 64);
+
+        tracker.record_connection("p1", 1024);
+        assert_eq!(tracker.get_buffer_size("p1"), 8192);
+
+        tracker.record_connection("p1", 8 * 1024 * 1024);
+        assert_eq!(tracker.get_buffer_size("p1"), 262_144);
+
+        let state = tracker.state.get("p1").expect("proxy state should exist");
+        assert_eq!(state.bytes_sample_count.load(Ordering::Relaxed), 2);
+        assert_eq!(state.bytes_ewma.load(Ordering::Relaxed), 4_194_816);
+    }
+
+    #[test]
+    fn buffer_selection_clamps_selected_tier_to_configured_bounds() {
+        let min_limited = AdaptiveBufferTracker::new(true, true, 300, 65_536, 262_144, 65_536, 64);
+        min_limited.record_connection("p1", 1024);
+        assert_eq!(min_limited.get_buffer_size("p1"), 65_536);
+
+        let max_limited = AdaptiveBufferTracker::new(true, true, 300, 8192, 32 * 1024, 8192, 64);
+        max_limited.record_connection("p1", 8 * 1024 * 1024);
+        assert_eq!(max_limited.get_buffer_size("p1"), 32 * 1024);
+    }
+
+    #[test]
+    fn jitter_bumps_buffer_tier_when_above_threshold() {
+        let tracker = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 64);
+
+        tracker.record_connection("p1", 32 * 1024);
+        tracker.record_jitter("p1", JITTER_BUMP_THRESHOLD_US);
+        assert_eq!(tracker.get_buffer_size("p1"), 32 * 1024);
+
+        tracker.record_jitter("p1", JITTER_BUMP_THRESHOLD_US + 4);
+        assert_eq!(tracker.get_buffer_size("p1"), 64 * 1024);
+    }
+
+    #[test]
+    fn batch_limit_uses_defaults_when_disabled_or_unsampled() {
+        let disabled = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 128);
+        disabled.record_batch_cycle("p1", 10_000);
+
+        assert_eq!(disabled.get_batch_limit("missing"), 128);
+        assert_eq!(disabled.get_batch_limit("p1"), 128);
+        assert!(disabled.state.get("p1").is_none());
+
+        let unsampled = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 128);
+        unsampled.record_connection("p1", 8 * 1024);
+        assert_eq!(unsampled.get_batch_limit("p1"), 128);
+    }
+
+    #[test]
+    fn batch_samples_seed_then_smooth_into_limit_tiers() {
+        let tracker = AdaptiveBufferTracker::new(true, true, 500, 8192, 262_144, 65_536, 64);
+
+        tracker.record_batch_cycle("p1", 9);
+        assert_eq!(tracker.get_batch_limit("p1"), 64);
+
+        tracker.record_batch_cycle("p1", 191);
+        assert_eq!(tracker.get_batch_limit("p1"), 2000);
+
+        tracker.record_batch_cycle("p1", 5000);
+        assert_eq!(tracker.get_batch_limit("p1"), 6000);
+
+        let state = tracker.state.get("p1").expect("proxy state should exist");
+        assert_eq!(state.dgram_sample_count.load(Ordering::Relaxed), 3);
+        assert_eq!(state.dgram_ewma.load(Ordering::Relaxed), 2550);
+    }
+
+    #[test]
+    fn prune_missing_removes_only_inactive_proxy_state() {
+        let tracker = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 64);
+
+        tracker.record_connection("keep", 1024);
+        tracker.record_batch_cycle("drop", 100);
+        tracker.record_jitter("drop", 20_000);
+        tracker.prune_missing(&["keep"]);
+
+        assert!(tracker.state.get("keep").is_some());
+        assert!(tracker.state.get("drop").is_none());
+    }
+
+    #[test]
     fn test_record_jitter_disabled() {
         let tracker = AdaptiveBufferTracker::new(false, false, 300, 8192, 262_144, 65_536, 64);
         tracker.record_jitter("p1", 15_000);

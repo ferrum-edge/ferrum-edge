@@ -55,7 +55,10 @@
 //!   continue to the backend. If false (default), unmatched requests get 404.
 
 use async_trait::async_trait;
-use http::header::{HeaderName, HeaderValue};
+use http::{
+    Method,
+    header::{HeaderName, HeaderValue},
+};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -108,6 +111,11 @@ impl ResponseMock {
 
             let method = match rule_val.get("method") {
                 Some(Value::String(method)) if !method.is_empty() => {
+                    Method::from_bytes(method.as_bytes()).map_err(|_| {
+                        format!(
+                            "response_mock: rule[{i}] 'method' must be a valid HTTP method token"
+                        )
+                    })?;
                     Some(method.to_ascii_uppercase())
                 }
                 Some(Value::String(_)) => {

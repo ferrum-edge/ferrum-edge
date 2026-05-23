@@ -19,7 +19,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::{debug, warn};
-use url::Url;
+use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::modes::mesh::config::TracingProvider;
@@ -1471,9 +1471,12 @@ fn validate_endpoint_for_provider(provider_name: &str, endpoint: &str) -> Result
             ));
         }
     }
-    url.host_str()
-        .filter(|host| !host.is_empty())
-        .map(|host| host.to_string())
+    if !has_non_empty_authority(endpoint) {
+        return Err(format!(
+            "{provider_name}: 'endpoint' must include a hostname"
+        ));
+    }
+    normalized_url_hostname(&url)
         .ok_or_else(|| format!("{provider_name}: 'endpoint' must include a hostname"))
 }
 
@@ -1488,7 +1491,7 @@ fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {
             ));
         }
     }
-    if url.host_str().is_none_or(str::is_empty) {
+    if !has_non_empty_authority(agent_url) || normalized_url_hostname(&url).is_none() {
         return Err("Datadog: 'agent_url' must include a hostname".to_string());
     }
     let path = url.path().trim_end_matches('/');
@@ -1501,6 +1504,22 @@ fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {
         url.set_path(&combined);
     }
     Ok(url.to_string())
+}
+
+fn has_non_empty_authority(raw_url: &str) -> bool {
+    raw_url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| !authority.is_empty())
+}
+
+fn normalized_url_hostname(url: &Url) -> Option<String> {
+    match url.host()? {
+        Host::Domain(host) if !host.is_empty() => Some(host.to_string()),
+        Host::Ipv4(host) => Some(host.to_string()),
+        Host::Ipv6(host) => Some(host.to_string()),
+        _ => None,
+    }
 }
 
 pub(crate) fn build_traceparent(

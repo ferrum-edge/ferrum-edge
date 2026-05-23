@@ -111,6 +111,40 @@ fn test_half_open_probe_failure_reopens() {
 }
 
 #[test]
+fn test_half_open_non_failure_status_releases_probe_slot() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 1);
+    assert!(cb.can_execute().is_err());
+
+    cb.record_failure(404, false, true);
+
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "neutral status codes must release their half-open probe slot"
+    );
+    assert!(
+        cb.can_execute().is_ok(),
+        "released neutral probe slot should admit another half-open probe"
+    );
+}
+
+#[test]
 fn test_cache_creates_and_reuses() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();
@@ -749,6 +783,55 @@ fn test_circuit_breaker_cache_max_entries_enforced() {
 }
 
 #[test]
+fn test_cache_replaces_existing_key_at_capacity_when_config_changes() {
+    let cache = CircuitBreakerCache::with_max_entries(1);
+    let config1 = default_config();
+    let config2 = CircuitBreakerConfig {
+        failure_threshold: 10,
+        ..default_config()
+    };
+
+    let cb1 = cache.get_or_create("proxy1", Some("host1:8080"), &config1);
+    cb1.record_failure(500, false, false);
+    cb1.record_failure(500, false, false);
+    cb1.record_failure(500, false, false);
+    assert_eq!(cb1.state_name(), "open");
+    assert_eq!(cache.len(), 1);
+
+    let cb2 = cache.get_or_create("proxy1", Some("host1:8080"), &config2);
+
+    assert_eq!(cache.len(), 1);
+    assert!(!Arc::ptr_eq(&cb1, &cb2));
+    assert_eq!(cb2.state_name(), "closed");
+    assert_eq!(cb2.config().failure_threshold, 10);
+}
+
+#[test]
+fn test_cache_capacity_transient_breakers_do_not_persist_state() {
+    let cache = CircuitBreakerCache::with_max_entries(1);
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        ..default_config()
+    };
+
+    cache.get_or_create("cached", Some("host1:8080"), &config);
+    assert_eq!(cache.len(), 1);
+
+    let transient = cache.get_or_create("overflow", Some("host2:8080"), &config);
+    transient.record_failure(500, false, false);
+    assert_eq!(transient.state_name(), "open");
+    assert_eq!(cache.len(), 1);
+
+    let fresh_transient = cache.get_or_create("overflow", Some("host2:8080"), &config);
+    assert_eq!(
+        fresh_transient.state_name(),
+        "closed",
+        "overflow breakers are intentionally transient and must not retain state"
+    );
+    assert!(!Arc::ptr_eq(&transient, &fresh_transient));
+}
+
+#[test]
 fn test_circuit_breaker_prune_stale_targets() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();
@@ -766,6 +849,33 @@ fn test_circuit_breaker_prune_stale_targets() {
 
     // Direct backend key (proxy2, no "::") should be preserved
     assert_eq!(cache.len(), 2); // proxy1::10.0.0.1:8080 + proxy2
+}
+
+#[test]
+fn test_snapshot_includes_direct_and_target_scoped_breakers() {
+    let cache = CircuitBreakerCache::new();
+    let config = default_config();
+
+    let direct = cache.get_or_create("proxy-direct", None, &config);
+    direct.record_failure(500, false, false);
+
+    let target = cache.get_or_create("proxy-target", Some("10.0.0.9:8080"), &config);
+    target.record_failure(500, false, false);
+    target.record_failure(500, false, false);
+    target.record_failure(500, false, false);
+    assert_eq!(target.state_name(), "open");
+
+    let snapshot = cache.snapshot();
+
+    assert!(snapshot.iter().any(|(key, state, failures, successes)| {
+        key == "proxy-direct" && *state == "closed" && *failures == 1 && *successes == 0
+    }));
+    assert!(snapshot.iter().any(|(key, state, failures, successes)| {
+        key == "proxy-target::10.0.0.9:8080"
+            && *state == "open"
+            && *failures == 3
+            && *successes == 0
+    }));
 }
 
 // ─── Timeout Boundary Tests ─────────────────────────────────────────────────

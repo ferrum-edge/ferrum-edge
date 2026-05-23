@@ -70,6 +70,20 @@ fn test_warmup_hostnames() {
 }
 
 #[test]
+fn test_warmup_hostnames_unbrackets_ipv6_function_url() {
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://[2001:db8::20]:9443/api/transform"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.warmup_hostnames(), vec!["2001:db8::20".to_string()]);
+}
+
+#[test]
 fn test_warmup_hostnames_aws() {
     let plugin = ServerlessFunction::new(
         &json!({
@@ -88,6 +102,24 @@ fn test_warmup_hostnames_aws() {
         hostnames,
         vec!["lambda.us-east-1.amazonaws.com".to_string()]
     );
+}
+
+#[test]
+fn test_warmup_hostnames_aws_endpoint_ipv6_override() {
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "aws_secret_access_key": "secret",
+            "aws_function_name": "my-function",
+            "aws_endpoint_url": "http://[2001:db8::30]:4566"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.warmup_hostnames(), vec!["2001:db8::30".to_string()]);
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +265,19 @@ fn test_non_http_url_rejects() {
     assert!(err.contains("http:// or https://"));
 }
 
+#[test]
+fn test_function_url_empty_authority_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https:///api/transform"
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("function_url"));
+    assert!(err.contains("hostname or IP address"));
+}
+
 // Regression: a malformed `aws_endpoint_url` must be rejected at plugin
 // construction (parity with `function_url` on Azure / GCP). Pre-fix the
 // override flowed straight into the Lambda invoke URL builder, so a
@@ -273,6 +318,23 @@ fn test_aws_endpoint_url_non_http_scheme_rejects() {
     ));
     assert!(err.contains("aws_endpoint_url"));
     assert!(err.contains("http:// or https://"));
+}
+
+#[test]
+fn test_aws_endpoint_url_empty_authority_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "AKIATEST",
+            "aws_secret_access_key": "secret",
+            "aws_function_name": "fn",
+            "aws_endpoint_url": "http:///lambda",
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("aws_endpoint_url"));
+    assert!(err.contains("hostname or IP address"));
 }
 
 #[test]

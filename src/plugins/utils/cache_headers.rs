@@ -35,7 +35,11 @@ const SENSITIVE_EXACT_HEADERS: &[&str] = &[
     "www-authenticate",
     "x-api-key",
     "x-amz-security-token",
+    "x-amz-request-id",
+    "x-amz-apigw-id",
+    "x-amzn-request-id",
     "x-amzn-requestid",
+    "x-amzn-trace-id",
     // Per-request trace identifiers — replaying these would splice the
     // original request's trace into every subsequent cache hit.
     "x-request-id",
@@ -118,6 +122,10 @@ mod tests {
         headers.insert("Set-Cookie".to_string(), "session=abc123".to_string());
         headers.insert("authorization".to_string(), "Bearer xyz".to_string());
         headers.insert("X-Request-Id".to_string(), "req-12345-abcdef".to_string());
+        headers.insert("X-Amz-Request-Id".to_string(), "aws-req-123".to_string());
+        headers.insert("X-Amz-Apigw-Id".to_string(), "api-gw-123".to_string());
+        headers.insert("X-Amzn-Request-Id".to_string(), "amzn-req-123".to_string());
+        headers.insert("X-Amzn-Trace-Id".to_string(), "Root=1-abc".to_string());
         headers.insert("X-AI-RateLimit-Remaining".to_string(), "42".to_string());
         headers.insert("retry-after".to_string(), "30".to_string());
         headers.insert("x-custom-app-header".to_string(), "keep-me".to_string());
@@ -136,6 +144,10 @@ mod tests {
         assert!(!sanitized.contains_key("Set-Cookie"));
         assert!(!sanitized.contains_key("authorization"));
         assert!(!sanitized.contains_key("X-Request-Id"));
+        assert!(!sanitized.contains_key("X-Amz-Request-Id"));
+        assert!(!sanitized.contains_key("X-Amz-Apigw-Id"));
+        assert!(!sanitized.contains_key("X-Amzn-Request-Id"));
+        assert!(!sanitized.contains_key("X-Amzn-Trace-Id"));
         assert!(!sanitized.contains_key("X-AI-RateLimit-Remaining"));
         assert!(!sanitized.contains_key("retry-after"));
     }

@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{info, warn};
-use url::Url;
+use url::{Host, Url};
 
 /// Configuration parsed from a plugin's JSON config for Redis connectivity.
 ///
@@ -118,6 +118,7 @@ impl RedisConfig {
                     .to_string(),
             );
         }
+        validate_redis_url(url)?;
 
         let tls = parse_optional_bool(object, "redis_tls")?.unwrap_or(false);
         let key_prefix = parse_optional_string(object, "redis_key_prefix")?
@@ -184,14 +185,14 @@ impl RedisConfig {
     /// Returns `None` if the URL cannot be parsed or uses an IP address directly.
     pub fn hostname(&self) -> Option<String> {
         let url = Url::parse(&self.effective_url()).ok()?;
-        let host = url.host_str()?;
+        let host = normalized_url_hostname(&url)?;
 
         // Skip if it's already an IP address
         if host.parse::<std::net::IpAddr>().is_ok() {
             return None;
         }
 
-        Some(host.to_string())
+        Some(host)
     }
 
     /// Build a Redis URL with a resolved IP address substituted for the hostname.
@@ -224,6 +225,39 @@ impl RedisConfig {
         }
 
         parsed.to_string()
+    }
+}
+
+fn validate_redis_url(raw_url: &str) -> Result<(), String> {
+    let parsed = Url::parse(raw_url)
+        .map_err(|e| format!("redis rate limiter: 'redis_url' must be a valid URL: {e}"))?;
+    match parsed.scheme() {
+        "redis" | "rediss" => {}
+        scheme => {
+            return Err(format!(
+                "redis rate limiter: 'redis_url' scheme must be redis or rediss, got: {scheme}"
+            ));
+        }
+    }
+    if !has_non_empty_authority(raw_url) || normalized_url_hostname(&parsed).is_none() {
+        return Err("redis rate limiter: 'redis_url' must include a hostname".to_string());
+    }
+    Ok(())
+}
+
+fn has_non_empty_authority(raw_url: &str) -> bool {
+    raw_url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| !authority.is_empty())
+}
+
+fn normalized_url_hostname(url: &Url) -> Option<String> {
+    match url.host()? {
+        Host::Domain(host) if !host.is_empty() => Some(host.to_string()),
+        Host::Ipv4(host) => Some(host.to_string()),
+        Host::Ipv6(host) => Some(host.to_string()),
+        _ => None,
     }
 }
 

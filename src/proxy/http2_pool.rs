@@ -26,7 +26,8 @@ use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
     BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
-    append_backend_tls_pool_key_fields, backend_svid_generation_for_client_cert,
+    append_backend_tls_pool_key_fields, append_optional_pool_key_component,
+    append_pool_key_component, backend_svid_generation_for_client_cert,
 };
 
 thread_local! {
@@ -81,14 +82,15 @@ fn write_http2_pool_key(
 ) {
     use std::fmt::Write;
     buf.clear();
-    let _ = write!(buf, "{}|{}|", host, port);
-    buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
+    append_pool_key_component(buf, host);
+    let _ = write!(buf, "|{port}|");
+    append_optional_pool_key_component(buf, proxy.dns_override.as_deref());
     buf.push('|');
     // Subset name partitions H2 pools so two proxies that share
     // `(host, port, dns_override)` but select different DestinationRule
     // subsets cannot share an H2 sender even when their TLS material is
     // byte-identical. Empty when the proxy has no `upstream_subset`.
-    buf.push_str(proxy.upstream_subset.as_deref().unwrap_or_default());
+    append_optional_pool_key_component(buf, proxy.upstream_subset.as_deref());
     buf.push('|');
     append_backend_tls_pool_key_fields(
         buf,

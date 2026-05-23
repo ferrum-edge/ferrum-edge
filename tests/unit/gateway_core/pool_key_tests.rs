@@ -15,6 +15,7 @@ use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::http3::client::Http3ConnectionPool;
 use ferrum_edge::proxy::backend_capabilities::{capability_key, capability_key_for_proxy_target};
+use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
 use ferrum_edge::proxy::http2_pool::Http2ConnectionPool;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -133,6 +134,21 @@ fn pool_with_workload_svid_generation(generation: Arc<AtomicU64>) -> ConnectionP
         Arc::new(Vec::new()),
         generation,
     )
+}
+
+fn runtime_pool_keys(pool: &ConnectionPool, proxy: &Proxy) -> Vec<(&'static str, String)> {
+    vec![
+        ("ConnectionPool", pool.pool_key_for_warmup(proxy)),
+        ("H2 pool", Http2ConnectionPool::pool_key_for_warmup(proxy)),
+        ("gRPC pool", GrpcConnectionPool::pool_key_for_warmup(proxy)),
+        ("H3 pool", Http3ConnectionPool::pool_key(proxy, 0)),
+    ]
+}
+
+fn pool_family_keys(pool: &ConnectionPool, proxy: &Proxy) -> Vec<(&'static str, String)> {
+    let mut keys = runtime_pool_keys(pool, proxy);
+    keys.push(("capabilities", capability_key(proxy)));
+    keys
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,6 +1250,72 @@ async fn all_three_pools_use_pipe_delimiter() {
         assert!(
             key.contains("||"),
             "{name} key should include empty SAN-digest field: {key}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pool_keys_escape_reserved_dns_subset_components() {
+    let conn_pool = pool_with_defaults();
+
+    let mut left = minimal_proxy();
+    left.upstream_id = Some("shared|upstream".to_string());
+    left.dns_override = Some("10.0.0.1|blue".to_string());
+    left.upstream_subset = Some("canary#1%live".to_string());
+
+    let mut right = minimal_proxy();
+    right.upstream_id = left.upstream_id.clone();
+    right.dns_override = Some("10.0.0.1".to_string());
+    right.upstream_subset = Some("blue|canary#1%live".to_string());
+
+    let left_keys = runtime_pool_keys(&conn_pool, &left);
+    let right_keys = runtime_pool_keys(&conn_pool, &right);
+
+    for ((left_name, left_key), (right_name, right_key)) in left_keys.iter().zip(right_keys.iter())
+    {
+        assert_eq!(left_name, right_name);
+        assert_ne!(
+            left_key, right_key,
+            "{left_name} must not let dns_override/upstream_subset delimiters collide: {left_key} vs {right_key}"
+        );
+        assert!(
+            left_key.contains("%7C") && left_key.contains("%23") && left_key.contains("%25"),
+            "{left_name} should escape reserved key delimiters: {left_key}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pool_keys_escape_reserved_tls_identity_components() {
+    let conn_pool = pool_with_defaults();
+
+    let mut left = minimal_proxy();
+    left.backend_scheme = Some(BackendScheme::Https);
+    left.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    left.resolved_tls.server_ca_cert_path = Some("/ca|client".to_string());
+    left.resolved_tls.client_cert_path = Some("/cert#blue".to_string());
+    left.resolved_tls.client_key_path = Some("/key%raw".to_string());
+
+    let mut right = minimal_proxy();
+    right.backend_scheme = Some(BackendScheme::Https);
+    right.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    right.resolved_tls.server_ca_cert_path = Some("/ca".to_string());
+    right.resolved_tls.client_cert_path = Some("client|/cert#blue".to_string());
+    right.resolved_tls.client_key_path = Some("/key%raw".to_string());
+
+    let left_keys = pool_family_keys(&conn_pool, &left);
+    let right_keys = pool_family_keys(&conn_pool, &right);
+
+    for ((left_name, left_key), (right_name, right_key)) in left_keys.iter().zip(right_keys.iter())
+    {
+        assert_eq!(left_name, right_name);
+        assert_ne!(
+            left_key, right_key,
+            "{left_name} must not let backend TLS identity delimiters collide: {left_key} vs {right_key}"
+        );
+        assert!(
+            left_key.contains("%7C") && left_key.contains("%23") && left_key.contains("%25"),
+            "{left_name} should escape reserved TLS key delimiters: {left_key}"
         );
     }
 }

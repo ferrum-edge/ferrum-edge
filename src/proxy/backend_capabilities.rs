@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::types::{BackendScheme, Proxy, UpstreamTarget};
+use crate::tls::backend::{append_optional_pool_key_component, append_pool_key_component};
 
 thread_local! {
     /// Reused per-thread buffer for capability-key lookups on the request hot
@@ -345,7 +346,8 @@ pub fn capability_key(proxy: &Proxy) -> String {
 ///
 /// Key shape:
 /// `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=static|hbone_port`.
-/// `|` delimiter matches the pool-key conventions in the rest of the code.
+/// `|` delimiter matches the pool-key conventions in the rest of the code;
+/// user/config-controlled components are escaped before separators are appended.
 /// The HBONE port field is populated only when the upstream target opts into
 /// HBONE; direct backend capability observations remain shared for ordinary
 /// targets that use the same connection identity.
@@ -358,14 +360,12 @@ fn write_capability_key(buf: &mut String, proxy: &Proxy, target: Option<&Upstrea
     let hbone_port = target
         .filter(|t| crate::proxy::hbone_pool::target_hbone_enabled(t))
         .map(crate::proxy::hbone_pool::target_hbone_port);
-    let _ = write!(
-        buf,
-        "{}|{}|{}|{}|",
-        scheme.to_scheme_str(),
-        host,
-        port,
-        proxy.dns_override.as_deref().unwrap_or_default(),
-    );
+    buf.push_str(scheme.to_scheme_str());
+    buf.push('|');
+    append_pool_key_component(buf, host);
+    let _ = write!(buf, "|{port}|");
+    append_optional_pool_key_component(buf, proxy.dns_override.as_deref());
+    buf.push('|');
     crate::tls::backend::append_backend_tls_pool_key_fields(
         buf,
         &proxy.resolved_tls,

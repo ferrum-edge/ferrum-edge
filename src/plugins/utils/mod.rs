@@ -22,6 +22,7 @@ pub mod redis_rate_limiter;
 pub mod response_body;
 pub mod route_header_transform;
 pub mod size_limit;
+pub mod socket_host;
 pub mod sse;
 pub mod tcp_endpoint;
 pub mod transformer_gate;
@@ -35,5 +36,6 @@ pub use log_helpers::{
     BatchConfigDefaults, SummaryLogEntry, build_batch_config, handle_http_batch_response,
     parse_http_endpoint, validate_batch_config,
 };
+pub use socket_host::{parse_socket_host, socket_addr_lookup_input};
 pub use tcp_endpoint::resolve_tcp_endpoint;
 pub use udp_endpoint::{UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, resolve_udp_endpoint};

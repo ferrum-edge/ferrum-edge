@@ -342,6 +342,41 @@ async fn test_jwks_auth_rejects_invalid_jwks_url() {
 }
 
 #[tokio::test]
+async fn test_jwks_auth_rejects_empty_authority_jwks_uri() {
+    let result = JwksAuth::new(
+        &json!({"providers": [{"jwks_uri": "https:///jwks.json"}]}),
+        default_client(),
+    );
+    assert!(result.is_err());
+    let err = result.as_ref().err().unwrap();
+    assert!(err.contains("jwks_uri"), "got: {err}");
+    assert!(err.contains("hostname"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_jwks_auth_rejects_empty_authority_discovery_url() {
+    let result = JwksAuth::new(
+        &json!({"providers": [{"discovery_url": "https:///.well-known/openid-configuration"}]}),
+        default_client(),
+    );
+    assert!(result.is_err());
+    let err = result.as_ref().err().unwrap();
+    assert!(err.contains("discovery_url"), "got: {err}");
+    assert!(err.contains("hostname"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_jwks_auth_warmup_hostnames_unbrackets_ipv6_literal() {
+    let plugin = JwksAuth::new(
+        &json!({"providers": [{"jwks_uri": "https://[2001:db8::40]/jwks.json"}]}),
+        default_client(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.warmup_hostnames(), vec!["2001:db8::40".to_string()]);
+}
+
+#[tokio::test]
 async fn test_jwks_auth_rejects_invalid_claim_path() {
     let mock_server = wiremock::MockServer::start().await;
     let result = JwksAuth::new(

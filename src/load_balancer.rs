@@ -521,26 +521,22 @@ impl LoadBalancerCache {
         algorithm: LoadBalancerAlgorithm,
         hash_on: Option<String>,
     ) -> Arc<LoadBalancerCacheInner> {
+        let Some(existing_upstream) = current.upstreams.get(upstream_id) else {
+            return Arc::new(LoadBalancerCacheInner {
+                balancers: current.balancers.clone(),
+                upstreams: current.upstreams.clone(),
+            });
+        };
+
         // Clone-and-patch both maps, then swap as a single unit
         let mut new_balancers = current.balancers.clone();
-        let existing_subsets = current
-            .upstreams
-            .get(upstream_id)
-            .and_then(|upstream| upstream.subsets.as_deref())
+        let existing_subsets = existing_upstream
+            .subsets
+            .as_deref()
             .map(|subsets| subsets.to_vec());
-        let existing_port_overrides = current
-            .upstreams
-            .get(upstream_id)
-            .map(|upstream| upstream.port_overrides.clone())
-            .unwrap_or_default();
-        let existing_source_locality = current
-            .upstreams
-            .get(upstream_id)
-            .and_then(|upstream| upstream.source_locality.clone());
-        let existing_locality_lb_setting = current
-            .upstreams
-            .get(upstream_id)
-            .and_then(|upstream| upstream.locality_lb_setting.clone());
+        let existing_port_overrides = existing_upstream.port_overrides.clone();
+        let existing_source_locality = existing_upstream.source_locality.clone();
+        let existing_locality_lb_setting = existing_upstream.locality_lb_setting.clone();
         new_balancers.insert(
             upstream_id.to_string(),
             Arc::new(LoadBalancer::with_subsets_and_port_overrides(
@@ -556,11 +552,9 @@ impl LoadBalancerCache {
         );
 
         let mut new_upstreams = current.upstreams.clone();
-        if let Some(existing) = new_upstreams.get(upstream_id) {
-            let mut updated = (**existing).clone();
-            updated.targets = new_targets;
-            new_upstreams.insert(upstream_id.to_string(), Arc::new(updated));
-        }
+        let mut updated = (**existing_upstream).clone();
+        updated.targets = new_targets;
+        new_upstreams.insert(upstream_id.to_string(), Arc::new(updated));
 
         Arc::new(LoadBalancerCacheInner {
             balancers: new_balancers,

@@ -117,6 +117,16 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+/// Hyper's HTTP/1 parser panics when `max_buf_size` is below 8 KiB. Ferrum's
+/// configured logical header limit may be lower; keep the parser floor safe
+/// and enforce the operator's lower limit in `check_protocol_headers`.
+const HYPER_HTTP1_MIN_MAX_BUF_SIZE: usize = 8 * 1024;
+
+#[inline]
+fn http1_parser_max_buf_size(configured_header_limit: usize) -> usize {
+    configured_header_limit.max(HYPER_HTTP1_MIN_MAX_BUF_SIZE)
+}
+
 /// Metadata key set on the request context for the duration of
 /// `apply_after_proxy_hooks_to_rejection`. Plugins that wire
 /// `applies_after_proxy_on_reject() -> true` can read this key from
@@ -846,6 +856,16 @@ pub(crate) fn should_bypass_h2_coalesce_for_large_response(
     len >= LARGE_H2_BYPASS_THRESHOLD && within_limit
 }
 
+/// Keep H2 transport header-list enforcement from resetting the stream before
+/// Ferrum's configured total-header validator can produce a protocol-aware 431.
+fn h2_parser_max_header_list_size(max_header_size_bytes: usize) -> u32 {
+    const MIN_H2_HEADER_LIST_SIZE: usize = 16 * 1024;
+
+    max_header_size_bytes
+        .max(MIN_H2_HEADER_LIST_SIZE)
+        .min(u32::MAX as usize) as u32
+}
+
 fn warn_if_h3_backend_tls_policy_incompatible(
     config: &GatewayConfig,
     tls_policy: Option<&TlsPolicy>,
@@ -1329,9 +1349,49 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
     val.push_str(proto);
     if let Some(h) = host {
         val.push_str(";host=");
-        val.push_str(h);
+        push_forwarded_param_value(&mut val, h);
     }
     val
+}
+
+fn push_forwarded_param_value(buf: &mut String, value: &str) {
+    if is_forwarded_token(value) {
+        buf.push_str(value);
+        return;
+    }
+
+    buf.push('"');
+    for ch in value.chars() {
+        if ch == '"' || ch == '\\' {
+            buf.push('\\');
+        }
+        buf.push(ch);
+    }
+    buf.push('"');
+}
+
+fn is_forwarded_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 pub(crate) async fn apply_request_body_plugins(
@@ -3716,12 +3776,7 @@ impl ProxyState {
         delta: &crate::config_delta::ConfigDelta,
     ) -> Result<StagedRequestEpoch, String> {
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
-        let rebuild_globals = delta
-            .added_plugin_configs
-            .iter()
-            .chain(delta.modified_plugin_configs.iter())
-            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
-            || !delta.removed_plugin_config_ids.is_empty();
+        let rebuild_globals = delta.global_plugin_configs_changed;
         let route_changed = Self::delta_routes_changed(delta, &current.config);
         let consumer_changed = Self::delta_consumers_changed(delta);
         let lb_changed = Self::delta_load_balancers_changed(delta);
@@ -4581,7 +4636,7 @@ async fn handle_connection(
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     {
         let mut http1 = builder.http1();
-        http1.max_buf_size(state.max_header_size_bytes);
+        http1.max_buf_size(http1_parser_max_buf_size(state.max_header_size_bytes));
         http1.writev(true);
         // Slowloris protection: close connections that take too long to send headers.
         if state.env_config.http_header_read_timeout_seconds > 0 {
@@ -4593,7 +4648,7 @@ async fn handle_connection(
     }
     builder
         .http2()
-        .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
+        .max_header_list_size(h2_parser_max_header_list_size(state.max_header_size_bytes))
         .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
         .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
         .adaptive_window(false)
@@ -5295,12 +5350,16 @@ async fn handle_websocket_request_authenticated(
 /// Hop-by-hop headers and WebSocket handshake headers are excluded.
 #[cfg(test)]
 fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     headers
         .iter()
         .filter_map(|(name, value)| {
             let lower_name = name.to_ascii_lowercase();
             if headers_mod::is_backend_request_strip_header(lower_name.as_str())
                 || is_websocket_backend_strip_header(lower_name.as_str())
+                || connection_listed_strip
+                    .iter()
+                    .any(|listed| listed == lower_name.as_str())
             {
                 return None;
             }
@@ -5324,11 +5383,20 @@ fn collect_forwardable_websocket_headers(
 ) -> Vec<(String, String)> {
     let mut forwarded = Vec::new();
     let mut preserved_raw_names = HashSet::new();
+    let raw_connection_listed_strip = headers_mod::parse_connection_listed_headers(raw_headers);
+    let proxy_connection_listed_strip =
+        headers_mod::parse_connection_listed_from_str_map(proxy_headers);
 
     for name in raw_headers.keys() {
         let lower_name = name.as_str().to_ascii_lowercase();
         if headers_mod::is_backend_request_strip_header(lower_name.as_str())
             || is_websocket_backend_strip_header(lower_name.as_str())
+            || raw_connection_listed_strip
+                .iter()
+                .any(|listed| listed.as_str() == lower_name.as_str())
+            || proxy_connection_listed_strip
+                .iter()
+                .any(|listed| listed == lower_name.as_str())
         {
             continue;
         }
@@ -5361,6 +5429,12 @@ fn collect_forwardable_websocket_headers(
         if preserved_raw_names.contains(lower_name.as_str())
             || headers_mod::is_backend_request_strip_header(lower_name.as_str())
             || is_websocket_backend_strip_header(lower_name.as_str())
+            || raw_connection_listed_strip
+                .iter()
+                .any(|listed| listed.as_str() == lower_name.as_str())
+            || proxy_connection_listed_strip
+                .iter()
+                .any(|listed| listed == lower_name.as_str())
         {
             continue;
         }
@@ -5435,6 +5509,59 @@ fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, Str
     headers.remove("x-consumer-custom-id");
 }
 
+#[derive(Clone, Copy)]
+struct BackendPathLayout {
+    is_root: bool,
+    needs_leading_slash: bool,
+    needs_between_slash: bool,
+    len: usize,
+}
+
+fn backend_path_layout(backend_path: &str, remaining_path: &str) -> BackendPathLayout {
+    let is_root = backend_path.is_empty() && remaining_path.is_empty();
+    let combined_starts_with_slash = if !backend_path.is_empty() {
+        backend_path.starts_with('/')
+    } else {
+        remaining_path.starts_with('/')
+    };
+    let needs_leading_slash = !is_root && !combined_starts_with_slash;
+    let needs_between_slash = !backend_path.is_empty()
+        && !remaining_path.is_empty()
+        && !backend_path.ends_with('/')
+        && !remaining_path.starts_with('/');
+    let len = if is_root {
+        1
+    } else {
+        (if needs_leading_slash { 1 } else { 0 })
+            + backend_path.len()
+            + (if needs_between_slash { 1 } else { 0 })
+            + remaining_path.len()
+    };
+
+    BackendPathLayout {
+        is_root,
+        needs_leading_slash,
+        needs_between_slash,
+        len,
+    }
+}
+
+fn push_backend_path(url: &mut String, backend_path: &str, remaining_path: &str) {
+    let layout = backend_path_layout(backend_path, remaining_path);
+    if layout.is_root {
+        url.push('/');
+        return;
+    }
+    if layout.needs_leading_slash {
+        url.push('/');
+    }
+    url.push_str(backend_path);
+    if layout.needs_between_slash {
+        url.push('/');
+    }
+    url.push_str(remaining_path);
+}
+
 /// Build a WebSocket backend URL using a specific target host/port,
 /// respecting strip_listen_path, backend_path, and query string.
 ///
@@ -5470,29 +5597,14 @@ pub(crate) fn build_websocket_backend_url_with_target(
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
-    // Both empty means path is just "/"
-    let path_is_root = backend_path.is_empty() && remaining_path.is_empty();
-
-    // Determine if we need to prepend a '/'. The first byte of the combined
-    // path is determined by backend_path (if non-empty) or remaining_path.
-    let combined_starts_with_slash = if !backend_path.is_empty() {
-        backend_path.starts_with('/')
-    } else {
-        remaining_path.starts_with('/')
-    };
-    let needs_leading_slash = !path_is_root && !combined_starts_with_slash;
+    let path_layout = backend_path_layout(backend_path, remaining_path);
 
     // Pre-calculate capacity and build in a single buffer.
-    let path_len = if path_is_root {
-        1
-    } else {
-        (if needs_leading_slash { 1 } else { 0 }) + backend_path.len() + remaining_path.len()
-    };
     let capacity = scheme.len()
         + 3 // "://"
         + host.len()
         + 6 // ":PORT" (max 5 digits + colon)
-        + path_len
+        + path_layout.len
         + if query_string.is_empty() {
             0
         } else {
@@ -5501,16 +5613,7 @@ pub(crate) fn build_websocket_backend_url_with_target(
 
     let mut url = String::with_capacity(capacity);
     let _ = write!(url, "{}://{}:{}", scheme, host, port);
-
-    if path_is_root {
-        url.push('/');
-    } else {
-        if needs_leading_slash {
-            url.push('/');
-        }
-        url.push_str(backend_path);
-        url.push_str(remaining_path);
-    }
+    push_backend_path(&mut url, backend_path, remaining_path);
 
     if !query_string.is_empty() {
         url.push('?');
@@ -7148,7 +7251,7 @@ async fn handle_tls_connection(
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     {
         let mut http1 = builder.http1();
-        http1.max_buf_size(state.max_header_size_bytes);
+        http1.max_buf_size(http1_parser_max_buf_size(state.max_header_size_bytes));
         http1.writev(true);
         // Slowloris protection: close connections that take too long to send headers.
         if state.env_config.http_header_read_timeout_seconds > 0 {
@@ -7160,7 +7263,7 @@ async fn handle_tls_connection(
     }
     builder
         .http2()
-        .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
+        .max_header_list_size(h2_parser_max_header_list_size(state.max_header_size_bytes))
         .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
         .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
         .adaptive_window(false)
@@ -7909,10 +8012,8 @@ async fn handle_proxy_request_inner(
     }
 
     // Validate query parameter count (skip empty segments from consecutive '&').
-    // Uses split + filter instead of a raw byte-scan to correctly handle edge
-    // cases like "&&" producing empty segments that shouldn't count as params.
     if state.max_query_params > 0 && !query_string.is_empty() {
-        let param_count = query_string.split('&').filter(|s| !s.is_empty()).count();
+        let param_count = count_query_params(&query_string);
         if param_count > state.max_query_params {
             record_request(&state, 400);
             return Ok(build_response(
@@ -8055,11 +8156,13 @@ async fn handle_proxy_request_inner(
 
     // Per-IP concurrent request limiting. The guard auto-decrements on drop,
     // covering all 30+ return paths without manual tracking.
-    let _per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
-        let count = counts
-            .entry(ctx.client_ip.clone())
-            .or_insert_with(|| AtomicU64::new(0));
-        let current = count.value().fetch_add(1, Ordering::Relaxed) + 1;
+    let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
+        let current = {
+            let count = counts
+                .entry(ctx.client_ip.clone())
+                .or_insert_with(|| AtomicU64::new(0));
+            count.value().fetch_add(1, Ordering::Relaxed) + 1
+        };
         let guard = Some(PerIpRequestGuard {
             ip: ctx.client_ip.clone(),
             counts: counts.clone(),
@@ -10051,6 +10154,7 @@ async fn handle_proxy_request_inner(
                     retained_body.as_deref(),
                     &ctx.client_ip,
                     is_tls,
+                    inbound_version,
                 )
                 .await
             } else {
@@ -10149,6 +10253,7 @@ async fn handle_proxy_request_inner(
         final_cb_target_key.as_deref(),
         response_status,
         backend_resp.connection_error,
+        backend_error_class,
         cb_retry_probe_slot_available,
         skip_final_cb_record,
         backend_start.elapsed(),
@@ -10711,6 +10816,12 @@ async fn handle_proxy_request_inner(
     // body reaches a terminal state (completion, streaming error, or client
     // disconnect via the Drop safety net) rather than at header-flush time.
     // `deferred_logger` is `Some` only for streaming responses with plugins.
+    let body = if let Some(guard) = per_ip_guard {
+        body.with_per_ip_request_guard(guard)
+    } else {
+        body
+    };
+
     let mut body = if let Some(logger) = deferred_logger {
         body.with_logger(logger)
     } else {
@@ -10801,25 +10912,15 @@ pub fn build_backend_url_with_target(
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
-    // Both empty means path is just "/"
-    let path_is_root = backend_path.is_empty() && remaining_path.is_empty();
-
-    // Determine if we need to prepend a '/' (when neither segment starts with one)
-    let needs_leading_slash =
-        !path_is_root && !backend_path.starts_with('/') && !remaining_path.starts_with('/');
+    let path_layout = backend_path_layout(backend_path, remaining_path);
 
     // Build URL in a single buffer, writing the path segments directly to avoid
     // an intermediate `full_path` String allocation from format!().
-    let path_len = if path_is_root {
-        1
-    } else {
-        (if needs_leading_slash { 1 } else { 0 }) + backend_path.len() + remaining_path.len()
-    };
     let capacity = scheme.len()
         + 3
         + host.len()
         + 6
-        + path_len
+        + path_layout.len
         + if query_string.is_empty() {
             0
         } else {
@@ -10828,15 +10929,7 @@ pub fn build_backend_url_with_target(
     let mut url = String::with_capacity(capacity);
     let _ = write!(url, "{}://{}:{}", scheme, host, port);
 
-    if path_is_root {
-        url.push('/');
-    } else {
-        if needs_leading_slash {
-            url.push('/');
-        }
-        url.push_str(backend_path);
-        url.push_str(remaining_path);
-    }
+    push_backend_path(&mut url, backend_path, remaining_path);
 
     if !query_string.is_empty() {
         url.push('?');
@@ -11114,6 +11207,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
@@ -11463,6 +11557,8 @@ async fn proxy_to_backend(
             ctx,
             upstream_target,
             client_ip,
+            is_tls,
+            inbound_version,
             stream_request_body,
             retain_request_body,
             stream_response,
@@ -11739,6 +11835,7 @@ async fn proxy_to_backend(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
@@ -12297,6 +12394,14 @@ pub(crate) fn strip_query_params(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
 }
 
+/// Count query parameters for global request validation.
+///
+/// Empty segments produced by duplicate or leading/trailing ampersands are not
+/// parameters and must not make otherwise equivalent H1/H2/H3 requests diverge.
+pub(crate) fn count_query_params(query_string: &str) -> usize {
+    query_string.split('&').filter(|s| !s.is_empty()).count()
+}
+
 pub(crate) fn query_string_after_plugin_strips<'a>(
     ctx: &RequestContext,
     query_string: &'a str,
@@ -12653,7 +12758,10 @@ pub fn check_host_authority_consistency(
 ///    duplicate Host headers MUST be rejected with 400 to prevent host-header routing
 ///    confusion between the proxy and backend.
 ///
-/// 4. **TE header validation** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and RFC 9114 §4.2 —
+/// 4. **Transfer-Encoding rejection** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and
+///    RFC 9114 §4.2 forbid this HTTP/1.x framing header on multiplexed protocols.
+///
+/// 5. **TE header validation** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and RFC 9114 §4.2 —
 ///    the only permitted value is "trailers"; any other value (or an empty list element
 ///    such as `,trailers` / `trailers,`) is a protocol violation that could be used to
 ///    confuse intermediaries that translate H2/H3 to HTTP/1.x.
@@ -12726,7 +12834,14 @@ pub fn check_protocol_headers(
         }
     }
 
-    // 4. TE header in HTTP/2 and HTTP/3 must be "trailers" only
+    // 4. HTTP/2 and HTTP/3 must not carry HTTP/1.x Transfer-Encoding.
+    if (version == hyper::Version::HTTP_2 || version == hyper::Version::HTTP_3)
+        && headers.contains_key("transfer-encoding")
+    {
+        return Some(r#"{"error":"HTTP/2 and HTTP/3 do not support Transfer-Encoding"}"#);
+    }
+
+    // 5. TE header in HTTP/2 and HTTP/3 must be "trailers" only
     // (RFC 9113 §8.2.2 for HTTP/2, RFC 9114 §4.2 for HTTP/3).
     // Iterate all TE header entries and comma-separated tokens within each entry.
     // A request with `te: trailers` plus a second `te: gzip` entry (or a single
@@ -13537,13 +13652,19 @@ async fn proxy_to_backend_http2(
     }
 }
 
+struct Http3BackendHeaderContext<'a> {
+    client_ip: &'a str,
+    effective_host: &'a str,
+    is_tls: bool,
+    inbound_version: hyper::Version,
+    content_length: Option<&'a str>,
+}
+
 fn build_http3_backend_headers(
     state: &ProxyState,
     proxy: &Proxy,
     headers: &HashMap<String, String>,
-    client_ip: &str,
-    effective_host: &str,
-    content_length: Option<&str>,
+    ctx: Http3BackendHeaderContext<'_>,
 ) -> Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> {
     let mut http3_headers = Vec::with_capacity(headers.len() + 5);
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
@@ -13556,6 +13677,13 @@ fn build_http3_backend_headers(
             // when the client used H1 — strip on the way out so the H3
             // backend never sees the listed names.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            // The gateway re-emits proxy-managed forwarding metadata below.
+            // Do not let client-supplied values appear first on native H3
+            // backend requests, where duplicate header ordering can make a
+            // backend consume the spoofed value instead of Ferrum's canonical
+            // value.
+            "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" => continue,
+            "forwarded" if state.add_forwarded_header => continue,
             "host" => {
                 // Apply per-route `preserve_host_header` override on the
                 // first-attempt H3-native backend path. Mirrors
@@ -13569,7 +13697,7 @@ fn build_http3_backend_headers(
                 let host_value = if proxy.preserve_host_header {
                     value.as_str()
                 } else {
-                    effective_host
+                    ctx.effective_host
                 };
                 if let Ok(hv) = host_value.parse::<hyper::header::HeaderValue>() {
                     http3_headers.push((hyper::header::HOST, hv));
@@ -13585,20 +13713,21 @@ fn build_http3_backend_headers(
         }
     }
 
-    if let Some(content_length) = content_length
+    if let Some(content_length) = ctx.content_length
         && let Ok(content_length) = content_length.parse()
     {
         http3_headers.push((hyper::header::CONTENT_LENGTH, content_length));
     }
 
     if let Some(xff) = headers.get("x-forwarded-for") {
-        if let Ok(v) = format!("{}, {}", xff, client_ip).parse() {
+        if let Ok(v) = format!("{}, {}", xff, ctx.client_ip).parse() {
             http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
         }
-    } else if let Ok(v) = client_ip.parse() {
+    } else if let Ok(v) = ctx.client_ip.parse() {
         http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
     }
-    if let Ok(v) = "https".parse() {
+    let proto = if ctx.is_tls { "https" } else { "http" };
+    if let Ok(v) = proto.parse() {
         http3_headers.push((
             hyper::header::HeaderName::from_static("x-forwarded-proto"),
             v,
@@ -13612,14 +13741,17 @@ fn build_http3_backend_headers(
             v,
         ));
     }
-    if let Some(ref via) = state.via_header_http3
+    if let Some(via) = via_header_for_inbound_version(state, ctx.inbound_version)
         && let Ok(v) = via.parse()
     {
         http3_headers.push((hyper::header::HeaderName::from_static("via"), v));
     }
     if state.add_forwarded_header {
-        let fwd =
-            build_forwarded_value(client_ip, "https", headers.get("host").map(|s| s.as_str()));
+        let fwd = build_forwarded_value(
+            ctx.client_ip,
+            proto,
+            headers.get("host").map(|s| s.as_str()),
+        );
         if let Ok(v) = fwd.parse() {
             http3_headers.push((hyper::header::HeaderName::from_static("forwarded"), v));
         }
@@ -13641,6 +13773,8 @@ async fn proxy_to_backend_http3(
     ctx: Option<&mut RequestContext>,
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
+    is_tls: bool,
+    inbound_version: hyper::Version,
     stream_request_body: bool,
     retain_request_body: bool,
     stream_response: bool,
@@ -13698,9 +13832,13 @@ async fn proxy_to_backend_http3(
                     state,
                     proxy,
                     headers,
-                    client_ip,
-                    effective_host,
-                    headers.get("content-length").map(String::as_str),
+                    Http3BackendHeaderContext {
+                        client_ip,
+                        effective_host,
+                        is_tls,
+                        inbound_version,
+                        content_length: headers.get("content-length").map(String::as_str),
+                    },
                 );
 
                 let h3_result = if let Some(target) = upstream_target {
@@ -14054,9 +14192,13 @@ async fn proxy_to_backend_http3(
         state,
         proxy,
         headers,
-        client_ip,
-        effective_host,
-        request_content_length.as_deref(),
+        Http3BackendHeaderContext {
+            client_ip,
+            effective_host,
+            is_tls,
+            inbound_version,
+            content_length: request_content_length.as_deref(),
+        },
     );
 
     // `Bytes::from(Vec<u8>)` transfers ownership without copying. Convert
@@ -14328,6 +14470,7 @@ async fn proxy_to_backend_http3_retry(
     request_body: Option<&[u8]>,
     client_ip: &str,
     is_tls: bool,
+    inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
     // reqwest dispatch receives `upstream_target` separately, so it only
     // needs per-port timeout rebasing. gRPC/direct-H2 pool paths use
@@ -14354,66 +14497,18 @@ async fn proxy_to_backend_http3_retry(
         .ok()
         .map(|ip| ip.to_string());
 
-    // Build HTTP/3 headers from the saved headers map
-    let mut http3_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
-        Vec::new();
-    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
-    for (name, value) in headers {
-        match name.as_str() {
-            // Hop-by-hop headers per RFC 9110 §7.6.1, plus content-length
-            // (h3 frames the body via QUIC streams so any forwarded value
-            // is informational and risks mismatch with body length when
-            // a request_transformer plugin mutated the body).
-            n if headers_mod::is_backend_request_strip_header(n) => continue,
-            // RFC 9110 §7.6.1 also requires stripping every header NAMED
-            // in the request's `Connection` field — see
-            // `parse_connection_listed_from_str_map`.
-            n if connection_listed_strip.iter().any(|s| s == n) => continue,
-            "host" => {
-                // Use effective upstream host unless preserve_host_header is set
-                let host_value = if proxy.preserve_host_header {
-                    value.as_str()
-                } else {
-                    effective_host
-                };
-                if let (Ok(hn), Ok(hv)) = (
-                    "host".parse::<hyper::header::HeaderName>(),
-                    host_value.parse::<hyper::header::HeaderValue>(),
-                ) {
-                    http3_headers.push((hn, hv));
-                }
-            }
-            _ => {
-                if let (Ok(hn), Ok(hv)) = (name.parse(), value.parse()) {
-                    http3_headers.push((hn, hv));
-                }
-            }
-        }
-    }
-
-    // X-Forwarded-* headers
-    let xff_val = build_xff_value(
-        headers.get("x-forwarded-for").map(|s| s.as_str()),
-        client_ip,
+    let http3_headers = build_http3_backend_headers(
+        state,
+        proxy,
+        headers,
+        Http3BackendHeaderContext {
+            client_ip,
+            effective_host,
+            is_tls,
+            inbound_version,
+            content_length: None,
+        },
     );
-    if let Ok(v) = xff_val.parse() {
-        http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
-    }
-    let proto = if is_tls { "https" } else { "http" };
-    if let Ok(v) = proto.parse() {
-        http3_headers.push((
-            hyper::header::HeaderName::from_static("x-forwarded-proto"),
-            v,
-        ));
-    }
-    if let Some(host) = headers.get("host")
-        && let Ok(v) = host.parse()
-    {
-        http3_headers.push((
-            hyper::header::HeaderName::from_static("x-forwarded-host"),
-            v,
-        ));
-    }
 
     let body_bytes = bytes::Bytes::copy_from_slice(request_body.unwrap_or(&[]));
 
@@ -14681,6 +14776,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn h1_to_native_h3_backend_headers_preserve_frontend_forwarding_metadata() {
+        let env_config = crate::config::env_config::EnvConfig {
+            add_via_header: true,
+            add_forwarded_header: true,
+            ..Default::default()
+        };
+        let state = make_test_proxy_state_with_env(GatewayConfig::default(), env_config);
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+        proxy.backend_host = "template.example".to_string();
+        proxy.preserve_host_header = false;
+
+        let headers = HashMap::from([
+            ("host".to_string(), "edge.example".to_string()),
+            ("connection".to_string(), "x-strip".to_string()),
+            ("x-strip".to_string(), "leak".to_string()),
+            ("x-keep".to_string(), "ok".to_string()),
+            ("x-forwarded-for".to_string(), "198.51.100.7".to_string()),
+        ]);
+
+        let out = build_http3_backend_headers(
+            &state,
+            &proxy,
+            &headers,
+            Http3BackendHeaderContext {
+                client_ip: "127.0.0.1",
+                effective_host: "backend.internal",
+                is_tls: false,
+                inbound_version: hyper::Version::HTTP_11,
+                content_length: None,
+            },
+        );
+
+        assert_eq!(header_value(&out, "host"), Some("backend.internal"));
+        assert_eq!(header_value(&out, "x-keep"), Some("ok"));
+        assert_eq!(
+            header_value(&out, "x-forwarded-for"),
+            Some("198.51.100.7, 127.0.0.1")
+        );
+        assert_eq!(header_value(&out, "x-forwarded-proto"), Some("http"));
+        assert_eq!(header_value(&out, "x-forwarded-host"), Some("edge.example"));
+        assert_eq!(header_value(&out, "via"), Some("1.1 ferrum-edge"));
+        assert_eq!(
+            header_value(&out, "forwarded"),
+            Some("for=127.0.0.1;proto=http;host=edge.example")
+        );
+        assert!(
+            header_value(&out, "x-strip").is_none(),
+            "headers named by Connection must not be forwarded to H3 backends"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_tls_to_native_h3_backend_headers_use_h2_via_and_https_proto() {
+        let env_config = crate::config::env_config::EnvConfig {
+            add_via_header: true,
+            add_forwarded_header: true,
+            ..Default::default()
+        };
+        let state = make_test_proxy_state_with_env(GatewayConfig::default(), env_config);
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+
+        let headers = HashMap::from([("host".to_string(), "api.example".to_string())]);
+        let out = build_http3_backend_headers(
+            &state,
+            &proxy,
+            &headers,
+            Http3BackendHeaderContext {
+                client_ip: "203.0.113.9",
+                effective_host: "h3-backend.example",
+                is_tls: true,
+                inbound_version: hyper::Version::HTTP_2,
+                content_length: None,
+            },
+        );
+
+        assert_eq!(header_value(&out, "x-forwarded-proto"), Some("https"));
+        assert_eq!(header_value(&out, "via"), Some("2.0 ferrum-edge"));
+        assert_eq!(
+            header_value(&out, "forwarded"),
+            Some("for=203.0.113.9;proto=https;host=api.example")
+        );
+    }
+
     #[test]
     fn websocket_backend_url_strips_exact_listen_path_literal() {
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
@@ -14723,6 +14904,47 @@ mod tests {
     }
 
     #[test]
+    fn websocket_backend_url_with_relative_backend_path_keeps_slash_boundary() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_path = Some("internal".to_string());
+        proxy.listen_path = Some("/ws".to_string());
+        proxy.strip_listen_path = true;
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            "/ws/chat",
+            "",
+            "backend.local",
+            8080,
+            "/ws".len(),
+            None,
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/internal/chat");
+    }
+
+    #[test]
+    fn websocket_backend_url_with_relative_target_path_inserts_separator() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.listen_path = Some("/ws/".to_string());
+        proxy.strip_listen_path = true;
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            "/ws/chat",
+            "",
+            "backend.local",
+            8080,
+            "/ws/".len(),
+            Some("internal"),
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/internal/chat");
+    }
+
+    #[test]
     fn websocket_forwardable_headers_use_sanitized_proxy_headers() {
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "edge.example".to_string());
@@ -14744,6 +14966,82 @@ mod tests {
                 .any(|(name, _)| name.eq_ignore_ascii_case("host")
                     || name.eq_ignore_ascii_case("connection"))
         );
+    }
+
+    #[test]
+    fn websocket_forwardable_proxy_headers_strip_connection_listed_names() {
+        let mut headers = HashMap::new();
+        headers.insert("Connection".to_string(), "upgrade, x-secret".to_string());
+        headers.insert("x-secret".to_string(), "leak".to_string());
+        headers.insert("x-request-id".to_string(), "req-1".to_string());
+
+        let forwarded = collect_forwardable_proxy_headers(&headers);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-secret")),
+            "headers named by Connection must not be forwarded to the WebSocket backend"
+        );
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
+        }));
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_strip_raw_connection_listed_names() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("upgrade, x-secret"),
+        );
+        raw.insert("x-secret", hyper::header::HeaderValue::from_static("leak"));
+        raw.insert("x-keep", hyper::header::HeaderValue::from_static("ok"));
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        ctx.set_raw_headers(raw.clone());
+        ctx.materialize_headers();
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &ctx.headers);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-secret")),
+            "raw Connection-listed header must not be restored from raw WebSocket headers"
+        );
+        assert!(
+            forwarded
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("x-keep") && value == "ok")
+        );
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_strip_proxy_connection_listed_plugin_headers() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.insert("x-keep", hyper::header::HeaderValue::from_static("ok"));
+
+        let mut sanitized = HashMap::new();
+        sanitized.insert("Connection".to_string(), "x-plugin-secret".to_string());
+        sanitized.insert("x-plugin-secret".to_string(), "leak".to_string());
+        sanitized.insert("x-added-by-plugin".to_string(), "kept".to_string());
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &sanitized);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-plugin-secret")),
+            "plugin/materialized Connection-listed header must be stripped after merge"
+        );
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
+        }));
     }
 
     #[test]
@@ -14928,6 +15226,14 @@ mod tests {
         );
 
         assert_eq!(stripped.as_ref(), "a=1&keep=2");
+    }
+
+    #[test]
+    fn count_query_params_ignores_empty_segments() {
+        assert_eq!(count_query_params(""), 0);
+        assert_eq!(count_query_params("&&"), 0);
+        assert_eq!(count_query_params("a=1&&b=2&"), 2);
+        assert_eq!(count_query_params("&a=1&&b=2&&c=3"), 3);
     }
 
     fn route_delta_proxy(
@@ -16874,11 +17180,33 @@ mod tests {
     // categorization and rationale.
 
     fn make_test_proxy_state(initial_config: GatewayConfig) -> ProxyState {
+        make_test_proxy_state_with_env(
+            initial_config,
+            crate::config::env_config::EnvConfig::default(),
+        )
+    }
+
+    fn make_test_proxy_state_with_env(
+        initial_config: GatewayConfig,
+        env_config: crate::config::env_config::EnvConfig,
+    ) -> ProxyState {
         let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
-        let env_config = crate::config::env_config::EnvConfig::default();
         ProxyState::new(initial_config, dns_cache, env_config, None, None)
             .expect("ProxyState construction should succeed in tests")
             .0
+    }
+
+    fn header_value<'a>(
+        headers: &'a [(hyper::header::HeaderName, hyper::header::HeaderValue)],
+        name: &str,
+    ) -> Option<&'a str> {
+        headers.iter().find_map(|(header_name, value)| {
+            header_name
+                .as_str()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.to_str().ok())
+                .flatten()
+        })
     }
 
     #[tokio::test]
