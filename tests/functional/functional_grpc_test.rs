@@ -156,6 +156,13 @@ fn start_gateway_with_env(
     let mut command = std::process::Command::new(gateway_binary_path());
     command
         .env("FERRUM_MODE", "file")
+fn start_gateway_with_extra_env(
+    config_path: &str,
+    http_port: u16,
+    extra_env: &[(&str, &str)],
+) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("RUST_LOG", "ferrum_edge=debug")
@@ -167,6 +174,12 @@ fn start_gateway_with_env(
     }
     let child = command.spawn()?;
     Ok(child)
+
+    for (name, value) in extra_env {
+        cmd.env(name, value);
+    }
+
+    Ok(cmd.spawn()?)
 }
 
 /// Write a YAML config file with a gRPC proxy pointing to the given backend port.
@@ -274,6 +287,19 @@ plugin_configs: []
 }
 
 /// Send a gRPC request through the gateway using hyper's HTTP/2 client (h2c).
+fn grpc_unary_body(payload_len: usize, fill: u8) -> Vec<u8> {
+    assert!(
+        payload_len <= u32::MAX as usize,
+        "test payload must fit the gRPC u32 length prefix"
+    );
+
+    let mut body = Vec::with_capacity(5 + payload_len);
+    body.push(0);
+    body.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    body.resize(5 + payload_len, fill);
+    body
+}
+
 async fn send_grpc_request(
     gateway_addr: &str,
     path: &str,
@@ -355,12 +381,19 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 async fn start_gateway_with_retry_and_env(
     config_path: &str,
     envs: &[(&str, &str)],
+    start_gateway_with_retry_extra_env(config_path, &[]).await
+}
+
+async fn start_gateway_with_retry_extra_env(
+    config_path: &str,
+    extra_env: &[(&str, &str)],
 ) -> (std::process::Child, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
         match start_gateway_with_env(config_path, gateway_port, envs) {
+        match start_gateway_with_extra_env(config_path, gateway_port, extra_env) {
             Ok(mut child) => match wait_for_gateway(gateway_port).await {
                 Ok(()) => return (child, gateway_port),
                 Err(e) => {
@@ -469,6 +502,11 @@ async fn test_grpc_unary_echo_through_gateway() {
 #[ignore]
 #[tokio::test]
 async fn test_grpc_max_recv_size_env_rejects_oversized_request() {
+/// End-to-end test: FERRUM_MAX_GRPC_RECV_SIZE_BYTES rejects oversized
+/// client request bodies using gRPC RESOURCE_EXHAUSTED semantics.
+#[ignore]
+#[tokio::test]
+async fn test_grpc_recv_size_limit_returns_resource_exhausted() {
     let backend_port = free_port().await;
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
@@ -479,6 +517,7 @@ async fn test_grpc_max_recv_size_env_rejects_oversized_request() {
 
     build_gateway().expect("Failed to build gateway");
     let (mut gateway, gateway_port) = start_gateway_with_retry_and_env(
+    let (mut gateway, gateway_port) = start_gateway_with_retry_extra_env(
         config_path.to_str().unwrap(),
         &[("FERRUM_MAX_GRPC_RECV_SIZE_BYTES", "8")],
     )
@@ -499,6 +538,17 @@ async fn test_grpc_max_recv_size_env_rejects_oversized_request() {
     assert!(
         body.is_empty(),
         "gateway-generated gRPC size rejection should be trailers-only"
+    let grpc_body = grpc_unary_body(32, b'x');
+    let (status, headers, body) =
+        send_grpc_request(&gateway_addr, "/grpc/my.EchoService/Echo", &grpc_body, &[])
+            .await
+            .expect("oversized gRPC request should receive a gRPC error response");
+
+    assert_eq!(status, 200, "gRPC size-limit errors must use HTTP 200");
+    assert_eq!(
+        headers.get("content-type").map(|s| s.as_str()),
+        Some("application/grpc"),
+        "size-limit rejection should preserve gRPC content-type"
     );
     assert_eq!(
         headers.get("grpc-status").map(|s| s.as_str()),
@@ -509,12 +559,68 @@ async fn test_grpc_max_recv_size_env_rejects_oversized_request() {
         headers.get("grpc-message").map(|s| s.as_str()),
         Some("Resource exhausted"),
         "gateway should use the public gRPC size-limit message"
+        "oversized gRPC request should map to RESOURCE_EXHAUSTED"
+    );
+    assert!(
+        body.is_empty(),
+        "gateway-generated gRPC size-limit error should be trailers-only"
     );
 
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_grpc_max_recv_size_env_rejects_oversized_request PASSED");
+    println!("test_grpc_recv_size_limit_returns_resource_exhausted PASSED");
+}
+
+/// End-to-end test: FERRUM_MAX_GRPC_RECV_SIZE_BYTES=0 disables the request
+/// receive cap, allowing a unary request above the default 4 MiB limit.
+#[ignore]
+#[tokio::test]
+async fn test_grpc_recv_size_zero_allows_over_default_request() {
+    let backend_port = free_port().await;
+    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_grpc_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) = start_gateway_with_retry_extra_env(
+        config_path.to_str().unwrap(),
+        &[("FERRUM_MAX_GRPC_RECV_SIZE_BYTES", "0")],
+    )
+    .await;
+
+    let gateway_addr = format!("127.0.0.1:{}", gateway_port);
+    let grpc_body = grpc_unary_body(4_194_304 + 1024, b'z');
+    let (status, headers, body) =
+        send_grpc_request(&gateway_addr, "/grpc/my.EchoService/Echo", &grpc_body, &[])
+            .await
+            .expect("zero gRPC recv size should allow over-default request");
+
+    assert_eq!(status, 200, "gRPC responses must use HTTP 200");
+    assert_eq!(
+        headers.get("grpc-status").map(|s| s.as_str()),
+        Some("0"),
+        "zero recv-size limit should allow the request to reach the backend"
+    );
+    assert_eq!(
+        body.len(),
+        grpc_body.len(),
+        "backend should echo the over-default gRPC request body"
+    );
+    assert_eq!(
+        &body[..16],
+        &grpc_body[..16],
+        "echoed gRPC frame prefix should match"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    println!("test_grpc_recv_size_zero_allows_over_default_request PASSED");
 }
 
 /// End-to-end test: gRPC error status forwarding through the gateway.
