@@ -10,6 +10,7 @@
 //! 6. Verifies configured WebSocket Origin allowlists across H1 Upgrade and
 //!    H3 Extended CONNECT envelopes
 //! 6. Exercises global WebSocket connection admission limits
+//!    WebSocket connections, including the H3 WebSocket disablement toggle
 //!
 //! This test is marked with #[ignore] as it requires the binary to be built
 //! and should be run with: cargo test --test functional_tests functional_websocket -- --ignored --nocapture
@@ -1373,11 +1374,21 @@ async fn test_h3_websocket_global_frame_limit_rejects_oversized_client_frame() {
         backend_port,
         oversized_frames.clone(),
     ));
+/// `FERRUM_HTTP3_WEBSOCKET_ENABLED=false` disables only RFC 9220 Extended
+/// CONNECT. Plain HTTP/3 requests on the same listener must continue to work,
+/// while a client that sends Extended CONNECT anyway receives 501.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_disabled_env_rejects_extended_connect_only() {
+    let dead_ws_backend_port = free_port().await;
+    let http_backend_port = free_port().await;
+    let http_handle = tokio::spawn(start_http_text_server(http_backend_port, "h3-ok"));
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
     write_ws_config(&config_path, backend_port);
+    write_ws_and_http_config(&config_path, dead_ws_backend_port, http_backend_port);
 
     let cert_path = "tests/certs/server.crt";
     let key_path = "tests/certs/server.key";
@@ -1402,6 +1413,14 @@ async fn test_h3_websocket_global_frame_limit_rejects_oversized_client_frame() {
     let url = format!("https://localhost:{}/ws-echo", gateway_https_port);
     let mut ws = client
         .websocket(&url, WebSocketOptions::default())
+    let plain_url = format!("https://localhost:{}/plain", gateway_https_port);
+    let plain = client.get(&plain_url).await.expect("plain H3 request");
+    assert_eq!(plain.status, StatusCode::OK);
+    assert_eq!(plain.body_text(), "h3-ok");
+
+    let ws_url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+    let mut ws = client
+        .websocket(&ws_url, WebSocketOptions::default())
         .await
         .expect("H3 WebSocket disabled response");
     assert_eq!(ws.status, StatusCode::NOT_IMPLEMENTED);
@@ -1447,11 +1466,13 @@ async fn test_h3_websocket_global_frame_limit_rejects_oversized_client_frame() {
         oversized_frames.load(Ordering::Relaxed),
         0,
         "oversized H3 WebSocket frame reached backend despite FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES"
+        "disabled response should explain H3 WebSocket is disabled"
     );
 
     let _ = gateway.kill();
     let _ = gateway.wait();
     probe_handle.abort();
+    http_handle.abort();
 }
 
 /// The H3 bridge forwards the client's offered subprotocols to the backend
