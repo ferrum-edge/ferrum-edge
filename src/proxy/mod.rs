@@ -117,6 +117,16 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+/// Hyper's HTTP/1 parser panics when `max_buf_size` is below 8 KiB. Ferrum's
+/// configured logical header limit may be lower; keep the parser floor safe
+/// and enforce the operator's lower limit in `check_protocol_headers`.
+const HYPER_HTTP1_MIN_MAX_BUF_SIZE: usize = 8 * 1024;
+
+#[inline]
+fn http1_parser_max_buf_size(configured_header_limit: usize) -> usize {
+    configured_header_limit.max(HYPER_HTTP1_MIN_MAX_BUF_SIZE)
+}
+
 /// Metadata key set on the request context for the duration of
 /// `apply_after_proxy_hooks_to_rejection`. Plugins that wire
 /// `applies_after_proxy_on_reject() -> true` can read this key from
