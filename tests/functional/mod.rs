@@ -68,6 +68,7 @@ mod functional_shared_harness_smoke_test;
 mod functional_sse_test;
 mod functional_stream_listener_failure_test;
 mod functional_streaming_latency_tracking_test;
+mod functional_tcp_idle_timeout_env_test;
 mod functional_tcp_proxy_test;
 mod functional_tls_lifecycle_test;
 mod functional_tls_only_test;
