@@ -62,6 +62,9 @@ impl Http3Client {
     /// Fire a single request with caller-controlled method/header overrides.
     /// Used by protocol validation tests that need to force non-default
     /// request shapes without hand-rolling the QUIC/H3 handshake.
+    /// Fire a single request with caller-controlled header overrides. Used by
+    /// host-header tests that need to force "only `:authority`" or
+    /// "explicit Host that contradicts `:authority`" wire shapes.
     pub async fn get_with_options(
         &self,
         url: &str,
@@ -118,6 +121,7 @@ impl Http3Client {
 
         let method = options.method.clone().unwrap_or(Method::GET);
         let mut req_builder = Request::builder().method(method).uri(url);
+        let mut req_builder = Request::builder().method(options.method.clone()).uri(url);
         match &options.host_header {
             HostHeader::Auto => {
                 // Mirror what production H3 clients (curl, Chromium, Firefox)
@@ -619,16 +623,28 @@ fn try_parse_ws_frame(
 }
 
 /// Per-request overrides for `Http3Client::get_with_options`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct GetOptions {
     pub method: Option<Method>,
+    pub method: Method,
     pub host_header: HostHeader,
     pub headers: Vec<(String, String)>,
+}
+
+impl Default for GetOptions {
+    fn default() -> Self {
+        Self {
+            method: Method::GET,
+            host_header: HostHeader::default(),
+            headers: Vec::new(),
+        }
+    }
 }
 
 impl GetOptions {
     pub fn method(mut self, method: Method) -> Self {
         self.method = Some(method);
+        self.method = method;
         self
     }
 
