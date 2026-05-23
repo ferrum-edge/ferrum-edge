@@ -794,6 +794,52 @@ async fn functional_protocol_validation_h1_header_count_zero_disables_limit() {
     h.cleanup();
 }
 
+// --- 7. Query parameter limits from ENV ------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_query_param_limit_rejects_from_env() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_QUERY_PARAMS", "1")]).await;
+
+    let req = b"GET /?a=1&b=2 HTTP/1.1\r\n\
+                Host: example.com\r\n\
+                \r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+    assert!(
+        resp.body.contains("Query parameter count"),
+        "unexpected body: {}",
+        resp.body
+    );
+    assert!(
+        resp.body.contains("exceeds maximum of 1"),
+        "body did not reflect env limit: {}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_query_param_limit_zero_is_unlimited() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_QUERY_PARAMS", "0")]).await;
+
+    let req = b"GET /?a=1&b=2&c=3 HTTP/1.1\r\n\
+                Host: example.com\r\n\
+                \r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(
+        resp.status_code, 200,
+        "FERRUM_MAX_QUERY_PARAMS=0 should disable query-param rejection; body={}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
 // --- 7. URL length limits from ENV -----------------------------------------
 
 #[ignore]
@@ -815,6 +861,25 @@ async fn functional_protocol_validation_url_length_limit_rejects_from_env() {
     assert!(
         resp.body.contains("exceeds maximum of 5 bytes"),
         "body did not reflect env limit: {}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_url_length_limit_zero_is_unlimited() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_URL_LENGTH_BYTES", "0")]).await;
+
+    let req = b"GET /abcdef?long=query HTTP/1.1\r\n\
+                Host: example.com\r\n\
+                \r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(
+        resp.status_code, 200,
+        "FERRUM_MAX_URL_LENGTH_BYTES=0 should disable URL-length rejection; body={}",
         resp.body
     );
 
