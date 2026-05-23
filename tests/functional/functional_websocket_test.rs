@@ -16,6 +16,10 @@
 use futures_util::{SinkExt, StreamExt};
 use http::StatusCode;
 use std::io::Write;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +34,9 @@ use crate::scaffolding::{Http3Client, WebSocketOptions};
 // ============================================================================
 // Helpers
 // ============================================================================
+
+const WS_FRAME_LIMIT_UNDER_TEST: usize = 64;
+const WS_OVERSIZE_FRAME_BYTES: usize = WS_FRAME_LIMIT_UNDER_TEST * 2;
 
 /// Allocate a free port by binding to port 0 and returning the assigned port.
 async fn free_port() -> u16 {
@@ -95,6 +102,77 @@ async fn start_ws_echo_server_with_subprotocol(
                             }
                         }
                         Message::Binary(data) => {
+                            let echo = format!("Echo binary: {} bytes", data.len());
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Ping(data) => {
+                            if sink.send(Message::Pong(data)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Start a WebSocket probe backend that can report whether an oversized
+/// client-to-backend frame reached it and can deliberately emit an oversized
+/// backend-to-client frame.
+#[allow(clippy::collapsible_match)]
+async fn start_ws_frame_limit_probe_server(
+    port: u16,
+    client_oversize_frames: Arc<AtomicUsize>,
+    server_oversize_frames: Arc<AtomicUsize>,
+) {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind WS frame-limit probe server");
+
+    loop {
+        if let Ok((stream, _addr)) = listener.accept().await {
+            let client_oversize_frames = client_oversize_frames.clone();
+            let server_oversize_frames = server_oversize_frames.clone();
+
+            tokio::spawn(async move {
+                let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+
+                let (mut sink, mut source) = ws_stream.split();
+
+                while let Some(Ok(msg)) = source.next().await {
+                    match msg {
+                        Message::Text(text) => {
+                            if text.len() > WS_FRAME_LIMIT_UNDER_TEST {
+                                client_oversize_frames.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            if text.as_str() == "server-oversize" {
+                                server_oversize_frames.fetch_add(1, Ordering::Relaxed);
+                                let payload = "s".repeat(WS_OVERSIZE_FRAME_BYTES);
+                                if sink.send(Message::Text(payload.into())).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            let echo = format!("Echo: {}", text);
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Binary(data) => {
+                            if data.len() > WS_FRAME_LIMIT_UNDER_TEST {
+                                client_oversize_frames.fetch_add(1, Ordering::Relaxed);
+                            }
+
                             let echo = format!("Echo binary: {} bytes", data.len());
                             if sink.send(Message::Text(echo.into())).await.is_err() {
                                 break;
@@ -498,6 +576,45 @@ async fn start_gateway_with_retry(
     );
 }
 
+async fn start_gateway_plain_with_retry_extra_env(
+    config_path: &str,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Child, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let gateway_port = free_port().await;
+        match start_gateway_with_extra_env(config_path, gateway_port, None, None, None, extra_env) {
+            Ok(mut child) => match wait_for_gateway(gateway_port).await {
+                Ok(()) => return (child, gateway_port),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Gateway startup attempt {}/{} failed (port {}): {}",
+                        attempt, MAX_ATTEMPTS, gateway_port, last_err
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            },
+            Err(e) => {
+                last_err = e.to_string();
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, last_err
+                );
+            }
+        }
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!(
+        "Gateway did not start after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
 /// Start the gateway with TLS and retry logic for both HTTP and HTTPS port allocation.
 ///
 /// Allocates fresh HTTP and HTTPS gateway ports on each attempt.
@@ -556,6 +673,25 @@ async fn start_gateway_tls_with_retry_extra_env(
         "Gateway (TLS) did not start after {} attempts: {}",
         MAX_ATTEMPTS, last_err
     );
+}
+
+fn assert_websocket_limit_closed(reply: Option<Result<Message, WsError>>, context: &str) {
+    match reply {
+        Some(Ok(Message::Text(text))) => {
+            panic!(
+                "{context}: oversized frame was forwarded as text ({} bytes)",
+                text.len()
+            );
+        }
+        Some(Ok(Message::Binary(data))) => {
+            panic!(
+                "{context}: oversized frame was forwarded as binary ({} bytes)",
+                data.len()
+            );
+        }
+        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {}
+        Some(Ok(other)) => panic!("{context}: expected close/error, got {other:?}"),
+    }
 }
 
 // ============================================================================
@@ -630,6 +766,21 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
     let backend_port = free_port().await;
 
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+/// The global WebSocket frame-size env limit is enforced by the shared
+/// frame-parsed relay in both directions. Oversized client frames must not
+/// reach the backend, and oversized backend frames must not reach the client.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_global_frame_limit_enforced_both_directions() {
+    let backend_port = free_port().await;
+    let client_oversize_frames = Arc::new(AtomicUsize::new(0));
+    let server_oversize_frames = Arc::new(AtomicUsize::new(0));
+
+    let probe_handle = tokio::spawn(start_ws_frame_limit_probe_server(
+        backend_port,
+        client_oversize_frames.clone(),
+        server_oversize_frames.clone(),
+    ));
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -696,6 +847,67 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1 PASSED");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let frame_limit = WS_FRAME_LIMIT_UNDER_TEST.to_string();
+    let extra_env = [(
+        "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES",
+        frame_limit.as_str(),
+    )];
+    let (mut gateway, gateway_port) =
+        start_gateway_plain_with_retry_extra_env(config_path.to_str().unwrap(), &extra_env).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    ws.send(Message::Text("small".into()))
+        .await
+        .expect("Failed to send small text");
+    let reply = ws
+        .next()
+        .await
+        .expect("No small-frame reply")
+        .expect("Error reading small-frame reply");
+    assert_eq!(reply, Message::Text("Echo: small".into()));
+
+    let oversized_client_payload = "c".repeat(WS_OVERSIZE_FRAME_BYTES);
+    ws.send(Message::Text(oversized_client_payload.into()))
+        .await
+        .expect("Failed to send oversized client frame");
+    let reply = tokio::time::timeout(Duration::from_secs(3), ws.next())
+        .await
+        .expect("gateway did not close after oversized client frame");
+    assert_websocket_limit_closed(reply, "client-to-backend");
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        client_oversize_frames.load(Ordering::Relaxed),
+        0,
+        "oversized client frame reached backend despite FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES"
+    );
+
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to reconnect WebSocket");
+    ws.send(Message::Text("server-oversize".into()))
+        .await
+        .expect("Failed to request oversized backend frame");
+    let reply = tokio::time::timeout(Duration::from_secs(3), ws.next())
+        .await
+        .expect("gateway did not close after oversized backend frame");
+    assert_websocket_limit_closed(reply, "backend-to-client");
+    assert_eq!(
+        server_oversize_frames.load(Ordering::Relaxed),
+        1,
+        "probe backend should have attempted exactly one oversized response"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    probe_handle.abort();
+    println!("test_websocket_global_frame_limit_enforced_both_directions PASSED");
 }
 
 /// End-to-end test: WebSocket handshakes are rejected by key_auth without a key.
