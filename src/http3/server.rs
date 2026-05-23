@@ -1971,7 +1971,15 @@ async fn handle_h3_request(
                 let h3_error_body = r#"{"error":"Backend unavailable"}"#;
                 send_h3_response(&mut stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
 
-                // Record outcome for CB/health even on failure
+                // Record outcome for CB/health even on failure.
+                // Frontend client aborts while uploading request bodies are
+                // client-caused and must not poison backend CB/passive health.
+                let (outcome_connection_error, outcome_error_class) =
+                    if is_client_request_body_disconnect {
+                        (false, Some(crate::retry::ErrorClass::ClientDisconnect))
+                    } else {
+                        (true, Some(h3_error_class))
+                    };
                 crate::proxy::backend_dispatch::record_backend_outcome(
                     &state,
                     &proxy,
@@ -1980,8 +1988,8 @@ async fn handle_h3_request(
                     upstream_target.as_deref(),
                     cb_target_key.as_deref(),
                     502,
-                    true,
-                    Some(h3_error_class),
+                    outcome_connection_error,
+                    outcome_error_class,
                     cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
