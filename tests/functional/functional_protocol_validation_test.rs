@@ -57,8 +57,7 @@
 //! Run: `cargo test --test functional_tests -- --ignored functional_protocol_validation --nocapture`
 
 use crate::common::TestGateway;
-use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
-use crate::scaffolding::clients::{GetOptions, Http2Client, Http3Client};
+use crate::scaffolding::clients::{GetOptions, Http2Client, Http3Client, Http3Response};
 
 use bytes::Bytes;
 use http::HeaderMap;
@@ -328,16 +327,14 @@ fn assert_hop_by_hop_response_headers_stripped(hdrs: &HeaderMap) {
         hdrs.get("x-backend-marker").is_some(),
         "non-hop-by-hop backend header should pass through; headers={hdrs:?}"
     );
+}
+
 fn parse_status_from_response_prefix(bytes: &[u8]) -> Option<u16> {
     let text = String::from_utf8_lossy(bytes);
     text.lines().next()?.split_whitespace().nth(1)?.parse().ok()
+}
+
 async fn send_h2_with_headers(proxy_port: u16, headers: &[(&str, &str)]) -> (u16, String) {
-async fn send_h2_prior_knowledge(
-    proxy_port: u16,
-    req: Request<Full<Bytes>>,
-    label: &str,
-) -> (u16, String) {
-async fn send_h2_get(proxy_port: u16, uri: &str, headers: &[(&str, &str)]) -> (u16, String) {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect");
@@ -359,10 +356,71 @@ async fn send_h2_get(proxy_port: u16, uri: &str, headers: &[(&str, &str)]) -> (u
         .body(Full::new(Bytes::new()))
         .expect("build h2 request");
     let resp = sender.send_request(req).await.expect("send h2 request");
+    let status = resp.status().as_u16();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
+    let body = String::from_utf8_lossy(&body).into_owned();
+
+    drop(sender);
+    conn_task.abort();
+    (status, body)
+}
+
+async fn send_h2_prior_knowledge(
+    proxy_port: u16,
+    req: Request<Full<Bytes>>,
+    label: &str,
+) -> (u16, String) {
+    let stream = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
     let resp = sender
         .send_request(req)
         .await
         .unwrap_or_else(|e| panic!("send {label}: {e}"));
+    let status = resp.status().as_u16();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&body).into_owned();
+
+    drop(sender);
+    conn_task.abort();
+
+    (status, body_str)
+}
+
+async fn send_h2_get(proxy_port: u16, uri: &str, headers: &[(&str, &str)]) -> (u16, String) {
+    let stream = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
     let mut req = Request::builder().method("GET").uri(uri);
     for (name, value) in headers {
         req = req.header(*name, *value);
@@ -378,11 +436,6 @@ async fn send_h2_get(proxy_port: u16, uri: &str, headers: &[(&str, &str)]) -> (u
         .await
         .map(|b| b.to_bytes().to_vec())
         .unwrap_or_default();
-    let body = String::from_utf8_lossy(&body).into_owned();
-
-    drop(sender);
-    conn_task.abort();
-    (status, body)
     let body_str = String::from_utf8_lossy(&body).into_owned();
 
     drop(sender);
@@ -432,9 +485,7 @@ impl Harness {
     }
 
     async fn new_with_env(with_host: bool, extra_env: &[(&str, &str)]) -> Self {
-    async fn new_with_env(with_host: bool, envs: &[(&str, &str)]) -> Self {
-    async fn new_with_env(with_host: bool, env: &[(&str, &str)]) -> Self {
-        Self::with_env(with_host, &[]).await
+        Self::with_env(with_host, extra_env).await
     }
 
     async fn with_env(with_host: bool, env: &[(&str, &str)]) -> Self {
@@ -446,10 +497,6 @@ impl Harness {
         let mut builder = TestGateway::builder()
             .mode_file(build_config(echo_port, with_host))
             .log_level("warn");
-        for (key, value) in extra_env {
-        for (key, value) in envs {
-            builder = builder.env(*key, *value);
-        }
 
         for (key, value) in env {
             builder = builder.env(*key, *value);
@@ -697,17 +744,6 @@ async fn functional_protocol_validation_host_trailing_dot_normalized() {
     h.cleanup();
 }
 
-// --- 7. Header count limit env ---------------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h1_header_count_env_rejects_excess_headers() {
-    let h = Harness::new_with_env(false, &[("FERRUM_MAX_HEADER_COUNT", "2")]).await;
-
-    let req = b"GET / HTTP/1.1\r\n\
-                Host: example.com\r\n\
-                X-One: 1\r\n\
-                X-Two: 2\r\n\
 // --- 7. Header count limits from ENV ---------------------------------------
 
 #[ignore]
@@ -754,14 +790,10 @@ async fn functional_protocol_validation_h1_header_count_zero_disables_limit() {
         reflected.get("x-extra-15").is_some(),
         "backend should receive the high-count request when count limit is disabled; reflected={reflected}"
     );
-// --- 7. Query parameter limits from ENV ------------------------------------
 
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_query_param_limit_rejects_from_env() {
-    let h = Harness::new_with_env(false, &[("FERRUM_MAX_QUERY_PARAMS", "1")]).await;
+    h.cleanup();
+}
 
-    let req = b"GET /?a=1&b=2 HTTP/1.1\r\n\
 // --- 7. URL length limits from ENV -----------------------------------------
 
 #[ignore]
@@ -774,9 +806,6 @@ async fn functional_protocol_validation_url_length_limit_rejects_from_env() {
                 \r\n";
     let resp = send_raw_h1(h.proxy_port, req).await;
 
-    assert_eq!(resp.status_code, 400, "body={}", resp.body);
-    assert!(
-        resp.body.contains("Query parameter count"),
     assert_eq!(resp.status_code, 414, "body={}", resp.body);
     assert!(
         resp.body.contains("Request URL length"),
@@ -784,10 +813,7 @@ async fn functional_protocol_validation_url_length_limit_rejects_from_env() {
         resp.body
     );
     assert!(
-        resp.body.contains("exceeds maximum of 1"),
         resp.body.contains("exceeds maximum of 5 bytes"),
-    assert!(
-        resp.body.contains("exceeds maximum of 1"),
         "body did not reflect env limit: {}",
         resp.body
     );
@@ -807,15 +833,13 @@ async fn functional_protocol_validation_h2_header_count_env_rejects_excess_heade
     assert!(
         body.contains("Request header count"),
         "unexpected body: {body}"
-async fn functional_protocol_validation_query_param_limit_zero_is_unlimited() {
-    let h = Harness::new_with_env(false, &[("FERRUM_MAX_QUERY_PARAMS", "0")]).await;
+    );
 
-    let req = b"GET /?a=1&b=2&c=3 HTTP/1.1\r\n\
-async fn functional_protocol_validation_url_length_limit_zero_is_unlimited() {
-    let h = Harness::new_with_env(false, &[("FERRUM_MAX_URL_LENGTH_BYTES", "0")]).await;
+    h.cleanup();
+}
 
-    let req = b"GET /abcdef?long=query HTTP/1.1\r\n\
-                Host: example.com\r\n\
+#[ignore]
+#[tokio::test]
 async fn functional_protocol_validation_header_count_limit_zero_is_unlimited() {
     let h = Harness::new_with_env(false, &[("FERRUM_MAX_HEADER_COUNT", "0")]).await;
 
@@ -828,8 +852,6 @@ async fn functional_protocol_validation_header_count_limit_zero_is_unlimited() {
 
     assert_eq!(
         resp.status_code, 200,
-        "FERRUM_MAX_QUERY_PARAMS=0 should disable query-param rejection; body={}",
-        "FERRUM_MAX_URL_LENGTH_BYTES=0 should disable URL-length rejection; body={}",
         "FERRUM_MAX_HEADER_COUNT=0 should disable header-count rejection; body={}",
         resp.body
     );
@@ -1427,140 +1449,12 @@ async fn functional_protocol_validation_h3_transfer_encoding_rejected() {
 
 #[ignore]
 #[tokio::test]
-async fn functional_protocol_validation_h3_empty_query_segments_do_not_count_against_limit() {
-#[ignore]
-#[tokio::test]
 async fn functional_protocol_validation_h3_query_param_limit_ignores_empty_segments() {
-// --- 9. URL length limits on H3 --------------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h3_url_length_limit_rejects_from_env() {
-// --- 9. Single header size on H3 ------------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h3_single_header_size_limit_rejects_from_env() {
-// --- 9. Total header size on H3 -------------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h3_total_header_size_limit_rejects_from_env() {
-// --- 9. Query parameter count on H3 ---------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h3_query_param_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let echo_port = echo_listener.local_addr().unwrap().port();
-    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
-// --- 9. Response body size on H3 ------------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h3_response_body_limit_rejects_from_env() {
-    let backend_body = "this backend response body exceeds the configured limit";
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    let backend_task = tokio::spawn(start_fixed_body_server_on(backend_listener, backend_body));
-    sleep(Duration::from_millis(150)).await;
-
-    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let https_port = https_reservation.local_addr().unwrap().port();
-    drop(https_reservation);
-
-    let mut gateway = TestGateway::builder()
-        .mode_file(build_config(echo_port, false))
-        .mode_file(build_config(backend_port, false))
-        .log_level("warn")
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-        .env("FERRUM_MAX_QUERY_PARAMS", "2")
-        .env("FERRUM_MAX_URL_LENGTH_BYTES", "5")
-        .env("FERRUM_MAX_QUERY_PARAMS", "1")
-        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "8")
-        .spawn()
-        .await
-        .expect("start gateway with h3");
-
-    let client = Http3Client::insecure().expect("H3 client");
-    let url = format!("https://localhost:{https_port}/?a=1&&b=2");
-    let url = format!("https://localhost:{https_port}/abcdef");
-    let url = format!("https://localhost:{https_port}/?one=1&two=2");
-    let url = format!("https://localhost:{https_port}/");
-    let mut last_err = None;
-    let resp = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match client.get(&url).await {
-                Ok(resp) => break resp,
-                Err(err) if std::time::Instant::now() < deadline => {
-                    last_err = Some(err.to_string());
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(err) => {
-                    panic!(
-                        "H3 request with empty query segment did not complete; last startup error={last_err:?}; final error={err}"
-                        "H3 over-limit URL request did not complete; last startup error={last_err:?}; final error={err}"
-                        "H3 request with too many query parameters did not complete; last startup error={last_err:?}; final error={err}"
-                        "H3 request for oversized backend response did not complete; last startup error={last_err:?}; final error={err}"
-                    );
-                }
-            }
-        }
-    };
-
-    assert_eq!(resp.status.as_u16(), 200, "body={}", resp.body_text());
-
-    gateway.shutdown();
-    echo_task.abort();
-}
-
-// --- 10. Total header size on H1 -------------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_env() {
-// --- 9. Single header size on H1 ------------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h1_single_header_size_limit_rejects_from_env() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
 
-    let mut gateway = TestGateway::builder()
-        .mode_file(build_config(echo_port, false))
-        .log_level("warn")
-        .env("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "64")
-        .env("FERRUM_MAX_HEADER_SIZE_BYTES", "20")
-        .env("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "12")
-        .spawn()
-        .await
-        .expect("start gateway");
-    gateway
-        .wait_for_proxy_port(Duration::from_secs(10))
-        .await
-        .expect("proxy port did not become ready");
-
-    let req = b"GET / HTTP/1.1\r\n\
-                Host: x\r\n\
-                X-One: 1234567890\r\n\
-                X-Two: abcdefghij\r\n\
-                X-Over: value-that-exceeds\r\n\
-                \r\n";
-    let resp = send_raw_h1(gateway.proxy_port, req).await;
-
-    assert_eq!(resp.status_code, 431, "body={}", resp.body);
-    assert!(
-        resp.body
-            .contains("Total request headers exceed maximum size"),
-        "unexpected body: {}",
-        resp.body
     let (mut gateway, https_port) =
         start_h3_validation_gateway(echo_port, &[("FERRUM_MAX_QUERY_PARAMS", "2")]).await;
 
@@ -1582,22 +1476,283 @@ async fn functional_protocol_validation_h1_single_header_size_limit_rejects_from
         "three non-empty params should exceed FERRUM_MAX_QUERY_PARAMS=2; body={}",
         rejected.body_text()
     );
-    assert!(
-        rejected
-            .body_text()
-            .contains("Query parameter count (3) exceeds maximum of 2"),
-        "unexpected body: {}",
-        rejected.body_text()
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. Query parameter count on H3 ---------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_query_param_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) =
+        start_h3_validation_gateway(echo_port, &[("FERRUM_MAX_QUERY_PARAMS", "1")]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/?one=1&two=2");
+    let resp = h3_get_with_startup_retry(&client, &url, GetOptions::default()).await;
+
     assert_eq!(resp.status.as_u16(), 400, "body={}", resp.body_text());
     assert!(
         resp.body_text()
             .contains("Query parameter count (2) exceeds maximum of 1"),
+        "unexpected body: {}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. URL length limits on H3 --------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_url_length_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) =
+        start_h3_validation_gateway(echo_port, &[("FERRUM_MAX_URL_LENGTH_BYTES", "5")]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/abcdef");
+    let resp = h3_get_with_startup_retry(&client, &url, GetOptions::default()).await;
+
+    assert_eq!(resp.status.as_u16(), 414, "body={}", resp.body_text());
+    assert!(
+        resp.body_text().contains("Request URL length"),
+        "unexpected body: {}",
+        resp.body_text()
+    );
+    assert!(
+        resp.body_text().contains("exceeds maximum of 5 bytes"),
+        "body did not reflect env limit: {}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. Header count limits on H3 ------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) =
+        start_h3_validation_gateway(echo_port, &[("FERRUM_MAX_HEADER_COUNT", "1")]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let options = GetOptions::default()
+        .header("x-one", "1")
+        .header("x-two", "2");
+    let resp = h3_get_with_startup_retry(&client, &url, options).await;
+
+    assert_eq!(resp.status.as_u16(), 431, "body={}", resp.body_text());
+    assert!(
+        resp.body_text().contains("Request header count"),
+        "unexpected body: {}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. Single header size on H3 ------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_single_header_size_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) =
+        start_h3_validation_gateway(echo_port, &[("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "12")])
+            .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let options = GetOptions::default().header("x-over", "value-that-exceeds");
+    let resp = h3_get_with_startup_retry(&client, &url, options).await;
+
+    assert_eq!(resp.status.as_u16(), 431, "body={}", resp.body_text());
+    assert!(
+        resp.body_text().contains("Request header"),
+        "unexpected body: {}",
+        resp.body_text()
+    );
+    assert!(
+        resp.body_text()
+            .contains("exceeds maximum size of 12 bytes"),
+        "body did not reflect env limit: {}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. Total header size on H3 -------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_total_header_size_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) = start_h3_validation_gateway(
+        echo_port,
+        &[
+            ("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "8192"),
+            ("FERRUM_MAX_HEADER_SIZE_BYTES", "9000"),
+        ],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let options = GetOptions::default()
+        .header("x-one", "1".repeat(5000).as_str())
+        .header("x-two", "2".repeat(5000).as_str());
+    let resp = h3_get_with_startup_retry(&client, &url, options).await;
+
+    assert_eq!(resp.status.as_u16(), 431, "body={}", resp.body_text());
+    assert!(
+        resp.body_text()
+            .contains("Total request headers exceed maximum size"),
+        "unexpected body: {}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. Response body size on H3 ------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_response_body_limit_rejects_from_env() {
+    let backend_body = "this backend response body exceeds the configured limit";
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_task = tokio::spawn(start_fixed_body_server_on(backend_listener, backend_body));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) = start_h3_validation_gateway(
+        backend_port,
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "8")],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let resp = h3_get_with_startup_retry(&client, &url, GetOptions::default()).await;
+
     assert_eq!(resp.status.as_u16(), 502, "body={}", resp.body_text());
     assert!(
         resp.body_text()
             .contains("Backend response body exceeds maximum size"),
         "unexpected body: {}",
         resp.body_text()
+    );
+
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+// --- 10. Total header size on H1 -------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "64")
+        .env("FERRUM_MAX_HEADER_SIZE_BYTES", "20")
+        .spawn()
+        .await
+        .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port did not become ready");
+
+    let req = b"GET / HTTP/1.1\r\n\
+                Host: x\r\n\
+                X-One: 1234567890\r\n\
+                X-Two: abcdefghij\r\n\
+                \r\n";
+    let resp = send_raw_h1(gateway.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 431, "body={}", resp.body);
+    assert!(
+        resp.body
+            .contains("Total request headers exceed maximum size"),
+        "unexpected body: {}",
+        resp.body
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. Single header size on H1 ------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h1_single_header_size_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "12")
+        .spawn()
+        .await
+        .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port did not become ready");
+
+    let req = b"GET / HTTP/1.1\r\n\
+                Host: x\r\n\
+                X-Over: value-that-exceeds\r\n\
+                \r\n";
+    let resp = send_raw_h1(gateway.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 431, "body={}", resp.body);
+    assert!(
         resp.body.contains("Request header"),
         "unexpected body: {}",
         resp.body
@@ -1612,78 +1767,20 @@ async fn functional_protocol_validation_h1_single_header_size_limit_rejects_from
     echo_task.abort();
 }
 
-// --- 11. CONNECT on H1 ------------------------------------------------------
-// --- 10. CONNECT on H1 ------------------------------------------------------
+// --- 9. CONNECT on H3 -------------------------------------------------------
+
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_connect_udp_rejected() {
-// --- 9. Header count limits on H3 ------------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env() {
-// --- 9. Request body size on H3 -------------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h3_request_body_limit_rejects_from_env() {
-// --- 9. Header count zero on H3 -------------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h3_header_count_zero_allows_extra_headers() {
-// --- 9. Query parameter count zero on H3 ----------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h3_query_param_zero_allows_extra_params() {
-// --- 9. URL length zero on H3 ---------------------------------------------
-
-#[ignore]
-#[tokio::test]
-async fn functional_protocol_validation_h3_url_length_zero_allows_long_url() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
 
-    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let https_port = https_reservation.local_addr().unwrap().port();
-    drop(https_reservation);
-
-    let mut gateway = TestGateway::builder()
-        .mode_file(build_config(echo_port, false))
-        .log_level("warn")
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-        .env("FERRUM_MAX_HEADER_COUNT", "1")
-        .env("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "12")
-        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "8")
-        .env("FERRUM_MAX_HEADER_COUNT", "0")
-        .env("FERRUM_MAX_QUERY_PARAMS", "0")
-        .env("FERRUM_MAX_URL_LENGTH_BYTES", "0")
-        .spawn()
-        .await
-        .expect("start gateway with h3");
+    let (mut gateway, https_port) = start_h3_validation_gateway(echo_port, &[]).await;
 
     let client = Http3Client::insecure().expect("H3 client");
     let url = format!("https://localhost:{https_port}/");
-    let options = GetOptions::default()
-        .header("x-extra-one", "one")
-        .header("x-extra-two", "two");
-    let options = GetOptions::default().header("x-over", "value-that-exceeds");
-        .header("x-one", "1234567890")
-        .header("x-two", "abcdefghij");
-        .header("x-one", "1")
-        .header("x-two", "2")
-        .header("x-three", "3")
-        .header("x-four", "4");
-    let url = format!("https://localhost:{https_port}/?one=1&two=2&three=3");
-    let options = GetOptions::default().header("x-query-zero", "forwarded");
-    let url = format!("https://localhost:{https_port}/{}", "long-path".repeat(32));
-    let options = GetOptions::default().header("x-url-zero", "forwarded");
     let mut last_err = None;
     let resp = {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1692,11 +1789,6 @@ async fn functional_protocol_validation_h3_url_length_zero_allows_long_url() {
                 .extended_connect(&url, h3::ext::Protocol::CONNECT_UDP)
                 .await
             {
-            match client.get_with_options(&url, options.clone()).await {
-                .post_bytes(&url, Bytes::from_static(b"0123456789abcdef"))
-                .await
-            {
-            match client.get_with_options(&url, options.clone()).await {
                 Ok(resp) => break resp,
                 Err(err) if std::time::Instant::now() < deadline => {
                     last_err = Some(err.to_string());
@@ -1705,13 +1797,6 @@ async fn functional_protocol_validation_h3_url_length_zero_allows_long_url() {
                 Err(err) => {
                     panic!(
                         "H3 CONNECT-UDP request did not complete; last startup error={last_err:?}; final error={err}"
-                        "H3 header-count limit request did not complete; last startup error={last_err:?}; final error={err}"
-                        "H3 request with oversized header did not complete; last startup error={last_err:?}; final error={err}"
-                        "H3 request with oversized total headers did not complete; last startup error={last_err:?}; final error={err}"
-                        "H3 request with oversized body did not complete; last startup error={last_err:?}; final error={err}"
-                        "H3 request with header-count limit disabled did not complete; last startup error={last_err:?}; final error={err}"
-                        "H3 request with query-param limit disabled did not complete; last startup error={last_err:?}; final error={err}"
-                        "H3 request with URL-length limit disabled did not complete; last startup error={last_err:?}; final error={err}"
                     );
                 }
             }
@@ -1722,41 +1807,143 @@ async fn functional_protocol_validation_h3_url_length_zero_allows_long_url() {
     assert!(
         resp.body_text().contains("CONNECT"),
         "unexpected body: {}",
-    assert_eq!(resp.status.as_u16(), 414, "body={}", resp.body_text());
-    assert!(
-        resp.body_text().contains("Request URL length"),
-    assert_eq!(resp.status.as_u16(), 431, "body={}", resp.body_text());
-    assert!(
-        resp.body_text().contains("Request header count"),
-    assert_eq!(resp.status.as_u16(), 431, "body={}", resp.body_text());
-    assert!(
-        resp.body_text().contains("Request header"),
-        "unexpected body: {}",
         resp.body_text()
     );
-    assert!(
-        resp.body_text().contains("exceeds maximum of 5 bytes"),
-        resp.body_text().contains("exceeds maximum of 1"),
-        "body did not reflect env limit: {}",
-        resp.body_text()
-            .contains("exceeds maximum size of 12 bytes"),
-    assert_eq!(resp.status.as_u16(), 431, "body={}", resp.body_text());
-    assert!(
-        resp.body_text()
-            .contains("Total request headers exceed maximum size"),
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. Request body size on H3 -------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_request_body_limit_rejects_from_env() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) =
+        start_h3_validation_gateway(echo_port, &[("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "8")])
+            .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let mut last_err = None;
+    let resp = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match client
+                .post_bytes(&url, Bytes::from_static(b"0123456789abcdef"))
+                .await
+            {
+                Ok(resp) => break resp,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    last_err = Some(err.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "H3 request with oversized body did not complete; last startup error={last_err:?}; final error={err}"
+                    );
+                }
+            }
+        }
+    };
+
     assert_eq!(resp.status.as_u16(), 413, "body={}", resp.body_text());
     assert!(
         resp.body_text()
             .contains("Request body exceeds maximum size"),
         "unexpected body: {}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. Header count zero on H3 -------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_header_count_zero_allows_extra_headers() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) =
+        start_h3_validation_gateway(echo_port, &[("FERRUM_MAX_HEADER_COUNT", "0")]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let options = GetOptions::default()
+        .header("x-one", "1")
+        .header("x-two", "2")
+        .header("x-three", "3")
+        .header("x-four", "4");
+    let resp = h3_get_with_startup_retry(&client, &url, options).await;
+
     assert_eq!(resp.status.as_u16(), 200, "body={}", resp.body_text());
     assert!(
         resp.body_text().contains("x-four"),
         "backend should receive extra headers when count limit is disabled; body={}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. Query parameter count zero on H3 ----------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_query_param_zero_allows_extra_params() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) =
+        start_h3_validation_gateway(echo_port, &[("FERRUM_MAX_QUERY_PARAMS", "0")]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/?one=1&two=2&three=3");
+    let options = GetOptions::default().header("x-query-zero", "forwarded");
+    let resp = h3_get_with_startup_retry(&client, &url, options).await;
+
     assert_eq!(resp.status.as_u16(), 200, "body={}", resp.body_text());
     assert!(
         resp.body_text().contains("x-query-zero"),
         "backend should receive request when query-param limit is disabled; body={}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. URL length zero on H3 ---------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_url_length_zero_allows_long_url() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) =
+        start_h3_validation_gateway(echo_port, &[("FERRUM_MAX_URL_LENGTH_BYTES", "0")]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/{}", "long-path".repeat(32));
+    let options = GetOptions::default().header("x-url-zero", "forwarded");
+    let resp = h3_get_with_startup_retry(&client, &url, options).await;
+
     assert_eq!(resp.status.as_u16(), 200, "body={}", resp.body_text());
     assert!(
         resp.body_text().contains("x-url-zero"),
@@ -1766,11 +1953,6 @@ async fn functional_protocol_validation_h3_url_length_zero_allows_long_url() {
 
     gateway.shutdown();
     echo_task.abort();
-}
-
-// --- 9. CONNECT on H1 -------------------------------------------------------
-// --- 9. CONNECT on H1/H2 ----------------------------------------------------
-    backend_task.abort();
 }
 
 // --- 10. CONNECT on H1 ------------------------------------------------------
@@ -1804,7 +1986,6 @@ async fn functional_protocol_validation_connect_rejected_http1() {
     h.cleanup();
 }
 
-// --- 11. Backend sees sanitized request (hop-by-hop headers stripped) ------
 // --- 10. H1 slow header timeout env ----------------------------------------
 
 #[ignore]
@@ -1852,6 +2033,10 @@ async fn functional_protocol_validation_h1_header_timeout_closes_incomplete_requ
         "gateway should continue serving valid H1 requests after timing out a slow header; body={}",
         resp.body
     );
+
+    h.cleanup();
+}
+
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_connect_rejected_http2_without_protocol() {
@@ -1899,6 +2084,12 @@ async fn functional_protocol_validation_h1_header_timeout_zero_disables_timer() 
         "gateway should still accept valid H1 requests when header timeout is disabled; body={}",
         resp.body
     );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
 async fn functional_protocol_validation_connect_rejected_http2_non_websocket_protocol() {
     let h = Harness::new(false).await;
 
@@ -1920,8 +2111,6 @@ async fn functional_protocol_validation_connect_rejected_http2_non_websocket_pro
     h.cleanup();
 }
 
-// --- 12. Backend sees sanitized request (hop-by-hop headers stripped) ------
-// --- 10. Backend sees sanitized request (hop-by-hop headers stripped) -------
 // --- 10. Global request body size limit ------------------------------------
 
 #[ignore]
@@ -1941,6 +2130,11 @@ async fn functional_protocol_validation_env_request_body_limit_rejects_http1() {
         resp.body.contains("Request body exceeds maximum size"),
         "unexpected body: {}",
         resp.body
+    );
+
+    h.cleanup();
+}
+
 // --- 10. Global response body size limit -----------------------------------
 
 #[ignore]
@@ -1973,8 +2167,6 @@ async fn functional_protocol_validation_env_response_body_limit_rejects_http1() 
 #[tokio::test]
 async fn functional_protocol_validation_env_request_body_limit_rejects_http2() {
     let h = Harness::new_with_env(false, &[("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "8")]).await;
-async fn functional_protocol_validation_env_response_body_limit_rejects_http2() {
-    let h = Harness::new_with_env(false, &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "8")]).await;
 
     let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
         .await
@@ -1997,6 +2189,45 @@ async fn functional_protocol_validation_env_response_body_limit_rejects_http2() 
         .body(Full::new(Bytes::from_static(b"0123456789abcdef")))
         .expect("build oversized H2 request");
     let resp = sender.send_request(req).await.expect("send oversized POST");
+    let status = resp.status().as_u16();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert_eq!(status, 413, "body={body_str}");
+    assert!(
+        body_str.contains("Request body exceeds maximum size"),
+        "unexpected body: {body_str}"
+    );
+
+    drop(sender);
+    conn_task.abort();
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_env_response_body_limit_rejects_http2() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "8")]).await;
+
+    let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
+        .await
+        .expect("connect");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
         .method("GET")
         .uri("http://example.com/large-response")
         .header("host", "example.com")
@@ -2012,9 +2243,6 @@ async fn functional_protocol_validation_env_response_body_limit_rejects_http2() 
         .unwrap_or_default();
     let body_str = String::from_utf8_lossy(&body);
 
-    assert_eq!(status, 413, "body={body_str}");
-    assert!(
-        body_str.contains("Request body exceeds maximum size"),
     assert_eq!(status, 502, "body={body_str}");
     assert!(
         body_str.contains("Backend response body exceeds maximum size"),
@@ -2195,60 +2423,17 @@ async fn functional_protocol_validation_response_hop_by_hop_stripped_http2() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_response_hop_by_hop_stripped_http3() {
-async fn functional_protocol_validation_h3_response_hop_by_hop_stripped() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
 
-    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let https_port = https_reservation.local_addr().unwrap().port();
-    drop(https_reservation);
-
-    let mut gateway = TestGateway::builder()
-        .mode_file(build_config(echo_port, false))
-        .log_level("warn")
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-        .spawn()
-        .await
-        .expect("start gateway with h3");
+    let (mut gateway, https_port) = start_h3_validation_gateway(echo_port, &[]).await;
 
     let client = Http3Client::insecure().expect("H3 client");
     let url = format!("https://localhost:{https_port}/");
-    let response = {
-    let mut last_err = None;
-    let resp = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match client.get(&url).await {
-                Ok(resp) => break resp,
-                Err(err) if std::time::Instant::now() < deadline => {
-                    let _ = err;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(err) => panic!("H3 request did not complete: {err}"),
-                    last_err = Some(err.to_string());
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(err) => {
-                    panic!(
-                        "H3 hop-by-hop response probe did not complete; last startup error={last_err:?}; final error={err}"
-                    );
-                }
-            }
-        }
-    };
+    let resp = h3_get_with_startup_retry(&client, &url, GetOptions::default()).await;
 
-    assert_eq!(
-        response.status.as_u16(),
-        200,
-        "body={}",
-        response.body_text()
-    );
-    assert_hop_by_hop_response_headers_stripped(&response.headers);
     assert_eq!(resp.status.as_u16(), 200, "body={}", resp.body_text());
     for banned in [
         "connection",

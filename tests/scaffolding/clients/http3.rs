@@ -70,8 +70,7 @@ impl Http3Client {
         url: &str,
         options: GetOptions,
     ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
-        self.request_with_body(http::Method::GET, url, options, Bytes::new())
-            .await
+        self.request_with_body(url, options, Bytes::new()).await
     }
 
     /// Fire a single `POST <url>` via QUIC with DATA bytes and no explicit
@@ -81,13 +80,12 @@ impl Http3Client {
         url: &str,
         body: impl Into<Bytes>,
     ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
-        self.request_with_body(http::Method::POST, url, GetOptions::default(), body.into())
-            .await
+        let options = GetOptions::default().method(http::Method::POST);
+        self.request_with_body(url, options, body.into()).await
     }
 
     async fn request_with_body(
         &self,
-        method: http::Method,
         url: &str,
         options: GetOptions,
         body: Bytes,
@@ -119,8 +117,6 @@ impl Http3Client {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
-        let method = options.method.clone().unwrap_or(Method::GET);
-        let mut req_builder = Request::builder().method(method).uri(url);
         let mut req_builder = Request::builder().method(options.method.clone()).uri(url);
         match &options.host_header {
             HostHeader::Auto => {
@@ -152,6 +148,8 @@ impl Http3Client {
             tokio::time::timeout(Duration::from_secs(15), stream.send_data(body))
                 .await
                 .map_err(|_| "send request body timed out")?
+                .map_err(|e| format!("send request body: {e}"))?;
+        }
         if !options.body.is_empty() {
             stream
                 .send_data(options.body.clone())
@@ -629,7 +627,6 @@ fn try_parse_ws_frame(
 /// Per-request overrides for `Http3Client::get_with_options`.
 #[derive(Debug, Clone)]
 pub struct GetOptions {
-    pub method: Option<Method>,
     pub method: Method,
     pub host_header: HostHeader,
     pub headers: Vec<(String, String)>,
@@ -647,19 +644,8 @@ impl Default for GetOptions {
     }
 }
 
-impl Default for GetOptions {
-    fn default() -> Self {
-        Self {
-            method: Method::GET,
-            host_header: HostHeader::default(),
-            headers: Vec::new(),
-        }
-    }
-}
-
 impl GetOptions {
     pub fn method(mut self, method: Method) -> Self {
-        self.method = Some(method);
         self.method = method;
         self
     }

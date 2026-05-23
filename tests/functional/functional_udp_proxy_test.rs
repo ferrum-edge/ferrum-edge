@@ -3,19 +3,14 @@
 //! Tests:
 //! 1. Plain UDP datagram forwarding (single client)
 //! 2. Multiple concurrent UDP clients with session isolation
+//!    2b. UDP max session cap — `FERRUM_UDP_MAX_SESSIONS` rejects new clients
 //! 3. UDP session timeout and cleanup
 //! 4. Large UDP datagram forwarding
 //! 5. UDP response amplification factor enforcement
-//! 5. Global UDP max-session env cap
 //! 6. DTLS backend encryption (plain UDP → gateway → DTLS echo server)
 //! 7. DTLS backend with multiple clients
 //! 8. Frontend DTLS termination (DTLS client → gateway → plain UDP echo server)
 //! 9. Full DTLS: frontend DTLS + backend DTLS (DTLS client → gateway → DTLS echo server)
-//! 5. DTLS backend encryption (plain UDP → gateway → DTLS echo server)
-//! 6. DTLS backend with multiple clients
-//! 7. Frontend DTLS termination (DTLS client → gateway → plain UDP echo server)
-//! 8. Full DTLS: frontend DTLS + backend DTLS (DTLS client → gateway → DTLS echo server)
-//! 9. `FERRUM_UDP_MAX_SESSIONS` rejects new clients once the per-proxy session cap is full
 //!
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_udp_proxy --ignored --nocapture
@@ -536,19 +531,13 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_response_amplification_factor_drops_oversized_backend_datagram() {
-/// Test 5: UDP max sessions env cap — second client is dropped while first
-/// session remains active.
-#[ignore]
-#[tokio::test]
-async fn test_udp_proxy_max_sessions_env_caps_new_clients() {
-    let backend_port = 19826u16;
-    let proxy_port = 19827u16;
-    let gateway_http_port = 18218u16;
+    let backend_port = 19828u16;
+    let proxy_port = 19829u16;
+    let gateway_http_port = 18219u16;
 
     let fixed_response = b"0123456789abcdef".to_vec();
     let response_server =
         start_udp_fixed_response_server(backend_port, fixed_response.clone()).await;
-    let echo_server = start_udp_echo_server(backend_port).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -559,13 +548,11 @@ async fn test_udp_proxy_max_sessions_env_caps_new_clients() {
 version: "1"
 proxies:
   - id: "udp-amplification-guard"
-  - id: "udp-max-sessions"
     listen_port: {proxy_port}
     backend_scheme: udp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     udp_max_response_amplification_factor: 1.0
-    udp_idle_timeout_seconds: 30
 
 consumers: []
 plugin_configs: []
@@ -609,55 +596,6 @@ plugin_configs: []
     let _ = gateway.kill();
     let _ = gateway.wait();
     response_server.abort();
-    let mut gateway = start_gateway_with_extra_env(
-        config_path.to_str().unwrap(),
-        gateway_http_port,
-        &[("FERRUM_UDP_MAX_SESSIONS", "1")],
-    )
-    .expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
-
-    let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    first
-        .connect(format!("127.0.0.1:{}", proxy_port))
-        .await
-        .unwrap();
-    first.send(b"first-session").await.expect("send first");
-
-    let mut buf = vec![0u8; 1024];
-    let n = tokio::time::timeout(Duration::from_secs(5), first.recv(&mut buf))
-        .await
-        .expect("first recv timed out")
-        .expect("first recv error");
-    assert_eq!(&buf[..n], b"first-session");
-
-    let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    second
-        .connect(format!("127.0.0.1:{}", proxy_port))
-        .await
-        .unwrap();
-    second.send(b"second-session").await.expect("send second");
-
-    let second_result =
-        tokio::time::timeout(Duration::from_millis(750), second.recv(&mut buf)).await;
-    assert!(
-        second_result.is_err(),
-        "second client should not receive an echo while FERRUM_UDP_MAX_SESSIONS=1 is exhausted"
-    );
-
-    first
-        .send(b"first-still-active")
-        .await
-        .expect("send first again");
-    let n2 = tokio::time::timeout(Duration::from_secs(5), first.recv(&mut buf))
-        .await
-        .expect("first follow-up recv timed out")
-        .expect("first follow-up recv error");
-    assert_eq!(&buf[..n2], b"first-still-active");
-
-    let _ = gateway.kill();
-    let _ = gateway.wait();
-    echo_server.abort();
 }
 
 /// Test 6: DTLS backend — send plain UDP datagrams through the gateway,

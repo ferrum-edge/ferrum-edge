@@ -148,14 +148,6 @@ fn gateway_binary_path() -> &'static str {
 }
 
 /// Start the gateway in file mode with additional environment overrides.
-fn start_gateway_with_env(
-    config_path: &str,
-    http_port: u16,
-    envs: &[(&str, &str)],
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let mut command = std::process::Command::new(gateway_binary_path());
-    command
-        .env("FERRUM_MODE", "file")
 fn start_gateway_with_extra_env(
     config_path: &str,
     http_port: u16,
@@ -169,11 +161,6 @@ fn start_gateway_with_extra_env(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    let child = command.spawn()?;
-    Ok(child)
 
     for (name, value) in extra_env {
         cmd.env(name, value);
@@ -375,12 +362,6 @@ async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::E
 /// new attempt is made with a different port. Panics only after all attempts
 /// are exhausted.
 async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16) {
-    start_gateway_with_retry_and_env(config_path, &[]).await
-}
-
-async fn start_gateway_with_retry_and_env(
-    config_path: &str,
-    envs: &[(&str, &str)],
     start_gateway_with_retry_extra_env(config_path, &[]).await
 }
 
@@ -392,7 +373,6 @@ async fn start_gateway_with_retry_extra_env(
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
-        match start_gateway_with_env(config_path, gateway_port, envs) {
         match start_gateway_with_extra_env(config_path, gateway_port, extra_env) {
             Ok(mut child) => match wait_for_gateway(gateway_port).await {
                 Ok(()) => return (child, gateway_port),
@@ -497,11 +477,6 @@ async fn test_grpc_unary_echo_through_gateway() {
     println!("test_grpc_unary_echo_through_gateway PASSED");
 }
 
-/// End-to-end test: the gateway's global gRPC receive-size limit rejects
-/// oversized client payloads with RESOURCE_EXHAUSTED before proxying a success.
-#[ignore]
-#[tokio::test]
-async fn test_grpc_max_recv_size_env_rejects_oversized_request() {
 /// End-to-end test: FERRUM_MAX_GRPC_RECV_SIZE_BYTES rejects oversized
 /// client request bodies using gRPC RESOURCE_EXHAUSTED semantics.
 #[ignore]
@@ -516,7 +491,6 @@ async fn test_grpc_recv_size_limit_returns_resource_exhausted() {
     write_grpc_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let (mut gateway, gateway_port) = start_gateway_with_retry_and_env(
     let (mut gateway, gateway_port) = start_gateway_with_retry_extra_env(
         config_path.to_str().unwrap(),
         &[("FERRUM_MAX_GRPC_RECV_SIZE_BYTES", "8")],
@@ -524,20 +498,6 @@ async fn test_grpc_recv_size_limit_returns_resource_exhausted() {
     .await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
-    let oversized_grpc_body = b"\x00\x00\x00\x00\x100123456789abcdef";
-    let (status, headers, body) = send_grpc_request(
-        &gateway_addr,
-        "/grpc/my.EchoService/Echo",
-        oversized_grpc_body,
-        &[],
-    )
-    .await
-    .expect("oversized gRPC request should complete with gateway error");
-
-    assert_eq!(status, 200, "gRPC errors must use HTTP 200");
-    assert!(
-        body.is_empty(),
-        "gateway-generated gRPC size rejection should be trailers-only"
     let grpc_body = grpc_unary_body(32, b'x');
     let (status, headers, body) =
         send_grpc_request(&gateway_addr, "/grpc/my.EchoService/Echo", &grpc_body, &[])
@@ -553,12 +513,6 @@ async fn test_grpc_recv_size_limit_returns_resource_exhausted() {
     assert_eq!(
         headers.get("grpc-status").map(|s| s.as_str()),
         Some("8"),
-        "oversized request should map to RESOURCE_EXHAUSTED"
-    );
-    assert_eq!(
-        headers.get("grpc-message").map(|s| s.as_str()),
-        Some("Resource exhausted"),
-        "gateway should use the public gRPC size-limit message"
         "oversized gRPC request should map to RESOURCE_EXHAUSTED"
     );
     assert!(
@@ -569,7 +523,6 @@ async fn test_grpc_recv_size_limit_returns_resource_exhausted() {
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
-    println!("test_grpc_max_recv_size_env_rejects_oversized_request PASSED");
     println!("test_grpc_recv_size_limit_returns_resource_exhausted PASSED");
 }
 

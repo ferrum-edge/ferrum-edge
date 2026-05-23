@@ -856,14 +856,6 @@ pub(crate) fn should_bypass_h2_coalesce_for_large_response(
     len >= LARGE_H2_BYPASS_THRESHOLD && within_limit
 }
 
-/// Hyper's HTTP/1 parser closes the connection when `max_buf_size` is smaller
-/// than the request head, bypassing Ferrum's protocol-aware 431 response.
-/// Keep the parser buffer reasonably sized and enforce the configured total
-/// header limit in `handle_proxy_request_inner`.
-fn http1_parser_max_buf_size(max_header_size_bytes: usize) -> usize {
-    const MIN_HTTP1_PARSER_BUF_SIZE: usize = 8 * 1024;
-
-    max_header_size_bytes.max(MIN_HTTP1_PARSER_BUF_SIZE)
 /// Keep H2 transport header-list enforcement from resetting the stream before
 /// Ferrum's configured total-header validator can produce a protocol-aware 431.
 fn h2_parser_max_header_list_size(max_header_size_bytes: usize) -> u32 {
