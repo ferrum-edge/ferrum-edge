@@ -367,6 +367,7 @@ jobs:
               scripted_backend_network_sim_tests
               scripted_backend_tests
               scripted_backend_udp_tests
+              functional_header_limits_test
               functional_early_data_test
               functional_ws_origin_test
               functional_allowed_methods_test
