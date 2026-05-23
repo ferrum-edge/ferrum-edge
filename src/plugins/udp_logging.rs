@@ -30,8 +30,8 @@ use tracing::warn;
 use super::utils::log_schema::{SummaryLogEntryBatchView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
-    UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, resolve_udp_endpoint,
-    validate_batch_config,
+    UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, parse_socket_host,
+    resolve_udp_endpoint, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
@@ -62,7 +62,7 @@ struct UdpFlushState {
 
 pub struct UdpLogging {
     logger: BatchingLogger<SummaryLogEntry>,
-    endpoint_hostname: String,
+    endpoint_hostname: Option<String>,
 }
 
 impl UdpLogging {
@@ -71,13 +71,15 @@ impl UdpLogging {
             return Err("udp_logging: config must be an object".to_string());
         }
 
-        let host = config
+        let raw_host = config
             .get("host")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "udp_logging: 'host' is required".to_string())?
             .to_string();
+        let socket_host = parse_socket_host("udp_logging", "host", &raw_host)?;
+        let host = socket_host.dial_host.clone();
         let port = config.get("port").and_then(Value::as_u64).ok_or_else(|| {
             "udp_logging: 'port' is required and must be a positive integer".to_string()
         })?;
@@ -142,7 +144,7 @@ impl UdpLogging {
 
         Ok(Self {
             logger,
-            endpoint_hostname: host,
+            endpoint_hostname: socket_host.warmup_hostname,
         })
     }
 }
@@ -196,7 +198,7 @@ impl Plugin for UdpLogging {
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        vec![self.endpoint_hostname.clone()]
+        self.endpoint_hostname.iter().cloned().collect()
     }
 }
 

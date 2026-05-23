@@ -41,6 +41,68 @@ pub fn uri_encode(input: &str, encode_slash: bool) -> String {
     result
 }
 
+fn uri_encode_query_component(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let bytes = input.as_bytes();
+    let mut result = String::with_capacity(input.len() * 2);
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(byte as char);
+                idx += 1;
+            }
+            b'%' if idx + 2 < bytes.len()
+                && bytes[idx + 1].is_ascii_hexdigit()
+                && bytes[idx + 2].is_ascii_hexdigit() =>
+            {
+                result.push('%');
+                result.push((bytes[idx + 1] as char).to_ascii_uppercase());
+                result.push((bytes[idx + 2] as char).to_ascii_uppercase());
+                idx += 3;
+            }
+            _ => {
+                result.push('%');
+                result.push(HEX[(byte >> 4) as usize] as char);
+                result.push(HEX[(byte & 0x0f) as usize] as char);
+                idx += 1;
+            }
+        }
+    }
+    result
+}
+
+fn canonical_query_string(raw_query: &str) -> String {
+    if raw_query.is_empty() {
+        return String::new();
+    }
+
+    let mut pairs = raw_query
+        .split('&')
+        .map(|part| {
+            let (name, value) = part.split_once('=').unwrap_or((part, ""));
+            (
+                uri_encode_query_component(name),
+                uri_encode_query_component(value),
+            )
+        })
+        .collect::<Vec<_>>();
+    pairs.sort();
+
+    let mut canonical = String::new();
+    for (idx, (name, value)) in pairs.iter().enumerate() {
+        if idx > 0 {
+            canonical.push('&');
+        }
+        canonical.push_str(name);
+        canonical.push('=');
+        canonical.push_str(value);
+    }
+    canonical
+}
+
 /// SHA-256 hash of data, returned as lowercase hex.
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -104,7 +166,7 @@ pub fn sign_request(
         .to_string();
 
     let canonical_uri = uri_encode(parsed_url.path(), false);
-    let canonical_querystring = parsed_url.query().unwrap_or("");
+    let canonical_querystring = canonical_query_string(parsed_url.query().unwrap_or(""));
 
     let payload_hash = sha256_hex(payload);
 
@@ -174,4 +236,91 @@ pub fn sign_request(
     }
 
     Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn config() -> AwsSigV4Config {
+        AwsSigV4Config {
+            region: "us-east-1".to_string(),
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: None,
+        }
+    }
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(2024, 1, 15, 12, 0, 0)
+            .single()
+            .expect("fixed timestamp should be valid")
+    }
+
+    fn authorization_for(url: &str) -> String {
+        sign_request(
+            &config(),
+            "lambda",
+            "POST",
+            url,
+            "application/json",
+            b"{}",
+            &now(),
+        )
+        .expect("signing should succeed")
+        .into_iter()
+        .find(|(name, _)| name == "authorization")
+        .map(|(_, value)| value)
+        .expect("authorization header should be present")
+    }
+
+    #[test]
+    fn uri_encode_uses_sigv4_unreserved_set_and_uppercase_hex() {
+        assert_eq!(uri_encode("AZaz09-_.~", true), "AZaz09-_.~");
+        assert_eq!(uri_encode(" /+☃", true), "%20%2F%2B%E2%98%83");
+        assert_eq!(uri_encode("/path/segment", false), "/path/segment");
+        assert_eq!(uri_encode("/path/segment", true), "%2Fpath%2Fsegment");
+    }
+
+    #[test]
+    fn canonical_query_string_sorts_names_and_values() {
+        assert_eq!(
+            canonical_query_string("z=last&a=2&a=1&empty&space=a%20b&plus=a+b&slash=a/b"),
+            "a=1&a=2&empty=&plus=a%2Bb&slash=a%2Fb&space=a%20b&z=last"
+        );
+    }
+
+    #[test]
+    fn canonical_query_string_normalizes_percent_hex_case() {
+        assert_eq!(
+            canonical_query_string("token=a%2fb&literal_percent=%"),
+            "literal_percent=%25&token=a%2Fb"
+        );
+    }
+
+    #[test]
+    fn sign_request_is_independent_of_query_parameter_order() {
+        let one = authorization_for(
+            "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations?b=2&a=1",
+        );
+        let two = authorization_for(
+            "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations?a=1&b=2",
+        );
+
+        assert_eq!(one, two);
+    }
+
+    #[test]
+    fn sign_request_signature_changes_when_query_value_changes() {
+        let one = authorization_for(
+            "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations?a=1",
+        );
+        let two = authorization_for(
+            "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations?a=2",
+        );
+
+        assert_ne!(one, two);
+    }
 }

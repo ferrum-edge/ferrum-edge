@@ -574,12 +574,26 @@ async fn retry_on_connect_failure_fires_with_empty_methods_and_statuses() {
     // POST is the strictest case — `retryable_methods=[]` would normally
     // forbid replay. The retry-on-connect-failure path applies regardless
     // because connect-refused is a pre-wire transport class.
-    let resp = client
-        .request(reqwest::Method::POST, &harness.proxy_url("/api/x"))
-        .body(b"hello".to_vec())
-        .send()
-        .await
-        .expect("post request");
+    //
+    // On loaded CI runners the proxy route table may not be populated when
+    // `/health` first returns 200 (the admin and proxy listeners start on
+    // separate tasks). Retry on 404 to absorb that startup race.
+    let resp = {
+        let url = harness.proxy_url("/api/x");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let r = client
+                .request(reqwest::Method::POST, &url)
+                .body(b"hello".to_vec())
+                .send()
+                .await
+                .expect("post request");
+            if r.status().as_u16() != 404 || tokio::time::Instant::now() >= deadline {
+                break r;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
     assert_eq!(
         resp.status().as_u16(),
         502,

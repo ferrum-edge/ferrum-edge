@@ -632,6 +632,7 @@ where
             cb_target_key,
             502,
             false,
+            None,
             cb_is_half_open_probe,
             backend_start.elapsed(),
         );
@@ -668,6 +669,7 @@ where
                 cb_target_key,
                 502,
                 true,
+                None,
                 cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
@@ -883,6 +885,7 @@ where
                             current_cb_target_key.as_deref(),
                             attempt_result.status_code,
                             attempt_result.connection_error,
+                            attempt_result.error_class,
                             cb_retry_probe_slot_available,
                             backend_start.elapsed(),
                         );
@@ -926,9 +929,33 @@ where
             let max_req_bytes = state.max_request_body_size_bytes;
             let capacity = state.env_config.http3_request_body_channel_capacity;
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(capacity);
-            let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
-                rx.recv().await.map(|item| (item, rx))
-            });
+            // `tx` is borrowed by `reader_future` below, so the receiver cannot
+            // rely on sender drop to observe EOF. Signal completion explicitly
+            // once H3 DATA is drained so reqwest emits the final chunk marker.
+            let reader_finished = Arc::new(AtomicBool::new(false));
+            let reader_done_notify = Arc::new(tokio::sync::Notify::new());
+            let body_stream_reader_finished = Arc::clone(&reader_finished);
+            let body_stream_reader_done_notify = Arc::clone(&reader_done_notify);
+            let body_stream = futures_util::stream::unfold(
+                (
+                    rx,
+                    body_stream_reader_finished,
+                    body_stream_reader_done_notify,
+                ),
+                |(mut rx, reader_finished, reader_done_notify)| async move {
+                    loop {
+                        if reader_finished.load(Ordering::Acquire) && rx.is_empty() {
+                            return None;
+                        }
+                        tokio::select! {
+                            item = rx.recv() => {
+                                return item.map(|item| (item, (rx, reader_finished, reader_done_notify)));
+                            }
+                            _ = reader_done_notify.notified() => {}
+                        }
+                    }
+                },
+            );
             let req_body = reqwest::Body::wrap_stream(body_stream);
             let send_future = req_builder.body(req_body).send();
 
@@ -958,13 +985,20 @@ where
             // `reader_halt.notified()`. The unconditional
             // `halt_request_body` call after the bridge (below) is the
             // final safety net for any await that remains uncancellable.
+            let reader_finished_for_reader = Arc::clone(&reader_finished);
+            let reader_done_notify_for_reader = Arc::clone(&reader_done_notify);
             let reader_future = async {
+                let finish_reader = || {
+                    reader_finished_for_reader.store(true, Ordering::Release);
+                    reader_done_notify_for_reader.notify_waiters();
+                };
                 let mut total: usize = 0;
                 loop {
                     tokio::select! {
                         biased;
                         _ = reader_halt.notified() => {
                             crate::http3::stream_util::halt_request_body(stream);
+                            finish_reader();
                             return;
                         }
                         chunk = stream.recv_data() => {
@@ -982,6 +1016,7 @@ where
                                                 "request body exceeds max_request_body_size_bytes",
                                             ))) => {}
                                         }
+                                        finish_reader();
                                         return;
                                     }
                                     total += len;
@@ -996,15 +1031,20 @@ where
                                         biased;
                                         _ = reader_halt.notified() => {
                                             crate::http3::stream_util::halt_request_body(stream);
+                                            finish_reader();
                                             return;
                                         }
                                         res = tx.send(Ok(body_bytes)) => res,
                                     };
                                     if send_outcome.is_err() {
+                                        finish_reader();
                                         return;
                                     }
                                 }
-                                Ok(None) => return,
+                                Ok(None) => {
+                                    finish_reader();
+                                    return;
+                                }
                                 Err(e) => {
                                     tokio::select! {
                                         biased;
@@ -1014,6 +1054,7 @@ where
                                             e
                                         )))) => {}
                                     }
+                                    finish_reader();
                                     return;
                                 }
                             }
@@ -1097,6 +1138,7 @@ where
                     current_cb_target_key.as_deref(),
                     413,
                     false,
+                    None,
                     cb_retry_probe_slot_available,
                     backend_start.elapsed(),
                 );
@@ -1136,6 +1178,7 @@ where
                         current_cb_target_key.as_deref(),
                         attempt_result.status_code,
                         attempt_result.connection_error,
+                        attempt_result.error_class,
                         cb_retry_probe_slot_available,
                         backend_start.elapsed(),
                     );
@@ -1178,6 +1221,7 @@ where
             current_cb_target_key.as_deref(),
             502,
             false,
+            None,
             cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );
@@ -1213,6 +1257,7 @@ where
             current_cb_target_key.as_deref(),
             reject.status_code,
             false,
+            None,
             cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );
@@ -1259,6 +1304,7 @@ where
                     current_cb_target_key.as_deref(),
                     502,
                     false,
+                    error_class,
                     cb_retry_probe_slot_available,
                     backend_start.elapsed(),
                 );
@@ -1378,6 +1424,7 @@ where
             current_cb_target_key.as_deref(),
             response_status,
             false,
+            None,
             cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );
@@ -1418,6 +1465,7 @@ where
         current_cb_target_key.as_deref(),
         status,
         false,
+        None,
         cb_retry_probe_slot_available,
         backend_start.elapsed(),
     );
@@ -1784,6 +1832,7 @@ where
                     current_cb_target_key.as_deref(),
                     outcome.response_status,
                     false,
+                    None,
                     cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
@@ -1900,6 +1949,7 @@ where
                 current_cb_target_key.as_deref(),
                 response_status,
                 false,
+                None,
                 cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
@@ -1959,6 +2009,7 @@ where
                     current_cb_target_key.as_deref(),
                     outcome.response_status,
                     false,
+                    None,
                     cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
@@ -2001,6 +2052,7 @@ where
                 current_cb_target_key.as_deref(),
                 streaming.status,
                 false,
+                None,
                 cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
@@ -2068,6 +2120,7 @@ where
                 current_cb_target_key.as_deref(),
                 502,
                 connection_error,
+                Some(error_class),
                 cb_is_half_open_probe,
                 backend_start.elapsed(),
             );

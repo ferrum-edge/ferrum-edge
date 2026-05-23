@@ -804,10 +804,9 @@ impl RequestContext {
     /// request init time instead of eagerly percent-decoding every param.
     #[inline]
     pub fn set_raw_query_string(&mut self, qs: String) {
-        if !qs.is_empty() {
-            self.raw_query_string = Some(qs);
-            self.query_params_materialized = false;
-        }
+        self.query_params.clear();
+        self.query_params_materialized = false;
+        self.raw_query_string = (!qs.is_empty()).then_some(qs);
     }
 
     /// Borrow the raw query string without materializing it.
@@ -2223,6 +2222,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "mesh_outbound_registry"
             | "access_control"
             | "tcp_connection_throttle"
+            | "rate_limiting"
             | "ip_restriction"
             | "waf"
             | "soap_ws_security"

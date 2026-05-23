@@ -1470,6 +1470,69 @@ async fn test_dp_handles_malformed_config() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_dp_rejects_snapshot_with_invalid_proxy_hosts() {
+    let cp_config = create_test_config(1);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "test-node-invalid-host",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(received.is_ok(), "Should receive initial config");
+    assert_eq!(proxy_state.config.load().proxies[0].id, "proxy-0");
+
+    let mut invalid_config = create_test_config(1);
+    invalid_config.proxies[0].id = "bad-host".to_string();
+    invalid_config.proxies[0].hosts = vec!["api..example.com".to_string()];
+    CpGrpcServer::broadcast_update(&update_tx, &invalid_config);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        proxy_state.config.load().proxies[0].id,
+        "proxy-0",
+        "DP must keep the last valid config after an invalid host snapshot"
+    );
+
+    let valid_config = create_test_config(2);
+    CpGrpcServer::broadcast_update(&update_tx, &valid_config);
+    let recovered = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "Client should continue processing valid updates after rejecting invalid hosts"
+    );
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_dp_preserves_config_after_cp_shutdown() {
     // This test verifies that when the CP goes down, the DP preserves its cached config
     // and the start_dp_client_with_shutdown loop keeps running (doesn't crash).

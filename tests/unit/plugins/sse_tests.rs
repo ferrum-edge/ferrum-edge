@@ -219,6 +219,19 @@ async fn test_wrong_accept_header_rejected_406() {
 }
 
 #[tokio::test]
+async fn test_accept_substring_media_type_rejected_406() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_sse_ctx();
+    ctx.headers.insert(
+        "accept".to_string(),
+        "application/json, text/event-stream-like".to_string(),
+    );
+
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_reject(&result, 406);
+}
+
+#[tokio::test]
 async fn test_accept_validation_disabled() {
     let plugin = make_plugin(json!({"require_accept_header": false}));
     let mut ctx = RequestContext::new(
@@ -391,6 +404,29 @@ async fn test_detects_sse_case_insensitive() {
     assert_eq!(headers.get("cache-control").unwrap(), "no-cache");
 }
 
+#[tokio::test]
+async fn test_sse_like_content_type_is_not_decorated() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_sse_ctx();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "text/event-stream-like".to_string(),
+    );
+    headers.insert("content-length".to_string(), "42".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+
+    assert_eq!(
+        headers.get("content-type").unwrap(),
+        "text/event-stream-like"
+    );
+    assert_eq!(headers.get("content-length").unwrap(), "42");
+    assert!(!headers.contains_key("cache-control"));
+    assert!(!headers.contains_key("connection"));
+    assert!(!headers.contains_key("x-accel-buffering"));
+}
+
 // ── after_proxy: configuration options ────────────────────────────────────────
 
 #[tokio::test]
@@ -528,6 +564,23 @@ async fn test_does_not_wrap_already_sse_body() {
         .await;
 
     assert!(result.is_none(), "should not double-wrap SSE body");
+}
+
+#[tokio::test]
+async fn test_wraps_sse_like_content_type_body() {
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true}));
+    let body = b"not an sse stream";
+    let headers = HashMap::new();
+
+    let result = plugin
+        .transform_response_body(body, Some("text/event-stream-like"), &headers)
+        .await;
+
+    let transformed = result.expect("sse-like content type should not suppress wrapping");
+    assert_eq!(
+        String::from_utf8(transformed).unwrap(),
+        "data: not an sse stream\n\n"
+    );
 }
 
 #[tokio::test]

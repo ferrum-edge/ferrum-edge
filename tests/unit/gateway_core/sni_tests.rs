@@ -101,6 +101,14 @@ fn build_dtls_client_hello(hostname: &str) -> Vec<u8> {
     record
 }
 
+fn set_sni_list_len(data: &mut [u8], hostname: &str, list_len: u16) {
+    let hostname_offset = data
+        .windows(hostname.len())
+        .position(|window| window == hostname.as_bytes())
+        .expect("hostname should be present in test ClientHello");
+    data[hostname_offset - 5..hostname_offset - 3].copy_from_slice(&list_len.to_be_bytes());
+}
+
 fn make_test_config(
     proxies: Vec<ferrum_edge::config::types::Proxy>,
 ) -> ferrum_edge::config::types::GatewayConfig {
@@ -258,6 +266,24 @@ fn test_extract_sni_wrong_content_type() {
 fn test_extract_sni_wrong_handshake_type() {
     let mut data = build_tls_client_hello("example.com");
     data[5] = 0x02;
+    assert_eq!(extract_sni_from_client_hello(&data), None);
+}
+
+#[test]
+fn test_extract_sni_rejects_short_server_name_list_length() {
+    let hostname = "example.com";
+    let mut data = build_tls_client_hello(hostname);
+    set_sni_list_len(&mut data, hostname, 0);
+
+    assert_eq!(extract_sni_from_client_hello(&data), None);
+}
+
+#[test]
+fn test_extract_sni_rejects_oversized_server_name_list_length() {
+    let hostname = "example.com";
+    let mut data = build_tls_client_hello(hostname);
+    set_sni_list_len(&mut data, hostname, (1 + 2 + hostname.len() + 1) as u16);
+
     assert_eq!(extract_sni_from_client_hello(&data), None);
 }
 

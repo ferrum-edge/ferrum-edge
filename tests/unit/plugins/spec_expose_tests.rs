@@ -106,6 +106,17 @@ fn test_creation_invalid_url() {
     assert!(err.contains("not a valid URL"));
 }
 
+#[test]
+fn test_creation_rejects_empty_authority_spec_url() {
+    let err = SpecExpose::new(
+        &json!({ "spec_url": "https:///openapi.yaml" }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("empty authority spec_url must be rejected");
+    assert!(err.contains("hostname or IP address"), "got: {err}");
+}
+
 // === Path matching ===
 
 #[test]
@@ -252,6 +263,17 @@ fn test_warmup_hostnames() {
     .unwrap();
     let hostnames = plugin.warmup_hostnames();
     assert_eq!(hostnames, vec!["internal.example.com"]);
+}
+
+#[test]
+fn test_warmup_hostnames_unbrackets_ipv6_literal() {
+    let plugin = SpecExpose::new(
+        &json!({ "spec_url": "https://[2001:db8::5]:9443/openapi.yaml" }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.warmup_hostnames(), vec!["2001:db8::5"]);
 }
 
 // === Constructor validation ===

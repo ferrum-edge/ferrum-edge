@@ -820,9 +820,11 @@ async fn handle_h3_request(
         }
     }
 
-    // Validate query parameter count
+    // Validate query parameter count (skip empty segments from consecutive '&').
+    // Keep this in sync with the H1/H2 proxy path so `?a=1&&b=2` counts as
+    // two parameters across all frontend protocols.
     if state.max_query_params > 0 && !query_string.is_empty() {
-        let param_count = query_string.split('&').count();
+        let param_count = crate::proxy::count_query_params(&query_string);
         if param_count > state.max_query_params {
             record_request(&state, 400);
             let body = format!(
@@ -996,13 +998,15 @@ async fn handle_h3_request(
 
     // Per-IP concurrent request limiting (same as HTTP/1.1 and HTTP/2 paths).
     let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
-        let count = counts
-            .entry(ctx.client_ip.clone())
-            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
-        let current = count
-            .value()
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
+        let current = {
+            let count = counts
+                .entry(ctx.client_ip.clone())
+                .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+            count
+                .value()
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1
+        };
         let guard = Some(crate::proxy::PerIpRequestGuard {
             ip: ctx.client_ip.clone(),
             counts: counts.clone(),
@@ -1981,6 +1985,7 @@ async fn handle_h3_request(
                     cb_target_key.as_deref(),
                     502,
                     true,
+                    Some(h3_error_class),
                     cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
@@ -2056,6 +2061,7 @@ async fn handle_h3_request(
                 cb_target_key.as_deref(),
                 502,
                 false,
+                None,
                 cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
@@ -2249,6 +2255,7 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             response_status,
             false,
+            None,
             cb_is_half_open_probe,
             backend_start.elapsed(),
         );
@@ -2534,6 +2541,7 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             response_status,
             connection_error,
+            h3_error_class,
             cb_is_half_open_probe,
             backend_start.elapsed(),
         );
@@ -2768,6 +2776,7 @@ async fn handle_h3_request(
             final_cb_target_key.as_deref(),
             response_status,
             !h3_request_on_wire,
+            h3_error_class,
             cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );

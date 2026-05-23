@@ -1499,7 +1499,7 @@ pub struct Proxy {
     /// Used only for direct-backend proxies (no `upstream_id`).
     #[serde(default)]
     pub backend_tls_server_ca_cert_path: Option<String>,
-    /// Resolved backend TLS config (populated at config load time).
+    /// Resolved backend TLS config (populated during `normalize_fields()`).
     /// When the proxy references an upstream, this is the upstream's TLS config.
     /// For direct-backend proxies, this is the proxy's own TLS fields.
     /// Not serialized — derived from the upstream or proxy fields.
@@ -2089,7 +2089,8 @@ impl GatewayConfig {
         }
     }
 
-    /// Normalize all resource fields that have canonical in-memory forms.
+    /// Normalize all resource fields that have canonical in-memory forms and
+    /// refresh derived runtime projections skipped by serde.
     pub fn normalize_fields(&mut self) {
         self.normalize_hosts();
         for consumer in &mut self.consumers {
@@ -2105,6 +2106,10 @@ impl GatewayConfig {
         // proxy at load time, so the request hot path never does any
         // scheme branching.
         self.resolve_dispatch_kind();
+        // Rebuild TLS projections after serde or admin/incremental mutations.
+        // `Proxy.resolved_tls` is skipped on the wire, so normalization must
+        // repopulate it before any runtime snapshot can serve traffic.
+        self.resolve_upstream_tls();
         // Project per-port `connect_timeout_ms` overrides from each proxy's
         // upstream onto a flat `Proxy.dispatch_port_overrides` map so the
         // request hot path skips the `ArcSwap` + `DashMap` lookup. No-op for
@@ -2131,9 +2136,9 @@ impl GatewayConfig {
 
     /// Resolve each proxy's `resolved_tls` from its upstream (if any) or its own fields.
     ///
-    /// Must be called after loading/mutating config and before any proxy traffic flows.
-    /// Called by `normalize_fields()` callers, `update_config()`, `apply_incremental()`,
-    /// and admin API mutation handlers.
+    /// Called by `normalize_fields()` after loading/mutating config and before
+    /// any proxy traffic flows. Direct calls are still valid for narrow mutation
+    /// paths that only need to refresh TLS projection.
     ///
     /// Proxies with `upstream_subset` set consult the upstream's
     /// `resolved_subset_tls` map first; when the named subset has a resolved
@@ -2767,6 +2772,20 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("host entry must not be empty".to_string());
     }
+    if host.len() > MAX_HOST_LENGTH {
+        return Err(format!(
+            "host '{}' must not exceed {} characters (got {})",
+            host,
+            MAX_HOST_LENGTH,
+            host.len()
+        ));
+    }
+    if host.trim() != host {
+        return Err(format!(
+            "host '{}' must not have leading or trailing whitespace",
+            host
+        ));
+    }
     if host.contains("://") {
         return Err(format!(
             "host '{}' must not contain a scheme (e.g., 'http://')",
@@ -2785,13 +2804,14 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
             host
         ));
     }
-    if host.starts_with("*.") {
+    if let Some(wildcard_suffix) = host.strip_prefix("*.") {
         if !WILDCARD_HOST_REGEX.is_match(host) {
             return Err(format!(
                 "wildcard host '{}' is invalid: must be '*.domain.tld' format",
                 host
             ));
         }
+        validate_hostname_labels(wildcard_suffix, host)?;
     } else if host.contains('*') {
         return Err(format!(
             "host '{}' has invalid wildcard: '*' is only allowed as prefix '*.domain'",
@@ -2802,6 +2822,37 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
             "host '{}' is invalid: must be a valid hostname (lowercase letters, digits, dots, hyphens)",
             host
         ));
+    } else {
+        validate_hostname_labels(host, host)?;
+    }
+    Ok(())
+}
+
+fn validate_hostname_labels(hostname: &str, original: &str) -> Result<(), String> {
+    for label in hostname.split('.') {
+        if label.is_empty() {
+            return Err(format!("host '{}' must not contain empty labels", original));
+        }
+        if label.len() > 63 {
+            return Err(format!(
+                "host '{}' contains a label longer than 63 characters",
+                original
+            ));
+        }
+        let starts_alnum = label
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+        let ends_alnum = label
+            .as_bytes()
+            .last()
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+        if !starts_alnum || !ends_alnum {
+            return Err(format!(
+                "host '{}' labels must start and end with an alphanumeric character",
+                original
+            ));
+        }
     }
     Ok(())
 }

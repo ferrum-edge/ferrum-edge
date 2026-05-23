@@ -34,6 +34,7 @@ use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{is_backend_request_strip_header, parse_connection_listed_headers};
 use crate::tls::backend::{
     BackendSvidGeneration, SvidGenerationMatcher, append_backend_tls_pool_key_fields,
+    append_optional_pool_key_component, append_pool_key_component,
     backend_svid_generation_for_client_cert,
 };
 
@@ -899,6 +900,9 @@ impl Http3ConnectionPool {
         buf.clear();
         // Key shape:
         //   host|port|index|dns_override|subset|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
+        // User/config-controlled components are escaped before delimiters are
+        // appended so values containing `|`, `#`, or `%` cannot collide with
+        // adjacent fields or shard suffixes.
         //
         // This must cover every dimension that affects QUIC connection
         // identity *and* matches the backend-capability registry key for
@@ -913,15 +917,12 @@ impl Http3ConnectionPool {
         // subsets cannot share a QUIC connection even when their TLS
         // material is byte-identical. Empty when the proxy has no
         // `upstream_subset`.
-        let _ = write!(
-            buf,
-            "{}|{}|{}|{}|{}|",
-            host,
-            port,
-            index,
-            proxy.dns_override.as_deref().unwrap_or_default(),
-            proxy.upstream_subset.as_deref().unwrap_or_default(),
-        );
+        append_pool_key_component(buf, host);
+        let _ = write!(buf, "|{port}|{index}|");
+        append_optional_pool_key_component(buf, proxy.dns_override.as_deref());
+        buf.push('|');
+        append_optional_pool_key_component(buf, proxy.upstream_subset.as_deref());
+        buf.push('|');
         append_backend_tls_pool_key_fields(
             buf,
             &proxy.resolved_tls,

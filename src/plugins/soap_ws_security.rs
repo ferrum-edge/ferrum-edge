@@ -1919,11 +1919,30 @@ fn parse_ws_datetime(s: &str) -> Option<DateTime<Utc>> {
 
 /// Escape special characters for JSON string interpolation.
 fn escape_json_chars(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut escaped = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            ch if ch < '\u{20}' => {
+                escaped.push_str("\\u00");
+                let byte = ch as u8;
+                escaped.push(HEX[(byte >> 4) as usize] as char);
+                escaped.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Escape XML special characters for safe interpolation.
@@ -1938,6 +1957,17 @@ fn escape_xml_chars(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn soap_escape_json_chars_round_trips_control_characters() {
+        let raw = "validation failed\"\n<xml>\u{00}\u{1f}\\";
+        let body = format!(r#"{{"error":"{}"}}"#, escape_json_chars(raw));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("escaped SOAP error should be valid JSON");
+
+        assert_eq!(parsed["error"], raw);
+        assert!(!escape_json_chars(raw).chars().any(|ch| ch < '\u{20}'));
+    }
 
     /// Iterating over multiple `<Reference>` elements with
     /// `find_element_block_from_with_end` must advance the cursor far enough

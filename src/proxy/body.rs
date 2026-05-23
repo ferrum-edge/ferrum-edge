@@ -42,6 +42,9 @@ pub struct ProxyBody {
     /// Dropped when a reqwest-backed response body finishes, so the
     /// runtime port-pressure estimate tracks streaming backend sockets too.
     _reqwest_backend_guard: Option<crate::runtime_metrics::ReqwestBackendRequestGuard>,
+    /// Dropped when the client-visible response body finishes, decrementing
+    /// per-IP in-flight request accounting.
+    _per_ip_request_guard: Option<super::PerIpRequestGuard>,
     /// Dropped when a streaming backend response body reaches terminal state
     /// (EOF, error, or client disconnect), ensuring least-connections
     /// accounting decrements when the backend stream actually ends.
@@ -212,6 +215,7 @@ impl ProxyBody {
             kind: ProxyBodyKind::Full(Full::new(data.into())),
             _request_guard: None,
             _reqwest_backend_guard: None,
+            _per_ip_request_guard: None,
             _lb_connection_guard: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
@@ -230,6 +234,7 @@ impl ProxyBody {
             kind: ProxyBodyKind::Full(Full::default()),
             _request_guard: None,
             _reqwest_backend_guard: None,
+            _per_ip_request_guard: None,
             _lb_connection_guard: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
@@ -249,6 +254,11 @@ impl ProxyBody {
         guard: crate::runtime_metrics::ReqwestBackendRequestGuard,
     ) -> Self {
         self._reqwest_backend_guard = Some(guard);
+        self
+    }
+
+    pub(crate) fn with_per_ip_request_guard(mut self, guard: super::PerIpRequestGuard) -> Self {
+        self._per_ip_request_guard = Some(guard);
         self
     }
 
@@ -300,6 +310,7 @@ impl ProxyBody {
             kind: ProxyBodyKind::Stream(body),
             _request_guard: None,
             _reqwest_backend_guard: None,
+            _per_ip_request_guard: None,
             _lb_connection_guard: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),

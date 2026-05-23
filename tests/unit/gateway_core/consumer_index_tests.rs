@@ -213,6 +213,15 @@ fn test_index_len_counts_all_entries() {
     assert_eq!(index.index_len(), 5);
 }
 
+#[test]
+fn test_index_len_includes_mtls_entries() {
+    let consumer = make_consumer_with_array_mtls("c1", "alice", &["CN=old", "CN=new"]);
+    let index = ConsumerIndex::new(&[consumer]);
+
+    // Expected entries: mtls:CN=old, mtls:CN=new, identity:alice, identity:c1
+    assert_eq!(index.index_len(), 4);
+}
+
 // ---- apply_delta correctness ----
 
 #[test]
@@ -386,6 +395,21 @@ fn make_consumer_with_array_mtls(id: &str, username: &str, identities: &[&str]) 
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
+}
+
+fn make_consumer_with_colliding_credentials(
+    id: &str,
+    username: &str,
+    api_key: &str,
+    custom_id: &str,
+    mtls_identity: &str,
+) -> Consumer {
+    let mut consumer = make_consumer(id, username, Some(api_key), Some(custom_id));
+    consumer.credentials.insert(
+        "mtls_auth".to_string(),
+        Value::Array(vec![serde_json::json!({ "identity": mtls_identity })]),
+    );
+    consumer
 }
 
 #[test]
@@ -785,6 +809,77 @@ fn test_mtls_collision_last_consumer_wins() {
         found.id, "c2",
         "Last consumer with colliding mTLS identity wins"
     );
+}
+
+#[test]
+fn test_apply_delta_remove_collision_winner_restores_shadowed_consumer() {
+    let c1 = make_consumer_with_colliding_credentials(
+        "c1",
+        "shared-user",
+        "shared-key",
+        "shared-custom",
+        "CN=shared",
+    );
+    let c2 = make_consumer_with_colliding_credentials(
+        "c2",
+        "shared-user",
+        "shared-key",
+        "shared-custom",
+        "CN=shared",
+    );
+    let index = ConsumerIndex::new(&[c1, c2]);
+
+    assert_eq!(index.find_by_api_key("shared-key").unwrap().id, "c2");
+    assert_eq!(index.find_by_username("shared-user").unwrap().id, "c2");
+    assert_eq!(index.find_by_identity("shared-custom").unwrap().id, "c2");
+    assert_eq!(index.find_by_mtls_identity("CN=shared").unwrap().id, "c2");
+
+    index.apply_delta(&[], &["c2".to_string()], &[]);
+
+    assert_eq!(index.consumer_count(), 1);
+    assert_eq!(index.find_by_api_key("shared-key").unwrap().id, "c1");
+    assert_eq!(index.find_by_username("shared-user").unwrap().id, "c1");
+    assert_eq!(index.find_by_identity("shared-custom").unwrap().id, "c1");
+    assert_eq!(index.find_by_mtls_identity("CN=shared").unwrap().id, "c1");
+    assert!(index.find_by_identity("c2").is_none());
+}
+
+#[test]
+fn test_apply_delta_modify_collision_winner_restores_shadowed_consumer() {
+    let c1 = make_consumer_with_colliding_credentials(
+        "c1",
+        "shared-user",
+        "shared-key",
+        "shared-custom",
+        "CN=shared",
+    );
+    let c2 = make_consumer_with_colliding_credentials(
+        "c2",
+        "shared-user",
+        "shared-key",
+        "shared-custom",
+        "CN=shared",
+    );
+    let index = ConsumerIndex::new(&[c1, c2]);
+
+    let c2_modified = make_consumer_with_colliding_credentials(
+        "c2",
+        "unique-user",
+        "unique-key",
+        "unique-custom",
+        "CN=unique",
+    );
+    index.apply_delta(&[], &[], &[c2_modified]);
+
+    assert_eq!(index.consumer_count(), 2);
+    assert_eq!(index.find_by_api_key("shared-key").unwrap().id, "c1");
+    assert_eq!(index.find_by_username("shared-user").unwrap().id, "c1");
+    assert_eq!(index.find_by_identity("shared-custom").unwrap().id, "c1");
+    assert_eq!(index.find_by_mtls_identity("CN=shared").unwrap().id, "c1");
+    assert_eq!(index.find_by_api_key("unique-key").unwrap().id, "c2");
+    assert_eq!(index.find_by_username("unique-user").unwrap().id, "c2");
+    assert_eq!(index.find_by_identity("unique-custom").unwrap().id, "c2");
+    assert_eq!(index.find_by_mtls_identity("CN=unique").unwrap().id, "c2");
 }
 
 #[test]

@@ -3,7 +3,10 @@
 use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::pool_config::{MAX_IDLE_PER_HOST, MIN_IDLE_PER_HOST};
-use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, DispatchKind, MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_WINDOW_SIZE,
+    MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE, Proxy,
+};
 
 fn create_test_proxy() -> Proxy {
     Proxy {
@@ -119,6 +122,55 @@ fn test_no_overrides() {
     );
     assert_eq!(config.enable_http_keep_alive, global.enable_http_keep_alive);
     assert_eq!(config.enable_http2, global.enable_http2);
+}
+
+#[test]
+fn test_proxy_overrides_apply_all_h2_bounds_defensively() {
+    let global = PoolConfig::default();
+    let mut proxy = create_test_proxy();
+    proxy.pool_idle_timeout_seconds = Some(12);
+    proxy.pool_enable_http_keep_alive = Some(false);
+    proxy.pool_enable_http2 = Some(false);
+    proxy.pool_tcp_keepalive_seconds = Some(13);
+    proxy.pool_http2_keep_alive_interval_seconds = Some(14);
+    proxy.pool_http2_keep_alive_timeout_seconds = Some(15);
+    proxy.pool_http2_initial_stream_window_size = Some(MIN_HTTP2_WINDOW_SIZE - 1);
+    proxy.pool_http2_initial_connection_window_size = Some(MAX_HTTP2_WINDOW_SIZE + 1);
+    proxy.pool_http2_adaptive_window = Some(false);
+    proxy.pool_http2_max_frame_size = Some(MIN_HTTP2_MAX_FRAME_SIZE - 1);
+    proxy.pool_http2_max_concurrent_streams = Some(0);
+
+    let config = global.for_proxy(&proxy);
+
+    assert_eq!(config.max_idle_per_host, global.max_idle_per_host);
+    assert_eq!(config.idle_timeout_seconds, 12);
+    assert!(!config.enable_http_keep_alive);
+    assert!(!config.enable_http2);
+    assert_eq!(config.tcp_keepalive_seconds, 13);
+    assert_eq!(config.http2_keep_alive_interval_seconds, 14);
+    assert_eq!(config.http2_keep_alive_timeout_seconds, 15);
+    assert_eq!(
+        config.http2_initial_stream_window_size,
+        MIN_HTTP2_WINDOW_SIZE
+    );
+    assert_eq!(
+        config.http2_initial_connection_window_size,
+        MAX_HTTP2_WINDOW_SIZE
+    );
+    assert!(!config.http2_adaptive_window);
+    assert_eq!(config.http2_max_frame_size, MIN_HTTP2_MAX_FRAME_SIZE);
+    assert_eq!(config.http2_max_concurrent_streams, Some(1));
+}
+
+#[test]
+fn test_proxy_overrides_clamp_h2_max_frame_high_boundary() {
+    let global = PoolConfig::default();
+    let mut proxy = create_test_proxy();
+    proxy.pool_http2_max_frame_size = Some(MAX_HTTP2_MAX_FRAME_SIZE + 1);
+
+    let config = global.for_proxy(&proxy);
+
+    assert_eq!(config.http2_max_frame_size, MAX_HTTP2_MAX_FRAME_SIZE);
 }
 
 #[test]

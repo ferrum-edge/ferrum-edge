@@ -491,6 +491,38 @@ async fn test_non_json_passes_through() {
 }
 
 #[tokio::test]
+async fn test_graphql_rejects_json_substring_content_types() {
+    let plugin = create_plugin("graphql", &json!({"max_depth": 1}))
+        .unwrap()
+        .unwrap();
+    let query = "{ user { posts { comments { text } } } }";
+
+    for content_type in [
+        "application/jsonp",
+        "application/notjson",
+        "text/application/json",
+        "application/json-seq",
+    ] {
+        let mut ctx = create_graphql_context(query, None);
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), content_type.to_string());
+
+        assert!(
+            !plugin.should_buffer_request_body(&ctx),
+            "{content_type} must not trigger GraphQL request-body buffering"
+        );
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_continue(result);
+        assert!(
+            !ctx.metadata.contains_key("graphql_depth"),
+            "{content_type} must not be parsed as GraphQL JSON"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_no_query_field_passes_through() {
     let config = json!({ "max_depth": 1 });
     let plugin = create_plugin("graphql", &config).unwrap().unwrap();

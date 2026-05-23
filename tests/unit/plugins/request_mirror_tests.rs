@@ -140,6 +140,28 @@ fn test_empty_mirror_host_is_error() {
 }
 
 #[test]
+fn test_mirror_host_rejects_url_authority_and_path_material() {
+    for mirror_host in [
+        "http://mirror.local",
+        "user@mirror.local",
+        "mirror.local/path",
+        "mirror.local?token=secret",
+        "mirror.local#fragment",
+        "mirror.local:8080",
+        "bad host",
+    ] {
+        let result = RequestMirror::new(
+            &json!({ "mirror_host": mirror_host }),
+            PluginHttpClient::default(),
+        );
+        assert!(
+            result.is_err(),
+            "mirror_host should fail validation: {mirror_host}"
+        );
+    }
+}
+
+#[test]
 fn test_invalid_protocol_is_error() {
     let result = RequestMirror::new(
         &json!({ "mirror_host": "mirror.local", "mirror_protocol": "ftp" }),
@@ -281,6 +303,19 @@ fn test_hostname_normalized_to_lowercase() {
         plugin.warmup_hostnames(),
         vec!["mirror.example.com".to_string()]
     );
+}
+
+#[test]
+fn test_warmup_hostnames_skips_ip_literals() {
+    for host in ["127.0.0.1", "2001:db8::10", "[2001:db8::10]"] {
+        let plugin =
+            RequestMirror::new(&json!({ "mirror_host": host }), PluginHttpClient::default())
+                .unwrap();
+        assert!(
+            plugin.warmup_hostnames().is_empty(),
+            "IP literal {host} should not be DNS-warmed"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

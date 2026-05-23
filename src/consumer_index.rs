@@ -1,5 +1,5 @@
 use arc_swap::ArcSwap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{error, warn};
 
@@ -157,7 +157,7 @@ impl ConsumerIndex {
         let mut all: Vec<Arc<Consumer>> = current.all_consumers.as_ref().clone();
 
         // Collect all IDs that need removal (deleted + modified consumers being re-inserted)
-        let ids_to_remove: std::collections::HashSet<&str> = removed_ids
+        let ids_to_remove: HashSet<&str> = removed_ids
             .iter()
             .map(|s| s.as_str())
             .chain(modified.iter().map(|c| c.id.as_str()))
@@ -241,6 +241,18 @@ impl ConsumerIndex {
 
             // Remove from all-consumers list (single pass with HashSet lookup)
             all.retain(|c| !ids_to_remove.contains(c.id.as_str()));
+
+            Self::restore_shadowed_entries(
+                &all,
+                &mut keyauth,
+                &mut basic,
+                &mut identity,
+                &mut mtls,
+                &old_keyauth_keys,
+                &old_basic_keys,
+                &old_identity_keys,
+                &old_mtls_keys,
+            );
         }
 
         // Insert added and modified consumers
@@ -296,7 +308,10 @@ impl ConsumerIndex {
     /// Number of indexed entries (for testing).
     pub fn index_len(&self) -> usize {
         self.with_inner(|inner| {
-            inner.keyauth_index.len() + inner.basic_index.len() + inner.identity_index.len()
+            inner.keyauth_index.len()
+                + inner.basic_index.len()
+                + inner.identity_index.len()
+                + inner.mtls_index.len()
         })
     }
 
@@ -403,6 +418,68 @@ impl ConsumerIndex {
             all,
             jwt_count,
             hmac_count,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_shadowed_entries(
+        all: &[Arc<Consumer>],
+        keyauth: &mut HashMap<String, Arc<Consumer>>,
+        basic: &mut HashMap<String, Arc<Consumer>>,
+        identity: &mut HashMap<String, Arc<Consumer>>,
+        mtls: &mut HashMap<String, Arc<Consumer>>,
+        keyauth_keys: &[String],
+        basic_keys: &[String],
+        identity_keys: &[String],
+        mtls_keys: &[String],
+    ) {
+        let keyauth_keys: HashSet<&str> = keyauth_keys.iter().map(String::as_str).collect();
+        let basic_keys: HashSet<&str> = basic_keys.iter().map(String::as_str).collect();
+        let identity_keys: HashSet<&str> = identity_keys.iter().map(String::as_str).collect();
+        let mtls_keys: HashSet<&str> = mtls_keys.iter().map(String::as_str).collect();
+
+        if keyauth_keys.is_empty()
+            && basic_keys.is_empty()
+            && identity_keys.is_empty()
+            && mtls_keys.is_empty()
+        {
+            return;
+        }
+
+        for consumer in all {
+            for key_creds in consumer.credential_entries("keyauth") {
+                if let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
+                    && keyauth_keys.contains(key)
+                {
+                    keyauth.insert(key.to_string(), Arc::clone(consumer));
+                }
+            }
+
+            if consumer.has_credential("basicauth")
+                && basic_keys.contains(consumer.username.as_str())
+            {
+                basic.insert(consumer.username.clone(), Arc::clone(consumer));
+            }
+
+            if identity_keys.contains(consumer.username.as_str()) {
+                identity.insert(consumer.username.clone(), Arc::clone(consumer));
+            }
+            if identity_keys.contains(consumer.id.as_str()) {
+                identity.insert(consumer.id.clone(), Arc::clone(consumer));
+            }
+            if let Some(custom_id) = consumer.custom_id.as_ref()
+                && identity_keys.contains(custom_id.as_str())
+            {
+                identity.insert(custom_id.clone(), Arc::clone(consumer));
+            }
+
+            for mtls_creds in consumer.credential_entries("mtls_auth") {
+                if let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str())
+                    && mtls_keys.contains(id)
+                {
+                    mtls.insert(id.to_string(), Arc::clone(consumer));
+                }
+            }
         }
     }
 }

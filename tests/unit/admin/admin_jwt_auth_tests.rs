@@ -1,20 +1,28 @@
 //! Tests for admin JWT authentication
 
 use chrono::{Duration, Utc};
-use ferrum_edge::admin::jwt_auth::{AdminClaims, AdminRole, JwtConfig, JwtManager};
+use ferrum_edge::admin::jwt_auth::{AdminClaims, AdminRole, JwtConfig, JwtError, JwtManager};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
 
-#[test]
-fn test_jwt_verification() {
-    let config = JwtConfig {
+fn test_jwt_config() -> JwtConfig {
+    JwtConfig {
         secret: "test-secret".to_string(),
         issuer: "test-issuer".to_string(),
         max_ttl_seconds: 3600,
         algorithm: Algorithm::HS256,
-    };
+    }
+}
 
-    let manager = JwtManager::new(config);
+fn encode_json_claims(claims: serde_json::Value, secret: &str, algorithm: Algorithm) -> String {
+    let header = Header::new(algorithm);
+    let key = EncodingKey::from_secret(secret.as_bytes());
+    encode(&header, &claims, &key).unwrap()
+}
+
+#[test]
+fn test_jwt_verification() {
+    let manager = JwtManager::new(test_jwt_config());
 
     // Create a test token manually (as a client would)
     let now = Utc::now();
@@ -38,6 +46,126 @@ fn test_jwt_verification() {
     assert_eq!(token_data.claims.iss, "test-issuer");
     assert_eq!(token_data.claims.sub, "admin-user");
     assert_eq!(token_data.claims.additional["role"], "admin");
+}
+
+#[test]
+fn test_authorization_header_extraction_is_case_insensitive_and_strict() {
+    assert_eq!(
+        JwtManager::extract_token_from_header("Bearer abc.def"),
+        Some("abc.def".to_string())
+    );
+    assert_eq!(
+        JwtManager::extract_token_from_header("bearer abc.def"),
+        Some("abc.def".to_string())
+    );
+    assert_eq!(
+        JwtManager::extract_token_from_header("BEARER   abc.def"),
+        Some("abc.def".to_string())
+    );
+    assert_eq!(JwtManager::extract_token_from_header("Bearer "), None);
+    assert_eq!(JwtManager::extract_token_from_header("Bearer"), None);
+    assert_eq!(JwtManager::extract_token_from_header("Basic abc.def"), None);
+    assert_eq!(
+        JwtManager::extract_token_from_header("Bearer abc.def extra"),
+        None
+    );
+}
+
+#[test]
+fn test_verify_request_maps_header_failures_and_accepts_lowercase_bearer() {
+    let manager = JwtManager::new(test_jwt_config());
+    let now = Utc::now();
+    let claims = json!({
+        "iss": "test-issuer",
+        "sub": "admin-user",
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + Duration::seconds(1800)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "role": "admin",
+    });
+    let token = encode_json_claims(claims, "test-secret", Algorithm::HS256);
+    let lowercase_header = format!("bearer {token}");
+
+    assert!(manager.verify_request(Some(&lowercase_header)).is_ok());
+    assert!(matches!(
+        manager.verify_request(None),
+        Err(JwtError::MissingHeader)
+    ));
+    assert!(matches!(
+        manager.verify_request(Some("Basic abc.def")),
+        Err(JwtError::InvalidHeaderFormat)
+    ));
+    assert!(matches!(
+        manager.verify_request(Some("Bearer ")),
+        Err(JwtError::InvalidHeaderFormat)
+    ));
+    assert!(matches!(
+        manager.verify_request(Some("Bearer abc.def extra")),
+        Err(JwtError::InvalidHeaderFormat)
+    ));
+    assert!(matches!(
+        manager.verify_request(Some("Bearer not-a-jwt")),
+        Err(JwtError::VerificationFailed(_))
+    ));
+}
+
+#[test]
+fn test_jwt_required_claims_are_enforced() {
+    let manager = JwtManager::new(test_jwt_config());
+    let now = Utc::now();
+    let claims_without_jti = json!({
+        "iss": "test-issuer",
+        "sub": "admin-user",
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + Duration::seconds(1800)).timestamp(),
+        "role": "admin",
+    });
+    let token = encode_json_claims(claims_without_jti, "test-secret", Algorithm::HS256);
+
+    assert!(
+        manager.verify_token(&token).is_err(),
+        "tokens missing required registered claims must be rejected"
+    );
+}
+
+#[test]
+fn test_jwt_not_before_and_algorithm_are_enforced() {
+    let manager = JwtManager::new(test_jwt_config());
+    let now = Utc::now();
+    let future_nbf_claims = json!({
+        "iss": "test-issuer",
+        "sub": "admin-user",
+        "iat": now.timestamp(),
+        "nbf": (now + Duration::hours(1)).timestamp(),
+        "exp": (now + Duration::hours(2)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "role": "admin",
+    });
+    let future_nbf_token = encode_json_claims(future_nbf_claims, "test-secret", Algorithm::HS256);
+
+    assert!(
+        manager.verify_token(&future_nbf_token).is_err(),
+        "tokens before their nbf time must be rejected"
+    );
+
+    let wrong_algorithm_claims = json!({
+        "iss": "test-issuer",
+        "sub": "admin-user",
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + Duration::seconds(1800)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "role": "admin",
+    });
+    let wrong_algorithm_token =
+        encode_json_claims(wrong_algorithm_claims, "test-secret", Algorithm::HS384);
+
+    assert!(
+        manager.verify_token(&wrong_algorithm_token).is_err(),
+        "tokens signed with an unexpected algorithm must be rejected"
+    );
 }
 
 #[test]
