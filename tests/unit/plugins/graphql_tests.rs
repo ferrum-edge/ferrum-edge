@@ -491,7 +491,7 @@ async fn test_non_json_passes_through() {
 }
 
 #[tokio::test]
-async fn test_graphql_rejects_json_substring_content_types() {
+async fn test_graphql_enforces_limits_for_json_substring_content_types() {
     let plugin = create_plugin("graphql", &json!({"max_depth": 1}))
         .unwrap()
         .unwrap();
@@ -510,14 +510,14 @@ async fn test_graphql_rejects_json_substring_content_types() {
         headers.insert("content-type".to_string(), content_type.to_string());
 
         assert!(
-            !plugin.should_buffer_request_body(&ctx),
-            "{content_type} must not trigger GraphQL request-body buffering"
+            plugin.should_buffer_request_body(&ctx),
+            "{content_type} must trigger GraphQL request-body buffering"
         );
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-        assert_continue(result);
+        assert_reject(result, Some(400));
         assert!(
-            !ctx.metadata.contains_key("graphql_depth"),
-            "{content_type} must not be parsed as GraphQL JSON"
+            ctx.metadata.contains_key("graphql_depth"),
+            "{content_type} must be parsed as GraphQL JSON"
         );
     }
 }
