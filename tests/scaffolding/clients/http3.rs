@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
-use http::{HeaderMap, Request, StatusCode};
+use http::{HeaderMap, Method, Request, StatusCode};
 use quinn::{ClientConfig, Endpoint};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -59,13 +59,36 @@ impl Http3Client {
         self.get_with_options(url, GetOptions::default()).await
     }
 
-    /// Fire a single `GET` with caller-controlled header overrides. Used by
+    /// Fire a single request with caller-controlled method/header overrides.
+    /// Used by protocol validation tests that need to force non-default
+    /// request shapes without hand-rolling the QUIC/H3 handshake.
+    /// Fire a single request with caller-controlled header overrides. Used by
     /// host-header tests that need to force "only `:authority`" or
     /// "explicit Host that contradicts `:authority`" wire shapes.
     pub async fn get_with_options(
         &self,
         url: &str,
         options: GetOptions,
+    ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+        self.request_with_body(url, options, Bytes::new()).await
+    }
+
+    /// Fire a single `POST <url>` via QUIC with DATA bytes and no explicit
+    /// `Content-Length`. This exercises H3 streaming request-body paths.
+    pub async fn post_bytes(
+        &self,
+        url: &str,
+        body: impl Into<Bytes>,
+    ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+        let options = GetOptions::default().method(http::Method::POST);
+        self.request_with_body(url, options, body.into()).await
+    }
+
+    async fn request_with_body(
+        &self,
+        url: &str,
+        options: GetOptions,
+        body: Bytes,
     ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
         let parsed: http::Uri = url.parse()?;
         let host = parsed.host().ok_or("missing host in url")?.to_string();
@@ -94,7 +117,7 @@ impl Http3Client {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
-        let mut req_builder = Request::builder().method(http::Method::GET).uri(url);
+        let mut req_builder = Request::builder().method(options.method.clone()).uri(url);
         match &options.host_header {
             HostHeader::Auto => {
                 // Mirror what production H3 clients (curl, Chromium, Firefox)
@@ -121,6 +144,18 @@ impl Http3Client {
                 .await
                 .map_err(|_| "send_request timed out")?
                 .map_err(|e| format!("send_request: {e}"))?;
+        if !body.is_empty() {
+            tokio::time::timeout(Duration::from_secs(15), stream.send_data(body))
+                .await
+                .map_err(|_| "send request body timed out")?
+                .map_err(|e| format!("send request body: {e}"))?;
+        }
+        if !options.body.is_empty() {
+            stream
+                .send_data(options.body.clone())
+                .await
+                .map_err(|e| format!("send request body: {e}"))?;
+        }
         stream
             .finish()
             .await
@@ -151,6 +186,81 @@ impl Http3Client {
         // Best-effort drain of any trailers (we don't expose them but
         // need to advance the stream to a clean shutdown).
         let _ = stream.recv_trailers().await;
+        drop(send_request);
+        driver_task.abort();
+
+        Ok(Http3Response {
+            status,
+            headers,
+            body_bytes: Bytes::from(body_bytes),
+        })
+    }
+
+    /// Send an HTTP/3 Extended CONNECT request with a caller-selected
+    /// `:protocol` value and buffer the regular response body. This is for
+    /// negative protocol tests such as unsupported CONNECT-UDP rejection; use
+    /// [`Self::websocket`] for successful RFC 9220 WebSocket sessions.
+    pub async fn extended_connect(
+        &self,
+        url: &str,
+        protocol: h3::ext::Protocol,
+    ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: http::Uri = url.parse()?;
+        let host = parsed.host().ok_or("missing host in url")?.to_string();
+        let port = parsed.port_u16().unwrap_or(443);
+        let addr = resolve_loopback(&host, port)?;
+
+        let server_name = parsed.host().unwrap_or("localhost").to_string();
+        let conn = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.endpoint.connect(addr, &server_name)?,
+        )
+        .await
+        .map_err(|_| "QUIC handshake timed out")??;
+        let h3_conn = h3_quinn::Connection::new(conn);
+        let (mut driver, mut send_request) = h3::client::new(h3_conn)
+            .await
+            .map_err(|e| format!("h3 new: {e}"))?;
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let mut req = Request::builder()
+            .method(http::Method::CONNECT)
+            .version(http::Version::HTTP_3)
+            .uri(url)
+            .body(())
+            .map_err(|e| format!("build request: {e}"))?;
+        req.extensions_mut().insert(protocol);
+
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(15), send_request.send_request(req))
+                .await
+                .map_err(|_| "send_request timed out")?
+                .map_err(|e| format!("send_request: {e}"))?;
+
+        let resp = tokio::time::timeout(Duration::from_secs(15), stream.recv_response())
+            .await
+            .map_err(|_| "recv_response timed out")?
+            .map_err(|e| format!("recv_response: {e}"))?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+
+        let mut body_bytes = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(15), stream.recv_data()).await {
+                Ok(Ok(Some(mut chunk))) => {
+                    while chunk.has_remaining() {
+                        let take = chunk.chunk().to_vec();
+                        body_bytes.extend_from_slice(&take);
+                        chunk.advance(take.len());
+                    }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
         drop(send_request);
         driver_task.abort();
 
@@ -515,15 +625,38 @@ fn try_parse_ws_frame(
 }
 
 /// Per-request overrides for `Http3Client::get_with_options`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct GetOptions {
+    pub method: Method,
     pub host_header: HostHeader,
     pub headers: Vec<(String, String)>,
+    pub body: Bytes,
+}
+
+impl Default for GetOptions {
+    fn default() -> Self {
+        Self {
+            method: Method::GET,
+            host_header: HostHeader::Auto,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        }
+    }
 }
 
 impl GetOptions {
+    pub fn method(mut self, method: Method) -> Self {
+        self.method = method;
+        self
+    }
+
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    pub fn body(mut self, body: Bytes) -> Self {
+        self.body = body;
         self
     }
 }

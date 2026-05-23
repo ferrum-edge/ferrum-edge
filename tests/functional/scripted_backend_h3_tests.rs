@@ -1298,3 +1298,111 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
         req.method, req.authority,
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 11 — H1 frontend → native H3 backend must preserve frontend protocol
+// metadata in X-Forwarded-Proto, Via, and Forwarded.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h1_frontend_to_native_h3_backend_uses_frontend_forwarding_metadata() {
+    let ca = TestCa::new("phase-h1-to-h3-metadata").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    // Capability probing needs the colocated TCP+TLS side to answer; the
+    // actual test request should go to the H3 backend once h3=supported.
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", "2".to_string()),
+            ("content-type", "text/plain".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(b"ok")))
+        .step(H3Step::StallFor(Duration::from_millis(50)))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let harness = GatewayHarness::builder()
+        .file_config(file_mode_yaml_for_h3(backend_port))
+        .log_level("info")
+        .capture_output()
+        // Let file mode run its initial capability refresh, but avoid pool
+        // warmup issuing an extra H3 request before this regression's GET.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_ADD_VIA_HEADER", "true")
+        .env("FERRUM_ADD_FORWARDED_HEADER", "true")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported so the request uses the native H3 backend path; entry: {entry:#?}"
+    );
+
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .expect("reqwest client");
+    let resp = client
+        .get(harness.proxy_url("/api/metadata"))
+        .header(reqwest::header::HOST, "edge.example")
+        .send()
+        .await
+        .expect("request through gateway");
+    if resp.status().as_u16() != 200 {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!(
+            "expected 200 from H1 frontend to native H3 backend; got {}\n--- registry: {entry:#?}\n--- logs ---\n{}",
+            resp.status(),
+            logs
+        );
+    }
+
+    let received = h3_backend.received_requests().await;
+    let req = received
+        .iter()
+        .find(|r| r.method == "GET")
+        .expect("H3 backend must have received the frontend GET");
+    let header = |name: &str| {
+        req.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+
+    assert_eq!(header("x-forwarded-proto"), Some("http"));
+    assert_eq!(header("via"), Some("1.1 ferrum-edge"));
+    let forwarded = header("forwarded").expect("Forwarded header should be present");
+    assert!(
+        forwarded.contains("for=127.0.0.1")
+            && forwarded.contains("proto=http")
+            && forwarded.contains("host=edge.example"),
+        "Forwarded header should describe the H1 frontend request, got {forwarded:?}; \
+         recorded request: {req:#?}"
+    );
+}

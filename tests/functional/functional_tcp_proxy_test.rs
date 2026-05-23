@@ -5,6 +5,9 @@
 //! 2. Frontend TLS termination (client connects with TLS, backend receives plain TCP)
 //! 3. Backend TLS origination (TcpTls protocol — gateway connects to backend over TLS)
 //! 4. Full TLS: frontend termination + backend origination simultaneously
+//! 5. TCP idle timeout via per-proxy config and global `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`
+//! 5. TCP backend-read inactivity timeout
+//! 5. TCP idle timeout from per-proxy config and global env fallback
 //!
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_tcp_proxy --ignored --nocapture
@@ -42,6 +45,23 @@ async fn start_tcp_echo_server_on(listener: TcpListener) -> tokio::task::JoinHan
     })
 }
 
+/// Start a TCP backend that accepts data but never writes a response.
+async fn start_tcp_silent_reader_server_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((mut stream, _addr)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => sleep(Duration::from_secs(60)).await,
+                    }
+                }
+            });
+        }
+    })
+}
+
 /// Start a TCP echo server that prefixes each echoed frame with a backend tag.
 async fn start_tagged_tcp_echo_server_on(
     listener: TcpListener,
@@ -64,6 +84,35 @@ async fn start_tagged_tcp_echo_server_on(
                         }
                         Err(_) => break,
                     }
+                }
+            });
+        }
+    })
+}
+
+/// Start a TCP backend that only responds after it observes client EOF.
+/// This models protocols where the client half-closes its write side after
+/// sending a request and the server replies later on the still-open read side.
+async fn start_half_close_response_server_on(
+    listener: TcpListener,
+    expected_request: &'static [u8],
+    response: &'static [u8],
+    response_delay: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((mut stream, _addr)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut received = Vec::new();
+                if stream.read_to_end(&mut received).await.is_err() {
+                    return;
+                }
+                if received != expected_request {
+                    return;
+                }
+
+                sleep(response_delay).await;
+                if stream.write_all(response).await.is_ok() {
+                    let _ = stream.shutdown().await;
                 }
             });
         }
@@ -141,12 +190,13 @@ fn gateway_binary_path() -> &'static str {
     }
 }
 
-fn start_gateway(
+fn start_gateway_with_extra_env(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
+    extra_env: &[(&str, &str)],
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
@@ -164,6 +214,9 @@ fn start_gateway(
     }
     if let Some(key) = tls_key_path {
         cmd.env("FERRUM_FRONTEND_TLS_KEY_PATH", key);
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
     }
 
     Ok(cmd.spawn()?)
@@ -220,6 +273,18 @@ async fn start_gateway_with_retry<F>(
 where
     F: Fn(u16) -> String,
 {
+    start_gateway_with_retry_extra_env(make_config, tls_cert_path, tls_key_path, &[]).await
+}
+
+async fn start_gateway_with_retry_extra_env<F>(
+    make_config: F,
+    tls_cert_path: Option<&str>,
+    tls_key_path: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Child, u16, u16, TempDir)
+where
+    F: Fn(u16) -> String,
+{
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         // Allocate fresh ephemeral ports each attempt
@@ -240,12 +305,13 @@ where
         let config_content = make_config(proxy_listen_port);
         std::fs::write(&config_path, &config_content).unwrap();
 
-        let mut child = match start_gateway(
+        let mut child = match start_gateway_with_extra_env(
             config_path.to_str().unwrap(),
             http_port,
             admin_port,
             tls_cert_path,
             tls_key_path,
+            extra_env,
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -698,7 +764,284 @@ plugin_configs: []
     echo_server.abort();
 }
 
-/// Test 6: Active TCP relay keeps its accepted connection epoch across config reload.
+/// Test 5b: Global TCP idle timeout — a TCP proxy without a per-proxy override
+/// inherits `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_global_idle_timeout_env() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let echo_server = start_tcp_echo_server_on(backend_listener).await;
+
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry_extra_env(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "tcp-global-idle-timeout"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        None,
+        None,
+        &[("FERRUM_TCP_IDLE_TIMEOUT_SECONDS", "2")],
+    )
+    .await;
+
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .expect("Failed to connect to TCP proxy");
+
+    let test_data = b"global-idle";
+    stream.write_all(test_data).await.expect("Failed to send");
+
+    let mut buf = vec![0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("Echo read timed out")
+        .expect("Echo read error");
+    assert_eq!(&buf[..n], test_data, "Echo response should match sent data");
+
+    sleep(Duration::from_secs(3)).await;
+
+    let read_result = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+    match read_result {
+        Ok(Ok(0)) => {}
+        Ok(Err(_)) => {}
+        Ok(Ok(_)) => {
+            let second = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+            match second {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(_)) => panic!(
+                    "connection should be closed by global TCP idle timeout, but keeps yielding data"
+                ),
+                Err(_) => panic!("timed out waiting for closure after stale data"),
+            }
+        }
+        Err(_) => panic!("timed out waiting for global idle-timeout closure"),
+    }
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_server.abort();
+}
+
+/// Test 5c: TCP backend-read timeout — if the backend accepts the request bytes
+/// but stops producing response bytes, the relay closes the client connection.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_backend_read_timeout() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let silent_backend = start_tcp_silent_reader_server_on(backend_listener).await;
+
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "tcp-backend-read-timeout"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    backend_read_timeout_ms: 500
+    tcp_idle_timeout_seconds: 30
+
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        None,
+        None,
+    )
+    .await;
+
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .expect("Failed to connect to TCP proxy");
+
+    stream
+        .write_all(b"backend-read-timeout")
+        .await
+        .expect("Failed to send");
+
+    // The proxy's watchdog ticks every 1s and closes the connection once
+    // `now - b2c_read_watermark >= backend_read_timeout_ms`. Give ourselves a
+    // generous 15s window: locally this fires in ~1.7s, but heavily-loaded CI
+    // runners (6 functional shards × parallel jobs) have observed the client
+    // read poll waking ~3-5s after the proxy actually closes the socket.
+    let mut buf = vec![0u8; 64];
+    let read_result = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut buf)).await;
+    match read_result {
+        Ok(Ok(0)) => {}
+        Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("silent backend should not send {n} bytes before timeout"),
+        Err(_) => panic!("timed out waiting for backend-read-timeout closure"),
+    }
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    silent_backend.abort();
+}
+
+/// Test 5d: TCP global idle timeout env fallback.
+///
+/// Leaves `tcp_idle_timeout_seconds` unset on the proxy and verifies
+/// `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` is still applied by the stream listener.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_global_idle_timeout_env_fallback() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let echo_server = start_tcp_echo_server_on(backend_listener).await;
+
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry_extra_env(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "tcp-global-idle-timeout"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        None,
+        None,
+        &[("FERRUM_TCP_IDLE_TIMEOUT_SECONDS", "1")],
+    )
+    .await;
+
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .expect("Failed to connect to TCP proxy");
+
+    let test_data = b"global-idle";
+    stream.write_all(test_data).await.expect("Failed to send");
+
+    let mut buf = vec![0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("Echo read timed out")
+        .expect("Echo read error");
+    assert_eq!(&buf[..n], test_data, "Echo response should match sent data");
+
+    sleep(Duration::from_secs(2)).await;
+
+    let read_result = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+    match read_result {
+        Ok(Ok(0)) => {}
+        Ok(Err(_)) => {}
+        Ok(Ok(_)) => {
+            let second = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+            match second {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(_)) => {
+                    panic!("Connection should be closed by global TCP idle timeout")
+                }
+                Err(_) => panic!("Timed out waiting for closure after stale data"),
+            }
+        }
+        Err(_) => {
+            panic!("Timed out waiting for global TCP idle-timeout closure; connection stayed open")
+        }
+    }
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_server.abort();
+}
+
+/// Test 6: Client half-close keeps the response direction open for delayed backend data.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_client_half_close_allows_delayed_backend_response() {
+    const REQUEST: &[u8] = b"half-close-request";
+    const RESPONSE: &[u8] = b"delayed-half-close-response";
+
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let response_server = start_half_close_response_server_on(
+        backend_listener,
+        REQUEST,
+        RESPONSE,
+        Duration::from_millis(250),
+    )
+    .await;
+
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "tcp-half-close"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    tcp_idle_timeout_seconds: 5
+
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        None,
+        None,
+    )
+    .await;
+
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .expect("Failed to connect to TCP proxy");
+
+    stream
+        .write_all(REQUEST)
+        .await
+        .expect("Failed to send half-close request");
+    stream
+        .shutdown()
+        .await
+        .expect("Failed to half-close client write side");
+
+    let mut buf = vec![0u8; RESPONSE.len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("Delayed half-close response timed out")
+        .expect("Delayed half-close response read failed");
+    assert_eq!(buf, RESPONSE);
+
+    let mut eof = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut eof))
+        .await
+        .expect("EOF after delayed half-close response timed out")
+        .expect("EOF after delayed half-close response read failed");
+    assert_eq!(n, 0, "backend close should propagate after response");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    response_server.abort();
+}
+
+/// Test 7: Active TCP relay keeps its accepted connection epoch across config reload.
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_active_connection_survives_config_reload() {
@@ -804,7 +1147,7 @@ plugin_configs: []
     backend_b.abort();
 }
 
-/// Test 7 (formerly 6): TCP proxy handles connection to unreachable backend gracefully.
+/// Test 8: TCP proxy handles connection to unreachable backend gracefully.
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_backend_unreachable() {
