@@ -50,7 +50,8 @@ use crate::proxy::headers::{
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
     BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
-    append_backend_tls_pool_key_fields, backend_svid_generation_for_client_cert,
+    append_backend_tls_pool_key_fields, append_optional_pool_key_component,
+    append_pool_key_component, backend_svid_generation_for_client_cert,
 };
 use crate::util::body_limit::is_length_limit_error;
 
@@ -201,15 +202,16 @@ fn write_grpc_pool_key(
     // is detected at request time and doesn't affect pool identity — an
     // Https pool entry serves both gRPC and Plain requests.
     let tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https)) as u8;
-    let _ = write!(buf, "{}|{}|{}|", host, port, tls);
-    buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
+    append_pool_key_component(buf, host);
+    let _ = write!(buf, "|{port}|{tls}|");
+    append_optional_pool_key_component(buf, proxy.dns_override.as_deref());
     buf.push('|');
     // Subset name partitions gRPC pools so two proxies that share
     // `(host, port, scheme, dns_override)` but select different
     // DestinationRule subsets cannot share an H2 gRPC sender even when their
     // TLS material is byte-identical. Empty when the proxy has no
     // `upstream_subset`.
-    buf.push_str(proxy.upstream_subset.as_deref().unwrap_or_default());
+    append_optional_pool_key_component(buf, proxy.upstream_subset.as_deref());
     buf.push('|');
     append_backend_tls_pool_key_fields(
         buf,

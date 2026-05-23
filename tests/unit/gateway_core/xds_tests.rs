@@ -434,6 +434,68 @@ fn nonce_tracker_rejects_version_drift() {
 }
 
 #[test]
+fn nonce_tracker_rejects_missing_unknown_and_stale_nonces() {
+    let tracker = XdsNonceTracker::new();
+    let initial = tracker.issue_nonce("node-a", LDS_TYPE_URL, "v1");
+
+    assert_eq!(
+        tracker.record_response("node-a", LDS_TYPE_URL, "", "v1", None),
+        AckOutcome::MissingNonce
+    );
+    assert_eq!(
+        tracker.record_response("node-b", LDS_TYPE_URL, &initial, "v1", None),
+        AckOutcome::UnknownNonce
+    );
+
+    let current = tracker.issue_nonce("node-a", LDS_TYPE_URL, "v2");
+    assert_eq!(
+        tracker.record_response("node-a", LDS_TYPE_URL, &initial, "v1", None),
+        AckOutcome::StaleNonce {
+            expected: current.clone(),
+            actual: initial
+        }
+    );
+
+    assert_eq!(
+        tracker.record_response("node-a", LDS_TYPE_URL, &current, "v2", None),
+        AckOutcome::Acked
+    );
+}
+
+#[test]
+fn nonce_tracker_clears_error_on_new_issue_and_removes_one_node_only() {
+    let tracker = XdsNonceTracker::new();
+    let failed = tracker.issue_nonce("node-a", LDS_TYPE_URL, "v1");
+    let node_b = tracker.issue_nonce("node-b", LDS_TYPE_URL, "v1");
+
+    assert_eq!(
+        tracker.record_response("node-a", LDS_TYPE_URL, &failed, "v1", Some("bad listener")),
+        AckOutcome::Nacked {
+            message: "bad listener".to_string()
+        }
+    );
+    assert_eq!(
+        tracker.last_error("node-a", LDS_TYPE_URL),
+        Some("bad listener".to_string())
+    );
+
+    let corrected = tracker.issue_nonce("node-a", LDS_TYPE_URL, "v2");
+    assert_eq!(tracker.last_error("node-a", LDS_TYPE_URL), None);
+    assert_eq!(tracker.len(), 2);
+    assert_eq!(
+        tracker.record_response("node-a", LDS_TYPE_URL, &corrected, "v2", None),
+        AckOutcome::Acked
+    );
+
+    tracker.remove_node("node-a");
+    assert_eq!(tracker.len(), 1);
+    assert_eq!(
+        tracker.record_response("node-b", LDS_TYPE_URL, &node_b, "v1", None),
+        AckOutcome::Acked
+    );
+}
+
+#[test]
 fn phase_b_conformance_stubs_cover_known_xds_edges() {
     let cases = required_phase_b_cases();
     assert!(cases.contains(&XdsConformanceCase::ResourceRemovalDuringUpdate));

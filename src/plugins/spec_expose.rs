@@ -44,6 +44,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use url::{Host, Url};
 
 use crate::dns::DnsCacheResolver;
 
@@ -97,7 +98,7 @@ impl SpecExpose {
             })?;
 
         // Validate URL format and require a fetchable scheme.
-        let parsed = url::Url::parse(spec_url)
+        let parsed = Url::parse(spec_url)
             .map_err(|e| format!("spec_expose: 'spec_url' is not a valid URL: {e}"))?;
         match parsed.scheme() {
             "http" | "https" => {}
@@ -107,7 +108,12 @@ impl SpecExpose {
                 ));
             }
         }
-        let warmup_hostname = parsed.host_str().map(str::to_string);
+        if !has_non_empty_authority(spec_url) {
+            return Err(
+                "spec_expose: 'spec_url' must include a hostname or IP address".to_string(),
+            );
+        }
+        let warmup_hostname = Some(spec_url_hostname(&parsed)?);
         let spec_url = parsed.to_string();
 
         let content_type_override = match config.get("content_type") {
@@ -334,6 +340,32 @@ impl SpecExpose {
         }
         Ok(entry)
     }
+}
+
+fn spec_url_hostname(parsed: &Url) -> Result<String, String> {
+    let host = parsed.host().ok_or_else(|| {
+        "spec_expose: 'spec_url' must include a hostname or IP address".to_string()
+    })?;
+
+    Ok(match host {
+        Host::Domain(hostname) => hostname.to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
+}
+
+fn has_non_empty_authority(spec_url: &str) -> bool {
+    let Some((_, after_scheme)) = spec_url.split_once(':') else {
+        return false;
+    };
+    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
+        return false;
+    };
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+
+    authority_end > 0
 }
 
 /// Build a 502 rejection for an oversized upstream spec body.

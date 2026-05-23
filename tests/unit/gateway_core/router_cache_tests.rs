@@ -380,6 +380,25 @@ fn test_cache_stores_different_paths() {
 }
 
 #[test]
+fn test_cache_stats_track_prefix_evictions() {
+    let config = test_config(vec![test_proxy("api", "/api")]);
+    let cache = RouterCache::new(&config, 4);
+
+    for i in 0..12 {
+        cache.find_proxy(None, &format!("/api/path/{i}"));
+    }
+
+    let (prefix, regex, prefix_evictions, regex_evictions, max) = cache.cache_stats();
+    assert!(prefix <= max, "prefix cache should stay bounded");
+    assert_eq!(regex, 0);
+    assert!(
+        prefix_evictions > 0,
+        "prefix eviction counter should increment after overflowing capacity"
+    );
+    assert_eq!(regex_evictions, 0);
+}
+
+#[test]
 fn test_cache_miss_not_cached() {
     // Misses (None) ARE cached as negative entries to prevent O(n) rescans
     // from scanner/bot traffic. The cache is bounded by max_cache_entries.
@@ -836,6 +855,67 @@ fn test_full_priority_chain() {
     assert_eq!(matched.unwrap().proxy.id, "catchall");
 }
 
+#[test]
+fn test_stream_dispatch_proxies_are_excluded_from_http_router() {
+    let mut stream = test_proxy("tcp-stream", "/tcp");
+    stream.backend_scheme = None;
+    stream.dispatch_kind = DispatchKind::TcpRaw;
+
+    let config = test_config(vec![stream, test_proxy("http-api", "/api")]);
+    let cache = RouterCache::new(&config, 100);
+
+    assert_eq!(
+        cache.route_count(),
+        1,
+        "HTTP router should index only HTTP-family proxies"
+    );
+    assert!(cache.find_proxy(None, "/tcp").is_none());
+    assert_eq!(cache.find_proxy(None, "/api").unwrap().proxy.id, "http-api");
+}
+
+#[test]
+fn test_exact_host_exact_path_precedes_prefix_and_regex() {
+    let mut exact = test_proxy_with_hosts("exact", "=/api", vec!["api.example.com"]);
+    exact.backend_host = "exact-backend".into();
+
+    let mut prefix = test_proxy_with_hosts("prefix", "/api", vec!["api.example.com"]);
+    prefix.backend_host = "prefix-backend".into();
+
+    let mut regex = test_regex_proxy("regex", r"/api");
+    regex.hosts = vec!["api.example.com".to_string()];
+    regex.backend_host = "regex-backend".into();
+
+    let config = test_config(vec![prefix, regex, exact]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(Some("api.example.com"), "/api").unwrap();
+    assert_eq!(matched.proxy.id, "exact");
+    assert_eq!(matched.matched_prefix_len, "/api".len());
+
+    let child = cache
+        .find_proxy(Some("api.example.com"), "/api/users")
+        .unwrap();
+    assert_eq!(
+        child.proxy.id, "prefix",
+        "children of an exact path should fall through to the prefix route"
+    );
+}
+
+#[test]
+fn test_more_specific_wildcard_host_wins_over_broader_wildcard() {
+    let narrow = test_proxy_with_hosts("narrow", "/", vec!["*.api.example.com"]);
+    let broad = test_proxy_with_hosts("broad", "/", vec!["*.example.com"]);
+    let cache = RouterCache::new(&test_config(vec![broad, narrow]), 100);
+
+    let matched = cache
+        .find_proxy(Some("users.api.example.com"), "/v1")
+        .unwrap();
+    assert_eq!(matched.proxy.id, "narrow");
+
+    let matched = cache.find_proxy(Some("users.example.com"), "/v1").unwrap();
+    assert_eq!(matched.proxy.id, "broad");
+}
+
 // ============================================================
 // Regex path routing
 // ============================================================
@@ -1012,6 +1092,25 @@ fn test_regex_cache_separation() {
     cache.find_proxy(None, "/users/99/orders");
     assert_eq!(cache.cache_len(), 1);
     assert_eq!(cache.regex_cache_len(), 2);
+}
+
+#[test]
+fn test_cache_stats_track_regex_evictions_without_touching_prefix_cache() {
+    let config = test_config(vec![test_regex_proxy("users", r"/users/[^/]+")]);
+    let cache = RouterCache::new(&config, 4);
+
+    for i in 0..12 {
+        cache.find_proxy(None, &format!("/users/{i}"));
+    }
+
+    let (prefix, regex, prefix_evictions, regex_evictions, max) = cache.cache_stats();
+    assert_eq!(prefix, 0);
+    assert!(regex <= max, "regex cache should stay bounded");
+    assert_eq!(prefix_evictions, 0);
+    assert!(
+        regex_evictions > 0,
+        "regex eviction counter should increment after overflowing capacity"
+    );
 }
 
 #[test]

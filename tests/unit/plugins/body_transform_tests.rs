@@ -111,8 +111,13 @@ fn test_is_json_content_type() {
     assert!(is_json_content_type("application/json"));
     assert!(is_json_content_type("application/json; charset=utf-8"));
     assert!(is_json_content_type("application/vnd.api+json"));
+    assert!(is_json_content_type("application/graphql-response+json"));
     assert!(!is_json_content_type("text/html"));
     assert!(!is_json_content_type("application/xml"));
+    assert!(!is_json_content_type("application/jsonp"));
+    assert!(!is_json_content_type("application/notjson"));
+    assert!(!is_json_content_type("text/application/json"));
+    assert!(!is_json_content_type("application/json-seq"));
 }
 
 #[test]
@@ -316,6 +321,36 @@ fn test_body_rules_reject_invalid_rules_container_shapes() {
             err.contains("'rules' must be an array") || err.contains("rule must be an object"),
             "unexpected error for {config:?}: {err}"
         );
+    }
+}
+
+#[test]
+fn test_body_rules_reject_operation_irrelevant_fields() {
+    for (rule, field) in [
+        (
+            json!({"operation": "add", "target": "body", "key": "x", "value": "v", "new_key": "y"}),
+            "'new_key' must not be set",
+        ),
+        (
+            json!({"operation": "update", "target": "body", "key": "x", "value": "v", "new_key": "y"}),
+            "'new_key' must not be set",
+        ),
+        (
+            json!({"operation": "remove", "target": "body", "key": "x", "value": null}),
+            "'value' must not be set",
+        ),
+        (
+            json!({"operation": "remove", "target": "body", "key": "x", "new_key": "y"}),
+            "'new_key' must not be set",
+        ),
+        (
+            json!({"operation": "rename", "target": "body", "key": "x", "new_key": "y", "value": "ignored"}),
+            "'value' must not be set",
+        ),
+    ] {
+        let config = json!({ "rules": [rule] });
+        let err = parse_body_rules(&config).expect_err("expected irrelevant field rejection");
+        assert!(err.contains(field), "expected {field:?}, got: {err}");
     }
 }
 

@@ -123,6 +123,14 @@ fn detect_http_flavor_classifies_grpc_with_space_before_param_as_grpc() {
 }
 
 #[test]
+fn detect_http_flavor_classifies_grpc_with_tab_before_param_as_grpc() {
+    assert_eq!(
+        detect_http_flavor(&http_post("application/grpc\t;charset=utf-8")),
+        HttpFlavor::Grpc
+    );
+}
+
+#[test]
 fn detect_http_flavor_does_not_misclassify_grpc_web_as_grpc() {
     // Regression test: a 16-byte prefix match alone would classify
     // `application/grpc-web` as Grpc. Byte 16 is `-`, so the flavor
@@ -133,6 +141,22 @@ fn detect_http_flavor_does_not_misclassify_grpc_web_as_grpc() {
         detect_http_flavor(&http_post("application/grpc-web")),
         HttpFlavor::Plain
     );
+}
+
+#[test]
+fn detect_http_flavor_does_not_misclassify_grpc_prefix_token_as_grpc() {
+    for content_type in [
+        "application/grpcish",
+        "application/grpcx",
+        "application/grpc-webish",
+        "application/grpc -web",
+    ] {
+        assert_eq!(
+            detect_http_flavor(&http_post(content_type)),
+            HttpFlavor::Plain,
+            "{content_type} must not route as native gRPC"
+        );
+    }
 }
 
 #[test]

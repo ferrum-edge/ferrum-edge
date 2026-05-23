@@ -56,21 +56,31 @@ fn http10_allows_cl_only() {
 }
 
 #[test]
-fn http2_allows_cl_and_te_trailers() {
-    // HTTP/2 doesn't use Transfer-Encoding, but if somehow present,
-    // the CL+TE check only applies to HTTP/1.x
+fn http2_rejects_transfer_encoding_even_without_cl() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("Transfer-Encoding"));
+}
+
+#[test]
+fn http2_rejects_cl_and_transfer_encoding_together() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("42"));
     headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
-    // HTTP/2 skips the CL+TE check (it's a protocol-level concern for HTTP/1.x)
     let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
-    // Should not trigger the CL+TE error (but may trigger TE validation)
-    assert!(
-        result.is_none()
-            || !result
-                .unwrap()
-                .contains("Content-Length and Transfer-Encoding")
-    );
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("Transfer-Encoding"));
+}
+
+#[test]
+fn http3_rejects_transfer_encoding() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_3);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("Transfer-Encoding"));
 }
 
 #[test]
@@ -753,6 +763,27 @@ fn h2_post_with_websocket_protocol_is_not_detected() {
 fn forwarded_ipv4_with_host() {
     let val = build_forwarded_value("192.0.2.60", "https", Some("example.com"));
     assert_eq!(val, "for=192.0.2.60;proto=https;host=example.com");
+}
+
+#[test]
+fn forwarded_quotes_host_with_port() {
+    let val = build_forwarded_value("192.0.2.60", "https", Some("example.com:8443"));
+    assert_eq!(val, "for=192.0.2.60;proto=https;host=\"example.com:8443\"");
+}
+
+#[test]
+fn forwarded_quotes_host_with_parameter_separator() {
+    let val = build_forwarded_value("192.0.2.60", "https", Some("example.com;for=198.51.100.99"));
+    assert_eq!(
+        val,
+        "for=192.0.2.60;proto=https;host=\"example.com;for=198.51.100.99\""
+    );
+}
+
+#[test]
+fn forwarded_escapes_quoted_host_value() {
+    let val = build_forwarded_value("192.0.2.60", "https", Some(r#"exa"mple\host"#));
+    assert_eq!(val, r#"for=192.0.2.60;proto=https;host="exa\"mple\\host""#);
 }
 
 #[test]

@@ -47,6 +47,32 @@ mod tests {
 
     impl Error for Plain {}
 
+    #[derive(Debug)]
+    struct Misleading;
+
+    impl fmt::Display for Misleading {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("length limit exceeded")
+        }
+    }
+
+    impl Error for Misleading {}
+
+    #[derive(Debug)]
+    struct Wrapper(Box<dyn Error + Send + Sync + 'static>);
+
+    impl fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("outer body collection error")
+        }
+    }
+
+    impl Error for Wrapper {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
     /// The real path the production code hits: a `Limited` body returns
     /// a boxed error whose inner cause is `LengthLimitError`. The helper must
     /// recognise it without relying on a brittle `to_string()` check. Also
@@ -63,11 +89,29 @@ mod tests {
         assert!(is_length_limit_error(err.as_ref()));
     }
 
+    #[tokio::test]
+    async fn detects_wrapped_limited_body_overflow() {
+        let body = Full::new(bytes::Bytes::from_static(b"abcdefghij"));
+        let err = Limited::new(body, 4)
+            .collect()
+            .await
+            .expect_err("body should exceed limit");
+        let wrapped = Wrapper(err);
+
+        assert!(is_length_limit_error(&wrapped));
+    }
+
     /// Unrelated transport errors must NOT be misclassified — that would
     /// silently turn a `400` into a `413` and confuse operators.
     #[test]
     fn rejects_unrelated_errors() {
         let err: Box<dyn Error + Send + Sync + 'static> = Box::new(Plain);
+        assert!(!is_length_limit_error(err.as_ref()));
+    }
+
+    #[test]
+    fn rejects_errors_that_only_match_length_limit_text() {
+        let err: Box<dyn Error + Send + Sync + 'static> = Box::new(Misleading);
         assert!(!is_length_limit_error(err.as_ref()));
     }
 }

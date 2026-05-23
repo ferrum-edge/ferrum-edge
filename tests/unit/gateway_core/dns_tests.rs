@@ -77,6 +77,40 @@ async fn test_dns_global_override() {
 }
 
 #[tokio::test]
+async fn test_dns_global_override_hostname_case_insensitive() {
+    let mut overrides = HashMap::new();
+    overrides.insert("Service.Local".to_string(), "192.0.2.10".to_string());
+    let cache = DnsCache::new(default_dns_config(overrides));
+
+    let result = cache.resolve("SERVICE.LOCAL", None, None).await;
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap().to_string(), "192.0.2.10");
+    assert_eq!(
+        cache.cache_len(),
+        0,
+        "Global overrides should bypass DNS cache insertion"
+    );
+}
+
+#[tokio::test]
+async fn test_dns_resolve_all_global_override_hostname_case_insensitive() {
+    let mut overrides = HashMap::new();
+    overrides.insert("Api.Internal".to_string(), "192.0.2.11".to_string());
+    let cache = DnsCache::new(default_dns_config(overrides));
+
+    let result = cache.resolve_all("api.internal", None, None).await;
+    assert!(result.is_ok());
+    assert_eq!(
+        result
+            .unwrap()
+            .into_iter()
+            .map(|addr| addr.to_string())
+            .collect::<Vec<_>>(),
+        vec!["192.0.2.11"]
+    );
+}
+
+#[tokio::test]
 async fn test_dns_per_proxy_override_takes_precedence_over_global() {
     let mut overrides = HashMap::new();
     overrides.insert("myhost.local".to_string(), "192.168.1.100".to_string());
@@ -118,6 +152,22 @@ async fn test_dns_public_policy_denies_private_global_override() {
 }
 
 #[tokio::test]
+async fn test_dns_public_policy_denies_case_insensitive_global_override() {
+    let mut overrides = HashMap::new();
+    overrides.insert("Metadata.Local".to_string(), "169.254.169.254".to_string());
+    let cache = DnsCache::new(public_dns_config(overrides));
+
+    let result = cache.resolve("METADATA.LOCAL", None, None).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("169.254.169.254"), "unexpected error: {err}");
+    assert!(
+        err.contains("denied by FERRUM_BACKEND_ALLOW_IPS"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_dns_resolve_localhost() {
     let cache = DnsCache::new(default_dns_config(HashMap::new()));
 
@@ -126,6 +176,21 @@ async fn test_dns_resolve_localhost() {
     let addr = result.unwrap();
     // localhost should resolve to 127.0.0.1 or ::1
     assert!(addr.to_string() == "127.0.0.1" || addr.to_string() == "::1");
+}
+
+#[tokio::test]
+async fn test_dns_cache_key_hostname_case_insensitive_for_localhost() {
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+
+    let result1 = cache.resolve("LOCALHOST", None, None).await.unwrap();
+    let result2 = cache.resolve("localhost", None, None).await.unwrap();
+
+    assert_eq!(result1, result2);
+    assert_eq!(
+        cache.cache_len(),
+        1,
+        "Case variants of one DNS hostname should share one cache entry"
+    );
 }
 
 #[tokio::test]

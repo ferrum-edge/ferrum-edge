@@ -102,6 +102,19 @@ fn test_build_backend_url_with_backend_path() {
 }
 
 #[test]
+fn test_build_backend_url_with_relative_backend_path() {
+    let mut proxy = test_proxy();
+    proxy.backend_path = Some("internal".into());
+    let url = build_backend_url(
+        &proxy,
+        "/api/v1/users",
+        "",
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
+    );
+    assert_eq!(url, "http://backend.example.com:3000/internal/users");
+}
+
+#[test]
 fn test_build_backend_url_with_query() {
     let proxy = test_proxy();
     let url = build_backend_url(
@@ -156,6 +169,22 @@ fn test_build_backend_url_target_path_with_no_backend_path() {
         9090,
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
         Some("/service"),
+    );
+    assert_eq!(url, "http://target.example.com:9090/service/users");
+}
+
+#[test]
+fn test_build_backend_url_target_path_without_slashes_inserts_separator() {
+    let mut proxy = test_proxy();
+    proxy.listen_path = Some("/api/v1/".into());
+    let url = build_backend_url_with_target(
+        &proxy,
+        "/api/v1/users",
+        "",
+        "target.example.com",
+        9090,
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
+        Some("service"),
     );
     assert_eq!(url, "http://target.example.com:9090/service/users");
 }

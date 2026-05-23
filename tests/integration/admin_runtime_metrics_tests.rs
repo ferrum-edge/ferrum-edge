@@ -175,16 +175,37 @@ async fn admin_request_unauth(base_url: &str) -> (reqwest::StatusCode, String) {
 }
 
 async fn admin_request_with_token(base_url: &str, token: &str) -> (reqwest::StatusCode, Value) {
+    admin_request_with_authorization(base_url, &format!("Bearer {}", token)).await
+}
+
+async fn admin_request_with_authorization(
+    base_url: &str,
+    authorization: &str,
+) -> (reqwest::StatusCode, Value) {
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{}{}", base_url, "/metrics/runtime"))
-        .header("authorization", format!("Bearer {}", token))
+        .header("authorization", authorization)
         .send()
         .await
         .unwrap();
     let status = resp.status();
     let body: Value = resp.json().await.unwrap();
     (status, body)
+}
+
+#[tokio::test]
+async fn runtime_metrics_endpoint_accepts_case_insensitive_bearer_scheme() {
+    let tc = TestConfig::default();
+    let state = admin_state_with_runtime_metrics(create_test_jwt_manager(&tc));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let auth_header = format!("bearer {token}");
+
+    let (status, body) = admin_request_with_authorization(&base_url, &auth_header).await;
+
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert_eq!(body["mode"].as_str(), Some("test"));
 }
 
 #[tokio::test]

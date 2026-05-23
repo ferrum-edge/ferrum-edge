@@ -73,6 +73,22 @@ async fn test_statsd_logging_empty_host() {
 }
 
 #[tokio::test]
+async fn test_statsd_logging_rejects_host_with_url_or_port_material() {
+    for host in [
+        "udp://statsd.example.com",
+        "user@statsd.example.com",
+        "statsd.example.com/path",
+        "statsd.example.com?token=secret",
+        "statsd.example.com#fragment",
+        "statsd.example.com:8125",
+        "bad host",
+    ] {
+        let result = StatsdLogging::new(&json!({"host": host}), default_client());
+        assert!(result.is_err(), "host should fail validation: {host}");
+    }
+}
+
+#[tokio::test]
 async fn test_statsd_logging_invalid_port_zero() {
     let result = StatsdLogging::new(&json!({"host": "127.0.0.1", "port": 0}), default_client());
     match result {
@@ -271,6 +287,17 @@ async fn test_statsd_logging_warmup_hostnames() {
     .unwrap();
     let hosts = plugin.warmup_hostnames();
     assert_eq!(hosts, vec!["statsd.internal.example.com".to_string()]);
+}
+
+#[tokio::test]
+async fn test_statsd_logging_warmup_skips_ip_literals() {
+    for host in ["127.0.0.1", "2001:db8::10", "[2001:db8::10]"] {
+        let plugin = StatsdLogging::new(&json!({"host": host}), default_client()).unwrap();
+        assert!(
+            plugin.warmup_hostnames().is_empty(),
+            "IP literal {host} should not be DNS-warmed"
+        );
+    }
 }
 
 #[tokio::test]

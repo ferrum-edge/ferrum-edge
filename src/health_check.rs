@@ -65,6 +65,23 @@ fn host_port_key(target: &UpstreamTarget) -> String {
     format!("{}:{}", target.host, target.port)
 }
 
+fn format_probe_socket_addr(host: &str, port: u16) -> String {
+    if !host.starts_with('[') && host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+fn format_probe_url(scheme: &str, host: &str, port: u16, path: &str) -> String {
+    let host = if !host.starts_with('[') && host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    };
+    format!("{}://{}:{}{}", scheme, host, port, path)
+}
+
 /// Re-export the cap from types so runtime and validation share one value.
 use crate::config::types::MAX_RECENT_FAILURES_PER_TARGET;
 
@@ -786,7 +803,7 @@ impl HealthChecker {
         let healthy_status_codes = config.healthy_status_codes.clone();
         let client = upstream_client.clone();
         let scheme = if config.use_tls { "https" } else { "http" };
-        let url = format!("{}://{}:{}{}", scheme, host, port, config.http_path);
+        let url = format_probe_url(scheme, &host, port, &config.http_path);
         let udp_payload = config
             .udp_probe_payload
             .as_deref()
@@ -937,7 +954,7 @@ async fn http_probe(
 
 /// TCP health probe — attempts a TCP connection within the timeout.
 async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
-    let addr = format!("{}:{}", host, port);
+    let addr = format_probe_socket_addr(host, port);
     match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
         Ok(Ok(_stream)) => true,
         Ok(Err(e)) => {
@@ -961,7 +978,7 @@ async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
 
 /// UDP health probe — sends a payload and waits for any response within the timeout.
 async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> bool {
-    let addr = format!("{}:{}", host, port);
+    let addr = format_probe_socket_addr(host, port);
     let bind_addr = if host.parse::<std::net::Ipv6Addr>().is_ok() {
         "[::]:0"
     } else {
@@ -1019,7 +1036,7 @@ async fn grpc_probe(
     global_no_verify: bool,
 ) -> bool {
     let scheme = if use_tls { "https" } else { "http" };
-    let endpoint_url = format!("{}://{}:{}", scheme, host, port);
+    let endpoint_url = format_probe_url(scheme, host, port, "");
 
     let endpoint = match tonic::transport::Endpoint::from_shared(endpoint_url) {
         Ok(ep) => ep.timeout(timeout).connect_timeout(timeout),
@@ -1250,10 +1267,9 @@ async fn build_grpc_probe_channel_no_verify(
         let tls_connector = tls_connector.clone();
         let host = host_owned.clone();
         async move {
-            let addr = format!(
-                "{}:{}",
+            let addr = format_probe_socket_addr(
                 uri.host().unwrap_or("127.0.0.1"),
-                uri.port_u16().unwrap_or(443)
+                uri.port_u16().unwrap_or(443),
             );
             let tcp = tokio::net::TcpStream::connect(&addr).await?;
             let server_name = ServerName::try_from(host)
@@ -1505,7 +1521,7 @@ mod tests {
     use std::sync::Once;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, UdpSocket};
     use tokio_rustls::TlsAcceptor;
 
     static INIT_CRYPTO: Once = Once::new();
@@ -1558,6 +1574,79 @@ mod tests {
         });
 
         port
+    }
+
+    async fn spawn_ipv6_plain_http_server() -> u16 {
+        let addr =
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0);
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+            let _ = stream.shutdown().await;
+        });
+
+        port
+    }
+
+    #[test]
+    fn probe_address_formatting_brackets_ipv6_literals() {
+        assert_eq!(format_probe_socket_addr("::1", 8443), "[::1]:8443");
+        assert_eq!(
+            format_probe_url("https", "::1", 8443, "/health"),
+            "https://[::1]:8443/health"
+        );
+        assert_eq!(
+            format_probe_url("http", "backend.local", 8080, "/health"),
+            "http://backend.local:8080/health"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_connects_to_ipv6_literal() {
+        let addr =
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0);
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+
+        assert!(tcp_probe("::1", port, Duration::from_secs(2)).await);
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_probe_connects_to_ipv6_literal() {
+        let addr =
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0);
+        let socket = UdpSocket::bind(addr).await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let responder = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let (_, peer) = socket.recv_from(&mut buf).await.unwrap();
+            socket.send_to(b"o", peer).await.unwrap();
+        });
+
+        assert!(udp_probe("::1", port, Duration::from_secs(2), b"p").await);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_probe_connects_to_ipv6_literal() {
+        let port = spawn_ipv6_plain_http_server().await;
+        let client = reqwest::Client::new();
+        let url = format_probe_url("http", "::1", port, "/health");
+
+        assert!(http_probe(&client, &url, Duration::from_secs(2), &[200]).await);
     }
 
     /// Default-built health-check client (verify ON) MUST reject a

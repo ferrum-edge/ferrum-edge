@@ -4,6 +4,7 @@
 //! serially. We use the same ENV_LOCK pattern as env_config_tests.
 
 use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_secret};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Mutex;
 use tempfile::NamedTempFile;
@@ -115,6 +116,63 @@ fn test_resolve_all_env_secrets_both_env_and_file_errors() {
             assert!(err.contains("FERRUM_TEST_SECRET_STARTUP_CONFLICT"));
             assert!(err.contains("direct env var"));
             assert!(err.contains("FERRUM_TEST_SECRET_STARTUP_CONFLICT_FILE"));
+        },
+    );
+}
+
+#[test]
+fn test_resolve_all_env_secrets_resolves_multiple_file_sources() {
+    let mut tmp_a = NamedTempFile::new().unwrap();
+    let mut tmp_b = NamedTempFile::new().unwrap();
+    writeln!(tmp_a, "bulk-alpha").unwrap();
+    writeln!(tmp_b, "bulk-beta").unwrap();
+    let path_a = tmp_a.path().to_str().unwrap().to_string();
+    let path_b = tmp_b.path().to_str().unwrap().to_string();
+
+    with_env_vars_async(
+        &[
+            ("FERRUM_TEST_SECRET_BULK_A_FILE", &path_a),
+            ("FERRUM_TEST_SECRET_BULK_B_FILE", &path_b),
+        ],
+        || async {
+            let resolved = resolve_all_env_secrets().await.unwrap();
+            let vars: HashMap<String, String> = resolved.vars.into_iter().collect();
+            assert_eq!(
+                vars.get("FERRUM_TEST_SECRET_BULK_A").map(String::as_str),
+                Some("bulk-alpha")
+            );
+            assert_eq!(
+                vars.get("FERRUM_TEST_SECRET_BULK_B").map(String::as_str),
+                Some("bulk-beta")
+            );
+
+            let source_keys: HashSet<String> = resolved.source_keys_to_remove.into_iter().collect();
+            assert!(source_keys.contains("FERRUM_TEST_SECRET_BULK_A_FILE"));
+            assert!(source_keys.contains("FERRUM_TEST_SECRET_BULK_B_FILE"));
+
+            let loaded_sources: HashMap<String, &'static str> =
+                resolved.loaded_sources.into_iter().collect();
+            assert_eq!(
+                loaded_sources.get("FERRUM_TEST_SECRET_BULK_A"),
+                Some(&"file")
+            );
+            assert_eq!(
+                loaded_sources.get("FERRUM_TEST_SECRET_BULK_B"),
+                Some(&"file")
+            );
+        },
+    );
+}
+
+#[test]
+fn test_resolve_all_env_secrets_ignores_non_secret_file_suffix_config() {
+    with_env_vars_async(
+        &[("FERRUM_DNS_RESOLVER_HOSTS_FILE", "/path/to/hosts")],
+        || async {
+            let resolved = resolve_all_env_secrets().await.unwrap();
+            assert!(resolved.vars.is_empty());
+            assert!(resolved.source_keys_to_remove.is_empty());
+            assert!(resolved.loaded_sources.is_empty());
         },
     );
 }

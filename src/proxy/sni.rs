@@ -265,27 +265,33 @@ fn parse_sni_hostname(data: &[u8]) -> Option<String> {
         return None;
     }
 
-    let _list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-    let mut pos = 2;
+    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    if data.len() != 2 + list_len {
+        return None;
+    }
 
-    while pos + 3 <= data.len() {
-        let name_type = data[pos];
-        let name_len = u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as usize;
+    let names = &data[2..];
+    let mut pos = 0;
+
+    while pos + 3 <= names.len() {
+        let name_type = names[pos];
+        let name_len = u16::from_be_bytes([names[pos + 1], names[pos + 2]]) as usize;
         pos += 3;
 
-        if pos + name_len > data.len() {
+        if pos + name_len > names.len() {
             return None;
         }
 
         if name_type == 0x00 {
             // host_name
-            return std::str::from_utf8(&data[pos..pos + name_len])
+            return std::str::from_utf8(&names[pos..pos + name_len])
                 .ok()
                 .map(|s| s.to_lowercase());
         }
 
         pos += name_len;
     }
+
     None
 }
 

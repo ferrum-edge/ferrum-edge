@@ -28,6 +28,7 @@ pub struct WindowedMetrics {
 
 impl WindowedMetrics {
     pub fn new(window_seconds: u64) -> Self {
+        let window_seconds = window_seconds.max(1);
         Self {
             requests_per_second: AtomicU64::new(0),
             status_codes_per_second: DashMap::new(),
@@ -49,6 +50,7 @@ pub fn start_metrics_monitor(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let window_seconds = window_seconds.max(1);
         let interval = Duration::from_secs(window_seconds);
 
         // Take the initial snapshot.

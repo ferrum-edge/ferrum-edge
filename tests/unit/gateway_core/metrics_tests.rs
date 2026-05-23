@@ -14,6 +14,14 @@ fn windowed_metrics_new_initializes_correctly() {
     assert!(m.status_codes_per_second.is_empty());
 }
 
+#[test]
+fn windowed_metrics_new_clamps_zero_window_to_one_second() {
+    let m = WindowedMetrics::new(0);
+    assert_eq!(m.window_seconds, 1);
+    assert_eq!(m.requests_per_second.load(Ordering::Relaxed), 0);
+    assert!(m.status_codes_per_second.is_empty());
+}
+
 #[tokio::test]
 async fn monitor_computes_rate_after_window() {
     let request_count = Arc::new(AtomicU64::new(0));
@@ -112,32 +120,40 @@ async fn monitor_shuts_down_on_signal() {
     assert!(result.is_ok(), "Monitor should shut down within 2 seconds");
 }
 
-/// window_seconds=0 causes a division by zero. This test documents the bug.
-/// The monitor divides by window_seconds: `delta / window_seconds`.
-/// With window_seconds=0, tokio::time::sleep(Duration::from_secs(0)) returns
-/// immediately, and the division panics.
 #[tokio::test]
-async fn monitor_zero_window_panics() {
-    let request_count = Arc::new(AtomicU64::new(100));
+async fn monitor_zero_window_is_clamped_to_one_second() {
+    let request_count = Arc::new(AtomicU64::new(0));
     let status_counts: Arc<DashMap<u16, AtomicU64>> = Arc::new(DashMap::new());
+    status_counts.insert(200, AtomicU64::new(0));
     let windowed = Arc::new(WindowedMetrics::new(0));
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    assert_eq!(windowed.window_seconds, 1);
 
     let handle = start_metrics_monitor(
-        request_count,
-        status_counts,
-        windowed,
-        0, // BUG: will cause division by zero
+        request_count.clone(),
+        status_counts.clone(),
+        windowed.clone(),
+        0,
         shutdown_rx,
     );
 
-    // The spawned task should panic due to divide-by-zero
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    request_count.store(2, Ordering::Relaxed);
+    status_counts.get(&200).unwrap().store(2, Ordering::Relaxed);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    assert_eq!(windowed.requests_per_second.load(Ordering::Relaxed), 2);
+    let rate_200 = windowed
+        .status_codes_per_second
+        .get(&200)
+        .map(|entry| entry.value().load(Ordering::Relaxed))
+        .unwrap_or(0);
+    assert_eq!(rate_200, 2);
+
+    shutdown_tx.send(true).unwrap();
     let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
-    match result {
-        Ok(Ok(())) => panic!("Expected panic from zero window, but task completed normally"),
-        Ok(Err(e)) => {
-            assert!(e.is_panic(), "Task should have panicked: {:?}", e);
-        }
-        Err(_) => panic!("Timed out waiting for zero-window panic"),
-    }
+    assert!(result.is_ok(), "Monitor should shut down within 2 seconds");
+    assert!(result.unwrap().is_ok(), "Monitor should not panic");
 }

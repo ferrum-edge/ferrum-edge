@@ -21,7 +21,8 @@ use tracing::warn;
 use super::utils::log_schema::{SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
-    UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, resolve_udp_endpoint,
+    UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, parse_socket_host,
+    resolve_udp_endpoint,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
@@ -144,7 +145,7 @@ struct StatsdFlushState {
 
 pub struct StatsdLogging {
     logger: BatchingLogger<MetricEntry>,
-    hostname: String,
+    hostname: Option<String>,
 }
 
 impl StatsdLogging {
@@ -153,7 +154,7 @@ impl StatsdLogging {
             return Err("statsd_logging: config must be an object".to_string());
         }
 
-        let host = config
+        let raw_host = config
             .get("host")
             .and_then(Value::as_str)
             .map(str::trim)
@@ -162,6 +163,8 @@ impl StatsdLogging {
                 "statsd_logging: 'host' is required — metrics will have nowhere to send".to_string()
             })?
             .to_string();
+        let socket_host = parse_socket_host("statsd_logging", "host", &raw_host)?;
+        let host = socket_host.dial_host.clone();
 
         let port = match config.get("port") {
             Some(value) => value.as_u64().ok_or_else(|| {
@@ -262,7 +265,7 @@ impl StatsdLogging {
 
         Ok(Self {
             logger,
-            hostname: host,
+            hostname: socket_host.warmup_hostname,
         })
     }
 }
@@ -290,7 +293,7 @@ impl Plugin for StatsdLogging {
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        vec![self.hostname.clone()]
+        self.hostname.iter().cloned().collect()
     }
 }
 

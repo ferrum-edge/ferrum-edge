@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
-use url::Url;
+use url::{Host, Url};
 
 use crate::consumer_index::ConsumerIndex;
 
@@ -1143,13 +1143,41 @@ fn parse_url_field(
             ));
         }
     }
-    let hostname = parsed.host_str().ok_or_else(|| {
+    if !has_non_empty_authority(url) {
+        return Err(format!(
+            "jwks_auth: 'provider[{provider_idx}].{field}' must include a hostname"
+        ));
+    }
+    let hostname = hostname_from_parsed_url(&parsed).ok_or_else(|| {
         format!("jwks_auth: 'provider[{provider_idx}].{field}' must include a hostname")
     })?;
     Ok(Some(ParsedEndpoint {
         url: url.to_string(),
-        hostname: hostname.to_string(),
+        hostname,
     }))
+}
+
+fn hostname_from_parsed_url(parsed: &Url) -> Option<String> {
+    let host = parsed.host()?;
+    Some(match host {
+        Host::Domain(hostname) => hostname.to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
+}
+
+fn has_non_empty_authority(url: &str) -> bool {
+    let Some((_, after_scheme)) = url.split_once(':') else {
+        return false;
+    };
+    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
+        return false;
+    };
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+
+    authority_end > 0
 }
 
 fn parse_inline_jwks(
@@ -1367,5 +1395,5 @@ fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext)
 fn hostname_from_url(url: &str) -> Option<String> {
     Url::parse(url)
         .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .and_then(|u| hostname_from_parsed_url(&u))
 }

@@ -68,7 +68,7 @@ use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
-use url::Url;
+use url::{Host, Url};
 
 use super::utils::aws_sigv4;
 use super::utils::response_body::{
@@ -387,7 +387,7 @@ impl ServerlessFunction {
         // Extract hostname for DNS warmup
         let function_hostname = Url::parse(&function_url)
             .ok()
-            .and_then(|u| u.host_str().map(String::from));
+            .and_then(|u| http_url_hostname(&u, "function_url").ok());
 
         let requires_body = forward_body;
 
@@ -622,15 +622,51 @@ fn parse_forward_headers(config: &Value) -> Result<Vec<String>, String> {
 
 /// Escape special characters for safe JSON string interpolation.
 fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut escaped = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            ch if ch < '\u{20}' => {
+                escaped.push_str("\\u00");
+                let byte = ch as u8;
+                escaped.push(HEX[(byte >> 4) as usize] as char);
+                escaped.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Validate a function URL (Azure/GCP `function_url`).
 fn validate_function_url(url: &str) -> Result<(), String> {
     validate_http_url_field(url, "function_url")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serverless_escape_json_string_round_trips_control_characters() {
+        let raw = "invoke failed\"\n<script>\u{00}\u{1f}\\";
+        let body = format!(r#"{{"details":"{}"}}"#, escape_json_string(raw));
+        let parsed: Value =
+            serde_json::from_str(&body).expect("escaped serverless error should be valid JSON");
+
+        assert_eq!(parsed["details"], raw);
+        assert!(!escape_json_string(raw).chars().any(|ch| ch < '\u{20}'));
+    }
 }
 
 /// Shared HTTP(S) URL validator for `function_url` (Azure/GCP) and the AWS
@@ -649,13 +685,40 @@ fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
         }
     }
 
-    if parsed.host_str().is_none() {
+    if !has_non_empty_authority(url) {
         return Err(format!(
             "serverless_function: {field} must include a hostname or IP address"
         ));
     }
+    http_url_hostname(&parsed, field)?;
 
     Ok(())
+}
+
+fn http_url_hostname(parsed: &Url, field: &str) -> Result<String, String> {
+    let host = parsed.host().ok_or_else(|| {
+        format!("serverless_function: {field} must include a hostname or IP address")
+    })?;
+
+    Ok(match host {
+        Host::Domain(hostname) => hostname.to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
+}
+
+fn has_non_empty_authority(url: &str) -> bool {
+    let Some((_, after_scheme)) = url.split_once(':') else {
+        return false;
+    };
+    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
+        return false;
+    };
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+
+    authority_end > 0
 }
 
 fn contains_json_ascii(value: &str) -> bool {

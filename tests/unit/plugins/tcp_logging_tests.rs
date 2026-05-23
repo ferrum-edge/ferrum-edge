@@ -87,6 +87,22 @@ async fn test_tcp_logging_plugin_creation_empty_host() {
 }
 
 #[tokio::test]
+async fn test_tcp_logging_rejects_host_with_url_or_port_material() {
+    for host in [
+        "tcp://logs.example.com",
+        "user@logs.example.com",
+        "logs.example.com/path",
+        "logs.example.com?token=secret",
+        "logs.example.com#fragment",
+        "logs.example.com:5140",
+        "bad host",
+    ] {
+        let result = TcpLogging::new(&json!({"host": host, "port": 5140}), default_client());
+        assert!(result.is_err(), "host should fail validation: {host}");
+    }
+}
+
+#[tokio::test]
 async fn test_tcp_logging_rejects_invalid_config_shapes() {
     let cases = [
         json!(null),
@@ -282,4 +298,16 @@ async fn test_tcp_logging_warmup_hostnames() {
 
     let hostnames = plugin.warmup_hostnames();
     assert_eq!(hostnames, vec!["logstash.example.com"]);
+}
+
+#[tokio::test]
+async fn test_tcp_logging_warmup_skips_ip_literals() {
+    for host in ["127.0.0.1", "2001:db8::10", "[2001:db8::10]"] {
+        let plugin =
+            TcpLogging::new(&json!({"host": host, "port": 5140}), default_client()).unwrap();
+        assert!(
+            plugin.warmup_hostnames().is_empty(),
+            "IP literal {host} should not be DNS-warmed"
+        );
+    }
 }

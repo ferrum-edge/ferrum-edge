@@ -2537,6 +2537,7 @@ impl EnvConfig {
         if let Some(ref addr) = self.cp_grpc_listen_addr
             && let Some(port_str) = addr.rsplit(':').next()
             && let Ok(port) = port_str.parse::<u16>()
+            && port != 0
         {
             ports.insert(port);
         }

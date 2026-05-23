@@ -214,6 +214,20 @@ async fn test_otel_tracing_rejects_invalid_endpoint() {
 }
 
 #[tokio::test]
+async fn test_otel_tracing_rejects_endpoint_with_empty_authority() {
+    let err = OtelTracing::new_with_http_client(
+        &json!({
+            "endpoint": "https:///v1/traces"
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("endpoint with empty authority must be rejected");
+
+    assert!(err.contains("hostname"), "got: {err}");
+}
+
+#[tokio::test]
 async fn test_otel_tracing_rejects_non_http_endpoint_scheme() {
     let err = OtelTracing::new_with_http_client(
         &json!({
@@ -616,6 +630,24 @@ async fn test_workload_metrics_datadog_exporter_payload() {
 }
 
 #[tokio::test]
+async fn test_workload_metrics_rejects_datadog_agent_url_with_empty_authority() {
+    let err = WorkloadMetrics::new(&json!({
+        "service_name": "reviews-default",
+        "tracing_providers": [{
+            "kind": "datadog",
+            "config": {
+                "agent_url": "https:///traces"
+            }
+        }]
+    }))
+    .err()
+    .expect("datadog agent_url with empty authority must be rejected");
+
+    assert!(err.contains("agent_url"), "got: {err}");
+    assert!(err.contains("hostname"), "got: {err}");
+}
+
+#[tokio::test]
 async fn test_workload_metrics_lightstep_exporter_uses_otlp_bearer_payload() {
     // SAFETY: This test uses a unique process env key and only reads it during
     // plugin construction. No other test in this module mutates the same key.
@@ -857,6 +889,16 @@ async fn test_otel_tracing_warmup_hostnames() {
 
     let hosts = plugin.warmup_hostnames();
     assert_eq!(hosts, vec!["otel-collector.example.com"]);
+}
+
+#[tokio::test]
+async fn test_otel_tracing_warmup_hostnames_unbrackets_ipv6_literals() {
+    let plugin = new_otel(&json!({
+        "endpoint": "https://[2001:db8::60]:4318/v1/traces"
+    }));
+
+    let hosts = plugin.warmup_hostnames();
+    assert_eq!(hosts, vec!["2001:db8::60"]);
 }
 
 #[tokio::test]

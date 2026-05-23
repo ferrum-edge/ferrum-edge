@@ -36,6 +36,22 @@ fn remove_var(key: &str) {
     }
 }
 
+const RUNTIME_METRICS_ENV_VARS: &[&str] = &[
+    "FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS",
+    "FERRUM_METRICS_WINDOW_1M_SECONDS",
+    "FERRUM_METRICS_WINDOW_5M_SECONDS",
+    "FERRUM_METRICS_LOG_COUNTER_ENABLED",
+    "FERRUM_METRICS_RUNTIME_CACHE_MS",
+    "FERRUM_METRICS_POOL_TRACKING_ENABLED",
+    "FERRUM_METRICS_STATUS_TRACKING_ENABLED",
+];
+
+fn remove_runtime_metrics_env_vars() {
+    for key in RUNTIME_METRICS_ENV_VARS {
+        remove_var(key);
+    }
+}
+
 #[test]
 fn test_operating_mode_database() {
     with_env_vars(&[("FERRUM_MODE", "database")], || {
@@ -505,6 +521,9 @@ fn test_env_config_http3_defaults() {
             assert_eq!(config.http3_stream_receive_window, 262_144);
             assert_eq!(config.http3_receive_window, 2_097_152);
             assert_eq!(config.http3_send_window, 2_097_152);
+            assert_eq!(config.http3_connections_per_backend, 4);
+            assert_eq!(config.http3_pool_idle_timeout_seconds, 120);
+            assert_eq!(config.http3_request_body_channel_capacity, 32);
             // Frontend H2 defaults (conservative for untrusted clients)
             assert_eq!(config.frontend_h2_initial_stream_window_size, 262_144);
             assert_eq!(config.frontend_h2_initial_connection_window_size, 2_097_152);
@@ -512,6 +531,116 @@ fn test_env_config_http3_defaults() {
             assert_eq!(config.server_http2_max_pending_accept_reset_streams, 64);
             assert_eq!(config.server_http2_max_local_error_reset_streams, 256);
             assert_eq!(config.websocket_max_connections, 20_000);
+        },
+    );
+}
+
+#[test]
+fn test_http3_connections_per_backend_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_CONNECTIONS_PER_BACKEND", "8"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_connections_per_backend, 8);
+        },
+    );
+}
+
+#[test]
+fn test_http3_connections_per_backend_clamps_zero() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_CONNECTIONS_PER_BACKEND", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_connections_per_backend, 1);
+        },
+    );
+}
+
+#[test]
+fn test_http3_pool_idle_timeout_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS", "45"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_pool_idle_timeout_seconds, 45);
+        },
+    );
+}
+
+#[test]
+fn test_http3_request_body_channel_capacity_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY", "64"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_request_body_channel_capacity, 64);
+        },
+    );
+}
+
+#[test]
+fn test_http3_request_body_channel_capacity_clamped_below_min() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_request_body_channel_capacity, 1);
+        },
+    );
+}
+
+#[test]
+fn test_http3_request_body_channel_capacity_clamped_above_max() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY", "2048"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_request_body_channel_capacity, 1024);
+        },
+    );
+}
+
+#[test]
+fn test_http3_request_body_channel_capacity_non_numeric_rejected() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY", "many"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                err.contains("FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY"),
+                "unexpected error: {err}"
+            );
         },
     );
 }
@@ -2093,6 +2222,41 @@ fn test_is_private_ip_public_v4() {
 }
 
 #[test]
+fn test_is_private_ip_ipv4_boundary_ranges() {
+    for ip in [
+        "9.255.255.255",
+        "11.0.0.0",
+        "172.15.255.255",
+        "172.32.0.0",
+        "192.167.255.255",
+        "192.169.0.0",
+        "100.63.255.255",
+        "100.128.0.0",
+    ] {
+        assert!(
+            !is_private_ip(&ip.parse().unwrap()),
+            "{ip} should be public"
+        );
+    }
+
+    for ip in [
+        "10.0.0.0",
+        "10.255.255.255",
+        "172.16.0.0",
+        "172.31.255.255",
+        "192.168.0.0",
+        "192.168.255.255",
+        "100.64.0.0",
+        "100.127.255.255",
+    ] {
+        assert!(
+            is_private_ip(&ip.parse().unwrap()),
+            "{ip} should be private/reserved"
+        );
+    }
+}
+
+#[test]
 fn test_is_private_ip_ipv6() {
     assert!(is_private_ip(&"::1".parse().unwrap()));
     assert!(is_private_ip(&"::".parse().unwrap()));
@@ -2125,6 +2289,40 @@ fn test_is_private_ip_ipv6() {
 }
 
 #[test]
+fn test_is_private_ip_ipv6_embedded_ipv4_boundaries() {
+    for ip in [
+        "::ffff:10.0.0.1",
+        "::ffff:100.64.0.1",
+        "::ffff:169.254.169.254",
+        "::ffff:192.0.2.1",
+        "::10.0.0.1",
+        "64:ff9b::10.0.0.1",
+        "64:ff9b::100.64.0.1",
+        "64:ff9b::169.254.169.254",
+        "64:ff9b::192.0.2.1",
+        "64:ff9b:1::8.8.8.8",
+    ] {
+        assert!(
+            is_private_ip(&ip.parse().unwrap()),
+            "{ip} should be private/reserved"
+        );
+    }
+
+    for ip in [
+        "::ffff:8.8.8.8",
+        "::8.8.8.8",
+        "64:ff9b::8.8.8.8",
+        "64:ff9b::192.0.0.9",
+        "64:ff9b::192.0.0.10",
+    ] {
+        assert!(
+            !is_private_ip(&ip.parse().unwrap()),
+            "{ip} should be public"
+        );
+    }
+}
+
+#[test]
 fn test_check_backend_ip_allowed_both_allows_all() {
     let policy = BackendAllowIps::Both;
     assert!(check_backend_ip_allowed(
@@ -2137,6 +2335,10 @@ fn test_check_backend_ip_allowed_both_allows_all() {
     ));
     assert!(check_backend_ip_allowed(
         &"169.254.169.254".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"64:ff9b::192.168.0.1".parse().unwrap(),
         &policy
     ));
 }
@@ -2160,9 +2362,21 @@ fn test_check_backend_ip_allowed_public_denies_private() {
         &"100.64.0.1".parse().unwrap(),
         &policy
     ));
+    assert!(!check_backend_ip_allowed(
+        &"::ffff:10.0.0.1".parse().unwrap(),
+        &policy
+    ));
+    assert!(!check_backend_ip_allowed(
+        &"64:ff9b::192.168.0.1".parse().unwrap(),
+        &policy
+    ));
     // Public allowed
     assert!(check_backend_ip_allowed(
         &"8.8.8.8".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"64:ff9b::8.8.8.8".parse().unwrap(),
         &policy
     ));
 }
@@ -2178,6 +2392,10 @@ fn test_check_backend_ip_allowed_private_denies_public() {
         &"1.1.1.1".parse().unwrap(),
         &policy
     ));
+    assert!(!check_backend_ip_allowed(
+        &"64:ff9b::8.8.8.8".parse().unwrap(),
+        &policy
+    ));
     // Private allowed
     assert!(check_backend_ip_allowed(
         &"10.0.0.1".parse().unwrap(),
@@ -2189,6 +2407,14 @@ fn test_check_backend_ip_allowed_private_denies_public() {
     ));
     assert!(check_backend_ip_allowed(
         &"169.254.169.254".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"::ffff:10.0.0.1".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"64:ff9b::192.168.0.1".parse().unwrap(),
         &policy
     ));
 }
@@ -3448,6 +3674,46 @@ fn test_reserved_gateway_ports_includes_grpc() {
 }
 
 #[test]
+fn test_reserved_gateway_ports_excludes_disabled_ports() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/test.yaml"),
+            ("FERRUM_PROXY_HTTP_PORT", "0"),
+            ("FERRUM_PROXY_HTTPS_PORT", "0"),
+            ("FERRUM_ADMIN_HTTP_PORT", "0"),
+            ("FERRUM_ADMIN_HTTPS_PORT", "0"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let ports = config.reserved_gateway_ports();
+            assert!(
+                !ports.contains(&0),
+                "disabled listener port 0 must not be reserved"
+            );
+            assert!(ports.is_empty(), "all configured listeners are disabled");
+        },
+    );
+}
+
+#[test]
+fn test_reserved_gateway_ports_extracts_ipv6_grpc_port() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/test.yaml"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "[::]:50051"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let ports = config.reserved_gateway_ports();
+            assert!(ports.contains(&50051), "should contain IPv6 CP gRPC port");
+        },
+    );
+}
+
+#[test]
 fn test_db_slow_query_threshold_default() {
     with_env_vars(
         &[
@@ -3716,6 +3982,89 @@ fn test_env_config_status_metrics_window_seconds_minimum_clamped() {
             assert_eq!(
                 config.status_metrics_window_seconds, 1,
                 "status_metrics_window_seconds should be clamped to minimum of 1"
+            );
+        },
+    );
+}
+
+// ============================================================================
+// Runtime Metrics Config Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_runtime_metrics_defaults() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_runtime_metrics_env_vars();
+            let config = EnvConfig::from_env().unwrap();
+
+            assert_eq!(config.runtime_metrics_system_sample_interval_ms, 1000);
+            assert_eq!(config.runtime_metrics_window_1m_seconds, 60);
+            assert_eq!(config.runtime_metrics_window_5m_seconds, 300);
+            assert!(config.runtime_metrics_log_counter_enabled);
+            assert_eq!(config.runtime_metrics_cache_ttl_ms, 1000);
+            assert!(config.runtime_metrics_pool_tracking_enabled);
+            assert!(config.runtime_metrics_status_tracking_enabled);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_runtime_metrics_custom_values() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS", "250"),
+            ("FERRUM_METRICS_WINDOW_1M_SECONDS", "15"),
+            ("FERRUM_METRICS_WINDOW_5M_SECONDS", "120"),
+            ("FERRUM_METRICS_LOG_COUNTER_ENABLED", "false"),
+            ("FERRUM_METRICS_RUNTIME_CACHE_MS", "0"),
+            ("FERRUM_METRICS_POOL_TRACKING_ENABLED", "false"),
+            ("FERRUM_METRICS_STATUS_TRACKING_ENABLED", "false"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+
+            assert_eq!(config.runtime_metrics_system_sample_interval_ms, 250);
+            assert_eq!(config.runtime_metrics_window_1m_seconds, 15);
+            assert_eq!(config.runtime_metrics_window_5m_seconds, 120);
+            assert!(!config.runtime_metrics_log_counter_enabled);
+            assert_eq!(config.runtime_metrics_cache_ttl_ms, 0);
+            assert!(!config.runtime_metrics_pool_tracking_enabled);
+            assert!(!config.runtime_metrics_status_tracking_enabled);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_runtime_metrics_minimums_are_clamped() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS", "1"),
+            ("FERRUM_METRICS_WINDOW_1M_SECONDS", "0"),
+            ("FERRUM_METRICS_WINDOW_5M_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+
+            assert_eq!(
+                config.runtime_metrics_system_sample_interval_ms, 100,
+                "system sampler interval should clamp to the documented minimum"
+            );
+            assert_eq!(
+                config.runtime_metrics_window_1m_seconds, 1,
+                "1m runtime metrics window should clamp away from zero"
+            );
+            assert_eq!(
+                config.runtime_metrics_window_5m_seconds, 1,
+                "5m runtime metrics window should clamp away from zero"
             );
         },
     );

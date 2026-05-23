@@ -37,6 +37,7 @@
 
 use std::collections::HashMap;
 
+use http::header::HeaderName;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -112,15 +113,9 @@ pub fn parse_route_header_transforms(
         if rule.key.is_empty() {
             return Err(format!("{context}[{idx}].key must not be empty"));
         }
-        if !rule
-            .key
-            .bytes()
-            .all(|b| matches!(b, b'!'..=b'~') && b != b':')
-        {
-            return Err(format!(
-                "{context}[{idx}].key contains characters outside the HTTP header token set"
-            ));
-        }
+        let key = HeaderName::from_bytes(rule.key.as_bytes())
+            .map_err(|_| format!("{context}[{idx}].key must be a valid HTTP header name"))?
+            .to_string();
         match op {
             RouteHeaderTransformOp::Add | RouteHeaderTransformOp::Update => {
                 let Some(value) = rule.value.as_ref() else {
@@ -134,7 +129,7 @@ pub fn parse_route_header_transforms(
                 }
                 out.push(RouteHeaderTransformRule {
                     operation: op,
-                    key: rule.key.to_ascii_lowercase(),
+                    key,
                     value: Some(value.clone()),
                 });
             }
@@ -146,7 +141,7 @@ pub fn parse_route_header_transforms(
                 }
                 out.push(RouteHeaderTransformRule {
                     operation: op,
-                    key: rule.key.to_ascii_lowercase(),
+                    key,
                     value: None,
                 });
             }
@@ -323,7 +318,17 @@ mod tests {
         assert!(
             parse_route_header_transforms(&bad, "ctx")
                 .unwrap_err()
-                .contains("HTTP header token")
+                .contains("valid HTTP header name")
+        );
+        let separator: Vec<RawRouteHeaderTransformRule> =
+            serde_json::from_value(serde_json::json!([
+                {"operation": "remove", "target": "header", "key": "X/Bad"},
+            ]))
+            .unwrap();
+        assert!(
+            parse_route_header_transforms(&separator, "ctx")
+                .unwrap_err()
+                .contains("valid HTTP header name")
         );
     }
 

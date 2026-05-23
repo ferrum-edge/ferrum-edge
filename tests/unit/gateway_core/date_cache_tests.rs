@@ -1,6 +1,6 @@
 //! Unit tests for thread-local Date header caching.
 
-use ferrum_edge::date_cache::get_cached_date;
+use ferrum_edge::date_cache::{get_cached_date, get_cached_date_bytes};
 
 #[test]
 fn test_cached_date_contains_gmt() {
@@ -15,9 +15,37 @@ fn test_cached_date_contains_gmt() {
 #[test]
 fn test_cached_date_is_valid_http_date() {
     let date = get_cached_date();
-    // HTTP date format: "Thu, 10 Apr 2026 12:34:56 GMT"
-    assert!(date.len() >= 25, "Date too short: {}", date);
+    assert_eq!(date.len(), 29, "Date length should be fixed: {}", date);
     assert!(date.ends_with("GMT"), "Should end with GMT: {}", date);
+    httpdate::parse_http_date(&date).unwrap();
+}
+
+#[test]
+fn test_cached_date_bytes_have_fixed_http_date_shape() {
+    let bytes = get_cached_date_bytes();
+    let date = std::str::from_utf8(&bytes).unwrap();
+
+    assert_eq!(bytes.len(), 29);
+    assert!(
+        !bytes.contains(&0),
+        "Date bytes must not contain NUL padding"
+    );
+    assert!(date.ends_with("GMT"), "Should end with GMT: {}", date);
+    httpdate::parse_http_date(date).unwrap();
+}
+
+#[test]
+fn test_cached_date_string_and_bytes_are_parseable_on_repeated_reads() {
+    for _ in 0..8 {
+        let date = get_cached_date();
+        let bytes = get_cached_date_bytes();
+        let byte_date = std::str::from_utf8(&bytes).unwrap();
+
+        assert_eq!(date.len(), 29);
+        assert_eq!(byte_date.len(), 29);
+        httpdate::parse_http_date(&date).unwrap();
+        httpdate::parse_http_date(byte_date).unwrap();
+    }
 }
 
 #[test]

@@ -206,13 +206,20 @@ plugin_configs:
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
         start_otel_gateway_with_retry(config_template).await;
 
-    // Send a request without a traceparent header — the plugin should generate one
+    // Send a request without a traceparent header — the plugin should generate one.
+    //
+    // On loaded CI runners the proxy route table may not be populated when
+    // `/health` first returns 200. Retry on 404 to absorb that startup race.
     let client = reqwest::Client::new();
-    let response = client
-        .get(format!("http://127.0.0.1:{}/traced/test", proxy_port))
-        .send()
-        .await
-        .expect("Request failed");
+    let url = format!("http://127.0.0.1:{}/traced/test", proxy_port);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let response = loop {
+        let r = client.get(&url).send().await.expect("Request failed");
+        if r.status().as_u16() != 404 || tokio::time::Instant::now() >= deadline {
+            break r;
+        }
+        sleep(Duration::from_millis(250)).await;
+    };
 
     assert_eq!(
         response.status().as_u16(),
@@ -291,15 +298,26 @@ plugin_configs:
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
         start_otel_gateway_with_retry(config_template).await;
 
-    // Send a request WITH an existing traceparent — the plugin should preserve the trace_id
+    // Send a request WITH an existing traceparent — the plugin should preserve the trace_id.
+    //
+    // On loaded CI runners the proxy route table may not be populated when
+    // `/health` first returns 200. Retry on 404 to absorb that startup race.
     let existing_traceparent = "00-abcdef1234567890abcdef1234567890-1234567890abcdef-01";
     let client = reqwest::Client::new();
-    let response = client
-        .get(format!("http://127.0.0.1:{}/traced/test", proxy_port))
-        .header("traceparent", existing_traceparent)
-        .send()
-        .await
-        .expect("Request failed");
+    let url = format!("http://127.0.0.1:{}/traced/test", proxy_port);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let response = loop {
+        let r = client
+            .get(&url)
+            .header("traceparent", existing_traceparent)
+            .send()
+            .await
+            .expect("Request failed");
+        if r.status().as_u16() != 404 || tokio::time::Instant::now() >= deadline {
+            break r;
+        }
+        sleep(Duration::from_millis(250)).await;
+    };
 
     assert_eq!(
         response.status().as_u16(),
@@ -448,14 +466,25 @@ plugin_configs:
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
         start_ldap_gateway_with_retry(config_template).await;
 
-    // Send a request with Basic auth credentials — LDAP server is unreachable so auth must fail
+    // Send a request with Basic auth credentials — LDAP server is unreachable so auth must fail.
+    //
+    // On loaded CI runners the proxy route table may not be populated when
+    // `/health` first returns 200. Retry on 404 to absorb that startup race.
     let client = reqwest::Client::new();
-    let response = client
-        .get(format!("http://127.0.0.1:{}/secure/resource", proxy_port))
-        .basic_auth("testuser", Some("testpassword"))
-        .send()
-        .await
-        .expect("Request failed");
+    let url = format!("http://127.0.0.1:{}/secure/resource", proxy_port);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let response = loop {
+        let r = client
+            .get(&url)
+            .basic_auth("testuser", Some("testpassword"))
+            .send()
+            .await
+            .expect("Request failed");
+        if r.status().as_u16() != 404 || tokio::time::Instant::now() >= deadline {
+            break r;
+        }
+        sleep(Duration::from_millis(250)).await;
+    };
 
     // The LDAP plugin should reject with 401 (LDAP authentication failed)
     assert_eq!(
@@ -509,13 +538,21 @@ plugin_configs:
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
         start_ldap_gateway_with_retry(config_template).await;
 
-    // Send a request WITHOUT any auth credentials
+    // Send a request WITHOUT any auth credentials.
+    //
+    // On loaded CI runners the proxy route table may not be populated when
+    // `/health` first returns 200 (the admin and proxy listeners start on
+    // separate tasks). Retry on 404 to absorb that startup race.
     let client = reqwest::Client::new();
-    let response = client
-        .get(format!("http://127.0.0.1:{}/secure/resource", proxy_port))
-        .send()
-        .await
-        .expect("Request failed");
+    let url = format!("http://127.0.0.1:{}/secure/resource", proxy_port);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let response = loop {
+        let r = client.get(&url).send().await.expect("Request failed");
+        if r.status().as_u16() != 404 || tokio::time::Instant::now() >= deadline {
+            break r;
+        }
+        sleep(Duration::from_millis(250)).await;
+    };
 
     // The LDAP plugin should reject with 401 (no credentials provided)
     assert_eq!(
