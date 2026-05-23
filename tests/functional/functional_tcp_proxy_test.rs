@@ -89,6 +89,35 @@ async fn start_tagged_tcp_echo_server_on(
     })
 }
 
+/// Start a TCP backend that only responds after it observes client EOF.
+/// This models protocols where the client half-closes its write side after
+/// sending a request and the server replies later on the still-open read side.
+async fn start_half_close_response_server_on(
+    listener: TcpListener,
+    expected_request: &'static [u8],
+    response: &'static [u8],
+    response_delay: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((mut stream, _addr)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut received = Vec::new();
+                if stream.read_to_end(&mut received).await.is_err() {
+                    return;
+                }
+                if received != expected_request {
+                    return;
+                }
+
+                sleep(response_delay).await;
+                if stream.write_all(response).await.is_ok() {
+                    let _ = stream.shutdown().await;
+                }
+            });
+        }
+    })
+}
+
 // ============================================================================
 // TLS Echo Server (for testing backend TLS origination)
 // ============================================================================
@@ -752,6 +781,22 @@ async fn test_tcp_proxy_backend_read_timeout() {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let silent_backend = start_tcp_silent_reader_server_on(backend_listener).await;
+/// Test 6: Client half-close keeps the response direction open for delayed backend data.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_client_half_close_allows_delayed_backend_response() {
+    const REQUEST: &[u8] = b"half-close-request";
+    const RESPONSE: &[u8] = b"delayed-half-close-response";
+
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let response_server = start_half_close_response_server_on(
+        backend_listener,
+        REQUEST,
+        RESPONSE,
+        Duration::from_millis(250),
+    )
+    .await;
 
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
         |proxy_port| {
@@ -761,12 +806,14 @@ version: "1"
 proxies:
   - id: "tcp-global-idle-timeout"
   - id: "tcp-backend-read-timeout"
+  - id: "tcp-half-close"
     listen_port: {proxy_port}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     backend_read_timeout_ms: 500
     tcp_idle_timeout_seconds: 30
+    tcp_idle_timeout_seconds: 5
 
 consumers: []
 plugin_configs: []
@@ -827,6 +874,35 @@ plugin_configs: []
 }
 
 /// Test 6: Active TCP relay keeps its accepted connection epoch across config reload.
+    stream
+        .write_all(REQUEST)
+        .await
+        .expect("Failed to send half-close request");
+    stream
+        .shutdown()
+        .await
+        .expect("Failed to half-close client write side");
+
+    let mut buf = vec![0u8; RESPONSE.len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("Delayed half-close response timed out")
+        .expect("Delayed half-close response read failed");
+    assert_eq!(buf, RESPONSE);
+
+    let mut eof = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut eof))
+        .await
+        .expect("EOF after delayed half-close response timed out")
+        .expect("EOF after delayed half-close response read failed");
+    assert_eq!(n, 0, "backend close should propagate after response");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    response_server.abort();
+}
+
+/// Test 7: Active TCP relay keeps its accepted connection epoch across config reload.
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_active_connection_survives_config_reload() {
@@ -932,7 +1008,7 @@ plugin_configs: []
     backend_b.abort();
 }
 
-/// Test 7 (formerly 6): TCP proxy handles connection to unreachable backend gracefully.
+/// Test 8: TCP proxy handles connection to unreachable backend gracefully.
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_backend_unreachable() {
