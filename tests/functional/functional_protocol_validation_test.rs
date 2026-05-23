@@ -10,6 +10,7 @@
 //! - Multiple `Host` headers (HTTP/1.1)
 //! - `Host` trailing-dot normalization
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H1
+//! - Configured request header count limits and `0` disable semantics
 //! - `TRACE` method rejection (XST) on H1 and H2
 //! - `Transfer-Encoding` rejection on H3
 //! - Empty query segments are ignored by HTTP/3 query-param limit counting
@@ -256,6 +257,40 @@ fn assert_hop_by_hop_response_headers_stripped(hdrs: &HeaderMap) {
 fn parse_status_from_response_prefix(bytes: &[u8]) -> Option<u16> {
     let text = String::from_utf8_lossy(bytes);
     text.lines().next()?.split_whitespace().nth(1)?.parse().ok()
+async fn send_h2_with_headers(proxy_port: u16, headers: &[(&str, &str)]) -> (u16, String) {
+    let stream = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut builder = Request::builder().method("GET").uri("http://example.com/");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let req = builder
+        .body(Full::new(Bytes::new()))
+        .expect("build h2 request");
+    let resp = sender.send_request(req).await.expect("send h2 request");
+    let status = resp.status().as_u16();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
+    let body = String::from_utf8_lossy(&body).into_owned();
+
+    drop(sender);
+    conn_task.abort();
+    (status, body)
 }
 
 // ============================================================================
@@ -507,7 +542,75 @@ async fn functional_protocol_validation_host_trailing_dot_normalized() {
     h.cleanup();
 }
 
-// --- 7. TRACE on H1 and H2 -------------------------------------------------
+// --- 7. Header count limit env ---------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h1_header_count_env_rejects_excess_headers() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_HEADER_COUNT", "2")]).await;
+
+    let req = b"GET / HTTP/1.1\r\n\
+                Host: example.com\r\n\
+                X-One: 1\r\n\
+                X-Two: 2\r\n\
+                \r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 431, "body={}", resp.body);
+    assert!(
+        resp.body.contains("Request header count"),
+        "unexpected body: {}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h1_header_count_zero_disables_limit() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_HEADER_COUNT", "0")]).await;
+
+    let mut req = String::from("GET / HTTP/1.1\r\nHost: example.com\r\n");
+    for i in 0..16 {
+        req.push_str(&format!("X-Extra-{i}: {i}\r\n"));
+    }
+    req.push_str("\r\n");
+
+    let resp = send_raw_h1(h.proxy_port, req.as_bytes()).await;
+    assert_eq!(
+        resp.status_code, 200,
+        "header count 0 should disable the gateway count limit; body={}",
+        resp.body
+    );
+    let reflected: serde_json::Value = serde_json::from_str(&resp.body)
+        .unwrap_or_else(|e| panic!("backend body not JSON: {} ({e})", resp.body));
+    assert!(
+        reflected.get("x-extra-15").is_some(),
+        "backend should receive the high-count request when count limit is disabled; reflected={reflected}"
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h2_header_count_env_rejects_excess_headers() {
+    let h = Harness::new_with_env(false, &[("FERRUM_MAX_HEADER_COUNT", "1")]).await;
+
+    let (status, body) =
+        send_h2_with_headers(h.proxy_port, &[("x-one", "1"), ("x-two", "2")]).await;
+
+    assert_eq!(status, 431, "body={body}");
+    assert!(
+        body.contains("Request header count"),
+        "unexpected body: {body}"
+    );
+
+    h.cleanup();
+}
+
+// --- 8. TRACE on H1 and H2 -------------------------------------------------
 
 #[ignore]
 #[tokio::test]
@@ -572,7 +675,7 @@ async fn functional_protocol_validation_trace_rejected_http2() {
     h.cleanup();
 }
 
-// --- 8. Transfer-Encoding on H3 -------------------------------------------
+// --- 9. Transfer-Encoding on H3 -------------------------------------------
 
 #[ignore]
 #[tokio::test]
@@ -726,6 +829,7 @@ async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_
 }
 
 // --- 11. CONNECT on H1 ------------------------------------------------------
+// --- 10. CONNECT on H1 ------------------------------------------------------
 
 #[ignore]
 #[tokio::test]
