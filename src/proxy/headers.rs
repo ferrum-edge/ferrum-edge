@@ -53,6 +53,21 @@ pub fn is_backend_request_strip_header(name: &str) -> bool {
     )
 }
 
+/// Returns true for request metadata headers that Ferrum regenerates before
+/// sending to HTTP backends.
+///
+/// These are not hop-by-hop headers, but copying the client-supplied field and
+/// then adding Ferrum's canonical value creates duplicate metadata. In
+/// particular, duplicated `X-Forwarded-For` can make a backend observe the
+/// untrusted client value twice after normal comma folding.
+#[inline]
+pub fn is_proxy_generated_forwarding_header(name: &str) -> bool {
+    matches!(
+        name,
+        "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host"
+    )
+}
+
 /// Parse the lowercased header names listed in any `Connection` header(s),
 /// per RFC 9110 §7.6.1. Walks every value of `Connection`, splits each value
 /// by `,`, trims OWS, lowercases, parses to `HeaderName`, deduplicates.
@@ -368,6 +383,15 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn proxy_generated_forwarding_header_filter_covers_x_forwarded_family() {
+        assert!(is_proxy_generated_forwarding_header("x-forwarded-for"));
+        assert!(is_proxy_generated_forwarding_header("x-forwarded-proto"));
+        assert!(is_proxy_generated_forwarding_header("x-forwarded-host"));
+        assert!(!is_proxy_generated_forwarding_header("forwarded"));
+        assert!(!is_proxy_generated_forwarding_header("via"));
     }
 
     #[test]

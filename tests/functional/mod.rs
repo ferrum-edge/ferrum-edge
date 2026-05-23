@@ -19,6 +19,7 @@ mod functional_db_tls_test;
 mod functional_db_upstream_test;
 mod functional_dns_cache_test;
 mod functional_file_mode_test;
+mod functional_forwarded_via_headers_test;
 mod functional_graceful_shutdown_test;
 mod functional_grpc_plugins_test;
 mod functional_grpc_test;

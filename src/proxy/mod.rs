@@ -11196,6 +11196,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
@@ -11823,6 +11824,7 @@ async fn proxy_to_backend(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
