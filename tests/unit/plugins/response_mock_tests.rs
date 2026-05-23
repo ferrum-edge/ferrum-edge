@@ -103,6 +103,14 @@ fn test_creation_rejects_invalid_field_shapes() {
             "'method' must be a string",
         ),
         (
+            json!({ "rules": [{ "path": "/test", "method": "GET /admin" }] }),
+            "'method' must be a valid HTTP method token",
+        ),
+        (
+            json!({ "rules": [{ "path": "/test", "method": "GET\r\nX-Injected: yes" }] }),
+            "'method' must be a valid HTTP method token",
+        ),
+        (
             json!({ "rules": [{ "path": "", "body": "test" }] }),
             "'path' must not be empty",
         ),

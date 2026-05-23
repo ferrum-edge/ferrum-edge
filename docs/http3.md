@@ -342,7 +342,9 @@ h3-quinn-based RFC 9220 client because common off-the-shelf clients
 / HTTP/2. The functional shard covers H3 text/binary frame relay,
 masked-frame permissiveness, subprotocol forwarding and the no-subprotocol
 case, backend retry target rotation, failed backend upgrade responses,
-and per-IP request-slot release after the 200 CONNECT response.
+per-IP request-slot release after the 200 CONNECT response, and
+`FERRUM_HTTP3_WEBSOCKET_ENABLED=false` rejecting Extended CONNECT while
+plain H3 requests continue to route.
 
 ## QUIC connection migration
 

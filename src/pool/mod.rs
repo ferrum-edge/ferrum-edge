@@ -415,6 +415,7 @@ impl<M: PoolManager> GenericPool<M> {
     {
         KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
+            buf.clear();
             build_key(&mut buf);
 
             if let Some(entry) = self.entries.get(&*buf) {
@@ -635,6 +636,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(first, second);
+        assert_eq!(manager.creates.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generic_pool_clears_key_buffer_before_custom_lookup() {
+        let manager = Arc::new(TestManager {
+            healthy: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let pool = GenericPool::new(
+            manager.clone(),
+            PoolConfig::default(),
+            Duration::from_secs(60),
+            64,
+        );
+        let proxy = test_proxy();
+
+        let _ = pool
+            .get(&proxy, "backend.example.com", 443, 0)
+            .await
+            .unwrap();
+        let manual = pool
+            .create_or_get_existing_owned("custom-key".to_string(), |key| async move {
+                Ok::<_, anyhow::Error>(format!("{key}|manual"))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(manual, "custom-key|manual");
+        assert_eq!(
+            pool.cached_with(|buf| buf.push_str("custom-key"))
+                .as_deref(),
+            Some("custom-key|manual"),
+            "custom lookup closures must start from an empty thread-local key buffer"
+        );
         assert_eq!(manager.creates.load(Ordering::Relaxed), 1);
     }
 

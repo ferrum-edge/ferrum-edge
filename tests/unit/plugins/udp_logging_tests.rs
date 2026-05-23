@@ -67,6 +67,22 @@ async fn test_udp_logging_empty_host() {
 }
 
 #[tokio::test]
+async fn test_udp_logging_rejects_host_with_url_or_port_material() {
+    for host in [
+        "udp://logs.example.com",
+        "user@logs.example.com",
+        "logs.example.com/path",
+        "logs.example.com?token=secret",
+        "logs.example.com#fragment",
+        "logs.example.com:9514",
+        "bad host",
+    ] {
+        let result = UdpLogging::new(&json!({"host": host, "port": 9514}), test_client());
+        assert!(result.is_err(), "host should fail validation: {host}");
+    }
+}
+
+#[tokio::test]
 async fn test_udp_logging_invalid_port_zero() {
     let result = UdpLogging::new(
         &json!({
@@ -359,6 +375,17 @@ async fn test_udp_logging_warmup_hostnames() {
     .unwrap();
     let hostnames = plugin.warmup_hostnames();
     assert_eq!(hostnames, vec!["syslog.example.com".to_string()]);
+}
+
+#[tokio::test]
+async fn test_udp_logging_warmup_skips_ip_literals() {
+    for host in ["127.0.0.1", "2001:db8::10", "[2001:db8::10]"] {
+        let plugin = UdpLogging::new(&json!({"host": host, "port": 9514}), test_client()).unwrap();
+        assert!(
+            plugin.warmup_hostnames().is_empty(),
+            "IP literal {host} should not be DNS-warmed"
+        );
+    }
 }
 
 #[tokio::test]

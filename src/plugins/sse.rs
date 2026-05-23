@@ -124,12 +124,12 @@ impl SsePlugin {
     fn accepts_event_stream(accept: &str) -> bool {
         accept
             .split(',')
-            .any(|part| has_ascii_case_insensitive_prefix(part.trim(), TEXT_EVENT_STREAM))
+            .any(|part| is_text_event_stream_media_type(part.trim()))
     }
 
     /// Returns true if the response `Content-Type` is `text/event-stream`.
     fn is_sse_content_type(content_type: &str) -> bool {
-        has_ascii_case_insensitive_prefix(content_type.trim(), TEXT_EVENT_STREAM)
+        is_text_event_stream_media_type(content_type.trim())
     }
 }
 
@@ -157,10 +157,9 @@ fn optional_positive_u64_config(config: &Value, key: &str) -> Result<Option<u64>
     }
 }
 
-fn has_ascii_case_insensitive_prefix(value: &str, prefix: &str) -> bool {
-    value
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+fn is_text_event_stream_media_type(value: &str) -> bool {
+    let media_type = value.split(';').next().unwrap_or(value).trim_end();
+    media_type.eq_ignore_ascii_case(TEXT_EVENT_STREAM)
 }
 
 #[async_trait]

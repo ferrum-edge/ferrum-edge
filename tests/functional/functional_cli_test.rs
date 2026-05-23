@@ -216,6 +216,48 @@ async fn functional_cli_validate_invalid_yaml() {
 
 #[ignore]
 #[tokio::test]
+async fn functional_cli_validate_rejects_invalid_proxy_host() {
+    let temp_dir = TempDir::new().unwrap();
+    let spec_path = temp_dir.path().join("bad-host.yaml");
+    std::fs::write(
+        &spec_path,
+        r#"version: "1"
+proxies:
+  - id: bad-host
+    hosts:
+      - "api..example.com"
+    listen_path: /test
+    backend_scheme: http
+    backend_host: localhost
+    backend_port: 3000
+consumers: []
+plugin_configs: []
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(binary_path())
+        .args(["validate", "--spec", spec_path.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    assert!(
+        !output.status.success(),
+        "invalid host config unexpectedly passed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid host"),
+        "expected hostname validation error, got: {stderr}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
 async fn functional_cli_validate_with_settings() {
     let temp_dir = TempDir::new().unwrap();
 
@@ -795,9 +837,17 @@ async fn functional_cli_precedence_env_beats_conf_file() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let env_proxy_port = ephemeral_port().await;
         let env_admin_port = ephemeral_port().await;
-        // Conf-file ports are decoys — they must NOT be bound when env vars override.
-        let conf_proxy_port = ephemeral_port().await;
-        let conf_admin_port = ephemeral_port().await;
+        // Hold decoy port listeners so that (a) no other CI process can
+        // grab them (eliminating false-positive port collisions) and
+        // (b) the gateway would fatal-fail if it tried to bind them.
+        let conf_proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind decoy proxy");
+        let conf_proxy_port = conf_proxy_listener.local_addr().unwrap().port();
+        let conf_admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind decoy admin");
+        let conf_admin_port = conf_admin_listener.local_addr().unwrap().port();
 
         // Sanity: all 4 distinct
         assert_ne!(env_proxy_port, conf_proxy_port);
@@ -833,22 +883,14 @@ async fn functional_cli_precedence_env_beats_conf_file() {
         let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
 
         if wait_for_health(env_admin_port).await {
-            // Confirm the conf-file admin port is NOT bound (i.e. env var won).
-            let decoy_client = reqwest::Client::builder()
-                .timeout(Duration::from_millis(500))
-                .build()
-                .unwrap();
-            let decoy_url = format!("http://127.0.0.1:{}/health", conf_admin_port);
-            let decoy_resp = decoy_client.get(&decoy_url).send().await;
-            let decoy_unbound =
-                decoy_resp.is_err() || matches!(decoy_resp, Ok(r) if !r.status().is_success());
-
+            // The gateway started and its admin health is reachable on the
+            // env-var port. Because the conf-file decoy ports are held by
+            // our listeners, the gateway would have fatally failed to start
+            // if it tried to bind them — so reaching this point proves
+            // env-var precedence works.
             kill_child(child);
-            assert!(
-                decoy_unbound,
-                "conf-file admin port {} should not be bound when env var {} overrides",
-                conf_admin_port, env_admin_port
-            );
+            drop(conf_proxy_listener);
+            drop(conf_admin_listener);
             return;
         }
 

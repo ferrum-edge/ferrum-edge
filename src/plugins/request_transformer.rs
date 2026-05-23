@@ -47,6 +47,7 @@
 //! is fail-open).
 
 use async_trait::async_trait;
+use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -252,6 +253,26 @@ impl RequestTransformer {
                 }
 
                 if target == "header" {
+                    let key = HeaderName::from_bytes(raw_key.as_bytes())
+                        .map_err(|_| {
+                            format!(
+                                "request_transformer: rule[{idx}]: 'key' must be a valid HTTP header name"
+                            )
+                        })?
+                        .to_string();
+                    let new_key = raw_new_key
+                        .as_deref()
+                        .map(|key| {
+                            HeaderName::from_bytes(key.as_bytes())
+                                .map_err(|_| {
+                                    format!(
+                                        "request_transformer: rule[{idx}]: 'new_key' must be a valid HTTP header name"
+                                    )
+                                })
+                                .map(|name| name.to_string())
+                        })
+                        .transpose()?;
+
                     // Defence-in-depth: reject CR/LF in header values at
                     // config time (hyper would reject later, but failing at
                     // load time gives clearer operator feedback).
@@ -264,9 +285,9 @@ impl RequestTransformer {
                     }
                     header_rules.push(HeaderRule {
                         operation: hop,
-                        key: raw_key.to_lowercase(),
+                        key,
                         value,
-                        new_key: raw_new_key.map(|k| k.to_lowercase()),
+                        new_key,
                     });
                 } else {
                     query_rules.push(QueryRule {

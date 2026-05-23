@@ -92,6 +92,7 @@ impl TrustedProxies {
         for entry in raw.split(',') {
             let entry = entry.trim();
             if entry.is_empty() {
+                invalid.push("<empty>".to_string());
                 continue;
             }
             if let Some(cidr) = Self::parse_cidr(entry) {

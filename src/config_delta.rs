@@ -14,7 +14,7 @@
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
-use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
+use crate::config::types::{Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream};
 
 /// Summary of routing changes affected by proxy adds, removals, or modifications.
 ///
@@ -54,6 +54,10 @@ pub struct ConfigDelta {
     pub added_plugin_configs: Vec<PluginConfig>,
     pub removed_plugin_config_ids: Vec<String>,
     pub modified_plugin_configs: Vec<PluginConfig>,
+    /// True when a global plugin was added, removed, modified, or changed away
+    /// from global scope. Known proxy plugin lists contain merged global
+    /// instances, so they must all be rebuilt when this is true.
+    pub global_plugin_configs_changed: bool,
 
     // Upstream changes
     pub added_upstreams: Vec<Upstream>,
@@ -68,6 +72,25 @@ impl ConfigDelta {
     /// Returns a delta describing exactly which resources were added,
     /// removed, or modified.
     pub fn compute(old: &GatewayConfig, new: &GatewayConfig) -> Self {
+        let added_plugin_configs = diff_added(&old.plugin_configs, &new.plugin_configs);
+        let removed_plugin_config_ids = diff_removed_ids(&old.plugin_configs, &new.plugin_configs);
+        let modified_plugin_configs = diff_modified(&old.plugin_configs, &new.plugin_configs);
+        let old_global_plugin_ids: HashSet<&str> = old
+            .plugin_configs
+            .iter()
+            .filter(|pc| pc.scope == PluginScope::Global)
+            .map(|pc| pc.id.as_str())
+            .collect();
+        let global_plugin_configs_changed = added_plugin_configs
+            .iter()
+            .any(|pc| pc.scope == PluginScope::Global)
+            || modified_plugin_configs.iter().any(|pc| {
+                pc.scope == PluginScope::Global || old_global_plugin_ids.contains(pc.id.as_str())
+            })
+            || removed_plugin_config_ids
+                .iter()
+                .any(|id| old_global_plugin_ids.contains(id.as_str()));
+
         Self {
             added_proxies: diff_added(&old.proxies, &new.proxies),
             removed_proxy_ids: diff_removed_ids(&old.proxies, &new.proxies),
@@ -77,9 +100,10 @@ impl ConfigDelta {
             removed_consumer_ids: diff_removed_ids(&old.consumers, &new.consumers),
             modified_consumers: diff_modified(&old.consumers, &new.consumers),
 
-            added_plugin_configs: diff_added(&old.plugin_configs, &new.plugin_configs),
-            removed_plugin_config_ids: diff_removed_ids(&old.plugin_configs, &new.plugin_configs),
-            modified_plugin_configs: diff_modified(&old.plugin_configs, &new.plugin_configs),
+            added_plugin_configs,
+            removed_plugin_config_ids,
+            modified_plugin_configs,
+            global_plugin_configs_changed,
 
             added_upstreams: diff_added(&old.upstreams, &new.upstreams),
             removed_upstream_ids: diff_removed_ids(&old.upstreams, &new.upstreams),
@@ -98,6 +122,7 @@ impl ConfigDelta {
             && self.added_plugin_configs.is_empty()
             && self.removed_plugin_config_ids.is_empty()
             && self.modified_plugin_configs.is_empty()
+            && !self.global_plugin_configs_changed
             && self.added_upstreams.is_empty()
             && self.removed_upstream_ids.is_empty()
             && self.modified_upstreams.is_empty()
@@ -155,21 +180,11 @@ impl ConfigDelta {
                 }
             }
 
-            // Global plugin config changes affect ALL proxies
-            let global_changed = self
-                .added_plugin_configs
-                .iter()
-                .chain(self.modified_plugin_configs.iter())
-                .any(|pc| pc.scope == crate::config::types::PluginScope::Global);
-            let global_removed = self.removed_plugin_config_ids.iter().any(|id| {
-                // We don't have the old config's scope info for removed IDs,
-                // so conservatively treat removed plugin configs as potentially global
-                // if they're not in the new config
-                !new_config.plugin_configs.iter().any(|pc| pc.id == *id)
-            });
-
-            if global_changed || global_removed {
-                // A global plugin changed — all proxies need rebuild
+            if self.global_plugin_configs_changed || !self.removed_plugin_config_ids.is_empty() {
+                // A global plugin change affects every merged proxy list. Any
+                // plugin-config deletion also rebuilds every proxy because DB
+                // cascade can remove association rows without updating proxy
+                // timestamps, leaving no reliable proxy-level delta.
                 for proxy in &new_config.proxies {
                     ids.insert(proxy.id.clone());
                 }
@@ -313,4 +328,247 @@ fn diff_modified<T: HasIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
         })
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::{
+        BackendScheme, DispatchKind, PluginAssociation, PluginScope, default_namespace,
+    };
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    #[derive(Clone)]
+    struct TestResource {
+        id: String,
+        updated_at: DateTime<Utc>,
+    }
+
+    impl HasIdAndTimestamp for TestResource {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn updated_at(&self) -> DateTime<Utc> {
+            self.updated_at
+        }
+    }
+
+    fn ts(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0)
+            .single()
+            .expect("fixed timestamp should be valid")
+    }
+
+    fn config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
+        GatewayConfig {
+            version: "1".to_string(),
+            proxies,
+            consumers: vec![],
+            plugin_configs,
+            upstreams: vec![],
+            loaded_at: ts(0),
+            known_namespaces: vec![],
+            trust_bundles: None,
+            mesh: None,
+        }
+    }
+
+    fn proxy(
+        id: &str,
+        listen_path: Option<&str>,
+        hosts: &[&str],
+        plugin_ids: &[&str],
+        updated_at: DateTime<Utc>,
+    ) -> Proxy {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "id": id,
+            "namespace": default_namespace(),
+            "hosts": hosts,
+            "listen_path": listen_path,
+            "backend_scheme": "http",
+            "backend_host": "backend.local",
+            "backend_port": 8080
+        }))
+        .expect("test proxy should deserialize");
+        proxy.dispatch_kind = DispatchKind::from(BackendScheme::Http);
+        proxy.plugins = plugin_ids
+            .iter()
+            .map(|id| PluginAssociation {
+                plugin_config_id: (*id).to_string(),
+            })
+            .collect();
+        proxy.created_at = updated_at;
+        proxy.updated_at = updated_at;
+        proxy
+    }
+
+    fn stream_proxy(id: &str, updated_at: DateTime<Utc>) -> Proxy {
+        let mut proxy = proxy(id, None, &[], &[], updated_at);
+        proxy.backend_scheme = Some(BackendScheme::Tcp);
+        proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+        proxy.listen_port = Some(9000);
+        proxy
+    }
+
+    fn plugin_config(
+        id: &str,
+        scope: PluginScope,
+        proxy_id: Option<&str>,
+        updated_at: DateTime<Utc>,
+    ) -> PluginConfig {
+        PluginConfig {
+            id: id.to_string(),
+            plugin_name: "request_transformer".to_string(),
+            namespace: default_namespace(),
+            config: json!({}),
+            scope,
+            proxy_id: proxy_id.map(str::to_string),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: updated_at,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn diff_modified_treats_backward_timestamp_drift_as_change() {
+        let old = vec![TestResource {
+            id: "r1".to_string(),
+            updated_at: ts(20),
+        }];
+        let new = vec![TestResource {
+            id: "r1".to_string(),
+            updated_at: ts(10),
+        }];
+
+        let modified = diff_modified(&old, &new);
+
+        assert_eq!(modified.len(), 1);
+        assert_eq!(modified[0].id, "r1");
+    }
+
+    #[test]
+    fn compute_tracks_proxy_add_remove_and_modify() {
+        let old = config(
+            vec![
+                proxy("modified", Some("/old"), &[], &[], ts(10)),
+                proxy("removed", Some("/removed"), &[], &[], ts(10)),
+            ],
+            vec![],
+        );
+        let new = config(
+            vec![
+                proxy("modified", Some("/old"), &[], &[], ts(11)),
+                proxy("added", Some("/added"), &[], &[], ts(10)),
+            ],
+            vec![],
+        );
+
+        let delta = ConfigDelta::compute(&old, &new);
+
+        assert_eq!(
+            delta
+                .added_proxies
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["added"]
+        );
+        assert_eq!(delta.removed_proxy_ids, vec!["removed"]);
+        assert_eq!(
+            delta
+                .modified_proxies
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["modified"]
+        );
+        assert!(!delta.is_empty());
+    }
+
+    #[test]
+    fn plugin_rebuild_targets_associations_and_proxy_scoped_configs() {
+        let old = config(
+            vec![
+                proxy("p1", Some("/one"), &[], &["pc-a"], ts(10)),
+                proxy("p2", Some("/two"), &[], &["pc-b"], ts(10)),
+                proxy("p3", Some("/three"), &[], &[], ts(10)),
+            ],
+            vec![
+                plugin_config("pc-a", PluginScope::ProxyGroup, None, ts(10)),
+                plugin_config("pc-b", PluginScope::ProxyGroup, None, ts(10)),
+            ],
+        );
+        let new = config(
+            old.proxies.clone(),
+            vec![
+                plugin_config("pc-a", PluginScope::ProxyGroup, None, ts(11)),
+                plugin_config("pc-b", PluginScope::ProxyGroup, None, ts(10)),
+                plugin_config("pc-p3", PluginScope::Proxy, Some("p3"), ts(10)),
+            ],
+        );
+
+        let delta = ConfigDelta::compute(&old, &new);
+        let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+
+        assert!(ids.contains("p1"));
+        assert!(ids.contains("p3"));
+        assert!(!ids.contains("p2"));
+    }
+
+    #[test]
+    fn removed_plugin_config_conservatively_rebuilds_all_current_proxies() {
+        let old = config(
+            vec![
+                proxy("p1", Some("/one"), &[], &[], ts(10)),
+                proxy("p2", Some("/two"), &[], &[], ts(10)),
+            ],
+            vec![plugin_config(
+                "removed",
+                PluginScope::ProxyGroup,
+                None,
+                ts(10),
+            )],
+        );
+        let new = config(old.proxies.clone(), vec![]);
+
+        let delta = ConfigDelta::compute(&old, &new);
+        let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("p1"));
+        assert!(ids.contains("p2"));
+    }
+
+    #[test]
+    fn affected_routes_collects_old_and_new_http_identities_and_skips_streams() {
+        let old = config(
+            vec![
+                proxy("path", Some("/old"), &[], &[], ts(10)),
+                proxy("host", None, &["old.example"], &[], ts(10)),
+                stream_proxy("stream", ts(10)),
+            ],
+            vec![],
+        );
+        let new = config(
+            vec![
+                proxy("path", Some("/new"), &[], &[], ts(11)),
+                proxy("added-host", None, &["new.example"], &[], ts(10)),
+                stream_proxy("stream", ts(11)),
+            ],
+            vec![],
+        );
+
+        let delta = ConfigDelta::compute(&old, &new);
+        let mut affected = delta.affected_routes(&old);
+        affected.listen_paths.sort();
+        affected.host_only_hosts.sort();
+
+        assert_eq!(affected.listen_paths, vec!["/new", "/old"]);
+        assert_eq!(affected.host_only_hosts, vec!["new.example", "old.example"]);
+        assert!(!affected.is_empty());
+    }
 }

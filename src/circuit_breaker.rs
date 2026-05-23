@@ -216,6 +216,19 @@ impl CircuitBreaker {
         }
     }
 
+    /// Record a neutral outcome that should not affect breaker health state.
+    ///
+    /// Used for client-caused aborts where no backend result exists, while
+    /// still releasing any reserved half-open probe slot.
+    pub fn record_neutral(&self, is_half_open_probe: bool) {
+        if !is_half_open_probe {
+            return;
+        }
+        let _ = self
+            .half_open_in_flight
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
+    }
+
     /// Record a failed response.
     ///
     /// `connection_error` indicates whether this was a connection-level failure

@@ -220,6 +220,14 @@ fn apply_common_overrides(settings: Option<&Path>, spec: Option<&Path>) {
     }
 }
 
+fn format_host_port(host: &str, port: u16) -> String {
+    if !host.starts_with('[') && host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
 // ── Subcommand executors ────────────────────────────────────────────────────
 
 /// Print version information and exit.
@@ -334,7 +342,7 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
         }
     });
 
-    let addr_str = format!("{}:{}", args.host, port);
+    let addr_str = format_host_port(&args.host, port);
     let sock_addr = addr_str
         .to_socket_addrs()
         .map_err(|e| format!("Cannot resolve {}: {}", addr_str, e))?
@@ -347,10 +355,9 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("Failed to set read timeout: {}", e))?;
 
-    let request = format!(
-        "GET /health HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
-        args.host, port
-    );
+    let host_header = format_host_port(&args.host, port);
+    let request =
+        format!("GET /health HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
 
     let response = if use_tls {
         health_request_tls(stream, &request, &args.host, args.tls_no_verify)?
@@ -499,5 +506,51 @@ fn find_gateway_pid() -> Result<u32, String> {
             n,
             pids.join("\n  ")
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener};
+
+    #[test]
+    fn format_host_port_brackets_ipv6_literals() {
+        assert_eq!(format_host_port("::1", 9443), "[::1]:9443");
+        assert_eq!(format_host_port("[::1]", 9443), "[::1]:9443");
+        assert_eq!(format_host_port("127.0.0.1", 9000), "127.0.0.1:9000");
+        assert_eq!(format_host_port("admin.local", 9000), "admin.local:9000");
+    }
+
+    #[test]
+    fn execute_health_plaintext_supports_ipv6_literal_host() {
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0))
+            .expect("IPv6 loopback should be available for CLI health tests");
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                request.contains(&format!("Host: [::1]:{port}")),
+                "request used malformed IPv6 Host header: {request}"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+        });
+
+        let args = HealthArgs {
+            port: Some(port),
+            host: "::1".to_string(),
+            tls: false,
+            tls_no_verify: false,
+        };
+
+        execute_health(&args).unwrap();
+        server.join().unwrap();
     }
 }

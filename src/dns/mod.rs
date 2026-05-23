@@ -19,6 +19,7 @@ use hickory_resolver::config::{
 };
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RData;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
@@ -141,6 +142,23 @@ impl Default for DnsConfig {
     }
 }
 
+fn normalize_global_overrides(
+    global_overrides: HashMap<String, String>,
+) -> HashMap<String, String> {
+    global_overrides
+        .into_iter()
+        .map(|(hostname, ip)| (hostname.to_ascii_lowercase(), ip))
+        .collect()
+}
+
+fn dns_hostname_key(hostname: &str) -> Cow<'_, str> {
+    if hostname.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(hostname.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(hostname)
+    }
+}
+
 /// A cached DNS entry with TTL and stale-while-revalidate support.
 #[derive(Debug, Clone)]
 struct DnsCacheEntry {
@@ -226,10 +244,11 @@ impl DnsCache {
         let dns_order = parse_dns_order(config.dns_order.as_deref());
 
         let shards = crate::util::sharding::pool_shard_amount(config.shard_amount);
+        let global_overrides = normalize_global_overrides(config.global_overrides);
 
         Self {
             cache: Arc::new(DashMap::with_shard_amount(shards)),
-            global_overrides: config.global_overrides,
+            global_overrides,
             resolver: Arc::new(resolver),
             dns_order,
             ttl_override: config.ttl_override_seconds.map(Duration::from_secs),
@@ -291,9 +310,10 @@ impl DnsCache {
         // stale refreshes, proactive background refreshes, and failed-retry
         // recovery. Cache reads intentionally trust entries accepted here.
         self.check_backend_addresses_policy(&addresses, hostname)?;
+        let cache_key = dns_hostname_key(hostname);
 
         self.cache.insert(
-            hostname.to_string(),
+            cache_key.into_owned(),
             DnsCacheEntry {
                 addresses: addresses.clone(),
                 expires_at: Instant::now() + ttl,
@@ -319,6 +339,9 @@ impl DnsCache {
         per_proxy_override: Option<&str>,
         per_proxy_ttl: Option<u64>,
     ) -> Result<IpAddr, anyhow::Error> {
+        let cache_key = dns_hostname_key(hostname);
+        let cache_hostname = cache_key.as_ref();
+
         // 1. Check per-proxy static override first
         if let Some(ip_str) = per_proxy_override {
             let addr: IpAddr = ip_str.parse()?;
@@ -326,14 +349,14 @@ impl DnsCache {
         }
 
         // 2. Check global overrides
-        if let Some(ip_str) = self.global_overrides.get(hostname) {
+        if let Some(ip_str) = self.global_overrides.get(cache_hostname) {
             let addr: IpAddr = ip_str.parse()?;
             return self.check_backend_ip_policy(addr, hostname);
         }
 
         // 3. Check cache with stale-while-revalidate
         let mut prior_per_proxy_ttl = None;
-        if let Some(entry) = self.cache.get(hostname) {
+        if let Some(entry) = self.cache.get(cache_hostname) {
             let now = Instant::now();
             prior_per_proxy_ttl = entry.original_per_proxy_ttl;
 
@@ -345,7 +368,7 @@ impl DnsCache {
 
             // Stale but within stale window — return stale data, trigger background refresh
             if entry.stale_deadline > now && !entry.addresses.is_empty() && !entry.is_error {
-                let host = hostname.to_string();
+                let host = cache_hostname.to_string();
                 // Deduplicate: only spawn a refresh if one isn't already in progress
                 if self.refreshing.insert(host.clone(), ()).is_none() {
                     // Try to acquire a semaphore permit to bound concurrent refreshes.
@@ -397,11 +420,11 @@ impl DnsCache {
         let per_proxy_ttl = per_proxy_ttl.or(prior_per_proxy_ttl);
 
         // 4. Perform actual DNS resolution
-        match self.timed_resolve(hostname).await {
+        match self.timed_resolve(cache_hostname).await {
             Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
                 let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
                 let addrs = match self.cache_success_entry(
-                    hostname,
+                    cache_hostname,
                     addrs,
                     record_type,
                     ttl,
@@ -421,14 +444,14 @@ impl DnsCache {
                 crate::runtime_metrics::global_ref().record_dns_miss();
                 Ok(addrs[0])
             }
-            Ok(_) | Err(_) if hostname == "localhost" => {
+            Ok(_) | Err(_) if cache_hostname == "localhost" => {
                 // Fallback for localhost — hickory-resolver may not read
                 // /etc/hosts, so DNS lookup can fail.  Respect dns_order:
                 // if AAAA appears before A, prefer IPv6 loopback.
                 let addr = self.localhost_addr();
                 let ttl = self.effective_ttl(Duration::from_secs(3600), per_proxy_ttl);
                 let addrs = match self.cache_success_entry(
-                    hostname,
+                    cache_hostname,
                     vec![addr],
                     None,
                     ttl,
@@ -445,12 +468,12 @@ impl DnsCache {
                 Ok(addrs[0])
             }
             Ok(_) => {
-                self.cache_error(hostname, per_proxy_ttl);
+                self.cache_error(cache_hostname, per_proxy_ttl);
                 crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
             }
             Err(e) => {
-                self.cache_error(hostname, per_proxy_ttl);
+                self.cache_error(cache_hostname, per_proxy_ttl);
                 crate::runtime_metrics::global_ref().record_dns_error();
                 Err(e)
             }
@@ -468,6 +491,9 @@ impl DnsCache {
         per_proxy_override: Option<&str>,
         per_proxy_ttl: Option<u64>,
     ) -> Result<Vec<IpAddr>, anyhow::Error> {
+        let cache_key = dns_hostname_key(hostname);
+        let cache_hostname = cache_key.as_ref();
+
         // 1. Per-proxy static override
         if let Some(ip_str) = per_proxy_override {
             let addr: IpAddr = ip_str.parse()?;
@@ -475,14 +501,14 @@ impl DnsCache {
         }
 
         // 2. Global overrides
-        if let Some(ip_str) = self.global_overrides.get(hostname) {
+        if let Some(ip_str) = self.global_overrides.get(cache_hostname) {
             let addr: IpAddr = ip_str.parse()?;
             return Ok(vec![self.check_backend_ip_policy(addr, hostname)?]);
         }
 
         // 3. Cache with stale-while-revalidate
         let mut prior_per_proxy_ttl = None;
-        if let Some(entry) = self.cache.get(hostname) {
+        if let Some(entry) = self.cache.get(cache_hostname) {
             let now = Instant::now();
             prior_per_proxy_ttl = entry.original_per_proxy_ttl;
 
@@ -492,7 +518,7 @@ impl DnsCache {
             }
 
             if entry.stale_deadline > now && !entry.addresses.is_empty() && !entry.is_error {
-                let host = hostname.to_string();
+                let host = cache_hostname.to_string();
                 if self.refreshing.insert(host.clone(), ()).is_none() {
                     match self.refresh_semaphore.clone().try_acquire_owned() {
                         Ok(permit) => {
@@ -524,11 +550,11 @@ impl DnsCache {
         let per_proxy_ttl = per_proxy_ttl.or(prior_per_proxy_ttl);
 
         // 4. Actual DNS resolution
-        match self.timed_resolve(hostname).await {
+        match self.timed_resolve(cache_hostname).await {
             Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
                 let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
                 let addrs = match self.cache_success_entry(
-                    hostname,
+                    cache_hostname,
                     addrs,
                     record_type,
                     ttl,
@@ -543,11 +569,11 @@ impl DnsCache {
                 crate::runtime_metrics::global_ref().record_dns_miss();
                 Ok(addrs)
             }
-            Ok(_) | Err(_) if hostname == "localhost" => {
+            Ok(_) | Err(_) if cache_hostname == "localhost" => {
                 let addr = self.localhost_addr();
                 let ttl = self.effective_ttl(Duration::from_secs(3600), per_proxy_ttl);
                 let addrs = match self.cache_success_entry(
-                    hostname,
+                    cache_hostname,
                     vec![addr],
                     None,
                     ttl,
@@ -563,12 +589,12 @@ impl DnsCache {
                 Ok(addrs)
             }
             Ok(_) => {
-                self.cache_error(hostname, per_proxy_ttl);
+                self.cache_error(cache_hostname, per_proxy_ttl);
                 crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
             }
             Err(e) => {
-                self.cache_error(hostname, per_proxy_ttl);
+                self.cache_error(cache_hostname, per_proxy_ttl);
                 crate::runtime_metrics::global_ref().record_dns_error();
                 Err(e)
             }
@@ -614,16 +640,19 @@ impl DnsCache {
     }
 
     fn cache_error(&self, hostname: &str, per_proxy_ttl: Option<u64>) {
+        let cache_key = dns_hostname_key(hostname);
+        let cache_hostname = cache_key.as_ref();
+
         // Preserve any prior per-proxy TTL recorded for this hostname so that
         // when the failed-retry task promotes the entry back to success, it can
         // re-thread the original per-proxy TTL through `effective_ttl` rather
         // than silently falling back to the global override or native TTL.
         let prior_ttl = self
             .cache
-            .get(hostname)
+            .get(cache_hostname)
             .and_then(|entry| entry.original_per_proxy_ttl);
         self.cache.insert(
-            hostname.to_string(),
+            cache_hostname.to_string(),
             DnsCacheEntry {
                 addresses: vec![],
                 expires_at: Instant::now() + self.error_ttl,
@@ -850,8 +879,9 @@ impl DnsCache {
     /// Check if a cached entry exists and is a cached error.
     #[allow(dead_code)]
     pub fn is_cached_error(&self, hostname: &str) -> bool {
+        let cache_key = dns_hostname_key(hostname);
         self.cache
-            .get(hostname)
+            .get(cache_key.as_ref())
             .map(|e| e.is_error && e.expires_at > Instant::now())
             .unwrap_or(false)
     }
@@ -1154,7 +1184,7 @@ impl DnsCache {
         let mut seen = HashSet::new();
         let unique: Vec<_> = hostnames
             .into_iter()
-            .filter(|(host, _, _)| seen.insert(host.clone()))
+            .filter(|(host, _, _)| seen.insert(dns_hostname_key(host).into_owned()))
             .collect();
 
         if unique.is_empty() {

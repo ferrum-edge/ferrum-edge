@@ -219,6 +219,39 @@ fn set_raw_query_string_ignores_empty() {
 }
 
 #[test]
+fn set_raw_query_string_replaces_materialized_params() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    ctx.set_raw_query_string("a=1&old=value".into());
+    ctx.materialize_query_params();
+    assert_eq!(ctx.query_params.get("a").unwrap(), "1");
+
+    ctx.set_raw_query_string("b=2".into());
+    assert_eq!(ctx.raw_query_string(), Some("b=2"));
+    assert!(ctx.query_params.is_empty());
+
+    ctx.materialize_query_params();
+    assert_eq!(ctx.query_params.len(), 1);
+    assert_eq!(ctx.query_params.get("b").unwrap(), "2");
+    assert!(!ctx.query_params.contains_key("a"));
+    assert!(!ctx.query_params.contains_key("old"));
+}
+
+#[test]
+fn set_raw_query_string_empty_clears_materialized_params() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    ctx.set_raw_query_string("a=1".into());
+    ctx.materialize_query_params();
+    assert_eq!(ctx.query_params.get("a").unwrap(), "1");
+
+    ctx.set_raw_query_string("".into());
+    assert_eq!(ctx.raw_query_string(), None);
+    assert!(ctx.query_params.is_empty());
+
+    ctx.materialize_query_params();
+    assert!(ctx.query_params.is_empty());
+}
+
+#[test]
 fn materialize_query_params_raw_no_decoding() {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
     ctx.set_raw_query_string("key%20name=val%26ue".into());

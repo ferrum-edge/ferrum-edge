@@ -441,15 +441,20 @@ impl Plugin for CorsPlugin {
             .metadata
             .get(crate::proxy::REJECTION_RESPONSE_METADATA_KEY)
             .is_some_and(|v| v == "true");
-        if !is_rejection_path {
+        let origin = ctx.metadata.get("cors_origin").cloned();
+
+        // Keep CORS plugin preflight rejection headers intact: that path is a
+        // rejection without `cors_origin` metadata by design.
+        let preserve_rejection_headers = is_rejection_path && origin.is_none();
+        if !preserve_rejection_headers {
             // Strip backend-supplied CORS policy headers so the gateway CORS
             // policy remains authoritative.
             Self::remove_access_control_headers(response_headers);
         }
 
         // Check if on_request_received marked this as a valid CORS request
-        let origin = match ctx.metadata.get("cors_origin") {
-            Some(o) => o.clone(),
+        let origin = match origin {
+            Some(o) => o,
             None => return PluginResult::Continue,
         };
 
@@ -532,7 +537,7 @@ fn validate_exact_origin(origin: &str) -> Result<(), String> {
             ));
         }
     }
-    if url.host_str().is_none() {
+    if !has_non_empty_authority(origin) || url.host_str().is_none() {
         return Err(format!("cors: origin must include a hostname: {origin}"));
     }
     if !url.username().is_empty() || url.password().is_some() {
@@ -550,6 +555,20 @@ fn validate_exact_origin(origin: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn has_non_empty_authority(origin: &str) -> bool {
+    let Some((_, after_scheme)) = origin.split_once(':') else {
+        return false;
+    };
+    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
+        return false;
+    };
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+
+    authority_end > 0
 }
 
 fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {

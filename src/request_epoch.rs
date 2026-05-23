@@ -41,6 +41,7 @@ mod tests {
     use crate::plugins::{PluginHttpClient, ProxyProtocol};
     use chrono::Utc;
     use serde_json::{Map, Value, json};
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     fn proxy(id: &str, path: &str, plugins: Vec<&str>) -> Proxy {
@@ -402,6 +403,127 @@ mod tests {
                 .map(|c| c.id.as_str()),
             Some("c1")
         );
+    }
+
+    #[test]
+    fn update_config_none_is_noop_and_skips_mirror() {
+        let initial = config(vec![proxy("p1", "/one", vec![])], vec![], vec![]);
+        let store = epoch_store(initial);
+        let before = store.load();
+        let mirror_called = Cell::new(false);
+
+        let result = store
+            .update_config(|_| Ok(None), |_| mirror_called.set(true))
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(result.is_none());
+        assert!(!mirror_called.get());
+        let after = store.load();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(after.config_generation, before.config_generation);
+        assert_eq!(after.route_generation, before.route_generation);
+        assert_eq!(after.lb_generation, before.lb_generation);
+    }
+
+    #[test]
+    fn update_config_generation_flags_are_independent_and_mirror_sees_published_epoch() {
+        let initial = config(vec![proxy("p1", "/one", vec![])], vec![], vec![]);
+        let store = epoch_store(initial);
+        let observed_generations = Cell::new((0, 0, 0));
+
+        let next = store
+            .update_config(
+                |current| {
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::clone(&current.config),
+                        route_table: Arc::clone(&current.route_table),
+                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: false,
+                        lb_changed: true,
+                    }))
+                },
+                |published| {
+                    observed_generations.set((
+                        published.config_generation,
+                        published.route_generation,
+                        published.lb_generation,
+                    ));
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"))
+            .expect("config update should publish");
+
+        assert_eq!(next.config_generation, 2);
+        assert_eq!(next.route_generation, 1);
+        assert_eq!(next.lb_generation, 2);
+        assert_eq!(observed_generations.get(), (2, 1, 2));
+        assert!(Arc::ptr_eq(&next, &store.load()));
+    }
+
+    #[test]
+    fn update_load_balancer_none_is_noop_and_skips_mirror() {
+        let initial = config(
+            vec![],
+            vec![],
+            vec![upstream("u1", vec![target("a.local", 80)])],
+        );
+        let store = epoch_store(initial);
+        let before = store.load();
+        let mirror_called = Cell::new(false);
+
+        let result = store.update_load_balancer(|_| None, |_| mirror_called.set(true));
+
+        assert!(result.is_none());
+        assert!(!mirror_called.get());
+        let after = store.load();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(after.config_generation, before.config_generation);
+        assert_eq!(after.route_generation, before.route_generation);
+        assert_eq!(after.lb_generation, before.lb_generation);
+    }
+
+    #[test]
+    fn update_load_balancer_preserves_config_generations_and_mirrors_published_epoch() {
+        let initial = config(
+            vec![],
+            vec![],
+            vec![upstream("u1", vec![target("a.local", 80)])],
+        );
+        let store = epoch_store(initial);
+        let observed_generations = Cell::new((0, 0, 0));
+
+        let next = store
+            .update_load_balancer(
+                |current| {
+                    Some(LoadBalancerCache::build_update_targets_inner(
+                        &current.load_balancer,
+                        "u1",
+                        vec![target("b.local", 81)],
+                        LoadBalancerAlgorithm::RoundRobin,
+                        None,
+                    ))
+                },
+                |published| {
+                    observed_generations.set((
+                        published.config_generation,
+                        published.route_generation,
+                        published.lb_generation,
+                    ));
+                },
+            )
+            .expect("lb update should publish");
+
+        assert_eq!(next.config_generation, 1);
+        assert_eq!(next.route_generation, 1);
+        assert_eq!(next.lb_generation, 2);
+        assert_eq!(observed_generations.get(), (1, 1, 2));
+        assert_eq!(
+            next.load_balancer.upstreams()["u1"].targets[0].host,
+            "b.local"
+        );
+        assert!(Arc::ptr_eq(&next, &store.load()));
     }
 }
 

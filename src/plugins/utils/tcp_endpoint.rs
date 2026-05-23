@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 
 use crate::dns::DnsCache;
 
+use super::socket_addr_lookup_input;
+
 /// Resolve `host:port` to a `SocketAddr` via the gateway's shared `DnsCache`.
 ///
 /// Mirrors `resolve_udp_endpoint` for plugins that open their own TCP
@@ -32,7 +34,7 @@ pub async fn resolve_tcp_endpoint(
             });
     }
 
-    let addr = format!("{host}:{port}");
+    let addr = socket_addr_lookup_input(host, port);
     tokio::net::lookup_host(&addr)
         .await
         .map_err(|error| format!("{plugin_name}: DNS resolution failed for {addr}: {error}"))?

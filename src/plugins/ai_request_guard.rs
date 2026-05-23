@@ -416,8 +416,9 @@ impl Plugin for AiRequestGuard {
             && json.get("max_tokens").is_none()
             && json.get("max_output_tokens").is_none()
             && json.get("max_completion_tokens").is_none()
+            && let Some(obj) = json.as_object_mut()
         {
-            json["max_tokens"] = Value::Number(default.into());
+            obj.insert("max_tokens".to_string(), Value::Number(default.into()));
             body_modified = true;
         }
 

@@ -10,8 +10,17 @@ pub async fn wait_for_start_signals(
     signals: Vec<(String, oneshot::Receiver<()>)>,
     timeout: Duration,
 ) -> Result<(), anyhow::Error> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
     for (name, rx) in signals {
-        match tokio::time::timeout(timeout, rx).await {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for {} to complete startup",
+                name
+            ));
+        };
+
+        match tokio::time::timeout(remaining, rx).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 return Err(anyhow::anyhow!("{} exited before completing startup", name));

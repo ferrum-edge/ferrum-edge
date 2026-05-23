@@ -100,7 +100,7 @@ const LOG_LEVELS: [LogLevel; 5] = [
     LogLevel::Error,
 ];
 
-const ERROR_CLASSES: [&str; 15] = [
+const ERROR_CLASSES: [&str; 16] = [
     "connection_timeout",
     "connection_refused",
     "connection_reset",
@@ -115,6 +115,7 @@ const ERROR_CLASSES: [&str; 15] = [
     "connection_pool_error",
     "port_exhaustion",
     "graceful_remote_close",
+    "dispatch_policy_rejected",
     "request_error",
 ];
 
@@ -1199,6 +1200,225 @@ mod tests {
     }
 
     #[test]
+    fn status_window_rotation_clamps_zero_second_windows() {
+        let metrics = RuntimeMetrics::new();
+
+        metrics.record_http_status(200);
+        metrics.rotate_status_window(StatusWindow::OneMinute(0));
+
+        assert_eq!(metrics.requests_window_1m.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .status_window_1m
+                .get(&200)
+                .map(|v| v.load(Ordering::Relaxed)),
+            Some(1)
+        );
+        assert_eq!(metrics.requests_count_window_1m.load(Ordering::Relaxed), 1);
+
+        metrics.record_http_status(500);
+        metrics.rotate_status_window(StatusWindow::FiveMinutes(0));
+
+        assert_eq!(metrics.requests_window_5m.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            metrics
+                .status_window_5m
+                .get(&200)
+                .map(|v| v.load(Ordering::Relaxed)),
+            Some(1)
+        );
+        assert_eq!(
+            metrics
+                .status_window_5m
+                .get(&500)
+                .map(|v| v.load(Ordering::Relaxed)),
+            Some(1)
+        );
+        assert_eq!(metrics.requests_count_window_5m.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn configure_clamps_zero_error_entry_cap_to_one() {
+        let metrics = RuntimeMetrics::new();
+        metrics.configure(0, true, true, 1000);
+
+        metrics.record_http_error(Some("proxy-a"), ErrorClass::ConnectionTimeout);
+        metrics.record_http_error(Some("proxy-b"), ErrorClass::TlsError);
+
+        let snapshot = build_errors_snapshot(&metrics);
+        assert_eq!(metrics.error_entry_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            snapshot
+                .by_proxy
+                .get("proxy-a")
+                .and_then(|classes| classes.get("connection_timeout"))
+                .copied(),
+            Some(1)
+        );
+        assert!(
+            !snapshot.by_proxy.contains_key("proxy-b"),
+            "second distinct error entry should be dropped once the clamped cap is full"
+        );
+    }
+
+    #[test]
+    fn pool_tracking_can_be_disabled_and_zero_eviction_batches_are_ignored() {
+        let metrics = RuntimeMetrics::new();
+        metrics.configure(200, false, true, 1234);
+
+        metrics.record_pool_handshake(PoolKind::HttpReqwest);
+        metrics.record_pool_failure(PoolKind::Http3);
+        metrics.record_pool_eviction(PoolKind::Grpc);
+        metrics.record_pool_evictions(PoolKind::Hbone, 4);
+
+        let connections = build_connections_snapshot(&metrics, None);
+        assert!(connections.pool_handshakes_total.is_empty());
+        assert!(connections.pool_failures_total.is_empty());
+        assert!(connections.pool_evictions_total.is_empty());
+        assert_eq!(metrics.cache_ttl_ms(), 1234);
+
+        metrics.configure(200, true, true, 1234);
+        metrics.record_pool_evictions(PoolKind::Grpc, 0);
+        assert!(
+            build_connections_snapshot(&metrics, None)
+                .pool_evictions_total
+                .is_empty()
+        );
+
+        metrics.record_pool_evictions(PoolKind::Grpc, 3);
+        let connections = build_connections_snapshot(&metrics, None);
+        assert_eq!(connections.pool_evictions_total.get("grpc"), Some(&3));
+    }
+
+    #[test]
+    fn tcp_rst_counts_by_proxy_and_direction_and_respects_cap() {
+        let metrics = RuntimeMetrics::new();
+        metrics.configure(2, true, true, 1000);
+
+        metrics.record_tcp_rst("proxy-a", Direction::ClientToBackend);
+        metrics.record_tcp_rst("proxy-a", Direction::ClientToBackend);
+        metrics.record_tcp_rst("proxy-a", Direction::BackendToClient);
+        metrics.record_tcp_rst("proxy-b", Direction::Unknown);
+
+        let snapshot = tcp_rst_snapshot(&metrics);
+        assert_eq!(snapshot.total, 3);
+        assert_eq!(
+            snapshot
+                .by_proxy
+                .get("proxy-a")
+                .and_then(|directions| directions.get("client_to_backend"))
+                .copied(),
+            Some(2)
+        );
+        assert_eq!(
+            snapshot
+                .by_proxy
+                .get("proxy-a")
+                .and_then(|directions| directions.get("backend_to_client"))
+                .copied(),
+            Some(1)
+        );
+        assert!(
+            !snapshot.by_proxy.contains_key("proxy-b"),
+            "new RST keys should be dropped once the configured cap is full"
+        );
+    }
+
+    #[test]
+    fn transaction_body_errors_without_proxy_use_unknown_bucket() {
+        let metrics = RuntimeMetrics::new();
+        metrics.record_transaction(&TransactionSummary {
+            body_error_class: Some(ErrorClass::ResponseBodyTooLarge),
+            ..TransactionSummary::default()
+        });
+
+        let snapshot = build_errors_snapshot(&metrics);
+        assert_eq!(
+            snapshot
+                .by_class
+                .get("response_body_too_large")
+                .map(|counts| counts.body),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .by_proxy
+                .get("unknown")
+                .and_then(|classes| classes.get("response_body_too_large"))
+                .copied(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn mesh_grpc_web_metadata_classifies_error_as_grpc() {
+        let metrics = RuntimeMetrics::new();
+        let mut summary = TransactionSummary {
+            proxy_id: Some("mesh-grpc-web".to_string()),
+            error_class: Some(ErrorClass::ProtocolError),
+            ..TransactionSummary::default()
+        };
+        summary
+            .metadata
+            .insert("mesh.request_protocol".to_string(), "grpc-web".to_string());
+
+        metrics.record_transaction(&summary);
+        let snapshot = build_errors_snapshot(&metrics);
+
+        assert_eq!(
+            snapshot
+                .by_class
+                .get("protocol_error")
+                .map(|counts| (counts.http, counts.grpc)),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn stream_transaction_without_error_is_noop() {
+        let metrics = RuntimeMetrics::new();
+        let summary = StreamTransactionSummary {
+            namespace: "ferrum".to_string(),
+            proxy_id: "tcp-a".to_string(),
+            proxy_name: None,
+            client_ip: "127.0.0.1".to_string(),
+            consumer_username: None,
+            auth_method: None,
+            backend_target: "tcp://127.0.0.1:9001".to_string(),
+            backend_resolved_ip: None,
+            protocol: "tcp".to_string(),
+            listen_port: 9000,
+            duration_ms: 1.0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            connection_error: None,
+            error_class: None,
+            disconnect_direction: None,
+            disconnect_cause: None,
+            timestamp_connected: "2026-05-14T00:00:00Z".to_string(),
+            timestamp_disconnected: "2026-05-14T00:00:01Z".to_string(),
+            sni_hostname: None,
+            metadata: Default::default(),
+        };
+
+        metrics.record_stream_transaction(&summary);
+
+        assert!(build_errors_snapshot(&metrics).by_proxy.is_empty());
+        assert!(metrics.stream_errors_by_class.is_empty());
+    }
+
+    #[test]
+    fn reqwest_backend_request_guard_decrements_on_drop() {
+        let metrics: &'static RuntimeMetrics = Box::leak(Box::new(RuntimeMetrics::new()));
+
+        assert_eq!(metrics.reqwest_active_backend_requests(), 0);
+        let guard = metrics.reqwest_backend_request_guard();
+        assert_eq!(metrics.reqwest_active_backend_requests(), 1);
+        drop(guard);
+        assert_eq!(metrics.reqwest_active_backend_requests(), 0);
+    }
+
+    #[test]
     fn direct_http_error_recording_covers_no_plugin_path() {
         let metrics = RuntimeMetrics::new();
 
@@ -1221,5 +1441,41 @@ mod tests {
                 .map(|counts| counts.http),
             Some(1)
         );
+    }
+
+    #[test]
+    fn error_snapshot_prepopulates_every_error_class() {
+        let metrics = RuntimeMetrics::new();
+        let snapshot = build_errors_snapshot(&metrics);
+        let expected = [
+            ErrorClass::ConnectionTimeout,
+            ErrorClass::ConnectionRefused,
+            ErrorClass::ConnectionReset,
+            ErrorClass::ConnectionClosed,
+            ErrorClass::DnsLookupError,
+            ErrorClass::TlsError,
+            ErrorClass::ReadWriteTimeout,
+            ErrorClass::ClientDisconnect,
+            ErrorClass::ProtocolError,
+            ErrorClass::ResponseBodyTooLarge,
+            ErrorClass::RequestBodyTooLarge,
+            ErrorClass::ConnectionPoolError,
+            ErrorClass::PortExhaustion,
+            ErrorClass::GracefulRemoteClose,
+            ErrorClass::DispatchPolicyRejected,
+            ErrorClass::RequestError,
+        ];
+
+        assert_eq!(snapshot.by_class.len(), expected.len());
+        for class in expected {
+            let counts = snapshot
+                .by_class
+                .get(class.as_str())
+                .unwrap_or_else(|| panic!("missing zero-count slot for {class}"));
+            assert_eq!(counts.http, 0);
+            assert_eq!(counts.grpc, 0);
+            assert_eq!(counts.stream, 0);
+            assert_eq!(counts.body, 0);
+        }
     }
 }

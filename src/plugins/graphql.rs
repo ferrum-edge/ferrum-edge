@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
+use super::utils::body_transform::is_json_content_type;
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
     RateLimitWindowSpec,
@@ -754,13 +755,6 @@ fn json_content_type_header() -> HashMap<String, String> {
     let mut h = HashMap::new();
     h.insert("content-type".to_string(), "application/json".to_string());
     h
-}
-
-fn is_json_content_type(value: &str) -> bool {
-    value
-        .as_bytes()
-        .windows(4)
-        .any(|window| window.eq_ignore_ascii_case(b"json"))
 }
 
 fn graphql_error_body(message: &str) -> String {

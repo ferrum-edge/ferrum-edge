@@ -189,6 +189,62 @@ async fn client_disconnect_outcome_sets_flag() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn error_outcome_can_also_mark_client_disconnect() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let summary = make_summary_with_status(200);
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    logger.fire(BodyOutcome::error(ErrorClass::ReadWriteTimeout, 321, true));
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1);
+    let got = &captures[0];
+    assert!(got.client_disconnected);
+    assert_eq!(got.bytes_received, 321);
+    assert!(!got.body_completed);
+    assert_eq!(got.body_error_class, Some(ErrorClass::ReadWriteTimeout));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn start_time_rederives_gateway_latency_from_backend_total_when_available() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let mut summary = make_summary_with_status(200);
+    summary.latency_total_ms = 1.0;
+    summary.latency_backend_ttfb_ms = 3.0;
+    summary.latency_backend_total_ms = 25.0;
+    summary.latency_plugin_execution_ms = 7.0;
+    summary.latency_gateway_processing_ms = 0.0;
+    summary.latency_gateway_overhead_ms = 0.0;
+    let start_time = std::time::Instant::now();
+    let logger =
+        DeferredTransactionLogger::new_with_start_time(summary, plugins, make_ctx(), start_time);
+
+    tokio::time::sleep(std::time::Duration::from_millis(45)).await;
+    logger.fire(BodyOutcome::success(1));
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1);
+    let got = &captures[0];
+    assert!(
+        got.latency_total_ms >= 35.0,
+        "total latency should be re-derived at fire time, got {}",
+        got.latency_total_ms
+    );
+    assert_eq!(got.latency_backend_ttfb_ms, 3.0);
+    assert_eq!(got.latency_backend_total_ms, 25.0);
+    assert_eq!(
+        got.latency_gateway_processing_ms,
+        (got.latency_total_ms - 25.0).max(0.0)
+    );
+    assert_eq!(
+        got.latency_gateway_overhead_ms,
+        (got.latency_total_ms - 25.0 - 7.0).max(0.0)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn drop_without_fire_is_safety_net() {
     // If hyper cancels the connection right after the header flush but before
     // any body frame is polled, the body — and therefore the logger — is

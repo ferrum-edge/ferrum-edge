@@ -356,6 +356,7 @@ fn test_detects_added_plugin_config() {
     assert_eq!(delta.added_plugin_configs[0].id, "pc1");
     assert!(delta.removed_plugin_config_ids.is_empty());
     assert!(delta.modified_plugin_configs.is_empty());
+    assert!(delta.global_plugin_configs_changed);
 }
 
 #[test]
@@ -376,6 +377,7 @@ fn test_detects_removed_plugin_config() {
     assert!(delta.added_plugin_configs.is_empty());
     assert_eq!(delta.removed_plugin_config_ids, vec!["pc1"]);
     assert!(delta.modified_plugin_configs.is_empty());
+    assert!(delta.global_plugin_configs_changed);
 }
 
 #[test]
@@ -407,6 +409,7 @@ fn test_detects_modified_plugin_config() {
     assert!(delta.removed_plugin_config_ids.is_empty());
     assert_eq!(delta.modified_plugin_configs.len(), 1);
     assert_eq!(delta.modified_plugin_configs[0].id, "pc1");
+    assert!(delta.global_plugin_configs_changed);
 }
 
 // --- proxy_ids_needing_plugin_rebuild tests ---
@@ -459,6 +462,79 @@ fn test_proxy_ids_needing_plugin_rebuild_from_global_plugin_change() {
     let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
     // Global plugin change should trigger rebuild for ALL proxies
     assert!(ids.contains("p1"));
+}
+
+#[test]
+fn test_proxy_ids_needing_plugin_rebuild_when_global_plugin_changes_scope() {
+    let t1 = Utc::now();
+    let t2 = t1 + chrono::Duration::seconds(5);
+    let proxy1 = make_proxy("p1", "/api", t1);
+    let proxy2 = make_proxy("p2", "/other", t1);
+    let old = GatewayConfig {
+        proxies: vec![proxy1.clone(), proxy2.clone()],
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Global,
+            None,
+            t1,
+        )],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        proxies: vec![proxy1, proxy2],
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            t2,
+        )],
+        ..Default::default()
+    };
+
+    let delta = ConfigDelta::compute(&old, &new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+
+    assert!(delta.global_plugin_configs_changed);
+    assert!(ids.contains("p1"));
+    assert!(
+        ids.contains("p2"),
+        "a plugin moving away from global scope must rebuild proxies that only saw it via globals"
+    );
+}
+
+#[test]
+fn test_proxy_ids_needing_plugin_rebuild_from_removed_proxy_plugin_config() {
+    let t = Utc::now();
+    let proxy1 = make_proxy("p1", "/api", t);
+    let proxy2 = make_proxy("p2", "/other", t);
+    let old = GatewayConfig {
+        proxies: vec![proxy1.clone(), proxy2.clone()],
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            t,
+        )],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        proxies: vec![proxy1, proxy2],
+        plugin_configs: vec![],
+        ..Default::default()
+    };
+
+    let delta = ConfigDelta::compute(&old, &new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+
+    assert!(!delta.global_plugin_configs_changed);
+    assert!(ids.contains("p1"));
+    assert!(
+        ids.contains("p2"),
+        "plugin config deletion conservatively rebuilds all proxies because associations may cascade without proxy timestamps"
+    );
 }
 
 // --- Full mixed delta across all entity types ---

@@ -29,7 +29,7 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
 fn test_validate_host_entry_whitespace_only_rejected() {
     let err = validate_host_entry("   ").unwrap_err();
     assert!(
-        err.contains("invalid"),
+        err.contains("whitespace"),
         "whitespace-only host should be rejected: {err}"
     );
 }
@@ -56,12 +56,11 @@ fn test_validate_host_entry_ipv6_rejected() {
 }
 
 #[test]
-fn test_validate_host_entry_double_dots_accepted() {
-    // The HOST_REGEX `^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$` does not forbid
-    // consecutive dots. This test documents the current permissive behaviour.
+fn test_validate_host_entry_double_dots_rejected() {
+    let err = validate_host_entry("example..com").unwrap_err();
     assert!(
-        validate_host_entry("example..com").is_ok(),
-        "double-dot hostname is currently accepted by the regex"
+        err.contains("empty labels"),
+        "double-dot hostname should be rejected: {err}"
     );
 }
 
@@ -77,16 +76,10 @@ fn test_validate_host_entry_trailing_dot_rejected() {
 }
 
 #[test]
-fn test_validate_host_entry_very_long_hostname() {
-    // RFC 1035 limits hostnames to 253 characters. The current validator
-    // doesn't enforce a length cap — it only checks the character pattern.
-    // A 254-char hostname made of valid chars will pass. This test documents
-    // that behaviour so any future length enforcement is deliberate.
+fn test_validate_host_entry_very_long_hostname_rejected() {
     let long = format!("{}.example.com", "a".repeat(240));
-    assert!(
-        validate_host_entry(&long).is_ok(),
-        "long hostname currently passes the regex check"
-    );
+    let err = validate_host_entry(&long).unwrap_err();
+    assert!(err.contains("label longer than 63"), "got {err}");
 }
 
 #[test]
@@ -111,13 +104,11 @@ fn test_validate_host_entry_leading_hyphen_rejected() {
 }
 
 #[test]
-fn test_validate_host_entry_mid_segment_hyphen_accepted() {
-    // The HOST_REGEX allows hyphens anywhere in the middle portion of the
-    // hostname. It does not validate per-label rules (RFC 952). This test
-    // documents that `example-.com` currently passes the regex.
+fn test_validate_host_entry_label_trailing_hyphen_rejected() {
+    let err = validate_host_entry("example-.com").unwrap_err();
     assert!(
-        validate_host_entry("example-.com").is_ok(),
-        "mid-segment hyphen is currently accepted by the regex"
+        err.contains("start and end"),
+        "label ending in hyphen should be rejected: {err}"
     );
 }
 

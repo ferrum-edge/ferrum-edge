@@ -5,6 +5,7 @@ use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
     PluginScope, Proxy,
 };
+use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
@@ -1167,6 +1168,63 @@ fn test_apply_delta_prunes_proxy_group_instance_after_last_association_removed()
     assert!(
         !Arc::ptr_eq(&held_group_plugin, reattached_group_plugin),
         "reattaching a previously unused proxy-group config should create fresh state"
+    );
+}
+
+#[test]
+fn test_apply_delta_global_to_proxy_scope_refreshes_all_proxy_views() {
+    let old_global = make_plugin_config("pc1", "stdout_logging", PluginScope::Global, None, true);
+    let old_config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![old_global.clone()],
+    );
+    let cache = PluginCache::new(&old_config).unwrap();
+
+    assert_eq!(cache.get_plugins("p1").len(), 1);
+    assert_eq!(cache.get_plugins("p2").len(), 1);
+    assert_eq!(cache.get_plugins("unknown").len(), 1);
+
+    let mut proxy_scoped = make_plugin_config(
+        "pc1",
+        "stdout_logging",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    proxy_scoped.updated_at = old_global.updated_at + chrono::Duration::seconds(5);
+    let new_config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["pc1"]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![proxy_scoped],
+    );
+    let delta = ConfigDelta::compute(&old_config, &new_config);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+
+    assert!(delta.global_plugin_configs_changed);
+    cache
+        .apply_delta(
+            &new_config,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .unwrap();
+
+    let p1_plugins = cache.get_plugins("p1");
+    assert_eq!(p1_plugins.len(), 1);
+    assert_eq!(p1_plugins[0].name(), "stdout_logging");
+    assert!(
+        cache.get_plugins("p2").is_empty(),
+        "known proxies that no longer reference the plugin must drop stale global instances"
+    );
+    assert!(
+        cache.get_plugins("unknown").is_empty(),
+        "global fallback must drop plugins that changed away from global scope"
     );
 }
 
