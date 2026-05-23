@@ -14,7 +14,7 @@
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
-//!   `Keep-Alive`, `Trailer`, etc. from the backend)
+//!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
 //!
 //! HTTP/3 validation is covered by unit tests in `tests/unit/gateway_core/protocol_validation_tests.rs`;
 //! TODO: add a functional H3 variant once the quinn test harness is in place.
@@ -25,6 +25,7 @@ use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 
 use bytes::Bytes;
+use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -211,6 +212,44 @@ fn header_value<'a>(hdrs: &'a [(String, String)], name: &str) -> Option<&'a str>
     hdrs.iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.as_str())
+}
+
+fn assert_hop_by_hop_response_headers_stripped(hdrs: &HeaderMap) {
+    for banned in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        // `connection` is one the gateway may emit itself to manage client
+        // keep-alive — allow it to exist as long as it wasn't the backend's
+        // comma-list value containing "Upgrade".
+        if banned == "connection" {
+            if let Some(v) = hdrs.get("connection") {
+                let vs = v.to_str().unwrap_or("").to_ascii_lowercase();
+                assert!(
+                    !vs.contains("upgrade"),
+                    "backend's Connection: Upgrade leaked to client: {vs:?}"
+                );
+            }
+            continue;
+        }
+        assert!(
+            hdrs.get(banned).is_none(),
+            "hop-by-hop header `{banned}` should be stripped from client response; \
+             all_headers={hdrs:?}"
+        );
+    }
+
+    // Sanity: the gateway kept at least one backend application header.
+    assert!(
+        hdrs.get("x-backend-marker").is_some(),
+        "non-hop-by-hop backend header should pass through; headers={hdrs:?}"
+    );
 }
 
 // ============================================================================
@@ -671,41 +710,99 @@ async fn functional_protocol_validation_response_hop_by_hop_stripped() {
     assert_eq!(resp.status().as_u16(), 200);
     let hdrs = resp.headers().clone();
 
-    for banned in [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    ] {
-        // `connection` is one the gateway may emit itself to manage client
-        // keep-alive — allow it to exist as long as it wasn't the backend's
-        // comma-list value containing "Upgrade".
-        if banned == "connection" {
-            if let Some(v) = hdrs.get("connection") {
-                let vs = v.to_str().unwrap_or("").to_ascii_lowercase();
-                assert!(
-                    !vs.contains("upgrade"),
-                    "backend's Connection: Upgrade leaked to client: {vs:?}"
-                );
-            }
-            continue;
-        }
-        assert!(
-            hdrs.get(banned).is_none(),
-            "hop-by-hop header `{banned}` should be stripped from client response; \
-             all_headers={hdrs:?}"
-        );
-    }
-
-    // Sanity: the gateway kept at least one backend application header.
-    assert!(
-        hdrs.get("x-backend-marker").is_some(),
-        "non-hop-by-hop backend header should pass through; headers={hdrs:?}"
-    );
+    assert_hop_by_hop_response_headers_stripped(&hdrs);
 
     h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_response_hop_by_hop_stripped_http2() {
+    let h = Harness::new(false).await;
+
+    let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
+        .await
+        .expect("connect h2 gateway");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("http://example.com/")
+        .header("host", "example.com")
+        .body(Full::new(Bytes::new()))
+        .expect("build h2 request");
+    let resp = sender.send_request(req).await.expect("send h2 request");
+    assert_eq!(resp.status().as_u16(), 200);
+    let hdrs = resp.headers().clone();
+    let _ = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("collect h2 body")
+        .to_bytes();
+
+    assert_hop_by_hop_response_headers_stripped(&hdrs);
+
+    drop(sender);
+    conn_task.abort();
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_response_hop_by_hop_stripped_http3() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let https_port = https_reservation.local_addr().unwrap().port();
+    drop(https_reservation);
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start gateway with h3");
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let response = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match client.get(&url).await {
+                Ok(resp) => break resp,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    let _ = err;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => panic!("H3 request did not complete: {err}"),
+            }
+        }
+    };
+
+    assert_eq!(
+        response.status.as_u16(),
+        200,
+        "body={}",
+        response.body_text()
+    );
+    assert_hop_by_hop_response_headers_stripped(&response.headers);
+
+    gateway.shutdown();
+    echo_task.abort();
 }
