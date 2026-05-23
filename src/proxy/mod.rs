@@ -8164,11 +8164,13 @@ async fn handle_proxy_request_inner(
 
     // Per-IP concurrent request limiting. The guard auto-decrements on drop,
     // covering all 30+ return paths without manual tracking.
-    let _per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
-        let count = counts
-            .entry(ctx.client_ip.clone())
-            .or_insert_with(|| AtomicU64::new(0));
-        let current = count.value().fetch_add(1, Ordering::Relaxed) + 1;
+    let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
+        let current = {
+            let count = counts
+                .entry(ctx.client_ip.clone())
+                .or_insert_with(|| AtomicU64::new(0));
+            count.value().fetch_add(1, Ordering::Relaxed) + 1
+        };
         let guard = Some(PerIpRequestGuard {
             ip: ctx.client_ip.clone(),
             counts: counts.clone(),
@@ -10811,6 +10813,12 @@ async fn handle_proxy_request_inner(
     // body reaches a terminal state (completion, streaming error, or client
     // disconnect via the Drop safety net) rather than at header-flush time.
     // `deferred_logger` is `Some` only for streaming responses with plugins.
+    let body = if let Some(guard) = per_ip_guard {
+        body.with_per_ip_request_guard(guard)
+    } else {
+        body
+    };
+
     let mut body = if let Some(logger) = deferred_logger {
         body.with_logger(logger)
     } else {

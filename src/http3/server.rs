@@ -999,13 +999,15 @@ async fn handle_h3_request(
 
     // Per-IP concurrent request limiting (same as HTTP/1.1 and HTTP/2 paths).
     let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
-        let count = counts
-            .entry(ctx.client_ip.clone())
-            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
-        let current = count
-            .value()
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
+        let current = {
+            let count = counts
+                .entry(ctx.client_ip.clone())
+                .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+            count
+                .value()
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1
+        };
         let guard = Some(crate::proxy::PerIpRequestGuard {
             ip: ctx.client_ip.clone(),
             counts: counts.clone(),

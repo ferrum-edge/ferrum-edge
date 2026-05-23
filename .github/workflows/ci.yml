@@ -412,6 +412,7 @@ jobs:
               functional_service_discovery_test
               functional_tls_lifecycle_test
               functional_tls_only_test
+              functional_client_ip_env_test
     services:
       redis:
         image: redis:7-alpine
