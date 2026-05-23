@@ -805,6 +805,102 @@ async fn test_websocket_multiple_messages() {
     println!("test_websocket_multiple_messages PASSED");
 }
 
+/// Test HTTP/2 WebSocket (RFC 8441 Extended CONNECT) proxying:
+/// client →(h2c Extended CONNECT)→ gateway → backend echo.
+#[ignore]
+#[tokio::test]
+async fn test_h2_websocket_extended_connect_echo() {
+    use bytes::Bytes;
+    use http::{Method, Version};
+    use http_body_util::Empty;
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", gateway_port))
+        .await
+        .expect("Failed to connect to gateway H2 port");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("H2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{}/ws-echo", gateway_port))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build H2 WebSocket CONNECT request");
+
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("send H2 WebSocket CONNECT");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(response.version(), Version::HTTP_2);
+    assert!(
+        response.headers().get("upgrade").is_none(),
+        "RFC 8441 H2 WebSocket responses must not use H1 Upgrade headers"
+    );
+
+    let upgraded = hyper::upgrade::on(response)
+        .await
+        .expect("H2 Extended CONNECT upgrade");
+    let io = TokioIo::new(upgraded);
+    let mut ws = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+
+    ws.send(Message::Text("hello h2".into()))
+        .await
+        .expect("send H2 WebSocket text");
+    let reply = ws
+        .next()
+        .await
+        .expect("No H2 WebSocket reply")
+        .expect("Error reading H2 WebSocket reply");
+    assert_eq!(reply, Message::Text("Echo: hello h2".into()));
+
+    ws.send(Message::Binary(vec![9, 8, 7].into()))
+        .await
+        .expect("send H2 WebSocket binary");
+    let reply = ws
+        .next()
+        .await
+        .expect("No H2 WebSocket binary reply")
+        .expect("Error reading H2 WebSocket binary reply");
+    assert_eq!(reply, Message::Text("Echo binary: 3 bytes".into()));
+
+    ws.send(Message::Close(None))
+        .await
+        .expect("close H2 WebSocket");
+    drop(ws);
+    let _ = tokio::time::timeout(Duration::from_secs(2), conn_task).await;
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    println!("test_h2_websocket_extended_connect_echo PASSED");
+}
+
 /// Test HTTP/3 WebSocket (RFC 9220 Extended CONNECT) proxying through the
 /// gateway, including unmasked compliant frames, binary frames, and today's
 /// documented permissive handling of masked client frames.
