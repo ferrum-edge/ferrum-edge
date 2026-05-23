@@ -152,6 +152,10 @@ impl Http3Client {
             tokio::time::timeout(Duration::from_secs(15), stream.send_data(body))
                 .await
                 .map_err(|_| "send request body timed out")?
+        if !options.body.is_empty() {
+            stream
+                .send_data(options.body.clone())
+                .await
                 .map_err(|e| format!("send request body: {e}"))?;
         }
         stream
@@ -629,6 +633,18 @@ pub struct GetOptions {
     pub method: Method,
     pub host_header: HostHeader,
     pub headers: Vec<(String, String)>,
+    pub body: Bytes,
+}
+
+impl Default for GetOptions {
+    fn default() -> Self {
+        Self {
+            method: Method::GET,
+            host_header: HostHeader::Auto,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        }
+    }
 }
 
 impl Default for GetOptions {
@@ -650,6 +666,11 @@ impl GetOptions {
 
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    pub fn body(mut self, body: Bytes) -> Self {
+        self.body = body;
         self
     }
 }

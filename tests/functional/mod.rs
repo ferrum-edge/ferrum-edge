@@ -55,6 +55,7 @@ mod functional_protocol_h3_request_body_test;
 mod functional_protocol_validation_test;
 mod functional_redis_rate_limiting_test;
 mod functional_regex_routing_test;
+mod functional_request_body_limits_test;
 mod functional_retry_test;
 mod functional_router_cache_test;
 mod functional_scale_perf_test;
