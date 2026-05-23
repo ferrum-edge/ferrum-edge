@@ -2,6 +2,7 @@ mod functional_admin_observability_test;
 mod functional_admin_operations_test;
 mod functional_ai_plugins_test;
 mod functional_auth_acl_test;
+mod functional_body_size_limits_test;
 mod functional_capability_registry_test;
 mod functional_ci_shard_coverage_test;
 mod functional_circuit_breaker_retry_test;
