@@ -826,6 +826,10 @@ async fn handle_h3_request(
     if state.max_query_params > 0 && !query_string.is_empty() {
         let param_count = query_string.split('&').filter(|s| !s.is_empty()).count();
         let param_count = crate::proxy::count_query_params(&query_string);
+    // Validate query parameter count (skip empty segments from consecutive '&')
+    // to match the H1/H2 proxy path.
+    if state.max_query_params > 0 && !query_string.is_empty() {
+        let param_count = query_string.split('&').filter(|s| !s.is_empty()).count();
         if param_count > state.max_query_params {
             record_request(&state, 400);
             let body = format!(

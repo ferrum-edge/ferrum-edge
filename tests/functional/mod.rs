@@ -54,6 +54,7 @@ mod functional_protocol_h2_body_limit_config_test;
 mod functional_protocol_h3_body_limit_config_test;
 mod functional_protocol_h3_request_body_test;
 mod functional_protocol_validation_test;
+mod functional_query_param_limits_test;
 mod functional_redis_rate_limiting_test;
 mod functional_regex_routing_test;
 mod functional_request_body_limits_test;
