@@ -3,12 +3,14 @@
 //! Tests:
 //! 1. Plain UDP datagram forwarding (single client)
 //! 2. Multiple concurrent UDP clients with session isolation
+//!    2b. UDP max session cap — `FERRUM_UDP_MAX_SESSIONS` rejects new clients
 //! 3. UDP session timeout and cleanup
 //! 4. Large UDP datagram forwarding
-//! 5. DTLS backend encryption (plain UDP → gateway → DTLS echo server)
-//! 6. DTLS backend with multiple clients
-//! 7. Frontend DTLS termination (DTLS client → gateway → plain UDP echo server)
-//! 8. Full DTLS: frontend DTLS + backend DTLS (DTLS client → gateway → DTLS echo server)
+//! 5. UDP response amplification factor enforcement
+//! 6. DTLS backend encryption (plain UDP → gateway → DTLS echo server)
+//! 7. DTLS backend with multiple clients
+//! 8. Frontend DTLS termination (DTLS client → gateway → plain UDP echo server)
+//! 9. Full DTLS: frontend DTLS + backend DTLS (DTLS client → gateway → DTLS echo server)
 //!
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_udp_proxy --ignored --nocapture
@@ -33,6 +35,25 @@ async fn start_udp_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
         let mut buf = vec![0u8; 65535];
         while let Ok((len, src)) = socket.recv_from(&mut buf).await {
             let _ = socket.send_to(&buf[..len], src).await;
+        }
+    });
+    sleep(Duration::from_millis(200)).await;
+    handle
+}
+
+/// Start a UDP backend that replies to every datagram with the same payload.
+async fn start_udp_fixed_response_server(
+    port: u16,
+    response: Vec<u8>,
+) -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async move {
+        let socket = UdpSocket::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap_or_else(|_| panic!("Failed to bind UDP response server on port {}", port));
+
+        let mut buf = vec![0u8; 65535];
+        while let Ok((_len, src)) = socket.recv_from(&mut buf).await {
+            let _ = socket.send_to(&response, src).await;
         }
     });
     sleep(Duration::from_millis(200)).await;
@@ -268,6 +289,95 @@ plugin_configs: []
     echo_server.abort();
 }
 
+/// Test 2b: UDP max session cap — once one client owns the only configured
+/// session slot, a second client is dropped while the original session still works.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_max_sessions_env_limits_new_clients() {
+    let backend_port = 19826u16;
+    let proxy_port = 19827u16;
+    let gateway_http_port = 18218u16;
+
+    let echo_server = start_udp_echo_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-max-sessions"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_idle_timeout_seconds: 30
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway = start_gateway_with_extra_env(
+        config_path.to_str().unwrap(),
+        gateway_http_port,
+        &[("FERRUM_UDP_MAX_SESSIONS", "1")],
+    )
+    .expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let client1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client1.connect(&proxy_addr).await.unwrap();
+    let client2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client2.connect(&proxy_addr).await.unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let first_msg = b"client-one";
+    client1.send(first_msg).await.expect("client1 send failed");
+    let first_len = tokio::time::timeout(Duration::from_secs(5), client1.recv(&mut buf))
+        .await
+        .expect("client1 initial recv timed out")
+        .expect("client1 initial recv error");
+    assert_eq!(
+        &buf[..first_len],
+        first_msg,
+        "first client should establish the only UDP session"
+    );
+
+    let second_msg = b"client-two";
+    client2.send(second_msg).await.expect("client2 send failed");
+    let mut second_buf = vec![0u8; 1024];
+    let second_recv =
+        tokio::time::timeout(Duration::from_secs(2), client2.recv(&mut second_buf)).await;
+    assert!(
+        second_recv.is_err(),
+        "second client should not receive an echo while FERRUM_UDP_MAX_SESSIONS=1"
+    );
+
+    let followup_msg = b"client-one-still-active";
+    client1
+        .send(followup_msg)
+        .await
+        .expect("client1 followup send failed");
+    let followup_len = tokio::time::timeout(Duration::from_secs(5), client1.recv(&mut buf))
+        .await
+        .expect("client1 followup recv timed out")
+        .expect("client1 followup recv error");
+    assert_eq!(
+        &buf[..followup_len],
+        followup_msg,
+        "existing UDP session should continue after a new client is rejected"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_server.abort();
+}
+
 /// Test 3: UDP session timeout — verify sessions are cleaned up after idle timeout.
 #[ignore]
 #[tokio::test]
@@ -417,7 +527,78 @@ plugin_configs: []
     echo_server.abort();
 }
 
-/// Test 5: DTLS backend — send plain UDP datagrams through the gateway,
+/// Test 5: UDP response amplification factor — oversized backend datagrams are dropped.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_response_amplification_factor_drops_oversized_backend_datagram() {
+    let backend_port = 19828u16;
+    let proxy_port = 19829u16;
+    let gateway_http_port = 18219u16;
+
+    let fixed_response = b"0123456789abcdef".to_vec();
+    let response_server =
+        start_udp_fixed_response_server(backend_port, fixed_response.clone()).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-amplification-guard"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_max_response_amplification_factor: 1.0
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway =
+        start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    client.send(b"tiny").await.expect("Failed to send");
+    let dropped = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut buf)).await;
+    assert!(
+        dropped.is_err(),
+        "backend response larger than request must be dropped by amplification guard"
+    );
+
+    let allowed_request = vec![b'a'; fixed_response.len()];
+    client
+        .send(&allowed_request)
+        .await
+        .expect("Failed to send allowed-size request");
+    let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+        .await
+        .expect("Allowed response timed out")
+        .expect("Allowed response recv error");
+    assert_eq!(
+        &buf[..n],
+        fixed_response.as_slice(),
+        "response at the configured amplification limit should be forwarded"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    response_server.abort();
+}
+
+/// Test 6: DTLS backend — send plain UDP datagrams through the gateway,
 /// which encrypts them via DTLS to a DTLS echo server backend.
 ///
 /// Architecture: client (plain UDP) → gateway (DTLS client) → DTLS echo server
@@ -493,7 +674,7 @@ plugin_configs: []
     dtls_echo.abort();
 }
 
-/// Test 6: DTLS backend with multiple clients — verify session isolation
+/// Test 7: DTLS backend with multiple clients — verify session isolation
 /// works with DTLS backend connections.
 #[ignore]
 #[tokio::test]
@@ -561,7 +742,7 @@ plugin_configs: []
     dtls_echo.abort();
 }
 
-/// Test 7: Frontend DTLS termination — DTLS client → gateway → plain UDP echo server.
+/// Test 8: Frontend DTLS termination — DTLS client → gateway → plain UDP echo server.
 ///
 /// The gateway terminates DTLS from the client and forwards decrypted datagrams
 /// to a plain UDP backend.
@@ -645,7 +826,7 @@ plugin_configs: []
     echo_server.abort();
 }
 
-/// Test 8: Full DTLS e2e — DTLS client → gateway (DTLS termination + DTLS origination) → DTLS echo server.
+/// Test 9: Full DTLS e2e — DTLS client → gateway (DTLS termination + DTLS origination) → DTLS echo server.
 ///
 /// Both sides encrypted: the gateway terminates DTLS from the client and opens a new
 /// DTLS session to the DTLS backend.

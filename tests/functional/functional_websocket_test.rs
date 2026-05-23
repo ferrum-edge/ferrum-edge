@@ -7,6 +7,10 @@
 //! 4. Verifies end-to-end echo round-trips for text and binary messages
 //! 5. Tests plaintext (ws://), TLS (wss://), and HTTP/3 Extended CONNECT
 //!    WebSocket connections
+//! 6. Verifies configured WebSocket Origin allowlists across H1 Upgrade and
+//!    H3 Extended CONNECT envelopes
+//! 6. Exercises global WebSocket connection admission limits
+//!    WebSocket connections, including the H3 WebSocket disablement toggle
 //!
 //! This test is marked with #[ignore] as it requires the binary to be built
 //! and should be run with: cargo test --test functional_tests functional_websocket -- --ignored --nocapture
@@ -14,6 +18,10 @@
 use futures_util::{SinkExt, StreamExt};
 use http::StatusCode;
 use std::io::Write;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,11 +31,16 @@ use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use crate::scaffolding::{Http3Client, WebSocketOptions};
+use crate::scaffolding::{H3WebSocketFrame, Http3Client, WebSocketOptions};
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+const WS_FRAME_LIMIT_UNDER_TEST: usize = 64;
+const WS_OVERSIZE_FRAME_BYTES: usize = WS_FRAME_LIMIT_UNDER_TEST * 2;
+const WS_H3_FRAME_LIMIT_UNDER_TEST: usize = 64;
+const WS_H3_OVERSIZE_FRAME_BYTES: usize = WS_H3_FRAME_LIMIT_UNDER_TEST * 2;
 
 /// Allocate a free port by binding to port 0 and returning the assigned port.
 async fn free_port() -> u16 {
@@ -112,6 +125,129 @@ async fn start_ws_echo_server_with_subprotocol(
     }
 }
 
+/// Start a WebSocket probe backend that can report whether an oversized
+/// client-to-backend frame reached it and can deliberately emit an oversized
+/// backend-to-client frame.
+#[allow(clippy::collapsible_match)]
+async fn start_ws_frame_limit_probe_server(
+    port: u16,
+    client_oversize_frames: Arc<AtomicUsize>,
+    server_oversize_frames: Arc<AtomicUsize>,
+) {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind WS frame-limit probe server");
+
+    loop {
+        if let Ok((stream, _addr)) = listener.accept().await {
+            let client_oversize_frames = client_oversize_frames.clone();
+            let server_oversize_frames = server_oversize_frames.clone();
+
+            tokio::spawn(async move {
+                let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+
+                let (mut sink, mut source) = ws_stream.split();
+
+                while let Some(Ok(msg)) = source.next().await {
+                    match msg {
+                        Message::Text(text) => {
+                            if text.len() > WS_FRAME_LIMIT_UNDER_TEST {
+                                client_oversize_frames.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            if text.as_str() == "server-oversize" {
+                                server_oversize_frames.fetch_add(1, Ordering::Relaxed);
+                                let payload = "s".repeat(WS_OVERSIZE_FRAME_BYTES);
+                                if sink.send(Message::Text(payload.into())).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            let echo = format!("Echo: {}", text);
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Binary(data) => {
+                            if data.len() > WS_FRAME_LIMIT_UNDER_TEST {
+                                client_oversize_frames.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            let echo = format!("Echo binary: {} bytes", data.len());
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Ping(data) => {
+                            if sink.send(Message::Pong(data)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Start a WebSocket probe backend that counts oversized client frames.
+#[allow(clippy::collapsible_match)]
+async fn start_ws_oversize_probe_server(port: u16, oversized_frames: Arc<AtomicUsize>) {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind WS oversize probe server");
+
+    loop {
+        if let Ok((stream, _addr)) = listener.accept().await {
+            let oversized_frames = oversized_frames.clone();
+            tokio::spawn(async move {
+                let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+
+                let (mut sink, mut source) = ws_stream.split();
+
+                while let Some(Ok(msg)) = source.next().await {
+                    match msg {
+                        Message::Text(text) => {
+                            if text.len() > WS_H3_FRAME_LIMIT_UNDER_TEST {
+                                oversized_frames.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let echo = format!("Echo: {}", text);
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Binary(data) => {
+                            if data.len() > WS_H3_FRAME_LIMIT_UNDER_TEST {
+                                oversized_frames.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let echo = format!("Echo binary: {} bytes", data.len());
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Ping(data) => {
+                            if sink.send(Message::Pong(data)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+}
+
 async fn start_http_text_server(port: u16, body: &'static str) {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
@@ -149,24 +285,6 @@ fn gateway_binary_path() -> &'static str {
     } else {
         "./target/release/ferrum-edge"
     }
-}
-
-/// Start the gateway in file mode with optional TLS configuration.
-fn start_gateway(
-    config_path: &str,
-    http_port: u16,
-    https_port: Option<u16>,
-    tls_cert_path: Option<&str>,
-    tls_key_path: Option<&str>,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    start_gateway_with_extra_env(
-        config_path,
-        http_port,
-        https_port,
-        tls_cert_path,
-        tls_key_path,
-        &[],
-    )
 }
 
 fn start_gateway_with_extra_env(
@@ -216,6 +334,32 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: true
+
+consumers: []
+plugin_configs: []
+"#,
+        backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+/// Write a YAML config with a WebSocket proxy protected by an Origin allowlist.
+fn write_ws_origin_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-origin-proxy"
+    listen_path: "/ws-echo"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {}
+    strip_listen_path: true
+    allowed_ws_origins:
+      - "https://app.example.com"
 
 consumers: []
 plugin_configs: []
@@ -429,17 +573,68 @@ async fn start_gateway_with_retry(
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
 ) -> (std::process::Child, u16) {
+    start_gateway_with_retry_extra_env(config_path, https_port, tls_cert_path, tls_key_path, &[])
+        .await
+}
+
+async fn start_gateway_with_retry_extra_env(
+    config_path: &str,
+    https_port: Option<u16>,
+    tls_cert_path: Option<&str>,
+    tls_key_path: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Child, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
-        match start_gateway(
+        match start_gateway_with_extra_env(
             config_path,
             gateway_port,
             https_port,
             tls_cert_path,
             tls_key_path,
+            extra_env,
         ) {
+            Ok(mut child) => match wait_for_gateway(gateway_port).await {
+                Ok(()) => return (child, gateway_port),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Gateway startup attempt {}/{} failed (port {}): {}",
+                        attempt, MAX_ATTEMPTS, gateway_port, last_err
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            },
+            Err(e) => {
+                last_err = e.to_string();
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, last_err
+                );
+            }
+        }
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!(
+        "Gateway did not start after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
+async fn start_gateway_plain_with_retry_extra_env(
+    config_path: &str,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Child, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let gateway_port = free_port().await;
+        match start_gateway_with_extra_env(config_path, gateway_port, None, None, None, extra_env) {
             Ok(mut child) => match wait_for_gateway(gateway_port).await {
                 Ok(()) => return (child, gateway_port),
                 Err(e) => {
@@ -530,6 +725,25 @@ async fn start_gateway_tls_with_retry_extra_env(
     );
 }
 
+fn assert_websocket_limit_closed(reply: Option<Result<Message, WsError>>, context: &str) {
+    match reply {
+        Some(Ok(Message::Text(text))) => {
+            panic!(
+                "{context}: oversized frame was forwarded as text ({} bytes)",
+                text.len()
+            );
+        }
+        Some(Ok(Message::Binary(data))) => {
+            panic!(
+                "{context}: oversized frame was forwarded as binary ({} bytes)",
+                data.len()
+            );
+        }
+        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {}
+        Some(Ok(other)) => panic!("{context}: expected close/error, got {other:?}"),
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -592,6 +806,164 @@ async fn test_websocket_plaintext_echo() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_websocket_plaintext_echo PASSED");
+}
+
+/// Origin allowlists should fail closed for browser WebSocket handshakes while
+/// preserving the documented case-insensitive match behavior.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
+    let backend_port = free_port().await;
+
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_origin_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let missing_origin = match tokio_tungstenite::connect_async(&url).await {
+        Ok(_) => panic!("WebSocket handshake without Origin should be rejected"),
+        Err(err) => err,
+    };
+    match missing_origin {
+        WsError::Http(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+        other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
+    }
+
+    let mut blocked_request = url
+        .as_str()
+        .into_client_request()
+        .expect("valid WebSocket request");
+    blocked_request
+        .headers_mut()
+        .insert("origin", "https://evil.example.com".parse().unwrap());
+    let blocked_origin = match tokio_tungstenite::connect_async(blocked_request).await {
+        Ok(_) => panic!("WebSocket handshake from disallowed Origin should be rejected"),
+        Err(err) => err,
+    };
+    match blocked_origin {
+        WsError::Http(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+        other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
+    }
+
+    let mut allowed_request = url
+        .as_str()
+        .into_client_request()
+        .expect("valid WebSocket request");
+    allowed_request
+        .headers_mut()
+        .insert("origin", "HTTPS://APP.EXAMPLE.COM".parse().unwrap());
+    let (mut ws, response) = tokio_tungstenite::connect_async(allowed_request)
+        .await
+        .expect("WebSocket handshake from allowed Origin should succeed");
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    ws.send(Message::Text("origin ok".into()))
+        .await
+        .expect("Failed to send text");
+    let reply = ws
+        .next()
+        .await
+        .expect("No reply")
+        .expect("Error reading reply");
+    assert_eq!(reply, Message::Text("Echo: origin ok".into()));
+
+    ws.send(Message::Close(None))
+        .await
+        .expect("Failed to send close");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    println!("test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1 PASSED");
+}
+
+/// The global WebSocket frame-size env limit is enforced by the shared
+/// frame-parsed relay in both directions. Oversized client frames must not
+/// reach the backend, and oversized backend frames must not reach the client.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_global_frame_limit_enforced_both_directions() {
+    let backend_port = free_port().await;
+    let client_oversize_frames = Arc::new(AtomicUsize::new(0));
+    let server_oversize_frames = Arc::new(AtomicUsize::new(0));
+
+    let probe_handle = tokio::spawn(start_ws_frame_limit_probe_server(
+        backend_port,
+        client_oversize_frames.clone(),
+        server_oversize_frames.clone(),
+    ));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let frame_limit = WS_FRAME_LIMIT_UNDER_TEST.to_string();
+    let extra_env = [(
+        "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES",
+        frame_limit.as_str(),
+    )];
+    let (mut gateway, gateway_port) =
+        start_gateway_plain_with_retry_extra_env(config_path.to_str().unwrap(), &extra_env).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    ws.send(Message::Text("small".into()))
+        .await
+        .expect("Failed to send small text");
+    let reply = ws
+        .next()
+        .await
+        .expect("No small-frame reply")
+        .expect("Error reading small-frame reply");
+    assert_eq!(reply, Message::Text("Echo: small".into()));
+
+    let oversized_client_payload = "c".repeat(WS_OVERSIZE_FRAME_BYTES);
+    ws.send(Message::Text(oversized_client_payload.into()))
+        .await
+        .expect("Failed to send oversized client frame");
+    let reply = tokio::time::timeout(Duration::from_secs(3), ws.next())
+        .await
+        .expect("gateway did not close after oversized client frame");
+    assert_websocket_limit_closed(reply, "client-to-backend");
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        client_oversize_frames.load(Ordering::Relaxed),
+        0,
+        "oversized client frame reached backend despite FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES"
+    );
+
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to reconnect WebSocket");
+    ws.send(Message::Text("server-oversize".into()))
+        .await
+        .expect("Failed to request oversized backend frame");
+    let reply = tokio::time::timeout(Duration::from_secs(3), ws.next())
+        .await
+        .expect("gateway did not close after oversized backend frame");
+    assert_websocket_limit_closed(reply, "backend-to-client");
+    assert_eq!(
+        server_oversize_frames.load(Ordering::Relaxed),
+        1,
+        "probe backend should have attempted exactly one oversized response"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    probe_handle.abort();
+    println!("test_websocket_global_frame_limit_enforced_both_directions PASSED");
 }
 
 /// End-to-end test: WebSocket handshakes are rejected by key_auth without a key.
@@ -805,6 +1177,182 @@ async fn test_websocket_multiple_messages() {
     println!("test_websocket_multiple_messages PASSED");
 }
 
+/// Test HTTP/2 WebSocket (RFC 8441 Extended CONNECT) proxying:
+/// client →(h2c Extended CONNECT)→ gateway → backend echo.
+#[ignore]
+#[tokio::test]
+async fn test_h2_websocket_extended_connect_echo() {
+    use bytes::Bytes;
+    use http::{Method, Version};
+    use http_body_util::Empty;
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", gateway_port))
+        .await
+        .expect("Failed to connect to gateway H2 port");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("H2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{}/ws-echo", gateway_port))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build H2 WebSocket CONNECT request");
+
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("send H2 WebSocket CONNECT");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(response.version(), Version::HTTP_2);
+    assert!(
+        response.headers().get("upgrade").is_none(),
+        "RFC 8441 H2 WebSocket responses must not use H1 Upgrade headers"
+    );
+
+    let upgraded = hyper::upgrade::on(response)
+        .await
+        .expect("H2 Extended CONNECT upgrade");
+    let io = TokioIo::new(upgraded);
+    let mut ws = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+
+    ws.send(Message::Text("hello h2".into()))
+        .await
+        .expect("send H2 WebSocket text");
+    let reply = ws
+        .next()
+        .await
+        .expect("No H2 WebSocket reply")
+        .expect("Error reading H2 WebSocket reply");
+    assert_eq!(reply, Message::Text("Echo: hello h2".into()));
+
+    ws.send(Message::Binary(vec![9, 8, 7].into()))
+        .await
+        .expect("send H2 WebSocket binary");
+    let reply = ws
+        .next()
+        .await
+        .expect("No H2 WebSocket binary reply")
+        .expect("Error reading H2 WebSocket binary reply");
+    assert_eq!(reply, Message::Text("Echo binary: 3 bytes".into()));
+
+    ws.send(Message::Close(None))
+        .await
+        .expect("close H2 WebSocket");
+    drop(ws);
+    let _ = tokio::time::timeout(Duration::from_secs(2), conn_task).await;
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    println!("test_h2_websocket_extended_connect_echo PASSED");
+}
+
+/// Global WebSocket connection admission should reject a second upgraded
+/// session while the first one is still open.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_global_connection_limit_rejects_second_upgrade() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) = start_gateway_with_retry_extra_env(
+        config_path.to_str().unwrap(),
+        None,
+        None,
+        None,
+        &[("FERRUM_WEBSOCKET_MAX_CONNECTIONS", "1")],
+    )
+    .await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut first_ws, _first_response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("first WebSocket should connect");
+    first_ws
+        .send(Message::Text("first".into()))
+        .await
+        .expect("send first");
+    assert_eq!(
+        first_ws
+            .next()
+            .await
+            .expect("first echo frame")
+            .expect("first echo result"),
+        Message::Text("Echo: first".into())
+    );
+
+    let second = tokio_tungstenite::connect_async(&url).await;
+    match second {
+        Err(WsError::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = response
+                .body()
+                .as_ref()
+                .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+                .unwrap_or_default();
+            assert!(
+                body.contains("WebSocket connection limit exceeded"),
+                "unexpected rejection body: {body}"
+            );
+        }
+        Ok(_) => panic!("second WebSocket upgrade should be rejected by global limit"),
+        Err(err) => panic!("unexpected second WebSocket error: {err:?}"),
+    }
+
+    first_ws
+        .send(Message::Text("still-open".into()))
+        .await
+        .expect("send still-open");
+    assert_eq!(
+        first_ws
+            .next()
+            .await
+            .expect("still-open echo frame")
+            .expect("still-open echo result"),
+        Message::Text("Echo: still-open".into())
+    );
+
+    first_ws
+        .send(Message::Close(None))
+        .await
+        .expect("close first");
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
 /// Test HTTP/3 WebSocket (RFC 9220 Extended CONNECT) proxying through the
 /// gateway, including unmasked compliant frames, binary frames, and today's
 /// documented permissive handling of masked client frames.
@@ -859,6 +1407,144 @@ async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
+}
+
+/// `FERRUM_HTTP3_WEBSOCKET_ENABLED=false` disables only RFC 9220 Extended
+/// CONNECT. Plain HTTP/3 requests on the same listener must continue to work,
+/// while a client that sends Extended CONNECT anyway receives 501.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_disabled_env_rejects_extended_connect_only() {
+    let dead_ws_backend_port = free_port().await;
+    let http_backend_port = free_port().await;
+    let http_handle = tokio::spawn(start_http_text_server(http_backend_port, "h3-ok"));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_and_http_config(&config_path, dead_ws_backend_port, http_backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry_extra_env(
+            config_path.to_str().unwrap(),
+            cert_path,
+            key_path,
+            &[("FERRUM_HTTP3_WEBSOCKET_ENABLED", "false")],
+        )
+        .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let plain_url = format!("https://localhost:{}/plain", gateway_https_port);
+    let plain = client.get(&plain_url).await.expect("plain H3 request");
+    assert_eq!(plain.status, StatusCode::OK);
+    assert_eq!(plain.body_text(), "h3-ok");
+
+    let ws_url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+    let mut ws = client
+        .websocket(&ws_url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket disabled response");
+    assert_eq!(ws.status, StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        ws.recv_body_text()
+            .await
+            .expect("disabled H3 WebSocket body")
+            .contains("WebSocket over HTTP/3 is disabled"),
+        "disabled response should explain H3 WebSocket is disabled"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    http_handle.abort();
+}
+
+/// H3 WebSocket always uses the shared frame-parsed relay. Verify the global
+/// WebSocket frame-size env limit rejects oversized RFC 9220 client frames
+/// before they reach the backend.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_global_frame_limit_rejects_oversized_client_frame() {
+    let backend_port = free_port().await;
+    let oversized_frames = Arc::new(AtomicUsize::new(0));
+    let probe_handle = tokio::spawn(start_ws_oversize_probe_server(
+        backend_port,
+        oversized_frames.clone(),
+    ));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let frame_limit = WS_H3_FRAME_LIMIT_UNDER_TEST.to_string();
+    let extra_env = [(
+        "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES",
+        frame_limit.as_str(),
+    )];
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry_extra_env(
+            config_path.to_str().unwrap(),
+            cert_path,
+            key_path,
+            &extra_env,
+        )
+        .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+    let mut ws = client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket connect");
+    assert_eq!(ws.status, StatusCode::OK);
+
+    ws.send_text("small h3").await.expect("send small text");
+    assert_eq!(
+        ws.recv_text().await.expect("small text echo"),
+        "Echo: small h3"
+    );
+
+    let oversized_payload = "x".repeat(WS_H3_OVERSIZE_FRAME_BYTES);
+    ws.send_text(&oversized_payload)
+        .await
+        .expect("send oversized H3 WebSocket frame");
+
+    let rejected = match tokio::time::timeout(Duration::from_secs(5), ws.recv_frame()).await {
+        Ok(Ok(H3WebSocketFrame::Text(text))) => {
+            panic!(
+                "oversized H3 WebSocket frame was echoed to client ({} bytes)",
+                text.len()
+            );
+        }
+        Ok(Ok(H3WebSocketFrame::Binary(data))) => {
+            panic!(
+                "oversized H3 WebSocket frame was echoed as binary ({} bytes)",
+                data.len()
+            );
+        }
+        Ok(Ok(H3WebSocketFrame::Close(_))) | Ok(Err(_)) | Err(_) => true,
+        Ok(Ok(other)) => panic!("expected H3 WebSocket close/error, got {other:?}"),
+    };
+    assert!(rejected, "oversized H3 WebSocket frame should be rejected");
+
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        oversized_frames.load(Ordering::Relaxed),
+        0,
+        "oversized H3 WebSocket frame reached backend despite FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    probe_handle.abort();
 }
 
 /// The H3 bridge forwards the client's offered subprotocols to the backend
@@ -933,6 +1619,87 @@ async fn test_h3_websocket_subprotocol_forwarding_and_none() {
         "Echo: plain"
     );
     without_subprotocol.send_close().await.expect("close");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// Origin allowlists are enforced before the H3 Extended CONNECT stream is
+/// upgraded to backend WebSocket transport.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_origin_allowlist_enforced_before_backend_connect() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_origin_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+
+    let mut missing_origin = client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket missing-origin response");
+    assert_eq!(missing_origin.status, StatusCode::FORBIDDEN);
+    assert!(
+        missing_origin
+            .recv_body_text()
+            .await
+            .expect("missing-origin body")
+            .contains("WebSocket Origin not allowed")
+    );
+
+    let mut blocked_origin = client
+        .websocket(
+            &url,
+            WebSocketOptions {
+                headers: vec![("origin".to_string(), "https://evil.example.com".to_string())],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("H3 WebSocket disallowed-origin response");
+    assert_eq!(blocked_origin.status, StatusCode::FORBIDDEN);
+    assert!(
+        blocked_origin
+            .recv_body_text()
+            .await
+            .expect("disallowed-origin body")
+            .contains("WebSocket Origin not allowed")
+    );
+
+    let mut allowed_origin = client
+        .websocket(
+            &url,
+            WebSocketOptions {
+                headers: vec![("origin".to_string(), "HTTPS://APP.EXAMPLE.COM".to_string())],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("H3 WebSocket allowed-origin connect");
+    assert_eq!(allowed_origin.status, StatusCode::OK);
+    allowed_origin
+        .send_text("origin h3")
+        .await
+        .expect("send text");
+    assert_eq!(
+        allowed_origin.recv_text().await.expect("text echo"),
+        "Echo: origin h3"
+    );
+    allowed_origin.send_close().await.expect("close");
 
     let _ = gateway.kill();
     let _ = gateway.wait();
@@ -1064,6 +1831,65 @@ async fn test_h3_websocket_releases_per_ip_request_slot_after_200() {
     ws.send_text("still open").await.expect("send text");
     assert_eq!(ws.recv_text().await.expect("echo"), "Echo: still open");
     ws.send_close().await.expect("close");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    http_handle.abort();
+}
+
+/// Disabling `FERRUM_HTTP3_WEBSOCKET_ENABLED` must only gate RFC 9220
+/// WebSocket Extended CONNECT. Ordinary HTTP/3 traffic on the same listener
+/// must keep working.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_env_disabled_rejects_connect_but_plain_h3_works() {
+    let ws_backend_port = free_port().await;
+    let http_backend_port = free_port().await;
+
+    let echo_handle = tokio::spawn(start_ws_echo_server(ws_backend_port));
+    let http_handle = tokio::spawn(start_http_text_server(http_backend_port, "h3-ok"));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_and_http_config(&config_path, ws_backend_port, http_backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry_extra_env(
+            config_path.to_str().unwrap(),
+            cert_path,
+            key_path,
+            &[("FERRUM_HTTP3_WEBSOCKET_ENABLED", "false")],
+        )
+        .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let plain_url = format!("https://localhost:{gateway_https_port}/plain");
+    let plain = client
+        .get(&plain_url)
+        .await
+        .expect("plain H3 request should still work");
+    assert_eq!(plain.status, StatusCode::OK);
+    assert_eq!(plain.body_text(), "h3-ok");
+
+    let ws_url = format!("https://localhost:{gateway_https_port}/ws-echo");
+    let mut ws = client
+        .websocket(&ws_url, WebSocketOptions::default())
+        .await
+        .expect("disabled H3 WebSocket response");
+    assert_eq!(ws.status, StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        ws.recv_body_text()
+            .await
+            .expect("disabled H3 WebSocket body")
+            .contains("WebSocket over HTTP/3 is disabled"),
+        "disabled H3 WebSocket response should explain the env gate"
+    );
 
     let _ = gateway.kill();
     let _ = gateway.wait();
