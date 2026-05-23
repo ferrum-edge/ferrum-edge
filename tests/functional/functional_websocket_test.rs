@@ -1070,3 +1070,62 @@ async fn test_h3_websocket_releases_per_ip_request_slot_after_200() {
     echo_handle.abort();
     http_handle.abort();
 }
+
+/// Disabling `FERRUM_HTTP3_WEBSOCKET_ENABLED` must only gate RFC 9220
+/// WebSocket Extended CONNECT. Ordinary HTTP/3 traffic on the same listener
+/// must keep working.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_env_disabled_rejects_connect_but_plain_h3_works() {
+    let ws_backend_port = free_port().await;
+    let http_backend_port = free_port().await;
+
+    let echo_handle = tokio::spawn(start_ws_echo_server(ws_backend_port));
+    let http_handle = tokio::spawn(start_http_text_server(http_backend_port, "h3-ok"));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_and_http_config(&config_path, ws_backend_port, http_backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry_extra_env(
+            config_path.to_str().unwrap(),
+            cert_path,
+            key_path,
+            &[("FERRUM_HTTP3_WEBSOCKET_ENABLED", "false")],
+        )
+        .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let plain_url = format!("https://localhost:{gateway_https_port}/plain");
+    let plain = client
+        .get(&plain_url)
+        .await
+        .expect("plain H3 request should still work");
+    assert_eq!(plain.status, StatusCode::OK);
+    assert_eq!(plain.body_text(), "h3-ok");
+
+    let ws_url = format!("https://localhost:{gateway_https_port}/ws-echo");
+    let mut ws = client
+        .websocket(&ws_url, WebSocketOptions::default())
+        .await
+        .expect("disabled H3 WebSocket response");
+    assert_eq!(ws.status, StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        ws.recv_body_text()
+            .await
+            .expect("disabled H3 WebSocket body")
+            .contains("WebSocket over HTTP/3 is disabled"),
+        "disabled H3 WebSocket response should explain the env gate"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    http_handle.abort();
+}
