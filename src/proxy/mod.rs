@@ -8010,10 +8010,8 @@ async fn handle_proxy_request_inner(
     }
 
     // Validate query parameter count (skip empty segments from consecutive '&').
-    // Uses split + filter instead of a raw byte-scan to correctly handle edge
-    // cases like "&&" producing empty segments that shouldn't count as params.
     if state.max_query_params > 0 && !query_string.is_empty() {
-        let param_count = query_string.split('&').filter(|s| !s.is_empty()).count();
+        let param_count = count_query_params(&query_string);
         if param_count > state.max_query_params {
             record_request(&state, 400);
             return Ok(build_response(
@@ -12373,6 +12371,14 @@ pub(crate) fn strip_query_params(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
 }
 
+/// Count query parameters for global request validation.
+///
+/// Empty segments produced by duplicate or leading/trailing ampersands are not
+/// parameters and must not make otherwise equivalent H1/H2/H3 requests diverge.
+pub(crate) fn count_query_params(query_string: &str) -> usize {
+    query_string.split('&').filter(|s| !s.is_empty()).count()
+}
+
 pub(crate) fn query_string_after_plugin_strips<'a>(
     ctx: &RequestContext,
     query_string: &'a str,
@@ -15197,6 +15203,14 @@ mod tests {
         );
 
         assert_eq!(stripped.as_ref(), "a=1&keep=2");
+    }
+
+    #[test]
+    fn count_query_params_ignores_empty_segments() {
+        assert_eq!(count_query_params(""), 0);
+        assert_eq!(count_query_params("&&"), 0);
+        assert_eq!(count_query_params("a=1&&b=2&"), 2);
+        assert_eq!(count_query_params("&a=1&&b=2&&c=3"), 3);
     }
 
     fn route_delta_proxy(

@@ -15,19 +15,20 @@
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H2
 //! - `Transfer-Encoding` rejection on H3
 //! - Empty query segments are ignored by HTTP/3 query-param limit counting
+//! - Query parameter counting parity on H3
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
 //!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
 //!
-//! HTTP/3 validation is covered by unit tests in `tests/unit/gateway_core/protocol_validation_tests.rs`;
-//! TODO: add a functional H3 variant once the quinn test harness is in place.
+//! HTTP/3 validation is covered by unit tests in `tests/unit/gateway_core/protocol_validation_tests.rs`
+//! plus targeted functional QUIC/H3 checks here.
 //!
 //! Run: `cargo test --test functional_tests -- --ignored functional_protocol_validation --nocapture`
 
 use crate::common::TestGateway;
-use crate::scaffolding::clients::{GetOptions, Http3Client};
+use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 
 use bytes::Bytes;
 use http::HeaderMap;
@@ -367,6 +368,53 @@ impl Harness {
 
     fn cleanup(self) {
         self.echo_task.abort();
+    }
+}
+
+async fn start_h3_validation_gateway(
+    echo_port: u16,
+    extra_env: &[(&str, &str)],
+) -> (TestGateway, u16) {
+    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let https_port = https_reservation.local_addr().unwrap().port();
+    drop(https_reservation);
+
+    let mut builder = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key");
+
+    for (key, value) in extra_env {
+        builder = builder.env(*key, *value);
+    }
+
+    let gateway = builder.spawn().await.expect("start gateway with h3");
+    (gateway, https_port)
+}
+
+async fn h3_get_with_startup_retry(
+    client: &Http3Client,
+    url: &str,
+    options: GetOptions,
+) -> Http3Response {
+    let mut last_err = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match client.get_with_options(url, options.clone()).await {
+            Ok(resp) => return resp,
+            Err(err) if std::time::Instant::now() < deadline => {
+                last_err = Some(err.to_string());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => {
+                panic!(
+                    "H3 request did not complete; last startup error={last_err:?}; final error={err}"
+                );
+            }
+        }
     }
 }
 
@@ -755,42 +803,12 @@ async fn functional_protocol_validation_h3_transfer_encoding_rejected() {
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
 
-    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let https_port = https_reservation.local_addr().unwrap().port();
-    drop(https_reservation);
-
-    let mut gateway = TestGateway::builder()
-        .mode_file(build_config(echo_port, false))
-        .log_level("warn")
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-        .spawn()
-        .await
-        .expect("start gateway with h3");
+    let (mut gateway, https_port) = start_h3_validation_gateway(echo_port, &[]).await;
 
     let client = Http3Client::insecure().expect("H3 client");
     let url = format!("https://localhost:{https_port}/");
     let options = GetOptions::default().header("transfer-encoding", "chunked");
-    let mut last_err = None;
-    let resp = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match client.get_with_options(&url, options.clone()).await {
-                Ok(resp) => break resp,
-                Err(err) if std::time::Instant::now() < deadline => {
-                    last_err = Some(err.to_string());
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(err) => {
-                    panic!(
-                        "H3 request with Transfer-Encoding did not complete; last startup error={last_err:?}; final error={err}"
-                    );
-                }
-            }
-        }
-    };
+    let resp = h3_get_with_startup_retry(&client, &url, options).await;
 
     assert_eq!(resp.status.as_u16(), 400, "body={}", resp.body_text());
     assert!(
@@ -808,6 +826,9 @@ async fn functional_protocol_validation_h3_transfer_encoding_rejected() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_empty_query_segments_do_not_count_against_limit() {
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_query_param_limit_ignores_empty_segments() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
@@ -892,6 +913,33 @@ async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_
             .contains("Total request headers exceed maximum size"),
         "unexpected body: {}",
         resp.body
+    let (mut gateway, https_port) =
+        start_h3_validation_gateway(echo_port, &[("FERRUM_MAX_QUERY_PARAMS", "2")]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let allowed_url = format!("https://localhost:{https_port}/?a=1&&b=2&");
+    let allowed = h3_get_with_startup_retry(&client, &allowed_url, GetOptions::default()).await;
+    assert_eq!(
+        allowed.status.as_u16(),
+        200,
+        "empty query segments must not count as params; body={}",
+        allowed.body_text()
+    );
+
+    let rejected_url = format!("https://localhost:{https_port}/?a=1&b=2&c=3");
+    let rejected = h3_get_with_startup_retry(&client, &rejected_url, GetOptions::default()).await;
+    assert_eq!(
+        rejected.status.as_u16(),
+        400,
+        "three non-empty params should exceed FERRUM_MAX_QUERY_PARAMS=2; body={}",
+        rejected.body_text()
+    );
+    assert!(
+        rejected
+            .body_text()
+            .contains("Query parameter count (3) exceeds maximum of 2"),
+        "unexpected body: {}",
+        rejected.body_text()
     );
 
     gateway.shutdown();
@@ -900,6 +948,7 @@ async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_
 
 // --- 11. CONNECT on H1 ------------------------------------------------------
 // --- 10. CONNECT on H1 ------------------------------------------------------
+// --- 9. CONNECT on H1 -------------------------------------------------------
 
 #[ignore]
 #[tokio::test]

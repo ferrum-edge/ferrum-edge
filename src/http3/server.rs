@@ -825,6 +825,7 @@ async fn handle_h3_request(
     // two parameters across all frontend protocols.
     if state.max_query_params > 0 && !query_string.is_empty() {
         let param_count = query_string.split('&').filter(|s| !s.is_empty()).count();
+        let param_count = crate::proxy::count_query_params(&query_string);
         if param_count > state.max_query_params {
             record_request(&state, 400);
             let body = format!(
