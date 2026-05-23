@@ -7,6 +7,7 @@
 //! 4. Full TLS: frontend termination + backend origination simultaneously
 //! 5. TCP idle timeout via per-proxy config and global `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`
 //! 5. TCP backend-read inactivity timeout
+//! 5. TCP idle timeout from per-proxy config and global env fallback
 //!
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_tcp_proxy --ignored --nocapture
@@ -276,6 +277,10 @@ where
 }
 
 async fn start_gateway_with_retry_and_env<F>(
+    start_gateway_with_retry_extra_env(make_config, tls_cert_path, tls_key_path, &[]).await
+}
+
+async fn start_gateway_with_retry_extra_env<F>(
     make_config: F,
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
@@ -768,6 +773,13 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_global_idle_timeout_env() {
+/// Test 6: TCP global idle timeout env fallback.
+///
+/// Leaves `tcp_idle_timeout_seconds` unset on the proxy and verifies
+/// `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` is still applied by the stream listener.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_global_idle_timeout_env_fallback() {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let echo_server = start_tcp_echo_server_on(backend_listener).await;
@@ -799,6 +811,7 @@ async fn test_tcp_proxy_client_half_close_allows_delayed_backend_response() {
     .await;
 
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry_extra_env(
         |proxy_port| {
             format!(
                 r#"
@@ -823,6 +836,7 @@ plugin_configs: []
         None,
         None,
         &[("FERRUM_TCP_IDLE_TIMEOUT_SECONDS", "2")],
+        &[("FERRUM_TCP_IDLE_TIMEOUT_SECONDS", "1")],
     )
     .await;
 
@@ -848,6 +862,8 @@ plugin_configs: []
         .expect("Failed to send");
 
     let mut buf = vec![0u8; 64];
+    sleep(Duration::from_secs(2)).await;
+
     let read_result = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
     match read_result {
         Ok(Ok(0)) => {}
@@ -865,6 +881,15 @@ plugin_configs: []
         Err(_) => panic!("timed out waiting for global idle-timeout closure"),
         Ok(Ok(n)) => panic!("silent backend should not send {n} bytes before timeout"),
         Err(_) => panic!("timed out waiting for backend-read-timeout closure"),
+                Ok(Ok(_)) => {
+                    panic!("Connection should be closed by global TCP idle timeout")
+                }
+                Err(_) => panic!("Timed out waiting for closure after stale data"),
+            }
+        }
+        Err(_) => {
+            panic!("Timed out waiting for global TCP idle-timeout closure; connection stayed open")
+        }
     }
 
     let _ = gateway.kill();
