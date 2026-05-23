@@ -30,7 +30,7 @@ use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use crate::scaffolding::{Http3Client, WebSocketOptions};
+use crate::scaffolding::{H3WebSocketFrame, Http3Client, WebSocketOptions};
 
 // ============================================================================
 // Helpers
@@ -38,6 +38,8 @@ use crate::scaffolding::{Http3Client, WebSocketOptions};
 
 const WS_FRAME_LIMIT_UNDER_TEST: usize = 64;
 const WS_OVERSIZE_FRAME_BYTES: usize = WS_FRAME_LIMIT_UNDER_TEST * 2;
+const WS_H3_FRAME_LIMIT_UNDER_TEST: usize = 64;
+const WS_H3_OVERSIZE_FRAME_BYTES: usize = WS_H3_FRAME_LIMIT_UNDER_TEST * 2;
 
 /// Allocate a free port by binding to port 0 and returning the assigned port.
 async fn free_port() -> u16 {
@@ -140,6 +142,16 @@ async fn start_ws_frame_limit_probe_server(
             let client_oversize_frames = client_oversize_frames.clone();
             let server_oversize_frames = server_oversize_frames.clone();
 
+/// Start a WebSocket probe backend that counts oversized client frames.
+#[allow(clippy::collapsible_match)]
+async fn start_ws_oversize_probe_server(port: u16, oversized_frames: Arc<AtomicUsize>) {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind WS oversize probe server");
+
+    loop {
+        if let Ok((stream, _addr)) = listener.accept().await {
+            let oversized_frames = oversized_frames.clone();
             tokio::spawn(async move {
                 let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                     Ok(s) => s,
@@ -164,6 +176,9 @@ async fn start_ws_frame_limit_probe_server(
                                 continue;
                             }
 
+                            if text.len() > WS_H3_FRAME_LIMIT_UNDER_TEST {
+                                oversized_frames.fetch_add(1, Ordering::Relaxed);
+                            }
                             let echo = format!("Echo: {}", text);
                             if sink.send(Message::Text(echo.into())).await.is_err() {
                                 break;
@@ -174,6 +189,9 @@ async fn start_ws_frame_limit_probe_server(
                                 client_oversize_frames.fetch_add(1, Ordering::Relaxed);
                             }
 
+                            if data.len() > WS_H3_FRAME_LIMIT_UNDER_TEST {
+                                oversized_frames.fetch_add(1, Ordering::Relaxed);
+                            }
                             let echo = format!("Echo binary: {} bytes", data.len());
                             if sink.send(Message::Text(echo.into())).await.is_err() {
                                 break;
@@ -1343,6 +1361,19 @@ async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
 #[tokio::test]
 async fn test_h3_websocket_disabled_by_env_returns_501() {
     let backend_port = free_port().await;
+/// H3 WebSocket always uses the shared frame-parsed relay. Verify the global
+/// WebSocket frame-size env limit rejects oversized RFC 9220 client frames
+/// before they reach the backend.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_global_frame_limit_rejects_oversized_client_frame() {
+    let backend_port = free_port().await;
+    let oversized_frames = Arc::new(AtomicUsize::new(0));
+    let probe_handle = tokio::spawn(start_ws_oversize_probe_server(
+        backend_port,
+        oversized_frames.clone(),
+    ));
+    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -1352,12 +1383,18 @@ async fn test_h3_websocket_disabled_by_env_returns_501() {
     let key_path = "tests/certs/server.key";
 
     build_gateway().expect("Failed to build gateway");
+    let frame_limit = WS_H3_FRAME_LIMIT_UNDER_TEST.to_string();
+    let extra_env = [(
+        "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES",
+        frame_limit.as_str(),
+    )];
     let (mut gateway, _gateway_http_port, gateway_https_port) =
         start_gateway_tls_with_retry_extra_env(
             config_path.to_str().unwrap(),
             cert_path,
             key_path,
             &[("FERRUM_HTTP3_WEBSOCKET_ENABLED", "false")],
+            &extra_env,
         )
         .await;
 
@@ -1373,10 +1410,48 @@ async fn test_h3_websocket_disabled_by_env_returns_501() {
             .await
             .expect("disabled H3 WebSocket body")
             .contains("WebSocket over HTTP/3 is disabled"),
+        .expect("H3 WebSocket connect");
+    assert_eq!(ws.status, StatusCode::OK);
+
+    ws.send_text("small h3").await.expect("send small text");
+    assert_eq!(
+        ws.recv_text().await.expect("small text echo"),
+        "Echo: small h3"
+    );
+
+    let oversized_payload = "x".repeat(WS_H3_OVERSIZE_FRAME_BYTES);
+    ws.send_text(&oversized_payload)
+        .await
+        .expect("send oversized H3 WebSocket frame");
+
+    let rejected = match tokio::time::timeout(Duration::from_secs(5), ws.recv_frame()).await {
+        Ok(Ok(H3WebSocketFrame::Text(text))) => {
+            panic!(
+                "oversized H3 WebSocket frame was echoed to client ({} bytes)",
+                text.len()
+            );
+        }
+        Ok(Ok(H3WebSocketFrame::Binary(data))) => {
+            panic!(
+                "oversized H3 WebSocket frame was echoed as binary ({} bytes)",
+                data.len()
+            );
+        }
+        Ok(Ok(H3WebSocketFrame::Close(_))) | Ok(Err(_)) | Err(_) => true,
+        Ok(Ok(other)) => panic!("expected H3 WebSocket close/error, got {other:?}"),
+    };
+    assert!(rejected, "oversized H3 WebSocket frame should be rejected");
+
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        oversized_frames.load(Ordering::Relaxed),
+        0,
+        "oversized H3 WebSocket frame reached backend despite FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES"
     );
 
     let _ = gateway.kill();
     let _ = gateway.wait();
+    probe_handle.abort();
 }
 
 /// The H3 bridge forwards the client's offered subprotocols to the backend
