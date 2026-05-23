@@ -75,6 +75,7 @@ mod functional_udp_proxy_test;
 mod functional_websocket_limits_test;
 mod functional_url_query_limits_test;
 mod functional_websocket_connection_limit_test;
+mod functional_websocket_frame_limit_test;
 mod functional_websocket_test;
 mod functional_ws_origin_test;
 mod functional_ws_plugins_test;
