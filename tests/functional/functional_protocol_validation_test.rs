@@ -14,6 +14,7 @@
 //! - `Transfer-Encoding` rejection on H3
 //! - Empty query segments are ignored by HTTP/3 query-param limit counting
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
+//! - HTTP/1.1 slow/incomplete header timeout, including `0` disable semantics
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
 //!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
@@ -252,6 +253,9 @@ fn assert_hop_by_hop_response_headers_stripped(hdrs: &HeaderMap) {
         hdrs.get("x-backend-marker").is_some(),
         "non-hop-by-hop backend header should pass through; headers={hdrs:?}"
     );
+fn parse_status_from_response_prefix(bytes: &[u8]) -> Option<u16> {
+    let text = String::from_utf8_lossy(bytes);
+    text.lines().next()?.split_whitespace().nth(1)?.parse().ok()
 }
 
 // ============================================================================
@@ -291,17 +295,23 @@ struct Harness {
 
 impl Harness {
     async fn new(with_host: bool) -> Self {
+        Self::new_with_env(with_host, &[]).await
+    }
+
+    async fn new_with_env(with_host: bool, extra_env: &[(&str, &str)]) -> Self {
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
         sleep(Duration::from_millis(150)).await;
 
-        let gateway = TestGateway::builder()
+        let mut builder = TestGateway::builder()
             .mode_file(build_config(echo_port, with_host))
-            .log_level("warn")
-            .spawn()
-            .await
-            .expect("start gateway");
+            .log_level("warn");
+        for (key, value) in extra_env {
+            builder = builder.env(*key, *value);
+        }
+
+        let gateway = builder.spawn().await.expect("start gateway");
         // `wait_for_health` only verifies the admin port. The proxy listener
         // is bound on a separate spawned task; on a loaded CI runner there is
         // a brief window where `/health` is green but raw `TcpStream::connect`
@@ -747,6 +757,90 @@ async fn functional_protocol_validation_connect_rejected_http1() {
 }
 
 // --- 11. Backend sees sanitized request (hop-by-hop headers stripped) ------
+// --- 10. H1 slow header timeout env ----------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h1_header_timeout_closes_incomplete_request() {
+    let h = Harness::new_with_env(false, &[("FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS", "1")]).await;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
+        .await
+        .expect("connect to gateway");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Slow:")
+        .await
+        .expect("write partial request headers");
+    stream.flush().await.expect("flush partial request");
+
+    let mut first = [0u8; 256];
+    match tokio::time::timeout(Duration::from_secs(4), stream.read(&mut first)).await {
+        Err(_) => panic!("gateway kept incomplete H1 headers open past configured timeout"),
+        Ok(Ok(0)) => {}
+        Ok(Err(err))
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ) => {}
+        Ok(Err(err)) => panic!("unexpected read error after header timeout: {err}"),
+        Ok(Ok(n)) => {
+            let mut response = first[..n].to_vec();
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
+                .await;
+            let status = parse_status_from_response_prefix(&response).unwrap_or(0);
+            assert!(
+                (400..500).contains(&status),
+                "slow incomplete headers should be rejected, got status={status} body={}",
+                String::from_utf8_lossy(&response)
+            );
+        }
+    }
+
+    let resp = send_raw_h1(h.proxy_port, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+    assert_eq!(
+        resp.status_code, 200,
+        "gateway should continue serving valid H1 requests after timing out a slow header; body={}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h1_header_timeout_zero_disables_timer() {
+    let h = Harness::new_with_env(false, &[("FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS", "0")]).await;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
+        .await
+        .expect("connect to gateway");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Slow:")
+        .await
+        .expect("write partial request headers");
+    stream.flush().await.expect("flush partial request");
+
+    let mut one = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_millis(1400), stream.read(&mut one)).await;
+    assert!(
+        read.is_err(),
+        "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0 should leave incomplete H1 headers open; read result={read:?}"
+    );
+    drop(stream);
+
+    let resp = send_raw_h1(h.proxy_port, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+    assert_eq!(
+        resp.status_code, 200,
+        "gateway should still accept valid H1 requests when header timeout is disabled; body={}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+// --- 12. Backend sees sanitized request (hop-by-hop headers stripped) ------
 
 #[ignore]
 #[tokio::test]
@@ -785,6 +879,7 @@ async fn functional_protocol_validation_request_te_stripped_before_backend() {
 }
 
 // --- 12. Response hop-by-hop headers stripped before client ----------------
+// --- 13. Response hop-by-hop headers stripped before client ----------------
 
 #[ignore]
 #[tokio::test]
