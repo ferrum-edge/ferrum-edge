@@ -9,6 +9,7 @@
 //!    WebSocket connections
 //! 6. Verifies configured WebSocket Origin allowlists across H1 Upgrade and
 //!    H3 Extended CONNECT envelopes
+//! 6. Exercises global WebSocket connection admission limits
 //!
 //! This test is marked with #[ignore] as it requires the binary to be built
 //! and should be run with: cargo test --test functional_tests functional_websocket -- --ignored --nocapture
@@ -229,24 +230,6 @@ fn gateway_binary_path() -> &'static str {
     } else {
         "./target/release/ferrum-edge"
     }
-}
-
-/// Start the gateway in file mode with optional TLS configuration.
-fn start_gateway(
-    config_path: &str,
-    http_port: u16,
-    https_port: Option<u16>,
-    tls_cert_path: Option<&str>,
-    tls_key_path: Option<&str>,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    start_gateway_with_extra_env(
-        config_path,
-        http_port,
-        https_port,
-        tls_cert_path,
-        tls_key_path,
-        &[],
-    )
 }
 
 fn start_gateway_with_extra_env(
@@ -535,16 +518,28 @@ async fn start_gateway_with_retry(
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
 ) -> (std::process::Child, u16) {
+    start_gateway_with_retry_extra_env(config_path, https_port, tls_cert_path, tls_key_path, &[])
+        .await
+}
+
+async fn start_gateway_with_retry_extra_env(
+    config_path: &str,
+    https_port: Option<u16>,
+    tls_cert_path: Option<&str>,
+    tls_key_path: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Child, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
-        match start_gateway(
+        match start_gateway_with_extra_env(
             config_path,
             gateway_port,
             https_port,
             tls_cert_path,
             tls_key_path,
+            extra_env,
         ) {
             Ok(mut child) => match wait_for_gateway(gateway_port).await {
                 Ok(()) => return (child, gateway_port),
@@ -1134,6 +1129,11 @@ async fn test_h2_websocket_extended_connect_echo() {
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
+/// Global WebSocket connection admission should reject a second upgraded
+/// session while the first one is still open.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_global_connection_limit_rejects_second_upgrade() {
     let backend_port = free_port().await;
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
     sleep(Duration::from_millis(300)).await;
@@ -1215,6 +1215,70 @@ async fn test_h2_websocket_extended_connect_echo() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_h2_websocket_extended_connect_echo PASSED");
+    let (mut gateway, gateway_port) = start_gateway_with_retry_extra_env(
+        config_path.to_str().unwrap(),
+        None,
+        None,
+        None,
+        &[("FERRUM_WEBSOCKET_MAX_CONNECTIONS", "1")],
+    )
+    .await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut first_ws, _first_response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("first WebSocket should connect");
+    first_ws
+        .send(Message::Text("first".into()))
+        .await
+        .expect("send first");
+    assert_eq!(
+        first_ws
+            .next()
+            .await
+            .expect("first echo frame")
+            .expect("first echo result"),
+        Message::Text("Echo: first".into())
+    );
+
+    let second = tokio_tungstenite::connect_async(&url).await;
+    match second {
+        Err(WsError::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = response
+                .body()
+                .as_ref()
+                .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+                .unwrap_or_default();
+            assert!(
+                body.contains("WebSocket connection limit exceeded"),
+                "unexpected rejection body: {body}"
+            );
+        }
+        Ok(_) => panic!("second WebSocket upgrade should be rejected by global limit"),
+        Err(err) => panic!("unexpected second WebSocket error: {err:?}"),
+    }
+
+    first_ws
+        .send(Message::Text("still-open".into()))
+        .await
+        .expect("send still-open");
+    assert_eq!(
+        first_ws
+            .next()
+            .await
+            .expect("still-open echo frame")
+            .expect("still-open echo result"),
+        Message::Text("Echo: still-open".into())
+    );
+
+    first_ws
+        .send(Message::Close(None))
+        .await
+        .expect("close first");
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
 }
 
 /// Test HTTP/3 WebSocket (RFC 9220 Extended CONNECT) proxying through the
