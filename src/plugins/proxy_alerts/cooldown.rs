@@ -37,7 +37,7 @@ impl CooldownGate {
     pub fn new() -> Self {
         let shard_amount = pool_shard_amount(0);
         Self {
-            last_sent: DashMap::new(),
+            last_sent: DashMap::with_shard_amount(shard_amount),
             inner_shard_amount: shard_amount,
         }
     }

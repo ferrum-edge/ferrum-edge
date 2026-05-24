@@ -45,6 +45,7 @@ mod loki_logging_tests;
 mod mesh_plugins_tests;
 mod mtls_auth_tests;
 mod opa_tests;
+mod openapi_validator_tests;
 mod otel_tracing_tests;
 mod plugin_cache_tests;
 mod plugin_http_client_tests;

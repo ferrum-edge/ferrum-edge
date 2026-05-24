@@ -55,6 +55,25 @@ pub const MAX_TAG_LENGTH: usize = 255;
 pub const MAX_LOCALITY_LENGTH: usize = 255;
 /// Maximum size of plugin config JSON in bytes.
 pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
+/// Maximum OpenAPI validator config JSON size in bytes.
+///
+/// Generated validator configs embed resolved operation schemas, so they need
+/// a larger budget than ordinary plugin configs. Keep this safely below
+/// MongoDB's 16 MiB BSON document ceiling because database mode may store a
+/// generated validator as one plugin row.
+pub const MAX_OPENAPI_VALIDATOR_CONFIG_SIZE: usize = 14_680_064; // 14 MiB
+/// Maximum OpenAPI validator config JSON nesting depth.
+pub const MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH: usize = 64;
+/// Default OpenAPI validator media types for generated and direct configs.
+pub const OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES: &[&str] = &[
+    "application/json",
+    "application/xml",
+    "text/xml",
+    "application/x-www-form-urlencoded",
+    "multipart/form-data",
+    "text/plain",
+    "application/octet-stream",
+];
 /// Maximum size of consumer credentials JSON in bytes.
 pub const MAX_CREDENTIALS_SIZE: usize = 65_536; // 64 KiB
 /// Maximum length for individual credential string values (API keys, secrets, identities).
@@ -4477,17 +4496,30 @@ impl PluginConfig {
 
         // Config JSON size
         let config_json = serde_json::to_string(&self.config).unwrap_or_default();
-        if config_json.len() > MAX_PLUGIN_CONFIG_SIZE {
+        let max_config_size = if self.plugin_name == "openapi_validator" {
+            MAX_OPENAPI_VALIDATOR_CONFIG_SIZE
+        } else {
+            MAX_PLUGIN_CONFIG_SIZE
+        };
+        if config_json.len() > max_config_size {
             errors.push(format!(
                 "config JSON must not exceed {} bytes (got {})",
-                MAX_PLUGIN_CONFIG_SIZE,
+                max_config_size,
                 config_json.len()
             ));
         }
 
         // Config JSON nesting depth
-        if json_depth(&self.config) > 10 {
-            errors.push("config JSON nesting depth must not exceed 10".to_string());
+        let max_config_depth = if self.plugin_name == "openapi_validator" {
+            MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH
+        } else {
+            10
+        };
+        if json_depth(&self.config) > max_config_depth {
+            errors.push(format!(
+                "config JSON nesting depth must not exceed {}",
+                max_config_depth
+            ));
         }
 
         // Priority override range (0–10000 keeps plugins within sane ordering bands)
@@ -5196,7 +5228,7 @@ impl GatewayConfig {
 }
 
 /// Compute the maximum nesting depth of a JSON value.
-fn json_depth(value: &serde_json::Value) -> usize {
+pub(crate) fn json_depth(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Array(arr) => 1 + arr.iter().map(json_depth).max().unwrap_or(0),
         serde_json::Value::Object(map) => 1 + map.values().map(json_depth).max().unwrap_or(0),

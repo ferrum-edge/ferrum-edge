@@ -322,7 +322,7 @@ impl WindowStore {
     pub fn new(rule_specs: HashMap<u32, RuleWindowSpec>) -> Self {
         let shard_amount = pool_shard_amount(0);
         Self {
-            by_rule: DashMap::new(),
+            by_rule: DashMap::with_shard_amount(shard_amount),
             rule_specs,
             inner_shard_amount: shard_amount,
         }

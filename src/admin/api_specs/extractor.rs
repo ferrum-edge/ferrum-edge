@@ -17,8 +17,13 @@
 // Re-export so Wave 3 handlers can `use crate::admin::api_specs::SpecFormat`
 // without knowing that the canonical definition lives in config::types.
 pub use crate::config::types::SpecFormat;
-use crate::config::types::validate_resource_id;
+use crate::config::types::{
+    MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH, MAX_OPENAPI_VALIDATOR_CONFIG_SIZE,
+    OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES, json_depth, validate_resource_id,
+};
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
+use chrono::Utc;
+use serde_json::{Map, Value, json};
 
 /// HTTP method keys counted when computing `operation_count`.
 const HTTP_METHODS: &[&str] = &[
@@ -113,6 +118,10 @@ pub enum ExtractError {
     /// matching LIKE pattern.
     #[error("tag '{name}' contains forbidden character '{char}' (\", %, _, or \\\\)")]
     InvalidTagName { name: String, char: char },
+    #[error("external $ref '{reference}' is not supported in x-ferrum-validate schemas")]
+    UnsupportedExternalRef { reference: String },
+    #[error("schema reference depth exceeded while resolving '{location}'")]
+    SchemaTooDeep { location: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -303,7 +312,7 @@ pub fn extract(
     }
 
     // --- x-ferrum-plugins (optional array) --------------------------------
-    let plugins = if let Some(plugins_val) = root.get("x-ferrum-plugins") {
+    let mut plugins = if let Some(plugins_val) = root.get("x-ferrum-plugins") {
         let arr = plugins_val
             .as_array()
             .ok_or_else(|| ExtractError::MalformedExtension {
@@ -367,7 +376,7 @@ pub fn extract(
             }
 
             // Walk config for forbidden credential / consumer keys.
-            if let Some(key) = find_forbidden_key(&pc.config) {
+            if let Some(key) = find_forbidden_key_for_plugin(&pc.plugin_name, &pc.config) {
                 return Err(ExtractError::PluginContainsCredentials {
                     plugin_id: pc.id,
                     key: key.to_string(),
@@ -396,6 +405,18 @@ pub fn extract(
     } else {
         Vec::new()
     };
+
+    if let Some(validate_ext) = parse_x_ferrum_validate_extension(&root)? {
+        let operations = extract_operation_schemas(&root, &version)?;
+        auto_inject_openapi_validator(
+            &mut plugins,
+            &proxy,
+            namespace,
+            validate_ext,
+            operations,
+            &version,
+        )?;
+    }
 
     // --- Build proxy.plugins association list (Fix 2) -----------------------
     // The PluginCache only instantiates plugins whose IDs appear in the proxy's
@@ -494,6 +515,727 @@ pub struct ExtractedMetadata {
     pub tags: Vec<String>,
     pub server_urls: Vec<String>,
     pub operation_count: u32,
+}
+
+fn parse_x_ferrum_validate_extension(root: &Value) -> Result<Option<Value>, ExtractError> {
+    let Some(value) = root.get("x-ferrum-validate") else {
+        return Ok(None);
+    };
+    match value {
+        Value::Bool(true) => Ok(Some(json!({}))),
+        Value::Bool(false) | Value::Null => Ok(None),
+        Value::Object(_) => Ok(Some(value.clone())),
+        other => Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            error: format!("expected true, false, or object; got {other}"),
+        }),
+    }
+}
+
+fn auto_inject_openapi_validator(
+    plugins: &mut Vec<PluginConfig>,
+    proxy: &Proxy,
+    namespace: &str,
+    validate_ext: Value,
+    operations: Vec<Value>,
+    version: &str,
+) -> Result<(), ExtractError> {
+    let mut config = Map::new();
+    config.insert(
+        "enforcement_mode".to_string(),
+        Value::String("block".to_string()),
+    );
+    config.insert("validate_request".to_string(), Value::Bool(true));
+    config.insert("validate_response".to_string(), Value::Bool(true));
+    config.insert(
+        "request_content_types".to_string(),
+        json!(OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES),
+    );
+    config.insert(
+        "response_content_types".to_string(),
+        json!(OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES),
+    );
+    config.insert("fail_on_unknown_operation".to_string(), Value::Bool(true));
+    config.insert(
+        "fail_on_missing_response_schema".to_string(),
+        Value::Bool(false),
+    );
+    config.insert(
+        "schema_draft".to_string(),
+        Value::String(schema_draft_for_openapi(version)),
+    );
+    apply_validate_extension(&mut config, validate_ext)?;
+    config.insert("operations".to_string(), Value::Array(operations));
+
+    let auto_config = Value::Object(config);
+    if let Some(existing) = plugins
+        .iter_mut()
+        .find(|plugin| plugin.plugin_name == "openapi_validator")
+    {
+        let merged = merge_openapi_validator_config(auto_config, &existing.config)?;
+        validate_openapi_validator_config_budget(&merged)?;
+        existing.config = merged;
+        return Ok(());
+    }
+
+    validate_openapi_validator_config_budget(&auto_config)?;
+    let now = Utc::now();
+    plugins.push(PluginConfig {
+        id: String::new(),
+        plugin_name: "openapi_validator".to_string(),
+        namespace: namespace.to_string(),
+        config: auto_config,
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy.id.clone()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    });
+    Ok(())
+}
+
+fn schema_draft_for_openapi(version: &str) -> String {
+    if version == "2.0" || version.starts_with("3.0.") {
+        "draft7".to_string()
+    } else {
+        "draft2020-12".to_string()
+    }
+}
+
+fn validate_openapi_validator_config_budget(config: &Value) -> Result<(), ExtractError> {
+    let size = serde_json::to_vec(config)
+        .map_err(|error| ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            error: format!("generated openapi_validator config could not be serialized: {error}"),
+        })?
+        .len();
+    if size > MAX_OPENAPI_VALIDATOR_CONFIG_SIZE {
+        return Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            error: format!(
+                "generated openapi_validator config must not exceed {MAX_OPENAPI_VALIDATOR_CONFIG_SIZE} bytes (got {size})"
+            ),
+        });
+    }
+    let depth = json_depth(config);
+    if depth > MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH {
+        return Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            error: format!(
+                "generated openapi_validator config depth must not exceed {MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH} (got {depth})"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn apply_validate_extension(
+    config: &mut Map<String, Value>,
+    validate_ext: Value,
+) -> Result<(), ExtractError> {
+    let Value::Object(map) = validate_ext else {
+        return Ok(());
+    };
+    for (key, value) in map {
+        match key.as_str() {
+            "operations" => {}
+            "mode" => {
+                config.insert("enforcement_mode".to_string(), value);
+            }
+            "request" => {
+                apply_validate_side_extension(config, "request", value)?;
+            }
+            "response" => {
+                apply_validate_side_extension(config, "response", value)?;
+            }
+            "bypass" => {
+                validate_openapi_validator_bypass("x-ferrum-validate", &value)?;
+                config.insert(key, value);
+            }
+            _ => {
+                config.insert(key, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_validate_side_extension(
+    config: &mut Map<String, Value>,
+    side: &'static str,
+    value: Value,
+) -> Result<(), ExtractError> {
+    let Value::Object(map) = value else {
+        return Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            error: format!("'{side}' must be an object"),
+        });
+    };
+    for (key, value) in map {
+        match key.as_str() {
+            "enabled" => {
+                config.insert(format!("validate_{side}"), value);
+            }
+            "content_types" => {
+                config.insert(format!("{side}_content_types"), value);
+            }
+            _ => {
+                config.insert(key, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_openapi_validator_bypass(
+    which: &'static str,
+    value: &Value,
+) -> Result<(), ExtractError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ExtractError::MalformedExtension {
+            which,
+            error: "openapi_validator bypass config must be an object".to_string(),
+        })?;
+    for key in ["paths", "methods", "consumers"] {
+        if let Some(value) = object.get(key)
+            && !value.is_array()
+        {
+            return Err(ExtractError::MalformedExtension {
+                which,
+                error: format!("openapi_validator bypass.{key} must be an array"),
+            });
+        }
+    }
+    if let Some(value) = object.get("header_present")
+        && !value.is_object()
+    {
+        return Err(ExtractError::MalformedExtension {
+            which,
+            error: "openapi_validator bypass.header_present must be an object".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn merge_openapi_validator_config(
+    auto_config: Value,
+    operator_config: &Value,
+) -> Result<Value, ExtractError> {
+    let mut base =
+        auto_config
+            .as_object()
+            .cloned()
+            .ok_or_else(|| ExtractError::MalformedExtension {
+                which: "x-ferrum-validate",
+                error: "generated openapi_validator config was not an object".to_string(),
+            })?;
+    let operator = operator_config
+        .as_object()
+        .ok_or_else(|| ExtractError::MalformedExtension {
+            which: "x-ferrum-plugins",
+            error: "openapi_validator config must be an object".to_string(),
+        })?;
+    for (key, value) in operator {
+        match key.as_str() {
+            "operations" => {}
+            "bypass" => merge_bypass_config(&mut base, value)?,
+            _ => {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Ok(Value::Object(base))
+}
+
+fn merge_bypass_config(
+    base: &mut Map<String, Value>,
+    operator_bypass: &Value,
+) -> Result<(), ExtractError> {
+    validate_openapi_validator_bypass("x-ferrum-plugins", operator_bypass)?;
+    let operator = operator_bypass
+        .as_object()
+        .ok_or_else(|| ExtractError::MalformedExtension {
+            which: "x-ferrum-plugins",
+            error: "openapi_validator bypass config must be an object".to_string(),
+        })?;
+    let base_bypass = base
+        .entry("bypass".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let base_object =
+        base_bypass
+            .as_object_mut()
+            .ok_or_else(|| ExtractError::MalformedExtension {
+                which: "x-ferrum-validate",
+                error: "generated openapi_validator bypass config was not an object".to_string(),
+            })?;
+    for (key, value) in operator {
+        match key.as_str() {
+            "paths" | "methods" | "consumers" => {
+                let mut values = match base_object.get(key) {
+                    Some(Value::Array(values)) => values.clone(),
+                    Some(_) => {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "x-ferrum-validate",
+                            error: format!("openapi_validator bypass.{key} must be an array"),
+                        });
+                    }
+                    None => Vec::new(),
+                };
+                if let Some(operator_values) = value.as_array() {
+                    for candidate in operator_values {
+                        if !values.iter().any(|existing| existing == candidate) {
+                            values.push(candidate.clone());
+                        }
+                    }
+                    base_object.insert(key.clone(), Value::Array(values));
+                } else {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "x-ferrum-plugins",
+                        error: format!("openapi_validator bypass.{key} must be an array"),
+                    });
+                }
+            }
+            "header_present" => {
+                let mut headers = match base_object.get(key) {
+                    Some(Value::Object(headers)) => headers.clone(),
+                    Some(_) => {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "x-ferrum-validate",
+                            error: "openapi_validator bypass.header_present must be an object"
+                                .to_string(),
+                        });
+                    }
+                    None => Map::new(),
+                };
+                let Some(operator_headers) = value.as_object() else {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "x-ferrum-plugins",
+                        error: "openapi_validator bypass.header_present must be an object"
+                            .to_string(),
+                    });
+                };
+                headers.extend(operator_headers.clone());
+                base_object.insert(key.clone(), Value::Object(headers));
+            }
+            _ => {
+                base_object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, ExtractError> {
+    let Some(paths) = root.get("paths").and_then(Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    let mut operations = Vec::new();
+    let schema_draft = if version == "2.0" || version.starts_with("3.0.") {
+        "draft7"
+    } else {
+        "draft2020-12"
+    };
+    for (path_template, path_item) in paths {
+        let Some(path_object) = path_item.as_object() else {
+            continue;
+        };
+        for method in HTTP_METHODS {
+            let Some(operation) = path_object.get(*method).and_then(Value::as_object) else {
+                continue;
+            };
+            let request_body = if version == "2.0" {
+                extract_swagger_request_body(root, path_object, operation, version)?
+            } else {
+                extract_openapi_request_body(root, operation, version)?
+            };
+            let responses = if version == "2.0" {
+                extract_swagger_responses(root, path_object, operation, version)?
+            } else {
+                extract_openapi_responses(root, operation, version)?
+            };
+            let mut entry = Map::new();
+            entry.insert(
+                "method".to_string(),
+                Value::String(method.to_ascii_uppercase()),
+            );
+            entry.insert(
+                "path_template".to_string(),
+                Value::String(path_template.clone()),
+            );
+            entry.insert(
+                "path_regex".to_string(),
+                Value::String(path_template_to_regex(path_template)?),
+            );
+            entry.insert(
+                "schema_draft".to_string(),
+                Value::String(schema_draft.to_string()),
+            );
+            if let Some((required, content)) = request_body {
+                entry.insert("request_required".to_string(), Value::Bool(required));
+                entry.insert("request_body".to_string(), json!({ "content": content }));
+            }
+            if !responses.is_empty() {
+                entry.insert("responses".to_string(), Value::Object(responses));
+            }
+            operations.push(Value::Object(entry));
+        }
+    }
+    Ok(operations)
+}
+
+fn extract_openapi_request_body(
+    root: &Value,
+    operation: &Map<String, Value>,
+    version: &str,
+) -> Result<ExtractedRequestBodySchemas, ExtractError> {
+    let Some(request_body) = operation.get("requestBody") else {
+        return Ok(None);
+    };
+    let resolved = resolve_refs(
+        root,
+        request_body,
+        "#/paths/requestBody",
+        MAX_SCHEMA_REF_DEPTH,
+    )?;
+    let Some(object) = resolved.as_object() else {
+        return Ok(None);
+    };
+    let required = object
+        .get("required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut content_schemas = Map::new();
+    if let Some(content) = object.get("content").and_then(Value::as_object) {
+        for (media_type, media) in content {
+            if let Some(schema) = media.get("schema") {
+                let schema = resolve_refs(root, schema, media_type, MAX_SCHEMA_REF_DEPTH)?;
+                content_schemas.insert(
+                    media_type.clone(),
+                    normalize_schema_for_openapi(schema, version),
+                );
+            }
+        }
+    }
+    if content_schemas.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some((required, content_schemas)))
+    }
+}
+
+fn extract_openapi_responses(
+    root: &Value,
+    operation: &Map<String, Value>,
+    version: &str,
+) -> Result<Map<String, Value>, ExtractError> {
+    let mut out = Map::new();
+    let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
+        return Ok(out);
+    };
+    for (status, response) in responses {
+        let resolved = resolve_refs(root, response, status, MAX_SCHEMA_REF_DEPTH)?;
+        let Some(response_object) = resolved.as_object() else {
+            continue;
+        };
+        let mut content_schemas = Map::new();
+        if let Some(content) = response_object.get("content").and_then(Value::as_object) {
+            for (media_type, media) in content {
+                if let Some(schema) = media.get("schema") {
+                    let schema = resolve_refs(root, schema, media_type, MAX_SCHEMA_REF_DEPTH)?;
+                    content_schemas.insert(
+                        media_type.clone(),
+                        normalize_schema_for_openapi(schema, version),
+                    );
+                }
+            }
+        }
+        if !content_schemas.is_empty() {
+            out.insert(status.clone(), Value::Object(content_schemas));
+        }
+    }
+    Ok(out)
+}
+
+fn extract_swagger_request_body(
+    root: &Value,
+    path_item: &Map<String, Value>,
+    operation: &Map<String, Value>,
+    version: &str,
+) -> Result<ExtractedRequestBodySchemas, ExtractError> {
+    let parameters = operation
+        .get("parameters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(
+            path_item
+                .get("parameters")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        );
+    for parameter in parameters {
+        let resolved = resolve_refs(root, parameter, "#/paths/parameters", MAX_SCHEMA_REF_DEPTH)?;
+        let Some(parameter_object) = resolved.as_object() else {
+            continue;
+        };
+        if parameter_object.get("in").and_then(Value::as_str) != Some("body") {
+            continue;
+        }
+        let Some(schema) = parameter_object.get("schema") else {
+            continue;
+        };
+        let schema = resolve_refs(root, schema, "body", MAX_SCHEMA_REF_DEPTH)?;
+        let schema = normalize_schema_for_openapi(schema, version);
+        let required = parameter_object
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut content = Map::new();
+        for media_type in swagger_media_types(root, path_item, operation, "consumes") {
+            content.insert(media_type, schema.clone());
+        }
+        return Ok(Some((required, content)));
+    }
+    Ok(None)
+}
+
+fn extract_swagger_responses(
+    root: &Value,
+    path_item: &Map<String, Value>,
+    operation: &Map<String, Value>,
+    version: &str,
+) -> Result<Map<String, Value>, ExtractError> {
+    let mut out = Map::new();
+    let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
+        return Ok(out);
+    };
+    let produces = swagger_media_types(root, path_item, operation, "produces");
+    for (status, response) in responses {
+        let resolved = resolve_refs(root, response, status, MAX_SCHEMA_REF_DEPTH)?;
+        let Some(response_object) = resolved.as_object() else {
+            continue;
+        };
+        let Some(schema) = response_object.get("schema") else {
+            continue;
+        };
+        let schema = resolve_refs(root, schema, status, MAX_SCHEMA_REF_DEPTH)?;
+        let schema = normalize_schema_for_openapi(schema, version);
+        let mut content = Map::new();
+        for media_type in &produces {
+            content.insert(media_type.clone(), schema.clone());
+        }
+        out.insert(status.clone(), Value::Object(content));
+    }
+    Ok(out)
+}
+
+fn swagger_media_types(
+    root: &Value,
+    path_item: &Map<String, Value>,
+    operation: &Map<String, Value>,
+    key: &'static str,
+) -> Vec<String> {
+    operation
+        .get(key)
+        .or_else(|| path_item.get(key))
+        .or_else(|| root.get(key))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .filter(|values: &Vec<String>| !values.is_empty())
+        .unwrap_or_else(|| vec!["application/json".to_string()])
+}
+
+const MAX_SCHEMA_REF_DEPTH: usize = 32;
+type ExtractedRequestBodySchemas = Option<(bool, Map<String, Value>)>;
+
+fn resolve_refs(
+    root: &Value,
+    value: &Value,
+    location: &str,
+    depth: usize,
+) -> Result<Value, ExtractError> {
+    if depth == 0 {
+        return Err(ExtractError::SchemaTooDeep {
+            location: location.to_string(),
+        });
+    }
+    match value {
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                if !reference.starts_with('#') {
+                    return Err(ExtractError::UnsupportedExternalRef {
+                        reference: reference.to_string(),
+                    });
+                }
+                let pointer = reference.strip_prefix('#').unwrap_or("");
+                let target = if pointer.is_empty() {
+                    root
+                } else {
+                    root.pointer(pointer)
+                        .ok_or_else(|| ExtractError::MalformedExtension {
+                            which: "x-ferrum-validate",
+                            error: format!("unresolved internal $ref '{reference}'"),
+                        })?
+                };
+                let mut resolved = resolve_refs(root, target, reference, depth - 1)?;
+                if object.len() > 1
+                    && let Some(resolved_object) = resolved.as_object_mut()
+                {
+                    for (key, child) in object {
+                        if key != "$ref" {
+                            resolved_object.insert(
+                                key.clone(),
+                                resolve_refs(root, child, location, depth - 1)?,
+                            );
+                        }
+                    }
+                }
+                return Ok(resolved);
+            }
+            let mut resolved = Map::new();
+            for (key, child) in object {
+                resolved.insert(key.clone(), resolve_refs(root, child, location, depth - 1)?);
+            }
+            Ok(Value::Object(resolved))
+        }
+        Value::Array(values) => values
+            .iter()
+            .map(|child| resolve_refs(root, child, location, depth - 1))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        other => Ok(other.clone()),
+    }
+}
+
+fn normalize_schema_for_openapi(schema: Value, version: &str) -> Value {
+    if version != "2.0" && !version.starts_with("3.0.") {
+        return schema;
+    }
+    normalize_legacy_schema(schema)
+}
+
+fn normalize_legacy_schema(schema: Value) -> Value {
+    match schema {
+        Value::Object(mut object) => {
+            let nullable = object
+                .remove("nullable")
+                .or_else(|| object.remove("x-nullable"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+
+            if object.get("exclusiveMinimum").and_then(Value::as_bool) == Some(true) {
+                if let Some(minimum) = object.get("minimum").cloned() {
+                    object.insert("exclusiveMinimum".to_string(), minimum);
+                    object.remove("minimum");
+                }
+            } else if object
+                .get("exclusiveMinimum")
+                .is_some_and(Value::is_boolean)
+            {
+                object.remove("exclusiveMinimum");
+            }
+
+            if object.get("exclusiveMaximum").and_then(Value::as_bool) == Some(true) {
+                if let Some(maximum) = object.get("maximum").cloned() {
+                    object.insert("exclusiveMaximum".to_string(), maximum);
+                    object.remove("maximum");
+                }
+            } else if object
+                .get("exclusiveMaximum")
+                .is_some_and(Value::is_boolean)
+            {
+                object.remove("exclusiveMaximum");
+            }
+
+            for child in object.values_mut() {
+                *child = normalize_legacy_schema(std::mem::take(child));
+            }
+            let value = Value::Object(object);
+            if nullable {
+                add_null_type(value)
+            } else {
+                value
+            }
+        }
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(normalize_legacy_schema).collect())
+        }
+        other => other,
+    }
+}
+
+fn add_null_type(schema: Value) -> Value {
+    let Value::Object(mut object) = schema else {
+        return json!({ "anyOf": [schema, { "type": "null" }] });
+    };
+    match object.remove("type") {
+        Some(Value::String(existing)) => {
+            object.insert(
+                "type".to_string(),
+                Value::Array(vec![Value::String(existing), json!("null")]),
+            );
+            Value::Object(object)
+        }
+        Some(Value::Array(mut types)) => {
+            if !types.iter().any(|value| value.as_str() == Some("null")) {
+                types.push(json!("null"));
+            }
+            object.insert("type".to_string(), Value::Array(types));
+            Value::Object(object)
+        }
+        Some(other) => {
+            object.insert("type".to_string(), other);
+            json!({ "anyOf": [Value::Object(object), { "type": "null" }] })
+        }
+        _ => json!({ "anyOf": [Value::Object(object), { "type": "null" }] }),
+    }
+}
+
+fn path_template_to_regex(path_template: &str) -> Result<String, ExtractError> {
+    let mut regex = String::from("^");
+    let mut literal = String::new();
+    let mut chars = path_template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            if !literal.is_empty() {
+                regex.push_str(&regex::escape(&literal));
+                literal.clear();
+            }
+            let mut name = String::new();
+            let mut closed = false;
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    closed = true;
+                    break;
+                }
+                name.push(inner);
+            }
+            if !closed || name.trim().is_empty() {
+                return Err(ExtractError::MalformedExtension {
+                    which: "paths",
+                    error: format!("invalid OpenAPI path template '{path_template}'"),
+                });
+            }
+            regex.push_str("[^/]+");
+        } else {
+            literal.push(ch);
+        }
+    }
+    if !literal.is_empty() {
+        regex.push_str(&regex::escape(&literal));
+    }
+    regex.push('$');
+    Ok(regex)
 }
 
 /// Truncate a string at a UTF-8 character boundary so the result is ≤ `max_bytes` bytes.
@@ -1097,6 +1839,20 @@ fn find_forbidden_key(value: &serde_json::Value) -> Option<&'static str> {
     find_forbidden_key_depth(value, MAX_FORBIDDEN_KEY_SCAN_DEPTH)
 }
 
+fn find_forbidden_key_for_plugin(
+    plugin_name: &str,
+    value: &serde_json::Value,
+) -> Option<&'static str> {
+    if plugin_name == "openapi_validator" {
+        return find_forbidden_key_depth_for_openapi_validator(
+            value,
+            MAX_FORBIDDEN_KEY_SCAN_DEPTH,
+            0,
+        );
+    }
+    find_forbidden_key(value)
+}
+
 fn find_forbidden_key_depth(value: &serde_json::Value, depth: usize) -> Option<&'static str> {
     if depth == 0 {
         // Fail closed: treat excessively nested config as forbidden.
@@ -1130,6 +1886,57 @@ fn find_forbidden_key_depth(value: &serde_json::Value, depth: usize) -> Option<&
             None
         }
         // Primitives carry no keys.
+        _ => None,
+    }
+}
+
+fn find_forbidden_key_depth_for_openapi_validator(
+    value: &serde_json::Value,
+    depth: usize,
+    path_level: u8,
+) -> Option<&'static str> {
+    if depth == 0 {
+        return Some("__depth_exceeded__");
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let trimmed = key.trim();
+                let is_bypass_consumers =
+                    path_level == 1 && trimmed.eq_ignore_ascii_case("consumers");
+                if !is_bypass_consumers
+                    && let Some(found) = FORBIDDEN_CONFIG_KEYS
+                        .iter()
+                        .find(|&&k| k.eq_ignore_ascii_case(trimmed))
+                {
+                    return Some(found);
+                }
+                let child_path_level = if path_level == 0 && trimmed.eq_ignore_ascii_case("bypass")
+                {
+                    1
+                } else {
+                    2
+                };
+                if let Some(found) = find_forbidden_key_depth_for_openapi_validator(
+                    child,
+                    depth - 1,
+                    child_path_level,
+                ) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(found) =
+                    find_forbidden_key_depth_for_openapi_validator(item, depth - 1, 2)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -1401,7 +2208,7 @@ mod tests {
 
     #[test]
     fn test_minimal_yaml_proxy_only() {
-        let spec = r#"
+        let spec = r##"
 swagger: "2.0"
 info:
   title: "YAML Test"
@@ -1410,7 +2217,7 @@ x-ferrum-proxy:
   id: "yaml-proxy"
   backend_host: "backend.example.com"
   backend_port: 8080
-"#;
+"##;
         let (bundle, _meta) = extract(spec.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
         assert_eq!(bundle.proxy.id, "yaml-proxy");
         assert!(bundle.upstream.is_none());
@@ -1419,7 +2226,7 @@ x-ferrum-proxy:
 
     #[test]
     fn test_full_bundle_proxy_upstream_plugins() {
-        let spec = r#"
+        let spec = r##"
 {
     "openapi": "3.1.0",
     "info": {"title": "Full API", "version": "3.0.0"},
@@ -1450,7 +2257,7 @@ x-ferrum-proxy:
         }
     ]
 }
-"#;
+"##;
         let (bundle, meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").unwrap();
         assert_eq!(bundle.proxy.id, "full-proxy");
         assert!(bundle.upstream.is_some());
@@ -1466,6 +2273,255 @@ x-ferrum-proxy:
         assert_eq!(meta.version, "3.1.0");
         assert_eq!(meta.title.as_deref(), Some("Full API"));
         assert_eq!(meta.info_version.as_deref(), Some("3.0.0"));
+    }
+
+    #[test]
+    fn test_x_ferrum_validate_auto_injects_openapi_validator() {
+        let spec = r##"
+{
+  "openapi": "3.0.3",
+  "info": {"title": "Contract API", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "contract-proxy",
+    "backend_host": "backend.internal",
+    "backend_port": 443
+  },
+  "components": {
+    "schemas": {
+      "Order": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": {"type": "string", "nullable": true}
+        }
+      }
+    }
+  },
+  "paths": {
+    "/orders/{id}": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/Order"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Order"}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"##;
+        let (bundle, _meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").unwrap();
+        assert_eq!(bundle.plugins.len(), 1);
+        let plugin = &bundle.plugins[0];
+        assert_eq!(plugin.plugin_name, "openapi_validator");
+        assert_eq!(plugin.scope, PluginScope::Proxy);
+        assert_eq!(plugin.proxy_id.as_deref(), Some("contract-proxy"));
+
+        let operations = plugin
+            .config
+            .get("operations")
+            .and_then(Value::as_array)
+            .expect("operations array");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0]["path_regex"], "^/orders/[^/]+$");
+        assert_eq!(operations[0]["request_required"], true);
+        assert_eq!(plugin.config["schema_draft"], "draft7");
+
+        let id_type = &operations[0]["request_body"]["content"]["application/json"]["properties"]["id"]
+            ["type"];
+        assert_eq!(id_type, &json!(["string", "null"]));
+    }
+
+    #[test]
+    fn test_x_ferrum_validate_absent_does_not_inject_validator() {
+        let spec = minimal_json_spec(minimal_proxy());
+        let (bundle, _meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").unwrap();
+        assert!(bundle.plugins.is_empty());
+    }
+
+    #[test]
+    fn test_x_ferrum_validate_merges_operator_openapi_validator_config() {
+        let spec = r#"
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Contract API", "version": "1.0.0"},
+  "x-ferrum-validate": {
+    "bypass": {"paths": ["^/health$"], "consumers": ["spec-bypass"]},
+    "request": {"content_types": ["application/json", "application/problem+json"]}
+  },
+  "x-ferrum-proxy": {
+    "id": "contract-proxy",
+    "backend_host": "backend.internal",
+    "backend_port": 443
+  },
+  "x-ferrum-plugins": [{
+    "id": "operator-validator",
+    "plugin_name": "openapi_validator",
+    "config": {
+      "enforcement_mode": "log_only",
+      "bypass": {"paths": ["^/ready$"], "methods": ["OPTIONS"], "consumers": ["break-glass"]},
+      "operations": [{"method": "GET", "path_template": "/wrong", "path_regex": "^/wrong$"}]
+    }
+  }],
+  "paths": {
+    "/orders": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {"type": "object"}
+            }
+          }
+        },
+        "responses": {"204": {"description": "ok"}}
+      }
+    }
+  }
+}
+"#;
+        let (bundle, _meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").unwrap();
+        assert_eq!(bundle.plugins.len(), 1);
+        let plugin = &bundle.plugins[0];
+        assert_eq!(plugin.id, "operator-validator");
+        assert_eq!(plugin.config["enforcement_mode"], "log_only");
+        assert_eq!(plugin.config["schema_draft"], "draft2020-12");
+        assert_eq!(plugin.config["operations"][0]["path_template"], "/orders");
+
+        let bypass_paths = plugin.config["bypass"]["paths"].as_array().unwrap();
+        assert!(bypass_paths.contains(&json!("^/health$")));
+        assert!(bypass_paths.contains(&json!("^/ready$")));
+        assert_eq!(plugin.config["bypass"]["methods"], json!(["OPTIONS"]));
+        let bypass_consumers = plugin.config["bypass"]["consumers"].as_array().unwrap();
+        assert!(bypass_consumers.contains(&json!("spec-bypass")));
+        assert!(bypass_consumers.contains(&json!("break-glass")));
+        assert_eq!(
+            plugin.config["request_content_types"],
+            json!(["application/json", "application/problem+json"])
+        );
+    }
+
+    #[test]
+    fn test_x_ferrum_validate_rejects_malformed_spec_bypass() {
+        let spec = r#"
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Contract API", "version": "1.0.0"},
+  "x-ferrum-validate": {
+    "bypass": {"paths": "^/health$"}
+  },
+  "x-ferrum-proxy": {
+    "id": "contract-proxy",
+    "backend_host": "backend.internal",
+    "backend_port": 443
+  },
+  "paths": {
+    "/orders": {
+      "get": {
+        "responses": {"200": {"description": "ok"}}
+      }
+    }
+  }
+}
+"#;
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").unwrap_err();
+        assert!(matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "x-ferrum-validate",
+                ..
+            }
+        ));
+        assert!(
+            err.to_string()
+                .contains("openapi_validator bypass.paths must be an array")
+        );
+    }
+
+    #[test]
+    fn test_x_ferrum_validate_preserves_wildcard_response_statuses() {
+        let spec = r#"
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Contract API", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "contract-proxy",
+    "backend_host": "backend.internal",
+    "backend_port": 443
+  },
+  "paths": {
+    "/orders": {
+      "get": {
+        "responses": {
+          "4XX": {
+            "description": "client error",
+            "content": {
+              "application/json": {
+                "schema": {"type": "object", "required": ["error"]}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+        let (bundle, _meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").unwrap();
+        let plugin = &bundle.plugins[0];
+        assert_eq!(
+            plugin.config["operations"][0]["responses"]["4XX"]["application/json"]["required"],
+            json!(["error"])
+        );
+    }
+
+    #[test]
+    fn test_x_ferrum_validate_rejects_external_refs() {
+        let spec = r#"
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Contract API", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "contract-proxy",
+    "backend_host": "backend.internal",
+    "backend_port": 443
+  },
+  "paths": {
+    "/orders": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "https://example.com/schemas/order.json"}
+            }
+          }
+        },
+        "responses": {"204": {"description": "ok"}}
+      }
+    }
+  }
+}
+"#;
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").unwrap_err();
+        assert!(
+            matches!(err, ExtractError::UnsupportedExternalRef { .. }),
+            "got: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------

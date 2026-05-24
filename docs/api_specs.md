@@ -93,6 +93,8 @@ x-ferrum-plugins:        # OPTIONAL — array (all must be proxy-scoped)
           window_seconds: 60
           max_requests: 100
 
+x-ferrum-validate: true  # OPTIONAL — auto-generate openapi_validator
+
 paths:
   /orders:
     get: ...
@@ -115,6 +117,65 @@ An array of `PluginConfig` objects. Fields follow the same schema as `POST /plug
 - `scope` must be `proxy` or omitted (defaults to `proxy`). `global` and `proxy_group` are rejected.
 - `proxy_id` must be omitted or match the spec's proxy ID.
 
+### `x-ferrum-validate` (optional)
+
+Set `x-ferrum-validate: true` to generate a proxy-scoped `openapi_validator` plugin from the spec's operation schemas. The generated plugin config embeds the resolved request and response schemas plus their media types; the gateway runtime never reads the `api_specs` row on the request path.
+
+```yaml
+x-ferrum-validate:
+  mode: block
+  request:
+    enabled: true
+    content_types:
+      - application/json
+      - application/xml
+      - text/xml
+      - application/x-www-form-urlencoded
+      - multipart/form-data
+      - text/plain
+      - application/octet-stream
+  response:
+    enabled: true
+    content_types:
+      - application/json
+      - application/xml
+      - text/xml
+      - application/x-www-form-urlencoded
+      - multipart/form-data
+      - text/plain
+      - application/octet-stream
+  fail_on_unknown_operation: true
+  fail_on_missing_response_schema: false
+  max_body_bytes: 1048576
+  bypass:
+    paths: ["^/orders/health$"]
+    methods: [OPTIONS]
+    consumers: [emergency-bypass]
+    header_present:
+      x-bypass-validator: null
+```
+
+`x-ferrum-validate` accepts:
+
+- `true` — generate an `openapi_validator` plugin with defaults.
+- `false` or `null` — do not generate the plugin.
+- object — generate the plugin and apply the listed settings.
+
+The importer walks `paths.{path}.{method}`, resolves local `$ref`s, and extracts:
+
+- OpenAPI 3.x request schemas from `requestBody.content.{mediaType}.schema`.
+- OpenAPI 3.x response schemas from `responses.{status}.content.{mediaType}.schema`.
+- Swagger 2.0 request schemas from `parameters[].in == "body"`.
+- Swagger 2.0 response schemas from `responses.{status}.schema`, using `consumes`/`produces` media types.
+
+External `$ref`s are rejected with HTTP 422 `UnsupportedExternalRef`, and deeply recursive refs are rejected with HTTP 422 `SchemaTooDeep`. Swagger 2.0 and OpenAPI 3.0 schemas are normalized for Draft 7 compatibility; OpenAPI 3.1+ schemas use Draft 2020-12.
+
+Runtime validation supports JSON and `+json`, XML and `+xml` with OpenAPI `xml` metadata, `application/x-www-form-urlencoded`, `multipart/form-data` fields and file metadata, `text/*`, and binary payloads such as `application/octet-stream`, other non-JSON/XML `application/*`, `image/*`, `audio/*`, and `video/*`. OpenAPI response wildcard status keys such as `4XX` and `5XX` are preserved in the generated config and matched after exact status codes.
+
+If `x-ferrum-plugins` already includes an `openapi_validator`, the importer merges it with the generated config: operator scalar fields win, `bypass.paths` / `bypass.methods` / `bypass.consumers` are unioned, `bypass.header_present` maps are merged with operator entries overriding spec entries on header-name conflicts, and `operations` is always regenerated from the spec. Malformed spec-side bypass shapes are rejected during extraction instead of being silently dropped.
+
+For full runtime settings and metadata keys, see [openapi_validator.md](openapi_validator.md).
+
 ## What is NOT allowed in specs
 
 The following are rejected at parse time with a 400 error:
@@ -123,6 +184,7 @@ The following are rejected at parse time with a 400 error:
 - **Plugin `scope: global` or `scope: proxy_group`** — only proxy-scoped plugins are allowed. A single shared plugin instance across multiple proxies cannot be expressed via a single-proxy spec bundle.
 - **Plugin `proxy_id` mismatch** — if `proxy_id` is set on a plugin, it must match the spec's proxy ID.
 - **Forbidden keys in plugin `config`** — the plugin `config` object is walked recursively. Any of the following keys at any nesting depth triggers a 400 `PluginContainsCredentials` error: `credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`.
+- **External `$ref`s in `x-ferrum-validate` schemas** — only local document refs are resolved into generated plugin config.
 
   Note the distinction: a `plugin_name: "jwt"` plugin is fine — the check walks the plugin's `config` *value*, not the plugin metadata fields. A JWT plugin with `config: { secret_lookup: env, validation: { validate_exp: true } }` passes; one with `config: { jwt: { secret: "abc" } }` fails.
 
@@ -316,6 +378,14 @@ The `api_specs` row is **always** updated: new `updated_at`, `content_hash`, spe
 
 This makes PUT safe to run on every CI/CD deploy cycle without causing unnecessary cache rebuilds or downstream configuration churn.
 
+When `x-ferrum-validate` is enabled, the generated `openapi_validator.config.operations` array is part of the resource hash. Schema-affecting spec changes replace the spec-owned plugin row and rebuild the affected plugin cache entry. Documentation-only changes that leave generated operations unchanged do not advance the plugin row's `updated_at`.
+
+### OpenAPI validator override semantics
+
+Persistent validator changes belong in `x-ferrum-validate` and should be applied with `PUT /api-specs/{id}`.
+
+Emergency direct edits to the generated `openapi_validator` row via `PUT /plugins/config/{id}` are allowed for incident response, but they are ephemeral. The next spec `PUT` regenerates the spec-owned plugin and replaces direct edits.
+
 ## Worked examples
 
 ### 1. Minimal spec — proxy only (JSON)
@@ -421,7 +491,54 @@ x-ferrum-plugins:
       header_names: [authorization]
 ```
 
-### 4. Updating a spec via PUT — what survives
+### 4. Proxy with generated OpenAPI validation
+
+```yaml
+openapi: 3.1.0
+info:
+  title: Orders API
+  version: 1.0.0
+
+x-ferrum-validate:
+  mode: block
+  bypass:
+    paths: ["^/orders/health$"]
+
+x-ferrum-proxy:
+  id: orders-contract
+  listen_path: /orders
+  backend_host: orders.internal
+  backend_port: 8080
+
+paths:
+  /orders:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [created]
+                properties:
+                  created:
+                    type: boolean
+```
+
+Submitting this spec creates one generated `openapi_validator` plugin attached to `orders-contract`. A request body missing `id` is rejected with HTTP 400 in `block` mode.
+
+### 5. Updating a spec via PUT — what survives
 
 Assume the spec from example 3 was submitted. Then a plugin was added manually:
 

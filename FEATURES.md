@@ -83,7 +83,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ## Plugin System
 
-- 62 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 63 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Three plugin scopes: **global** (all proxies), **proxy** (single proxy), **proxy_group** (shared across a subset of proxies) — scoped plugins replace global plugins of the same name. Proxy-group plugins share a single instance across all associated proxies, so stateful plugins (e.g., rate_limiting) share counters across the group
@@ -117,6 +117,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Bot Detection** — User-Agent pattern blocking with allow-list support
 - **CORS** — preflight handling with origin, method, and header validation
 - **Body Validator** — JSON Schema, XML, and gRPC protobuf validation
+- **OpenAPI Validator** — request/response JSON contract enforcement generated from attached OpenAPI/Swagger specs via `x-ferrum-validate`, with block/log-only/disabled modes and emergency bypasses
 - **Request Deduplication** — idempotency key-based deduplication for POST/PUT/PATCH requests with local in-memory and centralized Redis storage backends
 - **Fault Injection** — probabilistic HTTP/gRPC aborts and latency injection plus stream connect rejection/delay for chaos testing, with per-instance counters so proxy/group scopes stay independent
 - **GraphQL** — query depth/complexity limiting, alias limiting, introspection control, per-operation rate limiting

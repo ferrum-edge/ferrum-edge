@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 62 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 63 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -2642,6 +2642,33 @@ Request-side validation only buffers matching request bodies: methods that can c
 **Scope**: Protobuf validation supports unary RPCs only (single frame per message). Streaming RPCs with multiple concatenated frames are not validated — the length mismatch check will reject multi-frame bodies.
 
 **Supported JSON Schema `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
+
+### `openapi_validator`
+
+Validates request and response bodies against operation schemas generated from an attached OpenAPI or Swagger document. JSON, XML, form-urlencoded, multipart, text, and binary media types are supported. This plugin is normally auto-injected by `POST /api-specs` or `PUT /api-specs/{id}` when the document includes `x-ferrum-validate`.
+
+**Priority:** 2960
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `enforcement_mode` | string | `block` | `block`, `log_only`, or `disabled` |
+| `validate_request` | bool | `true` | Validate request bodies for operations with request schemas |
+| `validate_response` | bool | `true` | Validate response bodies for operations with response schemas |
+| `request_content_types` | String[] | common JSON/XML/form/text/binary types | Request media types to validate |
+| `response_content_types` | String[] | common JSON/XML/form/text/binary types | Response media types to validate |
+| `fail_on_unknown_operation` | bool | `true` | Reject requests that do not match any generated operation |
+| `fail_on_missing_response_schema` | bool | `false` | Reject responses with no matching status/content-type schema |
+| `max_body_bytes` | integer | `1048576` | Maximum raw or decompressed body size validated |
+| `schema_draft` | string | generated | `auto`, `draft7`, or `draft2020-12` |
+| `operations` | array | required | Generated operation schema table |
+| `bypass.paths` | String[] | `[]` | Regex paths that skip validation |
+| `bypass.methods` | String[] | `[]` | HTTP methods that skip validation |
+| `bypass.consumers` | String[] | `[]` | Consumer identities that skip validation |
+| `bypass.header_present` | object | `{}` | Header presence/value checks that skip validation |
+
+`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses, skips SSE responses, supports gzip and brotli decompression, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata, supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
+
+See [openapi_validator.md](openapi_validator.md) for the full generated config shape, `x-ferrum-validate` options, and emergency override behavior.
 
 ### `request_size_limiting`
 

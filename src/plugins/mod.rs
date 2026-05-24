@@ -51,6 +51,7 @@ pub mod mesh;
 pub mod mesh_route_dispatch;
 pub mod mtls_auth;
 pub mod opa;
+pub mod openapi_validator;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
 pub mod proxy_alerts;
@@ -1417,7 +1418,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), ai_request_guard (2975), ai_federation (2985) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), workload_metrics (9360), __mesh_bpf_metrics (9365), access_log (9375) |
@@ -1462,6 +1463,7 @@ pub mod priority {
     pub const WAF: u16 = 2930;
     pub const FAULT_INJECTION: u16 = 2940;
     pub const BODY_VALIDATOR: u16 = 2950;
+    pub const OPENAPI_VALIDATOR: u16 = 2960;
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const AI_FEDERATION: u16 = 2985;
     /// `mesh_route_dispatch`: rewrites `route_override_*` on `RequestContext`
@@ -2089,6 +2091,9 @@ pub fn create_plugin_with_http_client(
             response_size_limiting::ResponseSizeLimiting::new(config)?,
         ))),
         "body_validator" => Ok(Some(Arc::new(body_validator::BodyValidator::new(config)?))),
+        "openapi_validator" => Ok(Some(Arc::new(openapi_validator::OpenapiValidator::new(
+            config,
+        )?))),
         "soap_ws_security" => Ok(Some(Arc::new(soap_ws_security::SoapWsSecurity::new(
             config,
         )?))),
@@ -2229,6 +2234,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "rate_limiting"
             | "ip_restriction"
             | "waf"
+            | "openapi_validator"
             | "soap_ws_security"
     )
 }
@@ -2280,6 +2286,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "waf",
         "response_size_limiting",
         "body_validator",
+        "openapi_validator",
         "request_termination",
         "response_caching",
         "response_mock",

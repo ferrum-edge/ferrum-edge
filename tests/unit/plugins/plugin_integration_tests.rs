@@ -195,6 +195,7 @@ async fn test_all_plugins_available() {
         "ldap_auth",
         "hmac_auth",
         "mtls_auth",
+        "openapi_validator",
         "compression",
         "cors",
         "access_control",
@@ -319,6 +320,22 @@ async fn test_plugin_creation_all_plugins() {
             "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
             "ws_rate_limiting" => json!({"frames_per_second": 100}),
             "body_validator" => json!({"required_fields": ["name"]}),
+            "openapi_validator" => json!({
+                "operations": [{
+                    "method": "GET",
+                    "path_template": "/health",
+                    "path_regex": "^/health$",
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {
+                                    "type": "object"
+                                }
+                            }
+                        }
+                    }
+                }]
+            }),
             "graphql" => json!({"max_depth": 100}),
             "grpc_method_router" => json!({"allow_methods": ["test.Svc/Method"]}),
             "grpc_deadline" => json!({"max_deadline_ms": 30000}),
