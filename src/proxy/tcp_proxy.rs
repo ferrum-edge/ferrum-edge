@@ -1782,6 +1782,13 @@ async fn handle_tcp_connection_inner(
         } else {
             None
         };
+        #[cfg(target_os = "linux")]
+        let directional_timeouts_disabled = backend_read_timeout.is_none_or(|d| d.is_zero())
+            && backend_write_timeout.is_none_or(|d| d.is_zero());
+        #[cfg(target_os = "linux")]
+        let splice_used = directional_timeouts_disabled;
+        #[cfg(not(target_os = "linux"))]
+        let splice_used = false;
 
         // Resolve backend IP via DNS
         let resolved_ip = dns_cache
@@ -1859,7 +1866,7 @@ async fn handle_tcp_connection_inner(
         // Passthrough mode is always plain-to-plain (no TLS termination/origination).
         // When io_uring is enabled, use IORING_OP_SPLICE on dedicated blocking threads.
         #[cfg(target_os = "linux")]
-        let copy_result = if io_uring_splice_enabled {
+        let copy_result = if directional_timeouts_disabled && io_uring_splice_enabled {
             bidirectional_splice_io_uring(
                 client_stream,
                 backend_stream,
@@ -1868,12 +1875,23 @@ async fn handle_tcp_connection_inner(
                 buf_size,
             )
             .await
-        } else {
+        } else if directional_timeouts_disabled {
             bidirectional_splice(
                 client_stream,
                 backend_stream,
                 idle_timeout,
                 half_close_cap,
+                buf_size,
+            )
+            .await
+        } else {
+            bidirectional_copy(
+                client_stream,
+                backend_stream,
+                idle_timeout,
+                half_close_cap,
+                backend_read_timeout,
+                backend_write_timeout,
                 buf_size,
             )
             .await
@@ -1923,7 +1941,7 @@ async fn handle_tcp_connection_inner(
             bytes_in: copy_result.bytes_client_to_backend,
             bytes_out: copy_result.bytes_backend_to_client,
             duration: start.elapsed(),
-            splice_used: cfg!(target_os = "linux"),
+            splice_used,
             first_failure: copy_result.first_failure,
         });
     }
@@ -1950,6 +1968,9 @@ async fn handle_tcp_connection_inner(
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
+    let directional_timeouts_disabled = backend_read_timeout.is_none_or(|d| d.is_zero())
+        && backend_write_timeout.is_none_or(|d| d.is_zero());
 
     // Terminating TCP-TLS should complete the downstream TLS handshake before
     // opening an upstream connection. This avoids spending backend sockets or
@@ -2330,7 +2351,7 @@ async fn handle_tcp_connection_inner(
                     // so splice(2) can handle encrypted traffic without userspace copies.
                     #[cfg(target_os = "linux")]
                     {
-                        if ktls_enabled {
+                        if ktls_enabled && directional_timeouts_disabled {
                             match try_ktls_splice(
                                 tls_stream,
                                 bs,
@@ -2433,8 +2454,8 @@ async fn handle_tcp_connection_inner(
                     // When io_uring is enabled, use IORING_OP_SPLICE on blocking threads.
                     #[cfg(target_os = "linux")]
                     {
-                        used_splice = true;
-                        if io_uring_splice_enabled {
+                        if directional_timeouts_disabled && io_uring_splice_enabled {
+                            used_splice = true;
                             bidirectional_splice_io_uring(
                                 client_stream,
                                 bs,
@@ -2443,12 +2464,25 @@ async fn handle_tcp_connection_inner(
                                 buf_size,
                             )
                             .await
-                        } else {
+                        } else if directional_timeouts_disabled {
+                            used_splice = true;
                             bidirectional_splice(
                                 client_stream,
                                 bs,
                                 idle_timeout,
                                 half_close_cap,
+                                buf_size,
+                            )
+                            .await
+                        } else {
+                            used_splice = false;
+                            bidirectional_copy(
+                                client_stream,
+                                bs,
+                                idle_timeout,
+                                half_close_cap,
+                                backend_read_timeout,
+                                backend_write_timeout,
                                 buf_size,
                             )
                             .await
