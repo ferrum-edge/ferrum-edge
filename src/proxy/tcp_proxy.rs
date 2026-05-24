@@ -1859,7 +1859,18 @@ async fn handle_tcp_connection_inner(
         // Passthrough mode is always plain-to-plain (no TLS termination/origination).
         // When io_uring is enabled, use IORING_OP_SPLICE on dedicated blocking threads.
         #[cfg(target_os = "linux")]
-        let copy_result = if io_uring_splice_enabled {
+        let copy_result = if backend_read_timeout.is_some() || backend_write_timeout.is_some() {
+            bidirectional_copy(
+                client_stream,
+                backend_stream,
+                idle_timeout,
+                half_close_cap,
+                backend_read_timeout,
+                backend_write_timeout,
+                buf_size,
+            )
+            .await
+        } else if io_uring_splice_enabled {
             bidirectional_splice_io_uring(
                 client_stream,
                 backend_stream,
@@ -2433,8 +2444,20 @@ async fn handle_tcp_connection_inner(
                     // When io_uring is enabled, use IORING_OP_SPLICE on blocking threads.
                     #[cfg(target_os = "linux")]
                     {
-                        used_splice = true;
-                        if io_uring_splice_enabled {
+                        if backend_read_timeout.is_some() || backend_write_timeout.is_some() {
+                            used_splice = false;
+                            bidirectional_copy(
+                                client_stream,
+                                bs,
+                                idle_timeout,
+                                half_close_cap,
+                                backend_read_timeout,
+                                backend_write_timeout,
+                                buf_size,
+                            )
+                            .await
+                        } else if io_uring_splice_enabled {
+                            used_splice = true;
                             bidirectional_splice_io_uring(
                                 client_stream,
                                 bs,
@@ -2444,6 +2467,7 @@ async fn handle_tcp_connection_inner(
                             )
                             .await
                         } else {
+                            used_splice = true;
                             bidirectional_splice(
                                 client_stream,
                                 bs,
