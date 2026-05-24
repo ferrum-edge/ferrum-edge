@@ -13,7 +13,11 @@ transaction-level provenance and is the default.
 `mode: snapshot` keeps a local accumulator keyed by namespace, consumer, proxy,
 and status code. Every `snapshot.interval_secs`, it emits deltas since the last
 snapshot. Use this when event volume dominates ingest cost and aggregate
-reconciliation is sufficient.
+reconciliation is sufficient. Snapshot mode requires `spool.enabled: true`
+because the accumulator advances after a delta is handed to the sink queue; the
+spool is the durable path when ClickHouse or the in-memory queue is unavailable.
+Idle snapshot keys are evicted after `snapshot.stale_entry_ttl_secs` and checked
+every `snapshot.cleanup_interval_secs`.
 
 Both modes use the same pricing fields as `api_chargeback`:
 
@@ -30,8 +34,9 @@ clickhouse-client < migrations/clickhouse/0001_charges.sql
 ```
 
 The DDL creates `ferrum.charges_raw` with `ReplacingMergeTree` idempotency on
-`event_id`, plus hourly, daily, and monthly `SummingMergeTree` materialized
-views for invoice rollups.
+`event_id`, plus hourly, daily, and monthly views that read from
+`charges_raw FINAL`. The views trade query cost for correctness: duplicate raw
+events are deduplicated before rollup aggregation.
 
 ## Example Config
 
@@ -66,6 +71,12 @@ views for invoice rollups.
       "replay_interval_secs": 60,
       "compression": "zstd"
     },
+    "snapshot": {
+      "interval_secs": 30,
+      "cleanup_interval_secs": 300,
+      "stale_entry_ttl_secs": 3600,
+      "emit_zero_deltas": false
+    },
     "pricing_version": "2026-01-rev3",
     "currency": "USD"
   }
@@ -74,7 +85,8 @@ views for invoice rollups.
 
 Set `FERRUM_CLICKHOUSE_PASSWORD_FILE`, `FERRUM_CLICKHOUSE_PASSWORD_VAULT`, or
 another supported secret suffix at startup, then reference the materialized base
-variable (`FERRUM_CLICKHOUSE_PASSWORD`) from `password_ref`.
+variable (`FERRUM_CLICKHOUSE_PASSWORD`) from `password_ref`. `password_ref`
+must name a `FERRUM_*` variable.
 
 ## Spool And Replay
 
@@ -87,7 +99,9 @@ Spool files are written under:
 The sink writes failed batches and queue high-water overflow to disk. Files are
 created with private permissions, written as `*.tmp`, fsynced, and renamed into
 place. The background replayer scans files in lexicographic order and removes a
-file only after ClickHouse accepts every chunk.
+file only after ClickHouse accepts the whole file as one insert. Unreadable
+spool files are renamed with a `.corrupt` suffix so newer files can continue to
+replay.
 
 Size `spool.max_bytes` for the longest ClickHouse outage you are willing to
 absorb:
@@ -98,6 +112,11 @@ max_bytes >= peak_events_per_second * average_event_bytes * outage_seconds
 
 When the spool is full, the oldest file is dropped and
 `chargeback_sink_spool_drops_total` is incremented.
+
+When `spool.dir` is backed by persistent storage, set `FERRUM_NODE_ID` to a
+stable identity such as a StatefulSet ordinal. If the node ID changes across
+restarts, the sink logs a warning when it finds sibling spool directories that
+may contain events from an older identity.
 
 ## Reconciliation Queries
 

@@ -17,7 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use url::Url;
@@ -137,6 +137,14 @@ fn default_spool_replay_interval_secs() -> u64 {
 
 fn default_snapshot_interval_secs() -> u64 {
     30
+}
+
+fn default_snapshot_cleanup_interval_secs() -> u64 {
+    300
+}
+
+fn default_snapshot_stale_entry_ttl_secs() -> u64 {
+    3_600
 }
 
 fn default_clickhouse_database() -> String {
@@ -291,6 +299,10 @@ pub struct SnapshotSettings {
     #[serde(default = "default_snapshot_interval_secs")]
     pub interval_secs: u64,
     pub emit_zero_deltas: bool,
+    #[serde(default = "default_snapshot_cleanup_interval_secs")]
+    pub cleanup_interval_secs: u64,
+    #[serde(default = "default_snapshot_stale_entry_ttl_secs")]
+    pub stale_entry_ttl_secs: u64,
 }
 
 impl Default for SnapshotSettings {
@@ -298,6 +310,8 @@ impl Default for SnapshotSettings {
         Self {
             interval_secs: default_snapshot_interval_secs(),
             emit_zero_deltas: false,
+            cleanup_interval_secs: default_snapshot_cleanup_interval_secs(),
+            stale_entry_ttl_secs: default_snapshot_stale_entry_ttl_secs(),
         }
     }
 }
@@ -1199,10 +1213,38 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             ));
         }
         ensure_private_dir(&config.spool.dir)?;
+    } else if config.mode == SinkMode::Snapshot {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot mode requires spool.enabled=true so emitted deltas remain durable during ClickHouse outages"
+        ));
     }
     if config.snapshot.interval_secs == 0 {
         return Err(format!(
             "{PLUGIN_NAME}: snapshot.interval_secs must be at least 1"
+        ));
+    }
+    if config.snapshot.cleanup_interval_secs == 0 {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot.cleanup_interval_secs must be at least 1"
+        ));
+    }
+    if config.snapshot.stale_entry_ttl_secs == 0 {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot.stale_entry_ttl_secs must be at least 1"
+        ));
+    }
+    if config
+        .clickhouse
+        .password_ref
+        .as_deref()
+        .is_some_and(|value| {
+            !value.trim().is_empty()
+                && (config.clickhouse.tls.insecure_skip_verify
+                    || !config.clickhouse.tls.verify_hostname)
+        })
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: clickhouse.password_ref cannot be used when ClickHouse TLS certificate or hostname verification is disabled"
         ));
     }
     if config.pricing_version.trim().is_empty() {
@@ -1283,15 +1325,13 @@ fn resolve_password_ref(password_ref: Option<&str>) -> Result<Option<String>, St
     else {
         return Ok(None);
     };
+    if !reference.starts_with("FERRUM_") {
+        return Err(format!(
+            "{PLUGIN_NAME}: clickhouse.password_ref must reference a FERRUM_* environment variable"
+        ));
+    }
     if let Ok(value) = std::env::var(reference) {
         return Ok(Some(value));
-    }
-    for suffix in ["_VAULT", "_AWS", "_AZURE", "_GCP", "_FILE"] {
-        if let Some(base) = reference.strip_suffix(suffix)
-            && let Ok(value) = std::env::var(base)
-        {
-            return Ok(Some(value));
-        }
     }
     Err(format!(
         "{PLUGIN_NAME}: clickhouse.password_ref references unset environment variable"
@@ -1318,9 +1358,17 @@ fn build_clickhouse_http_client(
         builder = builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache)));
     }
     if cfg.tls.insecure_skip_verify {
+        warn!(
+            plugin = PLUGIN_NAME,
+            "ClickHouse TLS certificate verification is disabled; use only for testing"
+        );
         builder = builder.danger_accept_invalid_certs(true);
     }
     if !cfg.tls.verify_hostname {
+        warn!(
+            plugin = PLUGIN_NAME,
+            "ClickHouse TLS hostname verification is disabled; use only for testing"
+        );
         builder = builder.tls_danger_accept_invalid_hostnames(true);
     }
     if let Some(ca_file) = cfg.tls.ca_file.as_ref() {
@@ -1383,6 +1431,7 @@ pub struct SpoolManager {
     node_id: Arc<str>,
     metrics: Arc<SinkMetrics>,
     last_drop_warn_at: AtomicI64,
+    write_lock: Mutex<()>,
 }
 
 impl SpoolManager {
@@ -1393,11 +1442,13 @@ impl SpoolManager {
     ) -> Result<Self, String> {
         ensure_private_dir(&cfg.dir)?;
         ensure_private_dir(&cfg.dir.join(node_id.as_ref()))?;
+        warn_on_sibling_spool_dirs(&cfg.dir, node_id.as_ref());
         Ok(Self {
             cfg,
             node_id,
             metrics,
             last_drop_warn_at: AtomicI64::new(0),
+            write_lock: Mutex::new(()),
         })
     }
 
@@ -1414,6 +1465,10 @@ impl SpoolManager {
         if events.is_empty() {
             return Err(format!("{PLUGIN_NAME}: refusing to spool empty batch"));
         }
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
         self.evict_until_below_limit()?;
         let day = Utc::now().format("%Y%m%d").to_string();
         let dir = self.cfg.dir.join(self.node_id.as_ref()).join(day);
@@ -1463,12 +1518,16 @@ impl SpoolManager {
             let Some(oldest) = self.list_spool_files()?.into_iter().next() else {
                 return Ok(());
             };
-            fs::remove_file(&oldest).map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: failed to remove oldest spool file '{}': {error}",
-                    oldest.display()
-                )
-            })?;
+            match fs::remove_file(&oldest) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "{PLUGIN_NAME}: failed to remove oldest spool file '{}': {error}",
+                        oldest.display()
+                    ));
+                }
+            }
             self.metrics
                 .spool_drops_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -1495,6 +1554,33 @@ impl SpoolManager {
         collect_spool_files(&root, &mut files)?;
         files.sort();
         Ok(files)
+    }
+}
+
+fn warn_on_sibling_spool_dirs(root: &Path, node_id: &str) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name != node_id {
+            warn!(
+                plugin = PLUGIN_NAME,
+                node_id,
+                sibling_node_id = %name,
+                spool_dir = %root.display(),
+                "Chargeback sink found a sibling spool directory; use a stable FERRUM_NODE_ID when spool.dir is backed by persistent storage"
+            );
+        }
     }
 }
 
@@ -1530,6 +1616,22 @@ fn collect_spool_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+fn quarantine_spool_file(path: &Path) -> Result<PathBuf, String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
+    let quarantine_path = path.with_file_name(format!("{name}.corrupt"));
+    fs::rename(path, &quarantine_path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to quarantine corrupt spool file '{}' to '{}': {error}",
+            path.display(),
+            quarantine_path.display()
+        )
+    })?;
+    Ok(quarantine_path)
 }
 
 fn is_spool_data_file(path: &Path) -> bool {
@@ -1586,6 +1688,23 @@ fn decode_spool_file(path: &Path) -> Result<String, String> {
 #[allow(dead_code)]
 pub fn decode_spool_file_for_tests(path: &Path) -> Result<String, String> {
     decode_spool_file(path)
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn replay_spool_once_for_tests(
+    spool: &SpoolManager,
+    insert_url: &str,
+) -> Result<(), String> {
+    let flush_config = ClickHouseFlushConfig {
+        http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
+        insert_url: insert_url.to_string(),
+        username: None,
+        password: None,
+        timeout: Duration::from_secs(5),
+        metrics: Arc::clone(&spool.metrics),
+    };
+    replay_spool_once(spool, &flush_config).await
 }
 
 fn write_private_file_atomically(
@@ -1685,14 +1804,14 @@ fn start_spool_replayer(
     spool: Arc<SpoolManager>,
     _summary: SinkSummary,
     flush_config: ClickHouseFlushConfig,
-    batch_size: usize,
+    _batch_size: usize,
     replay_interval_secs: u64,
 ) {
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(Duration::from_secs(replay_interval_secs));
         loop {
             timer.tick().await;
-            if let Err(error) = replay_spool_once(&spool, &flush_config, batch_size).await {
+            if let Err(error) = replay_spool_once(&spool, &flush_config).await {
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink spool replay failed");
             }
         }
@@ -1702,11 +1821,38 @@ fn start_spool_replayer(
 async fn replay_spool_once(
     spool: &SpoolManager,
     flush_config: &ClickHouseFlushConfig,
-    batch_size: usize,
 ) -> Result<(), String> {
     let files = spool.list_spool_files()?;
     for file in files {
-        let body = decode_spool_file(&file)?;
+        let body = match decode_spool_file(&file) {
+            Ok(body) => body,
+            Err(error) => {
+                spool
+                    .metrics
+                    .record_failure(FailureReason::Serialize, error.clone());
+                match quarantine_spool_file(&file) {
+                    Ok(quarantine_path) => {
+                        warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %error,
+                            path = %file.display(),
+                            quarantine_path = %quarantine_path.display(),
+                            "Chargeback sink quarantined an unreadable spool file and will continue replay"
+                        );
+                    }
+                    Err(quarantine_error) => {
+                        warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %error,
+                            quarantine_error = %quarantine_error,
+                            path = %file.display(),
+                            "Chargeback sink could not quarantine an unreadable spool file; replay will continue"
+                        );
+                    }
+                }
+                continue;
+            }
+        };
         let lines: Vec<&str> = body
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -1720,10 +1866,7 @@ async fn replay_spool_once(
             })?;
             continue;
         }
-        for chunk in lines.chunks(batch_size.max(1)) {
-            let chunk_body = chunk.join("\n");
-            post_json_each_row(flush_config, chunk_body, chunk.len()).await?;
-        }
+        post_json_each_row(flush_config, lines.join("\n"), lines.len()).await?;
         fs::remove_file(&file).map_err(|error| {
             format!(
                 "{PLUGIN_NAME}: failed to remove replayed spool file '{}': {error}",
@@ -1848,6 +1991,7 @@ impl SnapshotAtomicTotals {
 struct SnapshotEntry {
     meta: SnapshotMetadata,
     totals: SnapshotAtomicTotals,
+    last_seen_at: AtomicI64,
 }
 
 pub struct SnapshotAccumulator {
@@ -1930,14 +2074,14 @@ impl SnapshotAccumulator {
             &meta.proxy_id,
             meta.status_code,
         );
-        self.entries
-            .entry(key)
-            .or_insert_with(|| SnapshotEntry {
-                meta,
-                totals: SnapshotAtomicTotals::default(),
-            })
-            .totals
-            .add(charge);
+        let now = unix_timestamp_seconds();
+        let entry = self.entries.entry(key).or_insert_with(|| SnapshotEntry {
+            meta,
+            totals: SnapshotAtomicTotals::default(),
+            last_seen_at: AtomicI64::new(now),
+        });
+        entry.last_seen_at.store(now, Ordering::Relaxed);
+        entry.totals.add(charge);
     }
 
     pub fn compute_deltas(
@@ -1970,6 +2114,34 @@ impl SnapshotAccumulator {
             }
         }
         events
+    }
+
+    #[allow(dead_code)]
+    pub fn cleanup_stale_for_tests(&self, stale_entry_ttl_secs: u64) -> usize {
+        self.cleanup_stale(unix_timestamp_seconds(), stale_entry_ttl_secs)
+    }
+
+    fn cleanup_stale(&self, now: i64, stale_entry_ttl_secs: u64) -> usize {
+        let cutoff = now.saturating_sub(stale_entry_ttl_secs.min(i64::MAX as u64) as i64);
+        let keys: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.value().last_seen_at.load(Ordering::Relaxed) <= cutoff)
+            .map(|entry| entry.key().clone())
+            .collect();
+        let mut removed = 0;
+        for key in keys {
+            let should_remove = self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.last_seen_at.load(Ordering::Relaxed) <= cutoff);
+            if should_remove {
+                self.entries.remove(&key);
+                self.last_emitted.remove(&key);
+                removed += 1;
+            }
+        }
+        removed
     }
 
     #[allow(dead_code)]
@@ -2014,27 +2186,42 @@ fn start_snapshot_task(
     _namespace: String,
 ) {
     tokio::spawn(async move {
-        let mut timer = tokio::time::interval(Duration::from_secs(config.snapshot.interval_secs));
+        let mut snapshot_timer =
+            tokio::time::interval(Duration::from_secs(config.snapshot.interval_secs));
+        let mut cleanup_timer =
+            tokio::time::interval(Duration::from_secs(config.snapshot.cleanup_interval_secs));
         loop {
-            timer.tick().await;
-            let snapshot_id = new_ulid();
-            let received_at = unix_timestamp_nanos();
-            let events = accumulator.compute_deltas(&config, &node_id, received_at, &snapshot_id);
-            if events.is_empty() {
-                continue;
+            tokio::select! {
+                _ = snapshot_timer.tick() => {
+                    let snapshot_id = new_ulid();
+                    let received_at = unix_timestamp_nanos();
+                    let events = accumulator.compute_deltas(&config, &node_id, received_at, &snapshot_id);
+                    if events.is_empty() {
+                        continue;
+                    }
+                    runtime
+                        .metrics
+                        .snapshot_emits_total
+                        .fetch_add(events.len() as u64, Ordering::Relaxed);
+                    for event in events {
+                        runtime
+                            .metrics
+                            .events_enqueued_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        runtime.logger.try_send(event);
+                    }
+                    invalidate_status_cache();
+                }
+                _ = cleanup_timer.tick() => {
+                    let removed = accumulator.cleanup_stale(
+                        unix_timestamp_seconds(),
+                        config.snapshot.stale_entry_ttl_secs,
+                    );
+                    if removed > 0 {
+                        invalidate_status_cache();
+                    }
+                }
             }
-            runtime
-                .metrics
-                .snapshot_emits_total
-                .fetch_add(events.len() as u64, Ordering::Relaxed);
-            for event in events {
-                runtime
-                    .metrics
-                    .events_enqueued_total
-                    .fetch_add(1, Ordering::Relaxed);
-                runtime.logger.try_send(event);
-            }
-            invalidate_status_cache();
         }
     });
 }
@@ -2226,7 +2413,7 @@ fn infer_http_protocol(summary: &TransactionSummary) -> String {
     {
         return bound_string(protocol, MAX_FIELD_LEN);
     }
-    if summary.http_method.eq_ignore_ascii_case("CONNECT") || summary.response_status_code == 101 {
+    if summary.response_status_code == 101 {
         "ws".to_string()
     } else {
         "http".to_string()
@@ -2289,6 +2476,7 @@ fn add_f64_atomic(slot: &AtomicU64, delta: f64) {
 
 pub fn new_ulid() -> String {
     const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    const RANDOM_MASK: u128 = (1u128 << 80) - 1;
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -2296,8 +2484,8 @@ pub fn new_ulid() -> String {
         & 0x0000_FFFF_FFFF_FFFF;
     let seq = ULID_COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
     let random_prefix =
-        *ULID_RANDOM_PREFIX.get_or_init(|| (uuid::Uuid::new_v4().as_u128() & 0xffff) << 64);
-    let value = ((millis as u128) << 80) | (random_prefix | (seq & u64::MAX as u128));
+        *ULID_RANDOM_PREFIX.get_or_init(|| uuid::Uuid::new_v4().as_u128() & RANDOM_MASK);
+    let value = ((millis as u128) << 80) | (random_prefix.wrapping_add(seq) & RANDOM_MASK);
     let mut encoded = [b'0'; 26];
     let mut n = value;
     for idx in (0..26).rev() {

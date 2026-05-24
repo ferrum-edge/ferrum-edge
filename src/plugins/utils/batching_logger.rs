@@ -45,6 +45,8 @@ type HighWaterHook = Arc<dyn Fn(usize, usize) + Send + Sync>;
 pub struct LoggerHooks<T: Send + 'static> {
     pub on_failed_batch: Option<FailedBatchHook<T>>,
     pub on_overflow: Option<OverflowHook<T>>,
+    /// Called whenever the observed queue depth is above the configured
+    /// high-water mark. This hook is independent of `on_overflow`.
     pub on_high_water: Option<HighWaterHook>,
     pub high_watermark_percent: u8,
 }
@@ -127,22 +129,21 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// silently drops intermediate entries so the hot path never blocks.
     pub fn try_send(&self, item: T) -> bool {
         let depth = self.queue_depth.load(Ordering::Relaxed);
-        if self.is_high_water(depth)
-            && let Some(on_overflow) = self.hooks.on_overflow.as_ref()
-        {
+        if self.is_high_water(depth) {
             if let Some(on_high_water) = self.hooks.on_high_water.as_ref() {
                 on_high_water(depth, self.buffer_capacity);
             }
-            on_overflow(item, "queue high water");
-            return false;
+            if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
+                on_overflow(item, "queue high water");
+                return false;
+            }
         }
 
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
         match self.sender.try_send(item) {
-            Ok(()) => {
-                self.queue_depth.fetch_add(1, Ordering::Relaxed);
-                true
-            }
+            Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(item)) => {
+                decrement_queue_depth(&self.queue_depth);
                 self.record_drop("buffer full");
                 if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
                     on_overflow(item, "buffer full");
@@ -150,6 +151,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                decrement_queue_depth(&self.queue_depth);
                 self.record_drop("worker unavailable during shutdown");
                 false
             }
@@ -208,7 +210,7 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
             item = receiver.recv() => {
                 match item {
                     Some(item) => {
-                        queue_depth.fetch_sub(1, Ordering::Relaxed);
+                        decrement_queue_depth(&queue_depth);
                         buffer.push(item);
                         if buffer.len() >= cfg.batch_size {
                             let batch = std::mem::take(&mut buffer);
@@ -233,6 +235,12 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
             }
         }
     }
+}
+
+fn decrement_queue_depth(queue_depth: &AtomicUsize) {
+    let _ = queue_depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1))
+    });
 }
 
 async fn flush_with_retry<T, F, Fut>(

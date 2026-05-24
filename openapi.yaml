@@ -10433,7 +10433,7 @@ components:
           type: string
           enum: [per_event, snapshot]
           default: per_event
-          description: Export one event per transaction or periodic snapshot deltas.
+          description: Export one event per transaction or periodic snapshot deltas. Snapshot mode requires spool.enabled=true for durable delta delivery.
         currency:
           type: string
           default: "USD"
@@ -10511,7 +10511,7 @@ components:
               description: Optional ClickHouse HTTP Basic username.
             password_ref:
               type: string
-              description: Environment variable containing the ClickHouse password, often materialized from an existing `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, or `_GCP` secret suffix.
+              description: FERRUM_* environment variable containing the ClickHouse password, often materialized at startup from an existing `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, or `_GCP` secret suffix.
             tls:
               type: object
               additionalProperties: false
@@ -10528,10 +10528,11 @@ components:
                 verify_hostname:
                   type: boolean
                   default: true
+                  description: Verify the ClickHouse server hostname. Disabling this logs a warning and is for testing only.
                 insecure_skip_verify:
                   type: boolean
                   default: false
-                  description: Disable certificate verification for this ClickHouse endpoint. Testing only.
+                  description: Disable certificate verification for this ClickHouse endpoint. Logs a warning and cannot be used with password_ref. Testing only.
             insert_query_params:
               type: object
               additionalProperties:
@@ -10613,6 +10614,16 @@ components:
               type: boolean
               default: false
               description: Emit unchanged keys on every snapshot tick.
+            cleanup_interval_secs:
+              type: integer
+              minimum: 1
+              default: 300
+              description: How often idle snapshot accumulator keys are evicted.
+            stale_entry_ttl_secs:
+              type: integer
+              minimum: 1
+              default: 3600
+              description: How long a snapshot accumulator key may remain idle before entries and last-emitted state are removed.
 
     ChargebackResponse:
       type: object

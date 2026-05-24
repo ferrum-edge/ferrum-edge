@@ -1,12 +1,18 @@
+use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolManager, SpoolSettings, decode_spool_file_for_tests, new_ulid, serialize_json_each_row,
+    SpoolManager, SpoolSettings, decode_spool_file_for_tests, new_ulid,
+    replay_spool_once_for_tests, serialize_json_each_row,
 };
 use ferrum_edge::plugins::chargeback::pricing::ChargeComputation;
-use ferrum_edge::plugins::{Plugin, PluginHttpClient};
+use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
 use serde_json::{Value, json};
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn valid_config(spool_dir: &Path) -> Value {
     json!({
@@ -62,6 +68,18 @@ fn sample_event(id: &str) -> ChargeEvent {
     }
 }
 
+async fn wait_for_requests(server: &MockServer, at_least: usize) -> Vec<wiremock::Request> {
+    for _ in 0..40 {
+        if let Some(requests) = server.received_requests().await
+            && requests.len() >= at_least
+        {
+            return requests;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("mock server did not receive {at_least} request(s)");
+}
+
 #[tokio::test]
 async fn config_validation_accepts_valid_config() {
     let temp = tempfile::tempdir().unwrap();
@@ -98,6 +116,33 @@ async fn config_validation_rejects_bad_shapes() {
             "expected config to be rejected: {config}"
         );
     }
+}
+
+#[tokio::test]
+async fn config_validation_rejects_snapshot_without_spool() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["mode"] = json!("snapshot");
+    config["spool"]["enabled"] = json!(false);
+
+    let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("snapshot mode without spool should be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.contains("snapshot mode requires spool.enabled=true"));
+}
+
+#[tokio::test]
+async fn password_ref_must_use_ferrum_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["password_ref"] = json!("PATH");
+
+    let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("non-FERRUM password_ref should be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.contains("password_ref must reference a FERRUM_*"));
 }
 
 #[test]
@@ -207,6 +252,193 @@ fn spool_write_round_trip_and_oldest_eviction() {
     );
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_spool_writes_do_not_fail_during_eviction() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 1,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = Arc::new(SpoolManager::for_tests(settings, "node-a").unwrap());
+    let mut handles = Vec::new();
+    for idx in 0..24 {
+        let spool = Arc::clone(&spool);
+        handles.push(tokio::task::spawn_blocking(move || {
+            spool.write_events(&[sample_event(&format!("evt-{idx}"))])
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap().unwrap();
+    }
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 1);
+}
+
+#[tokio::test]
+async fn replay_quarantines_corrupt_spool_file_and_continues() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 1024 * 1024,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let corrupt_dir = temp.path().join("node-a").join("20260524");
+    fs::create_dir_all(&corrupt_dir).unwrap();
+    let corrupt = corrupt_dir.join("00000000000000000000000000.ndjson");
+    fs::write(&corrupt, [0xff, 0xfe, 0xfd]).unwrap();
+    let valid = spool.write_events(&[sample_event("evt-good")]).unwrap();
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .unwrap();
+
+    assert!(
+        !valid.exists(),
+        "valid spool file should replay and be removed"
+    );
+    assert!(
+        corrupt
+            .with_file_name("00000000000000000000000000.ndjson.corrupt")
+            .exists(),
+        "corrupt spool file should be quarantined"
+    );
+    let requests = wait_for_requests(&server, 1).await;
+    assert_eq!(requests.len(), 1);
+    let body = String::from_utf8(requests[0].body.clone()).unwrap();
+    assert!(body.contains("evt-good"));
+}
+
+#[tokio::test]
+async fn websocket_disconnect_exports_bandwidth_charge() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    assert!(plugin.requires_ws_disconnect_hooks());
+
+    plugin
+        .on_ws_disconnect(&WsDisconnectContext {
+            namespace: "ferrum".to_string(),
+            proxy_id: "ws-proxy".to_string(),
+            proxy_name: Some("WS Proxy".to_string()),
+            client_ip: "127.0.0.1".to_string(),
+            backend_target: "http://127.0.0.1:9000/ws".to_string(),
+            listen_port: 8000,
+            duration_ms: 10.0,
+            frames_client_to_backend: 1,
+            frames_backend_to_client: 1,
+            bytes_client_to_backend: 300,
+            bytes_backend_to_client: 400,
+            direction: None,
+            io_side: None,
+            error_class: None,
+            consumer_username: Some("alice".to_string()),
+            auth_method: None,
+            metadata: Default::default(),
+        })
+        .await;
+
+    let requests = wait_for_requests(&server, 1).await;
+    let body: Value = requests[0].body_json().unwrap();
+    assert_eq!(body["protocol"], "ws");
+    assert_eq!(body["bytes_sent"], 300);
+    assert_eq!(body["bytes_received"], 400);
+}
+
+#[tokio::test]
+async fn connect_method_is_not_classified_as_websocket() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+
+    plugin
+        .log(&TransactionSummary {
+            namespace: "ferrum".to_string(),
+            consumer_username: Some("alice".to_string()),
+            http_method: "CONNECT".to_string(),
+            proxy_id: Some("proxy-a".to_string()),
+            proxy_name: Some("Proxy A".to_string()),
+            response_status_code: 200,
+            bytes_sent: 10,
+            bytes_received: 20,
+            ..TransactionSummary::default()
+        })
+        .await;
+
+    let requests = wait_for_requests(&server, 1).await;
+    let body: Value = requests[0].body_json().unwrap();
+    assert_eq!(body["protocol"], "http");
+}
+
+#[test]
+fn snapshot_cleanup_removes_idle_entries_and_last_emitted() {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    let accumulator = SnapshotAccumulator::new();
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        ChargeComputation {
+            call_count: 1,
+            charge_call: 0.01,
+            bytes_sent: 10,
+            bytes_received: 20,
+            charge_bytes_sent: 0.01,
+            charge_bytes_received: 0.02,
+            charge_total: 0.04,
+        },
+    );
+    assert_eq!(
+        accumulator
+            .compute_deltas(&config, "node-a", 100, "snap-1")
+            .len(),
+        1
+    );
+
+    assert_eq!(accumulator.cleanup_stale_for_tests(0), 1);
+    assert!(
+        accumulator
+            .compute_deltas(&config, "node-a", 200, "snap-2")
+            .is_empty()
+    );
 }
 
 #[test]

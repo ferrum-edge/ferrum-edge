@@ -29,42 +29,35 @@ ORDER BY (namespace, consumer_id, received_at, event_id)
 PARTITION BY toYYYYMM(received_at)
 TTL toDateTime(received_at) + INTERVAL 13 MONTH;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS ferrum.charges_hourly
-ENGINE = SummingMergeTree()
-ORDER BY (namespace, consumer_id, proxy_id, status_code, hour)
-PARTITION BY toYYYYMM(hour)
-AS SELECT
+CREATE VIEW IF NOT EXISTS ferrum.charges_hourly AS
+SELECT
     namespace, consumer_id, proxy_id, status_code,
     toStartOfHour(received_at) AS hour,
     sum(call_count)            AS calls,
     sum(charge_total)          AS charge,
     sum(bytes_sent)            AS bytes_sent,
     sum(bytes_received)        AS bytes_received
-FROM ferrum.charges_raw
+FROM ferrum.charges_raw FINAL
 GROUP BY namespace, consumer_id, proxy_id, status_code, hour;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS ferrum.charges_daily
-ENGINE = SummingMergeTree()
-ORDER BY (namespace, consumer_id, proxy_id, day)
-AS SELECT
+CREATE VIEW IF NOT EXISTS ferrum.charges_daily AS
+SELECT
     namespace, consumer_id, proxy_id,
-    toDate(hour)           AS day,
-    sum(calls)             AS calls,
-    sum(charge)            AS charge,
-    sum(bytes_sent)        AS bytes_sent,
-    sum(bytes_received)    AS bytes_received
-FROM ferrum.charges_hourly
+    toDate(received_at)        AS day,
+    sum(call_count)            AS calls,
+    sum(charge_total)          AS charge,
+    sum(bytes_sent)            AS bytes_sent,
+    sum(bytes_received)        AS bytes_received
+FROM ferrum.charges_raw FINAL
 GROUP BY namespace, consumer_id, proxy_id, day;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS ferrum.charges_monthly
-ENGINE = SummingMergeTree()
-ORDER BY (namespace, consumer_id, proxy_id, month)
-AS SELECT
+CREATE VIEW IF NOT EXISTS ferrum.charges_monthly AS
+SELECT
     namespace, consumer_id, proxy_id,
-    toStartOfMonth(day)    AS month,
-    sum(calls)             AS calls,
-    sum(charge)            AS charge,
-    sum(bytes_sent)        AS bytes_sent,
-    sum(bytes_received)    AS bytes_received
-FROM ferrum.charges_daily
+    toStartOfMonth(received_at) AS month,
+    sum(call_count)             AS calls,
+    sum(charge_total)           AS charge,
+    sum(bytes_sent)             AS bytes_sent,
+    sum(bytes_received)         AS bytes_received
+FROM ferrum.charges_raw FINAL
 GROUP BY namespace, consumer_id, proxy_id, month;

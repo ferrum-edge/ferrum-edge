@@ -90,25 +90,31 @@ async fn clickhouse_insert_round_trip_when_configured() {
         metadata,
     };
     plugin.log(&summary).await;
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
     let query = "SELECT count() FROM ferrum.charges_raw FINAL WHERE pricing_version='it-chargeback-sink' AND consumer_id='it-consumer'";
-    let response = client
-        .post(clickhouse_url_with_query(
-            &std::env::var("FERRUM_CLICKHOUSE_TEST_URL").unwrap(),
-            &[("query", query)],
-        ))
-        .send()
-        .await
-        .expect("ClickHouse SELECT request should send");
-    assert!(
-        response.status().is_success(),
-        "SELECT failed: {}",
-        response.text().await.unwrap_or_default()
-    );
-    let count = response.text().await.unwrap_or_default();
-    assert!(
-        count.trim().parse::<u64>().unwrap_or_default() >= 1,
-        "expected at least one inserted charge event, got {count:?}"
-    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let response = client
+            .post(clickhouse_url_with_query(
+                &std::env::var("FERRUM_CLICKHOUSE_TEST_URL").unwrap(),
+                &[("query", query)],
+            ))
+            .send()
+            .await
+            .expect("ClickHouse SELECT request should send");
+        assert!(
+            response.status().is_success(),
+            "SELECT failed: {}",
+            response.text().await.unwrap_or_default()
+        );
+        let count = response.text().await.unwrap_or_default();
+        if count.trim().parse::<u64>().unwrap_or_default() >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected at least one inserted charge event, got {count:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
