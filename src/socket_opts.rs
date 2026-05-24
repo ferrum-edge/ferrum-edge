@@ -1706,6 +1706,16 @@ pub mod io_uring_splice {
         }
     }
 
+    /// Sentinel `io::Error` kinds the loop uses to signal which timeout fired.
+    /// The caller distinguishes by message prefix on the anyhow wrapper.
+    /// `BACKEND_READ_TIMEOUT_MSG` and `BACKEND_WRITE_TIMEOUT_MSG` are the
+    /// stable message bodies the caller in `tcp_proxy.rs` matches via the
+    /// `STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX` /
+    /// `STREAM_SPLICE_BACKEND_WRITE_TIMEOUT_PREFIX` constants. Keep them in
+    /// sync — drift silently mis-attributes the timeout in metrics.
+    pub const BACKEND_READ_TIMEOUT_MSG: &str = "backend read inactivity timeout";
+    pub const BACKEND_WRITE_TIMEOUT_MSG: &str = "backend write inactivity timeout";
+
     /// Splice data in one direction using io_uring: src_fd → pipe → dst_fd.
     ///
     /// Runs on a blocking thread (called via `tokio::task::spawn_blocking`).
@@ -1716,10 +1726,20 @@ pub mod io_uring_splice {
     /// cannot be created, signaling the caller to fall back to `libc::splice`.
     ///
     /// `timeout_ms` is the idle timeout — if no data is transferred on either
-    /// direction for this duration, returns `ErrorKind::TimedOut`.
+    /// direction for this duration, returns `ErrorKind::TimedOut` with the
+    /// generic message body (caller maps to `Direction::Unknown`).
     /// `shared_last_activity_ms` is an `AtomicU64` shared between both splice
     /// directions so that activity in one direction prevents the other from
     /// timing out (critical for one-way streaming like downloads).
+    ///
+    /// `read_watermark` / `read_timeout_ms` enforce `backend_read_timeout_ms`
+    /// on the read side (src→pipe). Refreshed on every successful read.
+    /// `write_watermark` / `write_timeout_ms` enforce `backend_write_timeout_ms`
+    /// on the write side (pipe→dst). Primed when the read produces queued
+    /// bytes and refreshed on every successful write. Both watermarks emit a
+    /// distinct message body (see `BACKEND_*_TIMEOUT_MSG`) so the caller can
+    /// attribute the timeout to the correct `(Direction, StreamIoSide)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn io_uring_splice_loop(
         src_fd: i32,
         pipe_w: i32,
@@ -1727,6 +1747,10 @@ pub mod io_uring_splice {
         dst_fd: i32,
         shared_last_activity_ms: &std::sync::atomic::AtomicU64,
         timeout_ms: u64,
+        read_watermark: Option<&std::sync::atomic::AtomicU64>,
+        read_timeout_ms: u64,
+        write_watermark: Option<&std::sync::atomic::AtomicU64>,
+        write_timeout_ms: u64,
     ) -> Result<u64, SpliceError> {
         let mut ring = match io_uring::IoUring::new(8) {
             Ok(r) => r,
@@ -1743,6 +1767,8 @@ pub mod io_uring_splice {
         let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
         let mut total: u64 = 0;
         let chunk_size: u32 = 128 * 1024;
+        let read_wm_active = read_watermark.is_some() && read_timeout_ms > 0;
+        let write_wm_active = write_watermark.is_some() && write_timeout_ms > 0;
 
         loop {
             // Inline idle timeout check using the shared cross-direction timestamp.
@@ -1761,6 +1787,16 @@ pub mod io_uring_splice {
                 if now.saturating_sub(last) >= timeout_ms {
                     return Err(SpliceError::read(std::io::Error::from(
                         std::io::ErrorKind::TimedOut,
+                    )));
+                }
+            }
+            if read_wm_active && let Some(wm) = read_watermark {
+                let now = super::monotonic_now_ms();
+                let last = wm.load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(last) >= read_timeout_ms {
+                    return Err(SpliceError::read(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        BACKEND_READ_TIMEOUT_MSG,
                     )));
                 }
             }
@@ -1809,11 +1845,31 @@ pub mod io_uring_splice {
                             )));
                         }
                     }
+                    if read_wm_active && let Some(wm) = read_watermark {
+                        let now = super::monotonic_now_ms();
+                        let last = wm.load(std::sync::atomic::Ordering::Relaxed);
+                        if now.saturating_sub(last) >= read_timeout_ms {
+                            return Err(SpliceError::read(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                BACKEND_READ_TIMEOUT_MSG,
+                            )));
+                        }
+                    }
                     // Back off to avoid tight spin — sleep 1ms then retry.
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
                 return Err(SpliceError::read(err));
+            }
+
+            // Successful src→pipe: refresh the read watermark and prime the
+            // write watermark (we now have queued bytes ready for dst).
+            let post_read_now = super::monotonic_now_ms();
+            if read_wm_active && let Some(wm) = read_watermark {
+                wm.store(post_read_now, std::sync::atomic::Ordering::Relaxed);
+            }
+            if write_wm_active && let Some(wm) = write_watermark {
+                wm.store(post_read_now, std::sync::atomic::Ordering::Relaxed);
             }
 
             // Phase 2: splice pipe_r → dst_fd via io_uring
@@ -1864,6 +1920,16 @@ pub mod io_uring_splice {
                                 )));
                             }
                         }
+                        if write_wm_active && let Some(wm) = write_watermark {
+                            let now = super::monotonic_now_ms();
+                            let last = wm.load(std::sync::atomic::Ordering::Relaxed);
+                            if now.saturating_sub(last) >= write_timeout_ms {
+                                return Err(SpliceError::write(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    BACKEND_WRITE_TIMEOUT_MSG,
+                                )));
+                            }
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
@@ -1875,11 +1941,13 @@ pub mod io_uring_splice {
                 // prevents the connection from timing out. Must use the same
                 // monotonic clock as the reader loop above (and the libc
                 // fallback's `coarse_now_ms`) so the shared atomic is coherent.
+                let post_write_now = super::monotonic_now_ms();
                 if timeout_ms > 0 {
-                    shared_last_activity_ms.store(
-                        super::monotonic_now_ms(),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    shared_last_activity_ms
+                        .store(post_write_now, std::sync::atomic::Ordering::Relaxed);
+                }
+                if write_wm_active && let Some(wm) = write_watermark {
+                    wm.store(post_write_now, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -1903,6 +1971,11 @@ pub mod io_uring_splice {
     }
 
     #[allow(dead_code)]
+    pub const BACKEND_READ_TIMEOUT_MSG: &str = "backend read inactivity timeout";
+    #[allow(dead_code)]
+    pub const BACKEND_WRITE_TIMEOUT_MSG: &str = "backend write inactivity timeout";
+
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn io_uring_splice_loop(
         _src_fd: i32,
         _pipe_w: i32,
@@ -1910,6 +1983,10 @@ pub mod io_uring_splice {
         _dst_fd: i32,
         _shared_last_activity_ms: &std::sync::atomic::AtomicU64,
         _timeout_ms: u64,
+        _read_watermark: Option<&std::sync::atomic::AtomicU64>,
+        _read_timeout_ms: u64,
+        _write_watermark: Option<&std::sync::atomic::AtomicU64>,
+        _write_timeout_ms: u64,
     ) -> Result<u64, SpliceError> {
         Err(SpliceError {
             is_write_side: false,

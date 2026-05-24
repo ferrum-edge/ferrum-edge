@@ -798,6 +798,297 @@ async fn test_bidirectional_splice_half_close_idle_timeout_fires_in_phase2() {
     assert_eq!(*class, ErrorClass::ReadWriteTimeout);
 }
 
+// ── bidirectional_splice backend directional timeouts (Linux only) ───────────
+//
+// These tests pin the fix for the PR 1141 conservative gate: splice must
+// continue to enforce `backend_read_timeout_ms` and `backend_write_timeout_ms`
+// from within the splice loop rather than falling back to bidirectional_copy.
+// Mirror of the userspace `bidirectional_copy` backend-timeout tests above.
+
+/// `backend_read_timeout_ms`: splice b2c direction reads from backend. When
+/// backend stops sending, the watermark expires and the relay closes with
+/// `(BackendToClient, Read, ReadWriteTimeout)`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_bidirectional_splice_backend_read_timeout_fires_on_silent_backend() {
+    use ferrum_edge::_test_support::bidirectional_splice_for_test_with_timeouts;
+    use tokio::io::AsyncReadExt;
+
+    let (proxy_client_side, mut external_client) = connected_tcp_pair().await;
+    let (proxy_backend_side, external_backend) = connected_tcp_pair().await;
+
+    // Client keeps reading so it doesn't drive its own EOF.
+    tokio::spawn(async move {
+        let mut sink = Vec::new();
+        let _ = external_client.read_to_end(&mut sink).await;
+    });
+    // Hold the backend open without writing anything — b2c stalls.
+    tokio::spawn(async move {
+        let _backend = external_backend;
+        std::future::pending::<()>().await;
+    });
+
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        bidirectional_splice_for_test_with_timeouts(
+            proxy_client_side,
+            proxy_backend_side,
+            // Idle timeout long enough to ensure backend_read_timeout fires first.
+            Some(Duration::from_secs(10)),
+            None,
+            Some(Duration::from_millis(300)),
+            None,
+            64 * 1024,
+        ),
+    )
+    .await
+    .expect("splice backend_read_timeout must fire near the configured deadline");
+
+    let elapsed = start.elapsed();
+    let (dir, class, side, _msg) = result
+        .first_failure
+        .as_ref()
+        .expect("silent backend with backend_read_timeout must produce first_failure");
+    assert_eq!(*dir, Direction::BackendToClient);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert_eq!(*side, Some(StreamIoSide::Read));
+    // Should fire roughly at the deadline (300ms) + watchdog jitter (~1s),
+    // far below the 3s outer timeout.
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "backend_read_timeout took too long: {:?}",
+        elapsed
+    );
+}
+
+/// `backend_write_timeout_ms`: splice c2b direction writes to backend. When
+/// the backend stops draining its receive buffer, the watermark expires and
+/// the relay closes with `(ClientToBackend, Write, ReadWriteTimeout)`.
+///
+/// Uses kernel-side back-pressure: client writes a large blob, backend reads
+/// nothing, backend socket buffer fills, the splice pipe→backend write
+/// returns WouldBlock indefinitely.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_bidirectional_splice_backend_write_timeout_fires_on_stuck_backend() {
+    use ferrum_edge::_test_support::bidirectional_splice_for_test_with_timeouts;
+    use tokio::io::AsyncWriteExt;
+
+    let (proxy_client_side, mut external_client) = connected_tcp_pair().await;
+    let (proxy_backend_side, external_backend) = connected_tcp_pair().await;
+
+    // Drive c2b traffic: client streams bytes continuously until the splice
+    // closes from underneath it. 4 MiB chunks are large enough to saturate
+    // the backend socket buffer once it stops reading.
+    tokio::spawn(async move {
+        let payload = vec![0x55u8; 4 * 1024 * 1024];
+        loop {
+            if external_client.write_all(&payload).await.is_err() {
+                break;
+            }
+        }
+    });
+    // Hold the backend open without reading — c2b pipe→backend write stalls.
+    tokio::spawn(async move {
+        let _backend = external_backend;
+        std::future::pending::<()>().await;
+    });
+
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        bidirectional_splice_for_test_with_timeouts(
+            proxy_client_side,
+            proxy_backend_side,
+            // Long idle timeout so backend_write_timeout fires first.
+            Some(Duration::from_secs(15)),
+            None,
+            None,
+            Some(Duration::from_millis(500)),
+            64 * 1024,
+        ),
+    )
+    .await
+    .expect("splice backend_write_timeout must fire near the configured deadline");
+
+    let elapsed = start.elapsed();
+    let (dir, class, side, _msg) = result
+        .first_failure
+        .as_ref()
+        .expect("stuck backend with backend_write_timeout must produce first_failure");
+    assert_eq!(*dir, Direction::ClientToBackend);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert_eq!(*side, Some(StreamIoSide::Write));
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "backend_write_timeout took too long: {:?}",
+        elapsed
+    );
+}
+
+/// Slow-but-progressing backend must not falsely trigger `backend_read_timeout`
+/// — every successful src→pipe splice refreshes the read watermark. Backend
+/// trickles bytes faster than the timeout interval; relay should drain
+/// cleanly when both sides EOF.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_bidirectional_splice_slow_progressing_backend_does_not_fire_timeout() {
+    use ferrum_edge::_test_support::bidirectional_splice_for_test_with_timeouts;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (proxy_client_side, mut external_client) = connected_tcp_pair().await;
+    let (proxy_backend_side, mut external_backend) = connected_tcp_pair().await;
+
+    let chunks: usize = 6;
+    let chunk_size: usize = 16;
+    let chunk_interval_ms: u64 = 150;
+    let timeout_ms: u64 = 500;
+
+    tokio::spawn(async move {
+        let _ = external_client.shutdown().await;
+        let mut sink = Vec::new();
+        let _ = external_client.read_to_end(&mut sink).await;
+    });
+
+    let total_bytes = (chunks * chunk_size) as u64;
+    tokio::spawn(async move {
+        let payload = vec![0xCDu8; chunk_size];
+        for _ in 0..chunks {
+            if external_backend.write_all(&payload).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(chunk_interval_ms)).await;
+        }
+        let _ = external_backend.shutdown().await;
+    });
+
+    let result = bidirectional_splice_for_test_with_timeouts(
+        proxy_client_side,
+        proxy_backend_side,
+        Some(Duration::from_secs(10)),
+        None,
+        Some(Duration::from_millis(timeout_ms)),
+        None,
+        64 * 1024,
+    )
+    .await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "slow-but-progressing backend on splice path should complete cleanly, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(result.bytes_backend_to_client, total_bytes);
+}
+
+/// `backend_read_timeout_ms` zero disables the per-direction check on the
+/// splice path — the relay should behave exactly like the original idle-only
+/// timeout case.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_bidirectional_splice_backend_read_timeout_zero_disables_check() {
+    use ferrum_edge::_test_support::bidirectional_splice_for_test_with_timeouts;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (proxy_client_side, mut external_client) = connected_tcp_pair().await;
+    let (proxy_backend_side, mut external_backend) = connected_tcp_pair().await;
+
+    let request = b"REQ";
+    let response = b"RESP".to_vec();
+    let expected_response_len = response.len() as u64;
+
+    tokio::spawn(async move {
+        let _ = external_client.write_all(request).await;
+        let _ = external_client.shutdown().await;
+        let mut sink = Vec::new();
+        let _ = external_client.read_to_end(&mut sink).await;
+    });
+
+    let expected_request_len = request.len();
+    tokio::spawn(async move {
+        let mut received = 0usize;
+        let mut buf = [0u8; 32];
+        while received < expected_request_len {
+            match external_backend.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => received += n,
+                Err(_) => break,
+            }
+        }
+        let _ = external_backend.write_all(&response).await;
+        let _ = external_backend.shutdown().await;
+    });
+
+    // Both backend timeouts ZERO (None) — the splice path should run without
+    // the per-direction watermarks active, completing cleanly.
+    let result = bidirectional_splice_for_test_with_timeouts(
+        proxy_client_side,
+        proxy_backend_side,
+        Some(Duration::from_secs(5)),
+        None,
+        None,
+        None,
+        64 * 1024,
+    )
+    .await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "backend_*_timeout=0 should not produce first_failure, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(result.bytes_backend_to_client, expected_response_len);
+}
+
+/// io_uring path: when available, the io_uring splice loop must also enforce
+/// `backend_read_timeout_ms`. This test falls through to the libc fallback
+/// when io_uring is unavailable (CI containers without IORING_OP_SPLICE
+/// support), exercising `libc_splice_loop` instead.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_bidirectional_splice_io_uring_backend_read_timeout_fires() {
+    use ferrum_edge::_test_support::bidirectional_splice_io_uring_for_test_with_timeouts;
+    use tokio::io::AsyncReadExt;
+
+    let (proxy_client_side, mut external_client) = connected_tcp_pair().await;
+    let (proxy_backend_side, external_backend) = connected_tcp_pair().await;
+
+    tokio::spawn(async move {
+        let mut sink = Vec::new();
+        let _ = external_client.read_to_end(&mut sink).await;
+    });
+    tokio::spawn(async move {
+        let _backend = external_backend;
+        std::future::pending::<()>().await;
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        bidirectional_splice_io_uring_for_test_with_timeouts(
+            proxy_client_side,
+            proxy_backend_side,
+            Some(Duration::from_secs(10)),
+            // Set a half-close cap so the c2b worker is unblocked if the b2c
+            // worker is the one whose backend_read_timeout fires.
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_millis(300)),
+            None,
+            64 * 1024,
+        ),
+    )
+    .await
+    .expect("io_uring/libc-fallback splice backend_read_timeout must fire");
+
+    let (dir, class, side, _msg) = result
+        .first_failure
+        .as_ref()
+        .expect("io_uring splice b2c backend_read_timeout must produce first_failure");
+    assert_eq!(*dir, Direction::BackendToClient);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert_eq!(*side, Some(StreamIoSide::Read));
+}
+
 // ── disconnect_cause_for_failure — Direction + Side → DisconnectCause ────────
 //
 // Codex flagged that the old mapping attributed every `ClientToBackend` failure

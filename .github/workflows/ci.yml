@@ -359,6 +359,7 @@ jobs:
               functional_sse_test
               functional_stream_listener_failure_test
               functional_tcp_proxy_test
+              functional_tcp_splice_backend_timeout_test
               functional_udp_proxy_test
               functional_websocket_test
               scripted_backend_h2_tests
