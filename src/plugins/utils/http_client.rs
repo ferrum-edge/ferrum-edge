@@ -112,6 +112,8 @@ pub struct PluginHttpClient {
     /// reads this slot) falls back to a fresh unattached state and
     /// emits zero counters rather than panicking.
     bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+    /// Operator override for hot-path DashMap shard counts.
+    pool_shard_amount: usize,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -126,6 +128,7 @@ impl std::fmt::Debug for PluginHttpClient {
             .field("tls_crls_count", &self.tls_crls.len())
             .field("namespace", &self.namespace)
             .field("backend_allow_ips", &self.backend_allow_ips)
+            .field("pool_shard_amount", &self.pool_shard_amount)
             .finish()
     }
 }
@@ -184,6 +187,7 @@ impl PluginHttpClient {
         namespace: &str,
         backend_allow_ips: BackendAllowIps,
         mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
+        pool_shard_amount: usize,
     ) -> Self {
         let dns_cache_clone = dns_cache.clone();
         let resolver = DnsCacheResolver::new(dns_cache);
@@ -269,6 +273,7 @@ impl PluginHttpClient {
             backend_allow_ips,
             mesh_egress_strip_baggage_keys,
             bpf_metrics_state: None,
+            pool_shard_amount,
         }
     }
 
@@ -346,6 +351,7 @@ impl PluginHttpClient {
             backend_allow_ips: BackendAllowIps::Both,
             mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
             bpf_metrics_state: None,
+            pool_shard_amount: 0,
         }
     }
 
@@ -423,6 +429,11 @@ impl PluginHttpClient {
     /// gateway instances share a single external backend.
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// Effective shard count for hot-path plugin DashMaps.
+    pub fn pool_shard_amount(&self) -> usize {
+        crate::util::sharding::pool_shard_amount(self.pool_shard_amount)
     }
 
     /// Resolved backend IP allowlist policy.

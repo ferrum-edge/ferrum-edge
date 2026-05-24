@@ -683,6 +683,232 @@ async fn test_jwks_auth_strips_authorization_when_forward_original_token_false()
 }
 
 #[tokio::test]
+async fn claim_headers_writes_simple_and_array_claims_to_outbound_headers() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri,
+                "claim_headers": {
+                    "email": "X-User-Email",
+                    "roles": "X-User-Roles"
+                },
+                "claim_headers_separator": "|"
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert!(plugin.modifies_request_headers());
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let token = create_rs256_token(
+        &json!({
+            "sub": "idp-user",
+            "email": "idp@example.com",
+            "roles": ["admin", "editor"]
+        }),
+        private_key_pem,
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        headers.get("x-user-email").map(String::as_str),
+        Some("idp@example.com")
+    );
+    assert_eq!(
+        headers.get("x-user-roles").map(String::as_str),
+        Some("admin|editor")
+    );
+}
+
+#[test]
+fn new_rejects_claim_header_with_reserved_target() {
+    let err = match JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks": {"keys": []},
+                "claim_headers": {"sub": "Authorization"}
+            }]
+        }),
+        default_client(),
+    ) {
+        Ok(_) => panic!("reserved header should reject"),
+        Err(err) => err,
+    };
+    assert!(err.contains("reserved"));
+}
+
+#[tokio::test]
+async fn mtls_bound_token_with_matching_thumbprint_succeeds() {
+    use ferrum_edge::plugins::utils::cert_hash::sha256_base64url_no_pad;
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let cert_der = b"test client cert der".to_vec();
+    let thumbprint = sha256_base64url_no_pad(&cert_der);
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri,
+                "require_mtls_binding": true
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let token = create_rs256_token(
+        &json!({"sub": "idp-user", "cnf": {"x5t#S256": thumbprint}}),
+        private_key_pem,
+    );
+
+    let mut ctx = make_ctx();
+    ctx.tls_client_cert_der = Some(std::sync::Arc::new(cert_der));
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn mtls_binding_required_but_no_client_cert_rejects_401() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri,
+                "require_mtls_binding": true
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let token = create_rs256_token(
+        &json!({"sub": "idp-user", "cnf": {"x5t#S256": "abc"}}),
+        private_key_pem,
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn dpop_valid_proof_with_matching_jkt_succeeds() {
+    use ferrum_edge::plugins::utils::dpop::jwk_thumbprint_sha256;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwk_value = build_rsa_jwks_from_pem(public_key_pem)["keys"][0].clone();
+    let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk_value).unwrap();
+    let jkt = jwk_thumbprint_sha256(&jwk).unwrap();
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri,
+                "require_dpop": true
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let access_token = create_rs256_token(
+        &json!({"sub": "idp-user", "cnf": {"jkt": jkt}}),
+        private_key_pem,
+    );
+    let now = chrono::Utc::now().timestamp();
+    let mut dpop_header = Header::new(jsonwebtoken::Algorithm::RS256);
+    dpop_header.typ = Some("dpop+jwt".to_string());
+    dpop_header.jwk = Some(jwk);
+    let proof = encode(
+        &dpop_header,
+        &json!({
+            "htm": "GET",
+            "htu": "http://example.com/test",
+            "iat": now,
+            "exp": now + 60,
+            "jti": "proof-1"
+        }),
+        &EncodingKey::from_rsa_pem(private_key_pem).unwrap(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        format!("Bearer {}", access_token),
+    );
+    ctx.headers.insert("dpop".to_string(), proof);
+    ctx.headers
+        .insert("host".to_string(), "example.com".to_string());
+    ctx.metadata
+        .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn dpop_required_but_header_missing_rejects_401() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri,
+                "require_dpop": true
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let token = create_rs256_token(
+        &json!({"sub": "idp-user", "cnf": {"jkt": "missing"}}),
+        private_key_pem,
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
 async fn test_jwks_auth_rejects_wrong_key() {
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
     let other_public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem");
@@ -1248,7 +1474,7 @@ async fn test_jwks_auth_multi_provider_wrong_role_rejected() {
 
 #[test]
 fn test_extract_claim_values_space_delimited_string() {
-    use ferrum_edge::plugins::jwks_auth::extract_claim_values;
+    use ferrum_edge::plugins::utils::claim_resolver::extract_claim_values;
 
     let claims = json!({"scope": "read:data write:data admin"});
     let values = extract_claim_values(&claims, "scope");
@@ -1257,7 +1483,7 @@ fn test_extract_claim_values_space_delimited_string() {
 
 #[test]
 fn test_extract_claim_values_array() {
-    use ferrum_edge::plugins::jwks_auth::extract_claim_values;
+    use ferrum_edge::plugins::utils::claim_resolver::extract_claim_values;
 
     let claims = json!({"scp": ["read", "write"]});
     let values = extract_claim_values(&claims, "scp");
@@ -1266,7 +1492,7 @@ fn test_extract_claim_values_array() {
 
 #[test]
 fn test_extract_claim_values_nested_dot_path() {
-    use ferrum_edge::plugins::jwks_auth::extract_claim_values;
+    use ferrum_edge::plugins::utils::claim_resolver::extract_claim_values;
 
     let claims = json!({"realm_access": {"roles": ["admin", "user"]}});
     let values = extract_claim_values(&claims, "realm_access.roles");
@@ -1275,7 +1501,7 @@ fn test_extract_claim_values_nested_dot_path() {
 
 #[test]
 fn test_extract_claim_values_missing_path() {
-    use ferrum_edge::plugins::jwks_auth::extract_claim_values;
+    use ferrum_edge::plugins::utils::claim_resolver::extract_claim_values;
 
     let claims = json!({"sub": "user"});
     let values = extract_claim_values(&claims, "nonexistent.path");
@@ -1284,7 +1510,7 @@ fn test_extract_claim_values_missing_path() {
 
 #[test]
 fn test_extract_claim_values_deeply_nested() {
-    use ferrum_edge::plugins::jwks_auth::extract_claim_values;
+    use ferrum_edge::plugins::utils::claim_resolver::extract_claim_values;
 
     // Two levels of nesting (Keycloak resource_access style)
     let claims = json!({

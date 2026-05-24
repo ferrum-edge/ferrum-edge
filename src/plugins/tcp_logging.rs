@@ -622,6 +622,7 @@ mod tests {
             "ferrum",
             crate::config::BackendAllowIps::Both,
             std::sync::Arc::new(Vec::new()),
+            0,
         );
 
         let plugin = TcpLogging::new(
