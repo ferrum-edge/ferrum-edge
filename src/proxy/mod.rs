@@ -10001,6 +10001,7 @@ async fn handle_proxy_request_inner(
         supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
     let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
+    let mut skip_final_cb_record = false;
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
@@ -10111,14 +10112,23 @@ async fn handle_proxy_request_inner(
             // On break, restore the pre-rotation key so the post-loop
             // `record_backend_outcome` attributes against the target that
             // actually produced `result`, not the never-called new target.
-            if let Some(cb_config) = &proxy.circuit_breaker
-                && state
-                    .circuit_breaker_cache
-                    .can_execute(&proxy.id, current_cb_target_key.as_deref(), cb_config)
-                    .is_err()
-            {
-                current_cb_target_key = pre_rotation_cb_key;
-                break;
+            if let Some(cb_config) = &proxy.circuit_breaker {
+                match state.circuit_breaker_cache.can_execute(
+                    &proxy.id,
+                    current_cb_target_key.as_deref(),
+                    cb_config,
+                ) {
+                    Ok((_cb, is_half_open_probe)) => {
+                        cb_retry_probe_slot_available = is_half_open_probe;
+                    }
+                    Err(_err) => {
+                        current_cb_target_key = pre_rotation_cb_key;
+                        // The current `result` was already recorded at the top of this
+                        // retry iteration; don't double-record it below.
+                        skip_final_cb_record = true;
+                        break;
+                    }
+                }
             }
 
             warn!(
@@ -10248,6 +10258,7 @@ async fn handle_proxy_request_inner(
         backend_resp.connection_error,
         backend_error_class,
         cb_retry_probe_slot_available,
+        skip_final_cb_record,
         backend_start.elapsed(),
     );
 

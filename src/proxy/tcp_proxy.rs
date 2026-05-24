@@ -1815,6 +1815,11 @@ async fn handle_tcp_connection_inner(
         } else {
             None
         };
+        #[cfg(target_os = "linux")]
+        let splice_used =
+            splice_allowed_for_backend_timeouts(backend_read_timeout, backend_write_timeout);
+        #[cfg(not(target_os = "linux"))]
+        let splice_used = false;
 
         // Resolve backend IP via DNS
         let resolved_ip = dns_cache
@@ -1970,7 +1975,7 @@ async fn handle_tcp_connection_inner(
             bytes_in: copy_result.bytes_client_to_backend,
             bytes_out: copy_result.bytes_backend_to_client,
             duration: start.elapsed(),
-            splice_used: cfg!(target_os = "linux"),
+            splice_used,
             first_failure: copy_result.first_failure,
         });
     }
@@ -1997,7 +2002,6 @@ async fn handle_tcp_connection_inner(
     } else {
         None
     };
-
     // Terminating TCP-TLS should complete the downstream TLS handshake before
     // opening an upstream connection. This avoids spending backend sockets or
     // handshakes on clients that fail frontend TLS or are rejected by

@@ -1994,6 +1994,7 @@ async fn handle_h3_request(
                     outcome_connection_error,
                     outcome_error_class,
                     cb_is_half_open_probe,
+                    false,
                     backend_start.elapsed(),
                 );
 
@@ -2070,6 +2071,7 @@ async fn handle_h3_request(
                 false,
                 None,
                 cb_is_half_open_probe,
+                false,
                 backend_start.elapsed(),
             );
             record_request(&state, 502);
@@ -2264,6 +2266,7 @@ async fn handle_h3_request(
             false,
             None,
             cb_is_half_open_probe,
+            false,
             backend_start.elapsed(),
         );
 
@@ -2550,6 +2553,7 @@ async fn handle_h3_request(
             connection_error,
             h3_error_class,
             cb_is_half_open_probe,
+            false,
             backend_start.elapsed(),
         );
 
@@ -2785,6 +2789,7 @@ async fn handle_h3_request(
             !h3_request_on_wire,
             h3_error_class,
             cb_retry_probe_slot_available,
+            false,
             backend_start.elapsed(),
         );
 

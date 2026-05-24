@@ -244,6 +244,7 @@ async fn test_all_plugins_available() {
         "spec_expose",
         "spiffe_identity",
         "mesh_authz",
+        "opa",
         "mesh_route_dispatch",
         "mesh_outbound_registry",
         "workload_metrics",
@@ -373,6 +374,12 @@ async fn test_plugin_creation_all_plugins() {
             }
             "mesh_outbound_registry" => {
                 json!({"registry": ["reviews.default.svc.cluster.local"]})
+            }
+            "opa" => {
+                json!({
+                    "opa_host": "http://127.0.0.1:8181",
+                    "policy_path": "ferrum/authz/allow"
+                })
             }
             "proxy_alerts" => json!({
                 "channels": {

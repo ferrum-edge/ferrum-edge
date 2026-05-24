@@ -142,14 +142,19 @@ fn response_header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> O
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
+fn http1_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client")
+}
+
 #[ignore]
 #[tokio::test]
 async fn functional_forwarded_via_default_adds_x_forwarded_and_via() {
     let harness = HeaderHarness::new(true, "ferrum-edge", false).await;
-    let client = reqwest::Client::builder()
-        .http1_only()
-        .build()
-        .expect("client");
+    let client = http1_client();
 
     let response = client
         .get(harness.proxy_url())
@@ -183,10 +188,7 @@ async fn functional_forwarded_via_default_adds_x_forwarded_and_via() {
 #[tokio::test]
 async fn functional_forwarded_via_custom_pseudonym_and_forwarded_enabled() {
     let harness = HeaderHarness::new(true, "edge-under-test", true).await;
-    let client = reqwest::Client::builder()
-        .http1_only()
-        .build()
-        .expect("client");
+    let client = http1_client();
 
     let response = client
         .get(harness.proxy_url())
@@ -217,10 +219,7 @@ async fn functional_forwarded_via_custom_pseudonym_and_forwarded_enabled() {
 #[tokio::test]
 async fn functional_forwarded_via_can_disable_via_without_disabling_forwarded_headers() {
     let harness = HeaderHarness::new(false, "edge-disabled", true).await;
-    let client = reqwest::Client::builder()
-        .http1_only()
-        .build()
-        .expect("client");
+    let client = http1_client();
 
     let response = client
         .get(harness.proxy_url())

@@ -83,7 +83,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ## Plugin System
 
-- 62 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 63 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Three plugin scopes: **global** (all proxies), **proxy** (single proxy), **proxy_group** (shared across a subset of proxies) — scoped plugins replace global plugins of the same name. Proxy-group plugins share a single instance across all associated proxies, so stateful plugins (e.g., rate_limiting) share counters across the group
@@ -105,6 +105,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 ### Authorization & Security Plugins
 
 - **Access Control** — consumer-based and group-based allow/deny lists (consumers declare `acl_groups` membership; plugins match via `allowed_groups` / `disallowed_groups`)
+- **OPA** — Open Policy Agent authorization via the OPA Data API with fail-closed defaults, configurable decision pointers, and request-header redaction
 - **Mesh Outbound Registry** — HTTP-family Host allowlist used by mesh `REGISTRY_ONLY` outbound policy. It is normally auto-injected from mesh slices but can also be configured directly on non-mesh gateways as a generic Host allowlist.
 - **IP Restriction** — standalone IP/CIDR filtering
 - **Geo Restriction** — GeoIP-based country allow/deny lists using MaxMind .mmdb database files
