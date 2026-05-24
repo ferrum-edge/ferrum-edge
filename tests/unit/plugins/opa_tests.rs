@@ -239,6 +239,55 @@ async fn opa_rejects_duplicate_query_parameter_keys() {
 }
 
 #[tokio::test]
+async fn opa_allows_identical_value_duplicate_query_keys() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("a=1&a=1".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn opa_rejects_percent_encoded_key_collision() {
+    let server = MockServer::start().await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("a%20b=1&a%20b=2".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn opa_rejects_conflicting_keys_without_equals() {
+    let server = MockServer::start().await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("flag&flag=1".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn opa_rejects_conflicting_duplicate_with_empty_pairs() {
+    let server = MockServer::start().await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("a=1&&a=2".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
 async fn opa_allows_duplicate_query_keys_when_rejection_disabled() {
     let server = MockServer::start().await;
     mount_opa(&server, 200, json!({"result": true})).await;

@@ -54,21 +54,6 @@ pub struct Opa {
 }
 
 impl Opa {
-    fn has_duplicate_query_keys(raw_query: &str) -> bool {
-        let mut seen = HashSet::new();
-        for pair in raw_query.split('&') {
-            if pair.is_empty() {
-                continue;
-            }
-            let key = pair.split_once('=').map_or(pair, |(k, _)| k);
-            let decoded_key = percent_encoding::percent_decode_str(key).decode_utf8_lossy();
-            if !seen.insert(decoded_key.into_owned()) {
-                return true;
-            }
-        }
-        false
-    }
-
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let object = config
             .as_object()
@@ -344,7 +329,7 @@ impl Plugin for Opa {
             && self.reject_duplicate_query_keys
             && ctx
                 .raw_query_string()
-                .is_some_and(Self::has_duplicate_query_keys)
+                .is_some_and(super::utils::query::has_conflicting_duplicate_query_key)
         {
             warn!(
                 plugin = "opa",
@@ -402,6 +387,10 @@ impl Plugin for Opa {
 
     fn needs_request_body_bytes(&self) -> bool {
         self.include_body
+    }
+
+    fn requires_decoded_query_params(&self) -> bool {
+        self.include_query
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
