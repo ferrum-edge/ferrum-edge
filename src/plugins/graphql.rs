@@ -537,6 +537,28 @@ fn is_graphql_name_continue(b: u8) -> bool {
     is_graphql_name_start(b) || b.is_ascii_digit()
 }
 
+fn is_graphql_json_content_type(content_type: &str) -> bool {
+    is_json_content_type(content_type) || ascii_contains_ignore_case(content_type, "json")
+}
+
+fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    if nb.len() > hb.len() {
+        return false;
+    }
+
+    hb.windows(nb.len()).any(|window| {
+        window
+            .iter()
+            .zip(nb.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
 #[async_trait]
 impl Plugin for GraphqlPlugin {
     fn name(&self) -> &str {
@@ -569,7 +591,7 @@ impl Plugin for GraphqlPlugin {
             && ctx
                 .headers
                 .get("content-type")
-                .is_some_and(|ct| is_json_content_type(ct))
+                .is_some_and(|ct| is_graphql_json_content_type(ct))
     }
 
     async fn before_proxy(
@@ -585,7 +607,7 @@ impl Plugin for GraphqlPlugin {
         // Check content type
         if !headers
             .get("content-type")
-            .is_some_and(|ct| is_json_content_type(ct))
+            .is_some_and(|ct| is_graphql_json_content_type(ct))
         {
             return PluginResult::Continue;
         }
