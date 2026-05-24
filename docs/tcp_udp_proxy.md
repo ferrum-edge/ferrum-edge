@@ -347,7 +347,8 @@ TCP connections are monitored for idle activity. When no data is transferred in 
 - A watchdog compares the last activity timestamp against the timeout. It ticks every 1 second for sub-30s timeouts and every 5 seconds for 30s+ timeouts, reducing timer churn for production-length connections
 - When the timeout fires, the connection is closed gracefully and logged as a TCP idle timeout
 - Connections with active data flow in either direction are never affected
-- When the TCP idle timeout, TCP half-close cap, `backend_read_timeout_ms`, and `backend_write_timeout_ms` are all disabled (`0`), TLS userspace relays use the `copy_bidirectional` fast path. On Linux, plaintext TCP connections (no TLS on either side) use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. When `FERRUM_KTLS_ENABLED=auto` or `true` and the kernel `tls` module is loaded, frontend-TLS connections with AES-GCM cipher suites also use splice — the kernel handles encrypt/decrypt via kTLS
+- On Linux, plaintext TCP connections (no TLS on either side) always use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. The splice loops enforce `tcp_idle_timeout_seconds`, `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` directly via per-direction watermarks, so configuring any of those does not demote the connection to a userspace copy. When `FERRUM_KTLS_ENABLED=auto` or `true` and the kernel `tls` module is loaded, frontend-TLS connections with AES-GCM cipher suites also use splice — the kernel handles encrypt/decrypt via kTLS
+- TLS userspace relays additionally collapse to `tokio::io::copy_bidirectional_with_sizes` (no per-direction tracking) when the TCP idle timeout, TCP half-close cap, `backend_read_timeout_ms`, and `backend_write_timeout_ms` are all disabled (`0`); any non-zero bound opts into the direction-tracking copy path
 
 ```yaml
 proxies:
