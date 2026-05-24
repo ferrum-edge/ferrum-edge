@@ -3,6 +3,10 @@
 **/target/
 **/*.rs.bk
 
+# cargo-llvm-cov instrumented target dirs (scripts/coverage.sh)
+target/llvm-cov/
+target/llvm-cov-target/
+
 # Python
 __pycache__/
 *.pyc

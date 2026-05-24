@@ -1,0 +1,17 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+    patch:
+      default:
+        informational: true
+
+ignore:
+  - "vendor/**"
+  - "tests/**"
+  - "build.rs"
+  - "target/**"
+  - "custom_plugins/**"
+  - "ebpf/**"
+  - "proto/**"
