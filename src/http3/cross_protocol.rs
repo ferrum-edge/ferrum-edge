@@ -634,6 +634,7 @@ where
             false,
             None,
             cb_is_half_open_probe,
+            false,
             backend_start.elapsed(),
         );
         let mut outcome = write_error_with_header(
@@ -671,6 +672,7 @@ where
                 true,
                 None,
                 cb_is_half_open_probe,
+                false,
                 backend_start.elapsed(),
             );
             let mut outcome = write_error(
@@ -887,6 +889,7 @@ where
                             attempt_result.connection_error,
                             attempt_result.error_class,
                             cb_retry_probe_slot_available,
+                            false,
                             backend_start.elapsed(),
                         );
                         let mut outcome = write_error(
@@ -1140,6 +1143,7 @@ where
                     false,
                     None,
                     cb_retry_probe_slot_available,
+                    false,
                     backend_start.elapsed(),
                 );
                 return write_error(
@@ -1180,6 +1184,7 @@ where
                         attempt_result.connection_error,
                         attempt_result.error_class,
                         cb_retry_probe_slot_available,
+                        false,
                         backend_start.elapsed(),
                     );
                     let mut outcome = write_error(
@@ -1223,6 +1228,7 @@ where
             false,
             None,
             cb_retry_probe_slot_available,
+            false,
             backend_start.elapsed(),
         );
         let mut outcome = write_error(
@@ -1259,6 +1265,7 @@ where
             false,
             None,
             cb_retry_probe_slot_available,
+            false,
             backend_start.elapsed(),
         );
         let mut outcome = write_reject_with_headers(
@@ -1306,6 +1313,7 @@ where
                     false,
                     error_class,
                     cb_retry_probe_slot_available,
+                    false,
                     backend_start.elapsed(),
                 );
                 let empty_headers = HashMap::new();
@@ -1426,6 +1434,7 @@ where
             false,
             None,
             cb_retry_probe_slot_available,
+            false,
             backend_start.elapsed(),
         );
 
@@ -1467,6 +1476,7 @@ where
         false,
         None,
         cb_retry_probe_slot_available,
+        false,
         backend_start.elapsed(),
     );
 
@@ -1834,6 +1844,7 @@ where
                     false,
                     None,
                     cb_is_half_open_probe,
+                    false,
                     backend_start.elapsed(),
                 );
                 outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
@@ -1951,6 +1962,7 @@ where
                 false,
                 None,
                 cb_is_half_open_probe,
+                false,
                 backend_start.elapsed(),
             );
             Ok(CrossProtocolOutcome {
@@ -2011,6 +2023,7 @@ where
                     false,
                     None,
                     cb_is_half_open_probe,
+                    false,
                     backend_start.elapsed(),
                 );
                 outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
@@ -2054,6 +2067,7 @@ where
                 false,
                 None,
                 cb_is_half_open_probe,
+                false,
                 backend_start.elapsed(),
             );
             Ok(CrossProtocolOutcome {
@@ -2122,6 +2136,7 @@ where
                 connection_error,
                 Some(error_class),
                 cb_is_half_open_probe,
+                false,
                 backend_start.elapsed(),
             );
             let mut outcome = write_grpc_error(
