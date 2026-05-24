@@ -7750,13 +7750,14 @@ pub async fn run_authentication_phase(
                     }
                 }
             }
+            let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1
+                && ctx
+                    .metadata
+                    .get("mesh_request_auth.permissive_missing_token")
+                    .is_some_and(|v| v == "true");
             if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
-                || (last_reject.is_none()
-                    && ctx
-                        .metadata
-                        .get("mesh_request_auth.permissive_missing_token")
-                        .is_some_and(|v| v == "true"))
+                || (last_reject.is_none() && mesh_permissive_only_auth_plugin)
             {
                 None
             } else {
@@ -7775,12 +7776,14 @@ pub async fn run_authentication_phase(
                     PluginResult::Continue => {}
                 }
             }
-            if request_is_authenticated(ctx)
-                || auth_plugins.is_empty()
-                || ctx
+            let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1
+                && ctx
                     .metadata
                     .get("mesh_request_auth.permissive_missing_token")
-                    .is_some_and(|v| v == "true")
+                    .is_some_and(|v| v == "true");
+            if request_is_authenticated(ctx)
+                || auth_plugins.is_empty()
+                || mesh_permissive_only_auth_plugin
             {
                 None
             } else {

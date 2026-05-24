@@ -1959,7 +1959,7 @@ async fn handle_h3_request(
                 let h3_error_class = classify_h3_error(&e);
                 crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
                 let is_client_request_body_disconnect =
-                    err_msg.contains("client disconnected while sending request body");
+                    is_h3_client_request_body_disconnect(&err_msg);
                 // H3 frontend → H3 backend path: QUIC failure here means the
                 // cached H3 capability lied (backend probably lost UDP), so
                 // downgrade the classification. The next H3 request is free
@@ -1975,7 +1975,14 @@ async fn handle_h3_request(
                 let h3_error_body = r#"{"error":"Backend unavailable"}"#;
                 send_h3_response(&mut stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
 
-                // Record outcome for CB/health even on failure
+                // Record outcome for CB/health even on failure.
+                // Frontend client aborts while uploading request bodies are
+                // client-caused and must not poison backend CB/passive health.
+                let (outcome_connection_error, outcome_error_class) =
+                    h3_streaming_body_failure_outcome(
+                        is_client_request_body_disconnect,
+                        h3_error_class,
+                    );
                 crate::proxy::backend_dispatch::record_backend_outcome(
                     &state,
                     &proxy,
@@ -1984,8 +1991,8 @@ async fn handle_h3_request(
                     upstream_target.as_deref(),
                     cb_target_key.as_deref(),
                     502,
-                    true,
-                    Some(h3_error_class),
+                    outcome_connection_error,
+                    outcome_error_class,
                     cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
@@ -3250,6 +3257,23 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
     crate::http3::client::classify_http3_error(e.as_error().as_ref())
 }
 
+fn is_h3_client_request_body_disconnect(err_msg: &str) -> bool {
+    err_msg
+        .to_ascii_lowercase()
+        .contains("client disconnected while sending request body")
+}
+
+fn h3_streaming_body_failure_outcome(
+    is_client_request_body_disconnect: bool,
+    h3_error_class: crate::retry::ErrorClass,
+) -> (bool, Option<crate::retry::ErrorClass>) {
+    if is_client_request_body_disconnect {
+        (false, Some(crate::retry::ErrorClass::ClientDisconnect))
+    } else {
+        (true, Some(h3_error_class))
+    }
+}
+
 /// Outcome of a streaming H3 proxy operation.
 ///
 /// Carries pre-stream fields (status/error_class) and body-streaming outcome
@@ -4182,6 +4206,45 @@ mod h3_streaming_outcome_tests {
     //! is reported as a transport failure for CB regardless of the
     //! HTTP status the backend chose.
     use crate::retry::ErrorClass;
+
+    #[test]
+    fn request_body_upload_client_disconnect_maps_to_neutral_outcome() {
+        let (connection_error, error_class) =
+            super::h3_streaming_body_failure_outcome(true, ErrorClass::ConnectionClosed);
+
+        assert!(
+            !connection_error,
+            "H3 frontend upload aborts are client-caused and must not count \
+             as backend connection failures"
+        );
+        assert_eq!(error_class, Some(ErrorClass::ClientDisconnect));
+    }
+
+    #[test]
+    fn request_body_upload_backend_failure_keeps_original_class() {
+        let (connection_error, error_class) =
+            super::h3_streaming_body_failure_outcome(false, ErrorClass::ProtocolError);
+
+        assert!(
+            connection_error,
+            "non-client H3 streaming-body failures still represent backend \
+             connection failures"
+        );
+        assert_eq!(error_class, Some(ErrorClass::ProtocolError));
+    }
+
+    #[test]
+    fn request_body_upload_client_disconnect_detection_is_case_insensitive() {
+        for err_msg in [
+            "client disconnected while sending request body: stream closed",
+            "Client disconnected while sending request body: stream closed",
+        ] {
+            assert!(
+                super::is_h3_client_request_body_disconnect(err_msg),
+                "{err_msg:?} must be recognized as a client upload abort"
+            );
+        }
+    }
 
     /// Mirrors the predicate in `handle_h3_request`'s streaming branch.
     /// Kept as a free function so the test can assert against it

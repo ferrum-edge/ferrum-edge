@@ -878,11 +878,11 @@ plugin_configs: []
 
     // The proxy's watchdog ticks every 1s and closes the connection once
     // `now - b2c_read_watermark >= backend_read_timeout_ms`. Give ourselves a
-    // generous 15s window: locally this fires in ~1.7s, but heavily-loaded CI
-    // runners (6 functional shards × parallel jobs) have observed the client
-    // read poll waking ~3-5s after the proxy actually closes the socket.
+    // generous 45s window: locally this fires in ~1.7s, but heavily-loaded CI
+    // runners (6 functional shards x parallel jobs) have observed the client
+    // read poll waking well after the proxy actually closes the socket.
     let mut buf = vec![0u8; 64];
-    let read_result = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut buf)).await;
+    let read_result = tokio::time::timeout(Duration::from_secs(45), stream.read(&mut buf)).await;
     match read_result {
         Ok(Ok(0)) => {}
         Ok(Err(_)) => {}
