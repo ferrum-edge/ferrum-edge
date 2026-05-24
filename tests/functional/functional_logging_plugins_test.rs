@@ -111,6 +111,10 @@ upstreams: []
         .spawn()
         .await
         .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
 
     let client = reqwest::Client::new();
     let resp = client
@@ -180,6 +184,10 @@ upstreams: []
         .spawn()
         .await
         .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
 
     let client = reqwest::Client::new();
     let resp = client
