@@ -21,6 +21,8 @@ use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
+const MATCHED_OPERATION_INDEX_KEY: &str = "openapi_validator.matched_operation_index";
+const MATCHED_OPERATION_METHOD_KEY: &str = "openapi_validator.matched_operation_method";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnforcementMode {
@@ -87,6 +89,12 @@ struct ParsedOperation {
     method: String,
     path_regex: String,
     entry: OperationEntry,
+}
+
+struct OperationMatch<'a> {
+    method: &'a str,
+    index: usize,
+    entry: &'a OperationEntry,
 }
 
 impl OperationEntry {
@@ -297,19 +305,67 @@ impl OpenapiValidator {
         self.mode != EnforcementMode::Disabled
     }
 
-    fn match_operation(&self, method: &str, path: &str) -> Option<&OperationEntry> {
-        let bucket = self.ops_by_method.get(method).or_else(|| {
-            self.ops_by_method
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(method))
-                .map(|(_, bucket)| bucket)
-        })?;
-        bucket
-            .path_regexes
-            .matches(path)
-            .into_iter()
-            .next()
-            .and_then(|index| bucket.entries.get(index))
+    fn match_operation(&self, method: &str, path: &str) -> Option<OperationMatch<'_>> {
+        let (method, bucket) = self
+            .ops_by_method
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(method))?;
+        let index = bucket.path_regexes.matches(path).into_iter().next()?;
+        bucket.entries.get(index).map(|entry| OperationMatch {
+            method,
+            index,
+            entry,
+        })
+    }
+
+    fn cached_operation<'a>(&'a self, ctx: &RequestContext) -> Option<&'a OperationEntry> {
+        let method = ctx.metadata.get(MATCHED_OPERATION_METHOD_KEY)?;
+        if !method.eq_ignore_ascii_case(&ctx.method) {
+            return None;
+        }
+        let index = ctx
+            .metadata
+            .get(MATCHED_OPERATION_INDEX_KEY)?
+            .parse::<usize>()
+            .ok()?;
+        self.ops_by_method.get(method)?.entries.get(index)
+    }
+
+    fn operation_for_context<'a>(&'a self, ctx: &RequestContext) -> Option<&'a OperationEntry> {
+        self.cached_operation(ctx).or_else(|| {
+            self.match_operation(&ctx.method, &ctx.path)
+                .map(|matched| matched.entry)
+        })
+    }
+
+    fn mark_operation(&self, ctx: &mut RequestContext, operation: OperationMatch<'_>) {
+        self.mark_operation_entry(ctx, operation.entry);
+        ctx.metadata.insert(
+            MATCHED_OPERATION_METHOD_KEY.to_string(),
+            operation.method.to_string(),
+        );
+        ctx.metadata.insert(
+            MATCHED_OPERATION_INDEX_KEY.to_string(),
+            operation.index.to_string(),
+        );
+    }
+
+    fn mark_operation_entry(&self, ctx: &mut RequestContext, operation: &OperationEntry) {
+        self.mark_mode(ctx);
+        ctx.metadata.insert(
+            "openapi_validator.matched_operation".to_string(),
+            operation.operation_label.clone(),
+        );
+    }
+
+    fn match_and_mark_operation<'a>(
+        &'a self,
+        ctx: &mut RequestContext,
+    ) -> Option<&'a OperationEntry> {
+        let matched = self.match_operation(&ctx.method, &ctx.path)?;
+        let entry = matched.entry;
+        self.mark_operation(ctx, matched);
+        Some(entry)
     }
 
     fn bypass_reason(&self, ctx: &RequestContext) -> Option<&'static str> {
@@ -356,14 +412,6 @@ impl OpenapiValidator {
         ctx.metadata.insert(
             "openapi_validator.skip_reason".to_string(),
             reason.to_string(),
-        );
-    }
-
-    fn mark_operation(&self, ctx: &mut RequestContext, operation: &OperationEntry) {
-        self.mark_mode(ctx);
-        ctx.metadata.insert(
-            "openapi_validator.matched_operation".to_string(),
-            operation.operation_label.clone(),
         );
     }
 
@@ -506,7 +554,7 @@ impl Plugin for OpenapiValidator {
         {
             return false;
         }
-        let Some(operation) = self.match_operation(&ctx.method, &ctx.path) else {
+        let Some(operation) = self.operation_for_context(ctx) else {
             return false;
         };
         if !operation.has_request_schema() {
@@ -533,7 +581,10 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }
-        let Some(operation) = self.match_operation(&ctx.method, &ctx.path) else {
+        let Some(operation) = self
+            .cached_operation(ctx)
+            .or_else(|| self.match_and_mark_operation(ctx))
+        else {
             if self.fail_on_unknown_operation {
                 return self.handle_violation(
                     ctx,
@@ -549,7 +600,6 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "no_match");
             return PluginResult::Continue;
         };
-        self.mark_operation(ctx, operation);
         if body.is_empty() {
             return if operation.request_required {
                 self.handle_violation(
@@ -587,7 +637,7 @@ impl Plugin for OpenapiValidator {
             && !super::utils::sse::is_sse_request(ctx)
             && self.bypass_reason(ctx).is_none()
             && self
-                .match_operation(&ctx.method, &ctx.path)
+                .operation_for_context(ctx)
                 .is_some_and(OperationEntry::has_response_schema)
     }
 
@@ -609,7 +659,10 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }
-        let Some(operation) = self.match_operation(&ctx.method, &ctx.path) else {
+        let Some(operation) = self
+            .cached_operation(ctx)
+            .or_else(|| self.match_and_mark_operation(ctx))
+        else {
             if self.fail_on_unknown_operation {
                 return self.handle_violation(
                     ctx,
@@ -625,7 +678,6 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "no_match");
             return PluginResult::Continue;
         };
-        self.mark_operation(ctx, operation);
         if body.is_empty() {
             return PluginResult::Continue;
         }
