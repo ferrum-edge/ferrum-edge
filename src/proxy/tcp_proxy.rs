@@ -149,18 +149,23 @@ pub(crate) const STREAM_SPLICE_IDLE_TIMEOUT_PREFIX: &str = "TCP idle timeout";
 /// Sentinel prefix for `backend_read_timeout_ms` expiry on a splice path.
 /// The b2c splice worker reads from the backend; this fires when that read
 /// side stops producing bytes for the configured backend read timeout.
-/// Classified as `(BackendToClient, Read, ReadWriteTimeout)`.
+/// Classified as `(BackendToClient, Read, ReadWriteTimeout)`. Re-exported
+/// from `socket_opts::io_uring_splice` so the io_uring loop's emission
+/// site and the tcp_proxy classifier share one compile-time-coupled value
+/// — drift between the two is now a type error, not a silent metric drift.
 #[cfg(target_os = "linux")]
 pub(crate) const STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX: &str =
-    "backend read inactivity timeout";
+    crate::socket_opts::io_uring_splice::BACKEND_READ_TIMEOUT_MSG;
 
 /// Sentinel prefix for `backend_write_timeout_ms` expiry on a splice path.
 /// The c2b splice worker writes to the backend; this fires when that write
 /// side stops draining bytes for the configured backend write timeout.
-/// Classified as `(ClientToBackend, Write, ReadWriteTimeout)`.
+/// Classified as `(ClientToBackend, Write, ReadWriteTimeout)`. Shares a
+/// compile-time-coupled value with `socket_opts::io_uring_splice` (see the
+/// READ constant above).
 #[cfg(target_os = "linux")]
 pub(crate) const STREAM_SPLICE_BACKEND_WRITE_TIMEOUT_PREFIX: &str =
-    "backend write inactivity timeout";
+    crate::socket_opts::io_uring_splice::BACKEND_WRITE_TIMEOUT_MSG;
 
 /// Which end of a half-duplex copy produced the error.
 ///
@@ -4260,6 +4265,7 @@ async fn bidirectional_splice(
                 backend_write_timeout_ms,
                 StreamIoSide::Write,
                 STREAM_SPLICE_BACKEND_WRITE_TIMEOUT_PREFIX,
+                watchdog_interval,
             )
             .await;
         } else {
@@ -4293,6 +4299,7 @@ async fn bidirectional_splice(
                 backend_read_timeout_ms,
                 StreamIoSide::Read,
                 STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX,
+                watchdog_interval,
             )
             .await;
         } else {
@@ -4349,6 +4356,11 @@ fn shutdown_write_fd(fd: i32) {
 /// `direction_side` is the `StreamIoSide` attribution for the timeout case
 /// (Write for c2b, Read for b2c) and `direction_prefix` is the matching
 /// sentinel constant for the failure message.
+///
+/// `watchdog_interval` should be the same `relay_watchdog_interval` value
+/// Phase 1 used — passing it through keeps Phase 1 and Phase 2 ticks on the
+/// same cadence, matching the "1 s under 30 s timeouts, 5 s otherwise"
+/// guarantee documented in `docs/tcp_udp_proxy.md`.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn drain_half_close_splice<F>(
@@ -4362,6 +4374,7 @@ async fn drain_half_close_splice<F>(
     direction_timeout_ms: u64,
     direction_side: StreamIoSide,
     direction_prefix: &'static str,
+    watchdog_interval: Duration,
 ) -> Option<(Direction, ErrorClass, Option<StreamIoSide>, String)>
 where
     F: std::future::Future<Output = Result<(), (StreamIoSide, anyhow::Error)>> + Unpin,
@@ -4379,7 +4392,7 @@ where
                 }
                 return None;
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)), if any_tick_active => {
+            _ = tokio::time::sleep(watchdog_interval), if any_tick_active => {
                 let now = coarse_now_ms();
                 if let Some(wm) = direction_watermark
                     && direction_timeout_ms > 0
@@ -4813,8 +4826,14 @@ fn io_uring_splice_direction(
                 StreamIoSide::Read
             };
             if e.source.kind() == std::io::ErrorKind::TimedOut {
+                // Use `.starts_with(...)` to match the contract of
+                // `classify_splice_worker_failure` (the downstream classifier):
+                // if `io_uring_splice_loop` ever wraps the sentinel with extra
+                // context (e.g. byte counts in a debug aid) an exact-match
+                // here would silently fall through to the idle arm and
+                // mis-attribute the timeout.
                 let body = e.source.to_string();
-                if body == crate::socket_opts::io_uring_splice::BACKEND_READ_TIMEOUT_MSG {
+                if body.starts_with(STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX) {
                     Err((
                         side,
                         anyhow::anyhow!(
@@ -4822,7 +4841,7 @@ fn io_uring_splice_direction(
                             STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX
                         ),
                     ))
-                } else if body == crate::socket_opts::io_uring_splice::BACKEND_WRITE_TIMEOUT_MSG {
+                } else if body.starts_with(STREAM_SPLICE_BACKEND_WRITE_TIMEOUT_PREFIX) {
                     Err((
                         side,
                         anyhow::anyhow!(
@@ -4898,6 +4917,24 @@ fn libc_splice_loop(
                     anyhow::anyhow!(
                         "{} (libc splice fallback)",
                         STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX
+                    ),
+                ));
+            }
+        }
+        // See the io_uring loop's analogous block — the c2b worker must fire
+        // `backend_write_timeout_ms` even when stuck in the Reading phase, to
+        // match `bidirectional_copy`'s parent-watchdog semantics and the
+        // libc-async splice path's parent watchdog. The watermark is
+        // `u64::MAX` until c2b primes it on its first successful read, so
+        // this check stays inert until c2b actually carries data.
+        if write_wm_active && let Some(wm) = write_watermark {
+            let last = wm.load(Ordering::Relaxed);
+            if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
+                return Err((
+                    StreamIoSide::Write,
+                    anyhow::anyhow!(
+                        "{} (libc splice fallback)",
+                        STREAM_SPLICE_BACKEND_WRITE_TIMEOUT_PREFIX
                     ),
                 ));
             }
@@ -4985,6 +5022,23 @@ fn libc_splice_loop(
                                 ));
                             }
                         }
+                        // The b2c worker can be stalled in Phase 2 (client
+                        // not reading) while the backend has gone silent —
+                        // check read_watermark here too so firing matches
+                        // the parent-watchdog semantics of the libc-async
+                        // splice path and the io_uring loop.
+                        if read_wm_active && let Some(wm) = read_watermark {
+                            let last = wm.load(Ordering::Relaxed);
+                            if coarse_now_ms().saturating_sub(last) >= read_timeout_ms {
+                                return Err((
+                                    StreamIoSide::Read,
+                                    anyhow::anyhow!(
+                                        "{} (libc splice fallback)",
+                                        STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX
+                                    ),
+                                ));
+                            }
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
@@ -5022,6 +5076,21 @@ fn libc_splice_loop(
                             anyhow::anyhow!(
                                 "{} (libc splice fallback)",
                                 STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX
+                            ),
+                        ));
+                    }
+                }
+                // Mirror the outer-loop check: the c2b worker must also
+                // fire backend_write_timeout when stuck in Phase 1 with
+                // stale queued bytes. See the outer-loop comment above.
+                if write_wm_active && let Some(wm) = write_watermark {
+                    let last = wm.load(Ordering::Relaxed);
+                    if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
+                        return Err((
+                            StreamIoSide::Write,
+                            anyhow::anyhow!(
+                                "{} (libc splice fallback)",
+                                STREAM_SPLICE_BACKEND_WRITE_TIMEOUT_PREFIX
                             ),
                         ));
                     }

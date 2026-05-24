@@ -440,3 +440,40 @@ async fn functional_splice_io_uring_backend_read_timeout_closes_silent_backend()
 
     setup.teardown();
 }
+
+/// Companion of `functional_splice_backend_write_timeout_closes_stuck_reader_backend`
+/// but with io_uring splice enabled. Pins the io_uring path's write-watermark
+/// enforcement end-to-end through the binary.
+#[ignore]
+#[tokio::test]
+async fn functional_splice_io_uring_backend_write_timeout_closes_stuck_reader_backend() {
+    let setup = setup_splice_proxy(
+        "splice-io-uring-backend-write",
+        spawn_stuck_reader_backend,
+        0,
+        500,
+        30,
+        &[("FERRUM_IO_URING_SPLICE_ENABLED", "auto")],
+    )
+    .await;
+
+    let mut stream = connect_stream(setup.proxy_port).await;
+
+    let payload = vec![0x55u8; 256 * 1024];
+    let driver = tokio::spawn(async move {
+        loop {
+            if stream.write_all(&payload).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    match tokio::time::timeout(Duration::from_secs(45), driver).await {
+        Ok(_) => { /* writer exited because the connection closed */ }
+        Err(_) => panic!(
+            "io_uring/libc-fallback splice did not enforce backend_write_timeout_ms within 45s"
+        ),
+    }
+
+    setup.teardown();
+}

@@ -1706,13 +1706,12 @@ pub mod io_uring_splice {
         }
     }
 
-    /// Sentinel `io::Error` kinds the loop uses to signal which timeout fired.
-    /// The caller distinguishes by message prefix on the anyhow wrapper.
-    /// `BACKEND_READ_TIMEOUT_MSG` and `BACKEND_WRITE_TIMEOUT_MSG` are the
-    /// stable message bodies the caller in `tcp_proxy.rs` matches via the
-    /// `STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX` /
-    /// `STREAM_SPLICE_BACKEND_WRITE_TIMEOUT_PREFIX` constants. Keep them in
-    /// sync — drift silently mis-attributes the timeout in metrics.
+    /// Stable message bodies the loop emits via `io::Error::TimedOut` to
+    /// signal which per-direction watermark fired. `tcp_proxy.rs` re-exports
+    /// these as `STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX` /
+    /// `STREAM_SPLICE_BACKEND_WRITE_TIMEOUT_PREFIX` via `const = &str`
+    /// reference, so this module is the single source of truth and any
+    /// drift is a compile error rather than a silent metric mis-attribution.
     pub const BACKEND_READ_TIMEOUT_MSG: &str = "backend read inactivity timeout";
     pub const BACKEND_WRITE_TIMEOUT_MSG: &str = "backend write inactivity timeout";
 
@@ -1800,6 +1799,29 @@ pub mod io_uring_splice {
                     )));
                 }
             }
+            // The write watermark is also checked in the outer loop / Phase 1
+            // WouldBlock so the c2b worker fires `backend_write_timeout_ms`
+            // when it has been stuck in the Reading phase past the deadline
+            // (e.g. the client went silent after a complete c2b exchange).
+            // This matches `bidirectional_copy`'s parent-watchdog semantics
+            // and the async libc-splice path's parent watchdog. Without it,
+            // io_uring would diverge: write timeouts would only fire during
+            // an active write phase, leaving "client silent" cases for the
+            // shared idle timeout alone — operators switching
+            // `FERRUM_IO_URING_SPLICE_ENABLED` would see different
+            // `DisconnectCause` distributions on identical traffic. The
+            // watermark is `u64::MAX` until the first successful read primes
+            // it, so this check stays inert until c2b actually carries data.
+            if write_wm_active && let Some(wm) = write_watermark {
+                let now = super::monotonic_now_ms();
+                let last = wm.load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(last) >= write_timeout_ms {
+                    return Err(SpliceError::write(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        BACKEND_WRITE_TIMEOUT_MSG,
+                    )));
+                }
+            }
 
             // Phase 1: splice src_fd → pipe_w via io_uring
             let sqe = io_uring::opcode::Splice::new(
@@ -1852,6 +1874,21 @@ pub mod io_uring_splice {
                             return Err(SpliceError::read(std::io::Error::new(
                                 std::io::ErrorKind::TimedOut,
                                 BACKEND_READ_TIMEOUT_MSG,
+                            )));
+                        }
+                    }
+                    // Mirror the outer-loop check: a Phase 1 WouldBlock means
+                    // src has nothing new, so if c2b's write watermark has
+                    // gone stale (queued bytes already drained AND the
+                    // deadline has now passed) the c2b worker should report
+                    // it here rather than wait for a future write attempt.
+                    if write_wm_active && let Some(wm) = write_watermark {
+                        let now = super::monotonic_now_ms();
+                        let last = wm.load(std::sync::atomic::Ordering::Relaxed);
+                        if now.saturating_sub(last) >= write_timeout_ms {
+                            return Err(SpliceError::write(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                BACKEND_WRITE_TIMEOUT_MSG,
                             )));
                         }
                     }
@@ -1927,6 +1964,21 @@ pub mod io_uring_splice {
                                 return Err(SpliceError::write(std::io::Error::new(
                                     std::io::ErrorKind::TimedOut,
                                     BACKEND_WRITE_TIMEOUT_MSG,
+                                )));
+                            }
+                        }
+                        // The b2c worker can be stalled in Phase 2 (client
+                        // not reading) while the backend has gone silent —
+                        // check the read watermark here too so the firing
+                        // matches the parent-watchdog semantics of the
+                        // libc-async splice path.
+                        if read_wm_active && let Some(wm) = read_watermark {
+                            let now = super::monotonic_now_ms();
+                            let last = wm.load(std::sync::atomic::Ordering::Relaxed);
+                            if now.saturating_sub(last) >= read_timeout_ms {
+                                return Err(SpliceError::read(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    BACKEND_READ_TIMEOUT_MSG,
                                 )));
                             }
                         }
