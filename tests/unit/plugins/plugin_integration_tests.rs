@@ -252,6 +252,7 @@ async fn test_all_plugins_available() {
         "access_log",
         "ai_federation",
         "api_chargeback",
+        "api_chargeback_sink",
         "fault_injection",
         "proxy_alerts",
     ]
@@ -353,6 +354,17 @@ async fn test_plugin_creation_all_plugins() {
             "spiffe_identity" => json!({}),
             "api_chargeback" => {
                 json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]})
+            }
+            "api_chargeback_sink" => {
+                json!({
+                    "clickhouse": {
+                        "url": "http://127.0.0.1:8123",
+                        "database": "default",
+                        "table": "ferrum_charge_events"
+                    },
+                    "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}],
+                    "spool": {"enabled": false}
+                })
             }
             "ai_response_guard" => json!({"pii_patterns": ["ssn"], "action": "reject"}),
             // ai_request_guard rejects no-op configs — supply at least one policy.

@@ -295,6 +295,26 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /charges/sink/status:
+    get:
+      operationId: getChargebackSinkStatus
+      summary: API chargeback sink status
+      description: |
+        Returns queue depth, spool size, replay timestamps, and export counters
+        for the `api_chargeback_sink` plugin. Requires a valid admin JWT because
+        sink status can expose billing topology and ClickHouse endpoint metadata.
+        Credentials and URL user-info are never returned.
+      tags: [Metrics]
+      responses:
+        "200":
+          description: Chargeback sink status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChargebackSinkStatusResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /admin/metrics:
     get:
       operationId: getAdminMetrics
@@ -2358,6 +2378,7 @@ paths:
                 - soap_ws_security
                 - spec_expose
                 - api_chargeback
+                - api_chargeback_sink
                 - workload_metrics
                 - fault_injection
                 - access_log
@@ -10398,6 +10419,201 @@ components:
           default: 300
           description: How often (seconds) the background task evicts entries that have been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
 
+    ApiChargebackSinkConfig:
+      type: object
+      additionalProperties: false
+      description: |
+        Plugin: api_chargeback_sink — Durable ClickHouse charge export. Uses the
+        same `pricing_tiers`, `bandwidth_pricing`, `stream_connection_pricing`,
+        and `currency` fields as `api_chargeback`, then exports either
+        per-transaction events (`mode: per_event`) or periodic accumulator
+        deltas (`mode: snapshot`) to ClickHouse.
+      properties:
+        mode:
+          type: string
+          enum: [per_event, snapshot]
+          default: per_event
+          description: Export one event per transaction or periodic snapshot deltas.
+        currency:
+          type: string
+          default: "USD"
+          description: Currency label written to each charge event.
+        pricing_version:
+          type: string
+          default: default
+          description: Operator-controlled pricing/version label written to each event.
+        include_request_id:
+          type: boolean
+          default: true
+          description: Include request/correlation ID metadata when present.
+        include_trace_id:
+          type: boolean
+          default: true
+          description: Include trace ID or traceparent metadata when present.
+        pricing_tiers:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required: [status_codes, price_per_call]
+            properties:
+              status_codes:
+                type: array
+                minItems: 1
+                items:
+                  type: integer
+                  minimum: 100
+                  maximum: 599
+              price_per_call:
+                type: number
+                minimum: 0
+          description: HTTP-family per-call pricing. A status code must appear in at most one tier.
+        bandwidth_pricing:
+          type: object
+          additionalProperties: false
+          properties:
+            price_per_byte_sent:
+              type: number
+              minimum: 0
+              default: 0.0
+            price_per_byte_received:
+              type: number
+              minimum: 0
+              default: 0.0
+          description: Optional per-byte pricing for client->backend and backend->client bytes.
+        stream_connection_pricing:
+          type: object
+          additionalProperties: false
+          required: [price_per_connection]
+          properties:
+            price_per_connection:
+              type: number
+              minimum: 0
+          description: Optional flat per-session charge for TCP/TCP+TLS/UDP/DTLS disconnects.
+        clickhouse:
+          type: object
+          additionalProperties: false
+          required: [url]
+          properties:
+            url:
+              type: string
+              format: uri
+              description: ClickHouse HTTP endpoint. Must use http:// or https:// and must not contain user-info.
+            database:
+              type: string
+              default: ferrum
+            table:
+              type: string
+              default: charges_raw
+            username:
+              type: string
+              description: Optional ClickHouse HTTP Basic username.
+            password_ref:
+              type: string
+              description: Environment variable containing the ClickHouse password, often materialized from an existing `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, or `_GCP` secret suffix.
+            tls:
+              type: object
+              additionalProperties: false
+              properties:
+                ca_file:
+                  type: [string, "null"]
+                  description: PEM CA bundle for this ClickHouse endpoint.
+                client_cert_file:
+                  type: [string, "null"]
+                  description: PEM client certificate for ClickHouse mTLS.
+                client_key_file:
+                  type: [string, "null"]
+                  description: PEM client private key for ClickHouse mTLS.
+                verify_hostname:
+                  type: boolean
+                  default: true
+                insecure_skip_verify:
+                  type: boolean
+                  default: false
+                  description: Disable certificate verification for this ClickHouse endpoint. Testing only.
+            insert_query_params:
+              type: object
+              additionalProperties:
+                type: string
+              default: {}
+              description: Extra query parameters appended to the ClickHouse INSERT request, such as async_insert.
+            timeout_ms:
+              type: integer
+              minimum: 1
+              default: 5000
+        batch:
+          type: object
+          additionalProperties: false
+          properties:
+            size:
+              type: integer
+              minimum: 1
+              maximum: 100000
+              default: 500
+            flush_interval_ms:
+              type: integer
+              minimum: 1
+              default: 2000
+            buffer_capacity:
+              type: integer
+              minimum: 1
+              maximum: 1000000
+              default: 50000
+        retry:
+          type: object
+          additionalProperties: false
+          properties:
+            max_attempts:
+              type: integer
+              minimum: 0
+              default: 5
+            initial_delay_ms:
+              type: integer
+              minimum: 0
+              default: 250
+            max_delay_ms:
+              type: integer
+              minimum: 0
+              default: 10000
+            jitter:
+              type: boolean
+              default: true
+        spool:
+          type: object
+          additionalProperties: false
+          properties:
+            enabled:
+              type: boolean
+              default: true
+            dir:
+              type: string
+              default: /var/lib/ferrum/chargeback-spool
+            max_bytes:
+              type: integer
+              minimum: 1
+              default: 10737418240
+            replay_interval_secs:
+              type: integer
+              minimum: 1
+              default: 60
+            compression:
+              type: string
+              enum: [zstd, none]
+              default: zstd
+        snapshot:
+          type: object
+          additionalProperties: false
+          properties:
+            interval_secs:
+              type: integer
+              minimum: 1
+              default: 30
+            emit_zero_deltas:
+              type: boolean
+              default: false
+              description: Emit unchanged keys on every snapshot tick.
+
     ChargebackResponse:
       type: object
       description: JSON format response from the /charges endpoint.
@@ -10480,6 +10696,68 @@ components:
                         connection_charges:
                           type: number
                           description: Accumulated per-connection charge.
+
+    ChargebackSinkStatusResponse:
+      type: object
+      description: Status response from `GET /charges/sink/status`.
+      properties:
+        mode:
+          type: string
+          enum: [per_event, snapshot]
+        enabled:
+          type: boolean
+        pricing_version:
+          type: [string, "null"]
+        clickhouse:
+          type: [object, "null"]
+          properties:
+            endpoint:
+              type: string
+              description: ClickHouse endpoint with user-info, query, and fragment stripped.
+            database:
+              type: string
+            table:
+              type: string
+        queue:
+          type: object
+          properties:
+            depth:
+              type: integer
+            capacity:
+              type: integer
+            high_water_hits_total:
+              type: integer
+        spool:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+            files:
+              type: integer
+            bytes:
+              type: integer
+            drops_total:
+              type: integer
+            last_replay_at:
+              type: [string, "null"]
+              format: date-time
+        export:
+          type: object
+          properties:
+            events_enqueued_total:
+              type: integer
+            events_exported_total:
+              type: integer
+            failures_total:
+              type: integer
+            last_success_at:
+              type: [string, "null"]
+              format: date-time
+            last_failure_at:
+              type: [string, "null"]
+              format: date-time
+            last_failure_reason:
+              type: [string, "null"]
 
     RequestDeduplicationConfig:
       type: object

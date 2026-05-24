@@ -25,9 +25,11 @@ pub mod ai_response_guard;
 pub mod ai_semantic_cache;
 pub mod ai_token_metrics;
 pub mod api_chargeback;
+pub mod api_chargeback_sink;
 pub mod basic_auth;
 pub mod body_validator;
 pub mod bot_detection;
+pub mod chargeback;
 pub mod compression;
 pub mod correlation_id;
 pub mod cors;
@@ -1421,7 +1423,7 @@ pub struct StreamTransactionSummary {
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), workload_metrics (9360), __mesh_bpf_metrics (9365), access_log (9375) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), access_log (9375) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -1495,6 +1497,7 @@ pub mod priority {
     pub const PROXY_ALERTS: u16 = 9250;
     pub const PROMETHEUS_METRICS: u16 = 9300;
     pub const API_CHARGEBACK: u16 = 9350;
+    pub const API_CHARGEBACK_SINK: u16 = 9351;
     pub const WORKLOAD_METRICS: u16 = 9360;
     /// `__mesh_bpf_metrics`: exposes TCP-layer counters (Connect, Accept,
     /// Rst, Fin, SRTT, BPF drop reasons, ringbuf overrun) from the
@@ -2122,6 +2125,11 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.namespace(),
         )?))),
+        "api_chargeback_sink" => Ok(Some(Arc::new(api_chargeback_sink::ApiChargebackSink::new(
+            config,
+            http_client.clone(),
+            http_client.namespace(),
+        )?))),
         "otel_tracing" => Ok(Some(Arc::new(
             otel_tracing::OtelTracing::new_with_http_client(config, http_client)?,
         ))),
@@ -2316,6 +2324,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "soap_ws_security",
         "spec_expose",
         "api_chargeback",
+        "api_chargeback_sink",
         "workload_metrics",
         "__mesh_bpf_metrics",
         "fault_injection",
