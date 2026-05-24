@@ -12,9 +12,14 @@ use super::auth_flow::constant_time_eq;
 use super::claim_resolver::extract_claim_string;
 
 pub struct DpopJtiCache {
-    entries: DashMap<String, Instant>,
+    entries: DashMap<String, DpopJtiEntry>,
     max_entries: usize,
     ttl: Duration,
+}
+
+struct DpopJtiEntry {
+    inserted_at: Instant,
+    expires_at: Instant,
 }
 
 impl DpopJtiCache {
@@ -35,20 +40,31 @@ impl DpopJtiCache {
         if self.entries.len() >= self.max_entries {
             self.evict_one(now);
         }
-        self.entries.insert(key, now + self.ttl);
+        self.entries.insert(
+            key,
+            DpopJtiEntry {
+                inserted_at: now,
+                expires_at: now + self.ttl,
+            },
+        );
         true
     }
 
     fn evict_expired(&self, now: Instant) {
-        self.entries.retain(|_, expires_at| *expires_at > now);
+        self.entries.retain(|_, entry| entry.expires_at > now);
     }
 
     fn evict_one(&self, now: Instant) {
         let victim = self
             .entries
             .iter()
-            .find_map(|entry| (*entry.value() <= now).then(|| entry.key().clone()))
-            .or_else(|| self.entries.iter().next().map(|entry| entry.key().clone()));
+            .find_map(|entry| (entry.value().expires_at <= now).then(|| entry.key().clone()))
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .min_by_key(|entry| entry.value().inserted_at)
+                    .map(|entry| entry.key().clone())
+            });
         if let Some(key) = victim {
             self.entries.remove(&key);
         }
@@ -146,10 +162,14 @@ pub fn canonical_htu(scheme: &str, host: &str, path: &str) -> Option<String> {
         let (without_port, _) = host.rsplit_once(':')?;
         host = without_port.to_string();
     }
-    let path = if path.starts_with('/') {
-        path.to_string()
+    let raw_path = path
+        .find(['?', '#'])
+        .map(|idx| &path[..idx])
+        .unwrap_or(path);
+    let path = if raw_path.starts_with('/') {
+        raw_path.to_string()
     } else {
-        format!("/{path}")
+        format!("/{raw_path}")
     };
     Some(format!("{scheme}://{host}{path}"))
 }
@@ -195,6 +215,14 @@ mod tests {
     }
 
     #[test]
+    fn canonical_htu_strips_query_and_fragment() {
+        assert_eq!(
+            canonical_htu("https", "example.com", "/resource?x=1#frag").as_deref(),
+            Some("https://example.com/resource")
+        );
+    }
+
+    #[test]
     fn thumbprint_is_stable_for_rsa_jwk() {
         let jwk: Jwk = serde_json::from_value(json!({
             "kty": "RSA",
@@ -215,5 +243,15 @@ mod tests {
         let now = Instant::now();
         assert!(cache.check_and_insert("jkt", "jti", now));
         assert!(!cache.check_and_insert("jkt", "jti", now));
+    }
+
+    #[test]
+    fn jti_cache_evicts_oldest_live_entry_when_full() {
+        let cache = DpopJtiCache::new(2, Duration::from_secs(60), 4);
+        let now = Instant::now();
+        assert!(cache.check_and_insert("jkt", "old", now));
+        assert!(cache.check_and_insert("jkt", "new", now + Duration::from_secs(1)));
+        assert!(cache.check_and_insert("jkt", "third", now + Duration::from_secs(2)));
+        assert!(cache.check_and_insert("jkt", "old", now + Duration::from_secs(3)));
     }
 }

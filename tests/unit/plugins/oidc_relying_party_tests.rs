@@ -14,7 +14,7 @@ fn base_config() -> serde_json::Value {
             "token_endpoint": "https://issuer.example.com/token",
             "jwks_uri": "https://issuer.example.com/jwks",
             "client_id": "ferrum-gateway",
-            "client_auth": {"method": "none"},
+            "client_auth": {"method": "client_secret_basic", "client_secret": "secret"},
             "scopes": ["openid", "profile"],
             "redirect_uri": "https://app.example.com/oauth/callback",
             "callback_path": "/oauth/callback",
@@ -43,8 +43,8 @@ fn html_ctx() -> RequestContext {
     ctx
 }
 
-#[test]
-fn new_accepts_minimal_cookie_store_config() {
+#[tokio::test]
+async fn new_accepts_minimal_cookie_store_config() {
     let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
     assert_eq!(plugin.name(), "oidc_relying_party");
     assert_eq!(plugin.priority(), priority::OIDC_RELYING_PARTY);
@@ -63,6 +63,32 @@ fn new_rejects_same_site_none_without_secure() {
     config["session"]["same_site"] = json!("none");
     config["session"]["secure"] = json!(false);
     assert!(OidcRelyingParty::new(&config, PluginHttpClient::default()).is_err());
+}
+
+#[test]
+fn new_rejects_redis_session_store_until_implemented() {
+    let mut config = base_config();
+    config["session"]["store"] = json!("redis");
+    config["session"]["redis_url"] = json!("redis://127.0.0.1:6379/0");
+    assert!(OidcRelyingParty::new(&config, PluginHttpClient::default()).is_err());
+}
+
+#[test]
+fn new_rejects_none_client_auth_for_remote_token_endpoint() {
+    let mut config = base_config();
+    config["providers"][0]["client_auth"] = json!({"method": "none"});
+    let error = match OidcRelyingParty::new(&config, PluginHttpClient::default()) {
+        Ok(_) => panic!("remote none client auth should be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.contains("client_auth.method='none'"));
+}
+
+#[tokio::test]
+async fn new_accepts_uppercase_same_site_from_schema() {
+    let mut config = base_config();
+    config["session"]["same_site"] = json!("Lax");
+    assert!(OidcRelyingParty::new(&config, PluginHttpClient::default()).is_ok());
 }
 
 #[tokio::test]

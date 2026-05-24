@@ -7239,7 +7239,7 @@ components:
                     format: password
                   private_key_jwt_alg:
                     type: string
-                    enum: [RS256, RS384, RS512, ES256, ES384]
+                    enum: [RS256, RS384, RS512, ES256, ES384, EdDSA]
                   private_key_jwt_kid:
                     type: string
               from_headers:
@@ -7359,7 +7359,7 @@ components:
                     format: password
                   private_key_jwt_alg:
                     type: string
-                    enum: [RS256, RS384, RS512, ES256, ES384]
+                    enum: [RS256, RS384, RS512, ES256, ES384, EdDSA]
                   private_key_jwt_kid:
                     type: string
               redirect_uri:
@@ -7368,7 +7368,7 @@ components:
                 type: string
               logout_path:
                 type: string
-                default: /logout
+                default: /oauth/logout
               scopes:
                 type: array
                 items:
@@ -7415,13 +7415,15 @@ components:
               description: Previous encryption secret accepted during rotation
             cookie_name:
               type: string
-              default: ferrum_oidc
+              default: ferrum_session
             store:
               type: string
-              enum: [memory, redis]
-              default: memory
+              enum: [cookie]
+              default: cookie
             redis_url:
               type: string
+              deprecated: true
+              description: Reserved for future server-side sessions; redis store is rejected until implemented.
             ttl_secs:
               type: integer
               format: uint64
@@ -7433,7 +7435,7 @@ components:
             max_cookie_bytes:
               type: integer
               format: uint64
-              default: 4000
+              default: 8000
             secure:
               type: boolean
               default: true
@@ -7442,8 +7444,8 @@ components:
               default: true
             same_site:
               type: string
-              enum: [Lax, Strict, None]
-              default: Lax
+              enum: [lax, strict, none]
+              default: lax
             domain:
               type: string
             path:

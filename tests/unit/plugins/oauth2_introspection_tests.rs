@@ -49,6 +49,38 @@ fn new_rejects_none_client_auth_for_remote_endpoint() {
     assert!(err.contains("only allowed"));
 }
 
+#[test]
+fn new_accepts_none_client_auth_for_localhost_endpoint() {
+    assert!(
+        Oauth2Introspection::new(
+            &json!({
+                "providers": [{
+                    "introspection_endpoint": "http://localhost:8080/introspect",
+                    "client_auth": {"method": "none"}
+                }]
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn new_rejects_none_client_auth_for_local_mdns_endpoint() {
+    assert!(
+        Oauth2Introspection::new(
+            &json!({
+                "providers": [{
+                    "introspection_endpoint": "http://idp.local/introspect",
+                    "client_auth": {"method": "none"}
+                }]
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_err()
+    );
+}
+
 #[tokio::test]
 async fn active_token_sets_authenticated_identity_when_no_consumer_match() {
     let server = MockServer::start().await;

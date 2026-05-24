@@ -1343,7 +1343,7 @@ Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspecti
 | `providers[].client_auth.client_id` | String | OAuth client ID for authenticated methods |
 | `providers[].client_auth.client_secret` | String | Client secret for `client_secret_basic` or `client_secret_post` |
 | `providers[].client_auth.private_key_pem` | String | PEM private key for `private_key_jwt` |
-| `providers[].client_auth.private_key_jwt_alg` | String | `RS256`, `RS384`, `RS512`, `ES256`, or `ES384` |
+| `providers[].client_auth.private_key_jwt_alg` | String | `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA` |
 | `providers[].client_auth.private_key_jwt_kid` | String (optional) | Optional `kid` for private key JWT assertions |
 | `providers[].from_headers` | Array (optional) | Header token locations, each `{ "name": "...", "prefix": "..." }` |
 | `providers[].from_params` | String[] (optional) | Query parameter token locations |
@@ -1360,7 +1360,7 @@ Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspecti
 | `consumer_identity_claim` | String | Global claim used for consumer lookup (default: `"username"`) |
 | `consumer_header_claim` | String | Global claim used for `X-Consumer-Username` when no consumer maps |
 
-`client_auth.method: "none"` is accepted only for loopback or `.local` endpoints. Claim header mappings reject reserved headers.
+`client_auth.method: "none"` is accepted only for localhost or loopback endpoints. Discovery-provided introspection endpoints must stay on the discovery host. Claim header mappings reject reserved headers.
 
 ```yaml
 plugin_name: oauth2_introspection
@@ -1397,17 +1397,19 @@ Runs a browser-oriented OpenID Connect relying party flow with authorization cod
 | `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
 | `providers[].redirect_uri` | String | Absolute callback URI registered with the provider |
 | `providers[].callback_path` | String | Callback path Ferrum handles (default: path from `redirect_uri`) |
-| `providers[].logout_path` | String | Local logout path (default: `/logout`) |
-| `providers[].scopes` | String[] | OIDC scopes (default includes `openid profile email`) |
+| `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`) |
+| `providers[].scopes` | String[] | OIDC scopes; must include `openid` |
 | `providers[].audiences` | String[] | Accepted ID token audiences |
 | `providers[].required_scopes` | String[] (optional) | Scopes that must all be present in session claims |
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
 | `providers[].claim_headers` | Object (optional) | Session claim-to-header mappings |
 | `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies |
 | `session.encryption_secret_previous` | String (optional) | Previous secret accepted for rotation |
-| `session.cookie_name` | String | Session cookie name (default: `ferrum_oidc`) |
+| `session.store` | String | Session backend; only `cookie` is implemented |
+| `session.cookie_name` | String | Session cookie name (default: `ferrum_session`) |
 | `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`) |
 | `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`) |
+| `session.max_cookie_bytes` | u64 | Maximum sealed cookie size (default: `8000`) |
 | `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
 | `behavior.trusted_redirect_hosts` | String[] | Hosts allowed for post-login redirect parameters |
 

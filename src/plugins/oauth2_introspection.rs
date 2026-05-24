@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,7 @@ pub struct Oauth2Introspection {
 struct IntrospectionProvider {
     issuer: Option<String>,
     introspection_endpoint: Arc<ArcSwap<Option<String>>>,
+    assertion_audience: Option<String>,
     audiences: Vec<String>,
     token_locations: Vec<TokenLocation>,
     required_scopes: Vec<String>,
@@ -247,6 +249,7 @@ impl Oauth2Introspection {
             }
 
             providers.push(IntrospectionProvider {
+                assertion_audience: issuer.clone(),
                 issuer,
                 introspection_endpoint: endpoint_slot,
                 audiences,
@@ -415,8 +418,12 @@ impl Oauth2Introspection {
                 alg,
                 kid,
             } => {
+                let assertion_audience = provider
+                    .assertion_audience
+                    .as_deref()
+                    .unwrap_or(endpoint.as_str());
                 let assertion =
-                    build_client_assertion(client_id, &endpoint, encoding_key, *alg, kid)
+                    build_client_assertion(client_id, assertion_audience, encoding_key, *alg, kid)
                         .map_err(|_| IntrospectionDecision::Unavailable)?;
                 params.push(("client_id".to_string(), client_id.clone()));
                 params.push((
@@ -833,6 +840,11 @@ fn parse_client_auth(
                         )
                     })?
                 }
+                Algorithm::EdDSA => EncodingKey::from_ed_pem(pem.as_bytes()).map_err(|e| {
+                    format!(
+                        "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_pem is invalid EdDSA PEM: {e}"
+                    )
+                })?,
                 _ => {
                     return Err(format!(
                         "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_jwt_alg is unsupported"
@@ -855,7 +867,7 @@ fn parse_client_auth(
         "none" => {
             if endpoint.is_some_and(|endpoint| !is_local_introspection_host(&endpoint.hostname)) {
                 return Err(format!(
-                    "oauth2_introspection: provider[{provider_idx}].client_auth.method='none' is only allowed for 127.0.0.1, ::1, or *.local endpoints"
+                    "oauth2_introspection: provider[{provider_idx}].client_auth.method='none' is only allowed for localhost or loopback endpoints"
                 ));
             }
             Ok(ClientAuth::None)
@@ -894,6 +906,7 @@ fn parse_private_key_alg(value: Option<&Value>, provider_idx: usize) -> Result<A
         "RS512" => Ok(Algorithm::RS512),
         "ES256" => Ok(Algorithm::ES256),
         "ES384" => Ok(Algorithm::ES384),
+        "EdDSA" => Ok(Algorithm::EdDSA),
         _ => Err(format!(
             "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_jwt_alg is unsupported"
         )),
@@ -1204,7 +1217,10 @@ fn hostname_from_url(url: &str) -> Option<String> {
 }
 
 fn is_local_introspection_host(hostname: &str) -> bool {
-    hostname == "127.0.0.1" || hostname == "::1" || hostname.ends_with(".local")
+    hostname.eq_ignore_ascii_case("localhost")
+        || hostname
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn audience_matches(claims: &Value, audiences: &[String]) -> bool {
@@ -1300,8 +1316,87 @@ async fn discover_introspection_endpoint(
         .json()
         .await
         .map_err(|e| format!("discovery parse failed: {e}"))?;
-    body.get("introspection_endpoint")
+    let endpoint = body
+        .get("introspection_endpoint")
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "discovery document missing introspection_endpoint".to_string())
+        .ok_or_else(|| "discovery document missing introspection_endpoint".to_string())?;
+    validate_discovered_endpoint(discovery_url, endpoint, "introspection_endpoint")
+}
+
+fn validate_discovered_endpoint(
+    discovery_url: &str,
+    endpoint: &str,
+    field: &str,
+) -> Result<String, String> {
+    let discovery = Url::parse(discovery_url)
+        .map_err(|e| format!("discovery_url should already be valid: {e}"))?;
+    let parsed = Url::parse(endpoint).map_err(|e| format!("discovery {field} is invalid: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "discovery {field} must use http or https, got: {scheme}"
+            ));
+        }
+    }
+    let discovery_host = hostname_from_parsed_url(&discovery)
+        .ok_or_else(|| "discovery_url must include a hostname".to_string())?;
+    let endpoint_host = hostname_from_parsed_url(&parsed)
+        .ok_or_else(|| format!("discovery {field} must include a hostname"))?;
+    if !endpoint_host.eq_ignore_ascii_case(&discovery_host) {
+        return Err(format!(
+            "discovery {field} host must match discovery_url host"
+        ));
+    }
+    Ok(endpoint.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_introspection_host_accepts_loopback_and_localhost_only() {
+        assert!(is_local_introspection_host("localhost"));
+        assert!(is_local_introspection_host("127.42.0.9"));
+        assert!(is_local_introspection_host("::1"));
+        assert!(!is_local_introspection_host("idp.local"));
+        assert!(!is_local_introspection_host("auth.example.com"));
+    }
+
+    #[test]
+    fn discovered_introspection_endpoint_must_match_discovery_host() {
+        assert!(
+            validate_discovered_endpoint(
+                "https://issuer.example.com/.well-known/openid-configuration",
+                "https://issuer.example.com/introspect",
+                "introspection_endpoint",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_discovered_endpoint(
+                "https://issuer.example.com/.well-known/openid-configuration",
+                "https://evil.example.com/introspect",
+                "introspection_endpoint",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_discovered_endpoint(
+                "https://issuer.example.com/.well-known/openid-configuration",
+                "file:///etc/passwd",
+                "introspection_endpoint",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn private_key_jwt_accepts_eddsa_alg_name() {
+        assert_eq!(
+            parse_private_key_alg(Some(&Value::String("EdDSA".to_string())), 0).unwrap(),
+            Algorithm::EdDSA
+        );
+    }
 }

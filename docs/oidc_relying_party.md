@@ -24,14 +24,16 @@ config:
     post_login_default_path: "/"
 ```
 
-Exactly one provider is supported. Use `discovery_url` for normal OIDC providers, or set `authorization_endpoint`, `token_endpoint`, and `jwks_uri` explicitly for providers without discovery.
+Exactly one provider is supported. Use `discovery_url` for normal OIDC providers, or set `authorization_endpoint`, `token_endpoint`, and `jwks_uri` explicitly for providers without discovery. Discovery-provided endpoints must stay on the discovery host.
 
 ## Security Behavior
 
 - `redirect_uri` must be an absolute URI and the callback path is handled by the plugin before proxying.
 - The ID token issuer, audience, expiry, not-before, and nonce are validated.
 - Sessions are sealed with AES-256-GCM. `session.encryption_secret` must be at least 32 bytes; `session.encryption_secret_previous` supports cookie rotation.
+- `session.store` supports only `cookie`; Redis-backed server-side sessions are rejected until implemented.
 - `behavior.trusted_redirect_hosts` gates post-login redirects. If no trusted redirect is available, the plugin uses `behavior.post_login_default_path`.
+- UserInfo `sub` must match the ID token `sub`, and UserInfo cannot override protected ID token claims.
 - Claim header mappings reject reserved headers, including `Authorization`, `Host`, hop-by-hop headers, and Ferrum consumer identity headers.
 
 ## Client Authentication
@@ -42,8 +44,8 @@ Supported `client_auth.method` values are:
 |---|---|
 | `client_secret_basic` | Sends the client secret with HTTP Basic auth |
 | `client_secret_post` | Sends client credentials in the token request body |
-| `private_key_jwt` | Signs a client assertion with RSA or EC keys (`RS256`, `RS384`, `RS512`, `ES256`, `ES384`) |
-| `none` | Public client mode |
+| `private_key_jwt` | Signs a client assertion with RSA, EC, or EdDSA keys (`RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `EdDSA`) |
+| `none` | Public client mode, allowed only for localhost or loopback token endpoints |
 
 ## Logout
 
