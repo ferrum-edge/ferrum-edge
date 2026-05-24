@@ -219,6 +219,26 @@ async fn opa_allows_boolean_true_result() {
 }
 
 #[tokio::test]
+async fn opa_rejects_duplicate_query_parameter_keys() {
+    let server = MockServer::start().await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("action=delete&action=view".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_reject(result, 403);
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock request history should be available");
+    assert!(
+        requests.is_empty(),
+        "OPA should not be called when duplicate query keys are present"
+    );
+}
+
+#[tokio::test]
 async fn opa_allows_nested_pointer_result() {
     let server = MockServer::start().await;
     mount_opa(

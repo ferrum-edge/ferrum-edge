@@ -53,6 +53,21 @@ pub struct Opa {
 }
 
 impl Opa {
+    fn has_duplicate_query_keys(raw_query: &str) -> bool {
+        let mut seen = HashSet::new();
+        for pair in raw_query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let key = pair.split_once('=').map_or(pair, |(k, _)| k);
+            let decoded_key = percent_encoding::percent_decode_str(key).decode_utf8_lossy();
+            if !seen.insert(decoded_key.into_owned()) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let object = config
             .as_object()
@@ -319,6 +334,19 @@ impl Plugin for Opa {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        if self.include_query
+            && ctx
+                .raw_query_string()
+                .is_some_and(Self::has_duplicate_query_keys)
+        {
+            warn!(
+                plugin = "opa",
+                reason = "duplicate_query_parameters",
+                "Rejecting request with duplicate query parameter keys to avoid OPA/backend authorization mismatch"
+            );
+            return self.reject_policy_denial();
+        }
+
         let payload = json!({ "input": self.build_input(ctx) });
         let mut request = self
             .http_client
