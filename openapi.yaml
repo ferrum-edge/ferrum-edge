@@ -8162,6 +8162,14 @@ components:
         include_service:
           type: boolean
           default: true
+        reject_duplicate_query_keys:
+          type: boolean
+          default: true
+          description: >-
+            Reject requests with duplicate query parameter keys when
+            include_query is enabled, preventing OPA/backend authorization
+            mismatch. Set to false for APIs that use array-style repeated
+            query keys.
         redact_headers:
           type: array
           items:

@@ -227,7 +227,7 @@ async fn opa_rejects_duplicate_query_parameter_keys() {
 
     let result = plugin.authorize(&mut ctx).await;
 
-    assert_reject(result, 403);
+    assert_reject(result, Some(403));
     let requests = server
         .received_requests()
         .await
@@ -236,6 +236,32 @@ async fn opa_rejects_duplicate_query_parameter_keys() {
         requests.is_empty(),
         "OPA should not be called when duplicate query keys are present"
     );
+}
+
+#[tokio::test]
+async fn opa_allows_duplicate_query_keys_when_rejection_disabled() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({"reject_duplicate_query_keys": false}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("action=delete&action=view".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn opa_allows_duplicate_query_keys_when_include_query_disabled() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({"include_query": false}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("action=delete&action=view".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_continue(result);
 }
 
 #[tokio::test]

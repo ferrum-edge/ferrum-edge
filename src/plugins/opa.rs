@@ -49,6 +49,7 @@ pub struct Opa {
     include_consumer: bool,
     include_client_ip: bool,
     include_service: bool,
+    reject_duplicate_query_keys: bool,
     redact_headers: HashSet<String>,
 }
 
@@ -122,6 +123,11 @@ impl Opa {
             include_consumer: parse_optional_bool(object, "include_consumer")?.unwrap_or(true),
             include_client_ip: parse_optional_bool(object, "include_client_ip")?.unwrap_or(true),
             include_service: parse_optional_bool(object, "include_service")?.unwrap_or(true),
+            reject_duplicate_query_keys: parse_optional_bool(
+                object,
+                "reject_duplicate_query_keys",
+            )?
+            .unwrap_or(true),
             redact_headers,
         })
     }
@@ -335,6 +341,7 @@ impl Plugin for Opa {
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         if self.include_query
+            && self.reject_duplicate_query_keys
             && ctx
                 .raw_query_string()
                 .is_some_and(Self::has_duplicate_query_keys)
