@@ -23,6 +23,7 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
 const MATCHED_OPERATION_INDEX_KEY: &str = "openapi_validator.matched_operation_index";
 const MATCHED_OPERATION_METHOD_KEY: &str = "openapi_validator.matched_operation_method";
+const SKIP_REASON_KEY: &str = "openapi_validator.skip_reason";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnforcementMode {
@@ -368,7 +369,24 @@ impl OpenapiValidator {
         Some(entry)
     }
 
-    fn bypass_reason(&self, ctx: &RequestContext) -> Option<&'static str> {
+    fn cached_bypass_reason(&self, ctx: &RequestContext) -> Option<&'static str> {
+        match ctx.metadata.get(SKIP_REASON_KEY).map(String::as_str) {
+            Some("bypass_path") => Some("bypass_path"),
+            Some("bypass_method") => Some("bypass_method"),
+            Some("bypass_consumer") => Some("bypass_consumer"),
+            Some("bypass_header") => Some("bypass_header"),
+            _ => None,
+        }
+    }
+
+    fn bypass_reason_for_headers(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> Option<&'static str> {
+        if let Some(reason) = self.cached_bypass_reason(ctx) {
+            return Some(reason);
+        }
         if self
             .bypass_paths
             .as_ref()
@@ -389,7 +407,7 @@ impl OpenapiValidator {
             return Some("bypass_consumer");
         }
         if self.bypass_header_present.iter().any(|(name, expected)| {
-            header_value(&ctx.headers, name).is_some_and(|actual| {
+            header_value(headers, name).is_some_and(|actual| {
                 expected
                     .as_deref()
                     .is_none_or(|expected| actual == expected)
@@ -398,6 +416,10 @@ impl OpenapiValidator {
             return Some("bypass_header");
         }
         None
+    }
+
+    fn bypass_reason(&self, ctx: &RequestContext) -> Option<&'static str> {
+        self.bypass_reason_for_headers(ctx, &ctx.headers)
     }
 
     fn mark_mode(&self, ctx: &mut RequestContext) {
@@ -409,10 +431,8 @@ impl OpenapiValidator {
 
     fn mark_skip(&self, ctx: &mut RequestContext, reason: &'static str) {
         self.mark_mode(ctx);
-        ctx.metadata.insert(
-            "openapi_validator.skip_reason".to_string(),
-            reason.to_string(),
-        );
+        ctx.metadata
+            .insert(SKIP_REASON_KEY.to_string(), reason.to_string());
     }
 
     fn handle_violation(
@@ -511,13 +531,13 @@ impl Plugin for OpenapiValidator {
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if !self.active() {
             self.mark_mode(ctx);
             return PluginResult::Continue;
         }
-        if let Some(reason) = self.bypass_reason(ctx) {
+        if let Some(reason) = self.bypass_reason_for_headers(ctx, headers) {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }
@@ -577,7 +597,7 @@ impl Plugin for OpenapiValidator {
         if !self.requires_request_body_buffering() {
             return PluginResult::Continue;
         }
-        if let Some(reason) = self.bypass_reason(ctx) {
+        if let Some(reason) = self.bypass_reason_for_headers(ctx, headers) {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }

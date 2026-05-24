@@ -239,6 +239,35 @@ async fn bypass_header_skips_buffering_and_validation() {
 }
 
 #[tokio::test]
+async fn bypass_header_uses_before_proxy_headers_when_ctx_headers_are_moved() {
+    let config = json!({
+        "schema_draft": "draft7",
+        "bypass": {"header_present": {"x-bypass-validator": null}},
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {"content": {"application/json": {"type": "object"}}},
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    });
+    let plugin = OpenapiValidator::new(&config).unwrap();
+    let mut ctx = post_ctx("/missing");
+    ctx.headers
+        .insert("x-bypass-validator".to_string(), "1".to_string());
+    let mut headers = std::mem::take(&mut ctx.headers);
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.skip_reason")
+            .map(String::as_str),
+        Some("bypass_header")
+    );
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
 async fn response_validation_uses_default_and_strict_missing_schema() {
     let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
     let mut ctx = post_ctx("/items");
