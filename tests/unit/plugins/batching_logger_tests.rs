@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrum_edge::plugins::utils::{
-    BatchConfig, BatchConfigDefaults, BatchingLogger, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY,
-    RetryPolicy, build_batch_config, handle_http_batch_response, parse_http_endpoint,
-    validate_batch_config,
+    BatchConfig, BatchConfigDefaults, BatchingLogger, LoggerHooks, MAX_BATCH_SIZE,
+    MAX_BUFFER_CAPACITY, RetryPolicy, build_batch_config, handle_http_batch_response,
+    parse_http_endpoint, validate_batch_config,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -446,6 +446,39 @@ async fn full_channel_warns_once_per_rate_limit_window() {
         .matches("batching_logger_drop: dropping queued log entry because buffer full")
         .count();
     assert_eq!(occurrences, 1, "drop warnings should be rate-limited");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn high_water_hook_fires_without_overflow_hook() {
+    let high_water_hits = Arc::new(AtomicUsize::new(0));
+    let high_water_hits_clone = Arc::clone(&high_water_hits);
+    let logger = BatchingLogger::spawn_with_hooks(
+        BatchConfig {
+            batch_size: 10,
+            flush_interval: Duration::from_secs(60),
+            buffer_capacity: 1,
+            retry: RetryPolicy {
+                max_attempts: 1,
+                delay: Duration::from_millis(0),
+            },
+            plugin_name: "batching_logger_high_water",
+        },
+        LoggerHooks {
+            on_high_water: Some(Arc::new(move |_, _| {
+                high_water_hits_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+            high_watermark_percent: 1,
+            ..LoggerHooks::default()
+        },
+        move |_batch: Vec<u32>| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(())
+        },
+    );
+
+    assert!(logger.try_send(1));
+    assert!(!logger.try_send(2));
+    assert_eq!(high_water_hits.load(Ordering::Relaxed), 1);
 }
 
 struct CloneTracked {

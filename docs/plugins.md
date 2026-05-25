@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 63 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 64 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -1209,6 +1209,17 @@ scrape_configs:
 Existing Prometheus scrapes of `/charges` must be updated to send admin JWT
 credentials, for example with `bearer_token_file`, `authorization.credentials_file`,
 or an auth proxy that injects the `Authorization: Bearer <token>` header.
+
+### `api_chargeback_sink`
+
+Exports durable charge events or snapshot deltas to ClickHouse using the same
+pricing blocks as `api_chargeback`. It supports per-event mode for
+transaction-level provenance, snapshot mode for lower ingest volume, an on-disk
+spool for ClickHouse outages, `GET /charges/sink/status`, and Prometheus metrics
+under `/metrics`. See [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md)
+for DDL, configuration, spool sizing, replay, and reconciliation guidance.
+
+**Priority:** 9351
 
 ### `otel_tracing`
 

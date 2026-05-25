@@ -708,7 +708,8 @@ pub async fn handle_admin_request(
         let registry = crate::plugins::prometheus_metrics::global_registry();
         let inventory = tls_management::collect_inventory(&state);
         registry.refresh_tls_certificate_inventory(&inventory);
-        let metrics_output = registry.render();
+        let mut metrics_output = registry.render();
+        metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -786,6 +787,18 @@ pub async fn handle_admin_request(
                 });
             return Ok(resp);
         }
+    }
+
+    if path == "/charges/sink/status" && method == Method::GET {
+        let status_output = crate::plugins::api_chargeback_sink::render_status_json();
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Cache-Control", "no-store")
+            .body(Full::new(Bytes::from(status_output)))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+        return Ok(resp);
     }
 
     // Extract namespace from X-Ferrum-Namespace header (defaults to "ferrum")

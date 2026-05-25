@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::warn;
 
 use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
@@ -30,17 +30,33 @@ struct Filter {
 
 impl AccessLog {
     pub fn new(config: &Value) -> Result<Self, String> {
+        if !(config.is_object() || config.is_null()) {
+            return Err("access_log: config must be an object".to_string());
+        }
+
         let filter = match config.get("filter") {
-            Some(f) if !f.is_null() => Some(Filter {
-                status_code_min: parse_optional_u16(f, "status_code_min")?,
-                status_code_max: parse_optional_u16(f, "status_code_max")?,
-                min_latency_ms: f.get("min_latency_ms").and_then(Value::as_u64),
-                errors_only: f
-                    .get("errors_only")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            }),
-            _ => None,
+            Some(Value::Null) | None => None,
+            Some(Value::Object(filter_config)) => {
+                let status_code_min = parse_optional_u16(filter_config, "status_code_min")?;
+                let status_code_max = parse_optional_u16(filter_config, "status_code_max")?;
+                if let (Some(min), Some(max)) = (status_code_min, status_code_max)
+                    && min > max
+                {
+                    return Err(
+                        "access_log: filter.status_code_min must be less than or equal to filter.status_code_max"
+                            .to_string(),
+                    );
+                }
+
+                Some(Filter {
+                    status_code_min,
+                    status_code_max,
+                    min_latency_ms: parse_optional_u64(filter_config, "min_latency_ms")?,
+                    errors_only: parse_optional_bool(filter_config, "errors_only")?
+                        .unwrap_or(false),
+                })
+            }
+            Some(_) => return Err("access_log: filter must be an object".to_string()),
         };
         let schema = resolve_schema(config, "access_log")?;
         Ok(Self { filter, schema })
@@ -91,7 +107,7 @@ impl AccessLog {
     }
 }
 
-fn parse_optional_u16(config: &Value, key: &str) -> Result<Option<u16>, String> {
+fn parse_optional_u16(config: &Map<String, Value>, key: &str) -> Result<Option<u16>, String> {
     let Some(value) = config.get(key) else {
         return Ok(None);
     };
@@ -101,6 +117,26 @@ fn parse_optional_u16(config: &Value, key: &str) -> Result<Option<u16>, String> 
     u16::try_from(raw)
         .map(Some)
         .map_err(|_| format!("access_log: filter.{key} must be between 0 and 65535"))
+}
+
+fn parse_optional_u64(config: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
+    let Some(value) = config.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| format!("access_log: filter.{key} must be an integer"))
+}
+
+fn parse_optional_bool(config: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("access_log: filter.{key} must be a boolean"))
 }
 
 #[async_trait]
@@ -152,7 +188,22 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::retry::ErrorClass;
+
     use super::*;
+
+    fn http_summary(
+        status: u16,
+        latency_total_ms: f64,
+        error_class: Option<ErrorClass>,
+    ) -> TransactionSummary {
+        TransactionSummary {
+            response_status_code: status,
+            latency_total_ms,
+            error_class,
+            ..TransactionSummary::default()
+        }
+    }
 
     fn stream_summary() -> StreamTransactionSummary {
         StreamTransactionSummary {
@@ -181,6 +232,84 @@ mod tests {
     }
 
     #[test]
+    fn constructor_accepts_null_and_empty_object_config() {
+        assert!(AccessLog::new(&serde_json::Value::Null).is_ok());
+        assert!(AccessLog::new(&json!({})).is_ok());
+    }
+
+    #[test]
+    fn constructor_rejects_malformed_filter_config() {
+        for (config, expected) in [
+            (json!("bad"), "config must be an object"),
+            (json!({ "filter": "bad" }), "filter must be an object"),
+            (
+                json!({ "filter": { "status_code_min": "500" } }),
+                "filter.status_code_min must be an integer",
+            ),
+            (
+                json!({ "filter": { "status_code_max": 70000 } }),
+                "filter.status_code_max must be between 0 and 65535",
+            ),
+            (
+                json!({ "filter": { "min_latency_ms": "250" } }),
+                "filter.min_latency_ms must be an integer",
+            ),
+            (
+                json!({ "filter": { "errors_only": "true" } }),
+                "filter.errors_only must be a boolean",
+            ),
+            (
+                json!({ "filter": { "status_code_min": 500, "status_code_max": 499 } }),
+                "filter.status_code_min must be less than or equal to filter.status_code_max",
+            ),
+        ] {
+            let err = match AccessLog::new(&config) {
+                Ok(_) => panic!("invalid config should fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(expected),
+                "expected error containing {expected:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_filter_matches_status_latency_and_error_predicates() {
+        let plugin = AccessLog::new(&json!({
+            "filter": {
+                "status_code_min": 500,
+                "status_code_max": 599,
+                "min_latency_ms": 250,
+                "errors_only": true
+            }
+        }))
+        .expect("plugin config");
+
+        assert!(plugin.should_log_http(&http_summary(
+            503,
+            250.0,
+            Some(ErrorClass::ConnectionTimeout)
+        )));
+        assert!(!plugin.should_log_http(&http_summary(
+            499,
+            250.0,
+            Some(ErrorClass::ConnectionTimeout)
+        )));
+        assert!(!plugin.should_log_http(&http_summary(
+            600,
+            250.0,
+            Some(ErrorClass::ConnectionTimeout)
+        )));
+        assert!(!plugin.should_log_http(&http_summary(
+            503,
+            249.0,
+            Some(ErrorClass::ConnectionTimeout)
+        )));
+        assert!(!plugin.should_log_http(&http_summary(503, 250.0, None)));
+    }
+
+    #[test]
     fn stream_status_code_filter_does_not_match_without_status() {
         let plugin = AccessLog::new(&json!({
             "filter": {
@@ -190,5 +319,30 @@ mod tests {
         .expect("plugin config");
 
         assert!(!plugin.should_log_stream(&stream_summary()));
+    }
+
+    #[test]
+    fn stream_filter_matches_latency_and_error_predicates() {
+        let plugin = AccessLog::new(&json!({
+            "filter": {
+                "min_latency_ms": 250,
+                "errors_only": true
+            }
+        }))
+        .expect("plugin config");
+
+        let mut summary = stream_summary();
+        assert!(!plugin.should_log_stream(&summary));
+
+        summary.error_class = Some(ErrorClass::ConnectionReset);
+        assert!(plugin.should_log_stream(&summary));
+
+        summary.duration_ms = 249.0;
+        assert!(!plugin.should_log_stream(&summary));
+
+        summary.duration_ms = 250.0;
+        summary.error_class = None;
+        summary.connection_error = Some("backend closed".to_string());
+        assert!(plugin.should_log_stream(&summary));
     }
 }

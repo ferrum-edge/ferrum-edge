@@ -11,6 +11,7 @@ mod ai_request_guard_tests;
 mod ai_response_guard_tests;
 mod ai_semantic_cache_tests;
 mod ai_token_metrics_tests;
+mod api_chargeback_sink_tests;
 mod api_chargeback_tests;
 mod basic_auth_tests;
 mod batching_logger_tests;

@@ -108,6 +108,10 @@ fn is_extended_connect_websocket<B>(req: &Request<B>) -> bool {
 /// 16-byte `Sec-WebSocket-Key`, and `Sec-WebSocket-Version: 13`.
 #[inline]
 fn is_http1_websocket_upgrade<B>(req: &Request<B>) -> bool {
+    if req.version() != hyper::Version::HTTP_11 {
+        return false;
+    }
+
     let headers = req.headers();
     let Some(connection) = headers.get("connection").and_then(|v| v.to_str().ok()) else {
         return false;
