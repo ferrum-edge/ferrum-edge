@@ -1265,6 +1265,16 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         .clickhouse
         .password_ref
         .as_deref()
+        .is_some_and(|value| !value.trim().is_empty() && url.scheme() != "https")
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: clickhouse.password_ref requires clickhouse.url to use https://"
+        ));
+    }
+    if config
+        .clickhouse
+        .password_ref
+        .as_deref()
         .is_some_and(|value| {
             !value.trim().is_empty()
                 && (config.clickhouse.tls.insecure_skip_verify

@@ -133,6 +133,20 @@ async fn config_validation_rejects_snapshot_without_spool() {
 }
 
 #[tokio::test]
+async fn password_ref_requires_https_clickhouse_url() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("http://localhost:8123");
+    config["clickhouse"]["password_ref"] = json!("FERRUM_CLICKHOUSE_PASSWORD");
+
+    let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("password_ref over http should be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.contains("password_ref requires clickhouse.url to use https://"));
+}
+
+#[tokio::test]
 async fn password_ref_must_use_ferrum_prefix() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = valid_config(temp.path());
