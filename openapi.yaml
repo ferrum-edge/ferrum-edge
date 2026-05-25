@@ -12655,7 +12655,7 @@ components:
               description: Optional ClickHouse HTTP Basic username.
             password_ref:
               type: string
-              description: FERRUM_* environment variable containing the ClickHouse password, often materialized at startup from an existing `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, or `_GCP` secret suffix.
+              description: FERRUM_* environment variable containing the ClickHouse password, often materialized at startup from an existing `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, or `_GCP` secret suffix. Because the password is sent via HTTP Basic auth, `clickhouse.url` must use `https://` and TLS certificate/hostname verification must stay enabled when this is set.
             tls:
               type: object
               additionalProperties: false

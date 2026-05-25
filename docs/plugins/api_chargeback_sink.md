@@ -160,7 +160,10 @@ size, replay timestamps, and export counters. `/metrics` includes:
 
 ## Security Notes
 
-Use HTTPS to ClickHouse. Configure mTLS with `clickhouse.tls.client_cert_file`
+Use HTTPS to ClickHouse. When `clickhouse.password_ref` is set, the plugin
+requires an `https://` `clickhouse.url` and rejects configs that disable TLS
+certificate or hostname verification, so Basic Auth credentials are never sent
+over cleartext. Configure mTLS with `clickhouse.tls.client_cert_file`
 and `clickhouse.tls.client_key_file` when ClickHouse requires client
 authentication. Keep `password_ref` pointed at an environment variable resolved
 by Ferrum's existing secret materialization; do not place credentials directly

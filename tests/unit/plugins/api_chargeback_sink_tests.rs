@@ -150,6 +150,8 @@ async fn password_ref_requires_https_clickhouse_url() {
 async fn password_ref_must_use_ferrum_prefix() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = valid_config(temp.path());
+    // https so the prefix check is reached rather than the https-required guard.
+    config["clickhouse"]["url"] = json!("https://localhost:8123");
     config["clickhouse"]["password_ref"] = json!("PATH");
 
     let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
