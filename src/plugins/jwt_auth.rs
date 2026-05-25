@@ -61,8 +61,12 @@ impl JwtAuth {
         )?;
         let require_exp =
             parse_optional_bool(config_obj.get("require_exp"), "require_exp")?.unwrap_or(true);
+        // `nbf` is optional per RFC 7519 §4.1.5 and most issuers omit it, so it
+        // must not be required by default — doing so rejects otherwise-valid
+        // tokens. Operators can opt in with `require_nbf: true`. (`validate_nbf`
+        // below still rejects a token whose `nbf` is in the future when present.)
         let require_nbf =
-            parse_optional_bool(config_obj.get("require_nbf"), "require_nbf")?.unwrap_or(true);
+            parse_optional_bool(config_obj.get("require_nbf"), "require_nbf")?.unwrap_or(false);
         let expected_issuers = parse_expected_issuers(config_obj)?;
         let audiences = parse_string_array(config_obj.get("audiences"), "audiences")?;
         let leeway_secs = parse_optional_u64(config_obj.get("leeway_secs"), "leeway_secs", 0)?;

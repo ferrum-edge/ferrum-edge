@@ -137,7 +137,7 @@ async fn test_jwt_auth_require_exp_false_allows_legacy_token_without_exp() {
 
 #[tokio::test]
 async fn token_missing_nbf_rejects_when_require_nbf_true() {
-    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let plugin = JwtAuth::new(&json!({"require_nbf": true})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
     let token = create_jwt_token_exact(
         &json!({"sub": "testuser", "exp": 9_999_999_999u64}),
@@ -150,6 +150,26 @@ async fn token_missing_nbf_rejects_when_require_nbf_true() {
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn token_missing_nbf_authenticates_by_default() {
+    // `nbf` is optional (RFC 7519); the default config must accept a token that
+    // omits it. Regression guard for require_nbf defaulting to true, which
+    // rejected the (very common) nbf-less tokens with 401.
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let token = create_jwt_token_exact(
+        &json!({"sub": "testuser", "exp": 9_999_999_999u64}),
+        "test-jwt-secret",
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
 }
 
 #[tokio::test]
