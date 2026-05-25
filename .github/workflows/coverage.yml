@@ -257,13 +257,6 @@ jobs:
             jq -r "${rows} | sort_by(-.percent, -.count) | .[:20][] | \"| \(.file) | \(.covered)/\(.count) | \(((.percent * 100 | round) / 100))% |\"" coverage-report/coverage.json
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe # v5
-        with:
-          files: coverage-report/lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
-
       - name: Upload coverage report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

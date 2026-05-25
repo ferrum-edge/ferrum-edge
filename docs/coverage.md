@@ -37,12 +37,13 @@ scripts/coverage.sh -- plugins::cors
 
 The scheduled `Coverage` workflow runs on pushes to `main`, manual dispatch,
 and Sundays at 06:00 UTC. It publishes an HTML report and LCOV file as a
-30-day artifact and uploads `coverage-report/lcov.info` to Codecov.
+30-day GitHub Actions artifact. It also writes the overall coverage percentage
+and lowest/highest-covered files to the workflow step summary.
 
 Current overall coverage: **79.15% line coverage** (`143,848/181,736` lines),
 captured locally on 2026-05-24 with `scripts/coverage.sh`. Replace this local
-snapshot with the first successful `Coverage` workflow result after the
-repository is enabled in Codecov and the `CODECOV_TOKEN` secret is configured.
+snapshot with the first successful `Coverage` workflow artifact value after the
+workflow is merged to `main` if it differs.
 
 ## Lowest-Covered Modules
 
