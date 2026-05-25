@@ -1202,7 +1202,7 @@ Mesh mode automatically injects these global plugins with reserved IDs:
 | `__mesh_authz` | `mesh_authz` | 2075 | Evaluate MeshPolicy authorization rules |
 | `__mesh_workload_metrics` | `workload_metrics` | (default) | Istio/GAMMA RED metric labels from SPIFFE/HBONE identity |
 | `__mesh_request_auth` | `jwks_auth` | (default) | JWT validation from MeshRequestAuthentication rules |
-| `__mesh_access_log` | `access_log` | (default) | Access logging with optional Telemetry API filters |
+| `__mesh_access_log` | `stdout_logging` | (default) | Access logging with optional Telemetry API filters |
 
 An operator-managed global plugin of the same type takes precedence over mesh-injected plugins (explicit override). See [plugin_execution_order.md](plugin_execution_order.md) for the full lifecycle phase matrix.
 

@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 
 /// YAML config for the TTFB test: one HTTP proxy pointed at `backend_port`
 /// plus a single `stdout_logging` plugin so the gateway emits its
-/// `TransactionSummary` (which carries `latency_backend_ttfb_ms`) on
-/// the `access_log` tracing target. Without this plugin the TTFB
-/// assertion has nothing structured to inspect.
+/// `TransactionSummary` (which carries `latency_backend_ttfb_ms`) as a
+/// JSON line on stdout. Without this plugin the TTFB assertion has
+/// nothing structured to inspect.
 ///
 /// `global` scope is used so the log hook fires regardless of the
 /// runtime proxy-id match — the simpler setup reduces the chance of
@@ -318,7 +318,7 @@ async fn backend_bandwidth_below_budget_triggers_write_timeout() {
 //   - Middleman with 300 ms latency on reads and writes.
 //   - Gateway with generous `backend_read_timeout_ms`, and a
 //     `stdout_logging` plugin wired onto the proxy so
-//     `TransactionSummary` JSON hits the `access_log` tracing target.
+//     `TransactionSummary` JSON is written to stdout.
 //
 // Expected:
 //   - Total elapsed ≥ 300 ms (round trips see the latency).
@@ -378,12 +378,13 @@ async fn high_latency_preserves_first_byte_latency_metrics() {
     let harness = GatewayHarness::builder()
         .file_config(yaml)
         .log_level("info")
-        // `main.rs` builds its `EnvFilter` via `try_from_default_env()`,
-        // so an inherited `RUST_LOG=warn` in the test runner's env
-        // would silence the `access_log` target and defeat the
-        // structured latency assertion below. Pin `RUST_LOG`
-        // explicitly.
-        .env("RUST_LOG", "info,access_log=info")
+        // `stdout_logging` writes access-log JSON straight to the
+        // non-blocking stdout sink, independent of the
+        // `FERRUM_LOG_LEVEL` / `RUST_LOG` tracing filter, so the latency
+        // assertion below holds regardless of any inherited `RUST_LOG`.
+        // We still pin `RUST_LOG=info` so runtime diagnostics stay
+        // visible in the captured output.
+        .env("RUST_LOG", "info")
         .capture_output()
         .spawn()
         .await
@@ -426,16 +427,15 @@ async fn high_latency_preserves_first_byte_latency_metrics() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Mandatory TTFB assertion on the structured access log.
-    // `stdout_logging` emits `TransactionSummary` as JSON on the
-    // `access_log` target; `latency_backend_ttfb_ms` is the purpose-
-    // built field for this signal (vs. `latency_total_ms`, which also
-    // includes plugin post-processing).
+    // `stdout_logging` emits `TransactionSummary` as a JSON line on
+    // stdout; `latency_backend_ttfb_ms` is the purpose-built field for
+    // this signal (vs. `latency_total_ms`, which also includes plugin
+    // post-processing).
     let logs = harness.captured_combined().expect("capture");
     let ttfb_ms = extract_f64_field(&logs, "latency_backend_ttfb_ms").unwrap_or_else(|| {
         panic!(
             "expected a `latency_backend_ttfb_ms` entry from stdout_logging; \
-             did RUST_LOG suppress the access_log target or the plugin fail \
-             to wire? Logs:\n{logs}"
+             did the plugin fail to wire? Logs:\n{logs}"
         )
     });
     assert!(

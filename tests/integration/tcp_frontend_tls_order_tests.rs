@@ -428,12 +428,13 @@ async fn assert_backend_was_dialed(accepted: &AtomicUsize) {
     panic!("successful TCP/TLS setup should open a backend connection");
 }
 
-/// Pulls a direct-write stream summary out of stdout captured by
-/// [`StdoutRedirect`]. PR #1131 made `stdout_logging` `writeln!` to
-/// `std::io::stdout()` instead of going through `tracing::info!(target:
-/// "access_log", …)`, so a `tracing_subscriber::fmt`-backed buffer no
-/// longer sees the summary — it only shows up on the process's stdout
-/// fd. The matching summary is the JSON line carrying our proxy id.
+/// Pulls a stream summary out of stdout captured by [`StdoutRedirect`].
+/// `stdout_logging` writes its JSON line straight to the process's
+/// stdout fd — through the non-blocking stdout writer in the binary, or
+/// a direct synchronous write in-process (as here, where the binary's
+/// `init_logging` never installs that writer) — never through a
+/// `tracing_subscriber::fmt`-backed buffer. The matching summary is the
+/// JSON line carrying our proxy id.
 fn parse_direct_write_stream_summary(captured: &str) -> Option<Value> {
     captured
         .lines()
@@ -572,13 +573,13 @@ async fn tcp_tls_frontend_handshake_failure_does_not_connect_backend() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn tcp_tls_frontend_handshake_failure_logs_client_side_disconnect_summary() {
-    // PR #1131 moved `stdout_logging` from `tracing::info!(target:
-    // "access_log", …)` to a direct `writeln!(std::io::stdout(), …)`,
-    // so the stream summary no longer flows through a
-    // `tracing_subscriber::fmt` writer. Capture stdout at the libc fd
-    // level instead. Safe under nextest's process-per-test (this is
-    // the model `test-integration` uses); the redirect is undone on
-    // `Drop` for resilience against panic.
+    // `stdout_logging` writes its stream summary straight to the
+    // process's stdout fd, not through a `tracing_subscriber::fmt`
+    // writer (in-process, the binary's non-blocking writer is never
+    // installed, so the plugin's synchronous stdout fallback runs).
+    // Capture stdout at the libc fd level instead. Safe under nextest's
+    // process-per-test (this is the model `test-integration` uses); the
+    // redirect is undone on `Drop` for resilience against panic.
     let stdout_capture = StdoutRedirect::install();
 
     let backend = reserve_port().await.expect("reserve backend port");

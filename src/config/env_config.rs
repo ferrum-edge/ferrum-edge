@@ -1765,7 +1765,7 @@ impl EnvConfig {
             [core]
             dns_overrides: HashMap<String, String> = "FERRUM_DNS_OVERRIDES" => HashMap::new();
             namespace: String = "FERRUM_NAMESPACE" => "ferrum".to_string();
-            log_level: String = "FERRUM_LOG_LEVEL" => "error".to_string();
+            log_level: String = "FERRUM_LOG_LEVEL" => "warn".to_string();
             log_buffer_capacity: usize = "FERRUM_LOG_BUFFER_CAPACITY" => 128_000usize;
             enable_streaming_latency_tracking: bool = "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING" => false;
         }

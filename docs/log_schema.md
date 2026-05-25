@@ -2,8 +2,8 @@
 
 Operators can shape the JSON / line-protocol output of every logging plugin
 (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_logging`,
-`ws_logging`, `kafka_logging`, `loki_logging`, `statsd_logging`,
-`access_log`) through a per-plugin `schema:` block. This lets you rename
+`ws_logging`, `kafka_logging`, `loki_logging`, `statsd_logging`) through a
+per-plugin `schema:` block. This lets you rename
 keys, drop fields, reorder output, add static stamping, and inject a few
 derived fields without forking the gateway.
 
@@ -217,8 +217,7 @@ reload.
 
 | Plugin | Schema-aware output | Notes |
 |---|---|---|
-| `stdout_logging` | Full | Emits via `tracing::info!` target `access_log`. |
-| `access_log` | Full | Same shape; target `mesh_access_log`. Filter (`status_code_min/max`, `min_latency_ms`, `errors_only`) runs before schema application. |
+| `stdout_logging` | Full | Writes one JSON line per summary to stdout through the non-blocking writer, independent of `FERRUM_LOG_LEVEL`. Optional filter (`status_code_min/max`, `min_latency_ms`, `errors_only`) runs before schema application. |
 | `http_logging` | Full | Batched JSON array. |
 | `tcp_logging` | Full | NDJSON, one line per entry. |
 | `udp_logging` | Full | Batched JSON array per UDP datagram. Operators should keep per-summary size under MTU. |
