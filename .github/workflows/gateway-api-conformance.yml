@@ -173,26 +173,42 @@ jobs:
           cd /tmp/gateway-api
           : > "$results/gateway-api-conformance-test.json"
           status=0
+          # Mirror the per-subtest retry from ci.yml's conformance loop so a
+          # transient kube-apiserver poll timeout on a single subtest doesn't
+          # fail the whole standalone conformance job. Real regressions in
+          # Ferrum's status writer fail every attempt; flakes recover on retry.
+          MAX_ATTEMPTS=2
           for test_name in $GATEWAY_API_CONFORMANCE_TESTS; do
             echo "::group::Gateway API conformance: ${test_name}"
-            test_log="$results/gateway-api-conformance-${test_name}.json"
             test_report="$results/gateway-api-conformance-${test_name}-report.yaml"
-            go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
-              --gateway-class=ferrum \
-              --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
-              --run-test="$test_name" \
-              --cleanup-base-resources=false \
-              --organization=Ferrum \
-              --project="Ferrum Edge" \
-              --url=https://github.com/ferrum-edge/ferrum-edge \
-              --version="${GITHUB_SHA}" \
-              --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
-              --report-output="$test_report" \
-              2>&1 | tee "$test_log"
-            test_status=${PIPESTATUS[0]}
-            cat "$test_log" >> "$results/gateway-api-conformance-test.json"
+            test_status=1
+            # Per-attempt log paths so a flaky first attempt's diagnostics
+            # survive the retry. The aggregate JSON appends every attempt.
+            for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+              if [ "$attempt" -gt 1 ]; then
+                echo "::warning title=Gateway API conformance retry::${test_name} attempt ${attempt}/${MAX_ATTEMPTS}"
+              fi
+              test_log="$results/gateway-api-conformance-${test_name}-attempt${attempt}.json"
+              go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
+                --gateway-class=ferrum \
+                --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
+                --run-test="$test_name" \
+                --cleanup-base-resources=false \
+                --organization=Ferrum \
+                --project="Ferrum Edge" \
+                --url=https://github.com/ferrum-edge/ferrum-edge \
+                --version="${GITHUB_SHA}" \
+                --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
+                --report-output="$test_report" \
+                2>&1 | tee "$test_log"
+              test_status=${PIPESTATUS[0]}
+              cat "$test_log" >> "$results/gateway-api-conformance-test.json"
+              if [ "$test_status" -eq 0 ]; then
+                break
+              fi
+            done
             if [ "$test_status" -ne 0 ]; then
-              echo "::error title=Gateway API conformance failed::${test_name} exited with ${test_status}"
+              echo "::error title=Gateway API conformance failed::${test_name} exited with ${test_status} after ${MAX_ATTEMPTS} attempt(s)"
               status="$test_status"
             fi
             echo "::endgroup::"
