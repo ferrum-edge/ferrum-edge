@@ -145,6 +145,27 @@ async fn password_ref_must_use_ferrum_prefix() {
     assert!(error.contains("password_ref must reference a FERRUM_*"));
 }
 
+#[tokio::test]
+async fn rejects_clickhouse_identifier_injection() {
+    let temp = tempfile::tempdir().unwrap();
+    for bad in [
+        "charges_raw; DROP TABLE x",
+        "charges raw",
+        "charges`raw",
+        "charges_raw FORMAT TSV",
+    ] {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"]["table"] = json!(bad);
+        let error = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+            .err()
+            .unwrap_or_else(|| panic!("table '{bad}' should be rejected"));
+        assert!(
+            error.contains("may only contain"),
+            "unexpected error for table '{bad}': {error}"
+        );
+    }
+}
+
 #[test]
 fn json_each_row_serialization_is_line_delimited_and_omits_none() {
     let events = vec![sample_event("evt-1"), sample_event("evt-2")];

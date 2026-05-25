@@ -404,6 +404,11 @@ pub struct ApiChargebackSink {
     config: Arc<ApiChargebackSinkConfig>,
     node_id: Arc<str>,
     snapshot_accumulator: Option<Arc<SnapshotAccumulator>>,
+    /// Handles for the per-instance background loops (spool replayer and, in
+    /// snapshot mode, the snapshot emitter). Aborted on `Drop` so a config
+    /// reload or admin-validation throwaway does not leak immortal tasks that
+    /// would otherwise keep racing on the shared spool directory.
+    background_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 struct SinkRuntime {
@@ -713,8 +718,9 @@ impl ApiChargebackSink {
             spool,
         });
 
+        let mut background_tasks = Vec::new();
         if let Some(spool) = runtime.spool.clone() {
-            start_spool_replayer(
+            background_tasks.push(start_spool_replayer(
                 Arc::clone(&spool),
                 runtime.summary.clone(),
                 ClickHouseFlushConfig {
@@ -727,19 +733,19 @@ impl ApiChargebackSink {
                 },
                 config.batch.size,
                 config.spool.replay_interval_secs,
-            );
+            ));
         }
 
         let config = Arc::new(config);
         let snapshot_accumulator = if config.mode == SinkMode::Snapshot {
             let accumulator = Arc::new(SnapshotAccumulator::new());
-            start_snapshot_task(
+            background_tasks.push(start_snapshot_task(
                 Arc::clone(&accumulator),
                 Arc::clone(&runtime),
                 Arc::clone(&config),
                 Arc::clone(&node_id),
                 namespace.to_string(),
-            );
+            ));
             Some(accumulator)
         } else {
             None
@@ -754,6 +760,7 @@ impl ApiChargebackSink {
             config,
             node_id,
             snapshot_accumulator,
+            background_tasks,
         })
     }
 
@@ -764,6 +771,33 @@ impl ApiChargebackSink {
             .fetch_add(1, Ordering::Relaxed);
         self.runtime.logger.try_send(event);
         invalidate_status_cache();
+    }
+}
+
+impl Drop for ApiChargebackSink {
+    fn drop(&mut self) {
+        // Stop the per-instance background loops so a config reload or an admin
+        // validation throwaway does not leak immortal tasks that keep racing on
+        // the shared spool directory (duplicate replays, delete races). The
+        // BatchingLogger flush loop is intentionally left running: it owns the
+        // mpsc receiver and terminates on its own once the sender is dropped,
+        // after draining any buffered events.
+        for task in &self.background_tasks {
+            task.abort();
+        }
+        // If this instance is still the one published for status/metrics
+        // rendering, clear the slot. Without this, a dropped validation
+        // throwaway would leave stale (zeroed) metrics — and its idle flush
+        // loop pinned alive by the global — until the next construction.
+        let current = active_sink().load_full();
+        if current
+            .as_ref()
+            .as_ref()
+            .is_some_and(|runtime| Arc::ptr_eq(runtime, &self.runtime))
+        {
+            active_sink().store(Arc::new(None));
+            invalidate_status_cache();
+        }
     }
 }
 
@@ -1168,14 +1202,8 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             "{PLUGIN_NAME}: clickhouse.url must not contain user-info; use username/password_ref"
         ));
     }
-    if config.clickhouse.database.trim().is_empty() {
-        return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.database must not be empty"
-        ));
-    }
-    if config.clickhouse.table.trim().is_empty() {
-        return Err(format!("{PLUGIN_NAME}: clickhouse.table must not be empty"));
-    }
+    validate_clickhouse_identifier(&config.clickhouse.database, "database")?;
+    validate_clickhouse_identifier(&config.clickhouse.table, "table")?;
     if config.clickhouse.timeout_ms == 0 {
         return Err(format!(
             "{PLUGIN_NAME}: clickhouse.timeout_ms must be at least 1"
@@ -1273,6 +1301,28 @@ fn parse_clickhouse_url(raw: &str) -> Result<Url, String> {
         ));
     }
     Ok(url)
+}
+
+/// ClickHouse database/table names are interpolated directly into the
+/// `INSERT INTO <table> FORMAT JSONEachRow` query string in [`build_insert_url`],
+/// so restrict them to a safe identifier charset (ASCII letters, digits,
+/// underscore, and a `.` db-qualifier) to keep operator config from injecting
+/// SQL into the export query.
+fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!(
+            "{PLUGIN_NAME}: clickhouse.{field} must not be empty"
+        ));
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: clickhouse.{field} may only contain ASCII letters, digits, underscores, and dots"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_query_params(params: &HashMap<String, String>) -> Result<(), String> {
@@ -1806,7 +1856,7 @@ fn start_spool_replayer(
     flush_config: ClickHouseFlushConfig,
     _batch_size: usize,
     replay_interval_secs: u64,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(Duration::from_secs(replay_interval_secs));
         loop {
@@ -1815,7 +1865,7 @@ fn start_spool_replayer(
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink spool replay failed");
             }
         }
-    });
+    })
 }
 
 async fn replay_spool_once(
@@ -2184,7 +2234,7 @@ fn start_snapshot_task(
     config: Arc<ApiChargebackSinkConfig>,
     node_id: Arc<str>,
     _namespace: String,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut snapshot_timer =
             tokio::time::interval(Duration::from_secs(config.snapshot.interval_secs));
@@ -2223,7 +2273,7 @@ fn start_snapshot_task(
                 }
             }
         }
-    });
+    })
 }
 
 fn event_from_http_summary(
