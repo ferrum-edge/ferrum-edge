@@ -23,12 +23,33 @@ use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 /// Default MongoDB connection for local development / CI.
 const DEFAULT_MONGO_URL: &str = "mongodb://localhost:27017/ferrum_test";
 const DEFAULT_MONGO_DATABASE: &str = "ferrum_test";
+
+fn shutdown_gateway_process(child: &mut Child) {
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        #[cfg(unix)]
+        {
+            let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => thread::sleep(Duration::from_millis(50)),
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 /// Check if MongoDB is reachable at the expected address.
 /// Returns false if MongoDB is down — tests will be skipped gracefully.
@@ -155,8 +176,7 @@ impl MongoTestHarness {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    shutdown_gateway_process(&mut child);
                 }
                 Err(e)
             }
@@ -235,8 +255,7 @@ impl MongoTestHarness {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    shutdown_gateway_process(&mut child);
                 }
                 Err(e)
             }
@@ -309,8 +328,7 @@ impl MongoTestHarness {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    shutdown_gateway_process(&mut child);
                 }
                 Err(e)
             }
@@ -374,17 +392,22 @@ impl MongoTestHarness {
 impl Drop for MongoTestHarness {
     fn drop(&mut self) {
         if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            shutdown_gateway_process(&mut child);
         }
     }
 }
 
-fn find_binary() -> Result<&'static str, Box<dyn std::error::Error>> {
+fn find_binary() -> Result<String, Box<dyn std::error::Error>> {
+    if let Ok(path) = std::env::var("FERRUM_EDGE_TEST_BIN") {
+        return Ok(path);
+    }
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_ferrum-edge") {
+        return Ok(path);
+    }
     if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        Ok("./target/debug/ferrum-edge")
+        Ok("./target/debug/ferrum-edge".to_string())
     } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        Ok("./target/release/ferrum-edge")
+        Ok("./target/release/ferrum-edge".to_string())
     } else {
         Err("ferrum-edge binary not found. Run `cargo build` first.".into())
     }

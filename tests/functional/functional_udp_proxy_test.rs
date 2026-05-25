@@ -16,6 +16,7 @@
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_udp_proxy --ignored --nocapture
 
 use std::io::Write;
+use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::UdpSocket;
@@ -64,12 +65,38 @@ async fn start_udp_fixed_response_server(
 // Gateway Helpers
 // ============================================================================
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
+fn gateway_binary_path() -> String {
+    if let Ok(path) = std::env::var("FERRUM_EDGE_TEST_BIN") {
+        return path;
     }
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_ferrum-edge") {
+        return path;
+    }
+    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        "./target/debug/ferrum-edge".to_string()
+    } else {
+        "./target/release/ferrum-edge".to_string()
+    }
+}
+
+fn shutdown_gateway(gateway: &mut std::process::Child) {
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        #[cfg(unix)]
+        {
+            let _ = unsafe { libc::kill(gateway.id() as libc::pid_t, libc::SIGTERM) };
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                match gateway.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => thread::sleep(Duration::from_millis(50)),
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
 }
 
 /// Extra env vars for DTLS frontend configuration.
@@ -211,8 +238,7 @@ plugin_configs: []
     assert_eq!(&buf[..n2], msg2, "Second echo should match");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -284,8 +310,7 @@ plugin_configs: []
     assert_eq!(completed.len(), num_clients, "All clients should complete");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -373,8 +398,7 @@ plugin_configs: []
         "existing UDP session should continue after a new client is rejected"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -459,8 +483,7 @@ plugin_configs: []
     );
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -522,8 +545,7 @@ plugin_configs: []
     );
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -593,8 +615,7 @@ plugin_configs: []
         "response at the configured amplification limit should be forwarded"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     response_server.abort();
 }
 
@@ -669,8 +690,7 @@ plugin_configs: []
     assert_eq!(&buf[..n2], msg2, "Second DTLS echo should match");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     dtls_echo.abort();
 }
 
@@ -737,8 +757,7 @@ plugin_configs: []
     }
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     dtls_echo.abort();
 }
 
@@ -821,8 +840,7 @@ plugin_configs: []
 
     // Cleanup
     dtls_client.close().await;
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -893,8 +911,7 @@ plugin_configs: []
 
     // Cleanup
     dtls_client.close().await;
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     dtls_echo.abort();
 }
 
