@@ -1300,7 +1300,11 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = spawn_material_set_reload_task(
             MaterialSetReloadConfig {
-                surface: "test",
+                // Unique surface per test: the force-reload registry is a
+                // process-global keyed by surface, so a shared name lets a
+                // parallel test's task drop this one's force sender and exit
+                // early (`cargo test --lib` runs tests concurrently).
+                surface: "test_material_set_bump",
                 sources: vec![WatchedMaterialSource::new(
                     "cert",
                     source,

@@ -232,11 +232,11 @@ fn test_load_crls_none_returns_empty() {
 fn test_load_crls_nonexistent_file_fails() {
     let result = load_crls(Some("/nonexistent/crl.pem"));
     assert!(result.is_err());
+    let message = result.unwrap_err().to_string();
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("Failed to open CRL file")
+        message.contains("Failed to load CRL source")
+            && message.contains("failed to read TLS material"),
+        "unexpected CRL load error: {message}"
     );
 }
 

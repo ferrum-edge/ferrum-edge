@@ -175,7 +175,11 @@ mod tests {
 
         let task = spawn_frontend_tls_reload_task(
             FrontendTlsReloadConfig {
-                surface: "test",
+                // Unique surface per test: the force-reload registry is a
+                // process-global keyed by surface, so a shared name lets a
+                // parallel test's task drop this one's force sender and exit
+                // early (`cargo test --lib` runs tests concurrently).
+                surface: "test_frontend_reload_swap",
                 sources: vec![
                     WatchedMaterialSource::new(
                         "cert",

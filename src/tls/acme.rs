@@ -5,6 +5,13 @@
 //! flow through the same reload/inventory path as file, provider, Kubernetes,
 //! and admin-managed sources.
 
+// This module mixes always-compiled glue (the TLS-ALPN-01 resolver, HTTP-01
+// challenge serving) with order/account-store and challenge-validation helpers
+// that only have callers behind `#[cfg(feature = "acme")]`. Those helpers are
+// intentionally unused in the default (no-`acme`) build, so suppress dead-code
+// warnings there; the `acme`-feature build keeps full dead-code linting.
+#![cfg_attr(not(feature = "acme"), allow(dead_code))]
+
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
