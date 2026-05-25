@@ -398,10 +398,7 @@ impl MtlsAuth {
                 Ok(email)
             }
             CertField::FingerprintSha256 => {
-                use sha2::{Digest, Sha256};
-                let mut hasher = Sha256::new();
-                hasher.update(der_bytes);
-                Ok(hex::encode(hasher.finalize()))
+                Ok(super::utils::cert_hash::sha256_hex_lower(der_bytes))
             }
             CertField::Serial => Ok(cert.serial.to_str_radix(16)),
         }

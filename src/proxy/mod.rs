@@ -2822,6 +2822,7 @@ impl ProxyState {
             &env_config_arc.namespace,
             env_config_arc.backend_allow_ips.clone(),
             mesh_egress_strip_baggage_keys.clone(),
+            env_config_arc.pool_shard_amount,
         );
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will
@@ -8290,6 +8291,10 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.metadata.insert(
+        "ferrum.frontend_scheme".to_string(),
+        if is_tls { "https" } else { "http" }.to_string(),
+    );
     ctx.frontend_listen_port = Some(connection_metadata.frontend_listen_port.unwrap_or(
         if is_tls {
             state.env_config.proxy_https_port

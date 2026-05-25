@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 64 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 66 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -1318,14 +1318,131 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers[].role_claim` | String (optional) | Per-provider override for role claim path |
 | `providers[].consumer_identity_claim` | String (optional) | Per-provider override for consumer identity claim |
 | `providers[].consumer_header_claim` | String (optional) | Per-provider override for consumer header claim |
+| `providers[].claim_headers` | Object (optional) | Per-provider claim-to-header mappings; keys are claim paths and values are upstream header names |
+| `providers[].claim_headers_separator` | String (optional) | Separator for array claim header values |
+| `providers[].require_mtls_binding` | Boolean (optional) | Require JWT `cnf.x5t#S256` to match the frontend client certificate SHA-256 thumbprint |
+| `providers[].require_dpop` | Boolean (optional) | Require and validate a DPoP proof bound to the access token |
+| `providers[].dpop_clock_skew_secs` | u64 (optional) | DPoP `iat`/`exp` clock skew in seconds (default: `30`, max: `300`) |
+| `providers[].dpop_jti_cache_max_entries` | usize (optional) | Per-provider DPoP replay cache capacity (default: `10000`) |
+| `providers[].dpop_jti_ttl_secs` | u64 (optional) | DPoP `jti` replay cache TTL (default: `300`, must be at least twice clock skew) |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
 | `consumer_identity_claim` | String | Global JWT claim for consumer lookup (default: `"sub"`) |
 | `consumer_header_claim` | String | Global JWT claim for `X-Consumer-Username` header (default: same as `consumer_identity_claim`) |
+| `claim_headers` | Object | Global claim-to-header mappings used when the matched provider has no provider override |
+| `claim_headers_separator` | String | Global separator for array claim header values (default: `","`) |
 | `require_exp` | Boolean | Global default for requiring an `exp` claim (default: `true`) |
 | `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`) |
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
+Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
+
+### `oauth2_introspection`
+
+Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspection endpoints. Supports direct endpoint URLs or OIDC discovery, multi-provider routing, client authentication, bounded token caches, claim-based authorization, consumer lookup, claim header fan-out, and optional token stripping before proxying.
+
+**Priority:** 1050
+
+| Parameter | Type | Description |
+|---|---|---|
+| `providers` | Array | Introspection provider configurations (required) |
+| `providers[].introspection_endpoint` | String | Direct token introspection endpoint URL |
+| `providers[].discovery_url` | String | OIDC discovery URL used to resolve `introspection_endpoint` |
+| `providers[].issuer` | String (optional) | Expected `iss` claim in active introspection responses |
+| `providers[].audiences` | String[] (optional) | Accepted `aud` values; OR-matched |
+| `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
+| `providers[].client_auth.client_id` | String | OAuth client ID for authenticated methods |
+| `providers[].client_auth.client_secret` | String | Client secret for `client_secret_basic` or `client_secret_post` |
+| `providers[].client_auth.private_key_pem` | String | PEM private key for `private_key_jwt` |
+| `providers[].client_auth.private_key_jwt_alg` | String | `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA` |
+| `providers[].client_auth.private_key_jwt_kid` | String (optional) | Optional `kid` for private key JWT assertions |
+| `providers[].from_headers` | Array (optional) | Header token locations, each `{ "name": "...", "prefix": "..." }` |
+| `providers[].from_params` | String[] (optional) | Query parameter token locations |
+| `providers[].forward_original_token` | Boolean | Forward the original token-bearing header/query param (default `true`) |
+| `providers[].positive_cache_ttl_secs` | u64 | Active-token cache TTL cap (default `60`) |
+| `providers[].negative_cache_ttl_secs` | u64 | Inactive-token cache TTL (default `10`) |
+| `providers[].max_cache_entries` | usize | Bounded per-provider token cache capacity (default `10000`) |
+| `providers[].request_timeout_ms` | u64 | Introspection request timeout (default `5000`) |
+| `providers[].required_scopes` | String[] (optional) | Scopes that must all be present |
+| `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
+| `providers[].claim_headers` | Object (optional) | Claim-to-header mappings; keys are claim paths and values are upstream header names |
+| `scope_claim` | String | Global scope claim path (default: `"scope"`) |
+| `role_claim` | String | Global role claim path (default: `"roles"`) |
+| `consumer_identity_claim` | String | Global claim used for consumer lookup (default: `"username"`) |
+| `consumer_header_claim` | String | Global claim used for `X-Consumer-Username` when no consumer maps |
+
+`client_auth.method: "none"` is accepted only for localhost or loopback endpoints. Discovery-provided introspection endpoints must stay on the discovery host. Claim header mappings reject reserved headers.
+
+```yaml
+plugin_name: oauth2_introspection
+config:
+  providers:
+    - introspection_endpoint: "https://idp.example.com/oauth2/introspect"
+      issuer: "https://idp.example.com/"
+      audiences: ["api://edge"]
+      client_auth:
+        method: client_secret_basic
+        client_id: ferrum-edge
+        client_secret: "${INTROSPECTION_CLIENT_SECRET}"
+      required_scopes: ["orders:read"]
+      claim_headers:
+        sub: X-Authenticated-Subject
+```
+
+### `oidc_relying_party`
+
+Runs a browser-oriented OpenID Connect relying party flow with authorization code + PKCE, encrypted gateway sessions, ID token validation through provider JWKS, optional UserInfo merge, scope/role checks, claim header fan-out, and RP-initiated logout.
+
+**Priority:** 1075
+
+| Parameter | Type | Description |
+|---|---|---|
+| `providers` | Array | Exactly one OIDC provider configuration |
+| `providers[].issuer` | String | Expected ID token issuer |
+| `providers[].discovery_url` | String | OIDC discovery URL |
+| `providers[].authorization_endpoint` | String | Explicit authorization endpoint when discovery is not used |
+| `providers[].token_endpoint` | String | Explicit token endpoint when discovery is not used |
+| `providers[].jwks_uri` | String | Explicit JWKS URI when discovery is not used |
+| `providers[].userinfo_endpoint` | String (optional) | UserInfo endpoint used to enrich session claims |
+| `providers[].client_id` | String | OIDC client ID |
+| `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
+| `providers[].redirect_uri` | String | Absolute callback URI registered with the provider |
+| `providers[].callback_path` | String | Callback path Ferrum handles (default: path from `redirect_uri`) |
+| `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`) |
+| `providers[].scopes` | String[] | OIDC scopes; must include `openid` |
+| `providers[].audiences` | String[] | Accepted ID token audiences |
+| `providers[].required_scopes` | String[] (optional) | Scopes that must all be present in session claims |
+| `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
+| `providers[].claim_headers` | Object (optional) | Session claim-to-header mappings |
+| `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies |
+| `session.encryption_secret_previous` | String (optional) | Previous secret accepted for rotation |
+| `session.store` | String | Session backend; only `cookie` is implemented |
+| `session.cookie_name` | String | Session cookie name (default: `ferrum_session`) |
+| `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`) |
+| `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`) |
+| `session.max_cookie_bytes` | u64 | Maximum sealed cookie size (default: `8000`) |
+| `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
+| `behavior.trusted_redirect_hosts` | String[] | Hosts allowed for post-login redirect parameters |
+
+```yaml
+plugin_name: oidc_relying_party
+config:
+  providers:
+    - issuer: "https://idp.example.com/"
+      discovery_url: "https://idp.example.com/.well-known/openid-configuration"
+      client_id: ferrum-edge
+      redirect_uri: "https://edge.example.com/oidc/callback"
+      client_auth:
+        method: client_secret_basic
+        client_secret: "${OIDC_CLIENT_SECRET}"
+      audiences: ["ferrum-edge"]
+      claim_headers:
+        email: X-Authenticated-Email
+  session:
+    encryption_secret: "${OIDC_SESSION_SECRET_32_BYTES_MIN}"
+  behavior:
+    post_login_default_path: "/"
+```
 
 ### `jwt_auth`
 
@@ -1337,6 +1454,12 @@ Authenticates requests using HS256 JWT Bearer tokens matched against consumer cr
 |---|---|---|---|
 | `token_lookup` | String | `header:Authorization` | Where to find the token (`header:<name>` or `query:<name>`) |
 | `consumer_claim_field` | String | `sub` | JWT claim identifying the consumer |
+| `expected_issuer` | String | *(none)* | Required `iss` value; mutually exclusive with `expected_issuers` |
+| `expected_issuers` | String[] | `[]` | Accepted `iss` values |
+| `audiences` | String[] | `[]` | Accepted `aud` values; audience validation is disabled when empty |
+| `require_exp` | Boolean | `true` | Require an `exp` claim; expiration is always validated when present |
+| `require_nbf` | Boolean | `true` | Require an `nbf` claim and validate it |
+| `leeway_secs` | u64 | `0` | Clock leeway for time-based JWT claims; max `300` |
 
 **Consumer credential** (`jwt`) — array. Secrets must be at least 32 characters:
 ```yaml

@@ -45,6 +45,8 @@ mod load_testing_tests;
 mod loki_logging_tests;
 mod mesh_plugins_tests;
 mod mtls_auth_tests;
+mod oauth2_introspection_tests;
+mod oidc_relying_party_tests;
 mod opa_tests;
 mod openapi_validator_tests;
 mod otel_tracing_tests;

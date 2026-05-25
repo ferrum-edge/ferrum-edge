@@ -21,7 +21,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 **Key highlights:**
 
 - **Multi-protocol**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, raw TCP/UDP with TLS/DTLS
-- **63 built-in plugins**: Authentication, authorization, OPA policy decisions, WAF content threat detection, OpenAPI contract validation, rate limiting, fault injection, compression, SSE stream handling, transformation, response mocking, spec exposure, serverless functions, AI/LLM-specific plugins (including AI federation for multi-provider routing), load testing, API chargeback, and observability
+- **65 built-in plugins**: Authentication, authorization, OPA policy decisions, WAF content threat detection, OpenAPI contract validation, rate limiting, fault injection, compression, SSE stream handling, transformation, response mocking, spec exposure, serverless functions, AI/LLM-specific plugins (including AI federation for multi-provider routing), load testing, API chargeback, and observability
 - **Seven operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, and Migrate
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
 - **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
@@ -278,7 +278,7 @@ Plugins execute in a defined pipeline with priority ordering (lower = runs first
 |-------|---------|
 | **Tracing** (25) | `otel_tracing` |
 | **Early** (50-275) | `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `grpc_method_router` (275) |
-| **Authentication** (950-1500) | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
+| **Authentication** (950-1500) | `mtls_auth` (950), `jwks_auth` (1000), `oauth2_introspection` (1050), `oidc_relying_party` (1075), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
 | **Admission** (2000-2999) | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `ai_semantic_cache` (2700), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_request_guard` (2975) |
 | **Transform** (3000-3999) | `request_transformer` (3000), `serverless_function` (3025), `grpc_deadline` (3050), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** (4000-4999) | `response_transformer` (4000), `ai_response_guard` (4075), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |

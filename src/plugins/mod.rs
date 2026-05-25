@@ -1,4 +1,4 @@
-//! Plugin system — 62 built-in plugins with a trait-based architecture.
+//! Plugin system — 65 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -52,6 +52,8 @@ pub mod loki_logging;
 pub mod mesh;
 pub mod mesh_route_dispatch;
 pub mod mtls_auth;
+pub mod oauth2_introspection;
+pub mod oidc_relying_party;
 pub mod opa;
 pub mod openapi_validator;
 pub mod otel_tracing;
@@ -1419,7 +1421,7 @@ pub struct StreamTransactionSummary {
 /// | Band      | Range       | Purpose                                   | Plugins |
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
-/// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
+/// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
@@ -1446,6 +1448,8 @@ pub mod priority {
     pub const SPIFFE_IDENTITY: u16 = 940;
     pub const MTLS_AUTH: u16 = 950;
     pub const JWKS_AUTH: u16 = 1000;
+    pub const OAUTH2_INTROSPECTION: u16 = 1050;
+    pub const OIDC_RELYING_PARTY: u16 = 1075;
     pub const JWT_AUTH: u16 = 1100;
     pub const KEY_AUTH: u16 = 1200;
     pub const LDAP_AUTH: u16 = 1250;
@@ -1816,7 +1820,8 @@ pub trait Plugin: Send + Sync {
     /// phase, where auth mode (Single vs Multi) determines how failures are
     /// handled. Custom auth plugins should override this to return `true`.
     ///
-    /// Default is `false`. Built-in auth plugins (jwks_auth, jwt_auth, key_auth,
+    /// Default is `false`. Built-in auth plugins (mtls_auth, jwks_auth,
+    /// oauth2_introspection, oidc_relying_party, jwt_auth, key_auth, ldap_auth,
     /// basic_auth, hmac_auth) override this to return `true`.
     fn is_auth_plugin(&self) -> bool {
         false
@@ -2019,6 +2024,13 @@ pub fn create_plugin_with_http_client(
             transaction_debugger::TransactionDebugger::new(config)?,
         ))),
         "jwks_auth" => Ok(Some(Arc::new(jwks_auth::JwksAuth::new(
+            config,
+            http_client.clone(),
+        )?))),
+        "oauth2_introspection" => Ok(Some(Arc::new(
+            oauth2_introspection::Oauth2Introspection::new(config, http_client.clone())?,
+        ))),
+        "oidc_relying_party" => Ok(Some(Arc::new(oidc_relying_party::OidcRelyingParty::new(
             config,
             http_client.clone(),
         )?))),
@@ -2233,6 +2245,8 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "jwt_auth"
             | "hmac_auth"
             | "jwks_auth"
+            | "oauth2_introspection"
+            | "oidc_relying_party"
             | "mtls_auth"
             | "mesh_authz"
             | "opa"
@@ -2265,6 +2279,8 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ws_logging",
         "transaction_debugger",
         "jwks_auth",
+        "oauth2_introspection",
+        "oidc_relying_party",
         "jwt_auth",
         "key_auth",
         "basic_auth",
