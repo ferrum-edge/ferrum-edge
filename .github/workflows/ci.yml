@@ -127,17 +127,19 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Build ferrum-cni binary
+        # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, which
+        # resolves to target/debug/ferrum-cni in the checked-out workspace.
+        # Re-create that path in shard runners with this uploaded binary.
+        run: cargo build --bin ferrum-cni
+
       - name: Build integration tests archive
         # Nextest archives are native binaries, so the file and artifact names
         # include runner OS/arch. Future non-Linux shards must build and
         # download their matching archive instead of sharing this Linux one.
-        #
-        # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, so include
-        # that binary in the same archive as `integration_tests`.
         run: |
           archive_file="integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
-            --bin ferrum-cni \
             --test integration_tests \
             --archive-file "$archive_file"
 
@@ -146,6 +148,14 @@ jobs:
         with:
           name: integration-tests-archive-${{ runner.os }}-${{ runner.arch }}
           path: integration-tests-${{ runner.os }}-${{ runner.arch }}.tar.zst
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload ferrum-cni binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}
+          path: target/debug/ferrum-cni
           retention-days: 1
           if-no-files-found: error
 
@@ -276,6 +286,16 @@ jobs:
         with:
           name: integration-tests-archive-${{ runner.os }}-${{ runner.arch }}
           path: .
+
+      - name: Download prebuilt ferrum-cni binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}
+          path: target/debug
+
+      - name: Mark ferrum-cni binary executable
+        # actions/download-artifact does not preserve the executable bit.
+        run: chmod +x target/debug/ferrum-cni
 
       - name: Run integration test shard
         # Mirrors the `test-functional` shard runner. Each filter line is a
