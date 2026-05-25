@@ -19,37 +19,19 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_mongodb -- --ignored --nocapture
 
+use crate::common::{
+    configure_coverage_gateway_command, explicit_test_binary, shutdown_gateway_child,
+};
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::process::{Child, Command, Stdio};
-use std::thread;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 /// Default MongoDB connection for local development / CI.
 const DEFAULT_MONGO_URL: &str = "mongodb://localhost:27017/ferrum_test";
 const DEFAULT_MONGO_DATABASE: &str = "ferrum_test";
-
-fn shutdown_gateway_process(child: &mut Child) {
-    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        #[cfg(unix)]
-        {
-            let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-            let deadline = std::time::Instant::now() + Duration::from_secs(8);
-            while std::time::Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => thread::sleep(Duration::from_millis(50)),
-                    Err(_) => return,
-                }
-            }
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-}
 
 /// Check if MongoDB is reachable at the expected address.
 /// Returns false if MongoDB is down — tests will be skipped gracefully.
@@ -156,7 +138,8 @@ impl MongoTestHarness {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let binary_path = find_binary()?;
 
-        let child = Command::new(binary_path)
+        let mut command = Command::new(binary_path);
+        command
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
             .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
@@ -168,15 +151,16 @@ impl MongoTestHarness {
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "info")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        configure_coverage_gateway_command(&mut command);
+        let child = command.spawn()?;
 
         self.gateway_process = Some(child);
         match self.wait_for_health().await {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    shutdown_gateway_process(&mut child);
+                    shutdown_gateway_child(&mut child);
                 }
                 Err(e)
             }
@@ -245,6 +229,7 @@ impl MongoTestHarness {
             command.env("FERRUM_DB_TLS_CA_CERT_PATH", &ca_cert_path);
         }
 
+        configure_coverage_gateway_command(&mut command);
         let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -255,7 +240,7 @@ impl MongoTestHarness {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    shutdown_gateway_process(&mut child);
+                    shutdown_gateway_child(&mut child);
                 }
                 Err(e)
             }
@@ -304,7 +289,8 @@ impl MongoTestHarness {
         let client_cert_path = format!("{}/client.crt", cert_dir);
         let client_key_path = format!("{}/client.key", cert_dir);
 
-        let child = Command::new(binary_path)
+        let mut command = Command::new(binary_path);
+        command
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
             .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
@@ -320,15 +306,16 @@ impl MongoTestHarness {
             .env("FERRUM_DB_TLS_CLIENT_CERT_PATH", &client_cert_path)
             .env("FERRUM_DB_TLS_CLIENT_KEY_PATH", &client_key_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        configure_coverage_gateway_command(&mut command);
+        let child = command.spawn()?;
 
         self.gateway_process = Some(child);
         match self.wait_for_health().await {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    shutdown_gateway_process(&mut child);
+                    shutdown_gateway_child(&mut child);
                 }
                 Err(e)
             }
@@ -392,17 +379,14 @@ impl MongoTestHarness {
 impl Drop for MongoTestHarness {
     fn drop(&mut self) {
         if let Some(mut child) = self.gateway_process.take() {
-            shutdown_gateway_process(&mut child);
+            shutdown_gateway_child(&mut child);
         }
     }
 }
 
 fn find_binary() -> Result<String, Box<dyn std::error::Error>> {
-    if let Ok(path) = std::env::var("FERRUM_EDGE_TEST_BIN") {
-        return Ok(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_ferrum-edge") {
-        return Ok(path);
+    if let Some(path) = explicit_test_binary() {
+        return Ok(path.to_string_lossy().into_owned());
     }
     if std::path::Path::new("./target/debug/ferrum-edge").exists() {
         Ok("./target/debug/ferrum-edge".to_string())

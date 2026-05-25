@@ -71,6 +71,7 @@ pub use echo_servers::{
     spawn_http_slow_identifying, spawn_http_status, spawn_tcp_echo, spawn_udp_echo,
 };
 pub use gateway_harness::{
-    DbType, GatewayMode, TestGateway, TestGatewayBuilder, ensure_gateway_built,
+    DbType, GatewayMode, TestGateway, TestGatewayBuilder, configure_coverage_gateway_command,
+    ensure_gateway_built, explicit_test_binary, shutdown_gateway_child,
 };
 pub use hmac_helpers::{empty_digest_header, generate_hmac_signature};

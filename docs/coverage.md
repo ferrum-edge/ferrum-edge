@@ -59,11 +59,25 @@ snapshot with the first successful `Coverage` workflow artifact value after the
 workflow is merged to `main` if it differs.
 
 Latest opt-in functional benchmark: **81.68% line coverage**
-(`148,432/181,717` lines), captured locally on 2026-05-25 with the functional
-coverage path and targeted follow-up filters for HTTP/3, TCP, and UDP proxy
-coverage. This is not the scheduled CI baseline because functional coverage is
-heavier and depends on subprocess-based fixtures, but it is the current
-top-gap benchmark for tracking progress toward 90%.
+(`148,432/181,717` lines), captured locally on 2026-05-25 with
+`rustc 1.95.0 (59807616e 2026-04-14)`. This is not the scheduled CI baseline
+because functional coverage is heavier and depends on subprocess-based
+fixtures, but it is the current top-gap benchmark for tracking progress toward
+90%.
+
+The 81.68% profile used:
+
+- `scripts/coverage.sh --functional`
+- `scripts/coverage.sh --functional-filter functional_cp_dp`
+- `scripts/coverage.sh --functional-filter functional_cp_dp_resilience`
+- `scripts/coverage.sh --functional-filter functional_grpc`
+- `scripts/coverage.sh --functional-filter functional_load_balancer`
+
+The default `--functional` filters include coverage-aware TCP/UDP/Mongo and
+common-harness subprocess paths. Broad filters such as `h3`, and additional
+legacy functional filters, can still select tests that under-report
+child-process coverage until their local `kill()` cleanup paths are migrated to
+the shared coverage-aware shutdown helper.
 
 ## Lowest-Covered Modules
 

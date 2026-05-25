@@ -12,6 +12,7 @@
 #   scripts/coverage.sh --open             # also open the HTML report
 #   scripts/coverage.sh --functional       # also run curated functional gap tests
 #   scripts/coverage.sh --functional-filter functional_udp_proxy
+#                                          # run only specified filter(s), replacing defaults
 #   scripts/coverage.sh -- plugins::cors   # narrow by test filter
 #
 # Install (one-time):
@@ -105,6 +106,8 @@ run_coverage_target --test integration_tests
 
 if "${include_functional}"; then
   echo "Building instrumented ferrum-edge binary for functional subprocess coverage..."
+  # Force cargo to build the instrumented binary into target/llvm-cov-target/;
+  # "version" is a cheap invocation that exits before the functional filters run.
   cargo llvm-cov run --no-report --bin ferrum-edge -- version
   if [ ! -x "${instrumented_gateway_bin}" ]; then
     echo "Instrumented gateway binary not found: ${instrumented_gateway_bin}" >&2
@@ -112,6 +115,9 @@ if "${include_functional}"; then
   fi
 
   if [ "${#functional_filters[@]}" -eq 0 ]; then
+    # The default list prioritizes top gaps and includes the coverage-aware
+    # TCP/UDP/Mongo/common-harness subprocess paths. Broad or custom filters can
+    # still select legacy direct-kill tests that under-report child coverage.
     functional_filters=(
       functional_admin
       functional_database

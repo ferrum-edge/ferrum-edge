@@ -184,12 +184,7 @@ impl TestGateway {
     /// no-ops. Drop also cleans up the child if this was not called.
     pub fn shutdown(&mut self) {
         if let Some(mut child) = self.child.take() {
-            if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-                terminate_child_for_coverage(&mut child, Duration::from_secs(8));
-            } else {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            shutdown_gateway_child(&mut child);
         }
     }
 
@@ -254,6 +249,27 @@ impl Drop for TestGateway {
     }
 }
 
+pub fn shutdown_gateway_child(child: &mut Child) {
+    if coverage_profiles_enabled() {
+        terminate_child_for_coverage(child, Duration::from_secs(15));
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+pub fn configure_coverage_gateway_command(cmd: &mut Command) {
+    if coverage_profiles_enabled() {
+        // Keep SIGTERM teardown inside the coverage helper's grace period; the
+        // gateway still runs its fixed cleanup step before LLVM profiles flush.
+        cmd.env("FERRUM_SHUTDOWN_DRAIN_SECONDS", "0");
+    }
+}
+
+fn coverage_profiles_enabled() -> bool {
+    std::env::var_os("LLVM_PROFILE_FILE").is_some()
+}
+
 fn terminate_child_for_coverage(child: &mut Child, timeout: Duration) {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
@@ -279,7 +295,7 @@ fn terminate_child_for_coverage(child: &mut Child, timeout: Duration) {
         match child.try_wait() {
             Ok(Some(_)) => return,
             Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(_) => return,
+            Err(_) => break,
         }
     }
 
@@ -795,6 +811,7 @@ const SCRUB_DEFAULTS: &[&str] = &[
     "FERRUM_ADMIN_JWT_SECRET",
     "FERRUM_ADMIN_JWT_ISSUER",
     "FERRUM_CP_DP_GRPC_JWT_SECRET",
+    "FERRUM_SHUTDOWN_DRAIN_SECONDS",
 ];
 
 /// Build the subprocess env map from the builder's mode + tuning knobs.
@@ -817,6 +834,9 @@ async fn build_env(
     // Tests don't need the 5s warmup stall; pool warmup failures are
     // non-fatal but noisy in test logs.
     env.insert("FERRUM_POOL_WARMUP_ENABLED".into(), "false".into());
+    if coverage_profiles_enabled() {
+        env.insert("FERRUM_SHUTDOWN_DRAIN_SECONDS".into(), "0".into());
+    }
     env.insert(
         "FERRUM_BASIC_AUTH_HMAC_SECRET".into(),
         b.basic_auth_hmac_secret.clone(),
@@ -1079,7 +1099,7 @@ fn preserve_base_env(cmd: &mut Command) {
     }
 }
 
-fn explicit_test_binary() -> Option<PathBuf> {
+pub fn explicit_test_binary() -> Option<PathBuf> {
     for key in ["FERRUM_EDGE_TEST_BIN", "CARGO_BIN_EXE_ferrum-edge"] {
         if let Some(path) = std::env::var_os(key).map(PathBuf::from)
             && path.exists()

@@ -12,8 +12,10 @@
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_tcp_proxy --ignored --nocapture
 
+use crate::common::{
+    configure_coverage_gateway_command, explicit_test_binary, shutdown_gateway_child,
+};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -184,11 +186,8 @@ async fn start_tls_echo_server_on(listener: TcpListener) -> tokio::task::JoinHan
 // ============================================================================
 
 fn gateway_binary_path() -> String {
-    if let Ok(path) = std::env::var("FERRUM_EDGE_TEST_BIN") {
-        return path;
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_ferrum-edge") {
-        return path;
+    if let Some(path) = explicit_test_binary() {
+        return path.to_string_lossy().into_owned();
     }
     if std::path::Path::new("./target/debug/ferrum-edge").exists() {
         "./target/debug/ferrum-edge".to_string()
@@ -198,23 +197,7 @@ fn gateway_binary_path() -> String {
 }
 
 fn shutdown_gateway(gateway: &mut std::process::Child) {
-    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        #[cfg(unix)]
-        {
-            let _ = unsafe { libc::kill(gateway.id() as libc::pid_t, libc::SIGTERM) };
-            let deadline = std::time::Instant::now() + Duration::from_secs(8);
-            while std::time::Instant::now() < deadline {
-                match gateway.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => thread::sleep(Duration::from_millis(50)),
-                    Err(_) => return,
-                }
-            }
-        }
-    }
-
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway_child(gateway);
 }
 
 fn start_gateway_with_extra_env(
@@ -235,6 +218,7 @@ fn start_gateway_with_extra_env(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    configure_coverage_gateway_command(&mut cmd);
 
     if let Some(cert) = tls_cert_path {
         cmd.env("FERRUM_FRONTEND_TLS_CERT_PATH", cert);
