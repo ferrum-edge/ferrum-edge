@@ -308,10 +308,43 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  build-functional-tests-archive:
+    name: Build Functional Tests Archive
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-test-functional"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@213ccc1a076163c093f914550b94feb90fab916d # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Build functional tests archive
+        # `cargo nextest archive` compiles the test binary once and packages
+        # it with the metadata nextest needs to enumerate and filter tests
+        # without re-invoking cargo in every matrix shard.
+        run: |
+          cargo nextest archive \
+            --test functional_tests \
+            --archive-file functional-tests.tar.zst
+
+      - name: Upload functional tests archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: functional-tests-archive
+          path: functional-tests.tar.zst
+          retention-days: 1
+          if-no-files-found: error
+
   test-functional:
     name: Functional Tests (${{ matrix.shard }})
     if: github.event_name == 'pull_request'
-    needs: build-gateway-binary
+    needs: [build-gateway-binary, build-functional-tests-archive]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -471,12 +504,22 @@ jobs:
         # actions/download-artifact does not preserve the executable bit.
         run: chmod +x target/debug/ferrum-edge
 
+      - name: Download functional tests archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: functional-tests-archive
+          path: .
+
       - name: Run functional test shard
         # ── Single nextest invocation per shard ───────────────────────────
         # The old loop ran `cargo test` once per filter line, paying cargo's
         # fingerprint-check + libtest startup (~3–5s) every iteration. With
         # 7–13 filters per shard that was 30–60s of pure overhead. Here we
         # collect the filters into an argv array and let nextest OR them.
+        #
+        # `--archive-file` skips per-shard recompiles. `--workspace-remap .`
+        # rewrites the archive's compile-time workspace path to this runner's
+        # checkout so runtime fixtures under tests/ keep resolving correctly.
         #
         # `--run-ignored=all` mirrors libtest's `--include-ignored` so the
         # non-ignored harness unit tests bundled into the functional_tests
@@ -504,7 +547,9 @@ jobs:
           if [ -n "${NEXTEST_JOBS:-}" ]; then
             nextest_args+=("-j" "$NEXTEST_JOBS")
           fi
-          cargo nextest run --test functional_tests \
+          cargo nextest run \
+            --archive-file functional-tests.tar.zst \
+            --workspace-remap . \
             --run-ignored=all \
             --no-fail-fast \
             -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)' \
