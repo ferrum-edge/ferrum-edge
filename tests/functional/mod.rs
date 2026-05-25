@@ -73,6 +73,7 @@ mod functional_streaming_request_body_limits_test;
 mod functional_streaming_response_body_limits_test;
 mod functional_tcp_idle_timeout_env_test;
 mod functional_tcp_proxy_test;
+mod functional_tcp_splice_backend_timeout_test;
 mod functional_tls_lifecycle_test;
 mod functional_tls_only_test;
 mod functional_udp_proxy_test;

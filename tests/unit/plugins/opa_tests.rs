@@ -219,6 +219,101 @@ async fn opa_allows_boolean_true_result() {
 }
 
 #[tokio::test]
+async fn opa_rejects_duplicate_query_parameter_keys() {
+    let server = MockServer::start().await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("action=delete&action=view".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_reject(result, Some(403));
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock request history should be available");
+    assert!(
+        requests.is_empty(),
+        "OPA should not be called when duplicate query keys are present"
+    );
+}
+
+#[tokio::test]
+async fn opa_allows_identical_value_duplicate_query_keys() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("a=1&a=1".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn opa_rejects_percent_encoded_key_collision() {
+    let server = MockServer::start().await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("a%20b=1&a%20b=2".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn opa_rejects_conflicting_keys_without_equals() {
+    let server = MockServer::start().await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("flag&flag=1".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn opa_rejects_conflicting_duplicate_with_empty_pairs() {
+    let server = MockServer::start().await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("a=1&&a=2".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn opa_allows_duplicate_query_keys_when_rejection_disabled() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({"reject_duplicate_query_keys": false}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("action=delete&action=view".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn opa_allows_duplicate_query_keys_when_include_query_disabled() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({"include_query": false}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("action=delete&action=view".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_continue(result);
+}
+
+#[tokio::test]
 async fn opa_allows_nested_pointer_result() {
     let server = MockServer::start().await;
     mount_opa(

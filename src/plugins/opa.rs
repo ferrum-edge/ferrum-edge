@@ -49,6 +49,7 @@ pub struct Opa {
     include_consumer: bool,
     include_client_ip: bool,
     include_service: bool,
+    reject_duplicate_query_keys: bool,
     redact_headers: HashSet<String>,
 }
 
@@ -107,6 +108,11 @@ impl Opa {
             include_consumer: parse_optional_bool(object, "include_consumer")?.unwrap_or(true),
             include_client_ip: parse_optional_bool(object, "include_client_ip")?.unwrap_or(true),
             include_service: parse_optional_bool(object, "include_service")?.unwrap_or(true),
+            reject_duplicate_query_keys: parse_optional_bool(
+                object,
+                "reject_duplicate_query_keys",
+            )?
+            .unwrap_or(true),
             redact_headers,
         })
     }
@@ -319,6 +325,20 @@ impl Plugin for Opa {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        if self.include_query
+            && self.reject_duplicate_query_keys
+            && ctx
+                .raw_query_string()
+                .is_some_and(super::utils::query::has_conflicting_duplicate_query_key)
+        {
+            warn!(
+                plugin = "opa",
+                reason = "duplicate_query_parameters",
+                "Rejecting request with duplicate query parameter keys to avoid OPA/backend authorization mismatch"
+            );
+            return self.reject_policy_denial();
+        }
+
         let payload = json!({ "input": self.build_input(ctx) });
         let mut request = self
             .http_client
@@ -367,6 +387,10 @@ impl Plugin for Opa {
 
     fn needs_request_body_bytes(&self) -> bool {
         self.include_body
+    }
+
+    fn requires_decoded_query_params(&self) -> bool {
+        self.include_query
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
