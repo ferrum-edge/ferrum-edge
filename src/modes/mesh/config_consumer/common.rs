@@ -3,7 +3,7 @@ use std::time::Duration;
 use ring::rand::SecureRandom;
 use tonic::transport::{Certificate, Identity};
 
-use crate::grpc::dp_client::DpGrpcTlsConfig;
+use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, build_dp_grpc_tls_config};
 
 pub const BACKOFF_INITIAL_SECS: u64 = 1;
 pub const BACKOFF_MAX_SECS: u64 = 30;
@@ -74,6 +74,52 @@ pub async fn wait_for_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bo
     while !*shutdown_rx.borrow() {
         if shutdown_rx.changed().await.is_err() {
             return;
+        }
+    }
+}
+
+pub async fn wait_optional_tls_reload(mut revision_rx: Option<tokio::sync::watch::Receiver<u64>>) {
+    let changed = if let Some(revision_rx) = revision_rx.as_mut() {
+        revision_rx.changed().await.is_ok()
+    } else {
+        false
+    };
+    if !changed {
+        std::future::pending::<()>().await;
+    }
+}
+
+pub fn refresh_dp_grpc_tls_config_if_changed(
+    tls_config: &mut Option<DpGrpcTlsConfig>,
+    tls_reload: Option<&DpGrpcTlsReload>,
+    cp_urls: &[String],
+    last_tls_revision: &mut u64,
+) {
+    let Some(reload) = tls_reload else {
+        return;
+    };
+    let revision = *reload.revision_rx.borrow();
+    if revision == *last_tls_revision {
+        return;
+    }
+
+    *last_tls_revision = revision;
+    match build_dp_grpc_tls_config(&reload.env_config, cp_urls, reload.label) {
+        Ok(next_config) => {
+            *tls_config = next_config;
+            tracing::info!(
+                revision,
+                "{} gRPC TLS material reloaded; reconnecting mesh config stream with rotated material",
+                reload.label
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                revision,
+                error = %error,
+                "{} gRPC TLS source revision changed but rebuild failed; keeping previous mesh client TLS material",
+                reload.label
+            );
         }
     }
 }

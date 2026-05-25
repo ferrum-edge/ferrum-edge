@@ -1,5 +1,4 @@
 use dashmap::DashMap;
-use std::fs;
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -7,8 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use reqwest::ClientBuilder;
-use rustls::client::WebPkiServerVerifier;
+#[cfg(feature = "pkcs11")]
+use rustls::client::ResolvesClientCert;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::{WantsClientCert, WebPkiServerVerifier};
 use rustls::pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
 };
@@ -17,6 +18,9 @@ use thiserror::Error;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
 use crate::config::types::{BackendTlsConfig, Proxy, validate_backend_tls_san_allow_list_entry};
+use crate::tls::source::{
+    CertSource, CertSourceUri, MaterialError, MaterialKind, SourceScheme, load_material_blocking,
+};
 use crate::tls::{
     NoVerifier, TlsPolicy, backend_client_config_builder, build_server_verifier_with_crls,
 };
@@ -79,6 +83,10 @@ impl BackendTlsConfigCache {
     pub fn drain_svid_generation(&self, generation: u64) {
         let matcher = SvidGenerationMatcher::new(generation);
         self.configs.retain(|key, _| !matcher.matches(key));
+    }
+
+    pub fn clear(&self) {
+        self.configs.clear();
     }
 
     /// Build or retrieve a cached `ClientConfig` for `key`. Callers MUST have
@@ -223,6 +231,21 @@ pub fn append_optional_pool_key_component(buf: &mut String, component: Option<&s
     }
 }
 
+fn append_optional_tls_source_pool_key_component(
+    buf: &mut String,
+    component: Option<&str>,
+    kind: MaterialKind,
+) {
+    if let Some(component) = component {
+        if component.starts_with("-----BEGIN ") {
+            let source = CertSource::parse(component, kind);
+            append_pool_key_component(buf, &source.pool_key_component());
+        } else {
+            append_pool_key_component(buf, component);
+        }
+    }
+}
+
 /// Append the backend TLS identity fields that partition runtime client caches.
 ///
 /// Keep this in one place so HTTP, H2, H3, gRPC, and backend capability probes
@@ -245,11 +268,15 @@ pub fn append_backend_tls_pool_key_fields(
         BackendTlsConfig::compute_san_digest(&tls.san_allow_list),
         "BackendTlsConfig.san_allow_list_key_digest is stale; call recompute_san_digest() after mutating san_allow_list"
     );
-    append_optional_pool_key_component(buf, tls.server_ca_cert_path.as_deref());
+    append_optional_tls_source_pool_key_component(
+        buf,
+        tls.server_ca_cert_path.as_deref(),
+        MaterialKind::CaBundle,
+    );
     buf.push('|');
-    append_optional_pool_key_component(buf, client_cert_path);
+    append_optional_tls_source_pool_key_component(buf, client_cert_path, MaterialKind::Cert);
     buf.push('|');
-    append_optional_pool_key_component(buf, client_key_path);
+    append_optional_tls_source_pool_key_component(buf, client_key_path, MaterialKind::Key);
     buf.push('|');
     append_optional_pool_key_component(buf, tls.sni.as_deref());
     buf.push('|');
@@ -522,7 +549,7 @@ pub fn build_root_cert_store(
     };
 
     if let Some(ca_path) = ca_path {
-        let certs = load_cert_chain(ca_path, "backend CA bundle")?;
+        let certs = load_cert_chain(ca_path, MaterialKind::CaBundle, "backend CA bundle")?;
         let (added, ignored) = root_store.add_parsable_certificates(certs);
         if added == 0 {
             return Err(TlsError::Rustls(format!(
@@ -550,6 +577,16 @@ pub struct BackendTlsConfigBuilder<'a> {
     pub global_client_cert: Option<&'a Path>,
     pub global_client_key: Option<&'a Path>,
     pub crls: &'a [CertificateRevocationListDer<'static>],
+}
+
+enum BackendClientAuth {
+    None,
+    Materialized {
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    },
+    #[cfg(feature = "pkcs11")]
+    Resolver(Arc<dyn ResolvesClientCert>),
 }
 
 impl<'a> BackendTlsConfigBuilder<'a> {
@@ -609,44 +646,19 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             let dangerous = builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier));
-            match client_auth {
-                Some((certs, key)) => dangerous.with_client_auth_cert(certs, key).map_err(|e| {
-                    TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))
-                }),
-                None => Ok(dangerous.with_no_client_auth()),
-            }
+            finish_client_config_with_auth(dangerous, client_auth)
         } else {
             let verifier = self.build_server_verifier()?;
             match verifier {
                 BackendServerVerifier::WebPki(verifier) => {
                     let builder = builder.with_webpki_verifier(verifier);
-                    match client_auth {
-                        Some((certs, key)) => {
-                            builder.with_client_auth_cert(certs, key).map_err(|e| {
-                                TlsError::Rustls(format!(
-                                    "Invalid client certificate/key pair: {}",
-                                    e
-                                ))
-                            })
-                        }
-                        None => Ok(builder.with_no_client_auth()),
-                    }
+                    finish_client_config_with_auth(builder, client_auth)
                 }
                 BackendServerVerifier::SanAllowList(verifier) => {
                     let dangerous = builder
                         .dangerous()
                         .with_custom_certificate_verifier(verifier);
-                    match client_auth {
-                        Some((certs, key)) => {
-                            dangerous.with_client_auth_cert(certs, key).map_err(|e| {
-                                TlsError::Rustls(format!(
-                                    "Invalid client certificate/key pair: {}",
-                                    e
-                                ))
-                            })
-                        }
-                        None => Ok(dangerous.with_no_client_auth()),
-                    }
+                    finish_client_config_with_auth(dangerous, client_auth)
                 }
             }
         }?;
@@ -693,9 +705,7 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             .or(self.global_ca)
     }
 
-    fn load_client_auth(
-        &self,
-    ) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>, TlsError> {
+    fn load_client_auth(&self) -> Result<BackendClientAuth, TlsError> {
         let cert_path = self
             .proxy
             .resolved_tls
@@ -722,37 +732,92 @@ impl<'a> BackendTlsConfigBuilder<'a> {
                 path: key_path.to_path_buf(),
                 details: "the certificate is missing".to_string(),
             }),
-            (None, None) => Ok(None),
+            (None, None) => Ok(BackendClientAuth::None),
             (Some(cert_path), Some(key_path)) => {
-                let certs = load_cert_chain(cert_path, "backend TLS client certificate")?;
+                let certs = load_cert_chain(
+                    cert_path,
+                    MaterialKind::Cert,
+                    "backend TLS client certificate",
+                )?;
+                if let Some(uri) = pkcs11_key_uri_from_path(key_path) {
+                    return pkcs11_backend_client_auth(certs, &uri);
+                }
                 let key = load_private_key(key_path, "backend TLS client private key")?;
-                Ok(Some((certs, key)))
+                Ok(BackendClientAuth::Materialized { certs, key })
             }
         }
     }
 }
 
+fn finish_client_config_with_auth(
+    builder: rustls::ConfigBuilder<ClientConfig, WantsClientCert>,
+    client_auth: BackendClientAuth,
+) -> Result<ClientConfig, TlsError> {
+    match client_auth {
+        BackendClientAuth::None => Ok(builder.with_no_client_auth()),
+        BackendClientAuth::Materialized { certs, key } => builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))),
+        #[cfg(feature = "pkcs11")]
+        BackendClientAuth::Resolver(resolver) => Ok(builder.with_client_cert_resolver(resolver)),
+    }
+}
+
+fn pkcs11_key_uri_from_path(path: &Path) -> Option<CertSourceUri> {
+    match CertSource::parse(path.to_string_lossy().into_owned(), MaterialKind::Key) {
+        CertSource::Uri(uri) if uri.scheme == SourceScheme::Pkcs11 => Some(uri),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "pkcs11")]
+fn pkcs11_backend_client_auth(
+    certs: Vec<CertificateDer<'static>>,
+    uri: &CertSourceUri,
+) -> Result<BackendClientAuth, TlsError> {
+    let certified_key =
+        crate::tls::pkcs11::certified_key_from_uri(certs, uri).map_err(|error| {
+            TlsError::Rustls(format!(
+                "Failed to configure PKCS#11 backend TLS client key {}: {}",
+                uri.source_id(),
+                error
+            ))
+        })?;
+    Ok(BackendClientAuth::Resolver(Arc::new(
+        rustls::sign::SingleCertAndKey::from(certified_key),
+    )))
+}
+
+#[cfg(not(feature = "pkcs11"))]
+fn pkcs11_backend_client_auth(
+    _certs: Vec<CertificateDer<'static>>,
+    uri: &CertSourceUri,
+) -> Result<BackendClientAuth, TlsError> {
+    Err(TlsError::Rustls(format!(
+        "PKCS#11 backend TLS client key source {} requires building ferrum-edge with the 'pkcs11' Cargo feature",
+        uri.source_id()
+    )))
+}
+
 fn load_cert_chain(
     path: &Path,
+    material_kind: MaterialKind,
     kind: &'static str,
 ) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let pem = fs::read(path).map_err(|source| TlsError::Io {
-        kind,
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let certs = rustls_pemfile::certs(&mut Cursor::new(pem))
+    let material = load_backend_material(path, material_kind, kind)?;
+    let source_id = material.source_id.clone();
+    let certs = rustls_pemfile::certs(&mut Cursor::new(material.bytes.expose_secret()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TlsError::Pem {
             kind,
-            path: path.to_path_buf(),
+            path: PathBuf::from(&source_id),
             details: format!("PEM certificates: {}", e),
         })?;
 
     if certs.is_empty() {
         return Err(TlsError::Pem {
             kind,
-            path: path.to_path_buf(),
+            path: PathBuf::from(source_id),
             details: "no PEM certificates found".to_string(),
         });
     }
@@ -761,27 +826,45 @@ fn load_cert_chain(
 }
 
 fn load_private_key(path: &Path, kind: &'static str) -> Result<PrivateKeyDer<'static>, TlsError> {
-    let pem = fs::read(path).map_err(|source| TlsError::Io {
-        kind,
-        path: path.to_path_buf(),
-        source,
-    })?;
-    rustls_pemfile::private_key(&mut Cursor::new(pem))
+    let material = load_backend_material(path, MaterialKind::Key, kind)?;
+    let source_id = material.source_id.clone();
+    rustls_pemfile::private_key(&mut Cursor::new(material.bytes.expose_secret()))
         .map_err(|e| TlsError::Pem {
             kind,
-            path: path.to_path_buf(),
+            path: PathBuf::from(&source_id),
             details: format!("PEM private key: {}", e),
         })?
         .ok_or_else(|| TlsError::Pem {
             kind,
-            path: path.to_path_buf(),
+            path: PathBuf::from(source_id),
             details: "no private key found".to_string(),
         })
+}
+
+fn load_backend_material(
+    path: &Path,
+    material_kind: MaterialKind,
+    kind: &'static str,
+) -> Result<crate::tls::source::MaterializedMaterial, TlsError> {
+    let raw_source = path.to_string_lossy().into_owned();
+    let source = CertSource::parse(raw_source, material_kind);
+    load_material_blocking(&source, material_kind).map_err(|err| match err {
+        MaterialError::Io { source_id, source } => TlsError::Io {
+            kind,
+            path: PathBuf::from(source_id),
+            source,
+        },
+        other => TlsError::Rustls(format!(
+            "Failed to load {kind} from {}: {other}",
+            source.source_id()
+        )),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Once};
@@ -1192,6 +1275,32 @@ mod tests {
     }
 
     #[test]
+    fn backend_tls_pool_key_fields_hash_inline_material() {
+        let inline_ca = "-----BEGIN CERTIFICATE-----\nsecret-ca\n-----END CERTIFICATE-----\n";
+        let inline_cert = "-----BEGIN CERTIFICATE-----\nsecret-client\n-----END CERTIFICATE-----\n";
+        let inline_key = "-----BEGIN PRIVATE KEY-----\nsecret-key\n-----END PRIVATE KEY-----\n";
+        let mut tls = BackendTlsConfig {
+            server_ca_cert_path: Some(inline_ca.to_string()),
+            ..Default::default()
+        };
+        tls.recompute_san_digest();
+
+        let mut key = String::from("backend|443|");
+        append_backend_tls_pool_key_fields(
+            &mut key,
+            &tls,
+            Some(inline_cert),
+            Some(inline_key),
+            true,
+            None,
+        );
+
+        assert!(key.contains("inline-pem:sha256:"), "{key}");
+        assert!(!key.contains("BEGIN"), "{key}");
+        assert!(!key.contains("secret"), "{key}");
+    }
+
+    #[test]
     fn build_root_cert_store_prefers_proxy_ca_exclusively() {
         let dir = TempDir::new().unwrap();
         let proxy_ca = generate_ca("Proxy CA");
@@ -1422,6 +1531,30 @@ mod tests {
             .build_rustls()
             .unwrap_err();
         assert!(matches!(err, TlsError::Io { .. }));
+    }
+
+    #[cfg(not(feature = "pkcs11"))]
+    #[test]
+    fn build_rustls_rejects_pkcs11_client_key_without_feature() {
+        ensure_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        let ca = generate_ca("Client CA");
+        let client = generate_signed_cert(&ca, "client", &["localhost"]);
+        let cert_path = write_file(&dir, "client.crt", &client.cert_pem);
+
+        let mut proxy = test_proxy();
+        proxy.resolved_tls.client_cert_path = Some(cert_path.display().to_string());
+        proxy.resolved_tls.client_key_path =
+            Some("pkcs11://edge-rsa?module=/usr/lib/pkcs11.so".to_string());
+        proxy.resolved_tls.verify_server_cert = false;
+
+        let err = builder_for(&proxy, None, false, None, None, &[])
+            .build_rustls()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, TlsError::Rustls(message) if message.contains("'pkcs11' Cargo feature"))
+        );
     }
 
     #[test]

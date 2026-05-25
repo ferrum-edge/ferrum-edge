@@ -47,6 +47,7 @@ use tracing::{debug, warn};
 use url::{Host, Url};
 
 use crate::consumer_index::ConsumerIndex;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
@@ -640,13 +641,15 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
         ));
     };
 
-    let ca_data = std::fs::read(ca_path)
-        .map_err(|e| format!("ldap_auth: failed to read CA bundle '{}': {e}", ca_path))?;
+    let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+    let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
+        .map_err(|e| format!("ldap_auth: failed to load CA bundle: {e}"))?;
+    let source_id = ca_material.source_id.clone();
 
     // Parse only X.509 entries; tolerate other PEM blocks (private keys, etc.)
     // by ignoring them, but log them so operators can spot malformed bundles.
     let mut certs: Vec<CertificateDer<'static>> = Vec::new();
-    let mut reader = &ca_data[..];
+    let mut reader = ca_material.bytes.expose_secret();
     for item in std::iter::from_fn(move || rustls_pemfile::read_one(&mut reader).transpose()) {
         match item {
             Ok(rustls_pemfile::Item::X509Certificate(cert_der)) => {
@@ -656,7 +659,7 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
             Err(e) => {
                 warn!(
                     "ldap_auth: skipping malformed PEM item in '{}': {e}",
-                    ca_path
+                    source_id
                 );
             }
         }
@@ -669,18 +672,18 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
     if added == 0 {
         return Err(format!(
             "ldap_auth: no valid CA certificates found in '{}'",
-            ca_path
+            source_id
         ));
     }
     if ignored > 0 {
         warn!(
             "ldap_auth: ignored {} invalid CA certificate(s) while loading '{}'",
-            ignored, ca_path
+            ignored, source_id
         );
     }
     debug!(
         "ldap_auth: loaded {} CA certificate(s) from '{}' (CA exclusivity enforced)",
-        added, ca_path
+        added, source_id
     );
     Ok(root_store)
 }

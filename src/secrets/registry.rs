@@ -450,6 +450,57 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
     }))
 }
 
+/// Resolve a direct provider reference such as a `vault://...` or `aws://...`
+/// TLS material URI.
+///
+/// Unlike [`resolve_secret`], this does not inspect environment variables for
+/// suffixed variants; the caller has already selected the provider and passed
+/// its backend-specific reference. The same backend clients, timeouts, and
+/// feature gates are used so typed TLS source URIs do not duplicate provider
+/// setup logic.
+pub async fn resolve_external_reference(
+    provider: &str,
+    reference: &str,
+    key: &str,
+) -> Result<ResolvedSecret, String> {
+    if let Some(display_name) = unsupported_provider_name(provider) {
+        return Err(format!(
+            "{} support is not enabled in this build",
+            display_name
+        ));
+    }
+
+    let Some(backend) = suffix_backends()
+        .into_iter()
+        .find(|backend| backend.name() == provider)
+    else {
+        return Err(format!("Unsupported secret provider scheme '{}'", provider));
+    };
+
+    let value = tokio::time::timeout(secret_fetch_timeout(), backend.resolve_one(reference, key))
+        .await
+        .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))??;
+
+    if backend.log_loaded() {
+        info!("Loaded {} from {}", key, backend.display_name());
+    }
+
+    Ok(ResolvedSecret {
+        value,
+        source: backend.source(reference),
+    })
+}
+
+fn unsupported_provider_name(provider: &str) -> Option<&'static str> {
+    match provider {
+        "vault" if !cfg!(feature = "secrets-vault") => Some("Vault"),
+        "aws" if !cfg!(feature = "secrets-aws") => Some("AWS Secrets Manager"),
+        "gcp" if !cfg!(feature = "secrets-gcp") => Some("GCP Secret Manager"),
+        "azure" if !cfg!(feature = "secrets-azure") => Some("Azure Key Vault"),
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl SecretBackend for DirectEnvBackend {
     fn kind(&self) -> BackendKind {

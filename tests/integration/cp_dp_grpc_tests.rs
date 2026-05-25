@@ -811,6 +811,7 @@ async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
         state.clone(),
         shutdown_rx,
         None,
+        None,
     ));
 
     timeout(Duration::from_secs(5), state.wait_for_first_slice())
@@ -1552,6 +1553,7 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
             vec![url_clone],
             test_secret(),
             ps,
+            None,
             None,
             None,
             None,

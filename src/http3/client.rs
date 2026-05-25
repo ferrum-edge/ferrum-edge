@@ -836,6 +836,10 @@ impl Http3ConnectionPool {
         self.pool.invalidate_matching(|key| matcher.matches(key));
     }
 
+    pub fn force_drain_all(&self) {
+        self.pool.clear();
+    }
+
     fn current_svid_generation(&self) -> u64 {
         self.backend_svid_generation.load(Ordering::Acquire)
     }

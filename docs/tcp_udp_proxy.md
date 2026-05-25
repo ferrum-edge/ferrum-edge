@@ -214,6 +214,8 @@ FERRUM_DTLS_CERT_PATH=/path/to/dtls-cert.pem
 FERRUM_DTLS_KEY_PATH=/path/to/dtls-key.pem
 ```
 
+With `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, file/provider/Kubernetes/managed-backed DTLS cert, key, client-CA, and CRL sources are watched and swapped for new DTLS sessions without rebinding the UDP listener.
+
 **Important:** DTLS requires ECDSA P-256 or P-384 certificates. RSA and Ed25519 keys are not supported by the underlying `dimpl` library.
 
 ### Backend DTLS Origination (UDP)
@@ -422,6 +424,7 @@ Notes:
 | `FERRUM_DTLS_CERT_PATH` | (none) | PEM certificate for frontend DTLS termination (ECDSA P-256 or P-384) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` used for TCP. |
+| `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` | `false` | Enables live reload for frontend TCP TLS, admin TLS, and frontend DTLS source changes |
 | `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `10` | Seconds allowed for frontend TCP+TLS and UDP+DTLS handshakes. `0` disables; use only when an upstream load balancer enforces an equivalent pre-handshake deadline |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |

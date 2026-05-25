@@ -39,6 +39,7 @@ mod inner {
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, Proxy, Upstream,
     };
     use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
+    use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
     use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
@@ -362,7 +363,15 @@ mod inner {
             // Only set programmatic TLS if the connection string doesn't already
             // include TLS options (connection string takes precedence).
             if tls_enabled && client_options.tls.is_none() {
-                let ca = tls_ca_cert_path.map(PathBuf::from);
+                let ca = tls_ca_cert_path
+                    .map(|ca_path| {
+                        Self::materialize_tls_source_to_file(
+                            ca_path,
+                            MaterialKind::CaBundle,
+                            "ferrum-mongo-ca-",
+                        )
+                    })
+                    .transpose()?;
 
                 // MongoDB requires client cert + key in a single combined PEM file.
                 // If the user provides separate cert and key files, combine them
@@ -372,7 +381,11 @@ mod inner {
                     (Some(cert_path), Some(key_path)) => {
                         Some(Self::combine_cert_key_pem(cert_path, key_path)?)
                     }
-                    (Some(cert_path), None) => Some(PathBuf::from(cert_path)),
+                    (Some(cert_path), None) => Some(Self::materialize_tls_source_to_file(
+                        cert_path,
+                        MaterialKind::Cert,
+                        "ferrum-mongo-client-",
+                    )?),
                     _ => None,
                 };
 
@@ -383,8 +396,12 @@ mod inner {
                 client_options.tls = Some(Tls::Enabled(tls_opts));
                 info!(
                     "MongoDB TLS enabled (ca={}, client_cert={}, insecure={})",
-                    tls_ca_cert_path.unwrap_or("system-roots"),
-                    tls_client_cert_path.unwrap_or("none"),
+                    tls_ca_cert_path
+                        .map(|value| CertSource::parse(value, MaterialKind::CaBundle).source_id())
+                        .unwrap_or_else(|| "system-roots".to_string()),
+                    tls_client_cert_path
+                        .map(|value| CertSource::parse(value, MaterialKind::Cert).source_id())
+                        .unwrap_or_else(|| "none".to_string()),
                     tls_insecure
                 );
             }
@@ -411,25 +428,32 @@ mod inner {
             Ok((client, db, replica_set_configured))
         }
 
-        /// Combine separate PEM cert and key files into a single temporary file.
+        /// Combine separate PEM cert and key sources into a single temporary file.
         ///
         /// The MongoDB Rust driver requires client cert + key in a single PEM file
         /// (`TlsOptions::cert_key_file_path`). The gateway's `FERRUM_DB_TLS_*` env
-        /// vars use separate files (matching the PostgreSQL/MySQL convention).
-        /// This helper reads both files and writes a combined PEM to a securely
+        /// vars use separate sources (matching the PostgreSQL/MySQL convention).
+        /// This helper reads both sources and writes a combined PEM to a securely
         /// created temp file with restrictive permissions.
         fn combine_cert_key_pem(cert_path: &str, key_path: &str) -> Result<PathBuf, anyhow::Error> {
-            let cert_data = std::fs::read_to_string(cert_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read MongoDB client cert '{}': {}", cert_path, e)
-            })?;
-            let key_data = std::fs::read_to_string(key_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read MongoDB client key '{}': {}", key_path, e)
-            })?;
+            let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
+            let key_source = CertSource::parse(key_path, MaterialKind::Key);
+            let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert)
+                .map_err(|e| anyhow::anyhow!("Failed to load MongoDB client cert: {}", e))?;
+            let key_material = load_material_blocking(&key_source, MaterialKind::Key)
+                .map_err(|e| anyhow::anyhow!("Failed to load MongoDB client key: {}", e))?;
 
             // Write combined PEM to a securely-created temp file. `tempfile`
             // creates files with restrictive permissions and random names,
             // avoiding predictable-path and world-readable key leakage risks.
-            let combined = format!("{}\n{}", cert_data.trim(), key_data.trim());
+            let mut combined = Vec::with_capacity(
+                cert_material.bytes.expose_secret().len()
+                    + key_material.bytes.expose_secret().len()
+                    + 1,
+            );
+            combined.extend_from_slice(cert_material.bytes.expose_secret());
+            combined.extend_from_slice(b"\n");
+            combined.extend_from_slice(key_material.bytes.expose_secret());
             let temp_file = tempfile::Builder::new()
                 .prefix("ferrum-mongo-client-")
                 .suffix(".pem")
@@ -452,11 +476,51 @@ mod inner {
 
             info!(
                 "Combined MongoDB client cert ({}) + key ({}) into {}",
-                cert_path,
-                key_path,
+                cert_material.source_id,
+                key_material.source_id,
                 combined_path.display()
             );
             Ok(combined_path)
+        }
+
+        fn materialize_tls_source_to_file(
+            source_value: &str,
+            kind: MaterialKind,
+            temp_prefix: &str,
+        ) -> Result<PathBuf, anyhow::Error> {
+            let source = CertSource::parse(source_value, kind);
+            if let Some(path) = source.as_file_path() {
+                return Ok(path);
+            }
+
+            let material = load_material_blocking(&source, kind)
+                .map_err(|e| anyhow::anyhow!("Failed to load MongoDB TLS material: {}", e))?;
+            let temp_file = tempfile::Builder::new()
+                .prefix(temp_prefix)
+                .suffix(".pem")
+                .tempfile()
+                .map_err(|e| anyhow::anyhow!("Failed to create temp PEM file: {}", e))?;
+            let (_file, material_path) = temp_file.keep().map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to persist MongoDB TLS PEM '{}': {}",
+                    e.file.path().display(),
+                    e.error
+                )
+            })?;
+            std::fs::write(&material_path, material.bytes.expose_secret()).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to write MongoDB TLS PEM to '{}': {}",
+                    material_path.display(),
+                    e
+                )
+            })?;
+
+            info!(
+                "Materialized MongoDB TLS source {} into {}",
+                material.source_id,
+                material_path.display()
+            );
+            Ok(material_path)
         }
 
         /// Build `TlsOptions` from the individual components.

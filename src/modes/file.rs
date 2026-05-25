@@ -706,6 +706,8 @@ pub async fn serve(
         env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
     );
+    let acme_renewal_handle =
+        crate::modes::start_acme_renewal_scheduler(&env_config, shutdown_tx.subscribe());
 
     // Validate frontend TLS config if provided (paths, expiry, key match).
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
@@ -714,10 +716,11 @@ pub async fn serve(
     ) {
         info!("Loading TLS configuration with client certificate verification...");
         let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
-        match tls::load_tls_config_with_client_auth(
+        match tls::load_tls_config_with_client_auth_and_ocsp(
             cert_path,
             key_path,
             client_ca_bundle_path,
+            env_config.frontend_tls_ocsp_response_source.as_deref(),
             false,
             &tls_policy,
             env_config.tls_cert_expiry_warning_days,
@@ -879,10 +882,11 @@ pub async fn serve(
     ) {
         let admin_tls_policy = TlsPolicy::from_env_config(&env_config)?;
         let admin_client_ca = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        match tls::load_tls_config_with_client_auth(
+        match tls::load_tls_config_with_client_auth_and_ocsp(
             admin_cert,
             admin_key,
             admin_client_ca,
+            env_config.admin_tls_ocsp_response_source.as_deref(),
             env_config.admin_tls_no_verify,
             &admin_tls_policy,
             env_config.tls_cert_expiry_warning_days,
@@ -1136,6 +1140,9 @@ pub async fn serve(
         background_handles.push(h);
     }
     if let Some(h) = per_ip_cleanup_handle {
+        background_handles.push(h);
+    }
+    if let Some(h) = acme_renewal_handle {
         background_handles.push(h);
     }
     // Active-health-check probes and the passive recovery timer race

@@ -47,6 +47,7 @@ use tokio::sync::Mutex;
 use url::{Host, Url};
 
 use crate::dns::DnsCacheResolver;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
@@ -179,19 +180,25 @@ impl SpecExpose {
 
         // Load custom CA bundle when not skipping verification.
         if !tls_no_verify && let Some(ca_path) = plugin_http_client.tls_ca_bundle_path() {
-            match std::fs::read(ca_path) {
-                Ok(ca_pem) => match reqwest::Certificate::from_pem(&ca_pem) {
-                    Ok(cert) => {
-                        // reqwest 0.13: `tls_certs_only` replaces the trust
-                        // store entirely (CA exclusivity).
-                        builder = builder.tls_certs_only([cert]);
+            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+            match load_material_blocking(&source, MaterialKind::CaBundle) {
+                Ok(ca_material) => {
+                    match reqwest::Certificate::from_pem(ca_material.bytes.expose_secret()) {
+                        Ok(cert) => {
+                            // reqwest 0.13: `tls_certs_only` replaces the trust
+                            // store entirely (CA exclusivity).
+                            builder = builder.tls_certs_only([cert]);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "spec_expose: failed to parse CA bundle at {}: {e}",
+                                ca_material.source_id
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("spec_expose: failed to parse CA bundle at {ca_path}: {e}");
-                    }
-                },
+                }
                 Err(e) => {
-                    tracing::warn!("spec_expose: failed to read CA bundle at {ca_path}: {e}");
+                    tracing::warn!("spec_expose: failed to load CA bundle: {e}");
                 }
             }
         }

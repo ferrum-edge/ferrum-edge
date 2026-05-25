@@ -40,6 +40,7 @@
 //! periodically pings Redis to detect recovery.
 
 use crate::dns::DnsCache;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -353,15 +354,17 @@ impl RedisRateLimitClient {
         tls_ca_bundle_path: Option<&str>,
     ) -> Self {
         let tls_ca_bundle_pem = if !tls_no_verify {
-            tls_ca_bundle_path.and_then(|path| match std::fs::read(path) {
-                Ok(pem) => Some(pem),
-                Err(e) => {
-                    warn!(
-                        path = %path,
-                        error = %e,
-                        "Failed to read CA bundle for Redis TLS — using system root CAs"
-                    );
-                    None
+            tls_ca_bundle_path.and_then(|path| {
+                let source = CertSource::parse(path, MaterialKind::CaBundle);
+                match load_material_blocking(&source, MaterialKind::CaBundle) {
+                    Ok(material) => Some(material.bytes.expose_secret().to_vec()),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Failed to load CA bundle for Redis TLS — using system root CAs"
+                        );
+                        None
+                    }
                 }
             })
         } else {

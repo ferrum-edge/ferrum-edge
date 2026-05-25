@@ -20,7 +20,9 @@
 pub mod control_plane;
 pub mod data_plane;
 pub mod database;
+pub mod db_tls_reload;
 pub mod file;
+pub mod grpc_tls_reload;
 pub mod injector;
 pub mod mesh;
 pub mod migrate;
@@ -29,11 +31,15 @@ pub mod node_agent_cni_server;
 pub mod tls_reload;
 
 use std::sync::Arc;
+#[cfg(feature = "acme")]
+use std::time::Duration;
 
 use anyhow::Context as _;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::db_backend::DatabaseBackend;
+use crate::config::env_config::EnvConfig;
 
 /// Handle pending custom-plugin database migrations at startup for the
 /// `database` and `cp` modes.
@@ -66,6 +72,49 @@ pub(crate) async fn handle_startup_plugin_migrations(
 ) -> Result<(), anyhow::Error> {
     let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
     handle_startup_plugin_migrations_with_list(db, auto_apply, mode, &plugin_migrations).await
+}
+
+pub(crate) fn start_acme_renewal_scheduler(
+    env_config: &EnvConfig,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    if !env_config.acme_auto_renew_enabled {
+        return None;
+    }
+
+    #[cfg(not(feature = "acme"))]
+    {
+        let _ = shutdown_rx;
+        warn!(
+            "FERRUM_ACME_AUTO_RENEW_ENABLED=true but this binary was built without the 'acme' feature"
+        );
+        None
+    }
+
+    #[cfg(feature = "acme")]
+    {
+        let Some(challenge_type) = crate::tls::acme::AcmeRenewalChallengeType::parse(
+            &env_config.acme_renew_challenge_type,
+        ) else {
+            warn!(
+                value = %env_config.acme_renew_challenge_type,
+                "invalid FERRUM_ACME_RENEW_CHALLENGE_TYPE; ACME renewal scheduler disabled"
+            );
+            return None;
+        };
+        crate::tls::acme::start_renewal_scheduler(
+            crate::tls::acme::AcmeRenewalSchedulerConfig {
+                enabled: true,
+                renew_when_remaining_days: env_config.acme_renew_when_remaining_days,
+                check_interval: Duration::from_secs(env_config.acme_renew_check_interval_seconds),
+                poll_timeout: Duration::from_secs(env_config.acme_renew_poll_timeout_seconds),
+                challenge_type,
+                dns01_hook_command: env_config.acme_dns01_hook_command.clone(),
+                dns01_propagation: Duration::from_secs(env_config.acme_dns01_propagation_seconds),
+            },
+            shutdown_rx,
+        )
+    }
 }
 
 /// Internal entry point that takes the plugin-migration list as a parameter

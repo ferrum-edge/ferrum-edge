@@ -19,6 +19,13 @@ use std::env;
 #[path = "env_config_macro.rs"]
 mod env_config_macro;
 
+pub const DEFAULT_TLS_MANAGED_STORE_PATH: &str = "./ferrum-managed-tls";
+
+pub fn tls_managed_store_path_from_env() -> String {
+    crate::config::conf_file::resolve_ferrum_var("FERRUM_TLS_MANAGED_STORE_PATH")
+        .unwrap_or_else(|| DEFAULT_TLS_MANAGED_STORE_PATH.to_string())
+}
+
 /// The operating mode of the gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatingMode {
@@ -310,6 +317,45 @@ fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
     conf.get(key).map(|v| v.to_string())
 }
 
+fn resolve_tls_source_override(
+    conf: &ConfFile,
+    source_key: &str,
+    path_key: &str,
+    path_value: Option<String>,
+) -> Option<String> {
+    match resolve_var(conf, source_key) {
+        Some(source_value) => {
+            if path_value.as_ref().is_some_and(|value| !value.is_empty()) {
+                tracing::warn!(
+                    source_key,
+                    path_key,
+                    "{source_key} is set; it overrides {path_key}"
+                );
+            }
+            Some(source_value)
+        }
+        None => path_value,
+    }
+}
+
+fn resolve_tls_key_exchange_groups(
+    configured: Option<String>,
+    legacy_curves: Option<String>,
+) -> Option<String> {
+    match (configured, legacy_curves) {
+        (Some(value), Some(legacy)) => {
+            if value != legacy {
+                tracing::warn!(
+                    "FERRUM_TLS_KEY_EXCHANGE_GROUPS is set; it overrides FERRUM_TLS_CURVES"
+                );
+            }
+            Some(value)
+        }
+        (Some(value), None) => Some(value),
+        (None, legacy) => legacy,
+    }
+}
+
 /// Detect whether this process is running inside a Kubernetes pod.
 ///
 /// The Kubernetes API server injects `KUBERNETES_SERVICE_HOST` and
@@ -415,6 +461,33 @@ pub struct EnvConfig {
     /// first), but stored here for completeness alongside other FERRUM_* vars.
     #[allow(dead_code)]
     pub log_buffer_capacity: usize,
+    /// Default poll interval in seconds for external TLS material sources
+    /// (`vault://`, `aws://`, `azure://`, `gcp://`, `k8s://`, `managed://`) when a source URI does not
+    /// include its own `?poll=` option. Clamped to 1 second minimum and 24 hours
+    /// maximum.
+    pub secret_refresh_interval_seconds: u64,
+    /// Enable the ACME renewal scheduler. Requires the `acme` Cargo feature
+    /// to perform renewals; builds without that feature log a warning and do
+    /// not spawn the scheduler.
+    pub acme_auto_renew_enabled: bool,
+    /// Renew ACME-issued certificates when `not_after` is within this many
+    /// days. Default: 30.
+    pub acme_renew_when_remaining_days: u64,
+    /// ACME renewal scheduler scan interval in seconds. Default: 3600.
+    pub acme_renew_check_interval_seconds: u64,
+    /// Challenge type the scheduler prepares for automatic renewal.
+    /// Supported values: `http01`, `tls_alpn01`, `dns01`.
+    pub acme_renew_challenge_type: String,
+    /// Maximum time the scheduler waits for ACME authorization/order readiness
+    /// and certificate issuance.
+    pub acme_renew_poll_timeout_seconds: u64,
+    /// Optional DNS-01 provider hook command. The scheduler invokes it with
+    /// challenge details in environment variables before finalizing DNS-01
+    /// renewal orders.
+    pub acme_dns01_hook_command: Option<String>,
+    /// Seconds to wait after DNS-01 hook publication before marking the ACME
+    /// challenge ready.
+    pub acme_dns01_propagation_seconds: u64,
     /// When true, streaming responses are wrapped with a lightweight tracker
     /// that records the final transfer time via a deferred task. Adds one
     /// `Arc<StreamingMetrics>` + one `tokio::spawn` per streaming request.
@@ -426,12 +499,17 @@ pub struct EnvConfig {
     pub proxy_https_port: u16,
     pub frontend_tls_cert_path: Option<String>,
     pub frontend_tls_key_path: Option<String>,
-    /// Opt in to live reload of frontend TLS cert/key files for the proxy
+    /// DER OCSP response bytes, or a source URI resolving to DER bytes, to
+    /// staple on frontend proxy TLS handshakes.
+    pub frontend_tls_ocsp_response_source: Option<String>,
+    /// Opt in to live reload of frontend TLS cert/key sources for the proxy
     /// HTTPS / H2 / H3 listeners, the admin HTTPS listener, and (in mesh
     /// mode) the mesh inbound TLS listener. When `false` (the default)
-    /// cert/key paths are read once at startup and require a restart to
-    /// rotate. When `true`, a background watcher polls the configured paths
-    /// every [`frontend_tls_watch_interval_seconds`] seconds and atomically
+    /// cert/key sources are read once at startup and require a restart to
+    /// rotate. When `true`, a background watcher polls the configured sources
+    /// every [`frontend_tls_watch_interval_seconds`] seconds for file-backed
+    /// sources or [`secret_refresh_interval_seconds`] seconds for provider-
+    /// backed sources, then atomically
     /// swaps a rebuilt `rustls::ServerConfig` into the listener's
     /// `ArcSwap`-backed slot on a validated change. A rebuild that fails
     /// validation (parse / expired / not-yet-valid / key mismatch) keeps
@@ -441,11 +519,22 @@ pub struct EnvConfig {
     /// Operator-supplied per-proxy backend TLS paths and the DTLS frontend
     /// stay static under this knob.
     pub frontend_tls_live_reload_enabled: bool,
-    /// Poll interval in seconds for the frontend TLS file watcher when
+    /// Poll interval in seconds for the frontend TLS file-backed source watcher when
     /// [`frontend_tls_live_reload_enabled`] is `true`. Defaults to `30`.
     /// Ignored when live reload is disabled. Clamped to a 1-second minimum
     /// so an accidental `0` does not busy-loop the filesystem.
     pub frontend_tls_watch_interval_seconds: u64,
+    /// Enable live reload for backend TLS identity and trust sources. When
+    /// enabled, Ferrum watches global and per-proxy backend TLS cert/key/CA
+    /// sources, validates the active backend TLS configs on change, then
+    /// clears backend client pools so new backend connections rebuild with
+    /// the rotated material. Existing in-flight requests keep their current
+    /// connections.
+    pub backend_tls_live_reload_enabled: bool,
+    /// Poll interval in seconds for file-backed backend TLS source refresh.
+    /// Provider-backed sources use [`secret_refresh_interval_seconds`] unless
+    /// the URI includes its own `?poll=` override.
+    pub backend_tls_watch_interval_seconds: u64,
     /// Bind address for proxy listeners (HTTP, HTTPS, HTTP/3).
     /// Default: "0.0.0.0" (IPv4 only). Set to "::" for dual-stack IPv4+IPv6.
     /// On most operating systems, binding to "::" accepts both IPv4 and IPv6
@@ -486,6 +575,15 @@ pub struct EnvConfig {
     pub db_tls_ca_cert_path: Option<String>,
     pub db_tls_client_cert_path: Option<String>,
     pub db_tls_client_key_path: Option<String>,
+    /// Enable live reload for database TLS sources in database and CP modes.
+    /// When enabled, file/provider-backed DB CA/client cert/client key sources
+    /// are fingerprinted and the active database pool/client is reconnected
+    /// after validated byte changes. Defaults to `false`.
+    pub db_tls_live_reload_enabled: bool,
+    /// Poll interval in seconds for file-backed database TLS source refresh.
+    /// Provider-backed sources use [`secret_refresh_interval_seconds`] unless
+    /// the URI includes its own `?poll=` override.
+    pub db_tls_watch_interval_seconds: u64,
 
     // File mode
     pub file_config_path: Option<String>,
@@ -933,6 +1031,9 @@ pub struct EnvConfig {
     pub gateway_spiffe_id: Option<String>,
     /// Path to a PEM file containing trusted CA certificates for client certificate verification
     pub frontend_tls_client_ca_bundle_path: Option<String>,
+    /// DER OCSP response bytes, or a source URI resolving to DER bytes, to
+    /// staple on admin API TLS handshakes.
+    pub admin_tls_ocsp_response_source: Option<String>,
 
     /// Admin API TLS client CA bundle for mTLS verification
     pub admin_tls_client_ca_bundle_path: Option<String>,
@@ -1483,13 +1584,25 @@ impl Default for EnvConfig {
             namespace: "ferrum".into(),
             log_level: "error".into(),
             log_buffer_capacity: 128_000,
+            secret_refresh_interval_seconds:
+                crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS,
+            acme_auto_renew_enabled: false,
+            acme_renew_when_remaining_days: 30,
+            acme_renew_check_interval_seconds: 3600,
+            acme_renew_challenge_type: "http01".to_string(),
+            acme_renew_poll_timeout_seconds: 60,
+            acme_dns01_hook_command: None,
+            acme_dns01_propagation_seconds: 60,
             enable_streaming_latency_tracking: false,
             proxy_http_port: 8000,
             proxy_https_port: 8443,
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
+            frontend_tls_ocsp_response_source: None,
             frontend_tls_live_reload_enabled: false,
             frontend_tls_watch_interval_seconds: 30,
+            backend_tls_live_reload_enabled: true,
+            backend_tls_watch_interval_seconds: 30,
             proxy_bind_address: "0.0.0.0".into(),
             admin_http_port: 9000,
             admin_https_port: 9443,
@@ -1506,6 +1619,8 @@ impl Default for EnvConfig {
             db_tls_ca_cert_path: None,
             db_tls_client_cert_path: None,
             db_tls_client_key_path: None,
+            db_tls_live_reload_enabled: false,
+            db_tls_watch_interval_seconds: 30,
             file_config_path: None,
             db_config_backup_path: None,
             db_failover_urls: Vec::new(),
@@ -1621,6 +1736,7 @@ impl Default for EnvConfig {
             gateway_svid_trust_bundle_path: None,
             gateway_spiffe_id: None,
             frontend_tls_client_ca_bundle_path: None,
+            admin_tls_ocsp_response_source: None,
             admin_tls_client_ca_bundle_path: None,
             tls_no_verify: false,
             admin_read_only: false,
@@ -1767,6 +1883,14 @@ impl EnvConfig {
             namespace: String = "FERRUM_NAMESPACE" => "ferrum".to_string();
             log_level: String = "FERRUM_LOG_LEVEL" => "error".to_string();
             log_buffer_capacity: usize = "FERRUM_LOG_BUFFER_CAPACITY" => 128_000usize;
+            secret_refresh_interval_seconds: u64 = "FERRUM_SECRET_REFRESH_INTERVAL_SECONDS" => crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS, clamp(1u64, 86_400u64);
+            acme_auto_renew_enabled: bool = "FERRUM_ACME_AUTO_RENEW_ENABLED" => false;
+            acme_renew_when_remaining_days: u64 = "FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS" => 30u64, clamp(1u64, 365u64);
+            acme_renew_check_interval_seconds: u64 = "FERRUM_ACME_RENEW_CHECK_INTERVAL_SECONDS" => 3600u64, clamp(60u64, 86_400u64);
+            acme_renew_challenge_type: String = "FERRUM_ACME_RENEW_CHALLENGE_TYPE" => "http01".to_string();
+            acme_renew_poll_timeout_seconds: u64 = "FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS" => 60u64, clamp(1u64, 600u64);
+            acme_dns01_hook_command: Option<String> = "FERRUM_ACME_DNS01_HOOK_COMMAND";
+            acme_dns01_propagation_seconds: u64 = "FERRUM_ACME_DNS01_PROPAGATION_SECONDS" => 60u64, clamp(0u64, 3600u64);
             enable_streaming_latency_tracking: bool = "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING" => false;
         }
 
@@ -1779,6 +1903,8 @@ impl EnvConfig {
             frontend_tls_key_path: Option<String> = "FERRUM_FRONTEND_TLS_KEY_PATH";
             frontend_tls_live_reload_enabled: bool = "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED" => false;
             frontend_tls_watch_interval_seconds: u64 = "FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS" => 30u64, clamp(1u64, 3600u64);
+            backend_tls_live_reload_enabled: bool = "FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED" => true;
+            backend_tls_watch_interval_seconds: u64 = "FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS" => 30u64, clamp(1u64, 3600u64);
             proxy_bind_address: String = "FERRUM_PROXY_BIND_ADDRESS" => "0.0.0.0".to_string();
         }
 
@@ -1807,6 +1933,8 @@ impl EnvConfig {
             db_tls_ca_cert_path: Option<String> = "FERRUM_DB_TLS_CA_CERT_PATH";
             db_tls_client_cert_path: Option<String> = "FERRUM_DB_TLS_CLIENT_CERT_PATH";
             db_tls_client_key_path: Option<String> = "FERRUM_DB_TLS_CLIENT_KEY_PATH";
+            db_tls_live_reload_enabled: bool = "FERRUM_DB_TLS_LIVE_RELOAD_ENABLED" => false;
+            db_tls_watch_interval_seconds: u64 = "FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS" => 30u64, clamp(1u64, 3600u64);
             file_config_path: Option<String> = "FERRUM_FILE_CONFIG_PATH";
             db_config_backup_path: Option<String> = "FERRUM_DB_CONFIG_BACKUP_PATH";
             db_read_replica_url: Option<String> = "FERRUM_DB_READ_REPLICA_URL";
@@ -1974,6 +2102,8 @@ impl EnvConfig {
             gateway_svid_trust_bundle_path: Option<String> = "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH";
             gateway_spiffe_id: Option<String> = "FERRUM_GATEWAY_SPIFFE_ID";
             frontend_tls_client_ca_bundle_path: Option<String> = "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH";
+            frontend_tls_ocsp_response_source: Option<String> = "FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE";
+            admin_tls_ocsp_response_source: Option<String> = "FERRUM_ADMIN_TLS_OCSP_RESPONSE_SOURCE";
             admin_tls_client_ca_bundle_path: Option<String> = "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH";
             tls_no_verify: bool = "FERRUM_TLS_NO_VERIFY" => false;
             admin_tls_no_verify: bool = "FERRUM_ADMIN_TLS_NO_VERIFY" => false;
@@ -2020,10 +2150,13 @@ impl EnvConfig {
             tls_max_version: String = "FERRUM_TLS_MAX_VERSION" => "1.3".to_string();
             tls_cipher_suites: Option<String> = "FERRUM_TLS_CIPHER_SUITES";
             tls_prefer_server_cipher_order: bool = "FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER" => true;
-            tls_curves: Option<String> = "FERRUM_TLS_CURVES";
+            tls_key_exchange_groups: Option<String> = "FERRUM_TLS_KEY_EXCHANGE_GROUPS";
+            tls_curves_legacy: Option<String> = "FERRUM_TLS_CURVES";
             tls_session_cache_size: usize = "FERRUM_TLS_SESSION_CACHE_SIZE" => 4096usize;
             tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
         }
+        let tls_curves =
+            resolve_tls_key_exchange_groups(tls_key_exchange_groups, tls_curves_legacy);
 
         env_config! {
             conf = conf, mode = &mode;
@@ -2213,11 +2346,170 @@ impl EnvConfig {
             clamped
         };
 
+        let frontend_tls_cert_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_FRONTEND_TLS_CERT_SOURCE",
+            "FERRUM_FRONTEND_TLS_CERT_PATH",
+            frontend_tls_cert_path,
+        );
+        let frontend_tls_key_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_FRONTEND_TLS_KEY_SOURCE",
+            "FERRUM_FRONTEND_TLS_KEY_PATH",
+            frontend_tls_key_path,
+        );
+        let frontend_tls_client_ca_bundle_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_SOURCE",
+            "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH",
+            frontend_tls_client_ca_bundle_path,
+        );
+        let admin_tls_cert_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_ADMIN_TLS_CERT_SOURCE",
+            "FERRUM_ADMIN_TLS_CERT_PATH",
+            admin_tls_cert_path,
+        );
+        let admin_tls_key_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_ADMIN_TLS_KEY_SOURCE",
+            "FERRUM_ADMIN_TLS_KEY_PATH",
+            admin_tls_key_path,
+        );
+        let admin_tls_client_ca_bundle_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE",
+            "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH",
+            admin_tls_client_ca_bundle_path,
+        );
+        let db_tls_ca_cert_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_DB_TLS_CA_CERT_SOURCE",
+            "FERRUM_DB_TLS_CA_CERT_PATH",
+            db_tls_ca_cert_path,
+        );
+        let db_tls_client_cert_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_DB_TLS_CLIENT_CERT_SOURCE",
+            "FERRUM_DB_TLS_CLIENT_CERT_PATH",
+            db_tls_client_cert_path,
+        );
+        let db_tls_client_key_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_DB_TLS_CLIENT_KEY_SOURCE",
+            "FERRUM_DB_TLS_CLIENT_KEY_PATH",
+            db_tls_client_key_path,
+        );
+        let cp_grpc_tls_cert_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_CP_GRPC_TLS_CERT_SOURCE",
+            "FERRUM_CP_GRPC_TLS_CERT_PATH",
+            cp_grpc_tls_cert_path,
+        );
+        let cp_grpc_tls_key_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_CP_GRPC_TLS_KEY_SOURCE",
+            "FERRUM_CP_GRPC_TLS_KEY_PATH",
+            cp_grpc_tls_key_path,
+        );
+        let cp_grpc_tls_client_ca_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_CP_GRPC_TLS_CLIENT_CA_SOURCE",
+            "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH",
+            cp_grpc_tls_client_ca_path,
+        );
+        let dp_grpc_tls_ca_cert_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_DP_GRPC_TLS_CA_CERT_SOURCE",
+            "FERRUM_DP_GRPC_TLS_CA_CERT_PATH",
+            dp_grpc_tls_ca_cert_path,
+        );
+        let dp_grpc_tls_client_cert_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_DP_GRPC_TLS_CLIENT_CERT_SOURCE",
+            "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH",
+            dp_grpc_tls_client_cert_path,
+        );
+        let dp_grpc_tls_client_key_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_DP_GRPC_TLS_CLIENT_KEY_SOURCE",
+            "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH",
+            dp_grpc_tls_client_key_path,
+        );
+        let tls_ca_bundle_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_TLS_CA_BUNDLE_SOURCE",
+            "FERRUM_TLS_CA_BUNDLE_PATH",
+            tls_ca_bundle_path,
+        );
+        let backend_tls_client_cert_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_BACKEND_TLS_CLIENT_CERT_SOURCE",
+            "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH",
+            backend_tls_client_cert_path,
+        );
+        let backend_tls_client_key_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_BACKEND_TLS_CLIENT_KEY_SOURCE",
+            "FERRUM_BACKEND_TLS_CLIENT_KEY_PATH",
+            backend_tls_client_key_path,
+        );
+        let gateway_svid_cert_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_GATEWAY_SVID_CERT_SOURCE",
+            "FERRUM_GATEWAY_SVID_CERT_PATH",
+            gateway_svid_cert_path,
+        );
+        let gateway_svid_key_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_GATEWAY_SVID_KEY_SOURCE",
+            "FERRUM_GATEWAY_SVID_KEY_PATH",
+            gateway_svid_key_path,
+        );
+        let gateway_svid_trust_bundle_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_SOURCE",
+            "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+            gateway_svid_trust_bundle_path,
+        );
+        let dtls_cert_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_DTLS_CERT_SOURCE",
+            "FERRUM_DTLS_CERT_PATH",
+            dtls_cert_path,
+        );
+        let dtls_key_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_DTLS_KEY_SOURCE",
+            "FERRUM_DTLS_KEY_PATH",
+            dtls_key_path,
+        );
+        let dtls_client_ca_cert_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_DTLS_CLIENT_CA_CERT_SOURCE",
+            "FERRUM_DTLS_CLIENT_CA_CERT_PATH",
+            dtls_client_ca_cert_path,
+        );
+        let tls_crl_file_path = resolve_tls_source_override(
+            conf,
+            "FERRUM_TLS_CRL_SOURCE",
+            "FERRUM_TLS_CRL_FILE_PATH",
+            tls_crl_file_path,
+        );
+
         let mut config = Self {
             mode: mode.clone(),
             namespace,
             log_level,
             log_buffer_capacity,
+            secret_refresh_interval_seconds,
+            acme_auto_renew_enabled,
+            acme_renew_when_remaining_days,
+            acme_renew_check_interval_seconds,
+            acme_renew_challenge_type,
+            acme_renew_poll_timeout_seconds,
+            acme_dns01_hook_command,
+            acme_dns01_propagation_seconds,
             enable_streaming_latency_tracking,
             proxy_http_port,
             proxy_https_port,
@@ -2225,6 +2517,8 @@ impl EnvConfig {
             frontend_tls_key_path,
             frontend_tls_live_reload_enabled,
             frontend_tls_watch_interval_seconds,
+            backend_tls_live_reload_enabled,
+            backend_tls_watch_interval_seconds,
             proxy_bind_address,
             admin_http_port,
             admin_https_port,
@@ -2241,6 +2535,8 @@ impl EnvConfig {
             db_tls_ca_cert_path,
             db_tls_client_cert_path,
             db_tls_client_key_path,
+            db_tls_live_reload_enabled,
+            db_tls_watch_interval_seconds,
             file_config_path,
             db_config_backup_path,
             db_failover_urls,
@@ -2356,6 +2652,8 @@ impl EnvConfig {
             gateway_svid_trust_bundle_path,
             gateway_spiffe_id,
             frontend_tls_client_ca_bundle_path,
+            frontend_tls_ocsp_response_source,
+            admin_tls_ocsp_response_source,
             admin_tls_client_ca_bundle_path,
             tls_no_verify,
             admin_read_only,
@@ -2573,13 +2871,34 @@ impl EnvConfig {
                     if matches!(mode, DbTlsMode::VerifyCa | DbTlsMode::VerifyFull)
                         && let Some(ref cert) = self.db_tls_ca_cert_path
                     {
-                        params.push(format!("sslrootcert={}", cert));
+                        params.push(format!(
+                            "sslrootcert={}",
+                            Self::db_tls_source_param_value(
+                                cert,
+                                crate::tls::source::MaterialKind::CaBundle,
+                                "ferrum-db-ca-",
+                            )?
+                        ));
                     }
                     if let Some(ref cert) = self.db_tls_client_cert_path {
-                        params.push(format!("sslcert={}", cert));
+                        params.push(format!(
+                            "sslcert={}",
+                            Self::db_tls_source_param_value(
+                                cert,
+                                crate::tls::source::MaterialKind::Cert,
+                                "ferrum-db-client-cert-",
+                            )?
+                        ));
                     }
                     if let Some(ref key) = self.db_tls_client_key_path {
-                        params.push(format!("sslkey={}", key));
+                        params.push(format!(
+                            "sslkey={}",
+                            Self::db_tls_source_param_value(
+                                key,
+                                crate::tls::source::MaterialKind::Key,
+                                "ferrum-db-client-key-",
+                            )?
+                        ));
                     }
                 }
             }
@@ -2590,13 +2909,34 @@ impl EnvConfig {
                     if matches!(mode, DbTlsMode::VerifyCa | DbTlsMode::VerifyFull)
                         && let Some(ref cert) = self.db_tls_ca_cert_path
                     {
-                        params.push(format!("ssl-ca={}", cert));
+                        params.push(format!(
+                            "ssl-ca={}",
+                            Self::db_tls_source_param_value(
+                                cert,
+                                crate::tls::source::MaterialKind::CaBundle,
+                                "ferrum-db-ca-",
+                            )?
+                        ));
                     }
                     if let Some(ref cert) = self.db_tls_client_cert_path {
-                        params.push(format!("ssl-cert={}", cert));
+                        params.push(format!(
+                            "ssl-cert={}",
+                            Self::db_tls_source_param_value(
+                                cert,
+                                crate::tls::source::MaterialKind::Cert,
+                                "ferrum-db-client-cert-",
+                            )?
+                        ));
                     }
                     if let Some(ref key) = self.db_tls_client_key_path {
-                        params.push(format!("ssl-key={}", key));
+                        params.push(format!(
+                            "ssl-key={}",
+                            Self::db_tls_source_param_value(
+                                key,
+                                crate::tls::source::MaterialKind::Key,
+                                "ferrum-db-client-key-",
+                            )?
+                        ));
                     }
                 }
             }
@@ -2604,6 +2944,46 @@ impl EnvConfig {
         }
 
         Ok(Some(params))
+    }
+
+    fn db_tls_source_param_value(
+        source_value: &str,
+        kind: crate::tls::source::MaterialKind,
+        temp_prefix: &str,
+    ) -> Result<String, String> {
+        let source = crate::tls::source::CertSource::parse(source_value, kind);
+        if let Some(path) = source.as_file_path() {
+            return Ok(path.display().to_string());
+        }
+
+        let source_id = source.source_id();
+        let material = crate::tls::source::load_material_blocking(&source, kind)
+            .map_err(|e| format!("Failed to load database TLS material: {e}"))?;
+        let temp_file = tempfile::Builder::new()
+            .prefix(temp_prefix)
+            .suffix(".pem")
+            .tempfile()
+            .map_err(|e| format!("Failed to create database TLS temp PEM file: {e}"))?;
+        let (_file, material_path) = temp_file.keep().map_err(|e| {
+            format!(
+                "Failed to persist database TLS temp PEM file '{}': {}",
+                e.file.path().display(),
+                e.error
+            )
+        })?;
+        std::fs::write(&material_path, material.bytes.expose_secret()).map_err(|e| {
+            format!(
+                "Failed to write database TLS material to '{}': {}",
+                material_path.display(),
+                e
+            )
+        })?;
+        tracing::info!(
+            "Materialized database TLS source {} into {}",
+            source_id,
+            material_path.display()
+        );
+        Ok(material_path.display().to_string())
     }
 
     fn warn_on_existing_db_tls_url_params(base_url: &str, db_type: &str) {
@@ -3155,6 +3535,25 @@ impl EnvConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_key_exchange_groups_prefer_canonical_env_name() {
+        assert_eq!(
+            resolve_tls_key_exchange_groups(
+                Some("X25519,secp384r1".to_string()),
+                Some("secp256r1".to_string()),
+            ),
+            Some("X25519,secp384r1".to_string())
+        );
+    }
+
+    #[test]
+    fn tls_key_exchange_groups_accept_legacy_curves_alias() {
+        assert_eq!(
+            resolve_tls_key_exchange_groups(None, Some("X25519,secp256r1".to_string())),
+            Some("X25519,secp256r1".to_string())
+        );
+    }
 
     #[test]
     fn existing_db_tls_url_params_detects_sql_tls_options_case_insensitively() {

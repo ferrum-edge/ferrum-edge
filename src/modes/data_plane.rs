@@ -159,6 +159,25 @@ pub async fn run(
     // Build DP gRPC TLS config if any TLS settings are provided.
     let dp_grpc_tls =
         crate::grpc::dp_client::build_dp_grpc_tls_config(&env_config, &cp_urls, "DP")?;
+    let dp_grpc_tls_reload_handle = crate::modes::grpc_tls_reload::start_dp_grpc_tls_reload_task(
+        Arc::new(env_config.clone()),
+        Arc::new(cp_urls.clone()),
+        "DP",
+        Some(shutdown_tx.subscribe()),
+    );
+    let (dp_grpc_tls_reload, dp_grpc_tls_reload_watcher) =
+        if let Some(handle) = dp_grpc_tls_reload_handle {
+            (
+                Some(crate::grpc::dp_client::DpGrpcTlsReload {
+                    env_config: Arc::new(env_config.clone()),
+                    label: "DP",
+                    revision_rx: handle.revision_rx,
+                }),
+                Some(handle.watcher_handle),
+            )
+        } else {
+            (None, None)
+        };
 
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
@@ -167,10 +186,11 @@ pub async fn run(
     ) {
         info!("Loading TLS configuration...");
         let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
-        match tls::load_tls_config_with_client_auth(
+        match tls::load_tls_config_with_client_auth_and_ocsp(
             cert_path,
             key_path,
             client_ca_bundle_path,
+            env_config.frontend_tls_ocsp_response_source.as_deref(),
             false,
             &tls_policy,
             env_config.tls_cert_expiry_warning_days,
@@ -448,10 +468,11 @@ pub async fn run(
 
         // Load admin TLS configuration
         let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        let admin_tls_config = match tls::load_tls_config_with_client_auth(
+        let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
             admin_cert_path,
             admin_key_path,
             admin_client_ca_bundle,
+            env_config.admin_tls_ocsp_response_source.as_deref(),
             env_config.admin_tls_no_verify,
             &tls_policy,
             env_config.tls_cert_expiry_warning_days,
@@ -558,6 +579,7 @@ pub async fn run(
             dp_proxy_state,
             Some(dp_shutdown),
             dp_grpc_tls,
+            dp_grpc_tls_reload,
             Some(dp_startup_ready),
             dp_namespace,
             dp_primary_retry_secs,
@@ -613,6 +635,9 @@ pub async fn run(
             let _ = h.await;
         }
         let _ = dp_client_handle.await;
+        if let Some(h) = dp_grpc_tls_reload_watcher {
+            let _ = h.await;
+        }
         let _ = overload_handle.await;
         let _ = metrics_handle.await;
         let _ = runtime_system_handle.await;

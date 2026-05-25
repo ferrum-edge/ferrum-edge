@@ -20,4 +20,7 @@ mod registry;
 mod vault;
 
 #[allow(unused_imports)]
-pub use registry::{ResolvedEnvSecrets, ResolvedSecret, resolve_all_env_secrets, resolve_secret};
+pub use registry::{
+    ResolvedEnvSecrets, ResolvedSecret, resolve_all_env_secrets, resolve_external_reference,
+    resolve_secret,
+};

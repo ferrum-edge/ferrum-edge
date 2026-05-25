@@ -99,6 +99,8 @@ tags:
     description: Inspect the resolved service binding used by service-waypoint topology (mesh-only)
   - name: API Specs
     description: Submit, retrieve, replace, and delete OpenAPI/Swagger spec bundles that create proxy + upstream + plugin resources atomically
+  - name: TLS
+    description: Validate and inspect TLS certificate material
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
@@ -151,6 +153,1059 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
 
+  /admin/tls/inventory:
+    get:
+      operationId: listTlsInventory
+      summary: List configured TLS material sources
+      description: |
+        Returns a paginated inventory of configured TLS material sources with
+        non-secret provenance, load state, parsed certificate metadata, and the
+        runtime/config surfaces using each source. Inline PEM and private key
+        bytes are never returned.
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/PaginationOffset"
+      responses:
+        "200":
+          description: TLS material inventory
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsInventoryListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /admin/tls/events:
+    get:
+      operationId: listTlsEvents
+      summary: List recent TLS source rotation events
+      description: |
+        Returns bounded persisted history for TLS source watcher outcomes.
+        Events are emitted for successful rotations and source/rebuild failures;
+        no-op refresh polls are counted in Prometheus but are not stored here.
+        The bounded history is persisted under `FERRUM_TLS_MANAGED_STORE_PATH`
+        so recent rotation events survive process restarts.
+      tags: [TLS]
+      parameters:
+        - name: cert_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to events whose source material has this stable event cert ID.
+        - name: source_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to events whose source identifier matches exactly.
+        - name: surface
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by TLS surface such as `proxy_https` or `admin_https`.
+        - name: outcome
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [rotated, load_error, rebuild_error]
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/PaginationOffset"
+      responses:
+        "200":
+          description: Recent TLS source events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsEventListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /admin/tls/acme/certificates:
+    get:
+      operationId: listAcmeCertificates
+      summary: List ACME-issued TLS certificates
+      description: |
+        Lists certificates in Ferrum's ACME-issued material store. Records can
+        be referenced from TLS source fields as `acme://certificates/{id}#cert`
+        and `acme://certificates/{id}#key`. This store is the persistence
+        target for the ACME manager; importing already issued ACME material is
+        supported before automated order endpoints are enabled.
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/PaginationOffset"
+      responses:
+        "200":
+          description: ACME-issued certificate records
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcmeCertificateRecordListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: importAcmeCertificate
+      summary: Import an ACME-issued certificate and private key
+      description: |
+        Imports already issued ACME certificate material into Ferrum's ACME
+        store. Private key bytes are persisted but never returned in responses.
+      tags: [TLS]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcmeCertificateRequest"
+      responses:
+        "201":
+          description: ACME certificate imported
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcmeCertificateRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/acme/certificates/{id}:
+    get:
+      operationId: getAcmeCertificate
+      summary: Get an ACME-issued TLS certificate
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: ACME certificate record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcmeCertificateRecord"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: updateAcmeCertificate
+      summary: Replace an ACME-issued certificate and private key
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcmeCertificateRequest"
+      responses:
+        "200":
+          description: ACME certificate updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcmeCertificateRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteAcmeCertificate
+      summary: Delete an unreferenced ACME-issued TLS certificate
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: ACME certificate deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/acme/orders:
+    get:
+      operationId: listAcmeOrders
+      summary: List ACME orders and active challenge material
+      description: |
+        Lists ACME orders persisted by Ferrum. HTTP-01 challenge records in
+        `pending_challenges`, `ready`, or `processing` states are served from
+        proxy listeners at `/.well-known/acme-challenge/{token}` before
+        normal route matching. TLS-ALPN-01 records in those states are served
+        in-band on TLS listeners for ClientHello messages that offer only
+        `acme-tls/1` and matching SNI. DNS-01 records expose the TXT record
+        name and value that must be published before finalization.
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/PaginationOffset"
+      responses:
+        "200":
+          description: ACME order records
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcmeOrderListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: createAcmeOrder
+      summary: Create an ACME HTTP-01, TLS-ALPN-01, or DNS-01 order
+      description: |
+        Creates an ACME order through the optional `acme` Cargo feature and
+        persists the returned HTTP-01, TLS-ALPN-01, or DNS-01 challenge material. When
+        Ferrum is built without that feature this endpoint returns
+        `501 Not Implemented`.
+      tags: [TLS]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcmeOrderRequest"
+      responses:
+        "201":
+          description: ACME order created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcmeOrder"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /admin/tls/acme/accounts:
+    get:
+      operationId: listAcmeAccounts
+      summary: List ACME accounts in use
+      description: |
+        Lists non-secret ACME account metadata discovered from persisted
+        ACME account credentials, orders, and certificates. Account credentials
+        are never returned.
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/PaginationOffset"
+      responses:
+        "200":
+          description: ACME accounts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcmeAccountListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /admin/tls/acme/renew/{id}:
+    post:
+      operationId: renewAcmeCertificate
+      summary: Create a renewal order for an ACME certificate
+      description: |
+        Creates a replacement HTTP-01, TLS-ALPN-01, or DNS-01 ACME order for an existing
+        `acme://certificates/{id}` record. Ferrum reuses persisted account
+        credentials from the latest order for the certificate when available,
+        or uses credentials supplied in the request. Finalize the returned
+        order after the selected challenge is reachable.
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcmeRenewRequest"
+      responses:
+        "201":
+          description: Renewal order created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcmeOrder"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /admin/tls/acme/orders/{id}:
+    get:
+      operationId: getAcmeOrder
+      summary: Get an ACME order
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: ACME order record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcmeOrder"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteAcmeOrder
+      summary: Delete an ACME order and stop serving its challenges
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: ACME order deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /admin/tls/acme/orders/{id}/finalize:
+    post:
+      operationId: finalizeAcmeOrder
+      summary: Finalize an ACME HTTP-01, TLS-ALPN-01, or DNS-01 order
+      description: |
+        Marks the order's prepared HTTP-01, TLS-ALPN-01, or DNS-01 challenges ready,
+        waits for the ACME directory to accept the authorizations, finalizes
+        the order, fetches the issued certificate, and stores it as an
+        `acme://certificates/{id}` record. The endpoint requires the optional
+        `acme` Cargo feature and returns `501 Not Implemented` without it.
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcmeOrderFinalizeRequest"
+      responses:
+        "200":
+          description: ACME order finalized and certificate persisted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcmeOrderFinalizeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /admin/tls/certificates:
+    get:
+      operationId: listManagedTlsCertificates
+      summary: List admin-managed TLS certificates
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/PaginationOffset"
+      responses:
+        "200":
+          description: Managed certificate records
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecordListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: createManagedTlsCertificate
+      summary: Upload an admin-managed TLS certificate and private key
+      description: Private key bytes are persisted in the managed store but are never returned in responses.
+      tags: [TLS]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedTlsCertificateRequest"
+      responses:
+        "201":
+          description: Managed certificate created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/certificates/{id}:
+    get:
+      operationId: getManagedTlsCertificate
+      summary: Get an admin-managed TLS certificate
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Managed certificate record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: updateManagedTlsCertificate
+      summary: Rotate an admin-managed TLS certificate and private key
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedTlsCertificateRequest"
+      responses:
+        "200":
+          description: Managed certificate updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteManagedTlsCertificate
+      summary: Delete an unreferenced admin-managed TLS certificate
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Managed certificate deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/ca-bundles:
+    get:
+      operationId: listManagedTlsCaBundles
+      summary: List admin-managed TLS CA bundles
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/PaginationOffset"
+      responses:
+        "200":
+          description: Managed CA bundle records
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecordListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: createManagedTlsCaBundle
+      summary: Upload an admin-managed TLS CA bundle
+      tags: [TLS]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedTlsCaBundleRequest"
+      responses:
+        "201":
+          description: Managed CA bundle created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/ca-bundles/{id}:
+    get:
+      operationId: getManagedTlsCaBundle
+      summary: Get an admin-managed TLS CA bundle
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Managed CA bundle record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: updateManagedTlsCaBundle
+      summary: Rotate an admin-managed TLS CA bundle
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedTlsCaBundleRequest"
+      responses:
+        "200":
+          description: Managed CA bundle updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteManagedTlsCaBundle
+      summary: Delete an unreferenced admin-managed TLS CA bundle
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Managed CA bundle deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/crls:
+    get:
+      operationId: listManagedTlsCrls
+      summary: List admin-managed TLS CRLs
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/PaginationOffset"
+      responses:
+        "200":
+          description: Managed CRL records
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecordListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: createManagedTlsCrl
+      summary: Upload an admin-managed TLS CRL bundle
+      tags: [TLS]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedTlsCrlRequest"
+      responses:
+        "201":
+          description: Managed CRL created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/crls/{id}:
+    get:
+      operationId: getManagedTlsCrl
+      summary: Get an admin-managed TLS CRL bundle
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Managed CRL record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: updateManagedTlsCrl
+      summary: Rotate an admin-managed TLS CRL bundle
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedTlsCrlRequest"
+      responses:
+        "200":
+          description: Managed CRL updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteManagedTlsCrl
+      summary: Delete an unreferenced admin-managed TLS CRL bundle
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Managed CRL deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/ocsp-responses:
+    get:
+      operationId: listManagedTlsOcspResponses
+      summary: List admin-managed OCSP responses
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/PaginationOffset"
+      responses:
+        "200":
+          description: Managed OCSP response records
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecordListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: createManagedTlsOcspResponse
+      summary: Upload an admin-managed DER OCSP response
+      tags: [TLS]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedTlsOcspResponseRequest"
+      responses:
+        "201":
+          description: Managed OCSP response created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/ocsp-responses/{id}:
+    get:
+      operationId: getManagedTlsOcspResponse
+      summary: Get an admin-managed OCSP response
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Managed OCSP response record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: updateManagedTlsOcspResponse
+      summary: Rotate an admin-managed DER OCSP response
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedTlsOcspResponseRequest"
+      responses:
+        "200":
+          description: Managed OCSP response updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteManagedTlsOcspResponse
+      summary: Delete an unreferenced admin-managed OCSP response
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Managed OCSP response deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/jwks:
+    get:
+      operationId: listManagedTlsJwks
+      summary: List admin-managed JWKS documents
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/PaginationOffset"
+      responses:
+        "200":
+          description: Managed JWKS records
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecordListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: createManagedTlsJwks
+      summary: Upload an admin-managed JWKS document
+      tags: [TLS]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedTlsJwksRequest"
+      responses:
+        "201":
+          description: Managed JWKS document created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/jwks/{id}:
+    get:
+      operationId: getManagedTlsJwks
+      summary: Get an admin-managed JWKS document
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Managed JWKS record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: updateManagedTlsJwks
+      summary: Rotate an admin-managed JWKS document
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedTlsJwksRequest"
+      responses:
+        "200":
+          description: Managed JWKS document updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteManagedTlsJwks
+      summary: Delete an unreferenced admin-managed JWKS document
+      tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Managed JWKS document deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /admin/tls/rotate/{surface}:
+    post:
+      operationId: forceRotateTlsSurface
+      summary: Force an active TLS source watcher to re-pull sources
+      description: |
+        Enqueues an immediate source poll for an active TLS source watcher.
+        Supported surfaces are `proxy_https`, `backend_tls`, `admin_https`,
+        `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all`. Aliases
+        `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`,
+        `cp_grpc_tls`, `dp_grpc_tls`, and `gateway_svid` are accepted. Watcher-backed TLS reloads return after
+        enqueueing; rotation success or failure is reported asynchronously via
+        `/admin/tls/events` and Prometheus metrics. The `svid` surface validates
+        and reloads the gateway SVID synchronously, then publishes a backend
+        SVID generation bump on success.
+      tags: [TLS]
+      parameters:
+        - name: surface
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [proxy_https, backend_tls, admin_https, dtls, database_tls, cp_grpc, dp_grpc, frontend, backend, admin, frontend_dtls, db, database, cp_grpc_tls, dp_grpc_tls, svid, gateway_svid, all]
+      responses:
+        "202":
+          description: Reload request accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted:
+                    type: boolean
+                  requested_surface:
+                    type: string
+                  surface:
+                    type: string
+                  surfaces:
+                    type: array
+                    items:
+                      type: string
+                  gateway_svid_revision:
+                    type: integer
+                    format: uint64
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No active watcher is registered for the requested surface
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  requested_surface:
+                    type: string
+                  normalized_surface:
+                    type: string
+                  available_surfaces:
+                    type: array
+                    items:
+                      type: string
+
+  /admin/tls/validate:
+    post:
+      operationId: validateTlsMaterial
+      summary: Validate TLS PEM material without storing it
+      description: |
+        Validates inline PEM certificate/key pairs, CA bundles, and CRL bundles.
+        The endpoint never persists submitted material and returns validation
+        errors without logging private key bytes.
+      tags: [TLS]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsValidateRequest"
+      responses:
+        "200":
+          description: TLS material is valid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsValidateResponse"
+        "400":
+          description: TLS material or request body is invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
   # ── Overload ────────────────────────────────────────────────────────
   /overload:
     get:
@@ -192,6 +1247,10 @@ paths:
       description: |
         Returns gateway metrics in Prometheus exposition format.
         Unauthenticated so it can be scraped by Prometheus without credentials.
+        TLS source watcher telemetry includes certificate expiry gauges,
+        certificate rotation counters, source refresh outcomes, source fetch
+        duration histograms, and bounded source fetch failure counters when
+        those source watchers are active.
         Mesh mode adds identity and control-plane telemetry families for
         certificate expiry, rotation failures, CA health, trust-bundle
         versions, config freshness, and mTLS handshake failures.
@@ -3368,8 +4427,20 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    BadGateway:
+      description: Upstream ACME directory or provider operation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     ServiceUnavailable:
       description: Database unavailable and no cached config
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotImplemented:
+      description: Capability is not available in this build
       content:
         application/json:
           schema:
@@ -3384,6 +4455,707 @@ components:
         error:
           type: [string, "null"]
           description: Human-readable error message
+
+    AcmeCertificateRecordListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AcmeCertificateRecord"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    AcmeCertificateRecord:
+      type: object
+      required: [id, domains, directory_url, status, source_uri, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        domains:
+          type: array
+          items:
+            type: string
+        directory_url:
+          type: string
+          examples:
+            - https://acme-v02.api.letsencrypt.org/directory
+            - https://acme-staging-v02.api.letsencrypt.org/directory
+        account_id:
+          type: string
+        order_url:
+          type: string
+        status:
+          type: string
+          enum: [issued, renewing, failed, revoked]
+        source_uri:
+          type: string
+          examples:
+            - acme://certificates/edge-cert
+        subject:
+          type: string
+        issuer:
+          type: string
+        sans:
+          type: array
+          items:
+            type: string
+        not_before:
+          type: string
+          format: date-time
+        not_after:
+          type: string
+          format: date-time
+        fingerprint_sha256:
+          type: string
+          description: SHA-256 fingerprint of public certificate material. Private keys are never returned.
+        certificate_count:
+          type: integer
+        byte_length:
+          type: integer
+          description: Public certificate material byte length, including intermediate chain PEM.
+        issued_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    AcmeCertificateRequest:
+      type: object
+      required: [domains, directory_url, cert_pem, key_pem]
+      properties:
+        id:
+          type: string
+          description: Optional stable id. Generated when omitted on create.
+        domains:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: DNS identifiers covered by the ACME certificate.
+        directory_url:
+          type: string
+          description: ACME directory URL that issued the certificate.
+        account_id:
+          type: string
+          description: Optional ACME account identifier or URL.
+        order_url:
+          type: string
+          description: Optional ACME order URL.
+        cert_pem:
+          type: string
+          description: Leaf certificate PEM.
+        key_pem:
+          type: string
+          description: Private key PEM. Persisted but never returned.
+        chain_pem:
+          type: string
+          description: Optional intermediate chain PEM.
+        allow_overwrite:
+          type: boolean
+          default: false
+        allow_expired:
+          type: boolean
+          default: false
+        cert_expiry_warning_days:
+          type: integer
+          format: int64
+          default: 30
+
+    AcmeOrderListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AcmeOrder"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    AcmeAccountListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AcmeAccount"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    AcmeAccount:
+      type: object
+      required: [account_id, directory_url, order_count, certificate_count, has_persisted_credentials]
+      properties:
+        account_id:
+          type: string
+          description: ACME account URL or identifier.
+        directory_url:
+          type: string
+        order_count:
+          type: integer
+        certificate_count:
+          type: integer
+        has_persisted_credentials:
+          type: boolean
+          description: Whether at least one stored order can resume this account. The credentials are never returned.
+        last_order_at:
+          type: string
+          format: date-time
+        last_certificate_updated_at:
+          type: string
+          format: date-time
+
+    AcmeOrder:
+      type: object
+      required: [id, domains, directory_url, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        certificate_id:
+          type: string
+          description: ACME certificate record id that should receive the issued certificate.
+        domains:
+          type: array
+          items:
+            type: string
+        directory_url:
+          type: string
+        account_id:
+          type: string
+        order_url:
+          type: string
+        status:
+          type: string
+          enum: [pending_challenges, ready, processing, valid, failed, cancelled]
+        http01_challenges:
+          type: array
+          items:
+            $ref: "#/components/schemas/AcmeHttp01Challenge"
+        tls_alpn01_challenges:
+          type: array
+          items:
+            $ref: "#/components/schemas/AcmeTlsAlpn01Challenge"
+        dns01_challenges:
+          type: array
+          items:
+            $ref: "#/components/schemas/AcmeDns01Challenge"
+        error:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    AcmeHttp01Challenge:
+      type: object
+      required: [identifier, token, key_authorization, path]
+      properties:
+        identifier:
+          type: string
+        token:
+          type: string
+        key_authorization:
+          type: string
+          description: Public HTTP-01 response body served for this token.
+        path:
+          type: string
+          example: /.well-known/acme-challenge/abc_DEF-123
+
+    AcmeTlsAlpn01Challenge:
+      type: object
+      required: [identifier, token, key_authorization_sha256_base64url, alpn_protocol]
+      properties:
+        identifier:
+          type: string
+          description: DNS name used as SNI for the TLS-ALPN-01 validation handshake.
+        token:
+          type: string
+        key_authorization_sha256_base64url:
+          type: string
+          description: Base64url-encoded SHA-256 digest embedded in the critical acmeIdentifier extension.
+        alpn_protocol:
+          type: string
+          enum: [acme-tls/1]
+
+    AcmeDns01Challenge:
+      type: object
+      required: [identifier, token, txt_record_name, txt_value]
+      properties:
+        identifier:
+          type: string
+          description: DNS identifier authorized by the DNS-01 challenge.
+        token:
+          type: string
+        txt_record_name:
+          type: string
+          example: _acme-challenge.example.com
+        txt_value:
+          type: string
+          description: TXT value that must be published before finalizing the order.
+
+    AcmeOrderRequest:
+      type: object
+      required: [domains, directory_url]
+      properties:
+        id:
+          type: string
+          description: Optional stable order id. Generated when omitted.
+        certificate_id:
+          type: string
+          description: Optional target ACME certificate id for the issued cert.
+        domains:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        directory_url:
+          type: string
+          description: ACME directory URL.
+        contact:
+          type: array
+          items:
+            type: string
+          description: ACME account contact URIs such as `mailto:ops@example.com`.
+        terms_of_service_agreed:
+          type: boolean
+          default: false
+        challenge_type:
+          type: string
+          enum: [http01, tls_alpn01, dns01]
+          default: http01
+          description: ACME challenge type to prepare for this order.
+        existing_account_credentials_json:
+          type: string
+          description: Previously persisted instant-acme account credentials JSON. Persisted but never returned.
+        allow_overwrite:
+          type: boolean
+          default: false
+
+    AcmeOrderFinalizeRequest:
+      type: object
+      properties:
+        certificate_id:
+          type: string
+          description: Optional override for the ACME certificate record id. Defaults to the order certificate_id, then the order id.
+        poll_timeout_seconds:
+          type: integer
+          format: int64
+          default: 60
+          minimum: 1
+          maximum: 600
+          description: Maximum time spent polling ACME order readiness and certificate issuance.
+        allow_overwrite:
+          type: boolean
+          default: false
+          description: Replace an existing ACME certificate record with the target id.
+        allow_expired:
+          type: boolean
+          default: false
+          description: Permit the fetched certificate to be expired during validation.
+        cert_expiry_warning_days:
+          type: integer
+          format: int64
+          default: 30
+
+    AcmeOrderFinalizeResponse:
+      type: object
+      required: [order, certificate]
+      properties:
+        order:
+          $ref: "#/components/schemas/AcmeOrder"
+        certificate:
+          $ref: "#/components/schemas/AcmeCertificateRecord"
+
+    AcmeRenewRequest:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Optional stable renewal order id. Generated when omitted.
+        contact:
+          type: array
+          items:
+            type: string
+          description: ACME account contact URIs used only when a new account must be created.
+        terms_of_service_agreed:
+          type: boolean
+          default: false
+        challenge_type:
+          type: string
+          enum: [http01, tls_alpn01, dns01]
+          default: http01
+          description: ACME challenge type to prepare for the renewal order.
+        existing_account_credentials_json:
+          type: string
+          description: Optional instant-acme account credentials JSON. Persisted in the renewal order but never returned.
+        allow_overwrite:
+          type: boolean
+          default: false
+          description: Replace an existing order with the same id.
+
+    ManagedTlsRecordListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ManagedTlsRecord"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    ManagedTlsRecord:
+      type: object
+      required: [id, name, kind, source_uri, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        kind:
+          type: string
+          enum: [certificate, ca_bundle, crl, ocsp_response, jwks]
+        source_uri:
+          type: string
+          examples:
+            - managed://certificates/edge-cert
+            - managed://ca-bundles/internal-ca
+            - managed://ocsp-responses/edge-ocsp
+        subject:
+          type: string
+        issuer:
+          type: string
+        sans:
+          type: array
+          items:
+            type: string
+        not_before:
+          type: string
+          format: date-time
+        not_after:
+          type: string
+          format: date-time
+        fingerprint_sha256:
+          type: string
+          description: SHA-256 fingerprint of public material. Private keys are never returned.
+        certificate_count:
+          type: integer
+        crl_count:
+          type: integer
+        byte_length:
+          type: integer
+          description: Decoded public material byte length, including DER OCSP response length.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    ManagedTlsCertificateRequest:
+      type: object
+      required: [cert_pem, key_pem]
+      properties:
+        id:
+          type: string
+          description: Optional stable id. Generated when omitted on create.
+        name:
+          type: string
+        description:
+          type: string
+        cert_pem:
+          type: string
+          description: Leaf certificate PEM.
+        key_pem:
+          type: string
+          description: Private key PEM. Persisted but never returned.
+        chain_pem:
+          type: string
+          description: Optional intermediate chain PEM.
+        allow_overwrite:
+          type: boolean
+          default: false
+        allow_expired:
+          type: boolean
+          default: false
+        cert_expiry_warning_days:
+          type: integer
+          format: int64
+          default: 30
+
+    ManagedTlsCaBundleRequest:
+      type: object
+      required: [ca_bundle_pem]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        ca_bundle_pem:
+          type: string
+        allow_overwrite:
+          type: boolean
+          default: false
+        allow_expired:
+          type: boolean
+          default: false
+        cert_expiry_warning_days:
+          type: integer
+          format: int64
+          default: 30
+
+    ManagedTlsCrlRequest:
+      type: object
+      required: [crl_pem]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        crl_pem:
+          type: string
+        allow_overwrite:
+          type: boolean
+          default: false
+
+    ManagedTlsOcspResponseRequest:
+      type: object
+      required: [ocsp_der_base64]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        ocsp_der_base64:
+          type: string
+          description: Base64-encoded DER OCSP response bytes. The decoded response must be non-empty.
+        allow_overwrite:
+          type: boolean
+          default: false
+
+    ManagedTlsJwksRequest:
+      type: object
+      required: [jwks_json]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        jwks_json:
+          type: string
+          description: JSON Web Key Set document. Must contain a non-empty `keys` array.
+        allow_overwrite:
+          type: boolean
+          default: false
+
+    TlsInventoryListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsInventoryEntry"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    TlsInventoryEntry:
+      type: object
+      required: [id, material_kind, source, state, used_by]
+      properties:
+        id:
+          type: string
+          description: Stable non-secret inventory ID derived from material kind and source identity.
+        material_kind:
+          type: string
+          enum: [certificate, private_key, ca_bundle, crl, jwks, ocsp, unknown]
+        source:
+          $ref: "#/components/schemas/TlsInventorySource"
+        state:
+          type: string
+          enum: [loaded, unsupported, unavailable, invalid]
+        used_by:
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsInventoryUsage"
+        subject:
+          type: string
+        issuer:
+          type: string
+        sans:
+          type: array
+          items:
+            type: string
+        not_before:
+          type: string
+          format: date-time
+        not_after:
+          type: string
+          format: date-time
+        days_until_expiry:
+          type: integer
+          format: int64
+        fingerprint_sha256:
+          type: string
+          description: SHA-256 fingerprint of the leaf certificate. Not populated for private keys.
+        certificate_count:
+          type: integer
+        crl_count:
+          type: integer
+        error:
+          type: string
+          description: Non-secret load or parse error when state is not `loaded`.
+
+    TlsInventorySource:
+      type: object
+      required: [kind, identifier, refreshable]
+      properties:
+        kind:
+          type: string
+          description: Source scheme such as `file`, `vault`, `aws`, `k8s`, `acme`, `managed`, or `pkcs11`.
+        identifier:
+          type: string
+          description: Non-secret source identifier. Inline PEM is returned as `inline-pem:<redacted>`.
+        refreshable:
+          type: boolean
+        version:
+          type: string
+
+    TlsInventoryUsage:
+      type: object
+      required: [surface, role, resource_type, resource_id, field]
+      properties:
+        surface:
+          type: string
+          examples: [frontend_tls, backend_tls, admin_tls, dtls, cp_grpc_tls, dp_grpc_tls, database_tls, gateway_svid]
+        role:
+          type: string
+          examples: [server_certificate, private_key, client_ca_bundle, server_ca_bundle]
+        resource_type:
+          type: string
+          examples: [env, proxy, upstream, plugin_config]
+        resource_id:
+          type: string
+        field:
+          type: string
+
+    TlsEventListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsSourceEvent"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    TlsSourceEvent:
+      type: object
+      required: [id, at, surface, outcome, sources]
+      properties:
+        id:
+          type: integer
+          format: int64
+        at:
+          type: string
+          format: date-time
+        surface:
+          type: string
+        outcome:
+          type: string
+          enum: [rotated, load_error, rebuild_error]
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsSourceEventMaterial"
+        revision:
+          type: integer
+          format: int64
+          description: Surface revision after a successful rotation.
+        error:
+          type: string
+          description: Non-secret error string for failed load or rebuild events.
+
+    TlsSourceEventMaterial:
+      type: object
+      required: [label, cert_id, source_id, scheme, kind]
+      properties:
+        label:
+          type: string
+          examples: [cert, key, client_ca]
+        cert_id:
+          type: string
+          description: Stable event source ID derived from material kind and non-secret source identity.
+        source_id:
+          type: string
+          description: Non-secret source identifier. Inline PEM is redacted.
+        scheme:
+          type: string
+          examples: [file, vault, aws, azure, gcp, k8s, acme, managed, pkcs11]
+        kind:
+          type: string
+          examples: [cert, key, ca_bundle, crl, ocsp]
+        fingerprint_sha256:
+          type: string
+          description: Source material fingerprint for non-key material. Omitted for private keys.
+
+    TlsValidateRequest:
+      type: object
+      properties:
+        cert_pem:
+          type: string
+          description: PEM certificate chain to validate with `key_pem`.
+        key_pem:
+          type: string
+          description: PEM private key that must match `cert_pem`.
+        ca_bundle_pem:
+          type: string
+          description: PEM CA bundle to parse and expiry-check.
+        crl_pem:
+          type: string
+          description: PEM CRL bundle to parse.
+        allow_expired:
+          type: boolean
+          default: false
+          description: Skip notBefore/notAfter checks for submitted certificates.
+        cert_expiry_warning_days:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 30
+          description: Warning threshold used during certificate expiry checks.
+
+    TlsValidateResponse:
+      type: object
+      required: [valid, validated]
+      properties:
+        valid:
+          type: boolean
+          example: true
+        validated:
+          type: object
+          additionalProperties: true
+          description: Per-material validation summary.
 
     AuditEvent:
       type: object

@@ -4526,6 +4526,10 @@ fn test_frontend_tls_live_reload_default_disabled() {
         config.frontend_tls_watch_interval_seconds, 30,
         "Default frontend TLS watch interval should be 30 seconds when live reload is enabled"
     );
+    assert_eq!(
+        config.secret_refresh_interval_seconds, 300,
+        "Default TLS provider source refresh interval should be 300 seconds"
+    );
 }
 
 #[test]
@@ -4546,6 +4550,124 @@ fn test_frontend_tls_live_reload_parsed_from_env() {
 }
 
 #[test]
+fn test_db_tls_live_reload_default_disabled() {
+    let config = EnvConfig::default();
+    assert!(
+        !config.db_tls_live_reload_enabled,
+        "Database TLS live reload is opt-in"
+    );
+    assert_eq!(
+        config.db_tls_watch_interval_seconds, 30,
+        "Default database TLS watch interval should be 30 seconds"
+    );
+}
+
+#[test]
+fn test_db_tls_live_reload_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_TLS_LIVE_RELOAD_ENABLED", "true"),
+            ("FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS", "5"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.db_tls_live_reload_enabled);
+            assert_eq!(config.db_tls_watch_interval_seconds, 5);
+        },
+    );
+}
+
+#[test]
+fn test_db_tls_watch_interval_clamps_to_minimum() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_tls_watch_interval_seconds, 1,
+                "FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS=0 should clamp up to 1"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_tls_ocsp_response_sources_parse_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            (
+                "FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE",
+                "file:///source/frontend.ocsp.der",
+            ),
+            (
+                "FERRUM_ADMIN_TLS_OCSP_RESPONSE_SOURCE",
+                "k8s://edge/admin-ocsp#ocsp.der",
+            ),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.frontend_tls_ocsp_response_source.as_deref(),
+                Some("file:///source/frontend.ocsp.der")
+            );
+            assert_eq!(
+                config.admin_tls_ocsp_response_source.as_deref(),
+                Some("k8s://edge/admin-ocsp#ocsp.der")
+            );
+        },
+    );
+}
+
+#[test]
+fn test_tls_source_env_overrides_path_env() {
+    const INLINE_CERT: &str =
+        "-----BEGIN CERTIFICATE-----\nsource-cert\n-----END CERTIFICATE-----\n";
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_FRONTEND_TLS_CERT_PATH", "/path/frontend.crt"),
+            ("FERRUM_FRONTEND_TLS_CERT_SOURCE", INLINE_CERT),
+            ("FERRUM_FRONTEND_TLS_KEY_PATH", "/path/frontend.key"),
+            (
+                "FERRUM_FRONTEND_TLS_KEY_SOURCE",
+                "file:///source/frontend.key",
+            ),
+            ("FERRUM_ADMIN_TLS_CERT_PATH", "/path/admin.crt"),
+            ("FERRUM_ADMIN_TLS_CERT_SOURCE", "file:///source/admin.crt"),
+            ("FERRUM_ADMIN_TLS_KEY_PATH", "/path/admin.key"),
+            ("FERRUM_ADMIN_TLS_KEY_SOURCE", "file:///source/admin.key"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.frontend_tls_cert_path.as_deref(), Some(INLINE_CERT));
+            assert_eq!(
+                config.frontend_tls_key_path.as_deref(),
+                Some("file:///source/frontend.key")
+            );
+            assert_eq!(
+                config.admin_tls_cert_path.as_deref(),
+                Some("file:///source/admin.crt")
+            );
+            assert_eq!(
+                config.admin_tls_key_path.as_deref(),
+                Some("file:///source/admin.key")
+            );
+        },
+    );
+}
+
+#[test]
 fn test_frontend_tls_watch_interval_clamps_to_minimum() {
     // The watcher must not busy-loop the filesystem; an operator who sets 0
     // gets clamped up to 1 second.
@@ -4561,6 +4683,39 @@ fn test_frontend_tls_watch_interval_clamps_to_minimum() {
             assert_eq!(
                 config.frontend_tls_watch_interval_seconds, 1,
                 "FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS=0 should clamp up to 1"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_secret_refresh_interval_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_SECRET_REFRESH_INTERVAL_SECONDS", "60"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.secret_refresh_interval_seconds, 60);
+        },
+    );
+}
+
+#[test]
+fn test_secret_refresh_interval_clamps_to_minimum() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_SECRET_REFRESH_INTERVAL_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.secret_refresh_interval_seconds, 1,
+                "FERRUM_SECRET_REFRESH_INTERVAL_SECONDS=0 should clamp up to 1"
             );
         },
     );

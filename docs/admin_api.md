@@ -41,6 +41,177 @@ curl http://localhost:9000/status
 
 Both endpoints return the same response and do not require JWT authentication, making them suitable for load balancer health probes.
 
+## TLS Inventory
+
+List configured TLS material sources and parsed certificate metadata:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9000/admin/tls/inventory?limit=100"
+```
+
+The response is paginated and includes each source's non-secret provenance, material kind, load state, certificate subject/issuer/SANs, validity window, SHA-256 certificate fingerprint, and the runtime/config surfaces using it. Inline PEM values and private key bytes are redacted. Unsupported URI providers are listed with `state: "unsupported"` until their runtime loader is enabled.
+
+Exact `/metrics` also refreshes this inventory at scrape time and emits `ferrum_tls_cert_expiry_seconds` and `ferrum_tls_cert_not_before_seconds` gauges for loaded certificate entries.
+
+## TLS Events
+
+List recent source watcher rotations and failures:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9000/admin/tls/events?surface=proxy_https&limit=100"
+```
+
+The event log is bounded and persisted under `FERRUM_TLS_MANAGED_STORE_PATH` as `tls-events.json`, so recent rotation history survives process restarts. It records successful rotations, source load failures, and rebuild failures with non-secret source identifiers and fingerprints for non-key material. No-op refresh polls are not stored as events; they are counted in `/metrics` through `ferrum_tls_source_refresh_total`; rotation outcomes, source fetch latency, and bounded fetch failure reasons are exposed as `ferrum_tls_cert_rotations_total`, `ferrum_tls_source_fetch_duration_seconds`, and `ferrum_tls_source_fetch_failures_total`.
+
+## TLS Forced Rotation
+
+Ask active TLS source watchers to re-pull their configured sources immediately:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9000/admin/tls/rotate/proxy_https"
+```
+
+Supported force-reload surfaces are `proxy_https`, `backend_tls`, `admin_https`, `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all` for every registered watcher plus the configured gateway SVID. Aliases `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`, `cp_grpc_tls`, `dp_grpc_tls`, and `gateway_svid` are accepted. Watcher-backed TLS reloads are enqueued and report success or failure asynchronously through `/admin/tls/events` and `/metrics`; `svid` reloads are validated synchronously and publish a backend SVID generation bump on success.
+
+## TLS Validation
+
+Validate PEM material without storing it:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cert_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+    "key_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+  }' \
+  http://localhost:9000/admin/tls/validate
+```
+
+`cert_pem` and `key_pem` must be submitted together. `ca_bundle_pem` and `crl_pem` can be validated independently. Private key bytes are never logged or persisted by this endpoint.
+
+## ACME-Issued Certificates
+
+Ferrum persists issued ACME certificates in the same TLS store directory used by managed TLS records. Imported records can be referenced from any TLS source field:
+
+```bash
+export FERRUM_FRONTEND_TLS_CERT_SOURCE="acme://certificates/edge-cert#cert"
+export FERRUM_FRONTEND_TLS_KEY_SOURCE="acme://certificates/edge-cert#key"
+```
+
+List, import, replace, or delete ACME-issued records:
+
+`GET/POST /admin/tls/acme/certificates`, `GET/PUT/DELETE /admin/tls/acme/certificates/{id}`
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "edge-cert",
+    "domains": ["api.example.com"],
+    "directory_url": "https://acme-v02.api.letsencrypt.org/directory",
+    "cert_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+    "key_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+  }' \
+  http://localhost:9000/admin/tls/acme/certificates
+```
+
+Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
+
+ACME HTTP-01, TLS-ALPN-01, and DNS-01 order issue flows are available under:
+
+`GET /admin/tls/acme/accounts`, `GET/POST /admin/tls/acme/orders`, `GET/DELETE /admin/tls/acme/orders/{id}`, `POST /admin/tls/acme/orders/{id}/finalize`, `POST /admin/tls/acme/renew/{cert_id}`
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "edge-order",
+    "certificate_id": "edge-cert",
+    "domains": ["api.example.com"],
+    "directory_url": "https://acme-staging-v02.api.letsencrypt.org/directory",
+    "contact": ["mailto:ops@example.com"],
+    "terms_of_service_agreed": true,
+    "challenge_type": "http01"
+  }' \
+  http://localhost:9000/admin/tls/acme/orders
+```
+
+Creating orders requires the optional `acme` Cargo feature. `challenge_type` defaults to `http01`; set it to `tls_alpn01` to prepare TLS-ALPN-01 challenge material or `dns01` to prepare DNS-01 TXT material. HTTP-01 responses include public key-authorization values and challenge paths. TLS-ALPN-01 responses include the SNI identifier, token, `acme-tls/1` ALPN protocol, and base64url SHA-256 digest embedded in the validation certificate's critical `acmeIdentifier` extension. DNS-01 responses include the identifier, token, TXT record name, and TXT value. While an order is `pending_challenges`, `ready`, or `processing`, proxy listeners serve HTTP-01 key authorizations at `/.well-known/acme-challenge/{token}` before normal route matching, and TLS listeners return the TLS-ALPN-01 validation certificate when the ClientHello offers only `acme-tls/1` and SNI matches an active challenge. DNS-01 TXT records must be published in authoritative DNS before finalization. Account credentials are persisted in the order store for follow-up ACME calls but are never returned.
+
+`GET /admin/tls/acme/accounts` lists non-secret account identifiers, ACME directory URLs, order/certificate counts, whether resumable credentials exist, and last-seen timestamps. It merges credentials from order records and the dedicated `acme-accounts.json` account store, but never returns credential material.
+
+After DNS points at the gateway and the HTTP-01 challenge path or TLS-ALPN-01 listener is externally reachable, or after DNS-01 TXT records are published, finalize the order:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"poll_timeout_seconds": 90}' \
+  http://localhost:9000/admin/tls/acme/orders/edge-order/finalize
+```
+
+Finalization marks the order's prepared HTTP-01, TLS-ALPN-01, or DNS-01 challenges ready with the ACME directory, waits for authorization/order readiness, finalizes the order, fetches the PEM certificate chain, persists it as the order's `certificate_id`, and asks active TLS source watchers to re-pull. The stored certificate can then be used through `acme://certificates/edge-cert#cert` and `acme://certificates/edge-cert#key`.
+
+To force renewal for an existing ACME certificate record, create a replacement order:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  http://localhost:9000/admin/tls/acme/renew/edge-cert
+```
+
+Ferrum reuses persisted account credentials from the latest order for that certificate when available. The request accepts the same `challenge_type` values as order creation. The response is a new order whose selected challenges must become reachable before calling `/admin/tls/acme/orders/{id}/finalize`.
+
+Automatic renewal can be enabled with `FERRUM_ACME_AUTO_RENEW_ENABLED=true`. The scheduler reuses persisted account credentials, renews certificates inside `FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS`, and finalizes HTTP-01/TLS-ALPN-01 renewals after Ferrum stores their challenge material. For DNS-01 renewals, set `FERRUM_ACME_DNS01_HOOK_COMMAND` to an executable that creates and cleans up provider TXT records; Ferrum passes the challenge through `FERRUM_ACME_DNS01_*` environment variables, waits `FERRUM_ACME_DNS01_PROPAGATION_SECONDS`, then finalizes the order.
+
+## Managed TLS Records
+
+Upload TLS material into Ferrum's file-backed managed store:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "edge-cert",
+    "name": "Edge certificate",
+    "cert_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+    "key_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+  }' \
+  http://localhost:9000/admin/tls/certificates
+```
+
+Managed certificates, CA bundles, OCSP responses, CRLs, and JWKS documents are available under:
+
+`GET/POST /admin/tls/certificates`, `GET/PUT/DELETE /admin/tls/certificates/{id}`
+
+`GET/POST /admin/tls/ca-bundles`, `GET/PUT/DELETE /admin/tls/ca-bundles/{id}`
+
+`GET/POST /admin/tls/crls`, `GET/PUT/DELETE /admin/tls/crls/{id}`
+
+`GET/POST /admin/tls/ocsp-responses`, `GET/PUT/DELETE /admin/tls/ocsp-responses/{id}`
+
+`GET/POST /admin/tls/jwks`, `GET/PUT/DELETE /admin/tls/jwks/{id}`
+
+Responses return non-secret metadata only: source URI, subject, issuer, SANs, validity, public-material fingerprint, counts, and timestamps. Private keys are persisted in the managed store but never returned. Configure the store directory with `FERRUM_TLS_MANAGED_STORE_PATH`; on Unix, the JSON store files are written with owner-only permissions.
+
+Create, update, and delete operations ask active TLS source watchers to re-pull immediately. Surfaces without a live watcher still pick up managed records when their owning config/runtime is rebuilt.
+
+Use managed records from any TLS source field:
+
+```bash
+export FERRUM_FRONTEND_TLS_CERT_SOURCE="managed://certificates/edge-cert#cert"
+export FERRUM_FRONTEND_TLS_KEY_SOURCE="managed://certificates/edge-cert#key"
+export FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE="managed://ocsp-responses/edge-ocsp#ocsp"
+export FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true
+```
+
+JWKS-capable plugin fields can reference `managed://jwks/{id}#jwks` once the plugin accepts `CertSource` JWKS material.
+
+`DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
+
 ## Proxies
 
 ```bash
@@ -341,7 +512,7 @@ Returns:
 
 See [admin_metrics.md](admin_metrics.md) for the full metrics reference.
 
-The unauthenticated exact `/metrics` endpoint returns Prometheus text exposition for scrapers. In mesh mode it includes `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_config_last_received_timestamp_seconds`, and `ferrum_mesh_mtls_handshake_failures_total` alongside request RED metrics. Mesh RED and certificate series include SPIFFE identity labels, so expose `/metrics` only on trusted scrape networks; in Kubernetes, put it behind a `NetworkPolicy` or a scrape-side reverse proxy when workload identity inventory is sensitive.
+The unauthenticated exact `/metrics` endpoint returns Prometheus text exposition for scrapers. It includes TLS inventory gauges `ferrum_tls_cert_expiry_seconds` and `ferrum_tls_cert_not_before_seconds` for loaded certificate sources, plus `ferrum_tls_cert_rotations_total`, `ferrum_tls_source_refresh_total`, `ferrum_tls_source_fetch_duration_seconds`, and `ferrum_tls_source_fetch_failures_total` for background source watcher activity. In mesh mode it also includes `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_config_last_received_timestamp_seconds`, and `ferrum_mesh_mtls_handshake_failures_total` alongside request RED metrics. Mesh RED and certificate series include SPIFFE identity labels, so expose `/metrics` only on trusted scrape networks; in Kubernetes, put it behind a `NetworkPolicy` or a scrape-side reverse proxy when workload identity inventory is sensitive.
 
 ### Runtime Metrics
 

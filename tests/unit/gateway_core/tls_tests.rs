@@ -509,6 +509,71 @@ fn test_load_tls_config_basic_no_client_auth() {
 }
 
 #[test]
+fn test_load_tls_config_accepts_inline_cert_source() {
+    ensure_crypto_provider();
+    let (cert_pem, key_pem) = generate_self_signed_cert(&["localhost"]);
+
+    let env = default_env_config();
+    let policy = TlsPolicy::from_env_config(&env).unwrap();
+
+    let result =
+        tls::load_tls_config_with_client_auth(&cert_pem, &key_pem, None, false, &policy, 30, &[]);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_load_tls_config_accepts_ocsp_response_source() {
+    ensure_crypto_provider();
+    let dir = TempDir::new().unwrap();
+    let (cert_pem, key_pem) = generate_self_signed_cert(&["localhost"]);
+    let cert_path = write_pem(&dir, "cert.pem", &cert_pem);
+    let key_path = write_pem(&dir, "key.pem", &key_pem);
+    let ocsp_path = dir.path().join("ocsp.der");
+    std::fs::write(&ocsp_path, [1_u8, 2, 3, 4]).unwrap();
+
+    let env = default_env_config();
+    let policy = TlsPolicy::from_env_config(&env).unwrap();
+
+    let result = tls::load_tls_config_with_client_auth_and_ocsp(
+        &cert_path,
+        &key_path,
+        None,
+        Some(ocsp_path.to_string_lossy().as_ref()),
+        false,
+        &policy,
+        30,
+        &[],
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_load_tls_config_rejects_empty_ocsp_response_source() {
+    ensure_crypto_provider();
+    let dir = TempDir::new().unwrap();
+    let (cert_pem, key_pem) = generate_self_signed_cert(&["localhost"]);
+    let cert_path = write_pem(&dir, "cert.pem", &cert_pem);
+    let key_path = write_pem(&dir, "key.pem", &key_pem);
+    let ocsp_path = dir.path().join("ocsp.der");
+    std::fs::write(&ocsp_path, []).unwrap();
+
+    let env = default_env_config();
+    let policy = TlsPolicy::from_env_config(&env).unwrap();
+
+    let result = tls::load_tls_config_with_client_auth_and_ocsp(
+        &cert_path,
+        &key_path,
+        None,
+        Some(ocsp_path.to_string_lossy().as_ref()),
+        false,
+        &policy,
+        30,
+        &[],
+    );
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_load_tls_config_with_client_auth_ca() {
     ensure_crypto_provider();
     let dir = TempDir::new().unwrap();

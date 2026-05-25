@@ -32,6 +32,7 @@ use super::utils::{
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 #[derive(Clone)]
 struct TcpFlushConfig {
@@ -260,26 +261,27 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
 
     if !cfg.tls_no_verify {
         if let Some(ca_path) = &cfg.tls_ca_bundle_path {
-            match std::fs::read(ca_path) {
-                Ok(ca_pem) => {
-                    let certs = rustls_pemfile::certs(&mut &ca_pem[..])
+            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+            match load_material_blocking(&source, MaterialKind::CaBundle) {
+                Ok(ca_material) => {
+                    let source_id = ca_material.source_id.clone();
+                    let mut reader = ca_material.bytes.expose_secret();
+                    let certs = rustls_pemfile::certs(&mut reader)
                         .filter_map(|cert| cert.ok())
                         .collect::<Vec<_>>();
                     if certs.is_empty() {
                         return Err(format!(
-                            "TCP logging: no valid certificates found in CA bundle {ca_path}"
+                            "TCP logging: no valid certificates found in CA bundle {source_id}"
                         ));
                     }
                     for cert in certs {
                         root_store.add(cert).map_err(|error| {
-                            format!("TCP logging: failed to add CA cert from {ca_path}: {error}")
+                            format!("TCP logging: failed to add CA cert from {source_id}: {error}")
                         })?;
                     }
                 }
                 Err(error) => {
-                    return Err(format!(
-                        "TCP logging: failed to read CA bundle {ca_path}: {error}"
-                    ));
+                    return Err(format!("TCP logging: failed to load CA bundle: {error}"));
                 }
             }
         } else {

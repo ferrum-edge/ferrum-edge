@@ -7,13 +7,13 @@ The Ferrum Edge Admin API exposes a comprehensive runtime metrics endpoint that 
 | Endpoint | Method | Auth | Cache | Description |
 |----------|--------|------|-------|-------------|
 | `/admin/metrics` | GET | JWT required | 5-second TTL | Comprehensive runtime metrics (JSON) |
-| `/metrics` | GET | None | 5-second TTL (configurable via `render_cache_ttl_seconds`) | Prometheus exposition format (plugin-based) |
+| `/metrics` | GET | None | 5-second TTL (configurable via `render_cache_ttl_seconds`) | Prometheus exposition format, including request and TLS certificate gauges |
 | `/health` | GET | None | None | Health check (DB connectivity, config status) |
 
 ### Metrics vs Prometheus vs Health
 
 - **`/admin/metrics`** — Rich JSON with connection pools, circuit breakers, health checks, cache stats, load balancer state, consumer index breakdown, and rate limiter counters. Ideal for custom dashboards.
-- **`/metrics`** — Prometheus text format with per-proxy request counters and latency histograms. Requires the `prometheus_metrics` plugin to be enabled. Best for Prometheus/Grafana scraping.
+- **`/metrics`** — Prometheus text format with per-proxy request counters, latency histograms, TLS certificate inventory gauges (`ferrum_tls_cert_expiry_seconds`, `ferrum_tls_cert_not_before_seconds`), certificate rotation counters (`ferrum_tls_cert_rotations_total`), TLS source watcher outcomes (`ferrum_tls_source_refresh_total`), source fetch duration histograms (`ferrum_tls_source_fetch_duration_seconds`), and source fetch failure counters (`ferrum_tls_source_fetch_failures_total`). Requires the `prometheus_metrics` plugin to be enabled. Best for Prometheus/Grafana scraping.
 - **`/health`** — Lightweight health probe for load balancers and orchestrators (Kubernetes liveness/readiness).
 
 ## Endpoint: `GET /admin/metrics`

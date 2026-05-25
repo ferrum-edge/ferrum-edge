@@ -486,25 +486,42 @@ Recommended options:
 
 ## TLS Certificate Rotation on Kubernetes
 
-Ferrum Edge does **not** hot-reload file-based TLS certificates or keys.
+Ferrum Edge can hot-reload frontend/admin TLS sources that are configured as
+`k8s://<namespace>/<secret>#<key>` and
+`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`. This is the recommended path
+for cert-manager-managed frontend/admin certificates because Ferrum watches the
+named `Secret` directly and queues a validated reload when the Secret changes.
+
+Ferrum Edge does **not** hot-reload arbitrary file-based TLS certificates or
+keys outside the frontend/admin live-reload surface.
 
 This applies to:
 
-- frontend TLS / admin TLS certs and keys
-- DTLS certs and keys
-- backend TLS CA bundles
-- backend mTLS client certs and keys
+- frontend TLS / admin TLS certs and keys unless live reload is enabled and the
+  fields are configured as paths, `file://`, `k8s://`, provider, or managed
+  sources
+- DTLS certs and keys unless frontend TLS live reload is enabled
+- backend TLS CA bundles and backend mTLS client certs/keys unless backend TLS
+  live reload is enabled
+- database TLS CA bundles and client certs/keys unless database TLS live reload
+  is enabled in database or CP mode
+- CP gRPC TLS cert/key/client-CA material unless the CP is configured with
+  file/provider/Kubernetes-backed sources
+- DP gRPC TLS CA/client cert/client key material unless the DP is configured
+  with file/provider/Kubernetes-backed sources
 
 Important Kubernetes nuance:
 
 - Kubernetes can update mounted `Secret` and projected volume contents in a running Pod.
-- Ferrum Edge does **not** watch those files and does **not** rebuild its TLS state just because the mounted file changed.
-- Updating a Secret at the same mount path is therefore **not sufficient by itself** to make Ferrum use the new cert material.
+- Ferrum Edge only rebuilds TLS state for surfaces with live reload enabled. Updating a Secret at the same mount path is therefore **not sufficient by itself** for static TLS surfaces.
 
 Operational recommendation:
 
-- Update the `Secret` or certificate source.
-- Perform a **rolling restart / rolling redeploy** of the Ferrum workload so each Pod starts fresh and reloads the new TLS files from disk.
+- For frontend/admin TLS and frontend DTLS, prefer `k8s://` sources with live reload enabled so a Secret update applies without a pod restart.
+- For backend HTTP-family TLS, keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` and prefer `k8s://` sources so a Secret update applies without a pod restart.
+- For database TLS in database/CP modes, set `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` and prefer `k8s://` sources so a Secret update reconnects DB pools/clients without a pod restart.
+- For CP gRPC server TLS, prefer `k8s://` sources; a Secret update swaps the active server TLS slot for new gRPC handshakes without a pod restart.
+- For DP gRPC TLS, prefer `k8s://` sources; a Secret update forces the CP stream to reconnect with rotated CA/client cert/key material.
 - Keep readiness probes enabled so traffic stays on healthy Pods during the rollout.
 
 If you use `subPath` mounts for cert files, note that Kubernetes does not propagate Secret updates to those paths in running Pods. In that setup, a restart is required even to get the new file content into the container filesystem.

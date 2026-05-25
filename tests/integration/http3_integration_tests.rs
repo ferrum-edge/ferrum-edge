@@ -403,6 +403,7 @@ async fn test_http3_proxy_state_creation() {
         ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tls_policy: None,
         crls: std::sync::Arc::new(Vec::new()),
+        shared_crls: ferrum_edge::tls::shared_crl_list(std::sync::Arc::new(Vec::new())),
         overload: std::sync::Arc::new(ferrum_edge::overload::OverloadState::new()),
         adaptive_buffer: std::sync::Arc::new(
             ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
@@ -669,6 +670,7 @@ async fn test_http3_full_integration() {
         ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tls_policy: None,
         crls: std::sync::Arc::new(Vec::new()),
+        shared_crls: ferrum_edge::tls::shared_crl_list(std::sync::Arc::new(Vec::new())),
         overload: std::sync::Arc::new(ferrum_edge::overload::OverloadState::new()),
         adaptive_buffer: std::sync::Arc::new(
             ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(

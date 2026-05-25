@@ -7,7 +7,7 @@
 //! watcher.  When the operator opts in, the helpers additionally build a
 //! `SharedFrontendTls` slot pre-populated with the loaded config and spawn a
 //! poll task that re-runs the same load (`load_tls_config_with_client_auth`
-//! plus the surface-specific post-load options) on cert/key changes,
+//! plus the surface-specific post-load options) on watched source changes,
 //! atomically swapping the slot on success and warning-and-keeping the old
 //! slot on validation failure.
 //!
@@ -15,7 +15,6 @@
 //! it can rebuild the `quinn::ServerConfig` after a swap; see
 //! [`crate::http3::server::Http3FrontendTlsReload`].
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +24,10 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::config::EnvConfig;
+use crate::tls::source::subscription::{
+    WatchedMaterialSource, material_set_poll_interval, source_is_refreshable,
+};
+use crate::tls::source::{CertSource, MaterialKind};
 use crate::tls::{
     self, CrlList, FrontendTlsRebuildFn, FrontendTlsReloadConfig, SharedFrontendTls, TlsPolicy,
     empty_frontend_tls_slot, frontend_tls_slot_with, spawn_frontend_tls_reload_task,
@@ -88,18 +91,64 @@ pub fn prepare_proxy_frontend_tls(
             watcher_handle: None,
         };
     };
+    let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
+    let key_source = CertSource::parse(key_path, MaterialKind::Key);
+    let client_ca_source = env_config
+        .frontend_tls_client_ca_bundle_path
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::CaBundle));
+    let ocsp_source = env_config
+        .frontend_tls_ocsp_response_source
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::Ocsp));
+    let crl_source = env_config
+        .tls_crl_file_path
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::Crl));
+    let watched_sources = frontend_watched_sources(
+        &cert_source,
+        &key_source,
+        client_ca_source.as_ref(),
+        ocsp_source.as_ref(),
+        crl_source.as_ref(),
+    );
+    if !watched_sources
+        .iter()
+        .any(|source| source_is_refreshable(&source.source))
+    {
+        info!(
+            "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true but frontend TLS sources are static inline material; live reload disabled for proxy HTTPS"
+        );
+        return ProxyFrontendTlsReloadHandles {
+            slot: None,
+            revision_rx: None,
+            watcher_handle: None,
+        };
+    };
 
     let slot = frontend_tls_slot_with(tls_config);
     let (revision_tx, revision_rx) = watch::channel(0u64);
-    let interval = Duration::from_secs(env_config.frontend_tls_watch_interval_seconds.max(1));
+    let interval = material_set_poll_interval(
+        &watched_sources,
+        Duration::from_secs(env_config.frontend_tls_watch_interval_seconds.max(1)),
+        Duration::from_secs(env_config.secret_refresh_interval_seconds.max(1)),
+    );
 
-    let rebuild = build_proxy_rebuild_fn(env_config, tls_policy, crls);
+    let rebuild = build_proxy_rebuild_fn(
+        env_config,
+        tls_policy,
+        crls,
+        cert_source,
+        key_source,
+        client_ca_source,
+        ocsp_source,
+        env_config.tls_crl_file_path.clone(),
+    );
 
     let handle = spawn_frontend_tls_reload_task(
         FrontendTlsReloadConfig {
             surface: "proxy_https",
-            cert_path: cert_path.into(),
-            key_path: key_path.into(),
+            sources: watched_sources,
             slot: slot.clone(),
             interval,
             revision_tx,
@@ -115,43 +164,80 @@ pub fn prepare_proxy_frontend_tls(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_proxy_rebuild_fn(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &CrlList,
+    cert_source: CertSource,
+    key_source: CertSource,
+    client_ca_source: Option<CertSource>,
+    ocsp_source: Option<CertSource>,
+    crl_source_value: Option<String>,
 ) -> FrontendTlsRebuildFn {
-    let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.clone();
     let warning_days = env_config.tls_cert_expiry_warning_days;
     let ktls_could_be_enabled = env_config.ktls_enabled.could_be_enabled();
     let policy = tls_policy.clone();
-    let crls = crls.clone();
+    let startup_crls = crls.clone();
 
-    Box::new(
-        move |cert_path: &Path, key_path: &Path| -> Result<Arc<ServerConfig>, anyhow::Error> {
-            let cert_path_str = cert_path
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("frontend TLS cert path is not valid UTF-8"))?;
-            let key_path_str = key_path
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("frontend TLS key path is not valid UTF-8"))?;
-            let mut config = tls::load_tls_config_with_client_auth(
-                cert_path_str,
-                key_path_str,
-                client_ca_bundle_path.as_deref(),
-                false,
-                &policy,
-                warning_days,
-                &crls,
-            )?;
-            // Reapply the proxy-frontend-specific opt-ins so rotated configs
-            // match startup semantics (0-RTT, kTLS secret extraction).
-            tls::enable_early_data(&mut config, &policy);
-            if ktls_could_be_enabled {
-                tls::enable_secret_extraction_for_ktls(&mut config);
-            }
-            Ok(config)
-        },
-    )
+    Box::new(move || -> Result<Arc<ServerConfig>, anyhow::Error> {
+        let active_crls = match crl_source_value.as_deref() {
+            Some(source) => tls::load_crls(Some(source))?,
+            None => startup_crls.clone(),
+        };
+        let mut config = tls::load_tls_config_with_client_auth_from_sources_and_ocsp(
+            &cert_source,
+            &key_source,
+            client_ca_source.as_ref(),
+            ocsp_source.as_ref(),
+            false,
+            &policy,
+            warning_days,
+            &active_crls,
+        )?;
+        // Reapply the proxy-frontend-specific opt-ins so rotated configs
+        // match startup semantics (0-RTT, kTLS secret extraction).
+        tls::enable_early_data(&mut config, &policy);
+        if ktls_could_be_enabled {
+            tls::enable_secret_extraction_for_ktls(&mut config);
+        }
+        Ok(config)
+    })
+}
+
+fn frontend_watched_sources(
+    cert_source: &CertSource,
+    key_source: &CertSource,
+    client_ca_source: Option<&CertSource>,
+    ocsp_source: Option<&CertSource>,
+    crl_source: Option<&CertSource>,
+) -> Vec<WatchedMaterialSource> {
+    let mut sources = vec![
+        WatchedMaterialSource::new("cert", cert_source.clone(), MaterialKind::Cert),
+        WatchedMaterialSource::new("key", key_source.clone(), MaterialKind::Key),
+    ];
+    if let Some(client_ca_source) = client_ca_source {
+        sources.push(WatchedMaterialSource::new(
+            "client_ca",
+            client_ca_source.clone(),
+            MaterialKind::CaBundle,
+        ));
+    }
+    if let Some(ocsp_source) = ocsp_source {
+        sources.push(WatchedMaterialSource::new(
+            "ocsp",
+            ocsp_source.clone(),
+            MaterialKind::Ocsp,
+        ));
+    }
+    if let Some(crl_source) = crl_source {
+        sources.push(WatchedMaterialSource::new(
+            "crl",
+            crl_source.clone(),
+            MaterialKind::Crl,
+        ));
+    }
+    sources
 }
 
 /// Result of wiring the admin frontend TLS live-reload path. When live reload
@@ -195,18 +281,63 @@ pub fn prepare_admin_frontend_tls(
             watcher_handle: None,
         };
     };
+    let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
+    let key_source = CertSource::parse(key_path, MaterialKind::Key);
+    let client_ca_source = env_config
+        .admin_tls_client_ca_bundle_path
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::CaBundle));
+    let ocsp_source = env_config
+        .admin_tls_ocsp_response_source
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::Ocsp));
+    let crl_source = env_config
+        .tls_crl_file_path
+        .clone()
+        .map(|source| CertSource::parse(source, MaterialKind::Crl));
+    let watched_sources = frontend_watched_sources(
+        &cert_source,
+        &key_source,
+        client_ca_source.as_ref(),
+        ocsp_source.as_ref(),
+        crl_source.as_ref(),
+    );
+    if !watched_sources
+        .iter()
+        .any(|source| source_is_refreshable(&source.source))
+    {
+        info!(
+            "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true but admin TLS sources are static inline material; live reload disabled for admin HTTPS"
+        );
+        return AdminFrontendTlsReloadHandles {
+            slot: None,
+            watcher_handle: None,
+        };
+    };
 
     let slot = frontend_tls_slot_with(tls_config);
     let (revision_tx, _revision_rx) = watch::channel(0u64);
-    let interval = Duration::from_secs(env_config.frontend_tls_watch_interval_seconds.max(1));
+    let interval = material_set_poll_interval(
+        &watched_sources,
+        Duration::from_secs(env_config.frontend_tls_watch_interval_seconds.max(1)),
+        Duration::from_secs(env_config.secret_refresh_interval_seconds.max(1)),
+    );
 
-    let rebuild = build_admin_rebuild_fn(env_config, tls_policy, crls);
+    let rebuild = build_admin_rebuild_fn(
+        env_config,
+        tls_policy,
+        crls,
+        cert_source,
+        key_source,
+        client_ca_source,
+        ocsp_source,
+        env_config.tls_crl_file_path.clone(),
+    );
 
     let handle = spawn_frontend_tls_reload_task(
         FrontendTlsReloadConfig {
             surface: "admin_https",
-            cert_path: cert_path.into(),
-            key_path: key_path.into(),
+            sources: watched_sources,
             slot: slot.clone(),
             interval,
             revision_tx,
@@ -221,36 +352,38 @@ pub fn prepare_admin_frontend_tls(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_admin_rebuild_fn(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &CrlList,
+    cert_source: CertSource,
+    key_source: CertSource,
+    client_ca_source: Option<CertSource>,
+    ocsp_source: Option<CertSource>,
+    crl_source_value: Option<String>,
 ) -> FrontendTlsRebuildFn {
-    let admin_client_ca_bundle_path = env_config.admin_tls_client_ca_bundle_path.clone();
     let admin_no_verify = env_config.admin_tls_no_verify;
     let warning_days = env_config.tls_cert_expiry_warning_days;
     let policy = tls_policy.clone();
-    let crls = crls.clone();
+    let startup_crls = crls.clone();
 
-    Box::new(
-        move |cert_path: &Path, key_path: &Path| -> Result<Arc<ServerConfig>, anyhow::Error> {
-            let cert_path_str = cert_path
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("admin TLS cert path is not valid UTF-8"))?;
-            let key_path_str = key_path
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("admin TLS key path is not valid UTF-8"))?;
-            tls::load_tls_config_with_client_auth(
-                cert_path_str,
-                key_path_str,
-                admin_client_ca_bundle_path.as_deref(),
-                admin_no_verify,
-                &policy,
-                warning_days,
-                &crls,
-            )
-        },
-    )
+    Box::new(move || -> Result<Arc<ServerConfig>, anyhow::Error> {
+        let active_crls = match crl_source_value.as_deref() {
+            Some(source) => tls::load_crls(Some(source))?,
+            None => startup_crls.clone(),
+        };
+        tls::load_tls_config_with_client_auth_from_sources_and_ocsp(
+            &cert_source,
+            &key_source,
+            client_ca_source.as_ref(),
+            ocsp_source.as_ref(),
+            admin_no_verify,
+            &policy,
+            warning_days,
+            &active_crls,
+        )
+    })
 }
 
 /// Suppress unused-`empty_frontend_tls_slot` lint when none of the modes
@@ -404,6 +537,24 @@ mod tests {
             .watcher_handle
             .expect("live reload should spawn a watcher task");
         handle.abort();
+    }
+
+    #[test]
+    fn frontend_watched_sources_include_optional_client_ca_and_crl() {
+        let cert = CertSource::parse("/tmp/cert.pem", MaterialKind::Cert);
+        let key = CertSource::parse("/tmp/key.pem", MaterialKind::Key);
+        let client_ca = CertSource::parse("/tmp/client-ca.pem", MaterialKind::CaBundle);
+        let ocsp = CertSource::parse("/tmp/ocsp.der", MaterialKind::Ocsp);
+        let crl = CertSource::parse("/tmp/revocations.pem", MaterialKind::Crl);
+
+        let watched =
+            frontend_watched_sources(&cert, &key, Some(&client_ca), Some(&ocsp), Some(&crl));
+        let labels = watched
+            .iter()
+            .map(|source| source.label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["cert", "key", "client_ca", "ocsp", "crl"]);
     }
 
     #[test]

@@ -69,6 +69,48 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+  test-pkcs11-softhsm:
+    name: PKCS#11 SoftHSM Smoke Test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-test-pkcs11"
+
+      - name: Install SoftHSM and OpenSC tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y softhsm2 opensc
+
+      - name: Initialize SoftHSM token
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/softhsm/tokens"
+          cat > "$RUNNER_TEMP/softhsm/softhsm2.conf" <<EOF
+          directories.tokendir = $RUNNER_TEMP/softhsm/tokens
+          objectstore.backend = file
+          log.level = ERROR
+          slots.removable = false
+          EOF
+          export SOFTHSM2_CONF="$RUNNER_TEMP/softhsm/softhsm2.conf"
+          softhsm2-util --init-token --free --label ferrum-ci --so-pin 1234 --pin 123456
+          pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
+            --login --pin 123456 --token-label ferrum-ci \
+            --keypairgen --key-type rsa:2048 \
+            --label edge-rsa --id 01 --usage-sign
+          echo "SOFTHSM2_CONF=$SOFTHSM2_CONF" >> "$GITHUB_ENV"
+
+      - name: Run PKCS#11 signer smoke test
+        run: cargo test --features pkcs11 --lib tls::pkcs11::tests::signer_loads_configured_token_and_signs -- --ignored
+        env:
+          FERRUM_PKCS11_MODULE_PATH: /usr/lib/softhsm/libsofthsm2.so
+          FERRUM_PKCS11_PIN: "123456"
+          FERRUM_PKCS11_TEST_KEY_SOURCE: "pkcs11://edge-rsa?pin_env=FERRUM_PKCS11_PIN&id_hex=01"
+          RUST_BACKTRACE: 1
+
   test-integration:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external

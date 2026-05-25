@@ -153,6 +153,11 @@ pub async fn run(
     };
     // Convert to Arc for sharing across tasks
     let db: Arc<dyn DatabaseBackend> = Arc::from(db);
+    let db_tls_reload_handle = crate::modes::db_tls_reload::start_db_tls_reload_task(
+        env_config.clone(),
+        db.clone(),
+        Some(shutdown_tx.subscribe()),
+    );
 
     // If we used the offline-bootstrap path above, try to apply the deferred
     // migrations immediately. The DB may have been unreachable only during
@@ -399,6 +404,8 @@ pub async fn run(
         env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
     );
+    let acme_renewal_handle =
+        crate::modes::start_acme_renewal_scheduler(&env_config, shutdown_tx.subscribe());
 
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
@@ -407,10 +414,11 @@ pub async fn run(
     ) {
         info!("Loading TLS configuration with client certificate verification...");
         let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
-        match tls::load_tls_config_with_client_auth(
+        match tls::load_tls_config_with_client_auth_and_ocsp(
             cert_path,
             key_path,
             client_ca_bundle_path,
+            env_config.frontend_tls_ocsp_response_source.as_deref(),
             false,
             &tls_policy,
             env_config.tls_cert_expiry_warning_days,
@@ -696,10 +704,11 @@ pub async fn run(
 
         // Load admin TLS configuration
         let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        let admin_tls_config = match tls::load_tls_config_with_client_auth(
+        let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
             admin_cert_path,
             admin_key_path,
             admin_client_ca_bundle,
+            env_config.admin_tls_ocsp_response_source.as_deref(),
             env_config.admin_tls_no_verify,
             &tls_policy,
             env_config.tls_cert_expiry_warning_days,
@@ -1212,6 +1221,12 @@ pub async fn run(
         let _ = runtime_system_handle.await;
         let _ = runtime_window_handle.await;
         if let Some(h) = per_ip_cleanup_handle {
+            let _ = h.await;
+        }
+        if let Some(h) = db_tls_reload_handle {
+            let _ = h.await;
+        }
+        if let Some(h) = acme_renewal_handle {
             let _ = h.await;
         }
         for h in health_check_handles {
