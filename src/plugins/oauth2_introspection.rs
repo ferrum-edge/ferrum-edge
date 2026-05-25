@@ -221,13 +221,14 @@ impl Oauth2Introspection {
             }
 
             let cache_key = format!(
-                "{}|{}",
+                "{}|{}|{}",
                 endpoint
                     .as_ref()
                     .map(|parsed| parsed.url.as_str())
                     .or_else(|| discovery.as_ref().map(|parsed| parsed.url.as_str()))
                     .unwrap_or("pending"),
-                client_auth.client_id_for_cache()
+                client_auth.client_id_for_cache(),
+                provider_policy_cache_fragment(issuer.as_deref(), &audiences),
             );
             let cache = get_or_create_introspection_cache(
                 &cache_key,
@@ -614,6 +615,13 @@ impl Oauth2Introspection {
             _ => Oauth2ExtractedCredential::Missing,
         }
     }
+}
+
+fn provider_policy_cache_fragment(issuer: Option<&str>, audiences: &[String]) -> String {
+    let mut key = issuer.unwrap_or_default().to_string();
+    key.push('|');
+    key.push_str(&audiences.join(","));
+    key
 }
 
 enum IntrospectionDecision {
