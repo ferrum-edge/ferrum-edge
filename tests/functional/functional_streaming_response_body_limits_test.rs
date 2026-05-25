@@ -86,15 +86,32 @@ async fn functional_streaming_response_body_limit_h2_without_content_length() {
         .uri(format!("http://127.0.0.1:{}/stream", gateway.proxy_port))
         .body(Empty::<Bytes>::new())
         .expect("build h2 request");
-    let resp = sender.send_request(req).await.expect("send h2 request");
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body_result = resp
-        .into_body()
-        .collect()
-        .await
-        .map(|collected| collected.to_bytes().to_vec());
-    assert_streaming_body_cutoff(body_result);
+    // The proxy's streaming response-body limit aborts the H2 response when
+    // the chunked backend body exceeds the cap. Two equivalent outcomes are
+    // accepted:
+    //   * Headers arrive (status 200), then the body collect surfaces a
+    //     truncated body (or a body-collect error from the reset).
+    //   * The proxy resets the stream before any headers can be flushed —
+    //     `send_request` surfaces the RST_STREAM directly. This is a hyper
+    //     scheduling race observed on the GitHub-hosted runner; semantically
+    //     it is the same "body cutoff" outcome.
+    match sender.send_request(req).await {
+        Ok(resp) => {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body_result = resp
+                .into_body()
+                .collect()
+                .await
+                .map(|collected| collected.to_bytes().to_vec());
+            assert_streaming_body_cutoff(body_result);
+        }
+        Err(err) => {
+            assert!(
+                err.to_string().contains("Reset"),
+                "unexpected send_request error: {err}"
+            );
+        }
+    }
     assert_backend_hit_once(&backend_hits).await;
 
     drop(sender);
