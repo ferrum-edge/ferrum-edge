@@ -113,6 +113,7 @@ jobs:
               integration::log_schema_integration_tests
               integration::log_schema_registry_tests
               integration::deferred_log_tests
+              integration::api_chargeback_sink_tests
           - shard: mesh-routing
             # End-to-end mesh dispatch + authz + DestinationRule + sidecar
             # tests. Heaviest mesh slice tests since each one stands up a
