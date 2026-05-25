@@ -68,7 +68,7 @@ paths:
 - HTTP/3: quinn/h3 standalone server to `Http3ConnectionPool` or cross-protocol bridge; streaming through the shared H3 coalescer.
 - gRPC: hyper H2 direct through `GrpcConnectionPool`, not reqwest, to preserve trailers.
 - WebSocket: hyper upgrade or H2/H3 Extended CONNECT to backend WebSocket transport; persistent and frame-by-frame.
-- TCP: `TcpListener` to `TcpStream::connect`; splice on Linux for eligible plain/kTLS paths, else userspace copy.
+- TCP: `TcpListener` to `TcpStream::connect`; splice on Linux unconditionally for plain-to-plain (and for TLS frontends when kTLS install succeeds), else userspace copy. The splice loops enforce `tcp_idle_timeout_seconds`, `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` inline via per-direction watermarks — there is no eligibility gate based on timeout configuration.
 - UDP: `UdpSocket` per session; GSO-batched send on Linux.
 - `Proxy.dispatch_kind` is precomputed at config load by `GatewayConfig::resolve_dispatch_kind()`.
 - Buffer only when a plugin requires request/response body buffering or retry needs replay. SSE always streams.
@@ -92,9 +92,9 @@ paths:
 - Passthrough is stream-only, mutually exclusive with `frontend_tls`, and rejects backend TLS fields.
 - `StreamConnectionContext.sni_hostname` and `consumer_username` from `effective_identity()` must flow to stream lifecycle plugins.
 - Do not move terminating TLS/DTLS frontends to backend-first ordering.
-- TCP fast path is enabled only when idle timeout, half-close max wait, backend read timeout, and backend write timeout are all zero.
-- Direction-tracking TCP relay is the default when any bound is nonzero; it provides idle timeout, half-close cap, byte counters, and first-failure attribution.
-- TCP read/write timeouts refresh on read progress or partial-write progress. Slow but progressing backends must not be classified as inactive.
+- TCP userspace `copy_bidirectional` fast path is enabled only when idle timeout, half-close max wait, backend read timeout, and backend write timeout are all zero. The Linux splice and io_uring splice paths enforce these bounds inline and stay engaged regardless of timeout configuration.
+- Direction-tracking userspace TCP relay is the default when any bound is nonzero; it provides idle timeout, half-close cap, byte counters, and first-failure attribution.
+- TCP read/write timeouts refresh on read progress or partial-write progress. Slow but progressing backends must not be classified as inactive. This applies to userspace copy, splice, io_uring splice, and kTLS splice paths uniformly — `splice_one_direction_no_guard`, `libc_splice_loop`, and `io_uring_splice_loop` refresh the same per-direction watermarks the userspace path uses.
 - Stream proxy port validation happens at config, admin API, startup reconcile, and runtime reconcile. Startup bind is fatal in db/file and non-fatal in DP. Runtime reconcile never crashes.
 - DP does not revalidate CP-pushed port conflicts; bind failure skips only the conflicting proxy.
 

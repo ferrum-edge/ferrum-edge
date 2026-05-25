@@ -17,6 +17,7 @@ pub mod jwks_store;
 pub mod log_helpers;
 pub mod log_schema;
 pub mod metadata_redaction;
+pub mod query;
 pub mod rate_limit;
 pub mod redis_rate_limiter;
 pub mod response_body;
