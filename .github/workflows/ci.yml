@@ -112,7 +112,7 @@ jobs:
           RUST_BACKTRACE: 1
 
   build-integration-tests-archive:
-    name: Build Integration Tests Archive (Linux X64)
+    name: Build Integration Tests Archive
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -120,7 +120,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-test"
+          shared-key: "ci-test-integration-archive"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@213ccc1a076163c093f914550b94feb90fab916d # v2
@@ -129,8 +129,10 @@ jobs:
 
       - name: Build ferrum-cni binary
         # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, which
-        # resolves to target/debug/ferrum-cni in the checked-out workspace.
-        # Re-create that path in shard runners with this uploaded binary.
+        # Cargo bakes in as target/debug/ferrum-cni under the workspace path
+        # used to build the archive. Keep archive builders and shard runners on
+        # matching OS/arch + checkout layout, or update this artifact/path with
+        # any future runner/workspace/target-dir change.
         run: cargo build --bin ferrum-cni
 
       - name: Build integration tests archive
@@ -429,7 +431,7 @@ jobs:
           if-no-files-found: error
 
   build-functional-tests-archive:
-    name: Build Functional Tests Archive (Linux X64)
+    name: Build Functional Tests Archive
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -860,8 +862,7 @@ jobs:
                 echo "::warning title=Gateway API conformance retry::${test_name} attempt ${attempt}/${MAX_ATTEMPTS}"
               fi
               test_log="$results/gateway-api-conformance-${test_name}-attempt${attempt}.json"
-              set +e
-              go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
+              if go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
                 --gateway-class=ferrum \
                 --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
                 --run-test="$test_name" \
@@ -872,9 +873,11 @@ jobs:
                 --version="${GITHUB_SHA}" \
                 --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
                 --report-output="$test_report" \
-                2>&1 | tee "$test_log"
-              test_status=${PIPESTATUS[0]}
-              set -e
+                2>&1 | tee "$test_log"; then
+                test_status=0
+              else
+                test_status=${PIPESTATUS[0]}
+              fi
               cat "$test_log" >> "$results/gateway-api-conformance-test.json"
               if [ "$test_status" -eq 0 ]; then
                 break

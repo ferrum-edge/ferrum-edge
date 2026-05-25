@@ -189,8 +189,7 @@ jobs:
                 echo "::warning title=Gateway API conformance retry::${test_name} attempt ${attempt}/${MAX_ATTEMPTS}"
               fi
               test_log="$results/gateway-api-conformance-${test_name}-attempt${attempt}.json"
-              set +e
-              go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
+              if go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
                 --gateway-class=ferrum \
                 --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
                 --run-test="$test_name" \
@@ -201,9 +200,11 @@ jobs:
                 --version="${GITHUB_SHA}" \
                 --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
                 --report-output="$test_report" \
-                2>&1 | tee "$test_log"
-              test_status=${PIPESTATUS[0]}
-              set -e
+                2>&1 | tee "$test_log"; then
+                test_status=0
+              else
+                test_status=${PIPESTATUS[0]}
+              fi
               cat "$test_log" >> "$results/gateway-api-conformance-test.json"
               if [ "$test_status" -eq 0 ]; then
                 break
