@@ -32,13 +32,26 @@ impl DpopJtiCache {
     }
 
     pub fn check_and_insert(&self, jkt: &str, jti: &str, now: Instant) -> bool {
-        self.evict_expired(now);
         let key = format!("{jkt}|{jti}");
-        if self.entries.contains_key(&key) {
+        // A still-live entry for this (jkt, jti) is a replay. An expired entry
+        // is not: the proof carrying it would already have failed its own `exp`
+        // check before reaching here, so it is safe to overwrite. The `get`
+        // guard holds a shard lock, so it is scoped to this statement and
+        // dropped before the inserts/evictions below to avoid self-deadlock.
+        let is_live_replay = self
+            .entries
+            .get(&key)
+            .is_some_and(|existing| existing.expires_at > now);
+        if is_live_replay {
             return false;
         }
+        // Evict lazily, only when at capacity (mirrors IntrospectionCache), so
+        // the O(N) `retain` scan never runs on the per-request DPoP hot path.
         if self.entries.len() >= self.max_entries {
-            self.evict_one(now);
+            self.evict_expired(now);
+            if self.entries.len() >= self.max_entries {
+                self.evict_one(now);
+            }
         }
         self.entries.insert(
             key,
@@ -243,6 +256,17 @@ mod tests {
         let now = Instant::now();
         assert!(cache.check_and_insert("jkt", "jti", now));
         assert!(!cache.check_and_insert("jkt", "jti", now));
+    }
+
+    #[test]
+    fn expired_jti_is_not_treated_as_live_replay() {
+        let cache = DpopJtiCache::new(10, Duration::from_secs(60), 4);
+        let now = Instant::now();
+        assert!(cache.check_and_insert("jkt", "jti", now));
+        // Past the TTL the same jti is accepted again: lazy eviction means the
+        // stale entry may still be present, so the replay check must compare
+        // against `expires_at` rather than mere key presence.
+        assert!(cache.check_and_insert("jkt", "jti", now + Duration::from_secs(61)));
     }
 
     #[test]
