@@ -347,7 +347,8 @@ TCP connections are monitored for idle activity. When no data is transferred in 
 - A watchdog compares the last activity timestamp against the timeout. It ticks every 1 second for sub-30s timeouts and every 5 seconds for 30s+ timeouts, reducing timer churn for production-length connections
 - When the timeout fires, the connection is closed gracefully and logged as a TCP idle timeout
 - Connections with active data flow in either direction are never affected
-- When the TCP idle timeout, TCP half-close cap, `backend_read_timeout_ms`, and `backend_write_timeout_ms` are all disabled (`0`), TLS userspace relays use the `copy_bidirectional` fast path. On Linux, plaintext TCP connections (no TLS on either side) use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. When `FERRUM_KTLS_ENABLED=auto` or `true` and the kernel `tls` module is loaded, frontend-TLS connections with AES-GCM cipher suites also use splice — the kernel handles encrypt/decrypt via kTLS
+- On Linux, plaintext TCP connections (no TLS on either side) always use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. The splice loops enforce `tcp_idle_timeout_seconds`, `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` directly via per-direction watermarks, so configuring any of those does not demote the connection to a userspace copy. When `FERRUM_KTLS_ENABLED=auto` or `true` and the kernel `tls` module is loaded, frontend-TLS connections with AES-GCM cipher suites also use splice — the kernel handles encrypt/decrypt via kTLS
+- TLS userspace relays additionally collapse to `tokio::io::copy_bidirectional_with_sizes` (no per-direction tracking) when the TCP idle timeout, TCP half-close cap, `backend_read_timeout_ms`, and `backend_write_timeout_ms` are all disabled (`0`); any non-zero bound opts into the direction-tracking copy path
 
 ```yaml
 proxies:
@@ -377,7 +378,7 @@ Both default to 30,000 ms. Set to **`0` to disable** per-direction enforcement f
 
 **Watchdog granularity**: The watchdog ticks every 1 second when the shortest active timeout is below 30 seconds, and every 5 seconds when all active timeouts are 30 seconds or longer. A configured 5,000 ms timeout therefore fires within ~6 s; the default 30,000 ms backend timeouts fire within ~35 s. This keeps short test/dev timeouts responsive while reducing per-connection timer churn for production-length TCP sessions.
 
-**Splice/kTLS paths**: The per-direction inactivity timeouts only apply to the `bidirectional_copy` userspace relay path. The Linux `splice(2)`, io_uring splice, and kTLS-accelerated splice paths have no per-read hook and continue to rely on `tcp_idle_timeout_seconds`.
+**Splice/kTLS paths**: The per-direction inactivity timeouts apply to the Linux `splice(2)`, io_uring splice, and kTLS-accelerated splice paths too. Each direction carries a watermark refreshed on every successful splice syscall (read or write), and the same watchdog cadence (1 s under 30 s timeouts, 5 s otherwise) checks them. For the io_uring path the watermark is polled inline inside the blocking worker; on timeout the worker returns a sentinel error and the parent issues a `shutdown(SHUT_RDWR)` to unblock the other worker if needed.
 
 ## UDP Session Management
 

@@ -8162,6 +8162,17 @@ components:
         include_service:
           type: boolean
           default: true
+        reject_duplicate_query_keys:
+          type: boolean
+          default: true
+          description: >-
+            When include_query is enabled, reject requests whose query string
+            contains duplicate keys with conflicting values (e.g. a=1&a=2) to
+            prevent OPA/backend authorization mismatch. Identical-value
+            duplicates (a=1&a=1) are allowed. Rejection uses the configured
+            deny_status and deny_body. Set to false for APIs that use
+            array-style repeated query keys, or disable include_query entirely
+            to skip the check.
         redact_headers:
           type: array
           items:
