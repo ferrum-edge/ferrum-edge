@@ -1370,18 +1370,23 @@ fn test_proxy_tls_paths_control_chars() {
 #[test]
 fn test_proxy_tls_cert_file_not_found() {
     let mut proxy = make_proxy("test", "/api");
+    // TLS-enabled scheme so the cert/key paths are valid to set; isolates the
+    // file-loading failure this test asserts on from the scheme-mismatch check.
+    proxy.backend_scheme = Some(BackendScheme::Https);
     proxy.backend_tls_client_cert_path = Some("/nonexistent/cert.pem".into());
     proxy.backend_tls_client_key_path = Some("/nonexistent/key.pem".into());
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("backend_tls_client_cert_path") && e.contains("failed to open")),
+            .any(|e| e.contains("backend_tls_client_cert_path")
+                && e.contains("failed to read TLS material")),
         "Expected cert file-not-found error, got: {:?}",
         errs
     );
     assert!(
         errs.iter()
-            .any(|e| e.contains("backend_tls_client_key_path") && e.contains("failed to open")),
+            .any(|e| e.contains("backend_tls_client_key_path")
+                && e.contains("failed to read TLS material")),
         "Expected key file-not-found error, got: {:?}",
         errs
     );
@@ -1390,11 +1395,13 @@ fn test_proxy_tls_cert_file_not_found() {
 #[test]
 fn test_proxy_tls_ca_cert_file_not_found() {
     let mut proxy = make_proxy("test", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
     proxy.backend_tls_server_ca_cert_path = Some("/nonexistent/ca.pem".into());
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("backend_tls_server_ca_cert_path") && e.contains("failed to open")),
+            .any(|e| e.contains("backend_tls_server_ca_cert_path")
+                && e.contains("failed to read TLS material")),
         "Expected CA file-not-found error, got: {:?}",
         errs
     );
@@ -1410,6 +1417,7 @@ fn test_proxy_tls_cert_file_invalid_pem() {
     write!(&key_file, "not a valid PEM key").unwrap();
 
     let mut proxy = make_proxy("test", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
     proxy.backend_tls_client_cert_path = Some(cert_file.path().to_str().unwrap().to_string());
     proxy.backend_tls_client_key_path = Some(key_file.path().to_str().unwrap().to_string());
     let errs = proxy.validate_fields().unwrap_err();
@@ -1423,7 +1431,7 @@ fn test_proxy_tls_cert_file_invalid_pem() {
     assert!(
         errs.iter()
             .any(|e| e.contains("backend_tls_client_key_path")
-                && e.contains("no valid PKCS8 private keys")),
+                && e.contains("no valid private keys")),
         "Expected invalid PEM key error, got: {:?}",
         errs
     );

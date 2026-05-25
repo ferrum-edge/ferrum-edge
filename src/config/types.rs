@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::sync::LazyLock;
 
 /// Maximum length for resource IDs.
@@ -106,6 +107,8 @@ pub const MAX_STATUS_CODES: usize = 500;
 pub const MAX_RETRYABLE_METHODS: usize = 9;
 /// Maximum length for file path fields (TLS cert/key paths).
 pub const MAX_FILE_PATH_LENGTH: usize = 4096;
+/// Maximum size for inline PEM TLS material in config fields.
+pub const MAX_TLS_INLINE_PEM_LENGTH: usize = 1_048_576; // 1 MiB
 /// Maximum length for service discovery optional string fields.
 pub const MAX_SD_STRING_LENGTH: usize = 255;
 
@@ -2947,40 +2950,117 @@ fn validate_string_field(field_name: &str, value: &str, max_len: usize) -> Resul
     Ok(())
 }
 
+fn validate_tls_material_source_field(
+    field_name: &str,
+    value: &str,
+    kind: crate::tls::source::MaterialKind,
+) -> Result<(), String> {
+    match crate::tls::source::CertSource::parse(value, kind) {
+        crate::tls::source::CertSource::InlinePem(_) => {
+            validate_string_field(field_name, value, MAX_TLS_INLINE_PEM_LENGTH)
+        }
+        _ => validate_string_field(field_name, value, MAX_FILE_PATH_LENGTH),
+    }
+}
+
 /// Validate that a PEM certificate file exists, is readable, and contains at least one valid certificate.
 pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String> {
-    let file = std::fs::File::open(path).map_err(|e| {
-        format!(
-            "{}: failed to open certificate file '{}': {}",
-            field_name, path, e
-        )
-    })?;
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(file))
+    let source =
+        crate::tls::source::CertSource::parse(path, crate::tls::source::MaterialKind::Cert);
+    let material = match crate::tls::source::load_material_blocking(
+        &source,
+        crate::tls::source::MaterialKind::Cert,
+    ) {
+        Ok(material) => material,
+        Err(crate::tls::source::MaterialError::UnsupportedScheme { .. }) => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "{}: failed to load certificate source '{}': {}",
+                field_name,
+                source.source_id(),
+                e
+            ));
+        }
+    };
+    let certs: Vec<_> = rustls_pemfile::certs(&mut Cursor::new(material.bytes.expose_secret()))
         .filter_map(|r| r.ok())
         .collect();
     if certs.is_empty() {
         return Err(format!(
             "{}: no valid PEM certificates found in '{}'",
-            field_name, path
+            field_name, material.source_id
         ));
     }
     Ok(())
 }
 
-/// Validate that a PEM private key file exists, is readable, and contains at least one valid PKCS8 private key.
+/// Validate that a private key source is usable for backend mTLS.
+///
+/// Materializable sources must contain a PEM private key. PKCS#11 sources are
+/// validated through the token when the `pkcs11` feature is enabled.
 pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("{}: failed to open key file '{}': {}", field_name, path, e))?;
-    let keys: Vec<_> = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(file))
-        .filter_map(|r| r.ok())
-        .collect();
-    if keys.is_empty() {
+    let source = crate::tls::source::CertSource::parse(path, crate::tls::source::MaterialKind::Key);
+    if let crate::tls::source::CertSource::Uri(uri) = &source
+        && uri.scheme == crate::tls::source::SourceScheme::Pkcs11
+    {
+        return validate_pkcs11_key_source(field_name, uri);
+    }
+    let material = match crate::tls::source::load_material_blocking(
+        &source,
+        crate::tls::source::MaterialKind::Key,
+    ) {
+        Ok(material) => material,
+        Err(crate::tls::source::MaterialError::UnsupportedScheme { .. }) => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "{}: failed to load key source '{}': {}",
+                field_name,
+                source.source_id(),
+                e
+            ));
+        }
+    };
+    let key = rustls_pemfile::private_key(&mut Cursor::new(material.bytes.expose_secret()))
+        .map_err(|e| {
+            format!(
+                "{}: failed to parse private key from '{}': {}",
+                field_name, material.source_id, e
+            )
+        })?;
+    if key.is_none() {
         return Err(format!(
-            "{}: no valid PKCS8 private keys found in '{}'",
-            field_name, path
+            "{}: no valid private keys found in '{}'",
+            field_name, material.source_id
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "pkcs11")]
+fn validate_pkcs11_key_source(
+    field_name: &str,
+    uri: &crate::tls::source::CertSourceUri,
+) -> Result<(), String> {
+    crate::tls::pkcs11::validate_key_source_uri(uri).map_err(|error| {
+        format!(
+            "{}: failed to validate PKCS#11 key source '{}': {}",
+            field_name,
+            uri.source_id(),
+            error
+        )
+    })
+}
+
+#[cfg(not(feature = "pkcs11"))]
+fn validate_pkcs11_key_source(
+    field_name: &str,
+    uri: &crate::tls::source::CertSourceUri,
+) -> Result<(), String> {
+    Err(format!(
+        "{}: PKCS#11 key source '{}' requires building ferrum-edge with the 'pkcs11' Cargo feature",
+        field_name,
+        uri.source_id()
+    ))
 }
 
 /// Validate that a MaxMind `.mmdb` database file exists and can be parsed.
@@ -3491,24 +3571,30 @@ impl Proxy {
             }
         }
 
-        // TLS file path lengths
+        // TLS material source lengths
         if let Some(ref path) = self.backend_tls_client_cert_path
-            && let Err(e) =
-                validate_string_field("backend_tls_client_cert_path", path, MAX_FILE_PATH_LENGTH)
+            && let Err(e) = validate_tls_material_source_field(
+                "backend_tls_client_cert_path",
+                path,
+                crate::tls::source::MaterialKind::Cert,
+            )
         {
             errors.push(e);
         }
         if let Some(ref path) = self.backend_tls_client_key_path
-            && let Err(e) =
-                validate_string_field("backend_tls_client_key_path", path, MAX_FILE_PATH_LENGTH)
+            && let Err(e) = validate_tls_material_source_field(
+                "backend_tls_client_key_path",
+                path,
+                crate::tls::source::MaterialKind::Key,
+            )
         {
             errors.push(e);
         }
         if let Some(ref path) = self.backend_tls_server_ca_cert_path
-            && let Err(e) = validate_string_field(
+            && let Err(e) = validate_tls_material_source_field(
                 "backend_tls_server_ca_cert_path",
                 path,
-                MAX_FILE_PATH_LENGTH,
+                crate::tls::source::MaterialKind::CaBundle,
             )
         {
             errors.push(e);
@@ -4251,24 +4337,30 @@ impl Upstream {
             }
         }
 
-        // Backend TLS file path lengths
+        // Backend TLS material source lengths
         if let Some(ref path) = self.backend_tls_client_cert_path
-            && let Err(e) =
-                validate_string_field("backend_tls_client_cert_path", path, MAX_FILE_PATH_LENGTH)
+            && let Err(e) = validate_tls_material_source_field(
+                "backend_tls_client_cert_path",
+                path,
+                crate::tls::source::MaterialKind::Cert,
+            )
         {
             errors.push(e);
         }
         if let Some(ref path) = self.backend_tls_client_key_path
-            && let Err(e) =
-                validate_string_field("backend_tls_client_key_path", path, MAX_FILE_PATH_LENGTH)
+            && let Err(e) = validate_tls_material_source_field(
+                "backend_tls_client_key_path",
+                path,
+                crate::tls::source::MaterialKind::Key,
+            )
         {
             errors.push(e);
         }
         if let Some(ref path) = self.backend_tls_server_ca_cert_path
-            && let Err(e) = validate_string_field(
+            && let Err(e) = validate_tls_material_source_field(
                 "backend_tls_server_ca_cert_path",
                 path,
-                MAX_FILE_PATH_LENGTH,
+                crate::tls::source::MaterialKind::CaBundle,
             )
         {
             errors.push(e);
@@ -5257,5 +5349,21 @@ pub fn wildcard_matches(pattern: &str, hostname: &str) -> bool {
         false
     } else {
         pattern == hostname
+    }
+}
+
+#[cfg(all(test, not(feature = "pkcs11")))]
+mod pkcs11_key_validation_tests {
+    use super::*;
+
+    #[test]
+    fn backend_pkcs11_key_validation_requires_feature() {
+        let error = validate_pem_key_file(
+            "backend_tls_client_key_path",
+            "pkcs11://edge-rsa?module=/usr/lib/pkcs11.so",
+        )
+        .expect_err("pkcs11 key sources require the feature");
+
+        assert!(error.contains("'pkcs11' Cargo feature"));
     }
 }

@@ -42,7 +42,7 @@ use crate::config::types::{
     UpstreamPortOverride, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
-use crate::grpc::dp_client::{GrpcJwtSecret, build_dp_grpc_tls_config};
+use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
     MeshLocalityLbSetting, MeshOutlierDetection, MeshRequestAuthentication, MeshSimpleLb,
@@ -56,6 +56,7 @@ use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::tls::{self, TlsPolicy};
 
 const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
@@ -3127,8 +3128,23 @@ pub async fn run(
         })?,
         env_config.cp_dp_grpc_jwt_issuer.clone(),
     );
-    let grpc_tls = build_dp_grpc_tls_config(&env_config, &runtime.cp_urls, "Mesh")?;
     let mut background_handles = Vec::new();
+    let grpc_tls = build_dp_grpc_tls_config(&env_config, &runtime.cp_urls, "Mesh")?;
+    let mesh_grpc_tls_reload_handle = crate::modes::grpc_tls_reload::start_dp_grpc_tls_reload_task(
+        Arc::new(env_config.clone()),
+        Arc::new(runtime.cp_urls.clone()),
+        "Mesh",
+        Some(shutdown_tx.subscribe()),
+    );
+    let grpc_tls_reload = mesh_grpc_tls_reload_handle.map(|handle| {
+        let reload = DpGrpcTlsReload {
+            env_config: Arc::new(env_config.clone()),
+            label: "Mesh",
+            revision_rx: handle.revision_rx,
+        };
+        background_handles.push(handle.watcher_handle);
+        reload
+    });
 
     match runtime.config_protocol {
         MeshConfigProtocol::Native => {
@@ -3145,6 +3161,7 @@ pub async fn run(
                     state,
                     shutdown_rx,
                     grpc_tls.clone(),
+                    grpc_tls_reload,
                 ),
             );
             background_handles.push(handle);
@@ -3166,6 +3183,7 @@ pub async fn run(
                 state,
                 shutdown_rx,
                 grpc_tls.clone(),
+                grpc_tls_reload,
             ));
             background_handles.push(handle);
             info!(
@@ -3751,10 +3769,11 @@ fn start_mesh_admin_listeners(
     ) {
         let admin_https_addr = env_config.admin_socket_addr(env_config.admin_https_port);
         let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        let admin_tls_config = tls::load_tls_config_with_client_auth(
+        let admin_tls_config = tls::load_tls_config_with_client_auth_and_ocsp(
             admin_cert_path,
             admin_key_path,
             admin_client_ca_bundle,
+            env_config.admin_tls_ocsp_response_source.as_deref(),
             env_config.admin_tls_no_verify,
             tls_policy,
             env_config.tls_cert_expiry_warning_days,
@@ -3945,11 +3964,17 @@ fn mesh_inbound_tls_reload_snapshot(
     let client_ca_bundle = if mtls_mode == config::MtlsMode::Disable {
         None
     } else if let Some(path) = env_config.frontend_tls_client_ca_bundle_path.as_deref() {
-        let pem: Arc<[u8]> = std::fs::read(path)
-            .with_context(|| format!("failed to read mesh frontend client CA bundle at {path}"))?
-            .into();
+        let source = CertSource::parse(path, MaterialKind::CaBundle);
+        let material =
+            load_material_blocking(&source, MaterialKind::CaBundle).with_context(|| {
+                format!(
+                    "failed to load mesh frontend client CA bundle at {}",
+                    source.source_id()
+                )
+            })?;
+        let pem: Arc<[u8]> = material.bytes.expose_secret().to_vec().into();
         Some(MeshInboundClientCaBundle {
-            path: path.to_string(),
+            path: material.source_id,
             pem,
         })
     } else {

@@ -57,7 +57,7 @@ use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
 use percent_encoding::percent_decode_str;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -99,8 +99,10 @@ use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
 use crate::service_discovery::ServiceDiscoveryManager;
+use crate::tls::TlsPolicy;
 use crate::tls::backend::BackendSvidGeneration;
-use crate::tls::{NoVerifier, TlsPolicy};
+use crate::tls::backend::BackendTlsConfigBuilder;
+use crate::tls::source::{CertSource, MaterialKind};
 
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
@@ -1600,8 +1602,11 @@ pub struct ProxyState {
     /// protocol versions, and key exchange groups as inbound listeners.
     pub tls_policy: Option<Arc<TlsPolicy>>,
     /// Certificate Revocation Lists for backend TLS verification.
-    /// Loaded once at startup from `FERRUM_TLS_CRL_FILE_PATH` and shared via Arc.
+    /// Preserved as the startup snapshot for surfaces that still take an
+    /// immutable CRL list.
     pub crls: crate::tls::CrlList,
+    /// Hot-swappable backend CRL list consumed by backend HTTP/H2/gRPC pools.
+    pub shared_crls: crate::tls::SharedCrlList,
     /// Overload state for progressive load shedding and graceful drain tracking.
     /// Shared across all accept loops and the background monitor.
     pub overload: Arc<crate::overload::OverloadState>,
@@ -1760,10 +1765,7 @@ fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, 
         }
     };
 
-    let cert_path = std::path::Path::new(cert_path);
-    let key_path = std::path::Path::new(key_path);
-    let trust_bundle_path = std::path::Path::new(trust_bundle_path);
-    let bundle = crate::identity::file_loader::load_svid_bundle_from_files(
+    let bundle = crate::identity::file_loader::load_svid_bundle_from_sources(
         cert_path,
         key_path,
         trust_bundle_path,
@@ -1796,12 +1798,183 @@ fn gateway_svid_file_paths_from_env(env_config: &EnvConfig) -> Option<GatewaySvi
     ) else {
         return None;
     };
+    let cert_source = CertSource::parse(cert, MaterialKind::Cert);
+    let key_source = CertSource::parse(key, MaterialKind::Key);
+    let trust_bundle_source = CertSource::parse(trust_bundle, MaterialKind::CaBundle);
+
+    let (Some(cert), Some(key), Some(trust_bundle)) = (
+        cert_source.as_file_path(),
+        key_source.as_file_path(),
+        trust_bundle_source.as_file_path(),
+    ) else {
+        info!("Gateway SVID source includes non-file material; file rotation watcher disabled");
+        return None;
+    };
+
     Some(GatewaySvidFilePaths {
-        cert: PathBuf::from(cert),
-        key: PathBuf::from(key),
-        trust_bundle: PathBuf::from(trust_bundle),
+        cert,
+        key,
+        trust_bundle,
         expected_spiffe_id: env_config.gateway_spiffe_id.clone(),
     })
+}
+
+fn proxy_backend_uses_tls(proxy: &Proxy) -> bool {
+    matches!(
+        proxy.backend_scheme,
+        Some(BackendScheme::Https | BackendScheme::Tcps | BackendScheme::Dtls)
+    )
+}
+
+fn collect_frontend_dtls_watched_sources(
+    env_config: &EnvConfig,
+) -> Vec<crate::tls::source::subscription::WatchedMaterialSource> {
+    let mut seen = BTreeSet::new();
+    let mut sources = Vec::new();
+    let (Some(cert_path), Some(key_path)) = (
+        env_config.dtls_cert_path.as_deref(),
+        env_config.dtls_key_path.as_deref(),
+    ) else {
+        return sources;
+    };
+
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "dtls_cert",
+        Some(cert_path),
+        MaterialKind::Cert,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "dtls_key",
+        Some(key_path),
+        MaterialKind::Key,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "dtls_client_ca",
+        env_config.dtls_client_ca_cert_path.as_deref(),
+        MaterialKind::CaBundle,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "dtls_crl",
+        env_config.tls_crl_file_path.as_deref(),
+        MaterialKind::Crl,
+    );
+
+    sources
+}
+
+fn collect_backend_tls_watched_sources(
+    config: &GatewayConfig,
+    env_config: &EnvConfig,
+) -> Vec<crate::tls::source::subscription::WatchedMaterialSource> {
+    let mut seen = BTreeSet::new();
+    let mut sources = Vec::new();
+
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "global_ca",
+        env_config.tls_ca_bundle_path.as_deref(),
+        MaterialKind::CaBundle,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "global_client_cert",
+        env_config.backend_tls_client_cert_path.as_deref(),
+        MaterialKind::Cert,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "global_client_key",
+        env_config.backend_tls_client_key_path.as_deref(),
+        MaterialKind::Key,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "global_crl",
+        env_config.tls_crl_file_path.as_deref(),
+        MaterialKind::Crl,
+    );
+
+    for proxy in &config.proxies {
+        push_backend_tls_config_sources(&mut sources, &mut seen, &proxy.resolved_tls);
+    }
+    for upstream in &config.upstreams {
+        let tls = BackendTlsConfig::from_upstream(upstream);
+        push_backend_tls_config_sources(&mut sources, &mut seen, &tls);
+    }
+    for plugin in &config.plugin_configs {
+        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        let Ok(dispatch_config) = MeshRouteDispatchConfig::from_value_normalized(&plugin.config)
+        else {
+            continue;
+        };
+        for rule in &dispatch_config.rules {
+            if let Some(tls) = rule.destination.backend_tls.as_ref() {
+                push_backend_tls_config_sources(&mut sources, &mut seen, tls);
+            }
+        }
+    }
+
+    sources
+}
+
+fn push_backend_tls_config_sources(
+    sources: &mut Vec<crate::tls::source::subscription::WatchedMaterialSource>,
+    seen: &mut BTreeSet<(MaterialKind, String)>,
+    tls: &BackendTlsConfig,
+) {
+    push_tls_material_source(
+        sources,
+        seen,
+        "backend_ca",
+        tls.server_ca_cert_path.as_deref(),
+        MaterialKind::CaBundle,
+    );
+    push_tls_material_source(
+        sources,
+        seen,
+        "backend_client_cert",
+        tls.client_cert_path.as_deref(),
+        MaterialKind::Cert,
+    );
+    push_tls_material_source(
+        sources,
+        seen,
+        "backend_client_key",
+        tls.client_key_path.as_deref(),
+        MaterialKind::Key,
+    );
+}
+
+fn push_tls_material_source(
+    sources: &mut Vec<crate::tls::source::subscription::WatchedMaterialSource>,
+    seen: &mut BTreeSet<(MaterialKind, String)>,
+    label: &'static str,
+    value: Option<&str>,
+    kind: MaterialKind,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    let source = CertSource::parse(value.to_string(), kind);
+    if seen.insert((kind, source.pool_key_component())) {
+        sources.push(
+            crate::tls::source::subscription::WatchedMaterialSource::new(label, source, kind),
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1962,11 +2135,24 @@ impl BackendPoolFamily {
             .drain_backend_tls_config_cache_svid_generation(generation);
     }
 
+    fn clear_tls_config_caches(&self) {
+        self.connection_pool.clear_backend_tls_config_cache();
+        self.http2_pool.clear_backend_tls_config_cache();
+        self.grpc_pool.clear_backend_tls_config_cache();
+    }
+
     fn force_drain(&self, generation: u64) {
         self.connection_pool.force_drain_svid_generation(generation);
         self.http2_pool.force_drain_svid_generation(generation);
         self.grpc_pool.force_drain_svid_generation(generation);
         self.h3_pool.force_drain_svid_generation(generation);
+    }
+
+    fn force_drain_all(&self) {
+        self.connection_pool.force_drain_all();
+        self.http2_pool.force_drain_all();
+        self.grpc_pool.force_drain_all();
+        self.h3_pool.force_drain_all();
     }
 }
 
@@ -2139,6 +2325,292 @@ impl ProxyState {
             .store(Arc::new(Some(active_bundle)));
     }
 
+    /// Force a gateway SVID reload from the currently configured sources.
+    ///
+    /// This is the admin-triggered equivalent of the file watcher path. It
+    /// accepts any source form supported by `load_svid_bundle_from_sources`
+    /// (file path, inline PEM, typed URI), preserves any CP-delivered trust
+    /// override, and publishes a backend SVID generation bump so backend pools
+    /// rebuild/drain through the existing rotation consumer.
+    pub fn force_reload_gateway_svid(&self) -> Result<u64, anyhow::Error> {
+        let (Some(cert_source), Some(key_source), Some(trust_bundle_source)) = (
+            self.env_config.gateway_svid_cert_path.as_deref(),
+            self.env_config.gateway_svid_key_path.as_deref(),
+            self.env_config.gateway_svid_trust_bundle_path.as_deref(),
+        ) else {
+            anyhow::bail!(
+                "gateway SVID sources are not configured; set FERRUM_GATEWAY_SVID_CERT_SOURCE, FERRUM_GATEWAY_SVID_KEY_SOURCE, and FERRUM_GATEWAY_SVID_TRUST_BUNDLE_SOURCE"
+            );
+        };
+
+        let bundle = crate::identity::file_loader::load_svid_bundle_from_sources(
+            cert_source,
+            key_source,
+            trust_bundle_source,
+            self.env_config.gateway_spiffe_id.as_deref(),
+        )
+        .map_err(|error| anyhow::anyhow!("failed to reload gateway SVID sources: {error}"))?;
+        let spiffe_id = bundle.spiffe_id.to_string();
+        self.install_gateway_file_svid_bundle(bundle);
+        self.backend_svid_rotation_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+        let revision = *self.backend_svid_rotation_tx.borrow();
+
+        info!(
+            spiffe_id = %spiffe_id,
+            svid_revision = revision,
+            "Gateway SVID force reload completed; backend SVID rotation published"
+        );
+
+        Ok(revision)
+    }
+
+    fn validate_backend_tls_material(
+        &self,
+        crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    ) -> Result<usize, anyhow::Error> {
+        let config = self.config.load_full();
+        let mut validated = 0usize;
+        for proxy in config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy_backend_uses_tls(proxy))
+        {
+            BackendTlsConfigBuilder {
+                proxy,
+                policy: self.tls_policy.as_deref(),
+                global_ca: self.env_config.tls_ca_bundle_path.as_deref().map(Path::new),
+                global_no_verify: self.env_config.tls_no_verify,
+                global_client_cert: self
+                    .env_config
+                    .backend_tls_client_cert_path
+                    .as_deref()
+                    .map(Path::new),
+                global_client_key: self
+                    .env_config
+                    .backend_tls_client_key_path
+                    .as_deref()
+                    .map(Path::new),
+                crls,
+            }
+            .build_rustls()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "backend TLS validation failed for proxy '{}': {}",
+                    proxy.id,
+                    error
+                )
+            })?;
+            validated = validated.saturating_add(1);
+        }
+        let proxy_map = config
+            .proxies
+            .iter()
+            .map(|proxy| (proxy.id.as_str(), proxy))
+            .collect::<HashMap<_, _>>();
+        for plugin in &config.plugin_configs {
+            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            let dispatch_config = MeshRouteDispatchConfig::from_value_normalized(&plugin.config)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "mesh_route_dispatch backend TLS validation failed for plugin '{}': {}",
+                        plugin.id,
+                        error
+                    )
+                })?;
+            let base_proxy = plugin
+                .proxy_id
+                .as_deref()
+                .and_then(|proxy_id| proxy_map.get(proxy_id).copied())
+                .or_else(|| config.proxies.first());
+            let Some(base_proxy) = base_proxy else {
+                continue;
+            };
+            for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
+                let Some(tls) = rule.destination.backend_tls.as_ref() else {
+                    continue;
+                };
+                let mut validation_proxy = base_proxy.clone();
+                validation_proxy.id = format!(
+                    "{}:mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls",
+                    plugin.id
+                );
+                validation_proxy.backend_scheme = Some(BackendScheme::Https);
+                validation_proxy.resolved_tls = tls.clone();
+                BackendTlsConfigBuilder {
+                    proxy: &validation_proxy,
+                    policy: self.tls_policy.as_deref(),
+                    global_ca: self.env_config.tls_ca_bundle_path.as_deref().map(Path::new),
+                    global_no_verify: self.env_config.tls_no_verify,
+                    global_client_cert: self
+                        .env_config
+                        .backend_tls_client_cert_path
+                        .as_deref()
+                        .map(Path::new),
+                    global_client_key: self
+                        .env_config
+                        .backend_tls_client_key_path
+                        .as_deref()
+                        .map(Path::new),
+                    crls,
+                }
+                .build_rustls()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "mesh_route_dispatch backend TLS validation failed for plugin '{}' rule {}: {}",
+                        plugin.id,
+                        rule_idx,
+                        error
+                    )
+                })?;
+                validated = validated.saturating_add(1);
+            }
+        }
+        Ok(validated)
+    }
+
+    fn reload_backend_tls_material(&self) -> Result<(), anyhow::Error> {
+        let active_crls = crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())?;
+        let validated = self.validate_backend_tls_material(active_crls.as_ref().as_slice())?;
+        self.shared_crls.store(active_crls);
+        let pools = BackendPoolFamily {
+            connection_pool: self.connection_pool.clone(),
+            http2_pool: self.http2_pool.clone(),
+            grpc_pool: self.grpc_pool.clone(),
+            h3_pool: self.h3_pool.clone(),
+        };
+        pools.clear_tls_config_caches();
+        pools.force_drain_all();
+
+        let config = self.config.load_full();
+        self.health_checker
+            .restart_with_shutdown(&config, self.health_check_shutdown_rx.clone());
+
+        info!(
+            validated_backend_tls_configs = validated,
+            "Backend TLS material reloaded; backend client pools were drained"
+        );
+        Ok(())
+    }
+
+    fn reload_frontend_dtls_material(&self) -> Result<(), anyhow::Error> {
+        let (Some(cert_path), Some(key_path)) = (
+            self.env_config.dtls_cert_path.clone(),
+            self.env_config.dtls_key_path.clone(),
+        ) else {
+            return Ok(());
+        };
+        let client_ca_cert_path = self.env_config.dtls_client_ca_cert_path.clone();
+        let active_crls = crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())?;
+        crate::dtls::build_frontend_dtls_config(
+            &cert_path,
+            &key_path,
+            client_ca_cert_path.as_deref(),
+            active_crls.as_ref().as_slice(),
+        )?;
+
+        let manager = self.stream_listener_manager.clone();
+        tokio::spawn(async move {
+            let swapped = manager
+                .swap_active_dtls_frontend_configs(|| {
+                    crate::dtls::build_frontend_dtls_config(
+                        &cert_path,
+                        &key_path,
+                        client_ca_cert_path.as_deref(),
+                        active_crls.as_ref().as_slice(),
+                    )
+                })
+                .await;
+            info!(
+                swapped_dtls_listeners = swapped,
+                "Frontend DTLS material reloaded; new DTLS sessions will use rotated material"
+            );
+        });
+        Ok(())
+    }
+
+    fn start_frontend_dtls_source_reload_task(
+        &self,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.env_config.frontend_tls_live_reload_enabled {
+            return None;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            warn!(
+                "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true but no tokio runtime is active; frontend DTLS live reload disabled"
+            );
+            return None;
+        }
+        let watched_sources = collect_frontend_dtls_watched_sources(&self.env_config);
+        if !watched_sources
+            .iter()
+            .any(|source| crate::tls::source::subscription::source_is_refreshable(&source.source))
+        {
+            return None;
+        }
+        let interval = crate::tls::source::subscription::material_set_poll_interval(
+            &watched_sources,
+            Duration::from_secs(self.env_config.frontend_tls_watch_interval_seconds.max(1)),
+            Duration::from_secs(self.env_config.secret_refresh_interval_seconds.max(1)),
+        );
+        let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0u64);
+        let state = self.clone();
+        Some(
+            crate::tls::source::subscription::spawn_material_set_reload_task(
+                crate::tls::source::subscription::MaterialSetReloadConfig {
+                    surface: "dtls",
+                    sources: watched_sources,
+                    interval,
+                    revision_tx,
+                    rebuild: Box::new(move || state.reload_frontend_dtls_material()),
+                },
+                shutdown_rx,
+            ),
+        )
+    }
+
+    fn start_backend_tls_source_reload_task(
+        &self,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.env_config.backend_tls_live_reload_enabled {
+            return None;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            warn!(
+                "FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true but no tokio runtime is active; backend TLS live reload disabled"
+            );
+            return None;
+        }
+
+        let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0u64);
+        let collect_state = self.clone();
+        let rebuild_state = self.clone();
+        Some(
+            crate::tls::source::subscription::spawn_dynamic_material_set_reload_task(
+                crate::tls::source::subscription::DynamicMaterialSetReloadConfig {
+                    surface: "backend_tls",
+                    collect_sources: Box::new(move || {
+                        let config = collect_state.config.load_full();
+                        collect_backend_tls_watched_sources(&config, &collect_state.env_config)
+                    }),
+                    file_default_interval: Duration::from_secs(
+                        self.env_config.backend_tls_watch_interval_seconds.max(1),
+                    ),
+                    provider_default_interval: Duration::from_secs(
+                        self.env_config.secret_refresh_interval_seconds.max(1),
+                    ),
+                    revision_tx,
+                    rebuild: Box::new(move || rebuild_state.reload_backend_tls_material()),
+                },
+                shutdown_rx,
+            ),
+        )
+    }
+
     fn start_gateway_svid_file_rotation_task(
         &self,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
@@ -2262,25 +2734,30 @@ impl ProxyState {
         let tls_policy_arc = tls_policy.map(Arc::new);
         warn_if_h3_backend_tls_policy_incompatible(&config, tls_policy_arc.as_deref());
         let crls = crate::tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+        let shared_crls = crate::tls::shared_crl_list(crls.clone());
         let backend_svid_generation = Arc::new(AtomicU64::new(0));
         let (backend_svid_rotation_tx, backend_svid_rotation_rx) =
             tokio::sync::watch::channel(0u64);
-        let grpc_pool = Arc::new(GrpcConnectionPool::new_with_svid_generation(
-            global_pool_config.clone(),
-            env_config.clone(),
-            dns_cache.clone(),
-            tls_policy_arc.clone(),
-            crls.clone(),
-            backend_svid_generation.clone(),
-        ));
-        let http2_pool = Arc::new(Http2ConnectionPool::new_with_svid_generation(
-            global_pool_config.clone(),
-            env_config.clone(),
-            dns_cache.clone(),
-            tls_policy_arc.clone(),
-            crls.clone(),
-            backend_svid_generation.clone(),
-        ));
+        let grpc_pool = Arc::new(
+            GrpcConnectionPool::new_with_svid_generation_and_shared_crls(
+                global_pool_config.clone(),
+                env_config.clone(),
+                dns_cache.clone(),
+                tls_policy_arc.clone(),
+                shared_crls.clone(),
+                backend_svid_generation.clone(),
+            ),
+        );
+        let http2_pool = Arc::new(
+            Http2ConnectionPool::new_with_svid_generation_and_shared_crls(
+                global_pool_config.clone(),
+                env_config.clone(),
+                dns_cache.clone(),
+                tls_policy_arc.clone(),
+                shared_crls.clone(),
+                backend_svid_generation.clone(),
+            ),
+        );
         let env_config_arc = Arc::new(env_config.clone());
         let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
         inject_gateway_workload_metrics_if_svid(
@@ -2307,12 +2784,12 @@ impl ProxyState {
             pool_shard_amount,
         ));
         let backend_capabilities_refresh = Arc::new(RefreshCoalescer::new());
-        let connection_pool = Arc::new(ConnectionPool::new_with_svid_generation(
+        let connection_pool = Arc::new(ConnectionPool::new_with_svid_generation_and_shared_crls(
             global_pool_config.clone(),
             env_config,
             dns_cache.clone(),
             tls_policy_arc.clone(),
-            crls.clone(),
+            shared_crls.clone(),
             backend_svid_generation.clone(),
         ));
         // Build router cache with pre-sorted route table and HashMap prefix index.
@@ -2645,6 +3122,7 @@ impl ProxyState {
             ws_connection_counter: Arc::new(AtomicU64::new(0)),
             tls_policy: tls_policy_arc,
             crls,
+            shared_crls,
             overload,
             adaptive_buffer,
             mesh_egress_strip_baggage_keys,
@@ -2662,6 +3140,14 @@ impl ProxyState {
         if let Some(handle) =
             state.start_gateway_svid_file_rotation_task(health_check_restart_rx.clone())
         {
+            health_check_handles.push(handle);
+        }
+        if let Some(handle) =
+            state.start_frontend_dtls_source_reload_task(health_check_restart_rx.clone())
+        {
+            health_check_handles.push(handle);
+        }
+        if let Some(handle) = state.start_backend_tls_source_reload_task(health_check_restart_rx) {
             health_check_handles.push(handle);
         }
         Ok((state, health_check_handles))
@@ -5641,135 +6127,23 @@ fn build_websocket_tls_connector(
         return Ok(None);
     }
 
-    // Determine if we should skip server cert verification
-    let skip_verify = env_config.tls_no_verify || !proxy.resolved_tls.verify_server_cert;
-
-    // Build root certificate store:
-    // - Custom CA configured → empty store + only that CA (no public roots)
-    // - No CA configured → webpki/system roots as default fallback
-    let ca_path = proxy
-        .resolved_tls
-        .server_ca_cert_path
-        .as_ref()
-        .or(env_config.tls_ca_bundle_path.as_ref());
-    let mut root_store = if ca_path.is_some() {
-        rustls::RootCertStore::empty()
-    } else {
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
-    };
-    if let Some(ca_path) = ca_path {
-        let ca_pem = std::fs::read(ca_path).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read CA bundle '{}' for WebSocket TLS: {}",
-                ca_path,
-                e
-            )
-        })?;
-        let mut cursor = std::io::Cursor::new(ca_pem);
-        let certs = rustls_pemfile::certs(&mut cursor);
-        for cert in certs.flatten() {
-            root_store.add(cert).map_err(|e| {
-                anyhow::anyhow!("Failed to add CA certificate for WebSocket TLS: {}", e)
-            })?;
-        }
+    let client_config = BackendTlsConfigBuilder {
+        proxy,
+        policy: tls_policy,
+        global_ca: env_config.tls_ca_bundle_path.as_deref().map(Path::new),
+        global_no_verify: env_config.tls_no_verify,
+        global_client_cert: env_config
+            .backend_tls_client_cert_path
+            .as_deref()
+            .map(Path::new),
+        global_client_key: env_config
+            .backend_tls_client_key_path
+            .as_deref()
+            .map(Path::new),
+        crls,
     }
-
-    // Build client config with TLS policy (cipher suites, protocol versions)
-    let builder = match crate::tls::backend_client_config_builder(tls_policy) {
-        Ok(b) => {
-            let inner = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
-            let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-                if proxy.resolved_tls.san_allow_list.is_empty() {
-                    inner
-                } else {
-                    Arc::new(crate::tls::backend::SanAllowListVerifier::new(
-                        inner,
-                        proxy.resolved_tls.san_allow_list.clone(),
-                    )?)
-                };
-            b.dangerous().with_custom_certificate_verifier(verifier)
-        }
-        Err(e) => {
-            warn!(
-                "Failed to build WebSocket TLS config with policy: {}, using defaults",
-                e
-            );
-            let fallback_store =
-                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let inner = crate::tls::build_server_verifier_with_crls(fallback_store, crls)?;
-            let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-                if proxy.resolved_tls.san_allow_list.is_empty() {
-                    inner
-                } else {
-                    Arc::new(crate::tls::backend::SanAllowListVerifier::new(
-                        inner,
-                        proxy.resolved_tls.san_allow_list.clone(),
-                    )?)
-                };
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-        }
-    };
-
-    // Add client certificate for mTLS (resolved_tls overrides take priority)
-    let cert_path = proxy
-        .resolved_tls
-        .client_cert_path
-        .as_ref()
-        .or(env_config.backend_tls_client_cert_path.as_ref());
-    let key_path = proxy
-        .resolved_tls
-        .client_key_path
-        .as_ref()
-        .or(env_config.backend_tls_client_key_path.as_ref());
-
-    let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        let cert_pem = std::fs::read(cert_path).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read client cert '{}' for WebSocket mTLS: {}",
-                cert_path,
-                e
-            )
-        })?;
-        let key_pem = std::fs::read(key_path).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read client key '{}' for WebSocket mTLS: {}",
-                key_path,
-                e
-            )
-        })?;
-        let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
-            .flatten()
-            .collect();
-        let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key_pem))
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to parse private key '{}' for WebSocket mTLS: {}",
-                    key_path,
-                    e
-                )
-            })?
-            .ok_or_else(|| {
-                anyhow::anyhow!("No private key found in '{}' for WebSocket mTLS", key_path)
-            })?;
-        builder
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| anyhow::anyhow!("Failed to configure WebSocket mTLS client cert: {}", e))?
-    } else {
-        builder.with_no_client_auth()
-    };
-
-    // Disable server certificate verification only if explicitly opted out
-    if skip_verify {
-        warn!(
-            "WebSocket backend TLS certificate verification DISABLED for proxy {}",
-            proxy.id
-        );
-        client_config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(NoVerifier));
-    }
+    .build_rustls()
+    .map_err(|e| anyhow::anyhow!("Failed to build WebSocket backend TLS config: {}", e))?;
 
     Ok(Some(tokio_tungstenite::Connector::Rustls(Arc::new(
         client_config,
@@ -7824,6 +8198,17 @@ async fn handle_proxy_request_on_frontend_port(
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    if req.method() == hyper::Method::GET
+        && let Some(key_authorization) =
+            crate::tls::acme::http01_key_authorization_for_path(req.uri().path())
+    {
+        record_request(&state, 200);
+        return Ok(build_plain_text_response(
+            StatusCode::OK,
+            &key_authorization,
+        ));
+    }
+
     // Global request admission control. Single atomic load (~1ns) on the fast
     // path. Rejects with 503 when request pressure exceeds the critical
     // threshold (FERRUM_MAX_REQUESTS + FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD)
@@ -12883,6 +13268,15 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
         })
 }
 
+fn build_plain_text_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain")
+        .header("Cache-Control", "no-store")
+        .body(ProxyBody::from_string(body))
+        .unwrap_or_else(|_| Response::new(ProxyBody::from_string("Internal server error")))
+}
+
 /// Proxy the request to an HTTPS backend using the HTTP/2 multiplexing pool.
 ///
 /// Uses hyper's HTTP/2 client directly to multiplex concurrent requests over
@@ -14662,6 +15056,124 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    #[test]
+    fn backend_tls_watched_sources_collects_and_deduplicates_sources() {
+        let env_config = EnvConfig {
+            tls_ca_bundle_path: Some("/ca/global.pem".to_string()),
+            backend_tls_client_cert_path: Some("/certs/shared.pem".to_string()),
+            backend_tls_client_key_path: Some("/keys/global.key".to_string()),
+            tls_crl_file_path: Some("/crl/global.pem".to_string()),
+            ..EnvConfig::default()
+        };
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "p1",
+                "listen_path": "/",
+                "backend_host": "api.example.com",
+                "backend_port": 443,
+                "backend_scheme": "https"
+            }],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": "mrd1",
+                "plugin_name": "mesh_route_dispatch",
+                "scope": "proxy",
+                "proxy_id": "p1",
+                "enabled": true,
+                "config": {
+                    "rules": [{
+                        "match": {"methods": ["GET"]},
+                        "destination": {
+                            "backend_host": "canary.example.com",
+                            "backend_port": 443,
+                            "backend_tls": {
+                                "client_cert_path": "/certs/mesh-route.pem",
+                                "client_key_path": "/keys/mesh-route.key",
+                                "server_ca_cert_path": "/ca/mesh-route.pem"
+                            }
+                        }
+                    }]
+                }
+            }],
+            "upstreams": [{
+                "id": "u1",
+                "targets": [{"host": "api.example.com", "port": 443}],
+                "backend_tls_client_cert_path": "/certs/shared.pem",
+                "backend_tls_client_key_path": "/keys/upstream.key",
+                "backend_tls_server_ca_cert_path": "/ca/upstream.pem"
+            }]
+        }))
+        .expect("config should deserialize");
+        config.proxies[0].resolved_tls = BackendTlsConfig {
+            client_cert_path: Some("/certs/proxy.pem".to_string()),
+            client_key_path: Some("/keys/proxy.key".to_string()),
+            server_ca_cert_path: Some("/ca/proxy.pem".to_string()),
+            verify_server_cert: true,
+            sni: None,
+            san_allow_list: Vec::new(),
+            san_allow_list_key_digest: None,
+        };
+
+        let sources = collect_backend_tls_watched_sources(&config, &env_config);
+        let ids = sources
+            .iter()
+            .map(|source| source.source.pool_key_component())
+            .collect::<Vec<_>>();
+
+        assert_eq!(sources.len(), 12);
+        assert_eq!(
+            ids.iter()
+                .filter(|id| id.as_str() == "/certs/shared.pem")
+                .count(),
+            1,
+            "shared global/upstream cert source should be watched once"
+        );
+        assert!(ids.contains(&"/ca/global.pem".to_string()));
+        assert!(ids.contains(&"/crl/global.pem".to_string()));
+        assert!(ids.contains(&"/ca/proxy.pem".to_string()));
+        assert!(ids.contains(&"/ca/upstream.pem".to_string()));
+        assert!(ids.contains(&"/certs/mesh-route.pem".to_string()));
+        assert!(ids.contains(&"/keys/mesh-route.key".to_string()));
+        assert!(ids.contains(&"/ca/mesh-route.pem".to_string()));
+    }
+
+    #[test]
+    fn frontend_dtls_watched_sources_collects_cert_key_client_ca_and_crl() {
+        let env_config = EnvConfig {
+            dtls_cert_path: Some("/certs/dtls.pem".to_string()),
+            dtls_key_path: Some("/keys/dtls.key".to_string()),
+            dtls_client_ca_cert_path: Some("/ca/dtls-clients.pem".to_string()),
+            tls_crl_file_path: Some("/crl/global.pem".to_string()),
+            ..EnvConfig::default()
+        };
+
+        let sources = collect_frontend_dtls_watched_sources(&env_config);
+        let ids = sources
+            .iter()
+            .map(|source| source.source.pool_key_component())
+            .collect::<Vec<_>>();
+
+        assert_eq!(sources.len(), 4);
+        assert!(ids.contains(&"/certs/dtls.pem".to_string()));
+        assert!(ids.contains(&"/keys/dtls.key".to_string()));
+        assert!(ids.contains(&"/ca/dtls-clients.pem".to_string()));
+        assert!(ids.contains(&"/crl/global.pem".to_string()));
+    }
+
+    #[test]
+    fn proxy_backend_uses_tls_detects_tls_wire_schemes() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+        assert!(proxy_backend_uses_tls(&proxy));
+
+        proxy.backend_scheme = Some(BackendScheme::Tcps);
+        assert!(proxy_backend_uses_tls(&proxy));
+
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        assert!(!proxy_backend_uses_tls(&proxy));
     }
 
     #[test]

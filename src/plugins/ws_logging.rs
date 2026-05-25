@@ -33,6 +33,7 @@ use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
     WsDisconnectContext,
 };
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 /// Union type for log entries sent through the batched channel.
 #[derive(Clone, serde::Serialize)]
@@ -301,13 +302,15 @@ fn build_tls_connector(
     };
 
     if let Some(ca_path) = ca_bundle_path {
-        let ca_pem = std::fs::read(ca_path)
-            .map_err(|e| format!("ws_logging: failed to read CA bundle '{ca_path}': {e}"))?;
-        let mut cursor = std::io::Cursor::new(ca_pem);
+        let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+        let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
+            .map_err(|e| format!("ws_logging: failed to load CA bundle: {e}"))?;
+        let source_id = ca_material.source_id.clone();
+        let mut cursor = std::io::Cursor::new(ca_material.bytes.expose_secret());
         for cert in rustls_pemfile::certs(&mut cursor).flatten() {
-            root_store
-                .add(cert)
-                .map_err(|e| format!("ws_logging: failed to add CA certificate: {e}"))?;
+            root_store.add(cert).map_err(|e| {
+                format!("ws_logging: failed to add CA certificate from {source_id}: {e}")
+            })?;
         }
     }
 

@@ -21,6 +21,8 @@ Ferrum Edge uses one database TLS env family for every database backend that has
 | `FERRUM_DB_TLS_CA_CERT_PATH` | CA certificate for server verification | `/etc/ferrum/certs/ca.crt` |
 | `FERRUM_DB_TLS_CLIENT_CERT_PATH` | Client certificate for mutual TLS | `/etc/ferrum/certs/client.crt` |
 | `FERRUM_DB_TLS_CLIENT_KEY_PATH` | Client private key for mutual TLS | `/etc/ferrum/certs/client.key` |
+| `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED` | Reconnect DB pools/clients after DB TLS source rotation in database/CP modes | `true` |
+| `FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS` | Poll interval for file-backed DB TLS source watching | `30` |
 
 When `FERRUM_DB_TLS_MODE` is unset, Ferrum does not add or force database TLS settings. For production network databases, set `FERRUM_DB_TLS_MODE=verify-full` and provide the CA bundle needed to validate the database server certificate.
 
@@ -42,6 +44,26 @@ For PostgreSQL and MySQL, Ferrum appends TLS query parameters to `FERRUM_DB_URL`
 For PostgreSQL, client certificate parameters can be present with `allow` or `prefer`, but those modes may still use plaintext. Client-certificate authentication effectively requires `require`, `verify-ca`, or `verify-full`; use `verify-full` for production.
 
 SQLite is an embedded, file-based database. Because there is no network connection to secure, `FERRUM_DB_TLS_MODE=disable` is accepted as a no-op, while certificate paths and every other TLS mode are rejected when `FERRUM_DB_TYPE=sqlite`.
+
+## Live Reload
+
+Database and CP modes can opt in to DB TLS live reload:
+
+```bash
+export FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true
+export FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS=30
+```
+
+When enabled, Ferrum fingerprints `FERRUM_DB_TLS_CA_CERT_PATH`, `FERRUM_DB_TLS_CLIENT_CERT_PATH`, and `FERRUM_DB_TLS_CLIENT_KEY_PATH` after `_SOURCE` overrides are applied. File-backed sources use `FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS`; provider and Kubernetes sources use `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` unless their source URI includes `?poll=`.
+
+On changed bytes, Ferrum rebuilds the effective database URLs and reconnects the active SQL pool or MongoDB client. SQL read replica pools are reconnected when `FERRUM_DB_READ_REPLICA_URL` is configured. Existing in-flight DB queries keep their current connection; new DB work uses the reconnected pool/client. You can force an immediate source poll with:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9000/admin/tls/rotate/database_tls
+```
+
+Inline PEM DB TLS sources remain static until config reload. CP/DP gRPC TLS is not covered by this watcher.
 
 ## PostgreSQL TLS Setup
 
@@ -475,7 +497,7 @@ If the database URL already contains TLS parameters (for example, `?sslmode=requ
 ### SQL Databases (PostgreSQL, MySQL)
 
 When using `FERRUM_DB_FAILOVER_URLS` or `FERRUM_DB_READ_REPLICA_URL`, the same
-`FERRUM_DB_TLS_MODE` and certificate path settings apply to all SQL database connections.
+`FERRUM_DB_TLS_MODE` and certificate path settings apply to all SQL database connections. With `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true`, primary and read-replica SQL pools are reconnected after watched database TLS source bytes change.
 If your failover or replica databases require different TLS parameters, embed them
 directly in the URL query string:
 

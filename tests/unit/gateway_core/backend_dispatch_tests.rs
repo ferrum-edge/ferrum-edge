@@ -89,6 +89,140 @@ fn http_post(content_type: &str) -> Request<()> {
         .unwrap()
 }
 
+fn http_post_version(version: hyper::Version, content_type: &str) -> Request<()> {
+    Request::builder()
+        .method("POST")
+        .version(version)
+        .uri("https://example.com/pkg.Service/Method")
+        .header("content-type", content_type)
+        .body(())
+        .unwrap()
+}
+
+#[test]
+fn detect_http_flavor_classifies_plain_http_versions_as_plain() {
+    for (name, version) in [
+        ("HTTP/1.1", hyper::Version::HTTP_11),
+        ("HTTP/2", hyper::Version::HTTP_2),
+        ("HTTP/3", hyper::Version::HTTP_3),
+    ] {
+        let req = Request::builder()
+            .method("GET")
+            .version(version)
+            .uri("https://example.com/items")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            detect_http_flavor(&req),
+            HttpFlavor::Plain,
+            "{name} without gRPC/WebSocket markers must classify as Plain"
+        );
+    }
+}
+
+#[test]
+fn detect_http_flavor_classifies_native_grpc_across_http_versions() {
+    for (name, version) in [
+        ("HTTP/1.1", hyper::Version::HTTP_11),
+        ("HTTP/2", hyper::Version::HTTP_2),
+        ("HTTP/3", hyper::Version::HTTP_3),
+    ] {
+        let req = http_post_version(version, "application/grpc+proto");
+        assert_eq!(
+            detect_http_flavor(&req),
+            HttpFlavor::Grpc,
+            "{name} native gRPC content-type must classify as Grpc"
+        );
+    }
+}
+
+#[test]
+fn detect_http_flavor_requires_complete_http1_websocket_handshake() {
+    let mut missing_connection_upgrade = Request::builder()
+        .method("GET")
+        .version(hyper::Version::HTTP_11)
+        .uri("https://example.com/socket")
+        .header("connection", "keep-alive")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let missing_upgrade = Request::builder()
+        .method("GET")
+        .version(hyper::Version::HTTP_11)
+        .uri("https://example.com/socket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let bad_key = Request::builder()
+        .method("GET")
+        .version(hyper::Version::HTTP_11)
+        .uri("https://example.com/socket")
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", "AAAA")
+        .header("sec-websocket-version", "13")
+        .body(())
+        .unwrap();
+    let wrong_version = Request::builder()
+        .method("GET")
+        .version(hyper::Version::HTTP_11)
+        .uri("https://example.com/socket")
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "12")
+        .body(())
+        .unwrap();
+
+    missing_connection_upgrade
+        .headers_mut()
+        .append("connection", "close".parse().unwrap());
+
+    for (name, req) in [
+        (
+            "missing Connection upgrade token",
+            missing_connection_upgrade,
+        ),
+        ("missing Upgrade header", missing_upgrade),
+        ("invalid Sec-WebSocket-Key", bad_key),
+        ("wrong Sec-WebSocket-Version", wrong_version),
+    ] {
+        assert_eq!(
+            detect_http_flavor(&req),
+            HttpFlavor::Plain,
+            "{name} must not classify as WebSocket"
+        );
+    }
+}
+
+#[test]
+fn detect_http_flavor_does_not_treat_h2_or_h3_upgrade_headers_as_websocket() {
+    for (name, version) in [
+        ("HTTP/2", hyper::Version::HTTP_2),
+        ("HTTP/3", hyper::Version::HTTP_3),
+    ] {
+        let req = Request::builder()
+            .method("GET")
+            .version(version)
+            .uri("https://example.com/socket")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            detect_http_flavor(&req),
+            HttpFlavor::Plain,
+            "{name} must use Extended CONNECT, not HTTP/1.1 Upgrade headers"
+        );
+    }
+}
+
 #[test]
 fn detect_http_flavor_classifies_native_grpc_as_grpc() {
     assert_eq!(

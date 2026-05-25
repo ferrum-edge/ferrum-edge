@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, trace, warn};
 
 use crate::config::types::Proxy;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 /// Default MTU for DTLS records. Conservative default that works over most networks.
 #[allow(dead_code)]
@@ -1164,20 +1165,30 @@ pub fn load_dtls_certificate(
     cert_path: &str,
     key_path: &str,
 ) -> Result<DtlsCertificate, anyhow::Error> {
-    let cert_pem = std::fs::read(cert_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read DTLS cert {}: {}", cert_path, e))?;
-    let key_pem = std::fs::read(key_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read DTLS key {}: {}", key_path, e))?;
+    let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
+    let key_source = CertSource::parse(key_path, MaterialKind::Key);
+    let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load DTLS cert {}: {}",
+            cert_source.source_id(),
+            e
+        )
+    })?;
+    let key_material = load_material_blocking(&key_source, MaterialKind::Key).map_err(|e| {
+        anyhow::anyhow!("Failed to load DTLS key {}: {}", key_source.source_id(), e)
+    })?;
 
     // Parse PEM to DER
-    let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
+    let mut cert_reader = cert_material.bytes.expose_secret();
+    let cert_der = rustls_pemfile::certs(&mut cert_reader)
         .next()
-        .ok_or_else(|| anyhow::anyhow!("No certificate found in {}", cert_path))?
+        .ok_or_else(|| anyhow::anyhow!("No certificate found in {}", cert_material.source_id))?
         .map_err(|e| anyhow::anyhow!("Failed to parse certificate PEM: {}", e))?;
 
-    let key_der = rustls_pemfile::private_key(&mut &key_pem[..])
+    let mut key_reader = key_material.bytes.expose_secret();
+    let key_der = rustls_pemfile::private_key(&mut key_reader)
         .map_err(|e| anyhow::anyhow!("Failed to parse private key PEM: {}", e))?
-        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
+        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_material.source_id))?;
 
     // SAFETY: dimpl::DtlsCertificate stores `private_key` as plain Vec<u8>
     // without zeroize-on-drop. Unlike the kTLS path (which uses
@@ -1192,17 +1203,19 @@ pub fn load_dtls_certificate(
 
 /// Load a rustls root store from a PEM file.
 pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore, anyhow::Error> {
-    let pem_data = std::fs::read(pem_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read PEM file {}: {}", pem_path, e))?;
+    let source = CertSource::parse(pem_path, MaterialKind::CaBundle);
+    let material = load_material_blocking(&source, MaterialKind::CaBundle)
+        .map_err(|e| anyhow::anyhow!("Failed to load PEM source {}: {}", source.source_id(), e))?;
     let mut certs = Vec::new();
     let mut parse_errors = 0usize;
-    for cert in rustls_pemfile::certs(&mut &pem_data[..]) {
+    let mut reader = material.bytes.expose_secret();
+    for cert in rustls_pemfile::certs(&mut reader) {
         match cert {
             Ok(cert) => certs.push(cert),
             Err(err) => {
                 parse_errors += 1;
                 tracing::warn!(
-                    pem_path,
+                    pem_path = %material.source_id,
                     error = %err,
                     "Skipping unparsable certificate while loading DTLS CA bundle"
                 );
@@ -1214,7 +1227,7 @@ pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore,
     if added == 0 {
         return Err(anyhow::anyhow!(
             "No valid certificates found in DTLS CA file {} (ignored: {}, parse_errors: {})",
-            pem_path,
+            material.source_id,
             ignored,
             parse_errors
         ));

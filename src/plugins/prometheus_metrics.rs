@@ -6,10 +6,11 @@
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use chrono::Utc;
 use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -97,6 +98,67 @@ pub struct HboneRelayFailureKey {
     pub error_class: &'static str,
 }
 
+/// TLS certificate inventory gauge key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TlsCertGaugeKey {
+    pub cert_id: Arc<str>,
+    pub surface: Arc<str>,
+    pub source_kind: Arc<str>,
+}
+
+/// TLS source refresh counter key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TlsSourceRefreshKey {
+    pub scheme: Arc<str>,
+    pub kind: Arc<str>,
+    pub surface: Arc<str>,
+    pub outcome: Arc<str>,
+}
+
+/// TLS source fetch duration key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TlsSourceFetchKey {
+    pub scheme: Arc<str>,
+    pub kind: Arc<str>,
+}
+
+/// TLS source fetch failure counter key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TlsSourceFetchFailureKey {
+    pub scheme: Arc<str>,
+    pub kind: Arc<str>,
+    pub reason: Arc<str>,
+}
+
+/// TLS certificate rotation counter key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TlsCertRotationKey {
+    pub cert_id: Arc<str>,
+    pub reason: Arc<str>,
+    pub outcome: Arc<str>,
+}
+
+/// Scrape-time certificate inventory gauge values.
+pub struct TlsCertGaugeValues {
+    pub expiry_seconds: CachePadded<AtomicI64>,
+    pub not_before_unix_seconds: CachePadded<AtomicI64>,
+}
+
+impl TlsCertGaugeValues {
+    fn new(expiry_seconds: i64, not_before_unix_seconds: i64) -> Self {
+        Self {
+            expiry_seconds: CachePadded::new(AtomicI64::new(expiry_seconds)),
+            not_before_unix_seconds: CachePadded::new(AtomicI64::new(not_before_unix_seconds)),
+        }
+    }
+
+    fn update(&self, expiry_seconds: i64, not_before_unix_seconds: i64) {
+        self.expiry_seconds.store(expiry_seconds, Ordering::Relaxed);
+        self.not_before_unix_seconds
+            .store(not_before_unix_seconds, Ordering::Relaxed);
+    }
+}
+
 /// Mesh outbound registry admit/deny counters for one namespace/host pair.
 pub struct MeshOutboundRegistryDecisionCounters {
     pub admit: TimestampedCounter,
@@ -171,7 +233,7 @@ impl TimestampedCounter {
 
 /// Histogram with predefined buckets and a last-updated timestamp.
 pub struct HistogramBuckets {
-    /// Bucket boundaries in milliseconds
+    /// Bucket boundaries in the metric's native unit.
     pub boundaries: Vec<f64>,
     /// Count of observations <= each boundary
     pub counts: Vec<CachePadded<AtomicU64>>,
@@ -185,9 +247,24 @@ pub struct HistogramBuckets {
 
 impl HistogramBuckets {
     fn new(epoch: Instant) -> Self {
-        let boundaries = vec![
-            5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
-        ];
+        Self::new_with_boundaries(
+            vec![
+                5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+            ],
+            epoch,
+        )
+    }
+
+    fn new_seconds(epoch: Instant) -> Self {
+        Self::new_with_boundaries(
+            vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+            ],
+            epoch,
+        )
+    }
+
+    fn new_with_boundaries(boundaries: Vec<f64>, epoch: Instant) -> Self {
         let counts = boundaries
             .iter()
             .map(|_| CachePadded::new(AtomicU64::new(0)))
@@ -201,7 +278,7 @@ impl HistogramBuckets {
         }
     }
 
-    fn observe(&self, value_ms: f64, epoch: Instant) {
+    fn observe(&self, value: f64, epoch: Instant) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.last_updated
             .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -209,7 +286,7 @@ impl HistogramBuckets {
         loop {
             let old = self.sum.load(Ordering::Relaxed);
             let old_f = f64::from_bits(old);
-            let new_f = old_f + value_ms;
+            let new_f = old_f + value;
             match self.sum.compare_exchange_weak(
                 old,
                 new_f.to_bits(),
@@ -222,7 +299,7 @@ impl HistogramBuckets {
         }
         // Increment bucket counters
         for (i, boundary) in self.boundaries.iter().enumerate() {
-            if value_ms <= *boundary {
+            if value <= *boundary {
                 self.counts[i].fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -302,6 +379,18 @@ pub struct MetricsRegistry {
     /// concern that the HTTP counter has.
     pub mesh_outbound_registry_stream_decisions:
         DashMap<Arc<str>, DashMap<&'static str, MeshOutboundRegistryDecisionCounters>>,
+    /// TLS certificate expiry and validity-window gauges, refreshed on scrape
+    /// from the admin/proxy inventory. Labels are derived from configured
+    /// resources, never from request input.
+    pub tls_cert_gauges: DashMap<TlsCertGaugeKey, TlsCertGaugeValues>,
+    /// TLS material source refresh outcomes from background source watchers.
+    pub tls_source_refresh_counter: DashMap<TlsSourceRefreshKey, TimestampedCounter>,
+    /// TLS material source fetch durations from background source watchers.
+    pub tls_source_fetch_duration_buckets: DashMap<TlsSourceFetchKey, HistogramBuckets>,
+    /// TLS material source fetch failures from background source watchers.
+    pub tls_source_fetch_failure_counter: DashMap<TlsSourceFetchFailureKey, TimestampedCounter>,
+    /// TLS certificate rotation outcomes from source watchers.
+    pub tls_cert_rotation_counter: DashMap<TlsCertRotationKey, TimestampedCounter>,
     /// Node-agent metrics registered by `FERRUM_MODE=node_agent`.
     node_agent_metrics: ArcSwap<Option<Arc<NodeAgentMetrics>>>,
     /// Cached render output with generation timestamp
@@ -344,6 +433,11 @@ impl MetricsRegistry {
             hbone_relay_failure_counter: DashMap::new(),
             mesh_outbound_registry_decisions: DashMap::new(),
             mesh_outbound_registry_stream_decisions: DashMap::new(),
+            tls_cert_gauges: DashMap::new(),
+            tls_source_refresh_counter: DashMap::new(),
+            tls_source_fetch_duration_buckets: DashMap::new(),
+            tls_source_fetch_failure_counter: DashMap::new(),
+            tls_cert_rotation_counter: DashMap::new(),
             node_agent_metrics: ArcSwap::from_pointee(None),
             render_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
@@ -443,6 +537,106 @@ impl MetricsRegistry {
     pub fn set_node_agent_metrics(&self, metrics: Arc<NodeAgentMetrics>) {
         self.node_agent_metrics.store(Arc::new(Some(metrics)));
         self.render_cache.store(Arc::new(None));
+    }
+
+    pub fn refresh_tls_certificate_inventory(
+        &self,
+        inventory: &crate::tls::inventory::TlsInventory,
+    ) {
+        let now_ts = Utc::now().timestamp();
+        let mut seen = std::collections::HashSet::new();
+
+        for entry in &inventory.entries {
+            let Some(not_after) = entry.not_after else {
+                continue;
+            };
+            let not_before_ts = entry
+                .not_before
+                .map(|not_before| not_before.timestamp())
+                .unwrap_or(0);
+            let expiry_seconds = not_after.timestamp().saturating_sub(now_ts);
+            let mut surfaces = entry
+                .used_by
+                .iter()
+                .map(|usage| usage.surface.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if surfaces.is_empty() {
+                surfaces.insert("unknown");
+            }
+            for surface in surfaces {
+                let key = TlsCertGaugeKey {
+                    cert_id: Arc::from(entry.id.as_str()),
+                    surface: Arc::from(surface),
+                    source_kind: Arc::from(entry.source.kind.as_str()),
+                };
+                seen.insert(key.clone());
+                self.tls_cert_gauges
+                    .entry(key)
+                    .and_modify(|values| values.update(expiry_seconds, not_before_ts))
+                    .or_insert_with(|| TlsCertGaugeValues::new(expiry_seconds, not_before_ts));
+            }
+        }
+
+        self.tls_cert_gauges.retain(|key, _| seen.contains(key));
+        self.render_cache.store(Arc::new(None));
+    }
+
+    pub fn record_tls_source_refresh(
+        &self,
+        scheme: &str,
+        kind: &str,
+        surface: &str,
+        outcome: &str,
+    ) {
+        let key = TlsSourceRefreshKey {
+            scheme: Arc::from(scheme),
+            kind: Arc::from(kind),
+            surface: Arc::from(surface),
+            outcome: Arc::from(outcome),
+        };
+        self.tls_source_refresh_counter
+            .entry(key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_tls_source_fetch_duration(&self, scheme: &str, kind: &str, duration_secs: f64) {
+        let key = TlsSourceFetchKey {
+            scheme: Arc::from(scheme),
+            kind: Arc::from(kind),
+        };
+        self.tls_source_fetch_duration_buckets
+            .entry(key)
+            .or_insert_with(|| HistogramBuckets::new_seconds(self.epoch))
+            .observe(duration_secs.max(0.0), self.epoch);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_tls_source_fetch_failure(&self, scheme: &str, kind: &str, reason: &str) {
+        let key = TlsSourceFetchFailureKey {
+            scheme: Arc::from(scheme),
+            kind: Arc::from(kind),
+            reason: Arc::from(reason),
+        };
+        self.tls_source_fetch_failure_counter
+            .entry(key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_tls_cert_rotation(&self, cert_id: &str, reason: &str, outcome: &str) {
+        let key = TlsCertRotationKey {
+            cert_id: Arc::from(cert_id),
+            reason: Arc::from(reason),
+            outcome: Arc::from(outcome),
+        };
+        self.tls_cert_rotation_counter
+            .entry(key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+        self.maybe_invalidate_cache();
     }
 
     pub fn record_mesh_outbound_registry_decision(
@@ -690,6 +884,30 @@ impl MetricsRegistry {
             keep
         });
 
+        self.tls_source_fetch_duration_buckets.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.tls_source_fetch_failure_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.tls_cert_rotation_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
         if evicted > 0 {
             // Invalidate render cache after eviction
             self.render_cache.store(Arc::new(None));
@@ -748,6 +966,11 @@ impl MetricsRegistry {
                 .map(|entry| entry.value().len())
                 .sum::<usize>()
                 * 240
+            + self.tls_cert_gauges.len() * 260
+            + self.tls_source_refresh_counter.len() * 220
+            + self.tls_source_fetch_duration_buckets.len() * 700
+            + self.tls_source_fetch_failure_counter.len() * 220
+            + self.tls_cert_rotation_counter.len() * 220
             + if self.node_agent_metrics.load().is_some() {
                 512
             } else {
@@ -1035,6 +1258,106 @@ impl MetricsRegistry {
             }
         }
 
+        if !self.tls_cert_gauges.is_empty() {
+            output.push_str(
+                "# HELP ferrum_tls_cert_expiry_seconds Seconds until the certificate leaf not_after timestamp. Negative means expired.\n",
+            );
+            output.push_str("# TYPE ferrum_tls_cert_expiry_seconds gauge\n");
+            output.push_str(
+                "# HELP ferrum_tls_cert_not_before_seconds Certificate leaf not_before timestamp as Unix seconds.\n",
+            );
+            output.push_str("# TYPE ferrum_tls_cert_not_before_seconds gauge\n");
+            for entry in self.tls_cert_gauges.iter() {
+                let key = entry.key();
+                let cert_id = escape_label_value(&key.cert_id);
+                let surface = escape_label_value(&key.surface);
+                let source_kind = escape_label_value(&key.source_kind);
+                let expiry = entry.value().expiry_seconds.load(Ordering::Relaxed);
+                let not_before = entry
+                    .value()
+                    .not_before_unix_seconds
+                    .load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_tls_cert_expiry_seconds{{cert_id=\"{}\",surface=\"{}\",source_kind=\"{}\"{}}} {}\n",
+                    cert_id, surface, source_kind, ns_label, expiry
+                ));
+                output.push_str(&format!(
+                    "ferrum_tls_cert_not_before_seconds{{cert_id=\"{}\",surface=\"{}\",source_kind=\"{}\"{}}} {}\n",
+                    cert_id, surface, source_kind, ns_label, not_before
+                ));
+            }
+        }
+
+        if !self.tls_source_refresh_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_tls_source_refresh_total TLS material source refresh attempts by scheme, kind, surface, and outcome.\n",
+            );
+            output.push_str("# TYPE ferrum_tls_source_refresh_total counter\n");
+            for entry in self.tls_source_refresh_counter.iter() {
+                let key = entry.key();
+                let scheme = escape_label_value(&key.scheme);
+                let kind = escape_label_value(&key.kind);
+                let surface = escape_label_value(&key.surface);
+                let outcome = escape_label_value(&key.outcome);
+                let count = entry.value().value.load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_tls_source_refresh_total{{scheme=\"{}\",kind=\"{}\",surface=\"{}\",outcome=\"{}\"{}}} {}\n",
+                    scheme, kind, surface, outcome, ns_label, count
+                ));
+            }
+        }
+
+        if !self.tls_source_fetch_duration_buckets.is_empty() {
+            output.push_str(
+                "# HELP ferrum_tls_source_fetch_duration_seconds TLS material source fetch duration in seconds.\n",
+            );
+            output.push_str("# TYPE ferrum_tls_source_fetch_duration_seconds histogram\n");
+            for entry in self.tls_source_fetch_duration_buckets.iter() {
+                render_tls_source_fetch_histogram(
+                    &mut output,
+                    entry.key(),
+                    entry.value(),
+                    &ns_label,
+                );
+            }
+        }
+
+        if !self.tls_source_fetch_failure_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_tls_source_fetch_failures_total TLS material source fetch failures by scheme, kind, and bounded reason.\n",
+            );
+            output.push_str("# TYPE ferrum_tls_source_fetch_failures_total counter\n");
+            for entry in self.tls_source_fetch_failure_counter.iter() {
+                let key = entry.key();
+                let scheme = escape_label_value(&key.scheme);
+                let kind = escape_label_value(&key.kind);
+                let reason = escape_label_value(&key.reason);
+                let count = entry.value().value.load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_tls_source_fetch_failures_total{{scheme=\"{}\",kind=\"{}\",reason=\"{}\"{}}} {}\n",
+                    scheme, kind, reason, ns_label, count
+                ));
+            }
+        }
+
+        if !self.tls_cert_rotation_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_tls_cert_rotations_total TLS certificate rotation outcomes by cert ID, reason, and outcome.\n",
+            );
+            output.push_str("# TYPE ferrum_tls_cert_rotations_total counter\n");
+            for entry in self.tls_cert_rotation_counter.iter() {
+                let key = entry.key();
+                let cert_id = escape_label_value(&key.cert_id);
+                let reason = escape_label_value(&key.reason);
+                let outcome = escape_label_value(&key.outcome);
+                let count = entry.value().value.load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_tls_cert_rotations_total{{cert_id=\"{}\",reason=\"{}\",outcome=\"{}\"{}}} {}\n",
+                    cert_id, reason, outcome, ns_label, count
+                ));
+            }
+        }
+
         prometheus_helpers::render_mesh_cert_metrics(&mut output);
 
         let node_agent_metrics = self.node_agent_metrics.load_full();
@@ -1174,6 +1497,37 @@ fn render_histogram(
     ));
 }
 
+fn render_tls_source_fetch_histogram(
+    output: &mut String,
+    key: &TlsSourceFetchKey,
+    histogram: &HistogramBuckets,
+    ns_label: &str,
+) {
+    let scheme = escape_label_value(&key.scheme);
+    let kind = escape_label_value(&key.kind);
+    for (i, boundary) in histogram.boundaries.iter().enumerate() {
+        let count = histogram.counts[i].load(Ordering::Relaxed);
+        output.push_str(&format!(
+            "ferrum_tls_source_fetch_duration_seconds_bucket{{scheme=\"{}\",kind=\"{}\",le=\"{}\"{}}} {}\n",
+            scheme, kind, boundary, ns_label, count
+        ));
+    }
+    let total_count = histogram.count.load(Ordering::Relaxed);
+    let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
+    output.push_str(&format!(
+        "ferrum_tls_source_fetch_duration_seconds_bucket{{scheme=\"{}\",kind=\"{}\",le=\"+Inf\"{}}} {}\n",
+        scheme, kind, ns_label, total_count
+    ));
+    output.push_str(&format!(
+        "ferrum_tls_source_fetch_duration_seconds_sum{{scheme=\"{}\",kind=\"{}\"{}}} {:.6}\n",
+        scheme, kind, ns_label, sum
+    ));
+    output.push_str(&format!(
+        "ferrum_tls_source_fetch_duration_seconds_count{{scheme=\"{}\",kind=\"{}\"{}}} {}\n",
+        scheme, kind, ns_label, total_count
+    ));
+}
+
 pub struct PrometheusMetrics {
     registry: Arc<MetricsRegistry>,
 }
@@ -1250,5 +1604,102 @@ impl Plugin for PrometheusMetrics {
 
     async fn log(&self, summary: &TransactionSummary) {
         self.registry.record(summary);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tls::inventory::{
+        TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
+    };
+
+    #[test]
+    fn renders_tls_certificate_inventory_gauges() {
+        let registry = MetricsRegistry::new();
+        let not_before = Utc::now() - chrono::Duration::days(1);
+        let not_after = Utc::now() + chrono::Duration::days(30);
+        let inventory = TlsInventory {
+            entries: vec![TlsInventoryEntry {
+                id: "certificate-test".to_string(),
+                material_kind: "certificate".to_string(),
+                source: TlsInventorySource {
+                    kind: "file".to_string(),
+                    identifier: "/tmp/cert.pem".to_string(),
+                    refreshable: true,
+                    version: None,
+                },
+                state: TlsInventoryState::Loaded,
+                used_by: vec![TlsInventoryUsage {
+                    surface: "frontend_tls".to_string(),
+                    role: "server_certificate".to_string(),
+                    resource_type: "env".to_string(),
+                    resource_id: "runtime".to_string(),
+                    field: "FERRUM_FRONTEND_TLS_CERT".to_string(),
+                }],
+                subject: Some("CN=localhost".to_string()),
+                issuer: Some("CN=localhost".to_string()),
+                sans: vec!["dns:localhost".to_string()],
+                not_before: Some(not_before),
+                not_after: Some(not_after),
+                days_until_expiry: Some(30),
+                fingerprint_sha256: Some("abc123".to_string()),
+                certificate_count: Some(1),
+                crl_count: None,
+                error: None,
+            }],
+        };
+
+        registry.refresh_tls_certificate_inventory(&inventory);
+        let output = registry.render_uncached();
+
+        assert!(output.contains("ferrum_tls_cert_expiry_seconds"));
+        assert!(output.contains("ferrum_tls_cert_not_before_seconds"));
+        assert!(output.contains("cert_id=\"certificate-test\""));
+        assert!(output.contains("surface=\"frontend_tls\""));
+        assert!(output.contains("source_kind=\"file\""));
+    }
+
+    #[test]
+    fn renders_tls_source_refresh_counters() {
+        let registry = MetricsRegistry::new();
+        registry.record_tls_source_refresh("file", "cert", "proxy_https", "rotated");
+
+        let output = registry.render_uncached();
+
+        assert!(output.contains("ferrum_tls_source_refresh_total"));
+        assert!(output.contains("scheme=\"file\""));
+        assert!(output.contains("kind=\"cert\""));
+        assert!(output.contains("surface=\"proxy_https\""));
+        assert!(output.contains("outcome=\"rotated\""));
+    }
+
+    #[test]
+    fn renders_tls_source_fetch_metrics() {
+        let registry = MetricsRegistry::new();
+        registry.record_tls_source_fetch_duration("vault", "cert", 0.042);
+        registry.record_tls_source_fetch_failure("vault", "cert", "secret");
+
+        let output = registry.render_uncached();
+
+        assert!(output.contains("ferrum_tls_source_fetch_duration_seconds_bucket"));
+        assert!(output.contains("ferrum_tls_source_fetch_duration_seconds_sum"));
+        assert!(output.contains("ferrum_tls_source_fetch_failures_total"));
+        assert!(output.contains("scheme=\"vault\""));
+        assert!(output.contains("kind=\"cert\""));
+        assert!(output.contains("reason=\"secret\""));
+    }
+
+    #[test]
+    fn renders_tls_cert_rotation_counters() {
+        let registry = MetricsRegistry::new();
+        registry.record_tls_cert_rotation("cert-a", "source_refresh", "success");
+
+        let output = registry.render_uncached();
+
+        assert!(output.contains("ferrum_tls_cert_rotations_total"));
+        assert!(output.contains("cert_id=\"cert-a\""));
+        assert!(output.contains("reason=\"source_refresh\""));
+        assert!(output.contains("outcome=\"success\""));
     }
 }

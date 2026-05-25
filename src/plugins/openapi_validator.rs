@@ -569,7 +569,7 @@ impl Plugin for OpenapiValidator {
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         if !self.requires_request_body_buffering()
-            || matches!(ctx.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "DELETE")
+            || matches!(ctx.method.as_str(), "GET" | "HEAD" | "OPTIONS")
             || self.bypass_reason(ctx).is_some()
         {
             return false;

@@ -247,7 +247,8 @@ mod non_linux_stubs {
     #[test]
     fn io_uring_splice_loop_returns_unsupported() {
         let activity = std::sync::atomic::AtomicU64::new(0);
-        let result = io_uring_splice::io_uring_splice_loop(0, 0, 0, 0, &activity, 1000);
+        let result =
+            io_uring_splice::io_uring_splice_loop(0, 0, 0, 0, &activity, 1000, None, 0, None, 0);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(!err.is_write_side);

@@ -38,6 +38,8 @@ use std::time::Instant;
 use tracing::{debug, warn};
 use x509_parser::prelude::*;
 
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
+
 use super::{Plugin, PluginResult, RequestContext};
 
 // ── Namespace URIs ──────────────────────────────────────────────────────────
@@ -203,17 +205,14 @@ impl SoapWsSecurity {
 
         let mut trusted_certs = Vec::with_capacity(trusted_cert_paths.len());
         for path in &trusted_cert_paths {
-            let pem_data = std::fs::read(path).map_err(|e| {
-                format!(
-                    "soap_ws_security: failed to read trusted cert '{}': {}",
-                    path, e
-                )
-            })?;
+            let source = CertSource::parse(path, MaterialKind::Cert);
+            let material = load_material_blocking(&source, MaterialKind::Cert)
+                .map_err(|e| format!("soap_ws_security: failed to load trusted cert: {e}"))?;
 
-            let pem_str = std::str::from_utf8(&pem_data).map_err(|e| {
+            let pem_str = std::str::from_utf8(material.bytes.expose_secret()).map_err(|e| {
                 format!(
                     "soap_ws_security: trusted cert '{}' is not valid UTF-8: {}",
-                    path, e
+                    material.source_id, e
                 )
             })?;
 
@@ -335,17 +334,15 @@ impl SoapWsSecurity {
         let mut saml_trusted_signing_certs =
             Vec::with_capacity(saml_trusted_signing_cert_paths.len());
         for path in &saml_trusted_signing_cert_paths {
-            let pem_data = std::fs::read(path).map_err(|e| {
-                format!(
-                    "soap_ws_security: failed to read SAML trusted signing cert '{}': {}",
-                    path, e
-                )
+            let source = CertSource::parse(path, MaterialKind::Cert);
+            let material = load_material_blocking(&source, MaterialKind::Cert).map_err(|e| {
+                format!("soap_ws_security: failed to load SAML trusted signing cert: {e}")
             })?;
 
-            let pem_str = std::str::from_utf8(&pem_data).map_err(|e| {
+            let pem_str = std::str::from_utf8(material.bytes.expose_secret()).map_err(|e| {
                 format!(
                     "soap_ws_security: SAML trusted signing cert '{}' is not valid UTF-8: {}",
-                    path, e
+                    material.source_id, e
                 )
             })?;
 

@@ -6,11 +6,13 @@ use tonic::transport::Channel;
 use tracing::{error, info, warn};
 
 use super::common::{
-    BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs, sleep_or_shutdown, tonic_tls_config,
-    wait_for_shutdown,
+    BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs,
+    refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
+    wait_optional_tls_reload,
 };
 use crate::grpc::dp_client::{
-    DpGrpcTlsConfig, GrpcJwtSecret, check_cp_version_compatibility, generate_dp_jwt_with_issuer,
+    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, check_cp_version_compatibility,
+    generate_dp_jwt_with_issuer,
 };
 use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
 use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
@@ -47,7 +49,8 @@ pub async fn start_native_mesh_client_with_shutdown(
     config: NativeMeshClientConfig,
     state: MeshRuntimeState,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    tls_config: Option<DpGrpcTlsConfig>,
+    mut tls_config: Option<DpGrpcTlsConfig>,
+    tls_reload: Option<DpGrpcTlsReload>,
 ) {
     if cp_urls.is_empty() {
         error!("No CP URLs configured — cannot start native mesh client");
@@ -56,6 +59,10 @@ pub async fn start_native_mesh_client_with_shutdown(
 
     let mut current_cp_index = 0usize;
     let mut backoff_secs = BACKOFF_INITIAL_SECS;
+    let mut last_tls_revision = tls_reload
+        .as_ref()
+        .map(|reload| *reload.revision_rx.borrow())
+        .unwrap_or(0);
 
     info!(
         node_id = %config.node_id,
@@ -69,6 +76,12 @@ pub async fn start_native_mesh_client_with_shutdown(
             info!("Native mesh client shutting down");
             return;
         }
+        refresh_dp_grpc_tls_config_if_changed(
+            &mut tls_config,
+            tls_reload.as_ref(),
+            &cp_urls,
+            &mut last_tls_revision,
+        );
 
         let cp_url = &cp_urls[current_cp_index];
         let consumer = NativeMeshConfigConsumer::new(state.clone());
@@ -84,6 +97,11 @@ pub async fn start_native_mesh_client_with_shutdown(
             _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                 info!("Native mesh client shutting down");
                 return;
+            }
+            _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                info!("Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream");
+                backoff_secs = BACKOFF_INITIAL_SECS;
+                continue;
             }
         };
 
@@ -109,9 +127,17 @@ pub async fn start_native_mesh_client_with_shutdown(
         };
 
         let sleep_duration = jittered_backoff(backoff_secs);
-        if sleep_or_shutdown(sleep_duration, shutdown_rx.clone()).await {
-            info!("Native mesh client shutting down");
-            return;
+        let mut sleep_shutdown_rx = shutdown_rx.clone();
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_duration) => {}
+            _ = wait_for_shutdown(&mut sleep_shutdown_rx) => {
+                info!("Native mesh client shutting down");
+                return;
+            }
+            _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                backoff_secs = BACKOFF_INITIAL_SECS;
+                continue;
+            }
         }
         backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
     }

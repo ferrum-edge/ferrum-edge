@@ -29,6 +29,7 @@ use crate::config::types::{
 };
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::load_balancer::LoadBalancerCache;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use dashmap::DashMap;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -80,6 +81,17 @@ fn format_probe_url(scheme: &str, host: &str, port: u16, path: &str) -> String {
         host.to_string()
     };
     format!("{}://{}:{}{}", scheme, host, port, path)
+}
+
+fn load_probe_tls_material(
+    source_value: &str,
+    kind: MaterialKind,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let source = CertSource::parse(source_value, kind);
+    load_material_blocking(&source, kind)
+        .map(|material| material.bytes.expose_secret().to_vec())
+        .map_err(|e| format!("{label}: {e}"))
 }
 
 /// Re-export the cap from types so runtime and validation share one value.
@@ -1091,13 +1103,13 @@ async fn grpc_probe(
 
         // Load CA certs (upstream → global → system roots)
         if let Some(ca_path) = tls_config.server_ca_cert_path.as_deref().or(global_ca_path) {
-            match std::fs::read(ca_path) {
+            match load_probe_tls_material(ca_path, MaterialKind::CaBundle, "gRPC health probe CA") {
                 Ok(pem) => {
                     let cert = tonic::transport::Certificate::from_pem(pem);
                     tonic_tls = tonic_tls.ca_certificate(cert);
                 }
                 Err(e) => {
-                    debug!("gRPC health probe: failed to read CA {}: {}", ca_path, e);
+                    debug!("gRPC health probe: failed to load CA: {}", e);
                 }
             }
         } else {
@@ -1108,13 +1120,24 @@ async fn grpc_probe(
         let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
         let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
         if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-            match (std::fs::read(cert_path), std::fs::read(key_path)) {
+            match (
+                load_probe_tls_material(
+                    cert_path,
+                    MaterialKind::Cert,
+                    "gRPC health probe client cert",
+                ),
+                load_probe_tls_material(
+                    key_path,
+                    MaterialKind::Key,
+                    "gRPC health probe client key",
+                ),
+            ) {
                 (Ok(cert_pem), Ok(key_pem)) => {
                     let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
                     tonic_tls = tonic_tls.identity(identity);
                 }
                 (Err(e), _) | (_, Err(e)) => {
-                    debug!("gRPC health probe: failed to read client cert/key: {}", e);
+                    debug!("gRPC health probe: failed to load client cert/key: {}", e);
                 }
             }
         }
@@ -1231,7 +1254,8 @@ async fn build_grpc_probe_channel_no_verify(
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
     };
     if let Some(ca_path) = ca_path
-        && let Ok(ca_data) = std::fs::read(ca_path)
+        && let Ok(ca_data) =
+            load_probe_tls_material(ca_path, MaterialKind::CaBundle, "gRPC health probe CA")
     {
         for cert in rustls_pemfile::certs(&mut &ca_data[..]).flatten() {
             let _ = root_store.add(cert);
@@ -1243,8 +1267,15 @@ async fn build_grpc_probe_channel_no_verify(
     let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
     let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
     let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        let cert_data = std::fs::read(cert_path)?;
-        let key_data = std::fs::read(key_path)?;
+        let cert_data = load_probe_tls_material(
+            cert_path,
+            MaterialKind::Cert,
+            "gRPC health probe client cert",
+        )
+        .map_err(std::io::Error::other)?;
+        let key_data =
+            load_probe_tls_material(key_path, MaterialKind::Key, "gRPC health probe client key")
+                .map_err(std::io::Error::other)?;
         let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
             .filter_map(|r| r.ok())
             .collect();
@@ -1390,23 +1421,19 @@ fn build_health_check_client_with_tls(
         .as_ref()
         .or(global_ca_path.as_ref());
     if let Some(ca_path) = ca_path {
-        if let Ok(ca_data) = std::fs::read(ca_path) {
+        if let Ok(ca_data) =
+            load_probe_tls_material(ca_path, MaterialKind::CaBundle, "Health check CA")
+        {
             if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_data) {
                 // reqwest 0.13: `tls_certs_only` replaces the trust store entirely,
                 // matching the project's "CA exclusivity" rule (no webpki mixing
                 // when a custom CA is provided).
                 builder = builder.tls_certs_only([ca_cert]);
             } else {
-                tracing::warn!(
-                    "Health check: failed to parse CA cert from {}, using system roots",
-                    ca_path
-                );
+                tracing::warn!("Health check: failed to parse CA cert, using system roots");
             }
         } else {
-            tracing::warn!(
-                "Health check: failed to read CA cert from {}, using system roots",
-                ca_path
-            );
+            tracing::warn!("Health check: failed to load CA cert, using system roots");
         }
     }
 
@@ -1420,7 +1447,10 @@ fn build_health_check_client_with_tls(
         .as_ref()
         .or(global_key_path.as_ref());
     if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        match (std::fs::read(cert_path), std::fs::read(key_path)) {
+        match (
+            load_probe_tls_material(cert_path, MaterialKind::Cert, "Health check client cert"),
+            load_probe_tls_material(key_path, MaterialKind::Key, "Health check client key"),
+        ) {
             (Ok(cert_data), Ok(key_data)) => {
                 let mut combined = cert_data;
                 combined.extend_from_slice(b"\n");
@@ -1430,17 +1460,12 @@ fn build_health_check_client_with_tls(
                         builder = builder.identity(identity);
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Health check: failed to parse client identity from {} + {}: {}",
-                            cert_path,
-                            key_path,
-                            e
-                        );
+                        tracing::warn!("Health check: failed to parse client identity: {}", e);
                     }
                 }
             }
             (Err(e), _) | (_, Err(e)) => {
-                tracing::warn!("Health check: failed to read client cert/key: {}", e);
+                tracing::warn!("Health check: failed to load client cert/key: {}", e);
             }
         }
     }

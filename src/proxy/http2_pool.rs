@@ -131,7 +131,7 @@ struct Http2PoolManager {
     global_env_config: crate::config::EnvConfig,
     dns_cache: DnsCache,
     tls_policy: Option<Arc<TlsPolicy>>,
-    crls: crate::tls::CrlList,
+    crls: crate::tls::SharedCrlList,
     tls_configs: BackendTlsConfigCache,
     backend_svid_generation: BackendSvidGeneration,
     workload_svid_cert_path: Option<String>,
@@ -286,6 +286,7 @@ impl Http2PoolManager {
     ) -> Result<Arc<rustls::ClientConfig>, Http2PoolError> {
         self.tls_configs
             .get_or_try_build(pool_key_owned(proxy, svid_generation), || {
+                let crls = self.crls.load_full();
                 let mut tls_config = BackendTlsConfigBuilder {
                     proxy,
                     policy: self.tls_policy.as_deref(),
@@ -305,7 +306,7 @@ impl Http2PoolManager {
                         .backend_tls_client_key_path
                         .as_deref()
                         .map(Path::new),
-                    crls: &self.crls,
+                    crls: crls.as_ref().as_slice(),
                 }
                 .build_rustls()
                 .map_err(|e| {
@@ -508,6 +509,24 @@ impl Http2ConnectionPool {
         crls: crate::tls::CrlList,
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
+        Self::new_with_svid_generation_and_shared_crls(
+            global_pool_config,
+            global_env_config,
+            dns_cache,
+            tls_policy,
+            crate::tls::shared_crl_list(crls),
+            backend_svid_generation,
+        )
+    }
+
+    pub fn new_with_svid_generation_and_shared_crls(
+        global_pool_config: PoolConfig,
+        global_env_config: crate::config::EnvConfig,
+        dns_cache: DnsCache,
+        tls_policy: Option<Arc<TlsPolicy>>,
+        crls: crate::tls::SharedCrlList,
+        backend_svid_generation: BackendSvidGeneration,
+    ) -> Self {
         let cleanup_interval =
             Duration::from_secs(global_env_config.pool_cleanup_interval_seconds.max(1));
         let shards = crate::util::sharding::pool_shard_amount(global_env_config.pool_shard_amount);
@@ -540,10 +559,19 @@ impl Http2ConnectionPool {
             .drain_svid_generation(generation);
     }
 
+    pub fn clear_backend_tls_config_cache(&self) {
+        self.pool.manager().tls_configs.clear();
+    }
+
     pub fn force_drain_svid_generation(&self, generation: u64) {
         let matcher = SvidGenerationMatcher::new(generation);
         self.pool.invalidate_matching(|key| matcher.matches(key));
         self.rr_counters.retain(|key, _| !matcher.matches(key));
+    }
+
+    pub fn force_drain_all(&self) {
+        self.pool.clear();
+        self.rr_counters.clear();
     }
 
     #[allow(dead_code)] // exercised from integration/unit tests

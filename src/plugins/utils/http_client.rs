@@ -47,6 +47,7 @@ use crate::config::{BackendAllowIps, PoolConfig};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::retry::{ErrorClass, classify_reqwest_error};
 use crate::tls::CrlList;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -216,19 +217,26 @@ impl PluginHttpClient {
         //                                          platform via use_preconfigured_tls;
         //                                          this helper-client path differs.
         if !tls_no_verify && let Some(ca_path) = tls_ca_bundle_path {
-            match std::fs::read(ca_path) {
-                Ok(ca_pem) => match reqwest::Certificate::from_pem(&ca_pem) {
-                    Ok(cert) => {
-                        // reqwest 0.13: `tls_certs_only` replaces the trust
-                        // store entirely (CA exclusivity).
-                        builder = builder.tls_certs_only([cert]);
+            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+            match load_material_blocking(&source, MaterialKind::CaBundle) {
+                Ok(ca_material) => {
+                    match reqwest::Certificate::from_pem(ca_material.bytes.expose_secret()) {
+                        Ok(cert) => {
+                            // reqwest 0.13: `tls_certs_only` replaces the trust
+                            // store entirely (CA exclusivity).
+                            builder = builder.tls_certs_only([cert]);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse CA bundle from {}: {}",
+                                ca_material.source_id,
+                                e
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse CA bundle from {}: {}", ca_path, e);
-                    }
-                },
+                }
                 Err(e) => {
-                    tracing::warn!("Failed to read CA bundle from {}: {}", ca_path, e);
+                    tracing::warn!("Failed to load CA bundle: {}", e);
                 }
             }
         }

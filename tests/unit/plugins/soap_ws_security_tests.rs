@@ -741,7 +741,7 @@ fn test_saml_unreadable_signing_cert_is_error() {
         .err()
         .expect("missing trusted signing cert must fail construction");
     assert!(
-        err.contains("failed to read SAML trusted signing cert"),
+        err.contains("failed to load SAML trusted signing cert"),
         "got: {err}"
     );
 }
@@ -2031,7 +2031,7 @@ mod x509_roundtrip {
     #[test]
     fn unreadable_cert_path_is_rejected_at_load_time() {
         // A non-existent path must fail at constructor time with the
-        // existing "failed to read" surface, not panic.
+        // "failed to load trusted cert" surface, not panic.
         let result = SoapWsSecurity::new(&x509_plugin_config(std::path::Path::new(
             "/this/path/does/not/exist/cert.pem",
         )));
@@ -2039,6 +2039,6 @@ mod x509_roundtrip {
             Err(e) => e,
             Ok(_) => panic!("missing cert file must fail load"),
         };
-        assert!(err.contains("failed to read trusted cert"), "got: {err}");
+        assert!(err.contains("failed to load trusted cert"), "got: {err}");
     }
 }

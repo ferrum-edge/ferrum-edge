@@ -147,7 +147,7 @@ FERRUM_DP_CP_GRPC_URLS=https://cp1.example.com:50051,https://cp2.example.com:500
 FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS=300
 ```
 
-**TLS config is shared** across all CP URLs — the same `FERRUM_DP_GRPC_TLS_*` settings apply to every CP connection. SNI is extracted per-URL automatically.
+**TLS config is shared** across all CP URLs — the same `FERRUM_DP_GRPC_TLS_*` settings apply to every CP connection. SNI is extracted per-URL automatically. In DP mode, file/provider/Kubernetes-backed `FERRUM_DP_GRPC_TLS_*` sources are watched; when the CP CA or DP client cert/key bytes change, the active CP stream reconnects and new connections use the rotated material. In CP mode, file/provider/Kubernetes-backed `FERRUM_CP_GRPC_TLS_*` sources update the active server TLS slot so new gRPC handshakes use rotated cert/key/client-CA material without a process restart.
 
 Use `FERRUM_DP_CP_GRPC_URLS` for both single-CP and multi-CP deployments.
 

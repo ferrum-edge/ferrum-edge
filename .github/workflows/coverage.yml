@@ -1,0 +1,266 @@
+name: Coverage
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 0"
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # cargo-llvm-cov applies this during report generation; v0.8.7 warns if it
+  # is passed to --no-report collection commands.
+  LLVM_COV_IGNORE_FILENAME_REGEX: "(vendor/|tests/|build\\.rs|target/|custom_plugins/|ebpf/|proto/)"
+
+jobs:
+  coverage-shard:
+    name: Coverage Shard (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: lib-unit
+            kind: lib-unit
+            filters: ""
+          - shard: admin-api
+            kind: integration
+            filters: |
+              integration::admin_api_specs_handler_tests
+              integration::admin_db_api_specs_tests
+              integration::admin_audit_rbac_tests
+              integration::admin_backend_capabilities_tests
+              integration::admin_runtime_metrics_tests
+          - shard: admin-config
+            kind: integration
+            filters: |
+              integration::admin_cached_config_tests
+              integration::admin_cross_namespace_refs_tests
+              integration::admin_mesh_config_drift_tests
+              integration::admin_mesh_egress_scope_tests
+              integration::admin_mesh_policy_denies_tests
+              integration::admin_mesh_runtime_overlay_tests
+              integration::admin_mesh_service_graph_tests
+              integration::admin_node_waypoint_identities_tests
+              integration::apply_incremental_outcome_tests
+              integration::log_schema_integration_tests
+              integration::log_schema_registry_tests
+              integration::deferred_log_tests
+          - shard: mesh-routing
+            kind: integration
+            filters: |
+              integration::mesh_l7_routing_tests
+              integration::mesh_topology_hbone_tests
+              integration::mesh_authz_e2e_tests
+              integration::mesh_authz_negative_match_tests
+              integration::mesh_service_waypoint_tests
+              integration::mesh_ew_egress_e2e_tests
+              integration::mesh_destination_rule_tls_tests
+              integration::mesh_destination_rule_locality_lb_tests
+              integration::mesh_destination_rule_port_policy_tests
+              integration::mesh_dr_service_entry_e2e_tests
+              integration::mesh_sidecar_e2e_tests
+          - shard: mesh-platform
+            kind: integration
+            filters: |
+              integration::k8s_controller_istio_status_tests
+              integration::mesh_telemetry_k8s_provider_lookup_tests
+              integration::mesh_telemetry_tracing_tests
+              integration::mesh_federation_poller_tests
+              integration::mesh_proxy_config_tests
+              integration::mesh_outbound_registry_stream_tests
+              integration::mesh_runtime_overlay_consumers_tests
+              integration::mesh_peer_auth_live_reload_tests
+              integration::mesh_k8s_pod_discovery_tests
+              integration::mesh_hbone_tests
+              integration::cni_tests
+          - shard: protocols-data-plane
+            kind: integration
+            filters: |
+              integration::cp_dp_grpc_tests
+              integration::cp_multi_namespace_tests
+              integration::connection_pool_tests
+              integration::http2_pool_tests
+              integration::http3_integration_tests
+              integration::grpc_proxy_tests
+              integration::scripted_backend_smoke_tests
+              integration::dtls_integration_tests
+              integration::backend_mtls_tests
+              integration::backend_tls_san_allow_list_tests
+              integration::frontend_tls_live_reload_tests
+              integration::tcp_frontend_tls_order_tests
+              integration::tcp_fast_path_l4_plugins_tests
+              integration::gateway_hbone_pool_tests
+              integration::gateway_svid_identity_tests
+              integration::graceful_shutdown_tests
+              integration::db_incremental_poll_tests
+              integration::db_offline_bootstrap_tests
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-coverage"
+
+      - name: Install cargo-llvm-cov and cargo-nextest
+        uses: taiki-e/install-action@213ccc1a076163c093f914550b94feb90fab916d # v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      - name: Install llvm tools
+        run: rustup component add llvm-tools-preview
+
+      - name: Clean stale coverage data
+        run: cargo llvm-cov clean --workspace
+
+      - name: Run lib and unit coverage
+        if: matrix.kind == 'lib-unit'
+        run: |
+          set -euo pipefail
+          cargo llvm-cov --no-report \
+            --lib
+          cargo llvm-cov --no-report \
+            --test unit_tests
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run integration coverage shard
+        if: matrix.kind == 'integration'
+        run: |
+          set -euo pipefail
+          filters=()
+          while IFS= read -r filter; do
+            [ -z "$filter" ] && continue
+            filters+=("$filter")
+          done <<< "$INTEGRATION_FILTERS"
+          cargo llvm-cov --no-report \
+            nextest --test integration_tests \
+            --no-fail-fast \
+            "${filters[@]}"
+        env:
+          INTEGRATION_FILTERS: ${{ matrix.filters }}
+          RUST_BACKTRACE: 1
+
+      - name: List coverage profile data
+        run: find target/llvm-cov-target -name '*.profraw' -print
+
+      - name: Upload coverage profile data
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-profraw-${{ matrix.shard }}
+          path: target/llvm-cov-target/
+          retention-days: 1
+          if-no-files-found: error
+
+  coverage-merge:
+    name: Merge Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: coverage-shard
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-coverage"
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@213ccc1a076163c093f914550b94feb90fab916d # v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Install llvm tools
+        run: rustup component add llvm-tools-preview
+
+      - name: Download coverage profile data
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: coverage-profraw-*
+          path: target/llvm-cov-target
+          merge-multiple: true
+
+      - name: Verify downloaded profile data
+        run: |
+          set -euo pipefail
+          find target/llvm-cov-target -name '*.profraw' -print
+          test -n "$(find target/llvm-cov-target -name '*.profraw' -print -quit)"
+
+      - name: Generate coverage reports
+        run: |
+          set -euo pipefail
+          mkdir -p coverage-report
+          cargo llvm-cov report \
+            --ignore-filename-regex "$LLVM_COV_IGNORE_FILENAME_REGEX" \
+            --html \
+            --output-dir coverage-report
+          cargo llvm-cov report \
+            --ignore-filename-regex "$LLVM_COV_IGNORE_FILENAME_REGEX" \
+            --lcov \
+            --output-path coverage-report/lcov.info
+          cargo llvm-cov report \
+            --ignore-filename-regex "$LLVM_COV_IGNORE_FILENAME_REGEX" \
+            > coverage-report/summary.txt
+          cargo llvm-cov report \
+            --ignore-filename-regex "$LLVM_COV_IGNORE_FILENAME_REGEX" \
+            --json \
+            --summary-only \
+            --output-path coverage-report/coverage.json
+
+      - name: Write coverage summary
+        run: |
+          set -euo pipefail
+
+          overall=$(jq -r '
+            [.data[].totals.lines] as $lines
+            | (($lines | map(.covered) | add) // 0) as $covered
+            | (($lines | map(.count) | add) // 0) as $count
+            | if $count == 0 then "0.00" else (($covered / $count * 100 * 100 | round) / 100 | tostring) end
+          ' coverage-report/coverage.json)
+
+          rows='
+            [.data[].files[]
+              | {
+                  file: (.filename | sub("^" + env.GITHUB_WORKSPACE + "/"; "") | gsub("[|]"; "\\|")),
+                  covered: (.summary.lines.covered // 0),
+                  count: (.summary.lines.count // 0)
+                }
+              | select(.count > 0)
+              | .percent = (if .count == 0 then 0 else (.covered / .count * 100) end)
+            ]
+          '
+
+          {
+            echo "## Coverage Summary"
+            echo ""
+            echo "Overall line coverage: **${overall}%**"
+            echo ""
+            echo "### Lowest-covered files"
+            echo ""
+            echo "| File | Lines | Coverage |"
+            echo "| --- | ---: | ---: |"
+            jq -r "${rows} | sort_by(.percent, .count) | .[:20][] | \"| \(.file) | \(.covered)/\(.count) | \(((.percent * 100 | round) / 100))% |\"" coverage-report/coverage.json
+            echo ""
+            echo "### Highest-covered files"
+            echo ""
+            echo "| File | Lines | Coverage |"
+            echo "| --- | ---: | ---: |"
+            jq -r "${rows} | sort_by(-.percent, -.count) | .[:20][] | \"| \(.file) | \(.covered)/\(.count) | \(((.percent * 100 | round) / 100))% |\"" coverage-report/coverage.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-report
+          path: coverage-report/
+          retention-days: 30
+          if-no-files-found: error

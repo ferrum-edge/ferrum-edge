@@ -123,6 +123,7 @@ tokio-util = { version = "0.7.18", default-features = false }
 prost-reflect = "0.16"
 brotli = "8"
 flate2 = "1"
+zstd = "0.13"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -155,6 +156,8 @@ k8s-openapi = { version = "0.27", features = ["latest"] }
 time = "0.3"
 
 # Secrets management (optional cloud backends — gate via cargo features)
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen", "time", "x509-parser"], optional = true }
+cryptoki = { version = "0.12", optional = true }
 vaultrs = { version = "0.8", optional = true }
 aws-config = { version = "1.8", features = ["behavior-version-latest"], optional = true }
 aws-sdk-secretsmanager = { version = "1", optional = true }
@@ -204,6 +207,8 @@ aya-log = { version = "0.2", optional = true }
 # builds that never use external secret providers.
 [features]
 default = []
+acme = ["dep:instant-acme"]
+pkcs11 = ["dep:cryptoki"]
 cloud-secrets = ["secrets-vault", "secrets-aws", "secrets-gcp", "secrets-azure"]
 secrets-vault = ["dep:vaultrs"]
 secrets-aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]

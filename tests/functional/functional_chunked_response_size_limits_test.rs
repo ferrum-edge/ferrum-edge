@@ -98,7 +98,13 @@ async fn run_chunked_backend(listener: TcpListener) {
     }
 }
 
-async fn send_h2_get(proxy_port: u16) -> (u16, Result<String, String>) {
+/// Returns `(Some(status), body_result)` when response headers were received
+/// before the proxy reset the H2 stream, and `(None, Err(reset_error))` when
+/// the proxy reset the stream during the request-send phase (an equally valid
+/// "body reset" outcome — see the caller's assertion). The send-phase reset
+/// happens when the proxy's chunked-response size limit fires before any
+/// response bytes can be flushed to the client.
+async fn send_h2_get(proxy_port: u16) -> (Option<u16>, Result<String, String>) {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect h2");
@@ -117,19 +123,24 @@ async fn send_h2_get(proxy_port: u16) -> (u16, Result<String, String>) {
         .header("host", "example.com")
         .body(Full::new(Bytes::new()))
         .expect("build h2 request");
-    let response = sender.send_request(request).await.expect("send h2 request");
-    let status = response.status().as_u16();
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .map(|collected| String::from_utf8_lossy(&collected.to_bytes()).into_owned())
-        .map_err(|err| err.to_string());
+    let result = match sender.send_request(request).await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .map(|collected| String::from_utf8_lossy(&collected.to_bytes()).into_owned())
+                .map_err(|err| err.to_string());
+            (Some(status), body)
+        }
+        Err(err) => (None, Err(err.to_string())),
+    };
 
     drop(sender);
     conn_task.abort();
 
-    (status, body)
+    result
 }
 
 #[ignore]
@@ -163,11 +174,21 @@ async fn functional_chunked_response_size_limit_http2_streaming_body_resets_afte
 
     let (status, body) = send_h2_get(harness.proxy_port).await;
 
-    assert_eq!(status, 200);
+    // The proxy must abort the H2 response when the streaming chunked body
+    // exceeds the limit. Two equivalent outcomes are accepted:
+    //   * Headers arrive (status 200), then the body collect errors when the
+    //     proxy resets the stream mid-body.
+    //   * The proxy resets the stream before any headers can be flushed —
+    //     `send_request` surfaces the RST_STREAM directly. This is a hyper
+    //     scheduling race observed on the GitHub-hosted runner; semantically
+    //     it is the same "body reset" outcome.
     assert!(
         body.is_err(),
         "H2 downstream body should reset when unknown-length backend body exceeds limit"
     );
+    if let Some(s) = status {
+        assert_eq!(s, 200, "if headers arrived, the proxy must report 200");
+    }
 }
 
 #[ignore]
