@@ -12452,6 +12452,42 @@ async fn proxy_to_backend(
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
     let response = match req_builder.send().await {
         Ok(response) => {
+            // A streaming request body that overran `max_request_body_size_bytes`
+            // is authoritative regardless of how the send/receive race resolved.
+            // `SizeLimitedIncoming` forwards bytes up to the limit before it
+            // errors, so a truncated request can reach the backend; under HTTP/1
+            // full-duplex (and especially under CPU contention on loaded CI
+            // runners) the backend can answer that truncated request — or the
+            // poisoned connection can surface a malformed/oversized response —
+            // before the body error propagates, making `send()` return `Ok`
+            // instead of `Err`. Without this guard the `Ok` arm would process
+            // that backend-derived response and could return the backend's
+            // status (or a 502 from the response-size path) instead of the
+            // contractual 413. Mirror the `Err`-branch check so the outcome is
+            // deterministic across both arms of the race.
+            if body_size_exceeded.load(Ordering::Acquire) {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_url = %strip_query_params(backend_url),
+                    max_body_size = state.max_request_body_size_bytes,
+                    backend_status = response.status().as_u16(),
+                    "Streaming request body exceeded maximum size (backend responded before body error surfaced)"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 413,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                    },
+                    retained_body,
+                );
+            }
+
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
