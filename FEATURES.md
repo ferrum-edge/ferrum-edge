@@ -83,7 +83,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ## Plugin System
 
-- 63 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 65 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Three plugin scopes: **global** (all proxies), **proxy** (single proxy), **proxy_group** (shared across a subset of proxies) — scoped plugins replace global plugins of the same name. Proxy-group plugins share a single instance across all associated proxies, so stateful plugins (e.g., rate_limiting) share counters across the group
@@ -94,11 +94,13 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 ### Authentication Plugins
 
 - **mTLS** — client certificate identity matching with per-proxy CA filtering
+- **OAuth2 Introspection** — RFC 7662 bearer token validation with multi-provider routing, token cache, scope/role checks, and claim header fan-out
+- **OIDC Relying Party** — browser login with authorization code + PKCE, encrypted gateway sessions, ID token validation, optional UserInfo merge, and logout
 - **JWT** (HS256) — bearer token with configurable claim field
 - **API Key** — header or query parameter lookup
 - **Basic Auth** — HMAC-SHA256 password verification
 - **HMAC** — request signature verification with body integrity protection via Digest header (RFC 9421 / RFC 3230)
-- **JWKS Auth** — multi-provider JWKS JWT validation with claim-based authorization
+- **JWKS Auth** — multi-provider JWKS JWT validation with claim-based authorization, optional mTLS certificate binding, DPoP proof checks, and claim header fan-out
 - **LDAP Auth** — LDAP directory authentication via direct bind or search-then-bind with optional AD group filtering
 - **SOAP WS-Security** — WS-Security header validation with UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certs with enveloped-signature transform, Issuer/NotBefore/NotOnOrAfter/Audience checks, Subject NameID exported as `soap_ws_saml_subject`), timestamp freshness, and nonce replay protection
 

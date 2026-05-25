@@ -1,9 +1,6 @@
-use std::collections::HashSet;
-
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use http::header::HeaderName;
-use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
 use serde_json::Map;
 use serde_json::Value;
 use std::sync::Arc;
@@ -14,9 +11,24 @@ use url::{Host, Url};
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::PluginHttpClient;
+use super::utils::auth_flow::constant_time_eq;
 use super::utils::auth_flow::{AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::cert_hash::sha256_base64url_no_pad;
+use super::utils::claim_header_fanout::{
+    ClaimHeaderMapping, apply_claim_headers_from_metadata, emit_claim_headers_to_metadata,
+    parse_claim_headers, parse_separator,
+};
+use super::utils::claim_resolver::{extract_claim_string, parse_claim_path_value};
+use super::utils::dpop::{self, DpopJtiCache, DpopVerifyInput};
 use super::utils::jwks_cache::get_or_create_jwks_store;
 use super::utils::jwks_store::JwksKeyStore;
+use super::utils::jwt_verifier::{JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks};
+use super::utils::scope_role_check::{self, ScopeRoleRequirements};
+use super::utils::token_extract::{
+    TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
+    extract_from_location, mark_original_token_stripping_metadata as mark_token_stripping_metadata,
+    provider_locations_extract_token,
+};
 use super::{PluginResult, RequestContext};
 
 /// Default JWKS refresh interval: 15 minutes.
@@ -24,6 +36,7 @@ const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
 const STRIP_AUTHORIZATION_METADATA_KEY: &str = "jwks_auth.strip_authorization";
 const STRIP_HEADER_METADATA_PREFIX: &str = "jwks_auth.strip_header.";
 pub(crate) const STRIP_QUERY_PARAM_METADATA_PREFIX: &str = "jwks_auth.strip_query_param.";
+const CLAIM_HEADER_METADATA_PREFIX: &str = "jwks_auth.claim_header.";
 
 /// JWKS authentication plugin.
 ///
@@ -82,6 +95,8 @@ pub struct JwksAuth {
     /// JWT claim value sent as `X-Consumer-Username` header to the backend.
     /// Defaults to `consumer_identity_claim` if not set separately.
     consumer_header_claim: String,
+    claim_headers: Vec<ClaimHeaderMapping>,
+    claim_headers_separator: String,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
     emit_mesh_request_principal_metadata: bool,
@@ -111,22 +126,22 @@ struct JwksProvider {
     forward_original_token: bool,
     /// Whether this provider requires tokens to include an `exp` claim.
     require_exp: bool,
+    /// Claim values to forward as backend request headers for this provider.
+    claim_headers: Vec<ClaimHeaderMapping>,
+    /// Per-provider array separator for claim header fan-out.
+    claim_headers_separator: Option<String>,
+    /// Require RFC 8705 mTLS sender-constrained access tokens.
+    require_mtls_binding: bool,
+    /// Require RFC 9449 DPoP proof JWTs.
+    require_dpop: bool,
+    /// Allowed DPoP proof clock skew.
+    dpop_clock_skew: Duration,
+    /// Bounded replay cache for DPoP proof JTIs.
+    dpop_jti_cache: Option<Arc<DpopJtiCache>>,
     /// The JWKS key store (shared via global cache).
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
     /// Outbound hosts used by direct JWKS or discovery URLs.
     warmup_hostnames: Vec<String>,
-}
-
-#[derive(Clone)]
-struct TokenHeaderLocation {
-    name: String,
-    prefix: Option<String>,
-}
-
-#[derive(Clone)]
-enum TokenLocation {
-    Header(TokenHeaderLocation),
-    QueryParam(String),
 }
 
 impl JwksAuth {
@@ -153,11 +168,20 @@ impl JwksAuth {
             optional_claim_path(config_obj, "consumer_identity_claim", "sub")?;
         let global_require_exp = optional_bool(config_obj, "require_exp")?.unwrap_or(true);
         let consumer_header_claim = match config_obj.get("consumer_header_claim") {
-            Some(value) => parse_claim_path_value("consumer_header_claim", value)?,
+            Some(value) => parse_claim_path_value("consumer_header_claim", value, "jwks_auth")?,
             None => consumer_identity_claim.clone(),
         };
+        let claim_headers = parse_claim_headers(
+            config_obj,
+            "claim_headers",
+            "jwks_auth",
+            CLAIM_HEADER_METADATA_PREFIX,
+        )?;
+        let claim_headers_separator =
+            parse_separator(config_obj, "claim_headers_separator", "jwks_auth", ",")?;
         let emit_mesh_request_principal_metadata =
             optional_bool(config_obj, "emit_mesh_request_principal_metadata")?.unwrap_or(false);
+        let shard_amount = http_client.pool_shard_amount();
 
         let providers_val = config_obj.get("providers").unwrap_or(&Value::Null);
         let Some(providers_arr) = providers_val.as_array() else {
@@ -215,6 +239,47 @@ impl JwksAuth {
                 optional_provider_bool(prov_obj, "forward_original_token", idx)?.unwrap_or(true);
             let provider_require_exp =
                 optional_bool(prov_obj, "require_exp")?.unwrap_or(global_require_exp);
+            let provider_claim_headers = parse_claim_headers(
+                prov_obj,
+                "claim_headers",
+                "jwks_auth",
+                CLAIM_HEADER_METADATA_PREFIX,
+            )?;
+            let provider_claim_headers_separator =
+                optional_provider_string(prov_obj, "claim_headers_separator", idx)?;
+            let require_mtls_binding =
+                optional_provider_bool(prov_obj, "require_mtls_binding", idx)?.unwrap_or(false);
+            let require_dpop =
+                optional_provider_bool(prov_obj, "require_dpop", idx)?.unwrap_or(false);
+            let dpop_clock_skew_secs =
+                optional_provider_u64(prov_obj, "dpop_clock_skew_secs", idx)?.unwrap_or(30);
+            if dpop_clock_skew_secs > 300 {
+                return Err(format!(
+                    "jwks_auth: 'provider[{idx}].dpop_clock_skew_secs' must be <= 300"
+                ));
+            }
+            let dpop_jti_ttl_secs =
+                optional_provider_u64(prov_obj, "dpop_jti_ttl_secs", idx)?.unwrap_or(300);
+            if dpop_jti_ttl_secs < dpop_clock_skew_secs.saturating_mul(2) {
+                return Err(format!(
+                    "jwks_auth: 'provider[{idx}].dpop_jti_ttl_secs' must be at least twice dpop_clock_skew_secs"
+                ));
+            }
+            let dpop_jti_cache_max_entries =
+                optional_provider_usize(prov_obj, "dpop_jti_cache_max_entries", idx)?
+                    .unwrap_or(50_000);
+            if dpop_jti_cache_max_entries == 0 {
+                return Err(format!(
+                    "jwks_auth: 'provider[{idx}].dpop_jti_cache_max_entries' must be greater than 0"
+                ));
+            }
+            let dpop_jti_cache = require_dpop.then(|| {
+                Arc::new(DpopJtiCache::new(
+                    dpop_jti_cache_max_entries,
+                    Duration::from_secs(dpop_jti_ttl_secs),
+                    shard_amount,
+                ))
+            });
 
             let mut warmup_hostnames = Vec::new();
             if let Some(endpoint) = jwks_endpoint.as_ref() {
@@ -310,6 +375,12 @@ impl JwksAuth {
                 consumer_header_claim: prov_consumer_header_claim,
                 forward_original_token,
                 require_exp: provider_require_exp,
+                claim_headers: provider_claim_headers,
+                claim_headers_separator: provider_claim_headers_separator,
+                require_mtls_binding,
+                require_dpop,
+                dpop_clock_skew: Duration::from_secs(dpop_clock_skew_secs),
+                dpop_jti_cache,
                 jwks_store: jwks_store_slot,
                 warmup_hostnames,
             });
@@ -336,6 +407,8 @@ impl JwksAuth {
             global_role_claim,
             consumer_identity_claim,
             consumer_header_claim,
+            claim_headers,
+            claim_headers_separator,
             strip_authorization_on_success,
             has_custom_query_token_locations,
             emit_mesh_request_principal_metadata,
@@ -423,7 +496,7 @@ impl JwksAuth {
         }
 
         // Peek at the unverified issuer to try matching a specific provider first
-        let unverified_issuer = peek_issuer(token);
+        let unverified_issuer = peek_unverified_issuer(token);
 
         // If we have an issuer, try matching providers with that issuer first
         if let Some(ref iss) = unverified_issuer {
@@ -465,46 +538,108 @@ impl JwksAuth {
         claims: &Value,
         provider: &JwksProvider,
     ) -> Result<(), (u16, String)> {
-        // Check required scopes
-        if !provider.required_scopes.is_empty() {
-            let scope_claim_path = provider
-                .scope_claim
-                .as_deref()
-                .unwrap_or(&self.global_scope_claim);
-            let token_scopes = extract_claim_values(claims, scope_claim_path);
+        let scope_claim = provider
+            .scope_claim
+            .as_deref()
+            .unwrap_or(&self.global_scope_claim);
+        let role_claim = provider
+            .role_claim
+            .as_deref()
+            .unwrap_or(&self.global_role_claim);
+        scope_role_check::check(
+            claims,
+            &ScopeRoleRequirements {
+                required_scopes: &provider.required_scopes,
+                required_roles: &provider.required_roles,
+                scope_claim,
+                role_claim,
+                plugin_name: "jwks_auth",
+            },
+        )
+    }
 
-            for required in &provider.required_scopes {
-                if !token_scopes.iter().any(|s| s == required) {
-                    return Err((
-                        403,
-                        format!(
-                            r#"{{"error":"Insufficient scope","required":"{}"}}"#,
-                            html_escape(required)
-                        ),
-                    ));
-                }
+    fn check_sender_constraints(
+        &self,
+        ctx: &RequestContext,
+        claims: &Value,
+        provider: &JwksProvider,
+        token: &str,
+    ) -> Result<(), (u16, String)> {
+        if provider.require_mtls_binding {
+            let Some(cert_der) = ctx.tls_client_cert_der.as_ref() else {
+                return Err((401, r#"{"error":"mTLS binding mismatch"}"#.to_string()));
+            };
+            let Some(expected_thumbprint) = extract_claim_string(claims, "cnf.x5t#S256") else {
+                return Err((401, r#"{"error":"mTLS binding mismatch"}"#.to_string()));
+            };
+            let actual_thumbprint = sha256_base64url_no_pad(cert_der.as_slice());
+            if !constant_time_eq(actual_thumbprint.as_bytes(), expected_thumbprint.as_bytes()) {
+                return Err((401, r#"{"error":"mTLS binding mismatch"}"#.to_string()));
             }
         }
 
-        // Check required roles (any one match suffices)
-        if !provider.required_roles.is_empty() {
-            let role_claim_path = provider
-                .role_claim
-                .as_deref()
-                .unwrap_or(&self.global_role_claim);
-            let token_roles = extract_claim_values(claims, role_claim_path);
-
-            let has_match = provider
-                .required_roles
-                .iter()
-                .any(|r| token_roles.iter().any(|tr| tr == r));
-
-            if !has_match {
-                return Err((403, r#"{"error":"Insufficient role"}"#.to_string()));
+        if provider.require_dpop {
+            let Some(proof) = ctx.headers.get("dpop") else {
+                return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
+            };
+            let Some(cache) = provider.dpop_jti_cache.as_ref() else {
+                return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
+            };
+            let Some(host) = ctx
+                .headers
+                .get("host")
+                .or_else(|| ctx.headers.get(":authority"))
+            else {
+                return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string()));
+            };
+            let scheme = ctx
+                .metadata
+                .get("ferrum.frontend_scheme")
+                .map(String::as_str)
+                .unwrap_or("http");
+            let Some(htu) = dpop::canonical_htu(scheme, host, &ctx.path) else {
+                return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string()));
+            };
+            if let Err(reason) = dpop::verify(DpopVerifyInput {
+                proof,
+                access_token: token,
+                access_token_claims: claims,
+                method: &ctx.method,
+                htu: &htu,
+                clock_skew: provider.dpop_clock_skew,
+                cache,
+            }) {
+                let body = if reason == "DPoP replay" {
+                    r#"{"error":"DPoP replay"}"#
+                } else {
+                    r#"{"error":"DPoP validation failed"}"#
+                };
+                return Err((401, body.to_string()));
             }
         }
 
         Ok(())
+    }
+
+    fn emit_claim_headers(
+        &self,
+        ctx: &mut RequestContext,
+        claims: &Value,
+        provider: &JwksProvider,
+    ) {
+        let mappings = if provider.claim_headers.is_empty() {
+            &self.claim_headers
+        } else {
+            &provider.claim_headers
+        };
+        if mappings.is_empty() {
+            return;
+        }
+        let separator = provider
+            .claim_headers_separator
+            .as_deref()
+            .unwrap_or(&self.claim_headers_separator);
+        emit_claim_headers_to_metadata(ctx, claims, mappings, separator);
     }
 
     async fn authenticate_request(
@@ -539,6 +674,11 @@ impl JwksAuth {
                 };
 
                 let provider = &self.providers[provider_idx];
+                if let Err((status, body)) =
+                    self.check_sender_constraints(ctx, &claims, provider, &token)
+                {
+                    return reject(status, body);
+                }
                 if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
                     return reject(status, body);
                 }
@@ -574,6 +714,7 @@ impl JwksAuth {
                         if self.emit_mesh_request_principal_metadata {
                             set_mesh_request_principal_metadata(&claims, ctx);
                         }
+                        self.emit_claim_headers(ctx, &claims, provider);
 
                         if !provider.forward_original_token {
                             mark_original_token_stripping_metadata(ctx, provider);
@@ -611,7 +752,11 @@ impl JwksAuth {
                         for (other_idx, other_provider) in self.providers.iter().enumerate() {
                             if other_idx != idx
                                 && !other_provider.token_locations.is_empty()
-                                && provider_locations_extract_token(other_provider, ctx, &token)
+                                && provider_locations_extract_token(
+                                    &other_provider.token_locations,
+                                    ctx,
+                                    &token,
+                                )
                             {
                                 provider_indices.push(other_idx);
                             }
@@ -710,23 +855,6 @@ impl AuthMechanism for JwksAuth {
     }
 }
 
-fn extract_authorization_bearer(ctx: &RequestContext) -> ExtractedCredential {
-    match ctx.headers.get("authorization") {
-        None => ExtractedCredential::Missing,
-        Some(value) if value.starts_with("Bearer ") || value.starts_with("bearer ") => {
-            ExtractedCredential::BearerToken(value[7..].to_string())
-        }
-        Some(_) => {
-            ExtractedCredential::InvalidFormat(r#"{"error":"Missing Bearer token"}"#.to_string())
-        }
-    }
-}
-
-enum TokenLocationExtract {
-    Missing,
-    Credential(ExtractedCredential),
-}
-
 enum JwksExtractedCredential {
     BearerToken {
         token: String,
@@ -736,79 +864,14 @@ enum JwksExtractedCredential {
     Missing,
 }
 
-fn provider_locations_extract_token(
-    provider: &JwksProvider,
-    ctx: &RequestContext,
-    expected_token: &str,
-) -> bool {
-    provider
-        .token_locations
-        .iter()
-        .any(|location| match extract_from_location(location, ctx) {
-            TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token)) => {
-                token == expected_token
-            }
-            _ => false,
-        })
-}
-
 fn mark_original_token_stripping_metadata(ctx: &mut RequestContext, provider: &JwksProvider) {
-    if provider.token_locations.is_empty() {
-        ctx.metadata.insert(
-            STRIP_AUTHORIZATION_METADATA_KEY.to_string(),
-            "true".to_string(),
-        );
-        return;
-    }
-
-    for location in &provider.token_locations {
-        match location {
-            TokenLocation::Header(header) => {
-                ctx.metadata.insert(
-                    format!("{STRIP_HEADER_METADATA_PREFIX}{}", header.name),
-                    "true".to_string(),
-                );
-            }
-            TokenLocation::QueryParam(name) => {
-                ctx.metadata.insert(
-                    format!("{STRIP_QUERY_PARAM_METADATA_PREFIX}{name}"),
-                    "true".to_string(),
-                );
-                ctx.query_params.remove(name);
-            }
-        }
-    }
-}
-
-fn extract_from_location(location: &TokenLocation, ctx: &RequestContext) -> TokenLocationExtract {
-    match location {
-        TokenLocation::Header(header) => match ctx.headers.get(&header.name) {
-            Some(value) => extract_location_value(value, header.prefix.as_deref()),
-            None => TokenLocationExtract::Missing,
-        },
-        TokenLocation::QueryParam(name) => match ctx.query_params.get(name) {
-            Some(value) => extract_location_value(value, None),
-            None => TokenLocationExtract::Missing,
-        },
-    }
-}
-
-fn extract_location_value(value: &str, prefix: Option<&str>) -> TokenLocationExtract {
-    let token = match prefix {
-        Some(prefix) => match value.strip_prefix(prefix) {
-            Some(token) => token,
-            None => return TokenLocationExtract::Missing,
-        },
-        None => value,
-    };
-
-    if token.is_empty() {
-        return TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(
-            r#"{"error":"Empty token"}"#.to_string(),
-        ));
-    }
-
-    TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token.to_string()))
+    mark_token_stripping_metadata(
+        ctx,
+        &provider.token_locations,
+        STRIP_AUTHORIZATION_METADATA_KEY,
+        STRIP_HEADER_METADATA_PREFIX,
+        STRIP_QUERY_PARAM_METADATA_PREFIX,
+    );
 }
 
 #[async_trait]
@@ -839,6 +902,11 @@ impl super::Plugin for JwksAuth {
 
     fn modifies_request_headers(&self) -> bool {
         self.strip_authorization_on_success
+            || !self.claim_headers.is_empty()
+            || self
+                .providers
+                .iter()
+                .any(|provider| !provider.claim_headers.is_empty())
     }
 
     async fn before_proxy(
@@ -871,6 +939,7 @@ impl super::Plugin for JwksAuth {
             ctx.metadata
                 .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
         }
+        apply_claim_headers_from_metadata(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
         PluginResult::Continue
     }
 
@@ -916,118 +985,18 @@ impl super::Plugin for JwksAuth {
 async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Option<Value> {
     let guard = provider.jwks_store.load();
     let store = guard.as_ref().as_ref()?;
-
-    if !store.has_keys() {
-        debug!("jwks_auth: JWKS store has no cached keys; rejecting without hot-path fetch");
-        return None;
-    }
-
-    let header = decode_header(token).ok()?;
-
-    // Build validation params for this provider
-    let build_validation = |algorithm: Algorithm| -> Validation {
-        let mut validation = Validation::new(algorithm);
-        validation.validate_exp = true;
-        if provider.require_exp {
-            validation.required_spec_claims = HashSet::from(["exp".to_string()]);
-        } else {
-            validation.required_spec_claims.clear();
-        }
-        if let Some(ref iss) = provider.issuer {
-            validation.set_issuer(&[iss]);
-        }
-        if !provider.audiences.is_empty() {
-            validation.set_audience(&provider.audiences);
-        }
-        validation
-    };
-
-    // Try specific kid first
-    if let Some(kid) = &header.kid {
-        if let Some(cached_key) = store.get_key(kid) {
-            let validation = build_validation(cached_key.algorithm);
-            if let Ok(td) = decode::<Value>(token, &cached_key.decoding_key, &validation) {
-                return Some(td.claims);
-            }
-        }
-        debug!("JWKS key not found for kid={}, trying all keys", kid);
-    }
-
-    // Fallback: try all cached keys
-    let all_keys = store.all_keys();
-    for cached_key in all_keys.values() {
-        let validation = build_validation(cached_key.algorithm);
-        if let Ok(td) = decode::<Value>(token, &cached_key.decoding_key, &validation) {
-            return Some(td.claims);
-        }
-    }
-
-    None
-}
-
-/// Peek at the `iss` claim without signature verification.
-///
-/// Used to route the token to the correct provider before doing real validation.
-fn peek_issuer(token: &str) -> Option<String> {
-    let mut parts = token.split('.');
-    let _header = parts.next()?;
-    let payload_segment = parts.next()?;
-    let _signature = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-
-    use base64::Engine;
-    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_segment)
-        .ok()?;
-    let payload: Value = serde_json::from_slice(&payload_bytes).ok()?;
-    payload
-        .get("iss")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-/// Extract values from a JWT claim, supporting:
-/// - Space-delimited strings: `"read:data write:data"` → `["read:data", "write:data"]`
-/// - Arrays of strings: `["admin", "editor"]` → `["admin", "editor"]`
-/// - Nested dot-notation paths: `"realm_access.roles"` navigates `{"realm_access": {"roles": [...]}}`
-pub fn extract_claim_values(claims: &Value, claim_path: &str) -> Vec<String> {
-    let value = resolve_claim_path(claims, claim_path);
-    let Some(value) = value else {
-        return Vec::new();
-    };
-    normalize_claim_to_vec(value)
-}
-
-/// Resolve a dot-notation path like `"realm_access.roles"` through nested JSON.
-fn resolve_claim_path<'a>(claims: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut current = claims;
-    for segment in path.split('.') {
-        current = current.get(segment)?;
-    }
-    Some(current)
-}
-
-/// Normalize a claim value to a Vec<String>:
-/// - String → split on spaces
-/// - Array → collect string elements
-/// - Other → empty
-fn normalize_claim_to_vec(value: &Value) -> Vec<String> {
-    match value {
-        Value::String(s) => s.split_whitespace().map(|s| s.to_string()).collect(),
-        Value::Array(arr) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Extract a single string value from a claim path.
-fn extract_claim_string(claims: &Value, claim_path: &str) -> Option<String> {
-    let value = resolve_claim_path(claims, claim_path)?;
-    value.as_str().map(|s| s.to_string())
+    verify_jwt_with_jwks(
+        token,
+        store,
+        &JwtVerifyParams {
+            issuer: provider.issuer.as_deref(),
+            audiences: &provider.audiences,
+            require_exp: provider.require_exp,
+            leeway_secs: 0,
+            validate_nbf: false,
+        },
+    )
+    .await
 }
 
 /// Parse a JSON value as an array of strings, or empty vec if not present/valid.
@@ -1066,7 +1035,7 @@ fn optional_claim_path(
     default_value: &str,
 ) -> Result<String, String> {
     match config.get(field) {
-        Some(value) => parse_claim_path_value(field, value),
+        Some(value) => parse_claim_path_value(field, value, "jwks_auth"),
         None => Ok(default_value.to_string()),
     }
 }
@@ -1079,20 +1048,12 @@ fn optional_provider_claim_path(
     let Some(value) = config.get(field) else {
         return Ok(None);
     };
-    parse_claim_path_value(&format!("provider[{provider_idx}].{field}"), value).map(Some)
-}
-
-fn parse_claim_path_value(field: &str, value: &Value) -> Result<String, String> {
-    let raw = value
-        .as_str()
-        .ok_or_else(|| format!("jwks_auth: '{field}' must be a string, got: {value}"))?;
-    let path = raw.trim();
-    if path.is_empty() || path.split('.').any(str::is_empty) {
-        return Err(format!(
-            "jwks_auth: '{field}' must be a non-empty dot path without empty segments"
-        ));
-    }
-    Ok(path.to_string())
+    parse_claim_path_value(
+        &format!("provider[{provider_idx}].{field}"),
+        value,
+        "jwks_auth",
+    )
+    .map(Some)
 }
 
 fn optional_non_empty_string(
@@ -1334,20 +1295,62 @@ fn optional_provider_bool(
         .map(Some)
 }
 
+fn optional_provider_string(
+    config: &Map<String, Value>,
+    field: &str,
+    provider_idx: usize,
+) -> Result<Option<String>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or_else(|| {
+        format!("jwks_auth: 'provider[{provider_idx}].{field}' must be a string, got: {value}")
+    })?;
+    if raw.is_empty() {
+        return Err(format!(
+            "jwks_auth: 'provider[{provider_idx}].{field}' must not be empty"
+        ));
+    }
+    Ok(Some(raw.to_string()))
+}
+
+fn optional_provider_u64(
+    config: &Map<String, Value>,
+    field: &str,
+    provider_idx: usize,
+) -> Result<Option<u64>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| {
+            format!(
+                "jwks_auth: 'provider[{provider_idx}].{field}' must be an unsigned integer, got: {value}"
+            )
+        })
+        .map(Some)
+}
+
+fn optional_provider_usize(
+    config: &Map<String, Value>,
+    field: &str,
+    provider_idx: usize,
+) -> Result<Option<usize>, String> {
+    let Some(value) = optional_provider_u64(config, field, provider_idx)? else {
+        return Ok(None);
+    };
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("jwks_auth: 'provider[{provider_idx}].{field}' is too large"))
+}
+
 fn reject(status_code: u16, body: String) -> PluginResult {
     PluginResult::Reject {
         status_code,
         body,
         headers: std::collections::HashMap::new(),
     }
-}
-
-/// Escape characters that could cause JSON injection in error response bodies.
-fn html_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
 }
 
 /// Fetch the OIDC discovery document and extract the `jwks_uri` field.

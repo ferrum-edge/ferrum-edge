@@ -1455,5 +1455,6 @@ fn create_test_http_client_with_backend_allow_ips(
         ferrum_edge::config::types::DEFAULT_NAMESPACE,
         backend_allow_ips,
         std::sync::Arc::new(Vec::new()),
+        0,
     )
 }
