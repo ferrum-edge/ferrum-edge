@@ -38,6 +38,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
+use crate::plugins::chargeback::pricing::PricingConfig;
 
 /// Global chargeback registry (singleton per process).
 static CHARGEBACK_REGISTRY: OnceLock<Arc<ChargebackRegistry>> = OnceLock::new();
@@ -884,29 +885,6 @@ impl ChargebackRegistry {
     }
 }
 
-/// Resolved pricing configuration for one [`ApiChargeback`] instance.
-#[derive(Debug, Clone, Default)]
-struct PricingConfig {
-    /// Per-call pricing keyed by HTTP status code. Empty when `pricing_tiers`
-    /// is omitted.
-    price_by_status: HashMap<u16, f64>,
-    /// Per-byte bandwidth charge for client→backend bytes.
-    bandwidth_price_sent: f64,
-    /// Per-byte bandwidth charge for backend→client bytes.
-    bandwidth_price_received: f64,
-    /// Per-connection charge for stream sessions (TCP/UDP/DTLS).
-    stream_connection_price: f64,
-}
-
-impl PricingConfig {
-    fn has_any_pricing(&self) -> bool {
-        !self.price_by_status.is_empty()
-            || self.bandwidth_price_sent > 0.0
-            || self.bandwidth_price_received > 0.0
-            || self.stream_connection_price > 0.0
-    }
-}
-
 pub struct ApiChargeback {
     registry: Arc<ChargebackRegistry>,
     pricing: PricingConfig,
@@ -918,136 +896,6 @@ fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> 
             .as_u64()
             .ok_or_else(|| format!("api_chargeback: '{key}' must be an unsigned integer")),
         None => Ok(default),
-    }
-}
-
-fn optional_non_negative_f64(value: &Value, ctx: &str) -> Result<f64, String> {
-    let number = value
-        .as_f64()
-        .ok_or_else(|| format!("api_chargeback: '{ctx}' must be a number"))?;
-    if !number.is_finite() || number < 0.0 {
-        return Err(format!(
-            "api_chargeback: '{ctx}' must be a finite non-negative number"
-        ));
-    }
-    Ok(number)
-}
-
-fn parse_pricing_tiers(value: &Value) -> Result<HashMap<u16, f64>, String> {
-    let tiers = value
-        .as_array()
-        .ok_or_else(|| "api_chargeback: 'pricing_tiers' must be an array".to_string())?;
-
-    if tiers.is_empty() {
-        return Err(
-            "api_chargeback: 'pricing_tiers' must contain at least one pricing tier".to_string(),
-        );
-    }
-
-    let mut price_by_status: HashMap<u16, f64> = HashMap::new();
-    for (i, tier) in tiers.iter().enumerate() {
-        if !tier.is_object() {
-            return Err(format!(
-                "api_chargeback: pricing_tiers[{i}] must be an object"
-            ));
-        }
-
-        let status_codes = tier
-            .get("status_codes")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                format!(
-                    "api_chargeback: pricing_tiers[{i}].status_codes is required and must be an array"
-                )
-            })?;
-
-        if status_codes.is_empty() {
-            return Err(format!(
-                "api_chargeback: pricing_tiers[{i}].status_codes must not be empty"
-            ));
-        }
-
-        let price_value = tier.get("price_per_call").ok_or_else(|| {
-            format!(
-                "api_chargeback: pricing_tiers[{i}].price_per_call is required and must be a number"
-            )
-        })?;
-        let price =
-            optional_non_negative_f64(price_value, &format!("pricing_tiers[{i}].price_per_call"))?;
-
-        for code_val in status_codes {
-            let code_u64 = code_val.as_u64().ok_or_else(|| {
-                format!(
-                    "api_chargeback: pricing_tiers[{i}].status_codes contains non-integer value"
-                )
-            })?;
-
-            if !(100..=599).contains(&code_u64) {
-                return Err(format!(
-                    "api_chargeback: pricing_tiers[{i}].status_codes contains invalid HTTP status code {code_u64}"
-                ));
-            }
-            let code = code_u64 as u16;
-
-            if price_by_status.contains_key(&code) {
-                return Err(format!(
-                    "api_chargeback: status code {code} appears in multiple pricing tiers"
-                ));
-            }
-
-            price_by_status.insert(code, price);
-        }
-    }
-    Ok(price_by_status)
-}
-
-fn parse_bandwidth_pricing(value: &Value) -> Result<(f64, f64), String> {
-    if !value.is_object() {
-        return Err("api_chargeback: 'bandwidth_pricing' must be an object".to_string());
-    }
-    let allowed = ["price_per_byte_sent", "price_per_byte_received"];
-    if let Some(obj) = value.as_object() {
-        for key in obj.keys() {
-            if !allowed.contains(&key.as_str()) {
-                return Err(format!(
-                    "api_chargeback: unknown key '{key}' in bandwidth_pricing (allowed: {})",
-                    allowed.join(", ")
-                ));
-            }
-        }
-    }
-    let price_sent = match value.get("price_per_byte_sent") {
-        Some(v) => optional_non_negative_f64(v, "bandwidth_pricing.price_per_byte_sent")?,
-        None => 0.0,
-    };
-    let price_received = match value.get("price_per_byte_received") {
-        Some(v) => optional_non_negative_f64(v, "bandwidth_pricing.price_per_byte_received")?,
-        None => 0.0,
-    };
-    Ok((price_sent, price_received))
-}
-
-fn parse_stream_connection_pricing(value: &Value) -> Result<f64, String> {
-    if !value.is_object() {
-        return Err("api_chargeback: 'stream_connection_pricing' must be an object".to_string());
-    }
-    let allowed = ["price_per_connection"];
-    if let Some(obj) = value.as_object() {
-        for key in obj.keys() {
-            if !allowed.contains(&key.as_str()) {
-                return Err(format!(
-                    "api_chargeback: unknown key '{key}' in stream_connection_pricing (allowed: {})",
-                    allowed.join(", ")
-                ));
-            }
-        }
-    }
-    match value.get("price_per_connection") {
-        Some(v) => optional_non_negative_f64(v, "stream_connection_pricing.price_per_connection"),
-        None => Err(
-            "api_chargeback: 'stream_connection_pricing.price_per_connection' is required"
-                .to_string(),
-        ),
     }
 }
 
@@ -1099,18 +947,7 @@ impl ApiChargeback {
 
         // Validate ALL pricing dimensions before touching the global registry,
         // so a config error never leaves shared state half-mutated.
-        let mut pricing = PricingConfig::default();
-        if let Some(tiers) = config.get("pricing_tiers") {
-            pricing.price_by_status = parse_pricing_tiers(tiers)?;
-        }
-        if let Some(bw) = config.get("bandwidth_pricing") {
-            let (sent, received) = parse_bandwidth_pricing(bw)?;
-            pricing.bandwidth_price_sent = sent;
-            pricing.bandwidth_price_received = received;
-        }
-        if let Some(stream) = config.get("stream_connection_pricing") {
-            pricing.stream_connection_price = parse_stream_connection_pricing(stream)?;
-        }
+        let pricing = PricingConfig::from_config(config, "api_chargeback")?;
 
         if !pricing.has_any_pricing() {
             return Err(
@@ -1158,24 +995,13 @@ impl Plugin for ApiChargeback {
             _ => return,
         };
 
-        // Per-call price for this status code (O(1) HashMap lookup, no alloc).
-        // Zero when the status code is not in any tier — bandwidth charges may
-        // still apply, so we don't short-circuit here.
-        let call_price = self
-            .pricing
-            .price_by_status
-            .get(&summary.response_status_code)
-            .copied()
-            .unwrap_or(0.0);
-
-        let has_bandwidth_pricing =
-            self.pricing.bandwidth_price_sent > 0.0 || self.pricing.bandwidth_price_received > 0.0;
-
-        // If neither per-call nor bandwidth pricing applies, skip this record
-        // entirely to avoid creating a no-op entry for an uncharged status.
-        if call_price == 0.0 && !has_bandwidth_pricing {
+        let Some(charge) = self.pricing.compute_http(
+            summary.response_status_code,
+            summary.bytes_sent,
+            summary.bytes_received,
+        ) else {
             return;
-        }
+        };
 
         let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
@@ -1185,7 +1011,7 @@ impl Plugin for ApiChargeback {
             proxy_id,
             proxy_name,
             summary.response_status_code,
-            call_price,
+            charge.charge_call,
             summary.bytes_sent,
             summary.bytes_received,
             self.pricing.bandwidth_price_sent,
@@ -1199,16 +1025,12 @@ impl Plugin for ApiChargeback {
             _ => return,
         };
 
-        let connection_price = self.pricing.stream_connection_price;
-        let has_bandwidth_pricing =
-            self.pricing.bandwidth_price_sent > 0.0 || self.pricing.bandwidth_price_received > 0.0;
-
-        // If neither stream-connection nor bandwidth pricing applies, skip —
-        // otherwise we would silently create a $0 entry for every stream
-        // disconnect on consumers using only HTTP per-call pricing.
-        if connection_price == 0.0 && !has_bandwidth_pricing {
+        let Some(charge) = self
+            .pricing
+            .compute_stream(summary.bytes_sent, summary.bytes_received)
+        else {
             return;
-        }
+        };
 
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
 
@@ -1216,7 +1038,7 @@ impl Plugin for ApiChargeback {
             consumer,
             &summary.proxy_id,
             proxy_name,
-            connection_price,
+            charge.charge_call,
             summary.bytes_sent,
             summary.bytes_received,
             self.pricing.bandwidth_price_sent,
@@ -1233,7 +1055,13 @@ impl Plugin for ApiChargeback {
             Some(c) if !c.is_empty() => c,
             _ => return,
         };
-        if self.pricing.bandwidth_price_sent == 0.0 && self.pricing.bandwidth_price_received == 0.0
+        if self
+            .pricing
+            .compute_websocket_bandwidth(
+                summary.bytes_client_to_backend,
+                summary.bytes_backend_to_client,
+            )
+            .is_none()
         {
             return;
         }

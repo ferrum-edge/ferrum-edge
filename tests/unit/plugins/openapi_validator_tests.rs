@@ -157,6 +157,40 @@ async fn request_validation_blocks_or_logs_by_mode() {
 }
 
 #[tokio::test]
+async fn delete_request_with_schema_buffers_and_validates_body() {
+    let plugin = OpenapiValidator::new(&json!({
+        "enforcement_mode": "block",
+        "operations": [{
+            "method": "DELETE",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_required": true,
+            "request_body": {
+                "content": {
+                    "application/json": {
+                        "type": "object",
+                        "required": ["id"],
+                        "properties": {
+                            "id": {"type": "string"}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "DELETE".into(), "/items".into());
+    ctx.headers = json_headers();
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), br#"{}"#)
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
 async fn valid_request_and_gzip_body_continue() {
     let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
     let mut ctx = post_ctx("/items");

@@ -15,6 +15,7 @@ use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, StreamConnectionContext,
     TransactionSummary, available_plugins, create_plugin, is_security_plugin, priority,
+    validate_plugin_config,
 };
 use serde_json::json;
 
@@ -1440,6 +1441,36 @@ async fn access_log_is_all_protocol_logging_plugin() {
     assert_eq!(plugin.priority(), priority::ACCESS_LOG);
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
     plugin.log(&TransactionSummary::default()).await;
+}
+
+#[test]
+fn access_log_validation_path_rejects_invalid_filter() {
+    validate_plugin_config(
+        "access_log",
+        &json!({
+            "filter": {
+                "status_code_min": 400,
+                "status_code_max": 599,
+                "min_latency_ms": 250,
+                "errors_only": true
+            }
+        }),
+    )
+    .expect("valid access_log filter config should pass");
+
+    let err = validate_plugin_config(
+        "access_log",
+        &json!({
+            "filter": {
+                "min_latency_ms": "slow"
+            }
+        }),
+    )
+    .expect_err("invalid filter should fail through plugin registry validation");
+    assert!(
+        err.contains("filter.min_latency_ms must be an integer"),
+        "unexpected error: {err}"
+    );
 }
 
 // ── PolicyScope enforcement tests ────────────────────────────────────────────

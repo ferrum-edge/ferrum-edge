@@ -17,6 +17,7 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel. When full, new events are dropped to avoid backpressure on request threads |
 | `FERRUM_LOG_REDACT_METADATA_KEYS` | No | — | Comma-separated additional metadata-key substrings to redact from `TransactionSummary.metadata` and `StreamTransactionSummary.metadata` before log serialization. Built-in sensitive substrings such as `authorization`, `cookie`, `password`, `secret`, and `token` are always redacted. Operators can further reshape per-plugin log output (rename keys, drop fields, reorder, add static / derived fields, flatten metadata, change timestamp format) via per-logging-plugin `schema:` blocks or a shared `transaction_log_schema` plugin — see [docs/log_schema.md](log_schema.md) |
 | `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` | No | `30` | Timeout for each external secret fetch during startup |
+| `FERRUM_CLICKHOUSE_PASSWORD` | No | — | Optional materialized password used by the `api_chargeback_sink` plugin when its `clickhouse.password_ref` is set to `FERRUM_CLICKHOUSE_PASSWORD`. The plugin only accepts `FERRUM_*` password references. Populate this value directly or through existing secret suffixes such as `FERRUM_CLICKHOUSE_PASSWORD_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` |
 
 ### Proxy Listener
 
