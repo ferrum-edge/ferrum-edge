@@ -178,7 +178,12 @@ fn request_body_len(request: &[u8]) -> usize {
     request.len().saturating_sub(end).min(len)
 }
 
-async fn send_h2_request(request: Request<Full<Bytes>>, proxy_port: u16) -> (u16, String) {
+/// Send an H2 request and return `(Some(status), body)`, or `(None, "")` when
+/// the proxy resets the stream instead of delivering a response. A reset is a
+/// valid way for the proxy to reject an over-limit request body, so callers
+/// that exercise rejection must tolerate it (a genuine hang does not resolve
+/// here and surfaces as a test timeout instead).
+async fn send_h2_request(request: Request<Full<Bytes>>, proxy_port: u16) -> (Option<u16>, String) {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect h2");
@@ -191,19 +196,24 @@ async fn send_h2_request(request: Request<Full<Bytes>>, proxy_port: u16) -> (u16
         let _ = conn.await;
     });
 
-    let response = sender.send_request(request).await.expect("send h2 request");
-    let status = response.status().as_u16();
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .expect("collect h2 body")
-        .to_bytes();
+    let outcome = match sender.send_request(request).await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .map(|collected| collected.to_bytes())
+                .unwrap_or_default();
+            (Some(status), String::from_utf8_lossy(&body).into_owned())
+        }
+        Err(_reset) => (None, String::new()),
+    };
 
     drop(sender);
     conn_task.abort();
 
-    (status, String::from_utf8_lossy(&body).into_owned())
+    outcome
 }
 
 #[ignore]
@@ -259,11 +269,16 @@ async fn functional_body_size_limit_http2_request_body_rejected_without_content_
     let hits_before = harness.backend_hit_count();
     let (status, body) = send_h2_request(request, harness.proxy_port).await;
 
-    assert_eq!(status, 413, "body={body}");
-    assert!(
-        body.contains("Request body exceeds maximum size"),
-        "unexpected body: {body}"
-    );
+    // A delivered response must be the 413; a stream reset (None) is an equally
+    // valid rejection of the over-limit upload. The backend-hit guard below is
+    // the authoritative check that the body never reached the backend.
+    if let Some(status) = status {
+        assert_eq!(status, 413, "body={body}");
+        assert!(
+            body.contains("Request body exceeds maximum size"),
+            "unexpected body: {body}"
+        );
+    }
     assert_eq!(
         harness.backend_hit_count(),
         hits_before,
@@ -352,7 +367,9 @@ async fn functional_body_size_limit_http2_response_content_length_rejected() {
     let hits_before = harness.backend_hit_count();
     let (status, body) = send_h2_request(request, harness.proxy_port).await;
 
-    assert_eq!(status, 502, "body={body}");
+    // The over-limit response is rejected via the Content-Length fast path,
+    // which returns a complete buffered 502 (no streaming, so no reset race).
+    assert_eq!(status, Some(502), "body={body}");
     assert!(
         body.contains("Backend response body exceeds maximum size"),
         "unexpected body: {body}"

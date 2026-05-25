@@ -99,10 +99,24 @@ async fn functional_streaming_request_body_limit_h2_without_content_length() {
         .body(StreamBody::new(body_stream))
         .expect("build h2 streaming request");
 
-    let resp = sender.send_request(req).await.expect("send h2 request");
-
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    let _ = resp.into_body().collect().await;
+    // The proxy aborts the request stream once the streamed body crosses the
+    // limit. Depending on scheduling the client either receives the 413 or sees
+    // the request stream reset mid-upload (a non-timeout send error). Both are
+    // valid rejections; `assert_no_complete_oversized_body` below is the
+    // authoritative check that the over-limit body never fully reached the
+    // backend regardless of which outcome the client observed.
+    match sender.send_request(req).await {
+        Ok(resp) => {
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let _ = resp.into_body().collect().await;
+        }
+        Err(err) => {
+            assert!(
+                !err.is_timeout(),
+                "expected the proxy to reject the over-limit H2 upload, not hang: {err}"
+            );
+        }
+    }
     assert_no_complete_oversized_body(&backend).await;
 
     drop(sender);
