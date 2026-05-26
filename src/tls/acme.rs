@@ -1220,11 +1220,22 @@ pub(crate) fn validate_acme_directory_url_ssrf_policy(
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(host);
-    if let Ok(ip) = host_ip.parse::<std::net::IpAddr>()
-        && !crate::config::check_backend_ip_allowed(&ip, &crate::config::BackendAllowIps::Public)
+    if let Ok(ip) = host_ip.parse::<std::net::IpAddr>() {
+        if !crate::config::check_backend_ip_allowed(&ip, &crate::config::BackendAllowIps::Public) {
+            return Err(AcmeError::BlockedDirectoryUrl(format!(
+                "host IP {ip} is not a public address"
+            )));
+        }
+    } else if host_ip
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() || b == b'.' || b == b'x' || b == b'X')
     {
+        // System resolvers (getaddrinfo) interpret decimal integers (2130706433),
+        // abbreviated dotted (127.1), hex-prefixed (0x7f.0.0.1), and on some
+        // platforms octal (0177.0.0.1) as IP addresses. Rust's IpAddr only parses
+        // standard dotted-decimal/colon-hex, so those forms slip past the gate above.
         return Err(AcmeError::BlockedDirectoryUrl(format!(
-            "host IP {ip} is not a public address"
+            "non-standard numeric host '{host_ip}' is not permitted; use a hostname or standard dotted-decimal IP"
         )));
     }
     Ok(())
@@ -2333,6 +2344,23 @@ mod tests {
             "https://[fe80::1]/dir",          // IPv6 link-local
             "https://[fc00::1]/dir",          // IPv6 ULA
             "https://user@127.0.0.1/dir",     // userinfo must not bypass the IP gate
+        ] {
+            assert!(
+                validate_acme_directory_url_ssrf_policy(bad).is_err(),
+                "expected rejection for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_url_ssrf_policy_rejects_non_canonical_numeric_ips() {
+        for bad in [
+            "https://2130706433/dir", // decimal integer = 127.0.0.1
+            "https://0177.0.0.1/dir", // octal = 127.0.0.1 on glibc
+            "https://127.1/dir",      // abbreviated = 127.0.0.1
+            "https://0x7f.0.0.1/dir", // hex-prefixed = 127.0.0.1
+            "https://0x7f000001/dir", // hex integer = 127.0.0.1
+            "https://0xA9FEA9FE/dir", // hex integer = 169.254.169.254
         ] {
             assert!(
                 validate_acme_directory_url_ssrf_policy(bad).is_err(),
