@@ -4563,7 +4563,13 @@ components:
           description: DNS identifiers covered by the ACME certificate.
         directory_url:
           type: string
-          description: ACME directory URL that issued the certificate.
+          description: >-
+            ACME directory URL that issued the certificate. Must be an absolute
+            `https` URL with a host. Literal IP hosts must be public addresses;
+            private/reserved literals (loopback, RFC1918, link-local, ULA, and the
+            `169.254.169.254` metadata address) are rejected to limit SSRF. Hostnames
+            are not resolved here, so a hostname that points at a private IP is not
+            blocked by this check — apply network-level egress controls as well.
         account_id:
           type: string
           description: Optional ACME account identifier or URL.
@@ -4742,7 +4748,13 @@ components:
             type: string
         directory_url:
           type: string
-          description: ACME directory URL.
+          description: >-
+            ACME directory URL. Must be an absolute `https` URL with a host. Literal
+            IP hosts must be public addresses; private/reserved literals (loopback,
+            RFC1918, link-local, ULA, and the `169.254.169.254` metadata address) are
+            rejected to limit SSRF. Hostnames are not resolved here, so a hostname that
+            points at a private IP is not blocked by this check — apply network-level
+            egress controls as well.
         contact:
           type: array
           items:

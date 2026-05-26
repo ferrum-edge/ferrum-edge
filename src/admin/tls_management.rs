@@ -587,7 +587,7 @@ pub(super) async fn handle_create_acme_order(
             Ok(store) => store,
             Err(response) => return Ok(*response),
         };
-        let (record, overwrite) = match acme_order_record_from_request(state, request).await {
+        let (record, overwrite) = match acme_order_record_from_request(request).await {
             Ok(value) => value,
             Err(error) => {
                 return Ok(super::json_response(
@@ -927,20 +927,17 @@ pub(super) async fn handle_renew_acme_certificate(
                 ));
             }
         };
-        let (record, overwrite) = match acme_order_record_from_request(
-            state,
-            AcmeOrderRequest {
-                id: Some(renewal_order_id),
-                certificate_id: Some(certificate_id.to_string()),
-                domains: certificate.domains,
-                directory_url: certificate.directory_url,
-                contact: request.contact,
-                terms_of_service_agreed: request.terms_of_service_agreed,
-                challenge_type: request.challenge_type,
-                existing_account_credentials_json,
-                allow_overwrite: request.allow_overwrite,
-            },
-        )
+        let (record, overwrite) = match acme_order_record_from_request(AcmeOrderRequest {
+            id: Some(renewal_order_id),
+            certificate_id: Some(certificate_id.to_string()),
+            domains: certificate.domains,
+            directory_url: certificate.directory_url,
+            contact: request.contact,
+            terms_of_service_agreed: request.terms_of_service_agreed,
+            challenge_type: request.challenge_type,
+            existing_account_credentials_json,
+            allow_overwrite: request.allow_overwrite,
+        })
         .await
         {
             Ok(value) => value,
@@ -1625,6 +1622,7 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         | AcmeError::InvalidDomain(_)
         | AcmeError::InvalidPath(_)
         | AcmeError::InvalidChallengeToken(_)
+        | AcmeError::BlockedDirectoryUrl(_)
         | AcmeError::MissingMaterial { .. } => StatusCode::BAD_REQUEST,
         AcmeError::Read(_) | AcmeError::Write(_) | AcmeError::Parse(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -1766,6 +1764,11 @@ fn acme_certificate_record_from_request(
     let directory_url =
         validated_optional_acme_string(Some(request.directory_url), "directory_url")?
             .ok_or_else(|| "directory_url must not be empty".to_string())?;
+    // Validate the directory URL at the import boundary so the persisted value is
+    // already trusted by the time the renewal scheduler reads it (defense in depth;
+    // outbound order prep re-validates at the ACME client chokepoint).
+    crate::tls::acme::validate_acme_directory_url_ssrf_policy(&directory_url)
+        .map_err(|error| error.to_string())?;
     let account_id = validated_optional_acme_string(request.account_id, "account_id")?;
     let order_url = validated_optional_acme_string(request.order_url, "order_url")?;
     let cert_pem = combine_cert_and_chain(&request.cert_pem, request.chain_pem.as_deref());
@@ -1795,7 +1798,6 @@ fn acme_certificate_record_from_request(
 
 #[cfg(feature = "acme")]
 async fn acme_order_record_from_request(
-    state: &AdminState,
     request: AcmeOrderRequest,
 ) -> Result<(AcmeOrderRecord, bool), String> {
     let id = managed_request_id(None, request.id.as_deref())?;
@@ -1804,7 +1806,8 @@ async fn acme_order_record_from_request(
     let directory_url =
         validated_optional_acme_string(Some(request.directory_url), "directory_url")?
             .ok_or_else(|| "directory_url must not be empty".to_string())?;
-    validate_acme_directory_url_policy(state, &directory_url)?;
+    // The ACME client (`client::prepare_order`) validates the directory URL against
+    // SSRF policy at the outbound chokepoint below, so no separate check is needed here.
     let contact = normalize_acme_contact(request.contact)?;
     let existing_account_credentials_json = request
         .existing_account_credentials_json
@@ -1883,34 +1886,6 @@ async fn acme_order_record_from_request(
         .map_err(|error| error.to_string())?,
         allow_overwrite,
     ))
-}
-
-#[cfg(feature = "acme")]
-fn validate_acme_directory_url_policy(
-    state: &AdminState,
-    directory_url: &str,
-) -> Result<(), String> {
-    let uri: hyper::Uri = directory_url
-        .parse()
-        .map_err(|_| "directory_url must be a valid absolute URL".to_string())?;
-    if uri.scheme_str() != Some("https") {
-        return Err("directory_url must use https scheme".to_string());
-    }
-    let host = uri
-        .host()
-        .ok_or_else(|| "directory_url must include a host".to_string())?;
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let policy = match state.proxy_state.as_ref() {
-            Some(proxy) => &proxy.env_config.backend_allow_ips,
-            None => &crate::config::BackendAllowIps::Public,
-        };
-        if !crate::config::check_backend_ip_allowed(&ip, policy) {
-            return Err(format!(
-                "directory_url host IP {ip} is denied by FERRUM_BACKEND_ALLOW_IPS={policy} policy"
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(feature = "acme")]

@@ -295,6 +295,8 @@ pub enum AcmeError {
     Write(String),
     #[error("failed to parse ACME certificate store: {0}")]
     Parse(String),
+    #[error("ACME directory URL is not permitted: {0}")]
+    BlockedDirectoryUrl(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1170,6 +1172,64 @@ fn validate_acme_directory_url(directory_url: &str) -> Result<(), AcmeError> {
     Ok(())
 }
 
+/// Enforces SSRF policy on an operator-supplied ACME `directory_url` before any
+/// outbound ACME network activity.
+///
+/// This is the single chokepoint guarding directory URLs: it is invoked at order
+/// preparation in [`client::prepare_order`] — which covers both interactive order
+/// creation and the automatic renewal scheduler — and again at the certificate
+/// import boundary, so a stored URL is validated both at rest and immediately
+/// before use regardless of how the record was persisted.
+///
+/// Policy:
+/// - must parse as an absolute URL with the `https` scheme and a non-empty host;
+/// - if the host is a literal IP, it must be a public address (hard-coded
+///   [`BackendAllowIps::Public`](crate::config::BackendAllowIps)). Public CAs are
+///   always reachable, while private/reserved literals — loopback, RFC1918,
+///   link-local, ULA, and the cloud metadata address `169.254.169.254` — are
+///   rejected. `Public` is hard-coded rather than reusing `FERRUM_BACKEND_ALLOW_IPS`
+///   (which defaults to `both`, a no-op) so the guard is effective on stock installs.
+///
+/// Known gap: hostnames are not resolved here, so a hostname whose A/AAAA record
+/// resolves to a private IP (e.g. `localhost`, `*.nip.io`, `metadata.google.internal`)
+/// is not blocked by this check; the downstream ACME client resolves and connects
+/// without an IP gate, so operators must still enforce network-level egress controls.
+/// This mirrors the literal-only enforcement used elsewhere for
+/// `FERRUM_BACKEND_ALLOW_IPS`.
+pub(crate) fn validate_acme_directory_url_ssrf_policy(
+    directory_url: &str,
+) -> Result<(), AcmeError> {
+    let uri: hyper::Uri = directory_url
+        .trim()
+        .parse()
+        .map_err(|_| AcmeError::BlockedDirectoryUrl("must be a valid absolute URL".to_string()))?;
+    if uri.scheme_str() != Some("https") {
+        return Err(AcmeError::BlockedDirectoryUrl(
+            "must use https scheme".to_string(),
+        ));
+    }
+    let host = uri
+        .host()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| AcmeError::BlockedDirectoryUrl("must include a host".to_string()))?;
+    // hyper::Uri::host() strips userinfo, so `https://name@127.0.0.1/` resolves to the
+    // literal `127.0.0.1` here rather than the userinfo, closing that bypass. IPv6
+    // literals are returned bracketed (`[::1]`); strip the brackets before parsing so
+    // private IPv6 literals cannot slip past the IP gate as if they were hostnames.
+    let host_ip = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = host_ip.parse::<std::net::IpAddr>()
+        && !crate::config::check_backend_ip_allowed(&ip, &crate::config::BackendAllowIps::Public)
+    {
+        return Err(AcmeError::BlockedDirectoryUrl(format!(
+            "host IP {ip} is not a public address"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_acme_account_identifier(account_id: &str) -> Result<(), AcmeError> {
     let account_id = account_id.trim();
     if account_id.is_empty() {
@@ -1974,6 +2034,11 @@ pub mod client {
         challenge_type: ChallengeType,
         challenge_name: &'static str,
     ) -> Result<PreparedAcmeHttp01Order, AcmeClientError> {
+        // SSRF chokepoint: validate the operator-supplied directory URL before any
+        // outbound ACME activity. Both interactive order creation and the automatic
+        // renewal scheduler funnel through here, so this also closes the renewal path.
+        super::validate_acme_directory_url_ssrf_policy(&config.account.directory_url)
+            .map_err(|error| AcmeClientError::InvalidRequest(error.to_string()))?;
         let domains = normalize_order_domains(config.domains)?;
         let account = resolve_account(&config.account).await?;
         let identifiers = domains
@@ -2241,6 +2306,58 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), AcmeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_url_ssrf_policy_rejects_non_https_and_missing_host() {
+        for bad in [
+            "http://acme.example/dir", // non-https scheme
+            "file:///etc/passwd",      // non-https scheme
+            "acme.example/dir",        // missing scheme
+            "https:///dir",            // missing host
+            "not a url",               // unparseable
+        ] {
+            assert!(
+                validate_acme_directory_url_ssrf_policy(bad).is_err(),
+                "expected rejection for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_url_ssrf_policy_rejects_private_ip_literals() {
+        for bad in [
+            "https://127.0.0.1/dir",          // IPv4 loopback
+            "https://10.0.0.1/dir",           // RFC1918
+            "https://169.254.169.254/latest", // link-local cloud metadata
+            "https://[::1]/dir",              // IPv6 loopback
+            "https://[fe80::1]/dir",          // IPv6 link-local
+            "https://[fc00::1]/dir",          // IPv6 ULA
+            "https://user@127.0.0.1/dir",     // userinfo must not bypass the IP gate
+        ] {
+            assert!(
+                validate_acme_directory_url_ssrf_policy(bad).is_err(),
+                "expected rejection for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_url_ssrf_policy_accepts_public_ips_and_hostnames() {
+        // Public CAs (hostnames) and public IP literals are permitted. Hostnames
+        // resolving to private IPs are a documented gap (no DNS resolution here).
+        for ok in [
+            "https://acme-v02.api.letsencrypt.org/directory",
+            " https://acme-staging-v02.api.letsencrypt.org/directory ", // trimmed
+            "https://1.1.1.1/dir",                                      // public IPv4 literal
+            "https://[2606:4700:4700::1111]/dir",                       // public IPv6 literal
+            "https://localhost/dir", // hostname gap: not blocked here
+        ] {
+            assert!(
+                validate_acme_directory_url_ssrf_policy(ok).is_ok(),
+                "expected acceptance for {ok}"
+            );
+        }
+    }
 
     fn generated_cert_and_key() -> (String, String) {
         let key_pair =
