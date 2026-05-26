@@ -11,6 +11,7 @@ mod admin_mesh_runtime_overlay_tests;
 mod admin_mesh_service_graph_tests;
 mod admin_node_waypoint_identities_tests;
 mod admin_runtime_metrics_tests;
+mod api_chargeback_sink_tests;
 mod apply_incremental_outcome_tests;
 mod backend_mtls_tests;
 mod backend_tls_san_allow_list_tests;

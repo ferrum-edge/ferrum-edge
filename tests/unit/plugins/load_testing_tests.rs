@@ -503,6 +503,42 @@ fn test_gateway_addresses_invalid_url_is_error() {
     assert!(err.contains("invalid gateway address"), "got: {}", err);
 }
 
+#[test]
+fn test_gateway_addresses_with_empty_authority_is_error() {
+    let config = json!({
+        "key": "test",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "gateway_addresses": ["https:///node2"]
+    });
+    let err = LoadTesting::new(&config, PluginHttpClient::default())
+        .err()
+        .unwrap();
+    assert!(err.contains("with a host"), "got: {}", err);
+}
+
+#[test]
+fn test_gateway_addresses_with_query_or_fragment_is_error() {
+    for address in [
+        "https://node2:8443?trigger=true",
+        "https://node2:8443#fragment",
+    ] {
+        let config = json!({
+            "key": "test",
+            "concurrent_clients": 5,
+            "duration_seconds": 10,
+            "gateway_addresses": [address]
+        });
+        let err = LoadTesting::new(&config, PluginHttpClient::default())
+            .err()
+            .unwrap();
+        assert!(
+            err.contains("query or fragment"),
+            "address {address} should fail, got: {err}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // before_proxy — key matching
 // ---------------------------------------------------------------------------

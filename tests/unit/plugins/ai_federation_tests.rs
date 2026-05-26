@@ -59,6 +59,22 @@ fn test_plugin_metadata_and_warmup_hostnames() {
 }
 
 #[test]
+fn test_warmup_hostnames_unbrackets_ipv6_base_url() {
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test-key",
+            "base_url": "https://[2001:db8::60]/v1/chat/completions",
+            "model_patterns": ["gpt-*"]
+        }]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+
+    assert_eq!(plugin.warmup_hostnames(), vec!["2001:db8::60".to_string()]);
+}
+
+#[test]
 fn test_invalid_config_shapes_rejected() {
     let valid_provider = json!({
         "name": "openai",
@@ -1212,6 +1228,13 @@ fn test_base_url_https_accepted() {
 }
 
 #[test]
+fn test_base_url_empty_authority_rejected() {
+    let err = test_helpers::validate_base_url_test("openai", "https:///v1/chat", false, "both")
+        .unwrap_err();
+    assert!(err.contains("no host"), "got: {err}");
+}
+
+#[test]
 fn test_base_url_http_rejected_without_allow_plaintext() {
     let err = test_helpers::validate_base_url_test("openai", "http://example.com", false, "both")
         .unwrap_err();
@@ -1432,5 +1455,6 @@ fn create_test_http_client_with_backend_allow_ips(
         ferrum_edge::config::types::DEFAULT_NAMESPACE,
         backend_allow_ips,
         std::sync::Arc::new(Vec::new()),
+        0,
     )
 }

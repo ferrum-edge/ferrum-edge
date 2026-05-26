@@ -102,6 +102,19 @@ fn test_build_backend_url_with_backend_path() {
 }
 
 #[test]
+fn test_build_backend_url_with_relative_backend_path() {
+    let mut proxy = test_proxy();
+    proxy.backend_path = Some("internal".into());
+    let url = build_backend_url(
+        &proxy,
+        "/api/v1/users",
+        "",
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
+    );
+    assert_eq!(url, "http://backend.example.com:3000/internal/users");
+}
+
+#[test]
 fn test_build_backend_url_with_query() {
     let proxy = test_proxy();
     let url = build_backend_url(
@@ -156,6 +169,22 @@ fn test_build_backend_url_target_path_with_no_backend_path() {
         9090,
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
         Some("/service"),
+    );
+    assert_eq!(url, "http://target.example.com:9090/service/users");
+}
+
+#[test]
+fn test_build_backend_url_target_path_without_slashes_inserts_separator() {
+    let mut proxy = test_proxy();
+    proxy.listen_path = Some("/api/v1/".into());
+    let url = build_backend_url_with_target(
+        &proxy,
+        "/api/v1/users",
+        "",
+        "target.example.com",
+        9090,
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
+        Some("service"),
     );
     assert_eq!(url, "http://target.example.com:9090/service/users");
 }
@@ -317,6 +346,27 @@ impl Plugin for PermissiveMissingMeshAuth {
 
 struct BodySuffixPlugin {
     suffix: &'static str,
+}
+
+struct MissingCredentialContinueAuth;
+
+#[async_trait]
+impl Plugin for MissingCredentialContinueAuth {
+    fn name(&self) -> &str {
+        "missing_credential_continue_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
 }
 
 #[async_trait]
@@ -701,6 +751,83 @@ async fn test_multi_auth_rejects_when_mandatory_plugin_rejects_despite_mesh_perm
     assert!(
         result.is_some(),
         "mesh permissive marker must not bypass another plugin's rejection in Multi mode"
+    );
+    let (status, body, _headers) = result.unwrap();
+    assert_eq!(status, 401);
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        r#"{"error":"API key required"}"#
+    );
+}
+
+#[tokio::test]
+async fn test_single_auth_rejects_when_mesh_marker_present_with_other_missing_auth() {
+    let mesh_request_auth: Arc<dyn Plugin> = Arc::new(PermissiveMissingMeshAuth);
+    let missing_auth: Arc<dyn Plugin> = Arc::new(MissingCredentialContinueAuth);
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![mesh_request_auth, missing_auth];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mesh".to_string(),
+    );
+
+    let result =
+        run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    assert!(result.is_some());
+    let (status, body, _headers) = result.unwrap();
+    assert_eq!(status, 401);
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        r#"{"error":"Authentication required"}"#
+    );
+}
+
+#[tokio::test]
+async fn test_multi_auth_rejects_when_mesh_marker_present_with_other_missing_auth() {
+    let mesh_request_auth: Arc<dyn Plugin> = Arc::new(PermissiveMissingMeshAuth);
+    let missing_auth: Arc<dyn Plugin> = Arc::new(MissingCredentialContinueAuth);
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![mesh_request_auth, missing_auth];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mesh".to_string(),
+    );
+
+    let result =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    assert!(result.is_some());
+    let (status, body, _headers) = result.unwrap();
+    assert_eq!(status, 401);
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        r#"{"error":"Authentication required"}"#
+    );
+}
+
+#[tokio::test]
+async fn test_single_auth_rejects_when_mandatory_plugin_rejects_despite_mesh_permissive_marker() {
+    let rejecting_auth: Arc<dyn Plugin> = Arc::new(RejectingAuth {
+        body: r#"{"error":"API key required"}"#,
+    });
+    let mesh_request_auth: Arc<dyn Plugin> = Arc::new(PermissiveMissingMeshAuth);
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![rejecting_auth, mesh_request_auth];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mesh".to_string(),
+    );
+
+    let result =
+        run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    assert!(
+        result.is_some(),
+        "mesh permissive marker must not bypass another plugin's rejection in Single mode"
     );
     let (status, body, _headers) = result.unwrap();
     assert_eq!(status, 401);

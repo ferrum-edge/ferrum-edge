@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
-use url::Url;
 
 use crate::plugins::utils::http_client::PluginHttpClient;
 
@@ -17,7 +16,10 @@ use super::super::notification::Notification;
 use super::super::templating::{
     render_template, render_template_json_string_escaped, validate_template,
 };
-use super::{finalize_dispatch_response, redacted_endpoint_url, resolve_optional_string};
+use super::{
+    finalize_dispatch_response, redacted_endpoint_url, resolve_optional_string,
+    validate_notification_url,
+};
 
 /// Template variable names the webhook channel projects from a generic
 /// [`Notification`]. Callers (the proxy_alerts plugin in particular) supply
@@ -262,20 +264,5 @@ fn base_vars(n: &Notification) -> HashMap<String, String> {
 }
 
 fn validate_url(url: &str, channel: &str) -> Result<(), String> {
-    let parsed = Url::parse(url)
-        .map_err(|e| format!("channel '{channel}' (webhook): invalid 'url': {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        s => {
-            return Err(format!(
-                "channel '{channel}' (webhook): 'url' must use http:// or https:// (got '{s}')"
-            ));
-        }
-    }
-    if parsed.host_str().is_none() {
-        return Err(format!(
-            "channel '{channel}' (webhook): 'url' must include a hostname"
-        ));
-    }
-    Ok(())
+    validate_notification_url(url, channel, "webhook", "url")
 }

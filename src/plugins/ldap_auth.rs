@@ -44,8 +44,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
+use url::{Host, Url};
 
 use crate::consumer_index::ConsumerIndex;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
@@ -99,12 +101,22 @@ impl LdapAuth {
             .ok_or_else(|| format!("ldap_auth: config must be an object, got: {config}"))?;
 
         let ldap_url = parse_required_ldap_url(config_obj)?.to_owned();
+        let parsed_ldap_url = Url::parse(&ldap_url)
+            .map_err(|e| format!("ldap_auth: 'ldap_url' is not a valid URL: {e}"))?;
 
-        if !ldap_url.starts_with("ldap://") && !ldap_url.starts_with("ldaps://") {
-            return Err(
-                "ldap_auth: 'ldap_url' must start with 'ldap://' or 'ldaps://'".to_string(),
-            );
+        let is_ldaps = match parsed_ldap_url.scheme() {
+            "ldap" => false,
+            "ldaps" => true,
+            _ => {
+                return Err(
+                    "ldap_auth: 'ldap_url' must start with 'ldap://' or 'ldaps://'".to_string(),
+                );
+            }
+        };
+        if !has_non_empty_authority(&ldap_url) {
+            return Err("ldap_auth: 'ldap_url' must include a hostname".to_string());
         }
+        let ldap_hostname = Some(ldap_url_hostname(&parsed_ldap_url)?);
 
         let bind_dn_template = parse_optional_string(config_obj, "bind_dn_template")?;
 
@@ -175,7 +187,7 @@ impl LdapAuth {
 
         let starttls = parse_bool(config_obj, "starttls", false)?;
 
-        if starttls && ldap_url.starts_with("ldaps://") {
+        if starttls && is_ldaps {
             return Err(
                 "ldap_auth: 'starttls' cannot be used with 'ldaps://' URLs (STARTTLS is for upgrading ldap:// connections)"
                     .to_string(),
@@ -198,13 +210,9 @@ impl LdapAuth {
 
         let consumer_mapping = parse_bool(config_obj, "consumer_mapping", true)?;
 
-        let ldap_hostname = url::Url::parse(&ldap_url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()));
-
         // Build rustls TLS config respecting gateway settings
         let tls_no_verify = http_client.tls_no_verify();
-        let needs_tls = ldap_url.starts_with("ldaps://") || starttls;
+        let needs_tls = is_ldaps || starttls;
         let tls_config = if needs_tls {
             Some(build_ldap_tls_config(
                 tls_no_verify,
@@ -464,6 +472,32 @@ fn parse_required_ldap_url(config: &Map<String, Value>) -> Result<&str, String> 
     Ok(value)
 }
 
+fn ldap_url_hostname(parsed: &Url) -> Result<String, String> {
+    let host = parsed
+        .host()
+        .ok_or_else(|| "ldap_auth: 'ldap_url' must include a hostname".to_string())?;
+
+    Ok(match host {
+        Host::Domain(hostname) => hostname.to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
+}
+
+fn has_non_empty_authority(ldap_url: &str) -> bool {
+    let Some((_, after_scheme)) = ldap_url.split_once(':') else {
+        return false;
+    };
+    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
+        return false;
+    };
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+
+    authority_end > 0
+}
+
 fn parse_optional_string(
     config: &Map<String, Value>,
     field: &str,
@@ -607,13 +641,15 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
         ));
     };
 
-    let ca_data = std::fs::read(ca_path)
-        .map_err(|e| format!("ldap_auth: failed to read CA bundle '{}': {e}", ca_path))?;
+    let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+    let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
+        .map_err(|e| format!("ldap_auth: failed to load CA bundle: {e}"))?;
+    let source_id = ca_material.source_id.clone();
 
     // Parse only X.509 entries; tolerate other PEM blocks (private keys, etc.)
     // by ignoring them, but log them so operators can spot malformed bundles.
     let mut certs: Vec<CertificateDer<'static>> = Vec::new();
-    let mut reader = &ca_data[..];
+    let mut reader = ca_material.bytes.expose_secret();
     for item in std::iter::from_fn(move || rustls_pemfile::read_one(&mut reader).transpose()) {
         match item {
             Ok(rustls_pemfile::Item::X509Certificate(cert_der)) => {
@@ -623,7 +659,7 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
             Err(e) => {
                 warn!(
                     "ldap_auth: skipping malformed PEM item in '{}': {e}",
-                    ca_path
+                    source_id
                 );
             }
         }
@@ -636,18 +672,18 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
     if added == 0 {
         return Err(format!(
             "ldap_auth: no valid CA certificates found in '{}'",
-            ca_path
+            source_id
         ));
     }
     if ignored > 0 {
         warn!(
             "ldap_auth: ignored {} invalid CA certificate(s) while loading '{}'",
-            ignored, ca_path
+            ignored, source_id
         );
     }
     debug!(
         "ldap_auth: loaded {} CA certificate(s) from '{}' (CA exclusivity enforced)",
-        added, ca_path
+        added, source_id
     );
     Ok(root_store)
 }

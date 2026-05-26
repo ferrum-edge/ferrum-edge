@@ -57,7 +57,7 @@ use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade};
 use hyper_util::rt::TokioIo;
 use percent_encoding::percent_decode_str;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -99,8 +99,10 @@ use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
 use crate::service_discovery::ServiceDiscoveryManager;
+use crate::tls::TlsPolicy;
 use crate::tls::backend::BackendSvidGeneration;
-use crate::tls::{NoVerifier, TlsPolicy};
+use crate::tls::backend::BackendTlsConfigBuilder;
+use crate::tls::source::{CertSource, MaterialKind};
 
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
@@ -116,6 +118,16 @@ use self::http2_pool::Http2ConnectionPool;
 /// `&HashMap::new()` — this eliminates those per-rejection allocations.
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
+
+/// Hyper's HTTP/1 parser panics when `max_buf_size` is below 8 KiB. Ferrum's
+/// configured logical header limit may be lower; keep the parser floor safe
+/// and enforce the operator's lower limit in `check_protocol_headers`.
+const HYPER_HTTP1_MIN_MAX_BUF_SIZE: usize = 8 * 1024;
+
+#[inline]
+fn http1_parser_max_buf_size(configured_header_limit: usize) -> usize {
+    configured_header_limit.max(HYPER_HTTP1_MIN_MAX_BUF_SIZE)
+}
 
 /// Metadata key set on the request context for the duration of
 /// `apply_after_proxy_hooks_to_rejection`. Plugins that wire
@@ -846,6 +858,16 @@ pub(crate) fn should_bypass_h2_coalesce_for_large_response(
     len >= LARGE_H2_BYPASS_THRESHOLD && within_limit
 }
 
+/// Keep H2 transport header-list enforcement from resetting the stream before
+/// Ferrum's configured total-header validator can produce a protocol-aware 431.
+fn h2_parser_max_header_list_size(max_header_size_bytes: usize) -> u32 {
+    const MIN_H2_HEADER_LIST_SIZE: usize = 16 * 1024;
+
+    max_header_size_bytes
+        .max(MIN_H2_HEADER_LIST_SIZE)
+        .min(u32::MAX as usize) as u32
+}
+
 fn warn_if_h3_backend_tls_policy_incompatible(
     config: &GatewayConfig,
     tls_policy: Option<&TlsPolicy>,
@@ -1329,9 +1351,49 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
     val.push_str(proto);
     if let Some(h) = host {
         val.push_str(";host=");
-        val.push_str(h);
+        push_forwarded_param_value(&mut val, h);
     }
     val
+}
+
+fn push_forwarded_param_value(buf: &mut String, value: &str) {
+    if is_forwarded_token(value) {
+        buf.push_str(value);
+        return;
+    }
+
+    buf.push('"');
+    for ch in value.chars() {
+        if ch == '"' || ch == '\\' {
+            buf.push('\\');
+        }
+        buf.push(ch);
+    }
+    buf.push('"');
+}
+
+fn is_forwarded_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 pub(crate) async fn apply_request_body_plugins(
@@ -1540,8 +1602,11 @@ pub struct ProxyState {
     /// protocol versions, and key exchange groups as inbound listeners.
     pub tls_policy: Option<Arc<TlsPolicy>>,
     /// Certificate Revocation Lists for backend TLS verification.
-    /// Loaded once at startup from `FERRUM_TLS_CRL_FILE_PATH` and shared via Arc.
+    /// Preserved as the startup snapshot for surfaces that still take an
+    /// immutable CRL list.
     pub crls: crate::tls::CrlList,
+    /// Hot-swappable backend CRL list consumed by backend HTTP/H2/gRPC pools.
+    pub shared_crls: crate::tls::SharedCrlList,
     /// Overload state for progressive load shedding and graceful drain tracking.
     /// Shared across all accept loops and the background monitor.
     pub overload: Arc<crate::overload::OverloadState>,
@@ -1700,10 +1765,7 @@ fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, 
         }
     };
 
-    let cert_path = std::path::Path::new(cert_path);
-    let key_path = std::path::Path::new(key_path);
-    let trust_bundle_path = std::path::Path::new(trust_bundle_path);
-    let bundle = crate::identity::file_loader::load_svid_bundle_from_files(
+    let bundle = crate::identity::file_loader::load_svid_bundle_from_sources(
         cert_path,
         key_path,
         trust_bundle_path,
@@ -1736,12 +1798,183 @@ fn gateway_svid_file_paths_from_env(env_config: &EnvConfig) -> Option<GatewaySvi
     ) else {
         return None;
     };
+    let cert_source = CertSource::parse(cert, MaterialKind::Cert);
+    let key_source = CertSource::parse(key, MaterialKind::Key);
+    let trust_bundle_source = CertSource::parse(trust_bundle, MaterialKind::CaBundle);
+
+    let (Some(cert), Some(key), Some(trust_bundle)) = (
+        cert_source.as_file_path(),
+        key_source.as_file_path(),
+        trust_bundle_source.as_file_path(),
+    ) else {
+        info!("Gateway SVID source includes non-file material; file rotation watcher disabled");
+        return None;
+    };
+
     Some(GatewaySvidFilePaths {
-        cert: PathBuf::from(cert),
-        key: PathBuf::from(key),
-        trust_bundle: PathBuf::from(trust_bundle),
+        cert,
+        key,
+        trust_bundle,
         expected_spiffe_id: env_config.gateway_spiffe_id.clone(),
     })
+}
+
+fn proxy_backend_uses_tls(proxy: &Proxy) -> bool {
+    matches!(
+        proxy.backend_scheme,
+        Some(BackendScheme::Https | BackendScheme::Tcps | BackendScheme::Dtls)
+    )
+}
+
+fn collect_frontend_dtls_watched_sources(
+    env_config: &EnvConfig,
+) -> Vec<crate::tls::source::subscription::WatchedMaterialSource> {
+    let mut seen = BTreeSet::new();
+    let mut sources = Vec::new();
+    let (Some(cert_path), Some(key_path)) = (
+        env_config.dtls_cert_path.as_deref(),
+        env_config.dtls_key_path.as_deref(),
+    ) else {
+        return sources;
+    };
+
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "dtls_cert",
+        Some(cert_path),
+        MaterialKind::Cert,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "dtls_key",
+        Some(key_path),
+        MaterialKind::Key,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "dtls_client_ca",
+        env_config.dtls_client_ca_cert_path.as_deref(),
+        MaterialKind::CaBundle,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "dtls_crl",
+        env_config.tls_crl_file_path.as_deref(),
+        MaterialKind::Crl,
+    );
+
+    sources
+}
+
+fn collect_backend_tls_watched_sources(
+    config: &GatewayConfig,
+    env_config: &EnvConfig,
+) -> Vec<crate::tls::source::subscription::WatchedMaterialSource> {
+    let mut seen = BTreeSet::new();
+    let mut sources = Vec::new();
+
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "global_ca",
+        env_config.tls_ca_bundle_path.as_deref(),
+        MaterialKind::CaBundle,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "global_client_cert",
+        env_config.backend_tls_client_cert_path.as_deref(),
+        MaterialKind::Cert,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "global_client_key",
+        env_config.backend_tls_client_key_path.as_deref(),
+        MaterialKind::Key,
+    );
+    push_tls_material_source(
+        &mut sources,
+        &mut seen,
+        "global_crl",
+        env_config.tls_crl_file_path.as_deref(),
+        MaterialKind::Crl,
+    );
+
+    for proxy in &config.proxies {
+        push_backend_tls_config_sources(&mut sources, &mut seen, &proxy.resolved_tls);
+    }
+    for upstream in &config.upstreams {
+        let tls = BackendTlsConfig::from_upstream(upstream);
+        push_backend_tls_config_sources(&mut sources, &mut seen, &tls);
+    }
+    for plugin in &config.plugin_configs {
+        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        let Ok(dispatch_config) = MeshRouteDispatchConfig::from_value_normalized(&plugin.config)
+        else {
+            continue;
+        };
+        for rule in &dispatch_config.rules {
+            if let Some(tls) = rule.destination.backend_tls.as_ref() {
+                push_backend_tls_config_sources(&mut sources, &mut seen, tls);
+            }
+        }
+    }
+
+    sources
+}
+
+fn push_backend_tls_config_sources(
+    sources: &mut Vec<crate::tls::source::subscription::WatchedMaterialSource>,
+    seen: &mut BTreeSet<(MaterialKind, String)>,
+    tls: &BackendTlsConfig,
+) {
+    push_tls_material_source(
+        sources,
+        seen,
+        "backend_ca",
+        tls.server_ca_cert_path.as_deref(),
+        MaterialKind::CaBundle,
+    );
+    push_tls_material_source(
+        sources,
+        seen,
+        "backend_client_cert",
+        tls.client_cert_path.as_deref(),
+        MaterialKind::Cert,
+    );
+    push_tls_material_source(
+        sources,
+        seen,
+        "backend_client_key",
+        tls.client_key_path.as_deref(),
+        MaterialKind::Key,
+    );
+}
+
+fn push_tls_material_source(
+    sources: &mut Vec<crate::tls::source::subscription::WatchedMaterialSource>,
+    seen: &mut BTreeSet<(MaterialKind, String)>,
+    label: &'static str,
+    value: Option<&str>,
+    kind: MaterialKind,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    let source = CertSource::parse(value.to_string(), kind);
+    if seen.insert((kind, source.pool_key_component())) {
+        sources.push(
+            crate::tls::source::subscription::WatchedMaterialSource::new(label, source, kind),
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1902,11 +2135,24 @@ impl BackendPoolFamily {
             .drain_backend_tls_config_cache_svid_generation(generation);
     }
 
+    fn clear_tls_config_caches(&self) {
+        self.connection_pool.clear_backend_tls_config_cache();
+        self.http2_pool.clear_backend_tls_config_cache();
+        self.grpc_pool.clear_backend_tls_config_cache();
+    }
+
     fn force_drain(&self, generation: u64) {
         self.connection_pool.force_drain_svid_generation(generation);
         self.http2_pool.force_drain_svid_generation(generation);
         self.grpc_pool.force_drain_svid_generation(generation);
         self.h3_pool.force_drain_svid_generation(generation);
+    }
+
+    fn force_drain_all(&self) {
+        self.connection_pool.force_drain_all();
+        self.http2_pool.force_drain_all();
+        self.grpc_pool.force_drain_all();
+        self.h3_pool.force_drain_all();
     }
 }
 
@@ -2079,6 +2325,292 @@ impl ProxyState {
             .store(Arc::new(Some(active_bundle)));
     }
 
+    /// Force a gateway SVID reload from the currently configured sources.
+    ///
+    /// This is the admin-triggered equivalent of the file watcher path. It
+    /// accepts any source form supported by `load_svid_bundle_from_sources`
+    /// (file path, inline PEM, typed URI), preserves any CP-delivered trust
+    /// override, and publishes a backend SVID generation bump so backend pools
+    /// rebuild/drain through the existing rotation consumer.
+    pub fn force_reload_gateway_svid(&self) -> Result<u64, anyhow::Error> {
+        let (Some(cert_source), Some(key_source), Some(trust_bundle_source)) = (
+            self.env_config.gateway_svid_cert_path.as_deref(),
+            self.env_config.gateway_svid_key_path.as_deref(),
+            self.env_config.gateway_svid_trust_bundle_path.as_deref(),
+        ) else {
+            anyhow::bail!(
+                "gateway SVID sources are not configured; set FERRUM_GATEWAY_SVID_CERT_SOURCE, FERRUM_GATEWAY_SVID_KEY_SOURCE, and FERRUM_GATEWAY_SVID_TRUST_BUNDLE_SOURCE"
+            );
+        };
+
+        let bundle = crate::identity::file_loader::load_svid_bundle_from_sources(
+            cert_source,
+            key_source,
+            trust_bundle_source,
+            self.env_config.gateway_spiffe_id.as_deref(),
+        )
+        .map_err(|error| anyhow::anyhow!("failed to reload gateway SVID sources: {error}"))?;
+        let spiffe_id = bundle.spiffe_id.to_string();
+        self.install_gateway_file_svid_bundle(bundle);
+        self.backend_svid_rotation_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+        let revision = *self.backend_svid_rotation_tx.borrow();
+
+        info!(
+            spiffe_id = %spiffe_id,
+            svid_revision = revision,
+            "Gateway SVID force reload completed; backend SVID rotation published"
+        );
+
+        Ok(revision)
+    }
+
+    fn validate_backend_tls_material(
+        &self,
+        crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    ) -> Result<usize, anyhow::Error> {
+        let config = self.config.load_full();
+        let mut validated = 0usize;
+        for proxy in config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy_backend_uses_tls(proxy))
+        {
+            BackendTlsConfigBuilder {
+                proxy,
+                policy: self.tls_policy.as_deref(),
+                global_ca: self.env_config.tls_ca_bundle_path.as_deref().map(Path::new),
+                global_no_verify: self.env_config.tls_no_verify,
+                global_client_cert: self
+                    .env_config
+                    .backend_tls_client_cert_path
+                    .as_deref()
+                    .map(Path::new),
+                global_client_key: self
+                    .env_config
+                    .backend_tls_client_key_path
+                    .as_deref()
+                    .map(Path::new),
+                crls,
+            }
+            .build_rustls()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "backend TLS validation failed for proxy '{}': {}",
+                    proxy.id,
+                    error
+                )
+            })?;
+            validated = validated.saturating_add(1);
+        }
+        let proxy_map = config
+            .proxies
+            .iter()
+            .map(|proxy| (proxy.id.as_str(), proxy))
+            .collect::<HashMap<_, _>>();
+        for plugin in &config.plugin_configs {
+            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            let dispatch_config = MeshRouteDispatchConfig::from_value_normalized(&plugin.config)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "mesh_route_dispatch backend TLS validation failed for plugin '{}': {}",
+                        plugin.id,
+                        error
+                    )
+                })?;
+            let base_proxy = plugin
+                .proxy_id
+                .as_deref()
+                .and_then(|proxy_id| proxy_map.get(proxy_id).copied())
+                .or_else(|| config.proxies.first());
+            let Some(base_proxy) = base_proxy else {
+                continue;
+            };
+            for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
+                let Some(tls) = rule.destination.backend_tls.as_ref() else {
+                    continue;
+                };
+                let mut validation_proxy = base_proxy.clone();
+                validation_proxy.id = format!(
+                    "{}:mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls",
+                    plugin.id
+                );
+                validation_proxy.backend_scheme = Some(BackendScheme::Https);
+                validation_proxy.resolved_tls = tls.clone();
+                BackendTlsConfigBuilder {
+                    proxy: &validation_proxy,
+                    policy: self.tls_policy.as_deref(),
+                    global_ca: self.env_config.tls_ca_bundle_path.as_deref().map(Path::new),
+                    global_no_verify: self.env_config.tls_no_verify,
+                    global_client_cert: self
+                        .env_config
+                        .backend_tls_client_cert_path
+                        .as_deref()
+                        .map(Path::new),
+                    global_client_key: self
+                        .env_config
+                        .backend_tls_client_key_path
+                        .as_deref()
+                        .map(Path::new),
+                    crls,
+                }
+                .build_rustls()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "mesh_route_dispatch backend TLS validation failed for plugin '{}' rule {}: {}",
+                        plugin.id,
+                        rule_idx,
+                        error
+                    )
+                })?;
+                validated = validated.saturating_add(1);
+            }
+        }
+        Ok(validated)
+    }
+
+    fn reload_backend_tls_material(&self) -> Result<(), anyhow::Error> {
+        let active_crls = crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())?;
+        let validated = self.validate_backend_tls_material(active_crls.as_ref().as_slice())?;
+        self.shared_crls.store(active_crls);
+        let pools = BackendPoolFamily {
+            connection_pool: self.connection_pool.clone(),
+            http2_pool: self.http2_pool.clone(),
+            grpc_pool: self.grpc_pool.clone(),
+            h3_pool: self.h3_pool.clone(),
+        };
+        pools.clear_tls_config_caches();
+        pools.force_drain_all();
+
+        let config = self.config.load_full();
+        self.health_checker
+            .restart_with_shutdown(&config, self.health_check_shutdown_rx.clone());
+
+        info!(
+            validated_backend_tls_configs = validated,
+            "Backend TLS material reloaded; backend client pools were drained"
+        );
+        Ok(())
+    }
+
+    fn reload_frontend_dtls_material(&self) -> Result<(), anyhow::Error> {
+        let (Some(cert_path), Some(key_path)) = (
+            self.env_config.dtls_cert_path.clone(),
+            self.env_config.dtls_key_path.clone(),
+        ) else {
+            return Ok(());
+        };
+        let client_ca_cert_path = self.env_config.dtls_client_ca_cert_path.clone();
+        let active_crls = crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())?;
+        crate::dtls::build_frontend_dtls_config(
+            &cert_path,
+            &key_path,
+            client_ca_cert_path.as_deref(),
+            active_crls.as_ref().as_slice(),
+        )?;
+
+        let manager = self.stream_listener_manager.clone();
+        tokio::spawn(async move {
+            let swapped = manager
+                .swap_active_dtls_frontend_configs(|| {
+                    crate::dtls::build_frontend_dtls_config(
+                        &cert_path,
+                        &key_path,
+                        client_ca_cert_path.as_deref(),
+                        active_crls.as_ref().as_slice(),
+                    )
+                })
+                .await;
+            info!(
+                swapped_dtls_listeners = swapped,
+                "Frontend DTLS material reloaded; new DTLS sessions will use rotated material"
+            );
+        });
+        Ok(())
+    }
+
+    fn start_frontend_dtls_source_reload_task(
+        &self,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.env_config.frontend_tls_live_reload_enabled {
+            return None;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            warn!(
+                "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true but no tokio runtime is active; frontend DTLS live reload disabled"
+            );
+            return None;
+        }
+        let watched_sources = collect_frontend_dtls_watched_sources(&self.env_config);
+        if !watched_sources
+            .iter()
+            .any(|source| crate::tls::source::subscription::source_is_refreshable(&source.source))
+        {
+            return None;
+        }
+        let interval = crate::tls::source::subscription::material_set_poll_interval(
+            &watched_sources,
+            Duration::from_secs(self.env_config.frontend_tls_watch_interval_seconds.max(1)),
+            Duration::from_secs(self.env_config.secret_refresh_interval_seconds.max(1)),
+        );
+        let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0u64);
+        let state = self.clone();
+        Some(
+            crate::tls::source::subscription::spawn_material_set_reload_task(
+                crate::tls::source::subscription::MaterialSetReloadConfig {
+                    surface: "dtls",
+                    sources: watched_sources,
+                    interval,
+                    revision_tx,
+                    rebuild: Box::new(move || state.reload_frontend_dtls_material()),
+                },
+                shutdown_rx,
+            ),
+        )
+    }
+
+    fn start_backend_tls_source_reload_task(
+        &self,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.env_config.backend_tls_live_reload_enabled {
+            return None;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            warn!(
+                "FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true but no tokio runtime is active; backend TLS live reload disabled"
+            );
+            return None;
+        }
+
+        let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0u64);
+        let collect_state = self.clone();
+        let rebuild_state = self.clone();
+        Some(
+            crate::tls::source::subscription::spawn_dynamic_material_set_reload_task(
+                crate::tls::source::subscription::DynamicMaterialSetReloadConfig {
+                    surface: "backend_tls",
+                    collect_sources: Box::new(move || {
+                        let config = collect_state.config.load_full();
+                        collect_backend_tls_watched_sources(&config, &collect_state.env_config)
+                    }),
+                    file_default_interval: Duration::from_secs(
+                        self.env_config.backend_tls_watch_interval_seconds.max(1),
+                    ),
+                    provider_default_interval: Duration::from_secs(
+                        self.env_config.secret_refresh_interval_seconds.max(1),
+                    ),
+                    revision_tx,
+                    rebuild: Box::new(move || rebuild_state.reload_backend_tls_material()),
+                },
+                shutdown_rx,
+            ),
+        )
+    }
+
     fn start_gateway_svid_file_rotation_task(
         &self,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
@@ -2202,25 +2734,30 @@ impl ProxyState {
         let tls_policy_arc = tls_policy.map(Arc::new);
         warn_if_h3_backend_tls_policy_incompatible(&config, tls_policy_arc.as_deref());
         let crls = crate::tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+        let shared_crls = crate::tls::shared_crl_list(crls.clone());
         let backend_svid_generation = Arc::new(AtomicU64::new(0));
         let (backend_svid_rotation_tx, backend_svid_rotation_rx) =
             tokio::sync::watch::channel(0u64);
-        let grpc_pool = Arc::new(GrpcConnectionPool::new_with_svid_generation(
-            global_pool_config.clone(),
-            env_config.clone(),
-            dns_cache.clone(),
-            tls_policy_arc.clone(),
-            crls.clone(),
-            backend_svid_generation.clone(),
-        ));
-        let http2_pool = Arc::new(Http2ConnectionPool::new_with_svid_generation(
-            global_pool_config.clone(),
-            env_config.clone(),
-            dns_cache.clone(),
-            tls_policy_arc.clone(),
-            crls.clone(),
-            backend_svid_generation.clone(),
-        ));
+        let grpc_pool = Arc::new(
+            GrpcConnectionPool::new_with_svid_generation_and_shared_crls(
+                global_pool_config.clone(),
+                env_config.clone(),
+                dns_cache.clone(),
+                tls_policy_arc.clone(),
+                shared_crls.clone(),
+                backend_svid_generation.clone(),
+            ),
+        );
+        let http2_pool = Arc::new(
+            Http2ConnectionPool::new_with_svid_generation_and_shared_crls(
+                global_pool_config.clone(),
+                env_config.clone(),
+                dns_cache.clone(),
+                tls_policy_arc.clone(),
+                shared_crls.clone(),
+                backend_svid_generation.clone(),
+            ),
+        );
         let env_config_arc = Arc::new(env_config.clone());
         let gateway_svid_bundle = load_gateway_svid_bundle(&env_config_arc)?;
         inject_gateway_workload_metrics_if_svid(
@@ -2247,12 +2784,12 @@ impl ProxyState {
             pool_shard_amount,
         ));
         let backend_capabilities_refresh = Arc::new(RefreshCoalescer::new());
-        let connection_pool = Arc::new(ConnectionPool::new_with_svid_generation(
+        let connection_pool = Arc::new(ConnectionPool::new_with_svid_generation_and_shared_crls(
             global_pool_config.clone(),
             env_config,
             dns_cache.clone(),
             tls_policy_arc.clone(),
-            crls.clone(),
+            shared_crls.clone(),
             backend_svid_generation.clone(),
         ));
         // Build router cache with pre-sorted route table and HashMap prefix index.
@@ -2285,6 +2822,7 @@ impl ProxyState {
             &env_config_arc.namespace,
             env_config_arc.backend_allow_ips.clone(),
             mesh_egress_strip_baggage_keys.clone(),
+            env_config_arc.pool_shard_amount,
         );
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will
@@ -2585,6 +3123,7 @@ impl ProxyState {
             ws_connection_counter: Arc::new(AtomicU64::new(0)),
             tls_policy: tls_policy_arc,
             crls,
+            shared_crls,
             overload,
             adaptive_buffer,
             mesh_egress_strip_baggage_keys,
@@ -2602,6 +3141,14 @@ impl ProxyState {
         if let Some(handle) =
             state.start_gateway_svid_file_rotation_task(health_check_restart_rx.clone())
         {
+            health_check_handles.push(handle);
+        }
+        if let Some(handle) =
+            state.start_frontend_dtls_source_reload_task(health_check_restart_rx.clone())
+        {
+            health_check_handles.push(handle);
+        }
+        if let Some(handle) = state.start_backend_tls_source_reload_task(health_check_restart_rx) {
             health_check_handles.push(handle);
         }
         Ok((state, health_check_handles))
@@ -3716,12 +4263,7 @@ impl ProxyState {
         delta: &crate::config_delta::ConfigDelta,
     ) -> Result<StagedRequestEpoch, String> {
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
-        let rebuild_globals = delta
-            .added_plugin_configs
-            .iter()
-            .chain(delta.modified_plugin_configs.iter())
-            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
-            || !delta.removed_plugin_config_ids.is_empty();
+        let rebuild_globals = delta.global_plugin_configs_changed;
         let route_changed = Self::delta_routes_changed(delta, &current.config);
         let consumer_changed = Self::delta_consumers_changed(delta);
         let lb_changed = Self::delta_load_balancers_changed(delta);
@@ -4581,7 +5123,7 @@ async fn handle_connection(
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     {
         let mut http1 = builder.http1();
-        http1.max_buf_size(state.max_header_size_bytes);
+        http1.max_buf_size(http1_parser_max_buf_size(state.max_header_size_bytes));
         http1.writev(true);
         // Slowloris protection: close connections that take too long to send headers.
         if state.env_config.http_header_read_timeout_seconds > 0 {
@@ -4593,7 +5135,7 @@ async fn handle_connection(
     }
     builder
         .http2()
-        .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
+        .max_header_list_size(h2_parser_max_header_list_size(state.max_header_size_bytes))
         .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
         .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
         .adaptive_window(false)
@@ -5295,12 +5837,16 @@ async fn handle_websocket_request_authenticated(
 /// Hop-by-hop headers and WebSocket handshake headers are excluded.
 #[cfg(test)]
 fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     headers
         .iter()
         .filter_map(|(name, value)| {
             let lower_name = name.to_ascii_lowercase();
             if headers_mod::is_backend_request_strip_header(lower_name.as_str())
                 || is_websocket_backend_strip_header(lower_name.as_str())
+                || connection_listed_strip
+                    .iter()
+                    .any(|listed| listed == lower_name.as_str())
             {
                 return None;
             }
@@ -5324,11 +5870,20 @@ fn collect_forwardable_websocket_headers(
 ) -> Vec<(String, String)> {
     let mut forwarded = Vec::new();
     let mut preserved_raw_names = HashSet::new();
+    let raw_connection_listed_strip = headers_mod::parse_connection_listed_headers(raw_headers);
+    let proxy_connection_listed_strip =
+        headers_mod::parse_connection_listed_from_str_map(proxy_headers);
 
     for name in raw_headers.keys() {
         let lower_name = name.as_str().to_ascii_lowercase();
         if headers_mod::is_backend_request_strip_header(lower_name.as_str())
             || is_websocket_backend_strip_header(lower_name.as_str())
+            || raw_connection_listed_strip
+                .iter()
+                .any(|listed| listed.as_str() == lower_name.as_str())
+            || proxy_connection_listed_strip
+                .iter()
+                .any(|listed| listed == lower_name.as_str())
         {
             continue;
         }
@@ -5361,6 +5916,12 @@ fn collect_forwardable_websocket_headers(
         if preserved_raw_names.contains(lower_name.as_str())
             || headers_mod::is_backend_request_strip_header(lower_name.as_str())
             || is_websocket_backend_strip_header(lower_name.as_str())
+            || raw_connection_listed_strip
+                .iter()
+                .any(|listed| listed.as_str() == lower_name.as_str())
+            || proxy_connection_listed_strip
+                .iter()
+                .any(|listed| listed == lower_name.as_str())
         {
             continue;
         }
@@ -5435,6 +5996,59 @@ fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, Str
     headers.remove("x-consumer-custom-id");
 }
 
+#[derive(Clone, Copy)]
+struct BackendPathLayout {
+    is_root: bool,
+    needs_leading_slash: bool,
+    needs_between_slash: bool,
+    len: usize,
+}
+
+fn backend_path_layout(backend_path: &str, remaining_path: &str) -> BackendPathLayout {
+    let is_root = backend_path.is_empty() && remaining_path.is_empty();
+    let combined_starts_with_slash = if !backend_path.is_empty() {
+        backend_path.starts_with('/')
+    } else {
+        remaining_path.starts_with('/')
+    };
+    let needs_leading_slash = !is_root && !combined_starts_with_slash;
+    let needs_between_slash = !backend_path.is_empty()
+        && !remaining_path.is_empty()
+        && !backend_path.ends_with('/')
+        && !remaining_path.starts_with('/');
+    let len = if is_root {
+        1
+    } else {
+        (if needs_leading_slash { 1 } else { 0 })
+            + backend_path.len()
+            + (if needs_between_slash { 1 } else { 0 })
+            + remaining_path.len()
+    };
+
+    BackendPathLayout {
+        is_root,
+        needs_leading_slash,
+        needs_between_slash,
+        len,
+    }
+}
+
+fn push_backend_path(url: &mut String, backend_path: &str, remaining_path: &str) {
+    let layout = backend_path_layout(backend_path, remaining_path);
+    if layout.is_root {
+        url.push('/');
+        return;
+    }
+    if layout.needs_leading_slash {
+        url.push('/');
+    }
+    url.push_str(backend_path);
+    if layout.needs_between_slash {
+        url.push('/');
+    }
+    url.push_str(remaining_path);
+}
+
 /// Build a WebSocket backend URL using a specific target host/port,
 /// respecting strip_listen_path, backend_path, and query string.
 ///
@@ -5470,29 +6084,14 @@ pub(crate) fn build_websocket_backend_url_with_target(
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
-    // Both empty means path is just "/"
-    let path_is_root = backend_path.is_empty() && remaining_path.is_empty();
-
-    // Determine if we need to prepend a '/'. The first byte of the combined
-    // path is determined by backend_path (if non-empty) or remaining_path.
-    let combined_starts_with_slash = if !backend_path.is_empty() {
-        backend_path.starts_with('/')
-    } else {
-        remaining_path.starts_with('/')
-    };
-    let needs_leading_slash = !path_is_root && !combined_starts_with_slash;
+    let path_layout = backend_path_layout(backend_path, remaining_path);
 
     // Pre-calculate capacity and build in a single buffer.
-    let path_len = if path_is_root {
-        1
-    } else {
-        (if needs_leading_slash { 1 } else { 0 }) + backend_path.len() + remaining_path.len()
-    };
     let capacity = scheme.len()
         + 3 // "://"
         + host.len()
         + 6 // ":PORT" (max 5 digits + colon)
-        + path_len
+        + path_layout.len
         + if query_string.is_empty() {
             0
         } else {
@@ -5501,16 +6100,7 @@ pub(crate) fn build_websocket_backend_url_with_target(
 
     let mut url = String::with_capacity(capacity);
     let _ = write!(url, "{}://{}:{}", scheme, host, port);
-
-    if path_is_root {
-        url.push('/');
-    } else {
-        if needs_leading_slash {
-            url.push('/');
-        }
-        url.push_str(backend_path);
-        url.push_str(remaining_path);
-    }
+    push_backend_path(&mut url, backend_path, remaining_path);
 
     if !query_string.is_empty() {
         url.push('?');
@@ -5538,135 +6128,23 @@ fn build_websocket_tls_connector(
         return Ok(None);
     }
 
-    // Determine if we should skip server cert verification
-    let skip_verify = env_config.tls_no_verify || !proxy.resolved_tls.verify_server_cert;
-
-    // Build root certificate store:
-    // - Custom CA configured → empty store + only that CA (no public roots)
-    // - No CA configured → webpki/system roots as default fallback
-    let ca_path = proxy
-        .resolved_tls
-        .server_ca_cert_path
-        .as_ref()
-        .or(env_config.tls_ca_bundle_path.as_ref());
-    let mut root_store = if ca_path.is_some() {
-        rustls::RootCertStore::empty()
-    } else {
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
-    };
-    if let Some(ca_path) = ca_path {
-        let ca_pem = std::fs::read(ca_path).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read CA bundle '{}' for WebSocket TLS: {}",
-                ca_path,
-                e
-            )
-        })?;
-        let mut cursor = std::io::Cursor::new(ca_pem);
-        let certs = rustls_pemfile::certs(&mut cursor);
-        for cert in certs.flatten() {
-            root_store.add(cert).map_err(|e| {
-                anyhow::anyhow!("Failed to add CA certificate for WebSocket TLS: {}", e)
-            })?;
-        }
+    let client_config = BackendTlsConfigBuilder {
+        proxy,
+        policy: tls_policy,
+        global_ca: env_config.tls_ca_bundle_path.as_deref().map(Path::new),
+        global_no_verify: env_config.tls_no_verify,
+        global_client_cert: env_config
+            .backend_tls_client_cert_path
+            .as_deref()
+            .map(Path::new),
+        global_client_key: env_config
+            .backend_tls_client_key_path
+            .as_deref()
+            .map(Path::new),
+        crls,
     }
-
-    // Build client config with TLS policy (cipher suites, protocol versions)
-    let builder = match crate::tls::backend_client_config_builder(tls_policy) {
-        Ok(b) => {
-            let inner = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
-            let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-                if proxy.resolved_tls.san_allow_list.is_empty() {
-                    inner
-                } else {
-                    Arc::new(crate::tls::backend::SanAllowListVerifier::new(
-                        inner,
-                        proxy.resolved_tls.san_allow_list.clone(),
-                    )?)
-                };
-            b.dangerous().with_custom_certificate_verifier(verifier)
-        }
-        Err(e) => {
-            warn!(
-                "Failed to build WebSocket TLS config with policy: {}, using defaults",
-                e
-            );
-            let fallback_store =
-                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let inner = crate::tls::build_server_verifier_with_crls(fallback_store, crls)?;
-            let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-                if proxy.resolved_tls.san_allow_list.is_empty() {
-                    inner
-                } else {
-                    Arc::new(crate::tls::backend::SanAllowListVerifier::new(
-                        inner,
-                        proxy.resolved_tls.san_allow_list.clone(),
-                    )?)
-                };
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-        }
-    };
-
-    // Add client certificate for mTLS (resolved_tls overrides take priority)
-    let cert_path = proxy
-        .resolved_tls
-        .client_cert_path
-        .as_ref()
-        .or(env_config.backend_tls_client_cert_path.as_ref());
-    let key_path = proxy
-        .resolved_tls
-        .client_key_path
-        .as_ref()
-        .or(env_config.backend_tls_client_key_path.as_ref());
-
-    let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        let cert_pem = std::fs::read(cert_path).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read client cert '{}' for WebSocket mTLS: {}",
-                cert_path,
-                e
-            )
-        })?;
-        let key_pem = std::fs::read(key_path).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read client key '{}' for WebSocket mTLS: {}",
-                key_path,
-                e
-            )
-        })?;
-        let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
-            .flatten()
-            .collect();
-        let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key_pem))
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to parse private key '{}' for WebSocket mTLS: {}",
-                    key_path,
-                    e
-                )
-            })?
-            .ok_or_else(|| {
-                anyhow::anyhow!("No private key found in '{}' for WebSocket mTLS", key_path)
-            })?;
-        builder
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| anyhow::anyhow!("Failed to configure WebSocket mTLS client cert: {}", e))?
-    } else {
-        builder.with_no_client_auth()
-    };
-
-    // Disable server certificate verification only if explicitly opted out
-    if skip_verify {
-        warn!(
-            "WebSocket backend TLS certificate verification DISABLED for proxy {}",
-            proxy.id
-        );
-        client_config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(NoVerifier));
-    }
+    .build_rustls()
+    .map_err(|e| anyhow::anyhow!("Failed to build WebSocket backend TLS config: {}", e))?;
 
     Ok(Some(tokio_tungstenite::Connector::Rustls(Arc::new(
         client_config,
@@ -7148,7 +7626,7 @@ async fn handle_tls_connection(
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     {
         let mut http1 = builder.http1();
-        http1.max_buf_size(state.max_header_size_bytes);
+        http1.max_buf_size(http1_parser_max_buf_size(state.max_header_size_bytes));
         http1.writev(true);
         // Slowloris protection: close connections that take too long to send headers.
         if state.env_config.http_header_read_timeout_seconds > 0 {
@@ -7160,7 +7638,7 @@ async fn handle_tls_connection(
     }
     builder
         .http2()
-        .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
+        .max_header_list_size(h2_parser_max_header_list_size(state.max_header_size_bytes))
         .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
         .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
         .adaptive_window(false)
@@ -7647,13 +8125,14 @@ pub async fn run_authentication_phase(
                     }
                 }
             }
+            let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1
+                && ctx
+                    .metadata
+                    .get("mesh_request_auth.permissive_missing_token")
+                    .is_some_and(|v| v == "true");
             if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
-                || (last_reject.is_none()
-                    && ctx
-                        .metadata
-                        .get("mesh_request_auth.permissive_missing_token")
-                        .is_some_and(|v| v == "true"))
+                || (last_reject.is_none() && mesh_permissive_only_auth_plugin)
             {
                 None
             } else {
@@ -7672,12 +8151,14 @@ pub async fn run_authentication_phase(
                     PluginResult::Continue => {}
                 }
             }
-            if request_is_authenticated(ctx)
-                || auth_plugins.is_empty()
-                || ctx
+            let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1
+                && ctx
                     .metadata
                     .get("mesh_request_auth.permissive_missing_token")
-                    .is_some_and(|v| v == "true")
+                    .is_some_and(|v| v == "true");
+            if request_is_authenticated(ctx)
+                || auth_plugins.is_empty()
+                || mesh_permissive_only_auth_plugin
             {
                 None
             } else {
@@ -7718,6 +8199,17 @@ async fn handle_proxy_request_on_frontend_port(
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    if req.method() == hyper::Method::GET
+        && let Some(key_authorization) =
+            crate::tls::acme::http01_key_authorization_for_path(req.uri().path())
+    {
+        record_request(&state, 200);
+        return Ok(build_plain_text_response(
+            StatusCode::OK,
+            &key_authorization,
+        ));
+    }
+
     // Global request admission control. Single atomic load (~1ns) on the fast
     // path. Rejects with 503 when request pressure exceeds the critical
     // threshold (FERRUM_MAX_REQUESTS + FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD)
@@ -7799,6 +8291,10 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.metadata.insert(
+        "ferrum.frontend_scheme".to_string(),
+        if is_tls { "https" } else { "http" }.to_string(),
+    );
     ctx.frontend_listen_port = Some(connection_metadata.frontend_listen_port.unwrap_or(
         if is_tls {
             state.env_config.proxy_https_port
@@ -7909,10 +8405,8 @@ async fn handle_proxy_request_inner(
     }
 
     // Validate query parameter count (skip empty segments from consecutive '&').
-    // Uses split + filter instead of a raw byte-scan to correctly handle edge
-    // cases like "&&" producing empty segments that shouldn't count as params.
     if state.max_query_params > 0 && !query_string.is_empty() {
-        let param_count = query_string.split('&').filter(|s| !s.is_empty()).count();
+        let param_count = count_query_params(&query_string);
         if param_count > state.max_query_params {
             record_request(&state, 400);
             return Ok(build_response(
@@ -8055,11 +8549,13 @@ async fn handle_proxy_request_inner(
 
     // Per-IP concurrent request limiting. The guard auto-decrements on drop,
     // covering all 30+ return paths without manual tracking.
-    let _per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
-        let count = counts
-            .entry(ctx.client_ip.clone())
-            .or_insert_with(|| AtomicU64::new(0));
-        let current = count.value().fetch_add(1, Ordering::Relaxed) + 1;
+    let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
+        let current = {
+            let count = counts
+                .entry(ctx.client_ip.clone())
+                .or_insert_with(|| AtomicU64::new(0));
+            count.value().fetch_add(1, Ordering::Relaxed) + 1
+        };
         let guard = Some(PerIpRequestGuard {
             ip: ctx.client_ip.clone(),
             counts: counts.clone(),
@@ -9895,6 +10391,7 @@ async fn handle_proxy_request_inner(
         supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
     let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
+    let mut skip_final_cb_record = false;
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
@@ -10005,14 +10502,23 @@ async fn handle_proxy_request_inner(
             // On break, restore the pre-rotation key so the post-loop
             // `record_backend_outcome` attributes against the target that
             // actually produced `result`, not the never-called new target.
-            if let Some(cb_config) = &proxy.circuit_breaker
-                && state
-                    .circuit_breaker_cache
-                    .can_execute(&proxy.id, current_cb_target_key.as_deref(), cb_config)
-                    .is_err()
-            {
-                current_cb_target_key = pre_rotation_cb_key;
-                break;
+            if let Some(cb_config) = &proxy.circuit_breaker {
+                match state.circuit_breaker_cache.can_execute(
+                    &proxy.id,
+                    current_cb_target_key.as_deref(),
+                    cb_config,
+                ) {
+                    Ok((_cb, is_half_open_probe)) => {
+                        cb_retry_probe_slot_available = is_half_open_probe;
+                    }
+                    Err(_err) => {
+                        current_cb_target_key = pre_rotation_cb_key;
+                        // The current `result` was already recorded at the top of this
+                        // retry iteration; don't double-record it below.
+                        skip_final_cb_record = true;
+                        break;
+                    }
+                }
             }
 
             warn!(
@@ -10041,6 +10547,7 @@ async fn handle_proxy_request_inner(
                     retained_body.as_deref(),
                     &ctx.client_ip,
                     is_tls,
+                    inbound_version,
                 )
                 .await
             } else {
@@ -10139,7 +10646,9 @@ async fn handle_proxy_request_inner(
         final_cb_target_key.as_deref(),
         response_status,
         backend_resp.connection_error,
+        backend_error_class,
         cb_retry_probe_slot_available,
+        skip_final_cb_record,
         backend_start.elapsed(),
     );
 
@@ -10700,6 +11209,12 @@ async fn handle_proxy_request_inner(
     // body reaches a terminal state (completion, streaming error, or client
     // disconnect via the Drop safety net) rather than at header-flush time.
     // `deferred_logger` is `Some` only for streaming responses with plugins.
+    let body = if let Some(guard) = per_ip_guard {
+        body.with_per_ip_request_guard(guard)
+    } else {
+        body
+    };
+
     let mut body = if let Some(logger) = deferred_logger {
         body.with_logger(logger)
     } else {
@@ -10790,25 +11305,15 @@ pub fn build_backend_url_with_target(
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
-    // Both empty means path is just "/"
-    let path_is_root = backend_path.is_empty() && remaining_path.is_empty();
-
-    // Determine if we need to prepend a '/' (when neither segment starts with one)
-    let needs_leading_slash =
-        !path_is_root && !backend_path.starts_with('/') && !remaining_path.starts_with('/');
+    let path_layout = backend_path_layout(backend_path, remaining_path);
 
     // Build URL in a single buffer, writing the path segments directly to avoid
     // an intermediate `full_path` String allocation from format!().
-    let path_len = if path_is_root {
-        1
-    } else {
-        (if needs_leading_slash { 1 } else { 0 }) + backend_path.len() + remaining_path.len()
-    };
     let capacity = scheme.len()
         + 3
         + host.len()
         + 6
-        + path_len
+        + path_layout.len
         + if query_string.is_empty() {
             0
         } else {
@@ -10817,15 +11322,7 @@ pub fn build_backend_url_with_target(
     let mut url = String::with_capacity(capacity);
     let _ = write!(url, "{}://{}:{}", scheme, host, port);
 
-    if path_is_root {
-        url.push('/');
-    } else {
-        if needs_leading_slash {
-            url.push('/');
-        }
-        url.push_str(backend_path);
-        url.push_str(remaining_path);
-    }
+    push_backend_path(&mut url, backend_path, remaining_path);
 
     if !query_string.is_empty() {
         url.push('?');
@@ -11103,6 +11600,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
@@ -11452,6 +11950,8 @@ async fn proxy_to_backend(
             ctx,
             upstream_target,
             client_ip,
+            is_tls,
+            inbound_version,
             stream_request_body,
             retain_request_body,
             stream_response,
@@ -11728,6 +12228,7 @@ async fn proxy_to_backend(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
@@ -11951,6 +12452,42 @@ async fn proxy_to_backend(
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
     let response = match req_builder.send().await {
         Ok(response) => {
+            // A streaming request body that overran `max_request_body_size_bytes`
+            // is authoritative regardless of how the send/receive race resolved.
+            // `SizeLimitedIncoming` forwards bytes up to the limit before it
+            // errors, so a truncated request can reach the backend; under HTTP/1
+            // full-duplex (and especially under CPU contention on loaded CI
+            // runners) the backend can answer that truncated request — or the
+            // poisoned connection can surface a malformed/oversized response —
+            // before the body error propagates, making `send()` return `Ok`
+            // instead of `Err`. Without this guard the `Ok` arm would process
+            // that backend-derived response and could return the backend's
+            // status (or a 502 from the response-size path) instead of the
+            // contractual 413. Mirror the `Err`-branch check so the outcome is
+            // deterministic across both arms of the race.
+            if body_size_exceeded.load(Ordering::Acquire) {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_url = %strip_query_params(backend_url),
+                    max_body_size = state.max_request_body_size_bytes,
+                    backend_status = response.status().as_u16(),
+                    "Streaming request body exceeded maximum size (backend responded before body error surfaced)"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 413,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                    },
+                    retained_body,
+                );
+            }
+
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
@@ -12284,6 +12821,14 @@ pub(crate) fn build_sticky_cookie_header(
 
 pub(crate) fn strip_query_params(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
+}
+
+/// Count query parameters for global request validation.
+///
+/// Empty segments produced by duplicate or leading/trailing ampersands are not
+/// parameters and must not make otherwise equivalent H1/H2/H3 requests diverge.
+pub(crate) fn count_query_params(query_string: &str) -> usize {
+    query_string.split('&').filter(|s| !s.is_empty()).count()
 }
 
 pub(crate) fn query_string_after_plugin_strips<'a>(
@@ -12642,7 +13187,10 @@ pub fn check_host_authority_consistency(
 ///    duplicate Host headers MUST be rejected with 400 to prevent host-header routing
 ///    confusion between the proxy and backend.
 ///
-/// 4. **TE header validation** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and RFC 9114 §4.2 —
+/// 4. **Transfer-Encoding rejection** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and
+///    RFC 9114 §4.2 forbid this HTTP/1.x framing header on multiplexed protocols.
+///
+/// 5. **TE header validation** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and RFC 9114 §4.2 —
 ///    the only permitted value is "trailers"; any other value (or an empty list element
 ///    such as `,trailers` / `trailers,`) is a protocol violation that could be used to
 ///    confuse intermediaries that translate H2/H3 to HTTP/1.x.
@@ -12715,7 +13263,14 @@ pub fn check_protocol_headers(
         }
     }
 
-    // 4. TE header in HTTP/2 and HTTP/3 must be "trailers" only
+    // 4. HTTP/2 and HTTP/3 must not carry HTTP/1.x Transfer-Encoding.
+    if (version == hyper::Version::HTTP_2 || version == hyper::Version::HTTP_3)
+        && headers.contains_key("transfer-encoding")
+    {
+        return Some(r#"{"error":"HTTP/2 and HTTP/3 do not support Transfer-Encoding"}"#);
+    }
+
+    // 5. TE header in HTTP/2 and HTTP/3 must be "trailers" only
     // (RFC 9113 §8.2.2 for HTTP/2, RFC 9114 §4.2 for HTTP/3).
     // Iterate all TE header entries and comma-separated tokens within each entry.
     // A request with `te: trailers` plus a second `te: gzip` entry (or a single
@@ -12752,6 +13307,15 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
                 r#"{"error":"Internal server error"}"#,
             ))
         })
+}
+
+fn build_plain_text_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain")
+        .header("Cache-Control", "no-store")
+        .body(ProxyBody::from_string(body))
+        .unwrap_or_else(|_| Response::new(ProxyBody::from_string("Internal server error")))
 }
 
 /// Proxy the request to an HTTPS backend using the HTTP/2 multiplexing pool.
@@ -13526,13 +14090,19 @@ async fn proxy_to_backend_http2(
     }
 }
 
+struct Http3BackendHeaderContext<'a> {
+    client_ip: &'a str,
+    effective_host: &'a str,
+    is_tls: bool,
+    inbound_version: hyper::Version,
+    content_length: Option<&'a str>,
+}
+
 fn build_http3_backend_headers(
     state: &ProxyState,
     proxy: &Proxy,
     headers: &HashMap<String, String>,
-    client_ip: &str,
-    effective_host: &str,
-    content_length: Option<&str>,
+    ctx: Http3BackendHeaderContext<'_>,
 ) -> Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> {
     let mut http3_headers = Vec::with_capacity(headers.len() + 5);
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
@@ -13545,6 +14115,13 @@ fn build_http3_backend_headers(
             // when the client used H1 — strip on the way out so the H3
             // backend never sees the listed names.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            // The gateway re-emits proxy-managed forwarding metadata below.
+            // Do not let client-supplied values appear first on native H3
+            // backend requests, where duplicate header ordering can make a
+            // backend consume the spoofed value instead of Ferrum's canonical
+            // value.
+            "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" => continue,
+            "forwarded" if state.add_forwarded_header => continue,
             "host" => {
                 // Apply per-route `preserve_host_header` override on the
                 // first-attempt H3-native backend path. Mirrors
@@ -13558,7 +14135,7 @@ fn build_http3_backend_headers(
                 let host_value = if proxy.preserve_host_header {
                     value.as_str()
                 } else {
-                    effective_host
+                    ctx.effective_host
                 };
                 if let Ok(hv) = host_value.parse::<hyper::header::HeaderValue>() {
                     http3_headers.push((hyper::header::HOST, hv));
@@ -13574,20 +14151,21 @@ fn build_http3_backend_headers(
         }
     }
 
-    if let Some(content_length) = content_length
+    if let Some(content_length) = ctx.content_length
         && let Ok(content_length) = content_length.parse()
     {
         http3_headers.push((hyper::header::CONTENT_LENGTH, content_length));
     }
 
     if let Some(xff) = headers.get("x-forwarded-for") {
-        if let Ok(v) = format!("{}, {}", xff, client_ip).parse() {
+        if let Ok(v) = format!("{}, {}", xff, ctx.client_ip).parse() {
             http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
         }
-    } else if let Ok(v) = client_ip.parse() {
+    } else if let Ok(v) = ctx.client_ip.parse() {
         http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
     }
-    if let Ok(v) = "https".parse() {
+    let proto = if ctx.is_tls { "https" } else { "http" };
+    if let Ok(v) = proto.parse() {
         http3_headers.push((
             hyper::header::HeaderName::from_static("x-forwarded-proto"),
             v,
@@ -13601,14 +14179,17 @@ fn build_http3_backend_headers(
             v,
         ));
     }
-    if let Some(ref via) = state.via_header_http3
+    if let Some(via) = via_header_for_inbound_version(state, ctx.inbound_version)
         && let Ok(v) = via.parse()
     {
         http3_headers.push((hyper::header::HeaderName::from_static("via"), v));
     }
     if state.add_forwarded_header {
-        let fwd =
-            build_forwarded_value(client_ip, "https", headers.get("host").map(|s| s.as_str()));
+        let fwd = build_forwarded_value(
+            ctx.client_ip,
+            proto,
+            headers.get("host").map(|s| s.as_str()),
+        );
         if let Ok(v) = fwd.parse() {
             http3_headers.push((hyper::header::HeaderName::from_static("forwarded"), v));
         }
@@ -13630,6 +14211,8 @@ async fn proxy_to_backend_http3(
     ctx: Option<&mut RequestContext>,
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
+    is_tls: bool,
+    inbound_version: hyper::Version,
     stream_request_body: bool,
     retain_request_body: bool,
     stream_response: bool,
@@ -13687,9 +14270,13 @@ async fn proxy_to_backend_http3(
                     state,
                     proxy,
                     headers,
-                    client_ip,
-                    effective_host,
-                    headers.get("content-length").map(String::as_str),
+                    Http3BackendHeaderContext {
+                        client_ip,
+                        effective_host,
+                        is_tls,
+                        inbound_version,
+                        content_length: headers.get("content-length").map(String::as_str),
+                    },
                 );
 
                 let h3_result = if let Some(target) = upstream_target {
@@ -14043,9 +14630,13 @@ async fn proxy_to_backend_http3(
         state,
         proxy,
         headers,
-        client_ip,
-        effective_host,
-        request_content_length.as_deref(),
+        Http3BackendHeaderContext {
+            client_ip,
+            effective_host,
+            is_tls,
+            inbound_version,
+            content_length: request_content_length.as_deref(),
+        },
     );
 
     // `Bytes::from(Vec<u8>)` transfers ownership without copying. Convert
@@ -14317,6 +14908,7 @@ async fn proxy_to_backend_http3_retry(
     request_body: Option<&[u8]>,
     client_ip: &str,
     is_tls: bool,
+    inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
     // reqwest dispatch receives `upstream_target` separately, so it only
     // needs per-port timeout rebasing. gRPC/direct-H2 pool paths use
@@ -14343,66 +14935,18 @@ async fn proxy_to_backend_http3_retry(
         .ok()
         .map(|ip| ip.to_string());
 
-    // Build HTTP/3 headers from the saved headers map
-    let mut http3_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
-        Vec::new();
-    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
-    for (name, value) in headers {
-        match name.as_str() {
-            // Hop-by-hop headers per RFC 9110 §7.6.1, plus content-length
-            // (h3 frames the body via QUIC streams so any forwarded value
-            // is informational and risks mismatch with body length when
-            // a request_transformer plugin mutated the body).
-            n if headers_mod::is_backend_request_strip_header(n) => continue,
-            // RFC 9110 §7.6.1 also requires stripping every header NAMED
-            // in the request's `Connection` field — see
-            // `parse_connection_listed_from_str_map`.
-            n if connection_listed_strip.iter().any(|s| s == n) => continue,
-            "host" => {
-                // Use effective upstream host unless preserve_host_header is set
-                let host_value = if proxy.preserve_host_header {
-                    value.as_str()
-                } else {
-                    effective_host
-                };
-                if let (Ok(hn), Ok(hv)) = (
-                    "host".parse::<hyper::header::HeaderName>(),
-                    host_value.parse::<hyper::header::HeaderValue>(),
-                ) {
-                    http3_headers.push((hn, hv));
-                }
-            }
-            _ => {
-                if let (Ok(hn), Ok(hv)) = (name.parse(), value.parse()) {
-                    http3_headers.push((hn, hv));
-                }
-            }
-        }
-    }
-
-    // X-Forwarded-* headers
-    let xff_val = build_xff_value(
-        headers.get("x-forwarded-for").map(|s| s.as_str()),
-        client_ip,
+    let http3_headers = build_http3_backend_headers(
+        state,
+        proxy,
+        headers,
+        Http3BackendHeaderContext {
+            client_ip,
+            effective_host,
+            is_tls,
+            inbound_version,
+            content_length: None,
+        },
     );
-    if let Ok(v) = xff_val.parse() {
-        http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
-    }
-    let proto = if is_tls { "https" } else { "http" };
-    if let Ok(v) = proto.parse() {
-        http3_headers.push((
-            hyper::header::HeaderName::from_static("x-forwarded-proto"),
-            v,
-        ));
-    }
-    if let Some(host) = headers.get("host")
-        && let Ok(v) = host.parse()
-    {
-        http3_headers.push((
-            hyper::header::HeaderName::from_static("x-forwarded-host"),
-            v,
-        ));
-    }
 
     let body_bytes = bytes::Bytes::copy_from_slice(request_body.unwrap_or(&[]));
 
@@ -14556,6 +15100,124 @@ mod tests {
     }
 
     #[test]
+    fn backend_tls_watched_sources_collects_and_deduplicates_sources() {
+        let env_config = EnvConfig {
+            tls_ca_bundle_path: Some("/ca/global.pem".to_string()),
+            backend_tls_client_cert_path: Some("/certs/shared.pem".to_string()),
+            backend_tls_client_key_path: Some("/keys/global.key".to_string()),
+            tls_crl_file_path: Some("/crl/global.pem".to_string()),
+            ..EnvConfig::default()
+        };
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "p1",
+                "listen_path": "/",
+                "backend_host": "api.example.com",
+                "backend_port": 443,
+                "backend_scheme": "https"
+            }],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": "mrd1",
+                "plugin_name": "mesh_route_dispatch",
+                "scope": "proxy",
+                "proxy_id": "p1",
+                "enabled": true,
+                "config": {
+                    "rules": [{
+                        "match": {"methods": ["GET"]},
+                        "destination": {
+                            "backend_host": "canary.example.com",
+                            "backend_port": 443,
+                            "backend_tls": {
+                                "client_cert_path": "/certs/mesh-route.pem",
+                                "client_key_path": "/keys/mesh-route.key",
+                                "server_ca_cert_path": "/ca/mesh-route.pem"
+                            }
+                        }
+                    }]
+                }
+            }],
+            "upstreams": [{
+                "id": "u1",
+                "targets": [{"host": "api.example.com", "port": 443}],
+                "backend_tls_client_cert_path": "/certs/shared.pem",
+                "backend_tls_client_key_path": "/keys/upstream.key",
+                "backend_tls_server_ca_cert_path": "/ca/upstream.pem"
+            }]
+        }))
+        .expect("config should deserialize");
+        config.proxies[0].resolved_tls = BackendTlsConfig {
+            client_cert_path: Some("/certs/proxy.pem".to_string()),
+            client_key_path: Some("/keys/proxy.key".to_string()),
+            server_ca_cert_path: Some("/ca/proxy.pem".to_string()),
+            verify_server_cert: true,
+            sni: None,
+            san_allow_list: Vec::new(),
+            san_allow_list_key_digest: None,
+        };
+
+        let sources = collect_backend_tls_watched_sources(&config, &env_config);
+        let ids = sources
+            .iter()
+            .map(|source| source.source.pool_key_component())
+            .collect::<Vec<_>>();
+
+        assert_eq!(sources.len(), 12);
+        assert_eq!(
+            ids.iter()
+                .filter(|id| id.as_str() == "/certs/shared.pem")
+                .count(),
+            1,
+            "shared global/upstream cert source should be watched once"
+        );
+        assert!(ids.contains(&"/ca/global.pem".to_string()));
+        assert!(ids.contains(&"/crl/global.pem".to_string()));
+        assert!(ids.contains(&"/ca/proxy.pem".to_string()));
+        assert!(ids.contains(&"/ca/upstream.pem".to_string()));
+        assert!(ids.contains(&"/certs/mesh-route.pem".to_string()));
+        assert!(ids.contains(&"/keys/mesh-route.key".to_string()));
+        assert!(ids.contains(&"/ca/mesh-route.pem".to_string()));
+    }
+
+    #[test]
+    fn frontend_dtls_watched_sources_collects_cert_key_client_ca_and_crl() {
+        let env_config = EnvConfig {
+            dtls_cert_path: Some("/certs/dtls.pem".to_string()),
+            dtls_key_path: Some("/keys/dtls.key".to_string()),
+            dtls_client_ca_cert_path: Some("/ca/dtls-clients.pem".to_string()),
+            tls_crl_file_path: Some("/crl/global.pem".to_string()),
+            ..EnvConfig::default()
+        };
+
+        let sources = collect_frontend_dtls_watched_sources(&env_config);
+        let ids = sources
+            .iter()
+            .map(|source| source.source.pool_key_component())
+            .collect::<Vec<_>>();
+
+        assert_eq!(sources.len(), 4);
+        assert!(ids.contains(&"/certs/dtls.pem".to_string()));
+        assert!(ids.contains(&"/keys/dtls.key".to_string()));
+        assert!(ids.contains(&"/ca/dtls-clients.pem".to_string()));
+        assert!(ids.contains(&"/crl/global.pem".to_string()));
+    }
+
+    #[test]
+    fn proxy_backend_uses_tls_detects_tls_wire_schemes() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+        assert!(proxy_backend_uses_tls(&proxy));
+
+        proxy.backend_scheme = Some(BackendScheme::Tcps);
+        assert!(proxy_backend_uses_tls(&proxy));
+
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        assert!(!proxy_backend_uses_tls(&proxy));
+    }
+
+    #[test]
     fn retry_port_override_dispatch_port_uses_selected_target_port() {
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.upstream_id = Some("u1".to_string());
@@ -14670,6 +15332,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn h1_to_native_h3_backend_headers_preserve_frontend_forwarding_metadata() {
+        let env_config = crate::config::env_config::EnvConfig {
+            add_via_header: true,
+            add_forwarded_header: true,
+            ..Default::default()
+        };
+        let state = make_test_proxy_state_with_env(GatewayConfig::default(), env_config);
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+        proxy.backend_host = "template.example".to_string();
+        proxy.preserve_host_header = false;
+
+        let headers = HashMap::from([
+            ("host".to_string(), "edge.example".to_string()),
+            ("connection".to_string(), "x-strip".to_string()),
+            ("x-strip".to_string(), "leak".to_string()),
+            ("x-keep".to_string(), "ok".to_string()),
+            ("x-forwarded-for".to_string(), "198.51.100.7".to_string()),
+        ]);
+
+        let out = build_http3_backend_headers(
+            &state,
+            &proxy,
+            &headers,
+            Http3BackendHeaderContext {
+                client_ip: "127.0.0.1",
+                effective_host: "backend.internal",
+                is_tls: false,
+                inbound_version: hyper::Version::HTTP_11,
+                content_length: None,
+            },
+        );
+
+        assert_eq!(header_value(&out, "host"), Some("backend.internal"));
+        assert_eq!(header_value(&out, "x-keep"), Some("ok"));
+        assert_eq!(
+            header_value(&out, "x-forwarded-for"),
+            Some("198.51.100.7, 127.0.0.1")
+        );
+        assert_eq!(header_value(&out, "x-forwarded-proto"), Some("http"));
+        assert_eq!(header_value(&out, "x-forwarded-host"), Some("edge.example"));
+        assert_eq!(header_value(&out, "via"), Some("1.1 ferrum-edge"));
+        assert_eq!(
+            header_value(&out, "forwarded"),
+            Some("for=127.0.0.1;proto=http;host=edge.example")
+        );
+        assert!(
+            header_value(&out, "x-strip").is_none(),
+            "headers named by Connection must not be forwarded to H3 backends"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_tls_to_native_h3_backend_headers_use_h2_via_and_https_proto() {
+        let env_config = crate::config::env_config::EnvConfig {
+            add_via_header: true,
+            add_forwarded_header: true,
+            ..Default::default()
+        };
+        let state = make_test_proxy_state_with_env(GatewayConfig::default(), env_config);
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+
+        let headers = HashMap::from([("host".to_string(), "api.example".to_string())]);
+        let out = build_http3_backend_headers(
+            &state,
+            &proxy,
+            &headers,
+            Http3BackendHeaderContext {
+                client_ip: "203.0.113.9",
+                effective_host: "h3-backend.example",
+                is_tls: true,
+                inbound_version: hyper::Version::HTTP_2,
+                content_length: None,
+            },
+        );
+
+        assert_eq!(header_value(&out, "x-forwarded-proto"), Some("https"));
+        assert_eq!(header_value(&out, "via"), Some("2.0 ferrum-edge"));
+        assert_eq!(
+            header_value(&out, "forwarded"),
+            Some("for=203.0.113.9;proto=https;host=api.example")
+        );
+    }
+
     #[test]
     fn websocket_backend_url_strips_exact_listen_path_literal() {
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
@@ -14712,6 +15460,47 @@ mod tests {
     }
 
     #[test]
+    fn websocket_backend_url_with_relative_backend_path_keeps_slash_boundary() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_path = Some("internal".to_string());
+        proxy.listen_path = Some("/ws".to_string());
+        proxy.strip_listen_path = true;
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            "/ws/chat",
+            "",
+            "backend.local",
+            8080,
+            "/ws".len(),
+            None,
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/internal/chat");
+    }
+
+    #[test]
+    fn websocket_backend_url_with_relative_target_path_inserts_separator() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.listen_path = Some("/ws/".to_string());
+        proxy.strip_listen_path = true;
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            "/ws/chat",
+            "",
+            "backend.local",
+            8080,
+            "/ws/".len(),
+            Some("internal"),
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/internal/chat");
+    }
+
+    #[test]
     fn websocket_forwardable_headers_use_sanitized_proxy_headers() {
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "edge.example".to_string());
@@ -14733,6 +15522,82 @@ mod tests {
                 .any(|(name, _)| name.eq_ignore_ascii_case("host")
                     || name.eq_ignore_ascii_case("connection"))
         );
+    }
+
+    #[test]
+    fn websocket_forwardable_proxy_headers_strip_connection_listed_names() {
+        let mut headers = HashMap::new();
+        headers.insert("Connection".to_string(), "upgrade, x-secret".to_string());
+        headers.insert("x-secret".to_string(), "leak".to_string());
+        headers.insert("x-request-id".to_string(), "req-1".to_string());
+
+        let forwarded = collect_forwardable_proxy_headers(&headers);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-secret")),
+            "headers named by Connection must not be forwarded to the WebSocket backend"
+        );
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
+        }));
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_strip_raw_connection_listed_names() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("upgrade, x-secret"),
+        );
+        raw.insert("x-secret", hyper::header::HeaderValue::from_static("leak"));
+        raw.insert("x-keep", hyper::header::HeaderValue::from_static("ok"));
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        ctx.set_raw_headers(raw.clone());
+        ctx.materialize_headers();
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &ctx.headers);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-secret")),
+            "raw Connection-listed header must not be restored from raw WebSocket headers"
+        );
+        assert!(
+            forwarded
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("x-keep") && value == "ok")
+        );
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_strip_proxy_connection_listed_plugin_headers() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.insert("x-keep", hyper::header::HeaderValue::from_static("ok"));
+
+        let mut sanitized = HashMap::new();
+        sanitized.insert("Connection".to_string(), "x-plugin-secret".to_string());
+        sanitized.insert("x-plugin-secret".to_string(), "leak".to_string());
+        sanitized.insert("x-added-by-plugin".to_string(), "kept".to_string());
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &sanitized);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-plugin-secret")),
+            "plugin/materialized Connection-listed header must be stripped after merge"
+        );
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
+        }));
     }
 
     #[test]
@@ -14917,6 +15782,14 @@ mod tests {
         );
 
         assert_eq!(stripped.as_ref(), "a=1&keep=2");
+    }
+
+    #[test]
+    fn count_query_params_ignores_empty_segments() {
+        assert_eq!(count_query_params(""), 0);
+        assert_eq!(count_query_params("&&"), 0);
+        assert_eq!(count_query_params("a=1&&b=2&"), 2);
+        assert_eq!(count_query_params("&a=1&&b=2&&c=3"), 3);
     }
 
     fn route_delta_proxy(
@@ -16863,11 +17736,33 @@ mod tests {
     // categorization and rationale.
 
     fn make_test_proxy_state(initial_config: GatewayConfig) -> ProxyState {
+        make_test_proxy_state_with_env(
+            initial_config,
+            crate::config::env_config::EnvConfig::default(),
+        )
+    }
+
+    fn make_test_proxy_state_with_env(
+        initial_config: GatewayConfig,
+        env_config: crate::config::env_config::EnvConfig,
+    ) -> ProxyState {
         let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
-        let env_config = crate::config::env_config::EnvConfig::default();
         ProxyState::new(initial_config, dns_cache, env_config, None, None)
             .expect("ProxyState construction should succeed in tests")
             .0
+    }
+
+    fn header_value<'a>(
+        headers: &'a [(hyper::header::HeaderName, hyper::header::HeaderValue)],
+        name: &str,
+    ) -> Option<&'a str> {
+        headers.iter().find_map(|(header_name, value)| {
+            header_name
+                .as_str()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.to_str().ok())
+                .flatten()
+        })
     }
 
     #[tokio::test]

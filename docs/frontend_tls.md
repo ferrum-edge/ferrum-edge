@@ -22,6 +22,10 @@ export FERRUM_FRONTEND_TLS_CERT_PATH="/path/to/server.crt"
 
 # Server private key (PEM format)  
 export FERRUM_FRONTEND_TLS_KEY_PATH="/path/to/server.key"
+
+# Optional source overrides. These accept a path, file:// URI, or inline PEM.
+export FERRUM_FRONTEND_TLS_CERT_SOURCE="file:///path/to/server.crt"
+export FERRUM_FRONTEND_TLS_KEY_SOURCE="file:///path/to/server.key"
 ```
 
 ### Client Certificate Verification (mTLS)
@@ -31,7 +35,23 @@ Optional for mTLS mode:
 ```bash
 # Client CA bundle for verifying client certificates
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/path/to/client-ca-bundle.pem"
+
+# Optional source override for the client CA bundle
+export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_SOURCE="file:///path/to/client-ca-bundle.pem"
 ```
+
+`*_SOURCE` values override their matching `*_PATH` values when both are set. They can be ordinary filesystem paths, `file://` URIs, inline PEM beginning with `-----BEGIN `, provider URIs, Kubernetes Secret URIs such as `k8s://edge/frontend#tls.crt`, ACME-issued records such as `acme://certificates/edge-cert#cert`, or admin-managed URIs such as `managed://certificates/edge-cert#cert` and `managed://ocsp-responses/edge-ocsp#ocsp`. Frontend/admin server key sources can also use non-extractable RSA PKCS#11 keys when the binary is built with the `pkcs11` Cargo feature. Inline PEM is redacted in debug output. File/external-source-backed frontend/admin cert, key, client-CA, OCSP response, and CRL sources can be live-reloaded when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`; inline PEM remains static until config reload.
+
+PKCS#11 key sources use the token for TLS signing without exporting the private key:
+
+```bash
+export FERRUM_PKCS11_MODULE_PATH="/usr/lib/softhsm/libsofthsm2.so"
+export FERRUM_PKCS11_PIN="token-user-pin"
+export FERRUM_FRONTEND_TLS_CERT_SOURCE="file:///etc/ferrum/certs/frontend.crt"
+export FERRUM_FRONTEND_TLS_KEY_SOURCE="pkcs11://edge-rsa?pin_env=FERRUM_PKCS11_PIN"
+```
+
+Use `?module=/path/to/pkcs11.so` or `?module_env=FERRUM_PKCS11_MODULE_PATH` to override the default module path per source, `?slot=` to pin a slot id, `?label=` to override the URI path selector, and `?id_hex=` to refine selection by key id. PKCS#11 support is currently RSA-only and available for frontend/Admin API server TLS keys plus backend mTLS client keys. See [pkcs11_tls.md](pkcs11_tls.md) for HSM deployment notes and the token-backed smoke test.
 
 ### Handshake Timeout
 
@@ -232,9 +252,12 @@ The Admin API also supports separate HTTP and HTTPS listeners with the same arch
 # Admin server certificates (for HTTPS)
 export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
 export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
+export FERRUM_ADMIN_TLS_CERT_SOURCE="file:///etc/ssl/certs/admin.crt"
+export FERRUM_ADMIN_TLS_KEY_SOURCE="file:///etc/ssl/private/admin.key"
 
 # Admin client CA bundle (for mTLS)
 export FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/admin-client-ca.pem"
+export FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE="file:///etc/ssl/certs/admin-client-ca.pem"
 
 # Admin ports (configurable)
 export FERRUM_ADMIN_HTTP_PORT="9000"
@@ -392,24 +415,25 @@ curl https://localhost:8443/api/v1
 
 ## Certificate Reload Behavior
 
-**Ferrum Edge does not dynamically reload any TLS certificate files.** This applies to every TLS surface:
+Frontend proxy, Admin API, and frontend DTLS cert/key/client-CA/OCSP/CRL sources can opt in to live reload with `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`. Sources supplied as paths or `file://` URIs are polled by material byte fingerprint using `FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS`. Provider URI sources (`vault://`, `aws://`, `azure://`, `gcp://`) are fetched through the matching secret-provider backend and polled with `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` unless the URI includes `?poll=` (for example, `vault://secret/data/edge#cert?poll=60s`). Kubernetes Secret URI sources (`k8s://namespace/secret#key`) also register a Kubernetes watch on the named Secret and queue an immediate reload when cert-manager or another controller updates it; polling remains the fallback and debounce. A `pkcs11://` frontend/admin key source is tracked by stable selector fingerprint so adjacent cert, client-CA, OCSP, and CRL rotations still reload; changing the HSM key behind the same URI requires a config/source change or restart. Inline PEM remains static until config reload. Provider URI sources require the matching secret-provider Cargo feature and use the same credentials/configuration as the existing `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` env-var suffixes.
 
 | Category | Environment Variables |
 |----------|---------------------|
-| **Frontend proxy** | `FERRUM_FRONTEND_TLS_CERT_PATH`, `FERRUM_FRONTEND_TLS_KEY_PATH`, `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` |
-| **Admin API** | `FERRUM_ADMIN_TLS_CERT_PATH`, `FERRUM_ADMIN_TLS_KEY_PATH`, `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` |
-| **Backend mTLS (global)** | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`, `FERRUM_TLS_CA_BUNDLE_PATH` |
-| **Backend mTLS (per-proxy)** | `backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path` in proxy config |
-| **DTLS (UDP)** | `FERRUM_DTLS_CERT_PATH`, `FERRUM_DTLS_KEY_PATH`, `FERRUM_DTLS_CLIENT_CA_CERT_PATH` |
-| **gRPC CP/DP** | `FERRUM_CP_GRPC_TLS_CERT_PATH`, `FERRUM_CP_GRPC_TLS_KEY_PATH`, `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH`, `FERRUM_DP_GRPC_TLS_CA_CERT_PATH`, `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH`, `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` |
+| **Frontend proxy live reload** | `FERRUM_FRONTEND_TLS_CERT_PATH` / `_SOURCE`, `FERRUM_FRONTEND_TLS_KEY_PATH` / `_SOURCE`, `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` / `_SOURCE`, `FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE`, `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE` when any active source is file/provider/Kubernetes/managed-backed |
+| **Admin API live reload** | `FERRUM_ADMIN_TLS_CERT_PATH` / `_SOURCE`, `FERRUM_ADMIN_TLS_KEY_PATH` / `_SOURCE`, `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` / `_SOURCE`, `FERRUM_ADMIN_TLS_OCSP_RESPONSE_SOURCE`, `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE` when any active source is file/provider/Kubernetes/managed-backed |
+| **Frontend DTLS live reload** | `FERRUM_DTLS_CERT_PATH` / `_SOURCE`, `FERRUM_DTLS_KEY_PATH` / `_SOURCE`, `FERRUM_DTLS_CLIENT_CA_CERT_PATH` / `_SOURCE`, `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE` when any active source is file/provider/Kubernetes/managed-backed |
+| **Backend TLS live reload** | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` / `_SOURCE`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` / `_SOURCE`, `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE`, per-proxy/per-upstream backend TLS source fields, and `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE` |
+| **Database TLS live reload** | `FERRUM_DB_TLS_CA_CERT_PATH` / `_SOURCE`, `FERRUM_DB_TLS_CLIENT_CERT_PATH` / `_SOURCE`, and `FERRUM_DB_TLS_CLIENT_KEY_PATH` / `_SOURCE` in database/CP modes when `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` |
+| **CP gRPC TLS live reload** | `FERRUM_CP_GRPC_TLS_CERT_PATH` / `_SOURCE`, `FERRUM_CP_GRPC_TLS_KEY_PATH` / `_SOURCE`, and `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` / `_SOURCE` in CP mode |
+| **DP gRPC TLS live reload** | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` / `_SOURCE`, `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` / `_SOURCE`, and `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` / `_SOURCE` in DP mode |
+| **Loaded but static** | Inline frontend/admin/DTLS/backend/database/CP-gRPC/DP-gRPC sources |
+| **SVID file rotation** | `FERRUM_GATEWAY_SVID_*_PATH` / `_SOURCE` when all three sources are file-backed |
 
-**All TLS certificate files are validated at startup and config load time.** If any configured certificate or key file is missing, unreadable (permission denied), or contains invalid/corrupt PEM data, the gateway **refuses to start** (or rejects the config reload). There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key paths must always be configured as a pair.
+All TLS sources are validated at startup and config load time when their owning runtime is built. If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to non-empty DER bytes. There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
 
-Frontend, admin, DTLS, and gRPC certificates are read at process startup. Global and per-proxy backend mTLS certificates are validated at config load time and read again when the connection pool entry for a proxy is first created.
+The frontend/admin live-reload poller atomically swaps a validated `rustls::ServerConfig` for new handshakes. The frontend DTLS poller swaps the active DTLS server material for new DTLS sessions. Existing TLS/DTLS sessions keep the config they negotiated with. A failed reload keeps the previous config in service and logs a warning without exposing PEM contents.
 
-**No TLS surface supports hot reload — not frontend, not backend, not admin, not DTLS, not gRPC.** A config reload (SIGHUP in file mode, database polling, or CP→DP gRPC sync) refreshes routing, plugins, consumers, and upstreams — but does **not** re-read any TLS certificate files from disk. This includes frontend server certs, client CA bundles, backend mTLS certs/keys, backend CA bundles, DTLS certs, and gRPC TLS certs.
-
-**To rotate certificates**, replace the files on disk and **restart the gateway process**. In Kubernetes, a rolling restart after a Secret update is the standard approach. For per-proxy backend cert paths, a config reload (SIGHUP, DB poll, or gRPC sync) refreshes the proxy config but does **not** re-read existing TLS files from disk for cached pool entries — only newly created pool entries will read the updated files.
+For backend HTTP-family TLS, keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` to pick up in-place cert/key/CA/CRL source changes and to watch backend TLS sources added by later config reloads. Database TLS can opt in with `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` in database and CP modes. CP gRPC TLS swaps the server TLS slot for new handshakes when watched source bytes change; DP gRPC TLS reconnects the CP stream with fresh client-side TLS material.
 
 ### Backend Connection Pool and TLS Paths
 
@@ -537,7 +561,7 @@ The gateway supports fine-grained control over TLS protocol versions, cipher sui
 | `FERRUM_TLS_MIN_VERSION` | `1.2` | Minimum TLS version (inbound + outbound). Allowed: `1.2`, `1.3` |
 | `FERRUM_TLS_MAX_VERSION` | `1.3` | Maximum TLS version (inbound + outbound). Allowed: `1.2`, `1.3` |
 | `FERRUM_TLS_CIPHER_SUITES` | *(see defaults below)* | Comma-separated cipher suites (inbound + outbound) |
-| `FERRUM_TLS_CURVES` | *(see defaults below)* | Comma-separated key exchange groups (inbound + outbound) |
+| `FERRUM_TLS_KEY_EXCHANGE_GROUPS` | *(see defaults below)* | Comma-separated key exchange groups (inbound + outbound). `FERRUM_TLS_CURVES` is accepted as an alias |
 | `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | `true` | Server cipher preference for TLS 1.2 (inbound only) |
 | `FERRUM_TLS_SESSION_CACHE_SIZE` | `4096` | Session ID cache for TLS 1.2 resumption (inbound only) |
 
@@ -591,7 +615,7 @@ export FERRUM_TLS_CIPHER_SUITES="TLS_AES_256_GCM_SHA384,ECDHE-ECDSA-AES256-GCM-S
 
 ### Supported Key Exchange Groups (Curves)
 
-When `FERRUM_TLS_CURVES` is not set, the gateway uses `X25519` and `secp256r1`.
+When `FERRUM_TLS_KEY_EXCHANGE_GROUPS` is not set, the gateway uses `X25519` and `secp256r1`. `FERRUM_TLS_CURVES` is accepted as an alias for existing deployments; the canonical variable wins if both are set.
 
 | Name | Aliases | Description |
 |------|---------|-------------|
@@ -601,14 +625,16 @@ When `FERRUM_TLS_CURVES` is not set, the gateway uses `X25519` and `secp256r1`.
 
 Curve names are case-insensitive.
 
+Hybrid post-quantum groups such as Kyber/X25519 are not exposed by the current rustls/ring provider used by Ferrum. `FERRUM_TLS_KEY_EXCHANGE_GROUPS` is the stable operator-facing control point; supported hybrid names can be added there when the upstream provider exposes them.
+
 **Example — X25519 only:**
 ```bash
-export FERRUM_TLS_CURVES="X25519"
+export FERRUM_TLS_KEY_EXCHANGE_GROUPS="X25519"
 ```
 
 **Example — all supported curves:**
 ```bash
-export FERRUM_TLS_CURVES="X25519,secp256r1,secp384r1"
+export FERRUM_TLS_KEY_EXCHANGE_GROUPS="X25519,secp256r1,secp384r1"
 ```
 
 ### Server Cipher Order

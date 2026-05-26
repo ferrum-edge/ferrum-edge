@@ -47,6 +47,7 @@ use crate::config::{BackendAllowIps, PoolConfig};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::retry::{ErrorClass, classify_reqwest_error};
 use crate::tls::CrlList;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -112,6 +113,8 @@ pub struct PluginHttpClient {
     /// reads this slot) falls back to a fresh unattached state and
     /// emits zero counters rather than panicking.
     bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+    /// Operator override for hot-path DashMap shard counts.
+    pool_shard_amount: usize,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -126,6 +129,7 @@ impl std::fmt::Debug for PluginHttpClient {
             .field("tls_crls_count", &self.tls_crls.len())
             .field("namespace", &self.namespace)
             .field("backend_allow_ips", &self.backend_allow_ips)
+            .field("pool_shard_amount", &self.pool_shard_amount)
             .finish()
     }
 }
@@ -184,6 +188,7 @@ impl PluginHttpClient {
         namespace: &str,
         backend_allow_ips: BackendAllowIps,
         mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
+        pool_shard_amount: usize,
     ) -> Self {
         let dns_cache_clone = dns_cache.clone();
         let resolver = DnsCacheResolver::new(dns_cache);
@@ -216,19 +221,26 @@ impl PluginHttpClient {
         //                                          platform via use_preconfigured_tls;
         //                                          this helper-client path differs.
         if !tls_no_verify && let Some(ca_path) = tls_ca_bundle_path {
-            match std::fs::read(ca_path) {
-                Ok(ca_pem) => match reqwest::Certificate::from_pem(&ca_pem) {
-                    Ok(cert) => {
-                        // reqwest 0.13: `tls_certs_only` replaces the trust
-                        // store entirely (CA exclusivity).
-                        builder = builder.tls_certs_only([cert]);
+            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+            match load_material_blocking(&source, MaterialKind::CaBundle) {
+                Ok(ca_material) => {
+                    match reqwest::Certificate::from_pem(ca_material.bytes.expose_secret()) {
+                        Ok(cert) => {
+                            // reqwest 0.13: `tls_certs_only` replaces the trust
+                            // store entirely (CA exclusivity).
+                            builder = builder.tls_certs_only([cert]);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse CA bundle from {}: {}",
+                                ca_material.source_id,
+                                e
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse CA bundle from {}: {}", ca_path, e);
-                    }
-                },
+                }
                 Err(e) => {
-                    tracing::warn!("Failed to read CA bundle from {}: {}", ca_path, e);
+                    tracing::warn!("Failed to load CA bundle: {}", e);
                 }
             }
         }
@@ -269,6 +281,7 @@ impl PluginHttpClient {
             backend_allow_ips,
             mesh_egress_strip_baggage_keys,
             bpf_metrics_state: None,
+            pool_shard_amount,
         }
     }
 
@@ -346,6 +359,7 @@ impl PluginHttpClient {
             backend_allow_ips: BackendAllowIps::Both,
             mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
             bpf_metrics_state: None,
+            pool_shard_amount: 0,
         }
     }
 
@@ -423,6 +437,11 @@ impl PluginHttpClient {
     /// gateway instances share a single external backend.
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// Effective shard count for hot-path plugin DashMaps.
+    pub fn pool_shard_amount(&self) -> usize {
+        crate::util::sharding::pool_shard_amount(self.pool_shard_amount)
     }
 
     /// Resolved backend IP allowlist policy.

@@ -12,6 +12,7 @@ use x509_parser::prelude::*;
 
 use crate::identity::spiffe::{SpiffeId, UriSanError, extract_spiffe_id_from_cert};
 use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::tls::spiffe::SpiffeTlsError;
 
 pub fn load_svid_bundle_from_files(
@@ -20,9 +21,34 @@ pub fn load_svid_bundle_from_files(
     trust_bundle_path: &Path,
     explicit_spiffe_id: Option<&str>,
 ) -> Result<SvidBundle, SpiffeTlsError> {
-    let cert_chain_der = read_cert_chain(cert_path, "gateway SVID certificate chain")?;
-    let private_key_pkcs8_der = read_pkcs8_key(key_path)?;
-    let x509_authorities = read_cert_chain(trust_bundle_path, "gateway SVID trust bundle")?;
+    let cert_source = cert_path.to_string_lossy();
+    let key_source = key_path.to_string_lossy();
+    let trust_bundle_source = trust_bundle_path.to_string_lossy();
+    load_svid_bundle_from_sources(
+        cert_source.as_ref(),
+        key_source.as_ref(),
+        trust_bundle_source.as_ref(),
+        explicit_spiffe_id,
+    )
+}
+
+pub fn load_svid_bundle_from_sources(
+    cert_source: &str,
+    key_source: &str,
+    trust_bundle_source: &str,
+    explicit_spiffe_id: Option<&str>,
+) -> Result<SvidBundle, SpiffeTlsError> {
+    let cert_chain_der = read_cert_chain_source(
+        cert_source,
+        MaterialKind::Cert,
+        "gateway SVID certificate chain",
+    )?;
+    let private_key_pkcs8_der = read_pkcs8_key_source(key_source)?;
+    let x509_authorities = read_cert_chain_source(
+        trust_bundle_source,
+        MaterialKind::CaBundle,
+        "gateway SVID trust bundle",
+    )?;
 
     let leaf = cert_chain_der
         .first()
@@ -77,17 +103,22 @@ pub fn load_svid_bundle_from_files(
     })
 }
 
-fn read_cert_chain(path: &Path, label: &str) -> Result<Vec<Vec<u8>>, SpiffeTlsError> {
-    let pem = std::fs::read(path).map_err(|e| {
-        SpiffeTlsError::BadKeyMaterial(format!("{label}: failed to read '{}': {e}", path.display()))
-    })?;
-    let mut reader = pem.as_slice();
+fn read_cert_chain_source(
+    source_value: &str,
+    kind: MaterialKind,
+    label: &str,
+) -> Result<Vec<Vec<u8>>, SpiffeTlsError> {
+    let source = CertSource::parse(source_value, kind);
+    let material = load_material_blocking(&source, kind)
+        .map_err(|e| SpiffeTlsError::BadKeyMaterial(format!("{label}: {e}")))?;
+    let source_id = material.source_id.clone();
+    let mut reader = material.bytes.expose_secret();
     let certs: Vec<Vec<u8>> = rustls_pemfile::certs(&mut reader)
         .map(|cert| {
             cert.map(|cert| cert.as_ref().to_vec()).map_err(|e| {
                 SpiffeTlsError::BadKeyMaterial(format!(
                     "{label}: failed to parse PEM certificate in '{}': {e}",
-                    path.display()
+                    source_id
                 ))
             })
         })
@@ -96,40 +127,38 @@ fn read_cert_chain(path: &Path, label: &str) -> Result<Vec<Vec<u8>>, SpiffeTlsEr
     if certs.is_empty() {
         return Err(SpiffeTlsError::BadKeyMaterial(format!(
             "{label}: no CERTIFICATE blocks found in '{}'",
-            path.display()
+            source_id
         )));
     }
     Ok(certs)
 }
 
-fn read_pkcs8_key(path: &Path) -> Result<Vec<u8>, SpiffeTlsError> {
-    let pem = std::fs::read(path).map_err(|e| {
-        SpiffeTlsError::BadKeyMaterial(format!(
-            "gateway SVID key: failed to read '{}': {e}",
-            path.display()
-        ))
-    })?;
-    let mut reader = pem.as_slice();
+fn read_pkcs8_key_source(source_value: &str) -> Result<Vec<u8>, SpiffeTlsError> {
+    let source = CertSource::parse(source_value, MaterialKind::Key);
+    let material = load_material_blocking(&source, MaterialKind::Key)
+        .map_err(|e| SpiffeTlsError::BadKeyMaterial(format!("gateway SVID key: {e}")))?;
+    let source_id = material.source_id.clone();
+    let mut reader = material.bytes.expose_secret();
     let mut keys = rustls_pemfile::pkcs8_private_keys(&mut reader);
     let key = keys
         .next()
         .ok_or_else(|| {
             SpiffeTlsError::BadKeyMaterial(format!(
                 "gateway SVID key: no PKCS#8 PRIVATE KEY block found in '{}'",
-                path.display()
+                source_id
             ))
         })?
         .map_err(|e| {
             SpiffeTlsError::BadKeyMaterial(format!(
                 "gateway SVID key: failed to parse PKCS#8 key in '{}': {e}",
-                path.display()
+                source_id
             ))
         })?;
 
     if keys.next().is_some() {
         return Err(SpiffeTlsError::BadKeyMaterial(format!(
             "gateway SVID key: '{}' contains more than one PKCS#8 private key",
-            path.display()
+            source_id
         )));
     }
 

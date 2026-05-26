@@ -3,7 +3,7 @@
 //! The old per-test `TestHarness` / `AdminTestHarness` / `LoadTestHarness`
 //! structs all implemented the same skeleton: 3-attempt retry → ephemeral
 //! ports → spawn binary with `Stdio::null()` → `wait_for_health` → `Drop`
-//! kill. See CLAUDE.md "Functional test port allocation — MUST use retry
+//! cleanup. See CLAUDE.md "Functional test port allocation — MUST use retry
 //! pattern" for the required behaviour.
 //!
 //! This module centralises that skeleton in [`TestGateway`] + [`TestGatewayBuilder`]
@@ -18,7 +18,7 @@
 //!   subprocess rule".
 //! - **Backend/echo listeners held** — this struct only owns the gateway's
 //!   own listen ports. Echo servers in `echo_servers.rs` keep their listener.
-//! - **`Drop` kills the child** so a panic in a test cannot leave a zombie
+//! - **`Drop` cleans up the child** so a panic in a test cannot leave a zombie
 //!   process holding the admin or proxy port.
 //! - **Admin JWT** is HS256 with ≥32-char secret (CLAUDE.md `FERRUM_ADMIN_JWT_SECRET`).
 
@@ -31,6 +31,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
+use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
@@ -85,8 +86,8 @@ pub enum GatewayMode {
 
 /// A running gateway subprocess, with helpers for admin/proxy URLs and auth.
 ///
-/// Drop kills the process. Call [`TestGateway::shutdown`] for explicit teardown
-/// if you want to observe clean exit.
+/// Drop cleans up the process. Under coverage it first asks the gateway to exit
+/// normally so profile data can flush, then falls back to a hard kill.
 pub struct TestGateway {
     pub temp_dir: TempDir,
     child: Option<Child>,
@@ -180,16 +181,15 @@ impl TestGateway {
     }
 
     /// Explicit shutdown. Safe to call multiple times; subsequent calls are
-    /// no-ops. Drop also kills the child if this was not called.
+    /// no-ops. Drop also cleans up the child if this was not called.
     pub fn shutdown(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            shutdown_gateway_child(&mut child);
         }
     }
 
     /// Return the `Child` handle without dropping it (e.g. to send a signal).
-    /// After this call, `Drop` will no longer kill the process — the caller
+    /// After this call, `Drop` will no longer clean up the process — the caller
     /// is responsible for termination.
     pub fn take_child(&mut self) -> Option<Child> {
         self.child.take()
@@ -247,6 +247,60 @@ impl Drop for TestGateway {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+pub fn shutdown_gateway_child(child: &mut Child) {
+    if coverage_profiles_enabled() {
+        terminate_child_for_coverage(child, Duration::from_secs(15));
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+pub fn configure_coverage_gateway_command(cmd: &mut Command) {
+    if coverage_profiles_enabled() {
+        // Keep SIGTERM teardown inside the coverage helper's grace period; the
+        // gateway still runs its fixed cleanup step before LLVM profiles flush.
+        cmd.env("FERRUM_SHUTDOWN_DRAIN_SECONDS", "0");
+    }
+}
+
+fn coverage_profiles_enabled() -> bool {
+    std::env::var_os("LLVM_PROFILE_FILE").is_some()
+}
+
+fn terminate_child_for_coverage(child: &mut Child, timeout: Duration) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        // Coverage profiles are written on normal process exit. SIGTERM lets
+        // the gateway's shutdown handler flush coverage data; kill remains the
+        // fallback so failed tests do not leak subprocesses.
+        let _ = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Fluent builder for [`TestGateway`].
@@ -757,6 +811,7 @@ const SCRUB_DEFAULTS: &[&str] = &[
     "FERRUM_ADMIN_JWT_SECRET",
     "FERRUM_ADMIN_JWT_ISSUER",
     "FERRUM_CP_DP_GRPC_JWT_SECRET",
+    "FERRUM_SHUTDOWN_DRAIN_SECONDS",
 ];
 
 /// Build the subprocess env map from the builder's mode + tuning knobs.
@@ -779,6 +834,9 @@ async fn build_env(
     // Tests don't need the 5s warmup stall; pool warmup failures are
     // non-fatal but noisy in test logs.
     env.insert("FERRUM_POOL_WARMUP_ENABLED".into(), "false".into());
+    if coverage_profiles_enabled() {
+        env.insert("FERRUM_SHUTDOWN_DRAIN_SECONDS".into(), "0".into());
+    }
     env.insert(
         "FERRUM_BASIC_AUTH_HMAC_SECRET".into(),
         b.basic_auth_hmac_secret.clone(),
@@ -1027,6 +1085,8 @@ fn preserve_base_env(cmd: &mut Command) {
         "LD_LIBRARY_PATH",
         "DYLD_LIBRARY_PATH",
         "DYLD_FALLBACK_LIBRARY_PATH",
+        "LLVM_PROFILE_FILE",
+        "LLVM_PROFILE_MERGER_POOL_SIZE",
     ] {
         if let Ok(value) = std::env::var(key) {
             cmd.env(key, value);
@@ -1039,13 +1099,30 @@ fn preserve_base_env(cmd: &mut Command) {
     }
 }
 
+pub fn explicit_test_binary() -> Option<PathBuf> {
+    for key in ["FERRUM_EDGE_TEST_BIN", "CARGO_BIN_EXE_ferrum-edge"] {
+        if let Some(path) = std::env::var_os(key).map(PathBuf::from)
+            && path.exists()
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Locate the built `ferrum-edge` binary. Preference order:
-/// 1. `target/release/ferrum-edge` if `prefer_release` (load tests).
-/// 2. `target/debug/ferrum-edge` (normal).
-/// 3. `target/release/ferrum-edge` as a fallback.
+/// 1. `FERRUM_EDGE_TEST_BIN`, when an outer harness wants an explicit binary.
+/// 2. `CARGO_BIN_EXE_ferrum-edge`, when Cargo built an instrumented binary.
+/// 3. `target/release/ferrum-edge` if `prefer_release` (load tests).
+/// 4. `target/debug/ferrum-edge` (normal).
+/// 5. `target/release/ferrum-edge` as a fallback.
 fn locate_binary(
     prefer_release: bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(path) = explicit_test_binary() {
+        return Ok(path);
+    }
+
     let debug = PathBuf::from("./target/debug/ferrum-edge");
     let release = PathBuf::from("./target/release/ferrum-edge");
     if prefer_release && release.exists() {
@@ -1081,6 +1158,10 @@ fn locate_binary(
 pub fn ensure_gateway_built() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
     let result = RESULT.get_or_init(|| -> Result<(), String> {
+        if explicit_test_binary().is_some() {
+            return Ok(());
+        }
+
         if std::env::var_os("FERRUM_SKIP_GATEWAY_BUILD").is_some() {
             let debug = PathBuf::from("./target/debug/ferrum-edge");
             let release = PathBuf::from("./target/release/ferrum-edge");

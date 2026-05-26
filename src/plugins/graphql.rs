@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
+use super::utils::body_transform::is_json_content_type;
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
     RateLimitWindowSpec,
@@ -536,6 +537,28 @@ fn is_graphql_name_continue(b: u8) -> bool {
     is_graphql_name_start(b) || b.is_ascii_digit()
 }
 
+fn is_graphql_json_content_type(content_type: &str) -> bool {
+    is_json_content_type(content_type) || ascii_contains_ignore_case(content_type, "json")
+}
+
+fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    if nb.len() > hb.len() {
+        return false;
+    }
+
+    hb.windows(nb.len()).any(|window| {
+        window
+            .iter()
+            .zip(nb.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
 #[async_trait]
 impl Plugin for GraphqlPlugin {
     fn name(&self) -> &str {
@@ -568,7 +591,7 @@ impl Plugin for GraphqlPlugin {
             && ctx
                 .headers
                 .get("content-type")
-                .is_some_and(|ct| is_json_content_type(ct))
+                .is_some_and(|ct| is_graphql_json_content_type(ct))
     }
 
     async fn before_proxy(
@@ -584,7 +607,7 @@ impl Plugin for GraphqlPlugin {
         // Check content type
         if !headers
             .get("content-type")
-            .is_some_and(|ct| is_json_content_type(ct))
+            .is_some_and(|ct| is_graphql_json_content_type(ct))
         {
             return PluginResult::Continue;
         }
@@ -754,13 +777,6 @@ fn json_content_type_header() -> HashMap<String, String> {
     let mut h = HashMap::new();
     h.insert("content-type".to_string(), "application/json".to_string());
     h
-}
-
-fn is_json_content_type(value: &str) -> bool {
-    value
-        .as_bytes()
-        .windows(4)
-        .any(|window| window.eq_ignore_ascii_case(b"json"))
 }
 
 fn graphql_error_body(message: &str) -> String {

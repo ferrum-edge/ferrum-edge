@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::warn;
-use url::Url;
+use url::{Host, Url};
 
 use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
 use super::utils::{BatchConfigDefaults, PluginHttpClient, validate_batch_config};
@@ -33,6 +33,7 @@ use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
     WsDisconnectContext,
 };
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 /// Union type for log entries sent through the batched channel.
 #[derive(Clone, serde::Serialize)]
@@ -169,11 +170,12 @@ impl WsLogging {
                 ));
             }
         }
-        if parsed_url.host_str().is_none() {
+        if !has_non_empty_authority(&endpoint_url) {
             return Err(
                 "ws_logging: 'endpoint_url' must include a hostname or IP address".to_string(),
             );
         }
+        let endpoint_hostname = endpoint_hostname(&parsed_url)?;
 
         // Build TLS connector for wss:// using gateway CA/verify settings.
         let connector = if parsed_url.scheme() == "wss" {
@@ -224,16 +226,40 @@ impl WsLogging {
             schema,
         };
 
-        let endpoint_hostname = parsed_url.host_str().map(|h| h.to_string());
-
         let (sender, receiver) = mpsc::channel(buffer_capacity);
         tokio::spawn(flush_loop(receiver, ws_config));
 
         Ok(Self {
             sender,
-            endpoint_hostname,
+            endpoint_hostname: Some(endpoint_hostname),
         })
     }
+}
+
+fn endpoint_hostname(parsed_url: &Url) -> Result<String, String> {
+    let host = parsed_url.host().ok_or_else(|| {
+        "ws_logging: 'endpoint_url' must include a hostname or IP address".to_string()
+    })?;
+
+    Ok(match host {
+        Host::Domain(hostname) => hostname.to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
+}
+
+fn has_non_empty_authority(endpoint_url: &str) -> bool {
+    let Some((_, after_scheme)) = endpoint_url.split_once(':') else {
+        return false;
+    };
+    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
+        return false;
+    };
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+
+    authority_end > 0
 }
 
 fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> {
@@ -276,13 +302,15 @@ fn build_tls_connector(
     };
 
     if let Some(ca_path) = ca_bundle_path {
-        let ca_pem = std::fs::read(ca_path)
-            .map_err(|e| format!("ws_logging: failed to read CA bundle '{ca_path}': {e}"))?;
-        let mut cursor = std::io::Cursor::new(ca_pem);
+        let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+        let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
+            .map_err(|e| format!("ws_logging: failed to load CA bundle: {e}"))?;
+        let source_id = ca_material.source_id.clone();
+        let mut cursor = std::io::Cursor::new(ca_material.bytes.expose_secret());
         for cert in rustls_pemfile::certs(&mut cursor).flatten() {
-            root_store
-                .add(cert)
-                .map_err(|e| format!("ws_logging: failed to add CA certificate: {e}"))?;
+            root_store.add(cert).map_err(|e| {
+                format!("ws_logging: failed to add CA certificate from {source_id}: {e}")
+            })?;
         }
     }
 

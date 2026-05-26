@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 61 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 66 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -8,7 +8,7 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 
 1. **`on_request_received`** — Called immediately when a request arrives (CORS preflight, IP restriction, rate limiting)
 2. **`authenticate`** — Identifies the consumer (mTLS, JWKS, JWT, API Key, LDAP, Basic Auth, HMAC)
-3. **`authorize`** — Checks consumer permissions (Access Control, consumer-mode rate limiting)
+3. **`authorize`** — Checks consumer permissions and policy decisions (Access Control, OPA, consumer-mode rate limiting)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
 5. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
 6. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
@@ -1216,6 +1216,17 @@ Existing Prometheus scrapes of `/charges` must be updated to send admin JWT
 credentials, for example with `bearer_token_file`, `authorization.credentials_file`,
 or an auth proxy that injects the `Authorization: Bearer <token>` header.
 
+### `api_chargeback_sink`
+
+Exports durable charge events or snapshot deltas to ClickHouse using the same
+pricing blocks as `api_chargeback`. It supports per-event mode for
+transaction-level provenance, snapshot mode for lower ingest volume, an on-disk
+spool for ClickHouse outages, `GET /charges/sink/status`, and Prometheus metrics
+under `/metrics`. See [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md)
+for DDL, configuration, spool sizing, replay, and reconciliation guidance.
+
+**Priority:** 9351
+
 ### `otel_tracing`
 
 W3C Trace Context propagation and OTLP span export. Runs at priority 25 (earliest plugin) to capture accurate request timing.
@@ -1313,14 +1324,131 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers[].role_claim` | String (optional) | Per-provider override for role claim path |
 | `providers[].consumer_identity_claim` | String (optional) | Per-provider override for consumer identity claim |
 | `providers[].consumer_header_claim` | String (optional) | Per-provider override for consumer header claim |
+| `providers[].claim_headers` | Object (optional) | Per-provider claim-to-header mappings; keys are claim paths and values are upstream header names |
+| `providers[].claim_headers_separator` | String (optional) | Separator for array claim header values |
+| `providers[].require_mtls_binding` | Boolean (optional) | Require JWT `cnf.x5t#S256` to match the frontend client certificate SHA-256 thumbprint |
+| `providers[].require_dpop` | Boolean (optional) | Require and validate a DPoP proof bound to the access token |
+| `providers[].dpop_clock_skew_secs` | u64 (optional) | DPoP `iat`/`exp` clock skew in seconds (default: `30`, max: `300`) |
+| `providers[].dpop_jti_cache_max_entries` | usize (optional) | Per-provider DPoP replay cache capacity (default: `10000`) |
+| `providers[].dpop_jti_ttl_secs` | u64 (optional) | DPoP `jti` replay cache TTL (default: `300`, must be at least twice clock skew) |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
 | `consumer_identity_claim` | String | Global JWT claim for consumer lookup (default: `"sub"`) |
 | `consumer_header_claim` | String | Global JWT claim for `X-Consumer-Username` header (default: same as `consumer_identity_claim`) |
+| `claim_headers` | Object | Global claim-to-header mappings used when the matched provider has no provider override |
+| `claim_headers_separator` | String | Global separator for array claim header values (default: `","`) |
 | `require_exp` | Boolean | Global default for requiring an `exp` claim (default: `true`) |
 | `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`) |
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
+Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
+
+### `oauth2_introspection`
+
+Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspection endpoints. Supports direct endpoint URLs or OIDC discovery, multi-provider routing, client authentication, bounded token caches, claim-based authorization, consumer lookup, claim header fan-out, and optional token stripping before proxying.
+
+**Priority:** 1050
+
+| Parameter | Type | Description |
+|---|---|---|
+| `providers` | Array | Introspection provider configurations (required) |
+| `providers[].introspection_endpoint` | String | Direct token introspection endpoint URL |
+| `providers[].discovery_url` | String | OIDC discovery URL used to resolve `introspection_endpoint` |
+| `providers[].issuer` | String (optional) | Expected `iss` claim in active introspection responses |
+| `providers[].audiences` | String[] (optional) | Accepted `aud` values; OR-matched |
+| `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
+| `providers[].client_auth.client_id` | String | OAuth client ID for authenticated methods |
+| `providers[].client_auth.client_secret` | String | Client secret for `client_secret_basic` or `client_secret_post` |
+| `providers[].client_auth.private_key_pem` | String | PEM private key for `private_key_jwt` |
+| `providers[].client_auth.private_key_jwt_alg` | String | `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA` |
+| `providers[].client_auth.private_key_jwt_kid` | String (optional) | Optional `kid` for private key JWT assertions |
+| `providers[].from_headers` | Array (optional) | Header token locations, each `{ "name": "...", "prefix": "..." }` |
+| `providers[].from_params` | String[] (optional) | Query parameter token locations |
+| `providers[].forward_original_token` | Boolean | Forward the original token-bearing header/query param (default `true`) |
+| `providers[].positive_cache_ttl_secs` | u64 | Active-token cache TTL cap (default `60`) |
+| `providers[].negative_cache_ttl_secs` | u64 | Inactive-token cache TTL (default `10`) |
+| `providers[].max_cache_entries` | usize | Bounded per-provider token cache capacity (default `10000`) |
+| `providers[].request_timeout_ms` | u64 | Introspection request timeout (default `5000`) |
+| `providers[].required_scopes` | String[] (optional) | Scopes that must all be present |
+| `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
+| `providers[].claim_headers` | Object (optional) | Claim-to-header mappings; keys are claim paths and values are upstream header names |
+| `scope_claim` | String | Global scope claim path (default: `"scope"`) |
+| `role_claim` | String | Global role claim path (default: `"roles"`) |
+| `consumer_identity_claim` | String | Global claim used for consumer lookup (default: `"username"`) |
+| `consumer_header_claim` | String | Global claim used for `X-Consumer-Username` when no consumer maps |
+
+`client_auth.method: "none"` is accepted only for localhost or loopback endpoints. Discovery-provided introspection endpoints must stay on the discovery host. Claim header mappings reject reserved headers.
+
+```yaml
+plugin_name: oauth2_introspection
+config:
+  providers:
+    - introspection_endpoint: "https://idp.example.com/oauth2/introspect"
+      issuer: "https://idp.example.com/"
+      audiences: ["api://edge"]
+      client_auth:
+        method: client_secret_basic
+        client_id: ferrum-edge
+        client_secret: "${INTROSPECTION_CLIENT_SECRET}"
+      required_scopes: ["orders:read"]
+      claim_headers:
+        sub: X-Authenticated-Subject
+```
+
+### `oidc_relying_party`
+
+Runs a browser-oriented OpenID Connect relying party flow with authorization code + PKCE, encrypted gateway sessions, ID token validation through provider JWKS, optional UserInfo merge, scope/role checks, claim header fan-out, and RP-initiated logout.
+
+**Priority:** 1075
+
+| Parameter | Type | Description |
+|---|---|---|
+| `providers` | Array | Exactly one OIDC provider configuration |
+| `providers[].issuer` | String | Expected ID token issuer |
+| `providers[].discovery_url` | String | OIDC discovery URL |
+| `providers[].authorization_endpoint` | String | Explicit authorization endpoint when discovery is not used |
+| `providers[].token_endpoint` | String | Explicit token endpoint when discovery is not used |
+| `providers[].jwks_uri` | String | Explicit JWKS URI when discovery is not used |
+| `providers[].userinfo_endpoint` | String (optional) | UserInfo endpoint used to enrich session claims |
+| `providers[].client_id` | String | OIDC client ID |
+| `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
+| `providers[].redirect_uri` | String | Absolute callback URI registered with the provider |
+| `providers[].callback_path` | String | Callback path Ferrum handles (default: path from `redirect_uri`) |
+| `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`) |
+| `providers[].scopes` | String[] | OIDC scopes; must include `openid` |
+| `providers[].audiences` | String[] | Accepted ID token audiences |
+| `providers[].required_scopes` | String[] (optional) | Scopes that must all be present in session claims |
+| `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
+| `providers[].claim_headers` | Object (optional) | Session claim-to-header mappings |
+| `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies |
+| `session.encryption_secret_previous` | String (optional) | Previous secret accepted for rotation |
+| `session.store` | String | Session backend; only `cookie` is implemented |
+| `session.cookie_name` | String | Session cookie name (default: `ferrum_session`) |
+| `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`) |
+| `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`) |
+| `session.max_cookie_bytes` | u64 | Maximum sealed cookie size (default: `8000`) |
+| `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
+| `behavior.trusted_redirect_hosts` | String[] | Hosts allowed for post-login redirect parameters |
+
+```yaml
+plugin_name: oidc_relying_party
+config:
+  providers:
+    - issuer: "https://idp.example.com/"
+      discovery_url: "https://idp.example.com/.well-known/openid-configuration"
+      client_id: ferrum-edge
+      redirect_uri: "https://edge.example.com/oidc/callback"
+      client_auth:
+        method: client_secret_basic
+        client_secret: "${OIDC_CLIENT_SECRET}"
+      audiences: ["ferrum-edge"]
+      claim_headers:
+        email: X-Authenticated-Email
+  session:
+    encryption_secret: "${OIDC_SESSION_SECRET_32_BYTES_MIN}"
+  behavior:
+    post_login_default_path: "/"
+```
 
 ### `jwt_auth`
 
@@ -1332,6 +1460,12 @@ Authenticates requests using HS256 JWT Bearer tokens matched against consumer cr
 |---|---|---|---|
 | `token_lookup` | String | `header:Authorization` | Where to find the token (`header:<name>` or `query:<name>`) |
 | `consumer_claim_field` | String | `sub` | JWT claim identifying the consumer |
+| `expected_issuer` | String | *(none)* | Required `iss` value; mutually exclusive with `expected_issuers` |
+| `expected_issuers` | String[] | `[]` | Accepted `iss` values |
+| `audiences` | String[] | `[]` | Accepted `aud` values; audience validation is disabled when empty |
+| `require_exp` | Boolean | `true` | Require an `exp` claim; expiration is always validated when present |
+| `require_nbf` | Boolean | `true` | Require an `nbf` claim and validate it |
+| `leeway_secs` | u64 | `0` | Clock leeway for time-based JWT claims; max `300` |
 
 **Consumer credential** (`jwt`) — array. Secrets must be at least 32 characters:
 ```yaml
@@ -1685,6 +1819,68 @@ config:
 plugin_name: access_control
 config:
   allow_authenticated_identity: true
+```
+
+### `opa`
+
+Delegates HTTP request authorization to [Open Policy Agent](https://www.openpolicyagent.org/) by POSTing an `input` document to OPA's Data API during the `authorize` phase. It runs after local authentication, `access_control`, and `mesh_authz`, so OPA policies can use the authenticated Consumer or external identity without re-validating credentials.
+
+**Priority:** 2080
+**Supported protocols:** HTTP only
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. Do not include URL credentials; use `headers` for OPA auth. |
+| `policy_path` | String | **required** | OPA data path appended under `/v1/data/`, for example `ferrum/authz/allow`. Must not start with `/`, contain percent-encoding, or contain empty, `.`, or `..` path segments. |
+| `headers` | Object | `{}` | Static headers sent to OPA on every decision request. `content-type` is managed by the plugin and cannot be configured. |
+| `timeout_ms` | Integer | `1000` | Per-decision request timeout. Values above `30000` are clamped. |
+| `fail_open` | Boolean | `false` | Continue the request when OPA is unavailable, times out, returns non-2xx, or returns malformed JSON. |
+| `fail_closed` | Boolean | `true` | Inverse of `fail_open`, accepted for explicit fail-closed configs. Do not set both fields. |
+| `deny_status` | Integer | `403` | HTTP 4xx/5xx status returned when OPA returns a policy denial. |
+| `deny_body` | String | `{"error":"forbidden by policy"}` | Response body returned on policy denial. |
+| `deny_headers` | Object | `{}` | Headers added to the policy-denial response. Names and values are validated at config load. |
+| `fail_closed_status` | Integer | `503` | HTTP 4xx/5xx status returned when fail-closed handles OPA unavailability, timeouts, non-2xx responses, or malformed JSON. |
+| `fail_closed_body` | String | `{"error":"authorization service unavailable"}` | Response body returned on fail-closed OPA errors. |
+| `fail_closed_headers` | Object | `{}` | Headers added to fail-closed OPA error responses. Names and values are validated at config load. |
+| `decision_pointer` | String[] | `["result"]` | Path inside the OPA JSON response to evaluate. Use `["result","allow"]` for `{ "result": { "allow": true } }`. |
+| `include_method` | Boolean | `true` | Include `input.method`. |
+| `include_path` | Boolean | `true` | Include `input.path`. |
+| `include_query` | Boolean | `true` | Include decoded query parameters as `input.query`. |
+| `include_headers` | Boolean | `true` | Include request headers as `input.headers` after redaction. |
+| `include_body` | Boolean | `false` | Buffer and forward the request body. UTF-8 bodies use `input.body`; non-UTF-8 raw bytes use `input.body_base64`. |
+| `include_consumer` | Boolean | `true` | Include mapped Consumer data or external authenticated identity. |
+| `include_client_ip` | Boolean | `true` | Include `input.client_ip`. |
+| `include_service` | Boolean | `true` | Include matched proxy/service data. |
+| `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; built-in sensitive headers are always redacted. |
+
+Allow decisions:
+
+- `true` at `decision_pointer` continues the request.
+- An object with `allow: true` at `decision_pointer` also continues the request.
+- Any other value denies with the configured policy-denial response.
+
+Built-in request-header redaction always removes `authorization`, `proxy-authorization`, `cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, and `x-forwarded-authorization` before sending `input.headers` to OPA.
+
+The outbound OPA call uses the shared `PluginHttpClient`, so it shares connection pooling, DNS cache warmup, slow-call telemetry, and global outbound TLS settings such as `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides do not apply; see [configuration.md#tls--mtls](configuration.md#tls--mtls).
+
+```yaml
+plugin_name: opa
+config:
+  opa_host: "http://opa.opa-system.svc.cluster.local:8181"
+  policy_path: "ferrum/authz/allow"
+  timeout_ms: 500
+  fail_open: false
+  decision_pointer: ["result", "allow"]
+  headers:
+    Authorization: "Bearer opa-client-token"
+  deny_status: 403
+  deny_body: '{"error":"blocked by policy"}'
+  deny_headers:
+    content-type: application/json
+  fail_closed_status: 503
+  fail_closed_body: '{"error":"authorization service unavailable"}'
+  fail_closed_headers:
+    retry-after: "2"
 ```
 
 ### `mesh_outbound_registry`
@@ -2586,6 +2782,33 @@ Request-side validation only buffers matching request bodies: methods that can c
 **Scope**: Protobuf validation supports unary RPCs only (single frame per message). Streaming RPCs with multiple concatenated frames are not validated — the length mismatch check will reject multi-frame bodies.
 
 **Supported JSON Schema `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
+
+### `openapi_validator`
+
+Validates request and response bodies against operation schemas generated from an attached OpenAPI or Swagger document. JSON, XML, form-urlencoded, multipart, text, and binary media types are supported. This plugin is normally auto-injected by `POST /api-specs` or `PUT /api-specs/{id}` when the document includes `x-ferrum-validate`.
+
+**Priority:** 2960
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `enforcement_mode` | string | `block` | `block`, `log_only`, or `disabled` |
+| `validate_request` | bool | `true` | Validate request bodies for operations with request schemas |
+| `validate_response` | bool | `true` | Validate response bodies for operations with response schemas |
+| `request_content_types` | String[] | common JSON/XML/form/text/binary types | Request media types to validate |
+| `response_content_types` | String[] | common JSON/XML/form/text/binary types | Response media types to validate |
+| `fail_on_unknown_operation` | bool | `true` | Reject requests that do not match any generated operation |
+| `fail_on_missing_response_schema` | bool | `false` | Reject responses with no matching status/content-type schema |
+| `max_body_bytes` | integer | `1048576` | Maximum raw or decompressed body size validated |
+| `schema_draft` | string | generated | `auto`, `draft7`, or `draft2020-12` |
+| `operations` | array | required | Generated operation schema table |
+| `bypass.paths` | String[] | `[]` | Regex paths that skip validation |
+| `bypass.methods` | String[] | `[]` | HTTP methods that skip validation |
+| `bypass.consumers` | String[] | `[]` | Consumer identities that skip validation |
+| `bypass.header_present` | object | `{}` | Header presence/value checks that skip validation |
+
+`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses, skips SSE responses, supports gzip and brotli decompression, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata, supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
+
+See [openapi_validator.md](openapi_validator.md) for the full generated config shape, `x-ferrum-validate` options, and emergency override behavior.
 
 ### `request_size_limiting`
 

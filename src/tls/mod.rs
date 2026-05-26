@@ -11,11 +11,19 @@
 //! from being MITMed via any public CA.
 //!
 //! **TLS policy**: Optional hardening via `FERRUM_TLS_CIPHER_SUITES`,
-//! `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_CURVES`. Applied to
-//! both inbound listeners and outbound backend connections.
+//! `FERRUM_TLS_MIN_VERSION`, and `FERRUM_TLS_KEY_EXCHANGE_GROUPS`
+//! (`FERRUM_TLS_CURVES` alias). Applied to both inbound listeners and
+//! outbound backend connections.
 
+pub mod acme;
 pub mod backend;
+pub mod events;
 pub mod frontend_reload;
+pub mod inventory;
+pub mod managed;
+#[cfg(feature = "pkcs11")]
+pub mod pkcs11;
+pub mod source;
 // `spiffe` exposes Phase A scaffolding for Phase C — every public item is
 // dead from the binary's perspective until a later phase wires it in.
 #[allow(dead_code)]
@@ -36,8 +44,7 @@ use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls_pemfile::{certs, private_key};
 use std::fmt;
-use std::fs::File;
-use std::io::{self, BufReader};
+use std::io::{self, Cursor};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,9 +57,17 @@ use rustls::pki_types::CertificateRevocationListDer;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::config::EnvConfig;
+use crate::tls::source::{
+    CertSource, CertSourceUri, MaterialKind, SourceScheme, load_material_blocking,
+};
 
 /// Loaded CRL data shared across all TLS surfaces. Empty when no CRL file is configured.
 pub type CrlList = Arc<Vec<CertificateRevocationListDer<'static>>>;
+pub type SharedCrlList = Arc<arc_swap::ArcSwap<Vec<CertificateRevocationListDer<'static>>>>;
+
+pub fn shared_crl_list(crls: CrlList) -> SharedCrlList {
+    Arc::new(arc_swap::ArcSwap::new(crls))
+}
 
 /// Accept a frontend TLS stream, optionally bounding the handshake duration.
 ///
@@ -112,29 +127,41 @@ where
 /// The file may contain multiple `-----BEGIN X509 CRL-----` blocks.
 /// Returns an empty Vec if `path` is `None`.
 pub fn load_crls(path: Option<&str>) -> Result<CrlList, anyhow::Error> {
-    let Some(crl_path) = path else {
+    let Some(crl_source_raw) = path else {
         return Ok(Arc::new(Vec::new()));
     };
 
-    let file = File::open(crl_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open CRL file '{}': {}", crl_path, e))?;
-    let mut reader = BufReader::new(file);
+    let crl_source = CertSource::parse(crl_source_raw, MaterialKind::Crl);
+    let material = load_material_blocking(&crl_source, MaterialKind::Crl).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load CRL source '{}': {}",
+            crl_source.source_id(),
+            e
+        )
+    })?;
 
-    let crls: Vec<CertificateRevocationListDer<'static>> = rustls_pemfile::crls(&mut reader)
-        .filter_map(|r| r.ok())
-        .collect();
+    let crls: Vec<CertificateRevocationListDer<'static>> =
+        rustls_pemfile::crls(&mut Cursor::new(material.bytes.expose_secret()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse CRL PEM blocks from '{}': {}",
+                    material.source_id,
+                    e
+                )
+            })?;
 
     if crls.is_empty() {
         return Err(anyhow::anyhow!(
             "No valid CRL entries found in '{}'. Expected PEM blocks with '-----BEGIN X509 CRL-----'",
-            crl_path
+            material.source_id
         ));
     }
 
     info!(
         "Loaded {} CRL(s) from {} for certificate revocation checking",
         crls.len(),
-        crl_path
+        material.source_id
     );
     Ok(Arc::new(crls))
 }
@@ -371,21 +398,140 @@ pub fn load_tls_config_with_client_auth(
     cert_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
-    // Check certificate expiration before loading
-    check_cert_expiry(cert_path, "server TLS cert", cert_expiry_warning_days)?;
-    if let Some(ca_path) = client_ca_bundle_path {
-        check_cert_expiry(ca_path, "client CA bundle", cert_expiry_warning_days)?;
+    load_tls_config_with_client_auth_and_ocsp(
+        cert_path,
+        key_path,
+        client_ca_bundle_path,
+        None,
+        no_verify,
+        tls_policy,
+        cert_expiry_warning_days,
+        crls,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn load_tls_config_with_client_auth_and_ocsp(
+    cert_path: &str,
+    key_path: &str,
+    client_ca_bundle_path: Option<&str>,
+    ocsp_response_source: Option<&str>,
+    no_verify: bool,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<Arc<ServerConfig>, anyhow::Error> {
+    let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
+    let key_source = CertSource::parse(key_path, MaterialKind::Key);
+    let client_ca_source =
+        client_ca_bundle_path.map(|source| CertSource::parse(source, MaterialKind::CaBundle));
+    let ocsp_source =
+        ocsp_response_source.map(|source| CertSource::parse(source, MaterialKind::Ocsp));
+
+    load_tls_config_with_client_auth_from_sources_and_ocsp(
+        &cert_source,
+        &key_source,
+        client_ca_source.as_ref(),
+        ocsp_source.as_ref(),
+        no_verify,
+        tls_policy,
+        cert_expiry_warning_days,
+        crls,
+    )
+}
+
+/// Load TLS server configuration from polymorphic cert/key sources.
+///
+/// Existing path strings are parsed as [`CertSource::Path`]. Inline PEM is
+/// accepted without writing temporary files, and `file://` URIs share the same
+/// file loader. Other typed URI schemes parse successfully but are rejected here
+/// until their provider loaders are wired in later phases.
+#[allow(dead_code)]
+pub fn load_tls_config_with_client_auth_from_sources(
+    cert_source: &CertSource,
+    key_source: &CertSource,
+    client_ca_bundle_source: Option<&CertSource>,
+    no_verify: bool,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<Arc<ServerConfig>, anyhow::Error> {
+    load_tls_config_with_client_auth_from_sources_and_ocsp(
+        cert_source,
+        key_source,
+        client_ca_bundle_source,
+        None,
+        no_verify,
+        tls_policy,
+        cert_expiry_warning_days,
+        crls,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
+    cert_source: &CertSource,
+    key_source: &CertSource,
+    client_ca_bundle_source: Option<&CertSource>,
+    ocsp_response_source: Option<&CertSource>,
+    no_verify: bool,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<Arc<ServerConfig>, anyhow::Error> {
+    let cert_material = load_material_blocking(cert_source, MaterialKind::Cert)?;
+
+    check_cert_expiry_from_pem_bytes(
+        cert_material.bytes.expose_secret(),
+        "server TLS cert",
+        &cert_material.source_id,
+        cert_expiry_warning_days,
+    )?;
+
+    let cert_chain: Vec<_> = certs(&mut Cursor::new(cert_material.bytes.expose_secret()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "server TLS cert: failed to parse PEM certificates from '{}': {}",
+                cert_material.source_id,
+                e
+            )
+        })?;
+    if cert_chain.is_empty() {
+        return Err(anyhow::anyhow!(
+            "server TLS cert: no PEM certificates found in '{}'",
+            cert_material.source_id
+        ));
     }
 
-    let cert_file = File::open(cert_path)?;
-    let key_file = File::open(key_path)?;
+    let ocsp_response = match ocsp_response_source {
+        Some(source) => {
+            let material = load_material_blocking(source, MaterialKind::Ocsp)?;
+            let bytes = material.bytes.expose_secret().to_vec();
+            if bytes.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "OCSP response source '{}' was empty",
+                    material.source_id
+                ));
+            }
+            info!(
+                ocsp_source = %material.source_id,
+                "Loaded stapled OCSP response for server TLS config"
+            );
+            bytes
+        }
+        None => Vec::new(),
+    };
 
-    let cert_chain: Vec<_> = certs(&mut BufReader::new(cert_file))
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let key = private_key(&mut BufReader::new(key_file))?
-        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
+    let ServerCertResolverLoad {
+        resolver: cert_resolver,
+        key_source_id,
+    } = load_server_cert_resolver(
+        cert_chain,
+        key_source,
+        ocsp_response,
+        tls_policy.crypto_provider.as_ref(),
+    )?;
 
     let builder = ServerConfig::builder_with_provider(tls_policy.crypto_provider.clone())
         .with_protocol_versions(&tls_policy.protocol_versions)
@@ -394,19 +540,31 @@ pub fn load_tls_config_with_client_auth(
     let mut config = if no_verify {
         // No verification mode (for testing only)
         warn!(
-            "TLS configuration loaded with certificate verification DISABLED (testing mode) from cert: {}, key: {}",
-            cert_path, key_path
+            "TLS configuration loaded with certificate verification DISABLED (testing mode) from cert source: {}, key source: {}",
+            cert_material.source_id, key_source_id
         );
 
         builder
             .with_no_client_auth()
-            .with_single_cert(cert_chain, key)?
-    } else if let Some(ca_bundle_path) = client_ca_bundle_path {
+            .with_cert_resolver(cert_resolver)
+    } else if let Some(ca_bundle_source) = client_ca_bundle_source {
         // Load client CA bundle for client certificate verification
-        let ca_file = File::open(ca_bundle_path)?;
-        let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
-            .filter_map(|r| r.ok())
-            .collect();
+        let ca_material = load_material_blocking(ca_bundle_source, MaterialKind::CaBundle)?;
+        check_cert_expiry_from_pem_bytes(
+            ca_material.bytes.expose_secret(),
+            "client CA bundle",
+            &ca_material.source_id,
+            cert_expiry_warning_days,
+        )?;
+        let ca_certs: Vec<_> = certs(&mut Cursor::new(ca_material.bytes.expose_secret()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "client CA bundle: failed to parse PEM certificates from '{}': {}",
+                    ca_material.source_id,
+                    e
+                )
+            })?;
 
         let mut client_auth_roots = rustls::RootCertStore::empty();
         let (added, ignored) = client_auth_roots.add_parsable_certificates(ca_certs);
@@ -414,13 +572,13 @@ pub fn load_tls_config_with_client_auth(
         if added == 0 {
             return Err(anyhow::anyhow!(
                 "No valid client CA certificates found in {}",
-                ca_bundle_path
+                ca_material.source_id
             ));
         }
 
         info!(
-            "TLS configuration loaded with client certificate verification from cert: {}, key: {}, client CA: {} (added: {}, ignored: {})",
-            cert_path, key_path, ca_bundle_path, added, ignored
+            "TLS configuration loaded with client certificate verification from cert source: {}, key source: {}, client CA source: {} (added: {}, ignored: {})",
+            cert_material.source_id, key_source_id, ca_material.source_id, added, ignored
         );
 
         let mut verifier_builder =
@@ -441,24 +599,30 @@ pub fn load_tls_config_with_client_auth(
 
         builder
             .with_client_cert_verifier(client_cert_verifier)
-            .with_single_cert(cert_chain, key)?
+            .with_cert_resolver(cert_resolver)
     } else {
         // No client certificate verification
         info!(
-            "TLS configuration loaded without client certificate verification from cert: {}, key: {}",
-            cert_path, key_path
+            "TLS configuration loaded without client certificate verification from cert source: {}, key source: {}",
+            cert_material.source_id, key_source_id
         );
 
         builder
             .with_no_client_auth()
-            .with_single_cert(cert_chain, key)?
+            .with_cert_resolver(cert_resolver)
     };
 
     // Prefer server cipher order for TLS 1.2 negotiation
     config.ignore_client_order = tls_policy.prefer_server_cipher_order;
 
-    // Advertise HTTP/2 and HTTP/1.1 via ALPN so clients can negotiate HTTP/2 over TLS
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // Advertise HTTP/2 and HTTP/1.1 via ALPN so clients can negotiate HTTP/2
+    // over TLS. `acme-tls/1` is last so normal clients that also offer h2/h1
+    // do not accidentally negotiate the ACME validation protocol.
+    config.alpn_protocols = vec![
+        b"h2".to_vec(),
+        b"http/1.1".to_vec(),
+        crate::tls::acme::TLS_ALPN01_PROTOCOL.to_vec(),
+    ];
 
     // Enable TLS session resumption for reduced handshake latency on reconnections.
     // Stateless tickets (TLS 1.3): server encrypts session state into the ticket,
@@ -486,6 +650,87 @@ pub fn load_tls_config_with_client_auth(
     config.max_early_data_size = 0;
 
     Ok(Arc::new(config))
+}
+
+struct ServerCertResolverLoad {
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+    key_source_id: String,
+}
+
+fn load_server_cert_resolver(
+    cert_chain: Vec<CertificateDer<'static>>,
+    key_source: &CertSource,
+    ocsp_response: Vec<u8>,
+    crypto_provider: &CryptoProvider,
+) -> Result<ServerCertResolverLoad, anyhow::Error> {
+    if let Some(uri) = pkcs11_key_uri(key_source) {
+        let resolver = acme_tls_alpn_pkcs11_cert_resolver(cert_chain, uri, ocsp_response)?;
+        return Ok(ServerCertResolverLoad {
+            resolver,
+            key_source_id: uri.source_id(),
+        });
+    }
+
+    let key_material = load_material_blocking(key_source, MaterialKind::Key)?;
+    let key = private_key(&mut Cursor::new(key_material.bytes.expose_secret()))?
+        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_material.source_id))?;
+    let resolver = acme_tls_alpn_cert_resolver(cert_chain, key, ocsp_response, crypto_provider)?;
+    Ok(ServerCertResolverLoad {
+        resolver,
+        key_source_id: key_material.source_id,
+    })
+}
+
+fn pkcs11_key_uri(source: &CertSource) -> Option<&CertSourceUri> {
+    match source {
+        CertSource::Uri(uri) if uri.scheme == SourceScheme::Pkcs11 => Some(uri),
+        _ => None,
+    }
+}
+
+fn acme_tls_alpn_cert_resolver(
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    ocsp_response: Vec<u8>,
+    crypto_provider: &CryptoProvider,
+) -> Result<Arc<dyn rustls::server::ResolvesServerCert>, anyhow::Error> {
+    let mut certified_key = rustls::sign::CertifiedKey::from_der(cert_chain, key, crypto_provider)
+        .map_err(|error| {
+            anyhow::anyhow!("server TLS cert and key do not form a valid pair: {error}")
+        })?;
+    if !ocsp_response.is_empty() {
+        certified_key.ocsp = Some(ocsp_response);
+    }
+    Ok(Arc::new(crate::tls::acme::AcmeTlsAlpnResolver::new(
+        Arc::new(certified_key),
+    )))
+}
+
+#[cfg(feature = "pkcs11")]
+fn acme_tls_alpn_pkcs11_cert_resolver(
+    cert_chain: Vec<CertificateDer<'static>>,
+    uri: &CertSourceUri,
+    ocsp_response: Vec<u8>,
+) -> Result<Arc<dyn rustls::server::ResolvesServerCert>, anyhow::Error> {
+    let mut certified_key = crate::tls::pkcs11::certified_key_from_uri(cert_chain, uri)?;
+    if !ocsp_response.is_empty() {
+        certified_key.ocsp = Some(ocsp_response);
+    }
+    Ok(Arc::new(crate::tls::acme::AcmeTlsAlpnResolver::new(
+        Arc::new(certified_key),
+    )))
+}
+
+#[cfg(not(feature = "pkcs11"))]
+fn acme_tls_alpn_pkcs11_cert_resolver(
+    _cert_chain: Vec<CertificateDer<'static>>,
+    uri: &CertSourceUri,
+    _ocsp_response: Vec<u8>,
+) -> Result<Arc<dyn rustls::server::ResolvesServerCert>, anyhow::Error> {
+    Err(anyhow::anyhow!(
+        "PKCS#11 TLS key source '{}' requires building ferrum-edge with the 'pkcs11' cargo feature",
+        uri.source_id()
+    ))
 }
 
 /// Client authentication policy for mesh frontend TLS configs.
@@ -563,25 +808,33 @@ pub fn load_mesh_server_identity(
 ) -> Result<Arc<MeshServerIdentity>, anyhow::Error> {
     check_cert_expiry(cert_path, "mesh server TLS cert", cert_expiry_warning_days)?;
 
-    let cert_file = File::open(cert_path)?;
-    let key_file = File::open(key_path)?;
+    let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
+    let key_source = CertSource::parse(key_path, MaterialKind::Key);
+    let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert)?;
+    let key_material = load_material_blocking(&key_source, MaterialKind::Key)?;
 
-    let cert_chain: Vec<_> = certs(&mut BufReader::new(cert_file))
-        .filter_map(|r| r.ok())
-        .collect();
+    let cert_chain: Vec<_> = certs(&mut Cursor::new(cert_material.bytes.expose_secret()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "mesh server TLS cert: failed to parse PEM certificates from '{}': {}",
+                cert_material.source_id,
+                e
+            )
+        })?;
     if cert_chain.is_empty() {
         return Err(anyhow::anyhow!(
             "No certificates found in mesh server TLS cert {}",
-            cert_path
+            cert_material.source_id
         ));
     }
 
-    let key = private_key(&mut BufReader::new(key_file))?
-        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
+    let key = private_key(&mut Cursor::new(key_material.bytes.expose_secret()))?
+        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_material.source_id))?;
 
     Ok(Arc::new(MeshServerIdentity {
-        cert_path: cert_path.to_string(),
-        key_path: key_path.to_string(),
+        cert_path: cert_material.source_id,
+        key_path: key_material.source_id,
         cert_chain,
         key,
     }))
@@ -597,20 +850,24 @@ pub fn load_mesh_tls_config_with_identity(
     cert_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
-    let client_ca_bundle_pem = client_ca_bundle_path
+    let client_ca_bundle_material = client_ca_bundle_path
         .map(|path| {
-            std::fs::read(path).map_err(|e| {
-                anyhow::anyhow!("mesh client CA bundle: failed to read '{}': {}", path, e)
-            })
+            let source = CertSource::parse(path, MaterialKind::CaBundle);
+            load_material_blocking(&source, MaterialKind::CaBundle)
+                .map_err(|e| anyhow::anyhow!("mesh client CA bundle: {}", e))
         })
         .transpose()?;
+    let client_ca_bundle_ref =
+        client_ca_bundle_material
+            .as_ref()
+            .map(|material| ClientCaBundleRef {
+                path: material.source_id.as_str(),
+                pem: material.bytes.expose_secret(),
+            });
 
     load_mesh_tls_config_with_identity_and_client_ca_bytes(
         identity,
-        match (client_ca_bundle_path, client_ca_bundle_pem.as_deref()) {
-            (Some(path), Some(pem)) => Some(ClientCaBundleRef { path, pem }),
-            _ => None,
-        },
+        client_ca_bundle_ref,
         client_auth,
         tls_policy,
         cert_expiry_warning_days,
@@ -915,10 +1172,17 @@ pub fn build_client_cert_verifier(
     ca_bundle_path: &str,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, anyhow::Error> {
-    let ca_file = File::open(ca_bundle_path)?;
-    let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
-        .filter_map(|r| r.ok())
-        .collect();
+    let ca_source = CertSource::parse(ca_bundle_path, MaterialKind::CaBundle);
+    let ca_material = load_material_blocking(&ca_source, MaterialKind::CaBundle)?;
+    let ca_certs: Vec<_> = certs(&mut Cursor::new(ca_material.bytes.expose_secret()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "client CA bundle: failed to parse PEM certificates from '{}': {}",
+                ca_material.source_id,
+                e
+            )
+        })?;
 
     let mut client_auth_roots = rustls::RootCertStore::empty();
     let (added, _ignored) = client_auth_roots.add_parsable_certificates(ca_certs);
@@ -926,7 +1190,7 @@ pub fn build_client_cert_verifier(
     if added == 0 {
         return Err(anyhow::anyhow!(
             "No valid client CA certificates found in {}",
-            ca_bundle_path
+            ca_material.source_id
         ));
     }
 
@@ -956,13 +1220,19 @@ pub fn build_client_cert_verifier(
 /// - `label` is used in log/error messages to identify the cert surface
 ///   (e.g. "frontend TLS cert", "backend_tls_client_cert_path").
 pub fn check_cert_expiry(
-    pem_path: &str,
+    pem_source: &str,
     label: &str,
     warning_days: u64,
 ) -> Result<(), anyhow::Error> {
-    let pem_data = std::fs::read(pem_path)
-        .map_err(|e| anyhow::anyhow!("{}: failed to read '{}': {}", label, pem_path, e))?;
-    check_cert_expiry_from_pem_bytes(&pem_data, label, pem_path, warning_days)
+    let source = CertSource::parse(pem_source, MaterialKind::Cert);
+    let material = load_material_blocking(&source, MaterialKind::Cert)
+        .map_err(|e| anyhow::anyhow!("{}: {}", label, e))?;
+    check_cert_expiry_from_pem_bytes(
+        material.bytes.expose_secret(),
+        label,
+        &material.source_id,
+        warning_days,
+    )
 }
 
 pub(crate) fn check_cert_expiry_from_pem_bytes(
@@ -1054,7 +1324,18 @@ pub fn check_cert_expiry_for_validation(
     field_name: &str,
     warning_days: u64,
 ) -> Result<(), String> {
-    check_cert_expiry(pem_path, field_name, warning_days).map_err(|e| e.to_string())
+    let source = CertSource::parse(pem_path, MaterialKind::Cert);
+    match load_material_blocking(&source, MaterialKind::Cert) {
+        Ok(material) => check_cert_expiry_from_pem_bytes(
+            material.bytes.expose_secret(),
+            field_name,
+            &material.source_id,
+            warning_days,
+        )
+        .map_err(|e| e.to_string()),
+        Err(crate::tls::source::MaterialError::UnsupportedScheme { .. }) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[cfg(test)]

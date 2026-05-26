@@ -240,6 +240,23 @@ async fn test_before_proxy_writes_default_max_tokens_to_metadata() {
 }
 
 #[tokio::test]
+async fn test_before_proxy_does_not_inject_default_for_non_object_json() {
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096})).unwrap();
+
+    let mut ctx = make_post_ctx(&json!(["hello"]));
+    let original_body = ctx.metadata.get("request_body").cloned().unwrap();
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    assert_eq!(
+        ctx.metadata.get("request_body").unwrap(),
+        &original_body,
+        "non-object JSON must remain unchanged"
+    );
+}
+
+#[tokio::test]
 async fn test_before_proxy_clamps_max_output_tokens_in_metadata() {
     let plugin = AiRequestGuard::new(&json!({
         "max_tokens_limit": 500,

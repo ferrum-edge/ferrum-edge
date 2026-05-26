@@ -19,7 +19,10 @@ use std::collections::HashMap;
 use chrono::{Duration, Utc};
 
 use ferrum_edge::config::db_loader::IncrementalResult;
-use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
+    PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
+};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::{IncrementalApplyOutcome, ProxyState};
 
@@ -79,6 +82,70 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn test_consumer(id: &str, username: &str) -> Consumer {
+    Consumer {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: username.to_string(),
+        custom_id: None,
+        credentials: HashMap::new(),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn test_plugin_config(id: &str, enabled: bool) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "stdout_logging".to_string(),
+        config: serde_json::Value::Object(serde_json::Map::new()),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        name: None,
+        targets: vec![UpstreamTarget {
+            host: host.to_string(),
+            port,
+            weight: 100,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        }],
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -190,7 +257,7 @@ fn test_env_config() -> ferrum_edge::config::EnvConfig {
     }
 }
 
-fn empty_proxy_state() -> ProxyState {
+fn proxy_state_with_config(config: GatewayConfig) -> ProxyState {
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: HashMap::new(),
         resolver_addresses: None,
@@ -212,15 +279,13 @@ fn empty_proxy_state() -> ProxyState {
         max_concurrent_refreshes: 64,
         shard_amount: 0,
     });
-    let (state, _health_check_handles) = ProxyState::new(
-        GatewayConfig::default(),
-        dns_cache,
-        test_env_config(),
-        None,
-        None,
-    )
-    .unwrap();
+    let (state, _health_check_handles) =
+        ProxyState::new(config, dns_cache, test_env_config(), None, None).unwrap();
     state
+}
+
+fn empty_proxy_state() -> ProxyState {
+    proxy_state_with_config(GatewayConfig::default())
 }
 
 fn empty_delta_at(poll_timestamp: chrono::DateTime<Utc>) -> IncrementalResult {
@@ -273,6 +338,80 @@ async fn apply_incremental_valid_changes_returns_applied() {
     let cfg = state.config.load();
     assert_eq!(cfg.proxies.len(), 1);
     assert_eq!(cfg.proxies[0].id, "p1");
+}
+
+/// Mixed incremental mutations must replace by ID, append new IDs, and remove
+/// deleted IDs across every runtime config vector without duplicating stale
+/// entries.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_incremental_mixed_resource_mutations_are_atomic() {
+    let initial_config = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/one"), test_proxy("p2", "/two")],
+        consumers: vec![test_consumer("c1", "alice"), test_consumer("c2", "bob")],
+        plugin_configs: vec![
+            test_plugin_config("pc1", true),
+            test_plugin_config("pc2", true),
+        ],
+        upstreams: vec![
+            test_upstream("u1", "old.example.test", 8080),
+            test_upstream("u2", "remove.example.test", 8080),
+        ],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let state = proxy_state_with_config(initial_config);
+
+    let mut p1 = test_proxy("p1", "/one-updated");
+    p1.backend_port = 4001;
+    let p3 = test_proxy("p3", "/three");
+    let mut c1 = test_consumer("c1", "alice-updated");
+    c1.acl_groups = vec!["paid".to_string()];
+    let mut pc1 = test_plugin_config("pc1", false);
+    pc1.priority_override = Some(50);
+    let u1 = test_upstream("u1", "new.example.test", 9090);
+    let poll_timestamp = Utc::now();
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![p1, p3],
+        removed_proxy_ids: vec!["p2".to_string()],
+        added_or_modified_consumers: vec![c1],
+        removed_consumer_ids: vec!["c2".to_string()],
+        added_or_modified_plugin_configs: vec![pc1],
+        removed_plugin_config_ids: vec!["pc2".to_string()],
+        added_or_modified_upstreams: vec![u1],
+        removed_upstream_ids: vec!["u2".to_string()],
+        poll_timestamp,
+    };
+
+    let result = state.apply_incremental(delta).await;
+    assert_eq!(result, IncrementalApplyOutcome::Applied);
+
+    let cfg = state.config.load();
+    assert_eq!(cfg.loaded_at, poll_timestamp);
+    assert_eq!(cfg.proxies.len(), 2);
+    assert!(cfg.proxies.iter().all(|proxy| proxy.id != "p2"));
+    let p1 = cfg
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "p1")
+        .expect("p1 should be modified in place");
+    assert_eq!(p1.listen_path.as_deref(), Some("/one-updated"));
+    assert_eq!(p1.backend_port, 4001);
+    assert!(cfg.proxies.iter().any(|proxy| proxy.id == "p3"));
+
+    assert_eq!(cfg.consumers.len(), 1);
+    assert_eq!(cfg.consumers[0].id, "c1");
+    assert_eq!(cfg.consumers[0].username, "alice-updated");
+    assert_eq!(cfg.consumers[0].acl_groups, vec!["paid".to_string()]);
+
+    assert_eq!(cfg.plugin_configs.len(), 1);
+    assert_eq!(cfg.plugin_configs[0].id, "pc1");
+    assert!(!cfg.plugin_configs[0].enabled);
+    assert_eq!(cfg.plugin_configs[0].priority_override, Some(50));
+
+    assert_eq!(cfg.upstreams.len(), 1);
+    assert_eq!(cfg.upstreams[0].id, "u1");
+    assert_eq!(cfg.upstreams[0].targets[0].host, "new.example.test");
+    assert_eq!(cfg.upstreams[0].targets[0].port, 9090);
 }
 
 /// Two proxies sharing a non-regex `listen_path` violate

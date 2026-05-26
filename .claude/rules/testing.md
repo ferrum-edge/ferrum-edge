@@ -49,6 +49,15 @@ paths:
 - Proxy hot path: `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`
 - Multi-protocol perf: build once with `cargo build --release`, then `bash tests/performance/multi_protocol/run_protocol_test.sh {http1|http1-tls|http2|http3|ws|grpc|tcp|tcp-tls|udp|udp-dtls|all} [--duration N] [--concurrency N] [--skip-build]`
 
+## Coverage
+
+- Coverage is opt-in and not part of the normal local-test loop. Run when investigating untested code paths or after adding tests for a new module.
+- Install: `cargo install cargo-llvm-cov --locked && rustup component add llvm-tools-preview`.
+- Run: `scripts/coverage.sh` (lib + unit + integration). HTML report path is printed at the end.
+- Narrow scope: `scripts/coverage.sh -- <filter>` forwards to `cargo llvm-cov`. Example: `scripts/coverage.sh -- plugins::cors`.
+- Functional and conformance suites are intentionally excluded; they spawn subprocesses or use separate coverage reporters. Line coverage for lib/unit/integration runs in CI through `.github/workflows/coverage.yml`.
+- Coverage outputs (`target/llvm-cov/`, `target/llvm-cov-target/`) are gitignored.
+
 ## Functional Test Rules
 
 - Use `Stdio::null()` for gateway stdout/stderr unless the test reads the pipe. `Stdio::piped()` without reading can deadlock.

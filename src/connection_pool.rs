@@ -15,7 +15,8 @@ use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
     BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
-    append_backend_tls_pool_key_fields, backend_svid_generation_for_client_cert,
+    append_backend_tls_pool_key_fields, append_optional_pool_key_component,
+    append_pool_key_component, backend_svid_generation_for_client_cert,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -32,7 +33,7 @@ struct ReqwestPoolManager {
     global_env_config: crate::config::EnvConfig,
     dns_cache: DnsCache,
     tls_policy: Option<Arc<TlsPolicy>>,
-    crls: crate::tls::CrlList,
+    crls: crate::tls::SharedCrlList,
     backend_h3_tls_configs: BackendTlsConfigCache,
     backend_svid_generation: BackendSvidGeneration,
     workload_svid_cert_path: Option<String>,
@@ -48,6 +49,7 @@ impl ReqwestPoolManager {
     async fn create_client(&self, proxy: &Proxy, config: &PoolConfig) -> Result<reqwest::Client> {
         let dns_resolver = Arc::new(DnsCacheResolver::new(self.dns_cache.clone()));
 
+        let crls = self.crls.load_full();
         let mut client_builder = BackendTlsConfigBuilder {
             proxy,
             policy: self.tls_policy.as_deref(),
@@ -67,7 +69,7 @@ impl ReqwestPoolManager {
                 .backend_tls_client_key_path
                 .as_deref()
                 .map(Path::new),
-            crls: &self.crls,
+            crls: crls.as_ref().as_slice(),
         }
         .build_reqwest()
         .map_err(|e| anyhow::anyhow!("Failed to build reqwest backend TLS config: {}", e))?
@@ -145,9 +147,13 @@ impl PoolManager for ReqwestPoolManager {
         buf.clear();
 
         if let Some(ref upstream_id) = proxy.upstream_id {
-            let _ = write!(buf, "u={}|", upstream_id);
+            buf.push_str("u=");
+            append_pool_key_component(buf, upstream_id);
+            buf.push('|');
         } else {
-            let _ = write!(buf, "d={}:{}|", host, port);
+            buf.push_str("d=");
+            append_pool_key_component(buf, host);
+            let _ = write!(buf, ":{port}|");
         }
         // Pool keys partition by scheme discriminant so two proxies with different
         // wire schemes (http vs https, tcp vs tcps, etc.) don't share a client.
@@ -160,13 +166,13 @@ impl PoolManager for ReqwestPoolManager {
         );
         let scheme_disc = proxy.backend_scheme.map(|s| s as u8).unwrap_or(u8::MAX);
         let _ = write!(buf, "{}|", scheme_disc);
-        buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
+        append_optional_pool_key_component(buf, proxy.dns_override.as_deref());
         buf.push('|');
         // Subset name partitions backend pools so two proxies that share
         // `upstream_id` but select different DestinationRule subsets cannot
         // share a client even when their TLS material happens to be
         // byte-identical. Empty when the proxy has no `upstream_subset`.
-        buf.push_str(proxy.upstream_subset.as_deref().unwrap_or_default());
+        append_optional_pool_key_component(buf, proxy.upstream_subset.as_deref());
         buf.push('|');
         let verify = proxy.resolved_tls.verify_server_cert && !self.global_env_config.tls_no_verify;
         let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
@@ -243,6 +249,24 @@ impl ConnectionPool {
         crls: crate::tls::CrlList,
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
+        Self::new_with_svid_generation_and_shared_crls(
+            global_config,
+            mtls_config,
+            dns_cache,
+            tls_policy,
+            crate::tls::shared_crl_list(crls),
+            backend_svid_generation,
+        )
+    }
+
+    pub fn new_with_svid_generation_and_shared_crls(
+        global_config: PoolConfig,
+        mtls_config: crate::config::EnvConfig,
+        dns_cache: DnsCache,
+        tls_policy: Option<Arc<TlsPolicy>>,
+        crls: crate::tls::SharedCrlList,
+        backend_svid_generation: BackendSvidGeneration,
+    ) -> Self {
         let cleanup_interval =
             Duration::from_secs(mtls_config.pool_cleanup_interval_seconds.max(1));
         let shards = crate::util::sharding::pool_shard_amount(mtls_config.pool_shard_amount);
@@ -316,6 +340,7 @@ impl ConnectionPool {
         manager
             .backend_h3_tls_configs
             .get_or_try_build(manager.pool_key_owned(proxy), || {
+                let crls = manager.crls.load_full();
                 let mut client_config = BackendTlsConfigBuilder {
                     proxy,
                     policy: manager.tls_policy.as_deref(),
@@ -335,7 +360,7 @@ impl ConnectionPool {
                         .backend_tls_client_key_path
                         .as_deref()
                         .map(Path::new),
-                    crls: &manager.crls,
+                    crls: crls.as_ref().as_slice(),
                 }
                 .build_rustls_quic()
                 .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))?;
@@ -358,9 +383,17 @@ impl ConnectionPool {
             .drain_svid_generation(generation);
     }
 
+    pub fn clear_backend_tls_config_cache(&self) {
+        self.pool.manager().backend_h3_tls_configs.clear();
+    }
+
     pub fn force_drain_svid_generation(&self, generation: u64) {
         let matcher = SvidGenerationMatcher::new(generation);
         self.pool.invalidate_matching(|key| matcher.matches(key));
+    }
+
+    pub fn force_drain_all(&self) {
+        self.pool.clear();
     }
 }
 

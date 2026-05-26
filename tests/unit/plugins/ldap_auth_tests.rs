@@ -104,6 +104,32 @@ fn test_invalid_ldap_url_scheme_rejected() {
 }
 
 #[test]
+fn test_malformed_ldap_url_rejected() {
+    let result = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap://[not-ipv6",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+        }),
+        http_client(),
+    );
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("valid URL"));
+}
+
+#[test]
+fn test_ldap_url_empty_authority_rejected() {
+    let result = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap:///dc=example,dc=com",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+        }),
+        http_client(),
+    );
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("hostname"));
+}
+
+#[test]
 fn test_no_bind_mode_rejected() {
     let result = LdapAuth::new(
         &json!({
@@ -382,6 +408,20 @@ fn test_warmup_hostnames_ldaps() {
     )
     .unwrap();
     assert_eq!(plugin.warmup_hostnames(), vec!["secure-ldap.corp.internal"]);
+}
+
+#[test]
+fn test_warmup_hostnames_unbrackets_ipv6_ldap_url() {
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap://[2001:db8::50]:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+        }),
+        http_client(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.warmup_hostnames(), vec!["2001:db8::50"]);
 }
 
 // ─── Authenticate credential extraction tests ────────────────────────────

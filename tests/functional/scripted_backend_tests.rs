@@ -282,6 +282,63 @@ async fn backend_read_timeout_fires_after_backend_read_timeout_ms() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Test 3b — `backend_read_timeout_ms = 0` disables the read timeout.
+// ────────────────────────────────────────────────────────────────────────────
+//
+// The gateway treats zero timeout values as explicit opt-out. This exercises
+// the live HTTP proxy path with a backend that waits longer than the default
+// 5s helper timeout before sending a valid response. If the zero value were
+// accidentally normalized back to the default, this would return a gateway
+// timeout instead of the backend's 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn backend_read_timeout_zero_disables_timeout() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::Sleep(Duration::from_millis(5_600)))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "2".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"ok".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml =
+        file_mode_yaml_for_backend_with(backend_port, json!({ "backend_read_timeout_ms": 0 }));
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .log_level("info")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let started = Instant::now();
+    let resp = client
+        .get(&harness.proxy_url("/api/slow-but-allowed"))
+        .await
+        .expect("response");
+    let elapsed = started.elapsed();
+
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(resp.body_text(), "ok");
+    assert!(
+        elapsed >= Duration::from_millis(5_300),
+        "backend response arrived before the scripted sleep elapsed: {elapsed:?}"
+    );
+    backend.assert_no_step_errors().await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Test 4 — backend closes mid-body → client observes truncated body;
 // gateway logs a body_error_class.
 // ────────────────────────────────────────────────────────────────────────────

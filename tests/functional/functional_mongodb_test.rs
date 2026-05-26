@@ -19,6 +19,9 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_mongodb -- --ignored --nocapture
 
+use crate::common::{
+    configure_coverage_gateway_command, explicit_test_binary, shutdown_gateway_child,
+};
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
@@ -135,7 +138,8 @@ impl MongoTestHarness {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let binary_path = find_binary()?;
 
-        let child = Command::new(binary_path)
+        let mut command = Command::new(binary_path);
+        command
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
             .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
@@ -147,16 +151,16 @@ impl MongoTestHarness {
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "info")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        configure_coverage_gateway_command(&mut command);
+        let child = command.spawn()?;
 
         self.gateway_process = Some(child);
         match self.wait_for_health().await {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    shutdown_gateway_child(&mut child);
                 }
                 Err(e)
             }
@@ -225,6 +229,7 @@ impl MongoTestHarness {
             command.env("FERRUM_DB_TLS_CA_CERT_PATH", &ca_cert_path);
         }
 
+        configure_coverage_gateway_command(&mut command);
         let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -235,8 +240,7 @@ impl MongoTestHarness {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    shutdown_gateway_child(&mut child);
                 }
                 Err(e)
             }
@@ -285,7 +289,8 @@ impl MongoTestHarness {
         let client_cert_path = format!("{}/client.crt", cert_dir);
         let client_key_path = format!("{}/client.key", cert_dir);
 
-        let child = Command::new(binary_path)
+        let mut command = Command::new(binary_path);
+        command
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
             .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
@@ -301,16 +306,16 @@ impl MongoTestHarness {
             .env("FERRUM_DB_TLS_CLIENT_CERT_PATH", &client_cert_path)
             .env("FERRUM_DB_TLS_CLIENT_KEY_PATH", &client_key_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        configure_coverage_gateway_command(&mut command);
+        let child = command.spawn()?;
 
         self.gateway_process = Some(child);
         match self.wait_for_health().await {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    shutdown_gateway_child(&mut child);
                 }
                 Err(e)
             }
@@ -374,17 +379,19 @@ impl MongoTestHarness {
 impl Drop for MongoTestHarness {
     fn drop(&mut self) {
         if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            shutdown_gateway_child(&mut child);
         }
     }
 }
 
-fn find_binary() -> Result<&'static str, Box<dyn std::error::Error>> {
+fn find_binary() -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(path) = explicit_test_binary() {
+        return Ok(path.to_string_lossy().into_owned());
+    }
     if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        Ok("./target/debug/ferrum-edge")
+        Ok("./target/debug/ferrum-edge".to_string())
     } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        Ok("./target/release/ferrum-edge")
+        Ok("./target/release/ferrum-edge".to_string())
     } else {
         Err("ferrum-edge binary not found. Run `cargo build` first.".into())
     }

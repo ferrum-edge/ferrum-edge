@@ -9,10 +9,13 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
 use super::common::{
-    BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs, sleep_or_shutdown, tonic_tls_config,
-    wait_for_shutdown,
+    BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs,
+    refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
+    wait_optional_tls_reload,
 };
-use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret, generate_dp_jwt_with_issuer};
+use crate::grpc::dp_client::{
+    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer,
+};
 use crate::modes::mesh::config::{AppProtocol, MeshRuntimeOverlay, MeshService, ServicePort};
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::modes::mesh::slice::MeshSlice;
@@ -334,7 +337,8 @@ pub async fn start_xds_client_with_shutdown(
     config: XdsClientConfig,
     state: MeshRuntimeState,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    tls_config: Option<DpGrpcTlsConfig>,
+    mut tls_config: Option<DpGrpcTlsConfig>,
+    tls_reload: Option<DpGrpcTlsReload>,
 ) {
     let cp_urls = config.cp_urls.clone();
     if cp_urls.is_empty() {
@@ -346,6 +350,10 @@ pub async fn start_xds_client_with_shutdown(
     let mut backoff_secs = BACKOFF_INITIAL_SECS;
     let mut stream_state = XdsStreamState::default();
     let mut last_cp_url: Option<String> = None;
+    let mut last_tls_revision = tls_reload
+        .as_ref()
+        .map(|reload| *reload.revision_rx.borrow())
+        .unwrap_or(0);
 
     info!(
         node_id = %config.node_id,
@@ -360,6 +368,12 @@ pub async fn start_xds_client_with_shutdown(
             info!("xDS mesh client shutting down");
             return;
         }
+        refresh_dp_grpc_tls_config_if_changed(
+            &mut tls_config,
+            tls_reload.as_ref(),
+            &cp_urls,
+            &mut last_tls_revision,
+        );
 
         let cp_url = &cp_urls[current_cp_index];
         if last_cp_url.as_deref() != Some(cp_url.as_str()) {
@@ -405,6 +419,11 @@ pub async fn start_xds_client_with_shutdown(
                     info!("xDS mesh client shutting down");
                     return;
                 }
+                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                    info!("Mesh gRPC TLS source changed; reconnecting xDS ADS stream");
+                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    continue;
+                }
             }
         } else {
             tokio::select! {
@@ -419,6 +438,11 @@ pub async fn start_xds_client_with_shutdown(
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
                     info!("xDS mesh client shutting down");
                     return;
+                }
+                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                    info!("Mesh gRPC TLS source changed; reconnecting xDS ADS stream");
+                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    continue;
                 }
             }
         };
@@ -447,9 +471,17 @@ pub async fn start_xds_client_with_shutdown(
         };
 
         let sleep_duration = jittered_backoff(backoff_secs);
-        if sleep_or_shutdown(sleep_duration, shutdown_rx.clone()).await {
-            info!("xDS mesh client shutting down");
-            return;
+        let mut sleep_shutdown_rx = shutdown_rx.clone();
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_duration) => {}
+            _ = wait_for_shutdown(&mut sleep_shutdown_rx) => {
+                info!("xDS mesh client shutting down");
+                return;
+            }
+            _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                backoff_secs = BACKOFF_INITIAL_SECS;
+                continue;
+            }
         }
         backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
     }

@@ -37,6 +37,7 @@ pub struct JwtAuth {
     token_lookup: TokenLookup,
     consumer_claim_field: String,
     validation: Validation,
+    require_nbf: bool,
 }
 
 enum TokenLookup {
@@ -60,18 +61,42 @@ impl JwtAuth {
         )?;
         let require_exp =
             parse_optional_bool(config_obj.get("require_exp"), "require_exp")?.unwrap_or(true);
+        // `nbf` is optional per RFC 7519 §4.1.5 and most issuers omit it, so it
+        // must not be required by default — doing so rejects otherwise-valid
+        // tokens. Operators can opt in with `require_nbf: true`. (`validate_nbf`
+        // below still rejects a token whose `nbf` is in the future when present.)
+        let require_nbf =
+            parse_optional_bool(config_obj.get("require_nbf"), "require_nbf")?.unwrap_or(false);
+        let expected_issuers = parse_expected_issuers(config_obj)?;
+        let audiences = parse_string_array(config_obj.get("audiences"), "audiences")?;
+        let leeway_secs = parse_optional_u64(config_obj.get("leeway_secs"), "leeway_secs", 0)?;
+        if leeway_secs > 300 {
+            return Err("jwt_auth: 'leeway_secs' must be <= 300".to_string());
+        }
+
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
+        validation.validate_nbf = true;
+        validation.leeway = leeway_secs;
         if require_exp {
             validation.required_spec_claims = HashSet::from(["exp".to_string()]);
         } else {
             validation.required_spec_claims.clear();
+        }
+        if !expected_issuers.is_empty() {
+            validation.set_issuer(&expected_issuers);
+        }
+        if !audiences.is_empty() {
+            validation.set_audience(&audiences);
+        } else {
+            validation.validate_aud = false;
         }
 
         Ok(Self {
             token_lookup,
             consumer_claim_field,
             validation,
+            require_nbf,
         })
     }
 
@@ -160,7 +185,14 @@ impl AuthMechanism for JwtAuth {
         for jwt_cred in &jwt_entries {
             if let Some(secret) = jwt_cred.get("secret").and_then(|secret| secret.as_str()) {
                 let key = DecodingKey::from_secret(secret.as_bytes());
-                if decode::<serde_json::Value>(&token, &key, &self.validation).is_ok() {
+                if let Ok(token_data) = decode::<serde_json::Value>(&token, &key, &self.validation)
+                {
+                    if self.require_nbf && token_data.claims.get("nbf").is_none() {
+                        debug!("jwt_auth: JWT missing required nbf claim");
+                        return VerifyOutcome::Invalid(
+                            r#"{"error":"JWT missing nbf claim"}"#.into(),
+                        );
+                    }
                     return VerifyOutcome::consumer(consumer);
                 }
             }
@@ -227,4 +259,55 @@ fn parse_optional_bool(value: Option<&Value>, field: &str) -> Result<Option<bool
                 .ok_or_else(|| format!("jwt_auth: '{field}' must be a boolean, got: {value}"))
         })
         .transpose()
+}
+
+fn parse_expected_issuers(config: &serde_json::Map<String, Value>) -> Result<Vec<String>, String> {
+    let expected_issuer = config.get("expected_issuer");
+    let expected_issuers = config.get("expected_issuers");
+    if expected_issuer.is_some() && expected_issuers.is_some() {
+        return Err(
+            "jwt_auth: 'expected_issuer' and 'expected_issuers' are mutually exclusive".to_string(),
+        );
+    }
+
+    if let Some(value) = expected_issuer {
+        return Ok(vec![parse_required_string(value, "expected_issuer")?]);
+    }
+
+    parse_string_array(expected_issuers, "expected_issuers")
+}
+
+fn parse_string_array(value: Option<&Value>, field: &str) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let arr = value
+        .as_array()
+        .ok_or_else(|| format!("jwt_auth: '{field}' must be an array of strings, got: {value}"))?;
+    let mut values = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let parsed = parse_required_string(item, &format!("{field}[{idx}]"))?;
+        values.push(parsed);
+    }
+    Ok(values)
+}
+
+fn parse_required_string(value: &Value, field: &str) -> Result<String, String> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("jwt_auth: '{field}' must be a string, got: {value}"))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("jwt_auth: '{field}' must not be empty"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn parse_optional_u64(value: Option<&Value>, field: &str, default: u64) -> Result<u64, String> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| format!("jwt_auth: '{field}' must be an unsigned integer, got: {value}"))
 }

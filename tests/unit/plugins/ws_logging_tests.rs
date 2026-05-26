@@ -63,6 +63,19 @@ async fn test_ws_logging_plugin_creation() {
 }
 
 #[tokio::test]
+async fn test_ws_logging_ipv6_endpoint_warmup_hostname_is_unbracketed() {
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://[2001:db8::1]:9300/logs"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.warmup_hostnames(), vec!["2001:db8::1".to_string()]);
+}
+
+#[tokio::test]
 async fn test_ws_logging_plugin_creation_wss() {
     // wss:// triggers rustls ClientConfig construction, which requires
     // a crypto provider to be installed (normally done in main.rs).
@@ -161,6 +174,21 @@ async fn test_ws_logging_rejects_missing_hostname() {
         default_client(),
     );
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_ws_logging_rejects_empty_authority_endpoint() {
+    let result = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws:///logs"
+        }),
+        default_client(),
+    );
+    let err = result.err().expect("empty authority endpoint should fail");
+    assert!(
+        err.contains("hostname or IP address"),
+        "expected hostname validation error, got: {err}"
+    );
 }
 
 #[tokio::test]

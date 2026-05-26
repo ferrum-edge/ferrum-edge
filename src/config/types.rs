@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::sync::LazyLock;
 
 /// Maximum length for resource IDs.
@@ -55,6 +56,25 @@ pub const MAX_TAG_LENGTH: usize = 255;
 pub const MAX_LOCALITY_LENGTH: usize = 255;
 /// Maximum size of plugin config JSON in bytes.
 pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
+/// Maximum OpenAPI validator config JSON size in bytes.
+///
+/// Generated validator configs embed resolved operation schemas, so they need
+/// a larger budget than ordinary plugin configs. Keep this safely below
+/// MongoDB's 16 MiB BSON document ceiling because database mode may store a
+/// generated validator as one plugin row.
+pub const MAX_OPENAPI_VALIDATOR_CONFIG_SIZE: usize = 14_680_064; // 14 MiB
+/// Maximum OpenAPI validator config JSON nesting depth.
+pub const MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH: usize = 64;
+/// Default OpenAPI validator media types for generated and direct configs.
+pub const OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES: &[&str] = &[
+    "application/json",
+    "application/xml",
+    "text/xml",
+    "application/x-www-form-urlencoded",
+    "multipart/form-data",
+    "text/plain",
+    "application/octet-stream",
+];
 /// Maximum size of consumer credentials JSON in bytes.
 pub const MAX_CREDENTIALS_SIZE: usize = 65_536; // 64 KiB
 /// Maximum length for individual credential string values (API keys, secrets, identities).
@@ -87,6 +107,8 @@ pub const MAX_STATUS_CODES: usize = 500;
 pub const MAX_RETRYABLE_METHODS: usize = 9;
 /// Maximum length for file path fields (TLS cert/key paths).
 pub const MAX_FILE_PATH_LENGTH: usize = 4096;
+/// Maximum size for inline PEM TLS material in config fields.
+pub const MAX_TLS_INLINE_PEM_LENGTH: usize = 1_048_576; // 1 MiB
 /// Maximum length for service discovery optional string fields.
 pub const MAX_SD_STRING_LENGTH: usize = 255;
 
@@ -1499,7 +1521,7 @@ pub struct Proxy {
     /// Used only for direct-backend proxies (no `upstream_id`).
     #[serde(default)]
     pub backend_tls_server_ca_cert_path: Option<String>,
-    /// Resolved backend TLS config (populated at config load time).
+    /// Resolved backend TLS config (populated during `normalize_fields()`).
     /// When the proxy references an upstream, this is the upstream's TLS config.
     /// For direct-backend proxies, this is the proxy's own TLS fields.
     /// Not serialized — derived from the upstream or proxy fields.
@@ -2089,7 +2111,8 @@ impl GatewayConfig {
         }
     }
 
-    /// Normalize all resource fields that have canonical in-memory forms.
+    /// Normalize all resource fields that have canonical in-memory forms and
+    /// refresh derived runtime projections skipped by serde.
     pub fn normalize_fields(&mut self) {
         self.normalize_hosts();
         for consumer in &mut self.consumers {
@@ -2105,6 +2128,10 @@ impl GatewayConfig {
         // proxy at load time, so the request hot path never does any
         // scheme branching.
         self.resolve_dispatch_kind();
+        // Rebuild TLS projections after serde or admin/incremental mutations.
+        // `Proxy.resolved_tls` is skipped on the wire, so normalization must
+        // repopulate it before any runtime snapshot can serve traffic.
+        self.resolve_upstream_tls();
         // Project per-port `connect_timeout_ms` overrides from each proxy's
         // upstream onto a flat `Proxy.dispatch_port_overrides` map so the
         // request hot path skips the `ArcSwap` + `DashMap` lookup. No-op for
@@ -2131,9 +2158,9 @@ impl GatewayConfig {
 
     /// Resolve each proxy's `resolved_tls` from its upstream (if any) or its own fields.
     ///
-    /// Must be called after loading/mutating config and before any proxy traffic flows.
-    /// Called by `normalize_fields()` callers, `update_config()`, `apply_incremental()`,
-    /// and admin API mutation handlers.
+    /// Called by `normalize_fields()` after loading/mutating config and before
+    /// any proxy traffic flows. Direct calls are still valid for narrow mutation
+    /// paths that only need to refresh TLS projection.
     ///
     /// Proxies with `upstream_subset` set consult the upstream's
     /// `resolved_subset_tls` map first; when the named subset has a resolved
@@ -2767,6 +2794,20 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("host entry must not be empty".to_string());
     }
+    if host.len() > MAX_HOST_LENGTH {
+        return Err(format!(
+            "host '{}' must not exceed {} characters (got {})",
+            host,
+            MAX_HOST_LENGTH,
+            host.len()
+        ));
+    }
+    if host.trim() != host {
+        return Err(format!(
+            "host '{}' must not have leading or trailing whitespace",
+            host
+        ));
+    }
     if host.contains("://") {
         return Err(format!(
             "host '{}' must not contain a scheme (e.g., 'http://')",
@@ -2785,13 +2826,14 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
             host
         ));
     }
-    if host.starts_with("*.") {
+    if let Some(wildcard_suffix) = host.strip_prefix("*.") {
         if !WILDCARD_HOST_REGEX.is_match(host) {
             return Err(format!(
                 "wildcard host '{}' is invalid: must be '*.domain.tld' format",
                 host
             ));
         }
+        validate_hostname_labels(wildcard_suffix, host)?;
     } else if host.contains('*') {
         return Err(format!(
             "host '{}' has invalid wildcard: '*' is only allowed as prefix '*.domain'",
@@ -2802,6 +2844,37 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
             "host '{}' is invalid: must be a valid hostname (lowercase letters, digits, dots, hyphens)",
             host
         ));
+    } else {
+        validate_hostname_labels(host, host)?;
+    }
+    Ok(())
+}
+
+fn validate_hostname_labels(hostname: &str, original: &str) -> Result<(), String> {
+    for label in hostname.split('.') {
+        if label.is_empty() {
+            return Err(format!("host '{}' must not contain empty labels", original));
+        }
+        if label.len() > 63 {
+            return Err(format!(
+                "host '{}' contains a label longer than 63 characters",
+                original
+            ));
+        }
+        let starts_alnum = label
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+        let ends_alnum = label
+            .as_bytes()
+            .last()
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+        if !starts_alnum || !ends_alnum {
+            return Err(format!(
+                "host '{}' labels must start and end with an alphanumeric character",
+                original
+            ));
+        }
     }
     Ok(())
 }
@@ -2877,40 +2950,117 @@ fn validate_string_field(field_name: &str, value: &str, max_len: usize) -> Resul
     Ok(())
 }
 
+fn validate_tls_material_source_field(
+    field_name: &str,
+    value: &str,
+    kind: crate::tls::source::MaterialKind,
+) -> Result<(), String> {
+    match crate::tls::source::CertSource::parse(value, kind) {
+        crate::tls::source::CertSource::InlinePem(_) => {
+            validate_string_field(field_name, value, MAX_TLS_INLINE_PEM_LENGTH)
+        }
+        _ => validate_string_field(field_name, value, MAX_FILE_PATH_LENGTH),
+    }
+}
+
 /// Validate that a PEM certificate file exists, is readable, and contains at least one valid certificate.
 pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String> {
-    let file = std::fs::File::open(path).map_err(|e| {
-        format!(
-            "{}: failed to open certificate file '{}': {}",
-            field_name, path, e
-        )
-    })?;
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(file))
+    let source =
+        crate::tls::source::CertSource::parse(path, crate::tls::source::MaterialKind::Cert);
+    let material = match crate::tls::source::load_material_blocking(
+        &source,
+        crate::tls::source::MaterialKind::Cert,
+    ) {
+        Ok(material) => material,
+        Err(crate::tls::source::MaterialError::UnsupportedScheme { .. }) => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "{}: failed to load certificate source '{}': {}",
+                field_name,
+                source.source_id(),
+                e
+            ));
+        }
+    };
+    let certs: Vec<_> = rustls_pemfile::certs(&mut Cursor::new(material.bytes.expose_secret()))
         .filter_map(|r| r.ok())
         .collect();
     if certs.is_empty() {
         return Err(format!(
             "{}: no valid PEM certificates found in '{}'",
-            field_name, path
+            field_name, material.source_id
         ));
     }
     Ok(())
 }
 
-/// Validate that a PEM private key file exists, is readable, and contains at least one valid PKCS8 private key.
+/// Validate that a private key source is usable for backend mTLS.
+///
+/// Materializable sources must contain a PEM private key. PKCS#11 sources are
+/// validated through the token when the `pkcs11` feature is enabled.
 pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("{}: failed to open key file '{}': {}", field_name, path, e))?;
-    let keys: Vec<_> = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(file))
-        .filter_map(|r| r.ok())
-        .collect();
-    if keys.is_empty() {
+    let source = crate::tls::source::CertSource::parse(path, crate::tls::source::MaterialKind::Key);
+    if let crate::tls::source::CertSource::Uri(uri) = &source
+        && uri.scheme == crate::tls::source::SourceScheme::Pkcs11
+    {
+        return validate_pkcs11_key_source(field_name, uri);
+    }
+    let material = match crate::tls::source::load_material_blocking(
+        &source,
+        crate::tls::source::MaterialKind::Key,
+    ) {
+        Ok(material) => material,
+        Err(crate::tls::source::MaterialError::UnsupportedScheme { .. }) => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "{}: failed to load key source '{}': {}",
+                field_name,
+                source.source_id(),
+                e
+            ));
+        }
+    };
+    let key = rustls_pemfile::private_key(&mut Cursor::new(material.bytes.expose_secret()))
+        .map_err(|e| {
+            format!(
+                "{}: failed to parse private key from '{}': {}",
+                field_name, material.source_id, e
+            )
+        })?;
+    if key.is_none() {
         return Err(format!(
-            "{}: no valid PKCS8 private keys found in '{}'",
-            field_name, path
+            "{}: no valid private keys found in '{}'",
+            field_name, material.source_id
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "pkcs11")]
+fn validate_pkcs11_key_source(
+    field_name: &str,
+    uri: &crate::tls::source::CertSourceUri,
+) -> Result<(), String> {
+    crate::tls::pkcs11::validate_key_source_uri(uri).map_err(|error| {
+        format!(
+            "{}: failed to validate PKCS#11 key source '{}': {}",
+            field_name,
+            uri.source_id(),
+            error
+        )
+    })
+}
+
+#[cfg(not(feature = "pkcs11"))]
+fn validate_pkcs11_key_source(
+    field_name: &str,
+    uri: &crate::tls::source::CertSourceUri,
+) -> Result<(), String> {
+    Err(format!(
+        "{}: PKCS#11 key source '{}' requires building ferrum-edge with the 'pkcs11' Cargo feature",
+        field_name,
+        uri.source_id()
+    ))
 }
 
 /// Validate that a MaxMind `.mmdb` database file exists and can be parsed.
@@ -3421,24 +3571,30 @@ impl Proxy {
             }
         }
 
-        // TLS file path lengths
+        // TLS material source lengths
         if let Some(ref path) = self.backend_tls_client_cert_path
-            && let Err(e) =
-                validate_string_field("backend_tls_client_cert_path", path, MAX_FILE_PATH_LENGTH)
+            && let Err(e) = validate_tls_material_source_field(
+                "backend_tls_client_cert_path",
+                path,
+                crate::tls::source::MaterialKind::Cert,
+            )
         {
             errors.push(e);
         }
         if let Some(ref path) = self.backend_tls_client_key_path
-            && let Err(e) =
-                validate_string_field("backend_tls_client_key_path", path, MAX_FILE_PATH_LENGTH)
+            && let Err(e) = validate_tls_material_source_field(
+                "backend_tls_client_key_path",
+                path,
+                crate::tls::source::MaterialKind::Key,
+            )
         {
             errors.push(e);
         }
         if let Some(ref path) = self.backend_tls_server_ca_cert_path
-            && let Err(e) = validate_string_field(
+            && let Err(e) = validate_tls_material_source_field(
                 "backend_tls_server_ca_cert_path",
                 path,
-                MAX_FILE_PATH_LENGTH,
+                crate::tls::source::MaterialKind::CaBundle,
             )
         {
             errors.push(e);
@@ -4181,24 +4337,30 @@ impl Upstream {
             }
         }
 
-        // Backend TLS file path lengths
+        // Backend TLS material source lengths
         if let Some(ref path) = self.backend_tls_client_cert_path
-            && let Err(e) =
-                validate_string_field("backend_tls_client_cert_path", path, MAX_FILE_PATH_LENGTH)
+            && let Err(e) = validate_tls_material_source_field(
+                "backend_tls_client_cert_path",
+                path,
+                crate::tls::source::MaterialKind::Cert,
+            )
         {
             errors.push(e);
         }
         if let Some(ref path) = self.backend_tls_client_key_path
-            && let Err(e) =
-                validate_string_field("backend_tls_client_key_path", path, MAX_FILE_PATH_LENGTH)
+            && let Err(e) = validate_tls_material_source_field(
+                "backend_tls_client_key_path",
+                path,
+                crate::tls::source::MaterialKind::Key,
+            )
         {
             errors.push(e);
         }
         if let Some(ref path) = self.backend_tls_server_ca_cert_path
-            && let Err(e) = validate_string_field(
+            && let Err(e) = validate_tls_material_source_field(
                 "backend_tls_server_ca_cert_path",
                 path,
-                MAX_FILE_PATH_LENGTH,
+                crate::tls::source::MaterialKind::CaBundle,
             )
         {
             errors.push(e);
@@ -4426,17 +4588,30 @@ impl PluginConfig {
 
         // Config JSON size
         let config_json = serde_json::to_string(&self.config).unwrap_or_default();
-        if config_json.len() > MAX_PLUGIN_CONFIG_SIZE {
+        let max_config_size = if self.plugin_name == "openapi_validator" {
+            MAX_OPENAPI_VALIDATOR_CONFIG_SIZE
+        } else {
+            MAX_PLUGIN_CONFIG_SIZE
+        };
+        if config_json.len() > max_config_size {
             errors.push(format!(
                 "config JSON must not exceed {} bytes (got {})",
-                MAX_PLUGIN_CONFIG_SIZE,
+                max_config_size,
                 config_json.len()
             ));
         }
 
         // Config JSON nesting depth
-        if json_depth(&self.config) > 10 {
-            errors.push("config JSON nesting depth must not exceed 10".to_string());
+        let max_config_depth = if self.plugin_name == "openapi_validator" {
+            MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH
+        } else {
+            10
+        };
+        if json_depth(&self.config) > max_config_depth {
+            errors.push(format!(
+                "config JSON nesting depth must not exceed {}",
+                max_config_depth
+            ));
         }
 
         // Priority override range (0–10000 keeps plugins within sane ordering bands)
@@ -5145,7 +5320,7 @@ impl GatewayConfig {
 }
 
 /// Compute the maximum nesting depth of a JSON value.
-fn json_depth(value: &serde_json::Value) -> usize {
+pub(crate) fn json_depth(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Array(arr) => 1 + arr.iter().map(json_depth).max().unwrap_or(0),
         serde_json::Value::Object(map) => 1 + map.values().map(json_depth).max().unwrap_or(0),
@@ -5174,5 +5349,21 @@ pub fn wildcard_matches(pattern: &str, hostname: &str) -> bool {
         false
     } else {
         pattern == hostname
+    }
+}
+
+#[cfg(all(test, not(feature = "pkcs11")))]
+mod pkcs11_key_validation_tests {
+    use super::*;
+
+    #[test]
+    fn backend_pkcs11_key_validation_requires_feature() {
+        let error = validate_pem_key_file(
+            "backend_tls_client_key_path",
+            "pkcs11://edge-rsa?module=/usr/lib/pkcs11.so",
+        )
+        .expect_err("pkcs11 key sources require the feature");
+
+        assert!(error.contains("'pkcs11' Cargo feature"));
     }
 }

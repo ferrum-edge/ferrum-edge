@@ -16,15 +16,29 @@ Set these environment variables to configure client certificates and CA verifica
 # Path to CA bundle for backend TLS verification (overrides system trust store)
 export FERRUM_TLS_CA_BUNDLE_PATH="/path/to/ca-bundle.pem"
 
+# Optional source override for the CA bundle. Source values accept a path,
+# file:// URI, or inline PEM beginning with -----BEGIN .
+export FERRUM_TLS_CA_BUNDLE_SOURCE="file:///path/to/ca-bundle.pem"
+
 # Path to client certificate file (PEM format)
 export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/path/to/client-cert.pem"
+
+# Optional source override for the client certificate
+export FERRUM_BACKEND_TLS_CLIENT_CERT_SOURCE="file:///path/to/client-cert.pem"
 
 # Path to client private key file (PEM format)  
 export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/path/to/client-key.pem"
 
+# Optional source override for the client private key. With the pkcs11 Cargo
+# feature, this may be a non-extractable RSA token key.
+export FERRUM_BACKEND_TLS_CLIENT_KEY_SOURCE="file:///path/to/client-key.pem"
+# export FERRUM_BACKEND_TLS_CLIENT_KEY_SOURCE="pkcs11://backend-rsa?pin_env=FERRUM_PKCS11_PIN"
+
 # Disable backend TLS certificate verification (testing only)
 export FERRUM_TLS_NO_VERIFY="true"
 ```
+
+When both a `_PATH` and `_SOURCE` variable are set, `_SOURCE` wins and the startup warning names only the variable names, not the material. Inline PEM is redacted in debug output and hashed in backend pool keys so private-key bytes are not logged or embedded in cache identifiers.
 
 ### Custom CA Bundles
 
@@ -38,24 +52,24 @@ The `FERRUM_TLS_CA_BUNDLE_PATH` allows you to specify custom Certificate Authori
 **How it works:**
 - The CA bundle is loaded when a connection pool entry is first created for a proxy
 - Works with all backend protocols: HTTP/1.1, H2, HTTP/3, gRPC, WebSocket (wss://), and TCP/TLS
-- Per-proxy `backend_tls_server_ca_cert_path` takes priority over the global `FERRUM_TLS_CA_BUNDLE_PATH`
+- Per-proxy `backend_tls_server_ca_cert_path` takes priority over the global `FERRUM_TLS_CA_BUNDLE_PATH` / `FERRUM_TLS_CA_BUNDLE_SOURCE`
 
 **CA Trust Fallback Chain:**
 
 The gateway resolves backend CA trust in the following order:
 
 1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with **only** that CA. Webpki/system roots are excluded to prevent public CAs from being trusted alongside your internal CA.
-2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH`) — verify with **only** the global CA. Same exclusivity as proxy-specific.
+2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH` / `FERRUM_TLS_CA_BUNDLE_SOURCE`) — verify with **only** the global CA. Same exclusivity as proxy-specific.
 3. **Neither set** — verify with **bundled webpki roots** (secure default). The gateway does **not** skip verification when no CA is configured.
 4. **Explicit opt-out** — `backend_tls_verify_server_cert: false` on a per-proxy basis, or `FERRUM_TLS_NO_VERIFY=true` globally, skips all certificate verification. These are the **only** ways to disable verification and should never be used in production.
 
 **CA exclusivity**: When a custom CA is configured, it is the sole trust anchor. This prevents a backend pinned to an internal CA from being MITMed via any publicly-trusted certificate. If you need both internal and public CAs trusted, combine them into a single PEM bundle file.
 
 > **Trust roots — backend proxy path.**
-> The proxy backend path (HTTP/1.1, H2, HTTP/3, gRPC, WebSocket, TCP/TLS) builds its trust store in-house from `webpki-roots`'s `TLS_SERVER_ROOTS` and hands the resulting `rustls::ClientConfig` to reqwest via `use_preconfigured_tls(...)`. That means the "no custom CA" fallback always uses bundled webpki on every platform — Linux, macOS, and Windows — regardless of OS keychain contents. Only the `FERRUM_TLS_CA_BUNDLE_PATH` / per-proxy CA paths can change which roots the gateway trusts for backend traffic.
+> The proxy backend path (HTTP/1.1, H2, HTTP/3, gRPC, WebSocket, TCP/TLS) builds its trust store in-house from `webpki-roots`'s `TLS_SERVER_ROOTS` and hands the resulting `rustls::ClientConfig` to reqwest via `use_preconfigured_tls(...)`. That means the "no custom CA" fallback always uses bundled webpki on every platform — Linux, macOS, and Windows — regardless of OS keychain contents. Only the `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-proxy CA paths can change which roots the gateway trusts for backend traffic.
 
 > **Trust roots — internal helper clients.**
-> A few internal-helper reqwest clients (active health-check probes, plugin outbound HTTP via `PluginHttpClient`, the `spec_expose` plugin) do not preconfigure TLS. As of reqwest 0.13 those clients use `rustls-platform-verifier`, which resolves trust roots from the **OS keychain on macOS/Windows** and falls through to bundled webpki on Linux. For containerised production deploys (the supported target) behaviour is identical to pre-0.13. Operators running the gateway locally on macOS/Windows will see helper-client TLS verified against their OS keychain unless a `FERRUM_TLS_CA_BUNDLE_PATH` / per-plugin CA is configured (in which case the custom CA replaces the trust store wholesale, per the exclusivity rule above).
+> A few internal-helper reqwest clients (active health-check probes, plugin outbound HTTP via `PluginHttpClient`, the `spec_expose` plugin) do not preconfigure TLS. As of reqwest 0.13 those clients use `rustls-platform-verifier`, which resolves trust roots from the **OS keychain on macOS/Windows** and falls through to bundled webpki on Linux. For containerised production deploys (the supported target) behaviour is identical to pre-0.13. Operators running the gateway locally on macOS/Windows will see helper-client TLS verified against their OS keychain unless a `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-plugin CA is configured (in which case the custom CA replaces the trust store wholesale, per the exclusivity rule above).
 
 Backends using certificates from public CAs work out of the box with no CA configuration. Backends using internal or self-signed certificates require either a proxy-specific or global CA bundle.
 
@@ -102,8 +116,8 @@ proxies:
 
 - **Format**: PEM encoded
 - **Certificate**: X.509 certificate chain
-- **Private Key**: Unencrypted private key (RSA or ECDSA)
-- **Files**: Must be readable by the gateway process
+- **Private Key**: Unencrypted private key (RSA or ECDSA), or a `pkcs11://` RSA signer URI when Ferrum is built with the `pkcs11` feature
+- **Sources**: File paths and `file://` URIs must be readable by the gateway process; inline PEM must contain the full PEM block
 
 ## Usage Examples
 
@@ -209,31 +223,32 @@ cargo test test_backend_mtls_global_config -- --nocapture
 ## Security Considerations
 
 1. **File Permissions**: Protect private key files with appropriate permissions (600 or 400).
-2. **Key Storage**: Consider using hardware security modules (HSMs) for production environments.
-3. **Certificate Rotation**: Implement regular certificate rotation procedures. **Note:** Ferrum Edge does not watch certificate files for changes or reload them dynamically. **No TLS surface supports hot reload — not frontend, not backend, not admin, not DTLS, not gRPC.** All TLS certificate files are read from disk either at process startup or when the connection pool entry for a proxy is first created. A config reload (SIGHUP, database poll, or gRPC sync) refreshes routing, plugins, consumers, and upstreams but does **not** re-read any TLS certificate files from disk for existing connection pool entries. To pick up rotated certificates, you must **restart the gateway process**. In Kubernetes, a rolling restart after a Secret update is the standard approach.
+2. **Key Storage**: Consider using hardware security modules (HSMs) for production environments. Backend mTLS client keys can use `pkcs11://` RSA signer URIs when Ferrum is built with the `pkcs11` feature; see [pkcs11_tls.md](pkcs11_tls.md).
+3. **Certificate Rotation**: Keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` so backend cert/key/CA/CRL source changes are validated, backend CRLs are refreshed, HTTP-family backend pools are cleared, and active health checks restart with the rotated material.
 4. **Monitoring**: Monitor certificate expiration and renewal.
 
-### Operational Contract for File-Based Certificates
+### Operational Contract for Backend TLS Sources
 
-Ferrum Edge currently treats all file-based TLS materials as **static inputs**:
+Ferrum Edge loads backend TLS material from the configured sources and can refresh the HTTP-family backend pools when watched source bytes change:
 
-- **Frontend/admin/DTLS/server-side TLS** certs and keys are loaded when the process starts.
-- **Backend client certs, backend client keys, and backend CA bundles** are validated at config load time and then loaded into protocol-specific backend TLS configs when those connection pools are created.
-- **Config reload** updates routing and resources, but it is **not** a general-purpose TLS file reload mechanism.
+- **Backend client certs, backend client keys, backend CA bundles, and CRLs** are validated at config load time and then loaded into protocol-specific backend TLS configs when those connection pools are created.
+- **Config reload** updates routing and resources. Backend TLS live reload is the mechanism for in-place source byte changes at the same path or URI.
 
 This matters in Kubernetes and similar environments:
 
 - A mounted `Secret`, `ConfigMap`, CSI certificate volume, or sidecar-managed shared volume can update files at the same path while the Pod is still running.
-- Ferrum Edge does **not** watch those files and does **not** rebuild existing backend TLS configs just because the file contents changed.
-- If you rotate certificates in place, treat that rotation as requiring a **rolling redeploy / rolling restart** of Ferrum pods.
+- With `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` (default), Ferrum watches backend TLS cert/key/CA/CRL sources, validates the active backend TLS configs on changed bytes, refreshes the backend CRL slot, clears HTTP-family backend client pools, and restarts active health checks. Existing in-flight backend requests keep their current connections; new backend connections rebuild from the rotated material.
+- The backend watcher recollects sources from the current gateway config on each pass. After a file-mode SIGHUP reload, database poll, or CP/DP config push adds or replaces backend TLS source URIs, those new sources are watched without restarting Ferrum.
+- Watched backend TLS sources include global backend mTLS env vars, per-proxy settings, per-upstream settings, and direct-backend `mesh_route_dispatch.rules[].destination.backend_tls` overrides.
+- If you disable backend TLS live reload, treat in-place backend certificate rotation as requiring a **rolling redeploy / rolling restart** of Ferrum pods.
 
 Recommended practice:
 
 - Store TLS materials in Kubernetes `Secret` objects or your preferred cert delivery mechanism.
 - Update the Secret or mounted files as usual.
-- Trigger a **rolling restart** of the Deployment/StatefulSet so every pod re-reads the new cert/key/CA material.
+- Keep backend TLS live reload enabled for file/provider/Kubernetes/managed-backed sources, or trigger a **rolling restart** of the Deployment/StatefulSet after rotation if you intentionally disable it.
 
-If you need live, admin-API-driven certificate updates in the future, that should be implemented as a first-class certificate resource rather than relying on file replacement semantics.
+Admin-managed backend certificate resources can be referenced with `managed://` source URIs. Updating those records through the admin API requests active TLS source reload watchers immediately.
 
 ## Implementation Details
 
@@ -246,9 +261,9 @@ The mTLS implementation uses:
 
 ### Connection Pool Behavior
 
-- **Fail-fast on bad certificates**: All TLS certificate files — both global env var paths (`FERRUM_BACKEND_TLS_CLIENT_CERT_PATH`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`, `FERRUM_TLS_CA_BUNDLE_PATH`) and per-proxy paths (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) — are validated at startup and config load time. If any configured cert file is missing, unreadable (permission denied), or contains invalid/corrupt PEM data, the gateway **refuses to start** (or rejects the config reload). There is no silent fallback to unauthenticated connections or to webpki-only verification when a configured CA file fails to load. Cert and key paths must always be configured as a pair; setting one without the other is a validation error. CA paths are independent — you can set just a CA to verify a server without presenting client identity.
-- **TLS path deduplication**: When multiple proxies share the same cert/key/CA file paths, each unique file is parsed only once during validation. This avoids redundant disk I/O and PEM parsing at config load time.
-- **Pool-per-cert-path**: Each unique combination of `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` produces a **separate connection pool entry** per protocol:
+- **Fail-fast on bad certificates**: All backend TLS certificate sources — both global env vars (`FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` / `_SOURCE`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` / `_SOURCE`, `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE`, `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE`) and per-proxy fields (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) — are validated at startup and config load time when they are file-backed, inline PEM, provider-backed (`vault://`, `aws://`, `azure://`, `gcp://`), Kubernetes Secret-backed (`k8s://namespace/secret#key`), admin-managed (`managed://certificates/id#cert`, `managed://certificates/id#key`, `managed://ca-bundles/id`, `managed://crls/id`), or PKCS#11-backed (`pkcs11://label?...`) for client keys. Provider URI sources require the matching secret-provider Cargo feature and use the same credentials/configuration as the existing `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` env-var suffixes. Kubernetes sources use the default `kube` client environment. Managed sources are stored under `FERRUM_TLS_MANAGED_STORE_PATH`. PKCS#11 key sources require the `pkcs11` Cargo feature and a token RSA key matching the configured selector. If any configured source is missing, unreadable, unsupported by the current build, unreachable, or contains invalid/corrupt material, the gateway **refuses to start** or rejects the config reload. There is no silent fallback to unauthenticated connections or to webpki-only verification when a configured CA source fails to load. Cert and key sources must always be configured as a pair; setting one without the other is a validation error. CA and CRL sources are independent — you can set just a CA to verify a server without presenting client identity.
+- **TLS source deduplication**: When multiple proxies share the same cert/key/CA/CRL source values, each unique source is parsed only once during validation. This avoids redundant disk I/O and PEM parsing at config load time.
+- **Pool-per-cert-source**: Each unique combination of `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` produces a **separate connection pool entry** per protocol. Inline PEM values are represented by a SHA-256 source component instead of the raw PEM; PKCS#11 values use the URI selector as the non-secret pool key component:
   - **HTTP/1.1 + H2** (`ConnectionPool`): separate `reqwest::Client` instances keyed by `host:port:protocol:dns_override:ca_path`
   - **HTTP/3** (`Http3ConnectionPool`): separate `rustls::ClientConfig` + QUIC endpoints per proxy
   - **gRPC** (`GrpcConnectionPool`): separate `rustls::ClientConfig` + H2 senders per target
@@ -256,10 +271,10 @@ The mTLS implementation uses:
   - **TCP/TLS**: separate `rustls::ClientConfig` cached per listener lifecycle
   - **WebSocket (wss://)**: `rustls::ClientConfig` built per connection (no persistent pool)
 
-  Two proxies pointing at the same backend host but with different cert paths will **not** share connections. This is required because `reqwest::Client` and `rustls::ClientConfig` bake TLS identity and root certificates in at build time. Changing a proxy's cert paths in a config reload creates a new pool entry on the next request; the old pool entry is eventually evicted by idle timeout.
-- Certificate files are read from disk both at validation time (startup/config load) and when the connection pool entry is first created. Subsequent requests reuse the cached client.
-- Replacing the contents of a cert/key/CA file at the **same path** does not refresh already-built backend TLS configs. Use a process restart or Kubernetes rolling redeploy to pick up in-place rotations.
-- If certificate file reading or parsing fails at request time (e.g., file deleted after startup), the request fails with an error. This behavior is consistent across all backend protocols (HTTP/1.1, H2, and HTTP/3). The gateway continues running and serves other proxies normally.
+  Two proxies pointing at the same backend host but with different cert sources will **not** share connections. This is required because `reqwest::Client` and `rustls::ClientConfig` bake TLS identity and root certificates in at build time. Changing a proxy's cert sources in a config reload creates a new pool entry on the next request; the old pool entry is eventually evicted by idle timeout.
+- File-backed sources are read at validation time (startup/config load) and when the connection pool entry is first created. Inline PEM sources are materialized directly from the configured value. Subsequent requests reuse the cached client.
+- Replacing the contents of a watched cert/key/CA/CRL file at the **same path** refreshes already-built HTTP-family backend TLS configs when backend TLS live reload is enabled. If you disable it, use a process restart, Kubernetes rolling redeploy, or an effective config change that produces a new pool key to pick up in-place rotations.
+- If certificate source loading or parsing fails at request time (e.g., file deleted after startup), the request fails with an error. This behavior is consistent across all backend protocols (HTTP/1.1, H2, and HTTP/3). The gateway continues running and serves other proxies normally.
 - Connection reuse respects the original mTLS configuration
 
 ## Testing with Self-Signed Certificates

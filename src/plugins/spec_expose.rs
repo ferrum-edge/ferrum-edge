@@ -44,8 +44,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use url::{Host, Url};
 
 use crate::dns::DnsCacheResolver;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
@@ -97,7 +99,7 @@ impl SpecExpose {
             })?;
 
         // Validate URL format and require a fetchable scheme.
-        let parsed = url::Url::parse(spec_url)
+        let parsed = Url::parse(spec_url)
             .map_err(|e| format!("spec_expose: 'spec_url' is not a valid URL: {e}"))?;
         match parsed.scheme() {
             "http" | "https" => {}
@@ -107,7 +109,12 @@ impl SpecExpose {
                 ));
             }
         }
-        let warmup_hostname = parsed.host_str().map(str::to_string);
+        if !has_non_empty_authority(spec_url) {
+            return Err(
+                "spec_expose: 'spec_url' must include a hostname or IP address".to_string(),
+            );
+        }
+        let warmup_hostname = Some(spec_url_hostname(&parsed)?);
         let spec_url = parsed.to_string();
 
         let content_type_override = match config.get("content_type") {
@@ -173,19 +180,25 @@ impl SpecExpose {
 
         // Load custom CA bundle when not skipping verification.
         if !tls_no_verify && let Some(ca_path) = plugin_http_client.tls_ca_bundle_path() {
-            match std::fs::read(ca_path) {
-                Ok(ca_pem) => match reqwest::Certificate::from_pem(&ca_pem) {
-                    Ok(cert) => {
-                        // reqwest 0.13: `tls_certs_only` replaces the trust
-                        // store entirely (CA exclusivity).
-                        builder = builder.tls_certs_only([cert]);
+            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+            match load_material_blocking(&source, MaterialKind::CaBundle) {
+                Ok(ca_material) => {
+                    match reqwest::Certificate::from_pem(ca_material.bytes.expose_secret()) {
+                        Ok(cert) => {
+                            // reqwest 0.13: `tls_certs_only` replaces the trust
+                            // store entirely (CA exclusivity).
+                            builder = builder.tls_certs_only([cert]);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "spec_expose: failed to parse CA bundle at {}: {e}",
+                                ca_material.source_id
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("spec_expose: failed to parse CA bundle at {ca_path}: {e}");
-                    }
-                },
+                }
                 Err(e) => {
-                    tracing::warn!("spec_expose: failed to read CA bundle at {ca_path}: {e}");
+                    tracing::warn!("spec_expose: failed to load CA bundle: {e}");
                 }
             }
         }
@@ -334,6 +347,32 @@ impl SpecExpose {
         }
         Ok(entry)
     }
+}
+
+fn spec_url_hostname(parsed: &Url) -> Result<String, String> {
+    let host = parsed.host().ok_or_else(|| {
+        "spec_expose: 'spec_url' must include a hostname or IP address".to_string()
+    })?;
+
+    Ok(match host {
+        Host::Domain(hostname) => hostname.to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
+}
+
+fn has_non_empty_authority(spec_url: &str) -> bool {
+    let Some((_, after_scheme)) = spec_url.split_once(':') else {
+        return false;
+    };
+    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
+        return false;
+    };
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+
+    authority_end > 0
 }
 
 /// Build a 502 rejection for an oversized upstream spec body.

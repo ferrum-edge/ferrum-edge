@@ -7,6 +7,7 @@ pub(crate) mod crud;
 pub mod jwt_auth;
 pub mod mesh_config_drift;
 pub mod spec_codec;
+mod tls_management;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -41,6 +42,7 @@ use crate::grpc::dp_client::DpCpConnectionState;
 use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::plugins;
 use crate::proxy::ProxyState;
+use crate::tls::managed::ManagedTlsMaterialKind;
 use crate::util::body_limit::is_length_limit_error;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -704,7 +706,10 @@ pub async fn handle_admin_request(
     // Prometheus metrics endpoint (unauthenticated for scraping)
     if path == "/metrics" && method == Method::GET {
         let registry = crate::plugins::prometheus_metrics::global_registry();
-        let metrics_output = registry.render();
+        let inventory = tls_management::collect_inventory(&state);
+        registry.refresh_tls_certificate_inventory(&inventory);
+        let mut metrics_output = registry.render();
+        metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -782,6 +787,18 @@ pub async fn handle_admin_request(
                 });
             return Ok(resp);
         }
+    }
+
+    if path == "/charges/sink/status" && method == Method::GET {
+        let status_output = crate::plugins::api_chargeback_sink::render_status_json();
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Cache-Control", "no-store")
+            .body(Full::new(Bytes::from(status_output)))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+        return Ok(resp);
     }
 
     // Extract namespace from X-Ferrum-Namespace header (defaults to "ferrum")
@@ -1080,6 +1097,259 @@ pub async fn handle_admin_request(
         // Metrics
         (Method::GET, ["metrics", "runtime"]) => handle_metrics_runtime(&state).await,
         (Method::GET, ["admin", "metrics"]) => handle_metrics(&state).await,
+
+        // TLS certificate lifecycle helpers.
+        (Method::GET, ["admin", "tls", "inventory"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_inventory(&state, &pagination).await
+        }
+        (Method::GET, ["admin", "tls", "events"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_events(&pagination, query.as_deref()).await
+        }
+        (Method::GET, ["admin", "tls", "acme", "certificates"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_list_acme_certificates(&pagination).await
+        }
+        (Method::POST, ["admin", "tls", "acme", "certificates"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_create_acme_certificate(&state, &body_bytes).await
+        }
+        (Method::GET, ["admin", "tls", "acme", "certificates", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_get_acme_certificate(id).await
+        }
+        (Method::PUT, ["admin", "tls", "acme", "certificates", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_update_acme_certificate(&state, id, &body_bytes).await
+        }
+        (Method::DELETE, ["admin", "tls", "acme", "certificates", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_delete_acme_certificate(&state, id).await
+        }
+        (Method::GET, ["admin", "tls", "acme", "accounts"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_list_acme_accounts(&pagination).await
+        }
+        (Method::POST, ["admin", "tls", "acme", "renew", certificate_id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_renew_acme_certificate(&state, certificate_id, &body_bytes).await
+        }
+        (Method::GET, ["admin", "tls", "acme", "orders"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_list_acme_orders(&pagination).await
+        }
+        (Method::POST, ["admin", "tls", "acme", "orders"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_create_acme_order(&state, &body_bytes).await
+        }
+        (Method::GET, ["admin", "tls", "acme", "orders", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_get_acme_order(id).await
+        }
+        (Method::POST, ["admin", "tls", "acme", "orders", id, "finalize"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_finalize_acme_order(&state, id, &body_bytes).await
+        }
+        (Method::DELETE, ["admin", "tls", "acme", "orders", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_delete_acme_order(&state, id).await
+        }
+        (Method::GET, ["admin", "tls", "certificates"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_list_managed(ManagedTlsMaterialKind::Certificate, &pagination)
+                .await
+        }
+        (Method::POST, ["admin", "tls", "certificates"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_create_certificate(&state, &body_bytes).await
+        }
+        (Method::GET, ["admin", "tls", "certificates", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_get_managed(ManagedTlsMaterialKind::Certificate, id).await
+        }
+        (Method::PUT, ["admin", "tls", "certificates", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_update_certificate(&state, id, &body_bytes).await
+        }
+        (Method::DELETE, ["admin", "tls", "certificates", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Certificate, id)
+                .await
+        }
+        (Method::GET, ["admin", "tls", "ca-bundles"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_list_managed(ManagedTlsMaterialKind::CaBundle, &pagination).await
+        }
+        (Method::POST, ["admin", "tls", "ca-bundles"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_create_ca_bundle(&state, &body_bytes).await
+        }
+        (Method::GET, ["admin", "tls", "ca-bundles", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_get_managed(ManagedTlsMaterialKind::CaBundle, id).await
+        }
+        (Method::PUT, ["admin", "tls", "ca-bundles", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_update_ca_bundle(&state, id, &body_bytes).await
+        }
+        (Method::DELETE, ["admin", "tls", "ca-bundles", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::CaBundle, id)
+                .await
+        }
+        (Method::GET, ["admin", "tls", "crls"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_list_managed(ManagedTlsMaterialKind::Crl, &pagination).await
+        }
+        (Method::POST, ["admin", "tls", "crls"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_create_crl(&state, &body_bytes).await
+        }
+        (Method::GET, ["admin", "tls", "crls", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_get_managed(ManagedTlsMaterialKind::Crl, id).await
+        }
+        (Method::PUT, ["admin", "tls", "crls", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_update_crl(&state, id, &body_bytes).await
+        }
+        (Method::DELETE, ["admin", "tls", "crls", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Crl, id).await
+        }
+        (Method::GET, ["admin", "tls", "ocsp-responses"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_list_managed(ManagedTlsMaterialKind::OcspResponse, &pagination)
+                .await
+        }
+        (Method::POST, ["admin", "tls", "ocsp-responses"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_create_ocsp_response(&state, &body_bytes).await
+        }
+        (Method::GET, ["admin", "tls", "ocsp-responses", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_get_managed(ManagedTlsMaterialKind::OcspResponse, id).await
+        }
+        (Method::PUT, ["admin", "tls", "ocsp-responses", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_update_ocsp_response(&state, id, &body_bytes).await
+        }
+        (Method::DELETE, ["admin", "tls", "ocsp-responses", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::OcspResponse, id)
+                .await
+        }
+        (Method::GET, ["admin", "tls", "jwks"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_list_managed(ManagedTlsMaterialKind::Jwks, &pagination).await
+        }
+        (Method::POST, ["admin", "tls", "jwks"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_create_jwks(&state, &body_bytes).await
+        }
+        (Method::GET, ["admin", "tls", "jwks", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_get_managed(ManagedTlsMaterialKind::Jwks, id).await
+        }
+        (Method::PUT, ["admin", "tls", "jwks", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_update_jwks(&state, id, &body_bytes).await
+        }
+        (Method::DELETE, ["admin", "tls", "jwks", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Jwks, id).await
+        }
+        (Method::POST, ["admin", "tls", "rotate", surface]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_rotate(&state, surface).await
+        }
+        (Method::POST, ["admin", "tls", "validate"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            tls_management::handle_validate(&body_bytes).await
+        }
 
         // Mesh service graph
         (Method::GET, ["mesh", "service-graph"]) => handle_mesh_service_graph_get(&state).await,

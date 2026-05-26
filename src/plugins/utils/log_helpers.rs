@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use serde_json::Value;
-use url::Url;
+use url::{Host, Url};
 
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
@@ -131,6 +131,7 @@ pub fn parse_http_endpoint(
             format!("{plugin_name}: 'endpoint_url' is required — logs will have nowhere to send")
         })?
         .to_string();
+
     let parsed_url = Url::parse(&endpoint_url)
         .map_err(|error| format!("{plugin_name}: invalid 'endpoint_url': {error}"))?;
 
@@ -143,11 +144,36 @@ pub fn parse_http_endpoint(
         }
     }
 
-    let hostname = parsed_url.host_str().ok_or_else(|| {
+    if !has_non_empty_authority(&endpoint_url) {
+        return Err(format!(
+            "{plugin_name}: 'endpoint_url' must include a hostname or IP address"
+        ));
+    }
+
+    let host = parsed_url.host().ok_or_else(|| {
         format!("{plugin_name}: 'endpoint_url' must include a hostname or IP address")
     })?;
+    let hostname = match host {
+        Host::Domain(hostname) => hostname.to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    };
 
-    Ok((endpoint_url, hostname.to_string()))
+    Ok((endpoint_url, hostname))
+}
+
+fn has_non_empty_authority(endpoint_url: &str) -> bool {
+    let Some((_, after_scheme)) = endpoint_url.split_once(':') else {
+        return false;
+    };
+    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
+        return false;
+    };
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+
+    authority_end > 0
 }
 
 pub fn handle_http_batch_response(

@@ -1,4 +1,4 @@
-//! Plugin system — 61 built-in plugins with a trait-based architecture.
+//! Plugin system — 65 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -24,9 +24,11 @@ pub mod ai_response_guard;
 pub mod ai_semantic_cache;
 pub mod ai_token_metrics;
 pub mod api_chargeback;
+pub mod api_chargeback_sink;
 pub mod basic_auth;
 pub mod body_validator;
 pub mod bot_detection;
+pub mod chargeback;
 pub mod compression;
 pub mod correlation_id;
 pub mod cors;
@@ -49,6 +51,10 @@ pub mod loki_logging;
 pub mod mesh;
 pub mod mesh_route_dispatch;
 pub mod mtls_auth;
+pub mod oauth2_introspection;
+pub mod oidc_relying_party;
+pub mod opa;
+pub mod openapi_validator;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
 pub mod proxy_alerts;
@@ -803,10 +809,9 @@ impl RequestContext {
     /// request init time instead of eagerly percent-decoding every param.
     #[inline]
     pub fn set_raw_query_string(&mut self, qs: String) {
-        if !qs.is_empty() {
-            self.raw_query_string = Some(qs);
-            self.query_params_materialized = false;
-        }
+        self.query_params.clear();
+        self.query_params_materialized = false;
+        self.raw_query_string = (!qs.is_empty()).then_some(qs);
     }
 
     /// Borrow the raw query string without materializing it.
@@ -1415,11 +1420,11 @@ pub struct StreamTransactionSummary {
 /// | Band      | Range       | Purpose                                   | Plugins |
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
-/// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), ai_request_guard (2975), ai_federation (2985) |
+/// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), workload_metrics (9360), __mesh_bpf_metrics (9365), access_log (9375) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), access_log (9375) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -1442,6 +1447,8 @@ pub mod priority {
     pub const SPIFFE_IDENTITY: u16 = 940;
     pub const MTLS_AUTH: u16 = 950;
     pub const JWKS_AUTH: u16 = 1000;
+    pub const OAUTH2_INTROSPECTION: u16 = 1050;
+    pub const OIDC_RELYING_PARTY: u16 = 1075;
     pub const JWT_AUTH: u16 = 1100;
     pub const KEY_AUTH: u16 = 1200;
     pub const LDAP_AUTH: u16 = 1250;
@@ -1451,6 +1458,7 @@ pub mod priority {
     pub const ACCESS_CONTROL: u16 = 2000;
     pub const TCP_CONNECTION_THROTTLE: u16 = 2050;
     pub const MESH_AUTHZ: u16 = 2075;
+    pub const OPA: u16 = 2080;
     pub const AI_SEMANTIC_CACHE: u16 = 2700;
     pub const REQUEST_DEDUPLICATION: u16 = 2750;
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
@@ -1460,6 +1468,7 @@ pub mod priority {
     pub const WAF: u16 = 2930;
     pub const FAULT_INJECTION: u16 = 2940;
     pub const BODY_VALIDATOR: u16 = 2950;
+    pub const OPENAPI_VALIDATOR: u16 = 2960;
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const AI_FEDERATION: u16 = 2985;
     /// `mesh_route_dispatch`: rewrites `route_override_*` on `RequestContext`
@@ -1491,6 +1500,7 @@ pub mod priority {
     pub const PROXY_ALERTS: u16 = 9250;
     pub const PROMETHEUS_METRICS: u16 = 9300;
     pub const API_CHARGEBACK: u16 = 9350;
+    pub const API_CHARGEBACK_SINK: u16 = 9351;
     pub const WORKLOAD_METRICS: u16 = 9360;
     /// `__mesh_bpf_metrics`: exposes TCP-layer counters (Connect, Accept,
     /// Rst, Fin, SRTT, BPF drop reasons, ringbuf overrun) from the
@@ -1808,7 +1818,8 @@ pub trait Plugin: Send + Sync {
     /// phase, where auth mode (Single vs Multi) determines how failures are
     /// handled. Custom auth plugins should override this to return `true`.
     ///
-    /// Default is `false`. Built-in auth plugins (jwks_auth, jwt_auth, key_auth,
+    /// Default is `false`. Built-in auth plugins (mtls_auth, jwks_auth,
+    /// oauth2_introspection, oidc_relying_party, jwt_auth, key_auth, ldap_auth,
     /// basic_auth, hmac_auth) override this to return `true`.
     fn is_auth_plugin(&self) -> bool {
         false
@@ -2014,6 +2025,13 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
+        "oauth2_introspection" => Ok(Some(Arc::new(
+            oauth2_introspection::Oauth2Introspection::new(config, http_client.clone())?,
+        ))),
+        "oidc_relying_party" => Ok(Some(Arc::new(oidc_relying_party::OidcRelyingParty::new(
+            config,
+            http_client.clone(),
+        )?))),
         "jwt_auth" => Ok(Some(Arc::new(jwt_auth::JwtAuth::new(config)?))),
         "key_auth" => Ok(Some(Arc::new(key_auth::KeyAuth::new(config)?))),
         "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)?))),
@@ -2033,6 +2051,7 @@ pub fn create_plugin_with_http_client(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
         ))),
         "mesh_authz" => Ok(Some(Arc::new(mesh::authz::MeshAuthz::new(config)?))),
+        "opa" => Ok(Some(Arc::new(opa::Opa::new(config, http_client.clone())?))),
         "mesh_outbound_registry" => Ok(Some(Arc::new(
             mesh::outbound_registry::OutboundRegistry::new(config)?,
         ))),
@@ -2085,6 +2104,9 @@ pub fn create_plugin_with_http_client(
             response_size_limiting::ResponseSizeLimiting::new(config)?,
         ))),
         "body_validator" => Ok(Some(Arc::new(body_validator::BodyValidator::new(config)?))),
+        "openapi_validator" => Ok(Some(Arc::new(openapi_validator::OpenapiValidator::new(
+            config,
+        )?))),
         "soap_ws_security" => Ok(Some(Arc::new(soap_ws_security::SoapWsSecurity::new(
             config,
         )?))),
@@ -2111,6 +2133,11 @@ pub fn create_plugin_with_http_client(
         )?))),
         "api_chargeback" => Ok(Some(Arc::new(api_chargeback::ApiChargeback::new(
             config,
+            http_client.namespace(),
+        )?))),
+        "api_chargeback_sink" => Ok(Some(Arc::new(api_chargeback_sink::ApiChargebackSink::new(
+            config,
+            http_client.clone(),
             http_client.namespace(),
         )?))),
         "otel_tracing" => Ok(Some(Arc::new(
@@ -2215,13 +2242,18 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "jwt_auth"
             | "hmac_auth"
             | "jwks_auth"
+            | "oauth2_introspection"
+            | "oidc_relying_party"
             | "mtls_auth"
             | "mesh_authz"
+            | "opa"
             | "mesh_outbound_registry"
             | "access_control"
             | "tcp_connection_throttle"
+            | "rate_limiting"
             | "ip_restriction"
             | "waf"
+            | "openapi_validator"
             | "soap_ws_security"
     )
 }
@@ -2244,6 +2276,8 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ws_logging",
         "transaction_debugger",
         "jwks_auth",
+        "oauth2_introspection",
+        "oidc_relying_party",
         "jwt_auth",
         "key_auth",
         "basic_auth",
@@ -2252,6 +2286,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "mtls_auth",
         "spiffe_identity",
         "mesh_authz",
+        "opa",
         "mesh_outbound_registry",
         "compression",
         "cors",
@@ -2272,6 +2307,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "waf",
         "response_size_limiting",
         "body_validator",
+        "openapi_validator",
         "request_termination",
         "response_caching",
         "response_mock",
@@ -2301,6 +2337,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "soap_ws_security",
         "spec_expose",
         "api_chargeback",
+        "api_chargeback_sink",
         "workload_metrics",
         "__mesh_bpf_metrics",
         "fault_injection",

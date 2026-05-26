@@ -11,14 +11,19 @@
 //! `major.minor` version compatibility between CP and DP.
 
 use arc_swap::ArcSwap;
+use futures_util::TryStreamExt;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
+use tokio_stream::Stream;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::Server;
-use tonic::transport::server::ServerTlsConfig;
-use tonic::transport::{Certificate, Identity};
+use tonic::transport::server::{Connected, TcpConnectInfo};
 use tracing::{debug, error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
@@ -41,6 +46,168 @@ use crate::xds::XdsAdsServer;
 
 #[cfg(test)]
 use crate::config::incremental_apply::upsert_by_id;
+
+type CpGrpcIncomingStream =
+    Pin<Box<dyn Stream<Item = Result<CpGrpcIo, std::io::Error>> + Send + 'static>>;
+
+enum CpGrpcIo {
+    Plain(TcpStream),
+    Tls(Box<CpGrpcTlsIo>),
+}
+
+struct CpGrpcTlsIo {
+    inner: tokio_rustls::server::TlsStream<TcpStream>,
+    local_addr: Option<SocketAddr>,
+    remote_addr: Option<SocketAddr>,
+}
+
+impl AsyncRead for CpGrpcIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(&mut stream.inner).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for CpGrpcIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(&mut stream.inner).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(&mut stream.inner).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(&mut stream.inner).poll_shutdown(cx),
+        }
+    }
+}
+
+impl Connected for CpGrpcIo {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        match self {
+            Self::Plain(stream) => TcpConnectInfo {
+                local_addr: stream.local_addr().ok(),
+                remote_addr: stream.peer_addr().ok(),
+            },
+            Self::Tls(stream) => TcpConnectInfo {
+                local_addr: stream.local_addr,
+                remote_addr: stream.remote_addr,
+            },
+        }
+    }
+}
+
+fn cp_grpc_plain_incoming(listener: tokio::net::TcpListener) -> CpGrpcIncomingStream {
+    Box::pin(TcpListenerStream::new(listener).map_ok(CpGrpcIo::Plain))
+}
+
+fn cp_grpc_tls_incoming(
+    listener: tokio::net::TcpListener,
+    tls_slot: crate::tls::SharedFrontendTls,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    handshake_timeout_seconds: u64,
+) -> CpGrpcIncomingStream {
+    let (tx, rx) = tokio::sync::mpsc::channel(1024);
+    tokio::spawn(run_cp_grpc_tls_accept_loop(
+        listener,
+        tls_slot,
+        shutdown_rx,
+        handshake_timeout_seconds,
+        tx,
+    ));
+    Box::pin(ReceiverStream::new(rx))
+}
+
+async fn run_cp_grpc_tls_accept_loop(
+    listener: tokio::net::TcpListener,
+    tls_slot: crate::tls::SharedFrontendTls,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    handshake_timeout_seconds: u64,
+    tx: tokio::sync::mpsc::Sender<Result<CpGrpcIo, std::io::Error>>,
+) {
+    loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+
+        tokio::select! {
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, remote_addr)) => {
+                        let tls_config = tls_slot.load().as_ref().clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let Some(tls_config) = tls_config else {
+                                debug!(
+                                    remote_addr = %remote_addr.ip(),
+                                    "Dropping CP gRPC TLS connection: TLS slot is empty"
+                                );
+                                drop(stream);
+                                return;
+                            };
+                            let local_addr = stream.local_addr().ok();
+                            let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+                            match crate::tls::accept_with_optional_timeout(
+                                &acceptor,
+                                stream,
+                                handshake_timeout_seconds,
+                                &remote_addr,
+                                false,
+                            )
+                            .await
+                            {
+                                Ok(inner) => {
+                                    let io = CpGrpcIo::Tls(Box::new(CpGrpcTlsIo {
+                                        inner,
+                                        local_addr,
+                                        remote_addr: Some(remote_addr),
+                                    }));
+                                    let _ = tx.send(Ok(io)).await;
+                                }
+                                Err(error) => {
+                                    debug!(
+                                        remote_addr = %remote_addr.ip(),
+                                        error = %error,
+                                        "CP gRPC TLS handshake failed"
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        error!(error = %error, "Failed to accept CP gRPC connection");
+                    }
+                }
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
 
 /// Resolve which namespaces the CP polling loop should load on each tick.
 ///
@@ -520,6 +687,11 @@ pub async fn run(
         }
     };
     let db: Arc<dyn DatabaseBackend> = Arc::from(db);
+    let db_tls_reload_handle = crate::modes::db_tls_reload::start_db_tls_reload_task(
+        env_config.clone(),
+        db.clone(),
+        Some(shutdown_tx.subscribe()),
+    );
 
     // Custom-plugin migrations: warn on pending, opt-in auto-apply.
     crate::modes::handle_startup_plugin_migrations(
@@ -702,10 +874,11 @@ pub async fn run(
 
         // Load admin TLS configuration
         let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        let admin_tls_config = match tls::load_tls_config_with_client_auth(
+        let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
             admin_cert_path,
             admin_key_path,
             admin_client_ca_bundle,
+            env_config.admin_tls_ocsp_response_source.as_deref(),
             env_config.admin_tls_no_verify,
             &tls_policy,
             env_config.tls_cert_expiry_warning_days,
@@ -786,47 +959,35 @@ pub async fn run(
     };
 
     let grpc_handle = if grpc_addr.port() != 0 {
-        let grpc_tls_config = if let (Some(cert_path), Some(key_path)) = (
+        let grpc_tls_slot = if let (Some(_cert_path), Some(_key_path)) = (
             &env_config.cp_grpc_tls_cert_path,
             &env_config.cp_grpc_tls_key_path,
         ) {
-            // Check certificate expiration
-            tls::check_cert_expiry(
-                cert_path,
-                "CP gRPC TLS cert",
-                env_config.tls_cert_expiry_warning_days,
-            )?;
+            let tls_config = crate::modes::grpc_tls_reload::build_cp_grpc_server_tls_config(
+                &env_config,
+                &tls_policy,
+                &crls,
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid CP gRPC TLS configuration: {e}"))?;
+            let reload_handles = crate::modes::grpc_tls_reload::prepare_cp_grpc_server_tls_reload(
+                tls_config,
+                Arc::new(env_config.clone()),
+                tls_policy.clone(),
+                crls.clone(),
+                Some(shutdown_tx.subscribe()),
+            );
 
-            let cert_pem = std::fs::read(cert_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read CP gRPC TLS cert {}: {}", cert_path, e)
-            })?;
-            let key_pem = std::fs::read(key_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read CP gRPC TLS key {}: {}", key_path, e)
-            })?;
-
-            let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(&cert_pem, &key_pem));
-
-            if let Some(client_ca_path) = &env_config.cp_grpc_tls_client_ca_path {
-                tls::check_cert_expiry(
-                    client_ca_path,
-                    "CP gRPC client CA",
-                    env_config.tls_cert_expiry_warning_days,
-                )?;
-                let ca_pem = std::fs::read(client_ca_path).map_err(|e| {
-                    anyhow::anyhow!("Failed to read CP gRPC client CA {}: {}", client_ca_path, e)
-                })?;
-                tls = tls.client_ca_root(Certificate::from_pem(&ca_pem));
-                info!(
-                    "CP gRPC TLS configured with mTLS (server cert: {}, client CA: {})",
-                    cert_path, client_ca_path
-                );
+            if reload_handles.watcher_handle.is_some() {
+                info!("CP gRPC TLS live reload enabled");
+            }
+            if env_config.cp_grpc_tls_client_ca_path.is_some() {
+                info!("CP gRPC TLS configured with mTLS; new handshakes use the active TLS slot");
             } else {
                 info!(
-                    "CP gRPC TLS configured (server cert: {}, no client verification)",
-                    cert_path
+                    "CP gRPC TLS configured without client certificate verification; new handshakes use the active TLS slot"
                 );
             }
-            Some(tls)
+            Some(reload_handles.slot)
         } else {
             if env_config.cp_grpc_tls_client_ca_path.is_some() {
                 warn!(
@@ -846,6 +1007,8 @@ pub async fn run(
             env_config.server_http2_max_local_error_reset_streams;
         let (grpc_started_tx, grpc_started_rx) = tokio::sync::oneshot::channel();
         let mut grpc_shutdown = shutdown_tx.subscribe();
+        let grpc_accept_shutdown = grpc_shutdown.clone();
+        let grpc_tls_handshake_timeout_seconds = env_config.frontend_tls_handshake_timeout_seconds;
         let handle = tokio::spawn(async move {
             let mut builder = Server::builder()
                 .max_concurrent_streams(Some(grpc_http2_max_concurrent_streams))
@@ -855,15 +1018,6 @@ pub async fn run(
                 .http2_max_local_error_reset_streams(Some(
                     grpc_http2_max_local_error_reset_streams,
                 ));
-            if let Some(tls) = grpc_tls_config {
-                builder = match builder.tls_config(tls) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!("Failed to configure gRPC TLS: {}", e);
-                        return;
-                    }
-                };
-            }
             let shutdown_signal = async move {
                 while !*grpc_shutdown.borrow() {
                     if grpc_shutdown.changed().await.is_err() {
@@ -872,7 +1026,16 @@ pub async fn run(
                 }
                 info!("CP gRPC server shutting down");
             };
-            let incoming = TcpListenerStream::new(grpc_listener);
+            let incoming = if let Some(tls_slot) = grpc_tls_slot {
+                cp_grpc_tls_incoming(
+                    grpc_listener,
+                    tls_slot,
+                    grpc_accept_shutdown,
+                    grpc_tls_handshake_timeout_seconds,
+                )
+            } else {
+                cp_grpc_plain_incoming(grpc_listener)
+            };
             let _ = grpc_started_tx.send(());
             let router = builder
                 .add_service(grpc_server.into_service())
@@ -1666,16 +1829,16 @@ pub async fn run(
     // hanging if a task is stuck (e.g., blocked on a DB query). Same 5 s
     // cap as the pre-refactor inline timeout — a stuck DB poll is never
     // allowed to wedge graceful shutdown.
-    crate::modes::file::join_background_handles(
-        vec![
-            db_poll_handle,
-            mesh_registry_reaper_handle,
-            runtime_system_handle,
-            runtime_window_handle,
-        ],
-        Duration::from_secs(5),
-    )
-    .await;
+    let mut background_handles = vec![
+        db_poll_handle,
+        mesh_registry_reaper_handle,
+        runtime_system_handle,
+        runtime_window_handle,
+    ];
+    if let Some(handle) = db_tls_reload_handle {
+        background_handles.push(handle);
+    }
+    crate::modes::file::join_background_handles(background_handles, Duration::from_secs(5)).await;
 
     Ok(())
 }

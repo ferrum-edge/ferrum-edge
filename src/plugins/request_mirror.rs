@@ -62,7 +62,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::warn;
-use url::form_urlencoded;
+use url::{Host, form_urlencoded};
 
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, parse_max_response_body_bytes,
@@ -95,7 +95,7 @@ pub struct RequestMirror {
     /// against misbehaving sinks. Used only when the mirror response has no
     /// `content-length` header (the CL fast path doesn't read the body).
     max_response_body_bytes: usize,
-    mirror_hostname: String,
+    mirror_hostname: Option<String>,
     /// Monotonic counter for deterministic percentage sampling without rand.
     /// Every Nth request is mirrored based on the percentage threshold.
     request_counter: AtomicU64,
@@ -109,10 +109,11 @@ impl RequestMirror {
             return Err("request_mirror: config must be an object".to_string());
         }
 
-        let mirror_host = optional_string(config, "mirror_host")?
+        let raw_mirror_host = optional_string(config, "mirror_host")?
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "request_mirror: 'mirror_host' is required".to_string())?
             .to_ascii_lowercase();
+        let (mirror_host, mirror_hostname) = parse_mirror_host(&raw_mirror_host)?;
 
         let mirror_protocol = optional_string(config, "mirror_protocol")?
             .unwrap_or_else(|| "http".to_string())
@@ -177,8 +178,6 @@ impl RequestMirror {
             DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES,
         )?;
 
-        let mirror_hostname = mirror_host.clone();
-
         Ok(Self {
             http_client,
             mirror_host,
@@ -238,6 +237,56 @@ impl RequestMirror {
         let count = self.request_counter.fetch_add(1, Ordering::Relaxed);
         let threshold = (self.percentage * 10.0) as u64; // 0.1% granularity
         (count % 1000) < threshold
+    }
+}
+
+fn parse_mirror_host(raw_host: &str) -> Result<(String, Option<String>), String> {
+    let host = raw_host.trim();
+    if host.is_empty() {
+        return Err("request_mirror: 'mirror_host' is required".to_string());
+    }
+    if host
+        .chars()
+        .any(|c| c.is_ascii_whitespace() || c.is_control())
+        || host.contains("://")
+        || host.contains(['/', '?', '#', '@'])
+    {
+        return Err(
+            "request_mirror: 'mirror_host' must be a hostname or IP address without scheme, path, query, fragment, or credentials"
+                .to_string(),
+        );
+    }
+
+    let bracketed = host.starts_with('[') || host.ends_with(']');
+    let host_for_ip = if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+    {
+        inner
+    } else {
+        host
+    };
+
+    if let Ok(ip) = host_for_ip.parse::<std::net::IpAddr>() {
+        return Ok(match ip {
+            std::net::IpAddr::V4(ip) => (ip.to_string(), None),
+            std::net::IpAddr::V6(ip) => (format!("[{ip}]"), None),
+        });
+    }
+
+    if bracketed || host.contains(':') {
+        return Err(
+            "request_mirror: 'mirror_host' must not include brackets or a port unless it is an IPv6 literal"
+                .to_string(),
+        );
+    }
+
+    match Host::parse(host) {
+        Ok(Host::Domain(domain)) if !domain.is_empty() => {
+            let hostname = domain.to_ascii_lowercase();
+            Ok((hostname.clone(), Some(hostname)))
+        }
+        _ => {
+            Err("request_mirror: 'mirror_host' must be a valid hostname or IP address".to_string())
+        }
     }
 }
 
@@ -308,7 +357,7 @@ impl Plugin for RequestMirror {
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        vec![self.mirror_hostname.clone()]
+        self.mirror_hostname.iter().cloned().collect()
     }
 
     async fn before_proxy(
@@ -490,7 +539,10 @@ impl Plugin for RequestMirror {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_query_params;
+    use super::{RequestMirror, parse_mirror_host, strip_query_params};
+    use crate::plugins::PluginHttpClient;
+    use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn strip_query_params_removes_sensitive_query_data() {
@@ -501,6 +553,38 @@ mod tests {
         assert_eq!(
             strip_query_params("https://mirror.example.com:8443/path"),
             "https://mirror.example.com:8443/path"
+        );
+    }
+
+    #[test]
+    fn parse_mirror_host_brackets_ipv6_for_url_authority() {
+        assert_eq!(
+            parse_mirror_host("2001:db8::10").unwrap(),
+            ("[2001:db8::10]".to_string(), None)
+        );
+        assert_eq!(
+            parse_mirror_host("[2001:db8::10]").unwrap(),
+            ("[2001:db8::10]".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn build_mirror_url_uses_bracketed_ipv6_authority() {
+        let plugin = RequestMirror::new(
+            &json!({
+                "mirror_host": "2001:db8::10",
+                "mirror_port": 8443,
+                "mirror_protocol": "https"
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+        let mut query_params = HashMap::new();
+        query_params.insert("page".to_string(), "1".to_string());
+
+        assert_eq!(
+            plugin.build_mirror_url("/shadow", &query_params),
+            "https://[2001:db8::10]:8443/shadow?page=1"
         );
     }
 }

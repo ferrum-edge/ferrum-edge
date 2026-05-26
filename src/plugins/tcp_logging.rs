@@ -28,10 +28,11 @@ use tokio::time::Duration;
 use super::utils::log_schema::{SummaryLogEntryView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
-    resolve_tcp_endpoint, validate_batch_config,
+    parse_socket_host, resolve_tcp_endpoint, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 #[derive(Clone)]
 struct TcpFlushConfig {
@@ -57,7 +58,7 @@ struct TcpFlushConfig {
 
 pub struct TcpLogging {
     logger: BatchingLogger<SummaryLogEntry>,
-    endpoint_hostname: String,
+    endpoint_hostname: Option<String>,
 }
 
 impl TcpLogging {
@@ -66,7 +67,7 @@ impl TcpLogging {
             return Err("tcp_logging: config must be an object".to_string());
         }
 
-        let host = config
+        let raw_host = config
             .get("host")
             .and_then(Value::as_str)
             .map(str::trim)
@@ -75,6 +76,8 @@ impl TcpLogging {
                 "tcp_logging: 'host' is required — logs will have nowhere to send".to_string()
             })?
             .to_string();
+        let socket_host = parse_socket_host("tcp_logging", "host", &raw_host)?;
+        let host = socket_host.dial_host.clone();
 
         let port = config
             .get("port")
@@ -132,7 +135,7 @@ impl TcpLogging {
 
         Ok(Self {
             logger,
-            endpoint_hostname: host,
+            endpoint_hostname: socket_host.warmup_hostname,
         })
     }
 }
@@ -196,7 +199,7 @@ impl Plugin for TcpLogging {
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        vec![self.endpoint_hostname.clone()]
+        self.endpoint_hostname.iter().cloned().collect()
     }
 }
 
@@ -258,26 +261,27 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
 
     if !cfg.tls_no_verify {
         if let Some(ca_path) = &cfg.tls_ca_bundle_path {
-            match std::fs::read(ca_path) {
-                Ok(ca_pem) => {
-                    let certs = rustls_pemfile::certs(&mut &ca_pem[..])
+            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+            match load_material_blocking(&source, MaterialKind::CaBundle) {
+                Ok(ca_material) => {
+                    let source_id = ca_material.source_id.clone();
+                    let mut reader = ca_material.bytes.expose_secret();
+                    let certs = rustls_pemfile::certs(&mut reader)
                         .filter_map(|cert| cert.ok())
                         .collect::<Vec<_>>();
                     if certs.is_empty() {
                         return Err(format!(
-                            "TCP logging: no valid certificates found in CA bundle {ca_path}"
+                            "TCP logging: no valid certificates found in CA bundle {source_id}"
                         ));
                     }
                     for cert in certs {
                         root_store.add(cert).map_err(|error| {
-                            format!("TCP logging: failed to add CA cert from {ca_path}: {error}")
+                            format!("TCP logging: failed to add CA cert from {source_id}: {error}")
                         })?;
                     }
                 }
                 Err(error) => {
-                    return Err(format!(
-                        "TCP logging: failed to read CA bundle {ca_path}: {error}"
-                    ));
+                    return Err(format!("TCP logging: failed to load CA bundle: {error}"));
                 }
             }
         } else {
@@ -620,6 +624,7 @@ mod tests {
             "ferrum",
             crate::config::BackendAllowIps::Both,
             std::sync::Arc::new(Vec::new()),
+            0,
         );
 
         let plugin = TcpLogging::new(

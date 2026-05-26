@@ -218,19 +218,33 @@ pub(super) fn resolve_optional_string(
 }
 
 pub(super) fn validate_webhook_url(url: &str, channel: &str, kind: &str) -> Result<(), String> {
+    validate_notification_url(url, channel, kind, "webhook_url")
+}
+
+pub(super) fn validate_notification_url(
+    url: &str,
+    channel: &str,
+    kind: &str,
+    field: &str,
+) -> Result<(), String> {
     let parsed = Url::parse(url)
-        .map_err(|e| format!("channel '{channel}' ({kind}): invalid 'webhook_url': {e}"))?;
+        .map_err(|e| format!("channel '{channel}' ({kind}): invalid '{field}': {e}"))?;
     match parsed.scheme() {
         "http" | "https" => {}
         s => {
             return Err(format!(
-                "channel '{channel}' ({kind}): 'webhook_url' must use http:// or https:// (got '{s}')"
+                "channel '{channel}' ({kind}): '{field}' must use http:// or https:// (got '{s}')"
             ));
         }
     }
     if parsed.host_str().is_none() {
         return Err(format!(
-            "channel '{channel}' ({kind}): 'webhook_url' must include a hostname"
+            "channel '{channel}' ({kind}): '{field}' must include a hostname"
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "channel '{channel}' ({kind}): '{field}' must not include username or password credentials"
         ));
     }
     Ok(())

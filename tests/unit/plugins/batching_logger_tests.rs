@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrum_edge::plugins::utils::{
-    BatchConfig, BatchConfigDefaults, BatchingLogger, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY,
-    RetryPolicy, build_batch_config, validate_batch_config,
+    BatchConfig, BatchConfigDefaults, BatchingLogger, LoggerHooks, MAX_BATCH_SIZE,
+    MAX_BUFFER_CAPACITY, RetryPolicy, build_batch_config, handle_http_batch_response,
+    parse_http_endpoint, validate_batch_config,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -101,6 +102,35 @@ fn build_batch_config_caps_unbounded_values() {
 }
 
 #[test]
+fn build_batch_config_applies_defaults_and_lower_bounds() {
+    let cfg = build_batch_config(
+        &json!({
+            "batch_size": 0,
+            "buffer_capacity": 0,
+            "flush_interval_ms": 1,
+            "max_retries": 0,
+            "retry_delay_ms": 0
+        }),
+        "batching_logger_bounds",
+        batch_defaults(),
+    );
+
+    assert_eq!(cfg.batch_size, 1);
+    assert_eq!(cfg.buffer_capacity, 1);
+    assert_eq!(cfg.flush_interval, Duration::from_millis(100));
+    assert_eq!(cfg.retry.max_attempts, 1);
+    assert_eq!(cfg.retry.delay, Duration::from_millis(0));
+    assert_eq!(cfg.plugin_name, "batching_logger_bounds");
+
+    let default_cfg = build_batch_config(&json!({}), "batching_logger_defaults", batch_defaults());
+    assert_eq!(default_cfg.batch_size, 50);
+    assert_eq!(default_cfg.buffer_capacity, 10_000);
+    assert_eq!(default_cfg.flush_interval, Duration::from_millis(1000));
+    assert_eq!(default_cfg.retry.max_attempts, 4);
+    assert_eq!(default_cfg.retry.delay, Duration::from_millis(1000));
+}
+
+#[test]
 fn validate_batch_config_rejects_malformed_numeric_values() {
     for config in [
         json!({"batch_size": "many"}),
@@ -112,6 +142,86 @@ fn validate_batch_config_rejects_malformed_numeric_values() {
         assert!(
             validate_batch_config(&config, "batching_logger_bounds", batch_defaults()).is_err(),
             "expected invalid config to be rejected: {config}"
+        );
+    }
+}
+
+#[test]
+fn parse_http_endpoint_accepts_http_https_host_forms() {
+    let cases = [
+        (
+            json!({"endpoint_url": "http://logs.example.com/v1?tenant=edge#ignored"}),
+            "http://logs.example.com/v1?tenant=edge#ignored",
+            "logs.example.com",
+        ),
+        (
+            json!({"endpoint_url": "https://[2001:db8::1]:9443/loki/api/v1/push"}),
+            "https://[2001:db8::1]:9443/loki/api/v1/push",
+            "2001:db8::1",
+        ),
+    ];
+
+    for (config, expected_endpoint, expected_host) in cases {
+        let (endpoint, host) = parse_http_endpoint(&config, "batching_logger_endpoint").unwrap();
+        assert_eq!(endpoint, expected_endpoint);
+        assert_eq!(host, expected_host);
+    }
+}
+
+#[test]
+fn parse_http_endpoint_rejects_unusable_endpoint_forms() {
+    for config in [
+        json!({}),
+        json!({"endpoint_url": ""}),
+        json!({"endpoint_url": 42}),
+        json!({"endpoint_url": "not a url"}),
+        json!({"endpoint_url": "tcp://logs.example.com:9000"}),
+        json!({"endpoint_url": "http:///logs"}),
+    ] {
+        assert!(
+            parse_http_endpoint(&config, "batching_logger_endpoint").is_err(),
+            "expected unusable endpoint to be rejected: {config}"
+        );
+    }
+}
+
+#[test]
+fn handle_http_batch_response_classifies_retryable_and_discarded_statuses() {
+    for status in [
+        reqwest::StatusCode::OK,
+        reqwest::StatusCode::CREATED,
+        reqwest::StatusCode::NO_CONTENT,
+        reqwest::StatusCode::BAD_REQUEST,
+        reqwest::StatusCode::UNAUTHORIZED,
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+    ] {
+        let response = http::Response::builder()
+            .status(status)
+            .body("")
+            .unwrap()
+            .into();
+        assert!(
+            handle_http_batch_response("batching_logger_http", 3, Ok(response)).is_ok(),
+            "expected status {status} to be accepted or discarded without retry"
+        );
+    }
+
+    for status in [
+        reqwest::StatusCode::REQUEST_TIMEOUT,
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        reqwest::StatusCode::BAD_GATEWAY,
+    ] {
+        let response = http::Response::builder()
+            .status(status)
+            .body("")
+            .unwrap()
+            .into();
+        let err = handle_http_batch_response("batching_logger_http", 3, Ok(response))
+            .expect_err("expected retryable status to be returned as an error");
+        assert!(
+            err.contains(&status.to_string()),
+            "error should include retryable status {status}: {err}"
         );
     }
 }
@@ -336,6 +446,39 @@ async fn full_channel_warns_once_per_rate_limit_window() {
         .matches("batching_logger_drop: dropping queued log entry because buffer full")
         .count();
     assert_eq!(occurrences, 1, "drop warnings should be rate-limited");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn high_water_hook_fires_without_overflow_hook() {
+    let high_water_hits = Arc::new(AtomicUsize::new(0));
+    let high_water_hits_clone = Arc::clone(&high_water_hits);
+    let logger = BatchingLogger::spawn_with_hooks(
+        BatchConfig {
+            batch_size: 10,
+            flush_interval: Duration::from_secs(60),
+            buffer_capacity: 1,
+            retry: RetryPolicy {
+                max_attempts: 1,
+                delay: Duration::from_millis(0),
+            },
+            plugin_name: "batching_logger_high_water",
+        },
+        LoggerHooks {
+            on_high_water: Some(Arc::new(move |_, _| {
+                high_water_hits_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+            high_watermark_percent: 1,
+            ..LoggerHooks::default()
+        },
+        move |_batch: Vec<u32>| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(())
+        },
+    );
+
+    assert!(logger.try_send(1));
+    assert!(!logger.try_send(2));
+    assert_eq!(high_water_hits.load(Ordering::Relaxed), 1);
 }
 
 struct CloneTracked {

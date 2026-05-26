@@ -1,83 +1,59 @@
-/// Test admin API separate HTTP and HTTPS listeners
+use ferrum_edge::config::EnvConfig;
+
 #[test]
-fn test_admin_separate_listeners() {
-    println!("✅ Admin API separate listeners test:");
-    println!();
-    println!("Architecture:");
-    println!("  - Admin HTTP Listener: Always enabled on admin_http_port (default 9000)");
-    println!("  - Admin HTTPS Listener: Enabled only when admin TLS certificates are configured");
-    println!("  - Admin HTTPS Port: admin_https_port (default 9443)");
-    println!("  - JWT Authentication: Required for all admin endpoints");
-    println!("  - No mTLS: Admin API uses server TLS only (no client cert verification)");
-    println!();
-    println!("Benefits:");
-    println!("  - Secure admin operations over HTTPS");
-    println!("  - HTTP fallback for development/internal networks");
-    println!("  - Same security model across all operating modes");
-    println!("  - Clear protocol separation for management traffic");
+fn admin_listener_defaults_use_distinct_http_and_https_ports() {
+    let config = EnvConfig::default();
+
+    assert_eq!(config.admin_http_port, 9000);
+    assert_eq!(config.admin_https_port, 9443);
+    assert_ne!(config.admin_http_port, config.admin_https_port);
+
+    let reserved = config.reserved_gateway_ports();
+    assert!(reserved.contains(&config.admin_http_port));
+    assert!(reserved.contains(&config.admin_https_port));
 }
 
-/// Test admin API configuration scenarios
 #[test]
-fn test_admin_listener_scenarios() {
-    println!("✅ Admin API listener scenarios:");
-    println!();
-    println!("1. HTTP Only (default):");
-    println!("   - No admin TLS environment variables");
-    println!("   - Admin HTTP listener on port 9000");
-    println!("   - No admin HTTPS listener");
-    println!("   - Use case: Development, internal networks");
-    println!();
-    println!("2. HTTP + HTTPS:");
-    println!("   - FERRUM_ADMIN_TLS_CERT_PATH and FERRUM_ADMIN_TLS_KEY_PATH set");
-    println!("   - Admin HTTP listener on port 9000");
-    println!("   - Admin HTTPS listener on port 9443");
-    println!("   - Use case: Production with secure admin access");
-    println!();
-    println!("3. HTTPS Only (production):");
-    println!("   - Admin TLS configured, HTTP port blocked by firewall");
-    println!("   - Only admin HTTPS listener accessible");
-    println!("   - Use case: High-security environments");
+fn admin_socket_addr_uses_admin_bind_address_not_proxy_bind_address() {
+    let config = EnvConfig {
+        proxy_bind_address: "127.0.0.1".to_string(),
+        admin_bind_address: "127.0.0.2".to_string(),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        config.proxy_socket_addr(config.proxy_http_port).to_string(),
+        "127.0.0.1:8000"
+    );
+    assert_eq!(
+        config.admin_socket_addr(config.admin_http_port).to_string(),
+        "127.0.0.2:9000"
+    );
 }
 
-/// Test admin API environment variables
 #[test]
-fn test_admin_env_vars() {
-    println!("✅ Admin API environment variables:");
-    println!();
-    println!("Required for HTTPS:");
-    println!("  - FERRUM_ADMIN_TLS_CERT_PATH: Admin server TLS certificate");
-    println!("  - FERRUM_ADMIN_TLS_KEY_PATH: Admin server TLS private key");
-    println!();
-    println!("Ports (configurable):");
-    println!("  - FERRUM_ADMIN_HTTP_PORT: Admin HTTP port (default 9000)");
-    println!("  - FERRUM_ADMIN_HTTPS_PORT: Admin HTTPS port (default 9443)");
-    println!();
-    println!("Authentication:");
-    println!("  - FERRUM_ADMIN_JWT_SECRET: Required for JWT authentication");
-    println!("  - Same JWT tokens work on both HTTP and HTTPS");
+fn disabled_admin_listener_ports_do_not_reserve_port_zero() {
+    let config = EnvConfig {
+        admin_http_port: 0,
+        admin_https_port: 0,
+        ..Default::default()
+    };
+
+    let reserved = config.reserved_gateway_ports();
+    assert!(!reserved.contains(&0));
+    assert!(!reserved.contains(&9000));
+    assert!(!reserved.contains(&9443));
+    assert!(reserved.contains(&config.proxy_http_port));
+    assert!(reserved.contains(&config.proxy_https_port));
 }
 
-/// Test admin API operating modes
 #[test]
-fn test_admin_operating_modes() {
-    println!("✅ Admin API support across operating modes:");
-    println!();
-    println!("Database Mode:");
-    println!("  - Admin HTTP listener: Always enabled");
-    println!("  - Admin HTTPS listener: If TLS configured");
-    println!("  - Database polling: Config reloads");
-    println!();
-    println!("Control Plane Mode:");
-    println!("  - Admin HTTP listener: Always enabled");
-    println!("  - Admin HTTPS listener: If TLS configured");
-    println!("  - gRPC server: Data plane communication");
-    println!();
-    println!("File Mode:");
-    println!("  - No admin API (proxy only)");
-    println!("  - File-based configuration only");
-    println!();
-    println!("Data Plane Mode:");
-    println!("  - No admin API (proxy only)");
-    println!("  - gRPC client to control plane");
+fn cp_grpc_listener_port_is_reserved_when_configured() {
+    let config = EnvConfig {
+        cp_grpc_listen_addr: Some("0.0.0.0:50051".to_string()),
+        ..Default::default()
+    };
+
+    let reserved = config.reserved_gateway_ports();
+    assert!(reserved.contains(&50051));
 }

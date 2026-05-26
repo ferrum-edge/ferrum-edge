@@ -1,75 +1,47 @@
-/// Test frontend TLS configuration with client certificate verification
+use ferrum_edge::config::EnvConfig;
+
 #[test]
-fn test_frontend_tls_configuration() {
-    // This test verifies that the frontend TLS configuration can be loaded
-    // with optional client certificate verification
+fn frontend_tls_defaults_have_no_server_or_client_material() {
+    let config = EnvConfig::default();
 
-    // Test without client CA bundle (regular HTTPS)
-    let _config_without_client_ca = r#"
-    # Server certificate and key
-    FERRUM_FRONTEND_TLS_CERT_PATH="/path/to/server.crt"
-    FERRUM_FRONTEND_TLS_KEY_PATH="/path/to/server.key"
-    "#;
+    assert!(config.frontend_tls_cert_path.is_none());
+    assert!(config.frontend_tls_key_path.is_none());
+    assert!(config.frontend_tls_client_ca_bundle_path.is_none());
+    assert!(!config.tls_no_verify);
+}
 
-    println!("✅ Frontend TLS configuration test:");
-    println!(
-        "   - Server certificates: FERRUM_FRONTEND_TLS_CERT_PATH, FERRUM_FRONTEND_TLS_KEY_PATH"
+#[test]
+fn frontend_tls_server_material_and_client_ca_are_preserved() {
+    let config = EnvConfig {
+        frontend_tls_cert_path: Some("/etc/ferrum/frontend.crt".to_string()),
+        frontend_tls_key_path: Some("/etc/ferrum/frontend.key".to_string()),
+        frontend_tls_client_ca_bundle_path: Some("/etc/ferrum/client-ca.pem".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        config.frontend_tls_cert_path.as_deref(),
+        Some("/etc/ferrum/frontend.crt")
     );
-    println!("   - Optional client CA: FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH");
-    println!("   - When client CA is provided: mTLS (mutual TLS) is enabled");
-    println!("   - When client CA is not provided: regular HTTPS");
+    assert_eq!(
+        config.frontend_tls_key_path.as_deref(),
+        Some("/etc/ferrum/frontend.key")
+    );
+    assert_eq!(
+        config.frontend_tls_client_ca_bundle_path.as_deref(),
+        Some("/etc/ferrum/client-ca.pem")
+    );
 }
 
-/// Test environment variable parsing for frontend TLS
 #[test]
-fn test_frontend_tls_env_vars() {
-    // Verify the expected environment variables are documented
-    let expected_env_vars = vec![
-        (
-            "FERRUM_FRONTEND_TLS_CERT_PATH",
-            "Path to server TLS certificate",
-        ),
-        (
-            "FERRUM_FRONTEND_TLS_KEY_PATH",
-            "Path to server TLS private key",
-        ),
-        (
-            "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH",
-            "Path to client CA bundle for mTLS",
-        ),
-    ];
+fn frontend_client_ca_does_not_toggle_backend_or_admin_no_verify_flags() {
+    let config = EnvConfig {
+        frontend_tls_client_ca_bundle_path: Some("/etc/ferrum/client-ca.pem".to_string()),
+        ..Default::default()
+    };
 
-    for (env_var, description) in expected_env_vars {
-        println!("✅ Environment variable: {} - {}", env_var, description);
-    }
-
-    println!("✅ Frontend TLS environment variables documented correctly");
-}
-
-/// Test TLS configuration loading scenarios
-#[test]
-fn test_tls_scenarios() {
-    println!("✅ Frontend TLS scenarios:");
-    println!();
-    println!("1. HTTP Only (no TLS):");
-    println!("   - No FERRUM_FRONTEND_TLS_CERT_PATH or FERRUM_FRONTEND_TLS_KEY_PATH");
-    println!("   - Gateway listens on HTTP port only");
-    println!();
-    println!("2. HTTPS (server TLS only):");
-    println!("   - FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH provided");
-    println!("   - No FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH");
-    println!("   - Gateway presents server certificate to clients");
-    println!("   - Clients verify server certificate using system trust store");
-    println!();
-    println!("3. mTLS (mutual TLS):");
-    println!("   - All HTTPS environment variables provided");
-    println!("   - Plus FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH");
-    println!("   - Gateway presents server certificate");
-    println!("   - Gateway requires and verifies client certificates");
-    println!("   - Only clients with certificates from trusted CAs can connect");
-    println!();
-    println!("4. Use Cases:");
-    println!("   - HTTP: Development, internal networks");
-    println!("   - HTTPS: Public-facing services with encryption");
-    println!("   - mTLS: Enterprise APIs, microservices, zero-trust networks");
+    assert!(config.frontend_tls_client_ca_bundle_path.is_some());
+    assert!(!config.tls_no_verify);
+    assert!(!config.admin_tls_no_verify);
+    assert!(config.admin_tls_client_ca_bundle_path.is_none());
 }

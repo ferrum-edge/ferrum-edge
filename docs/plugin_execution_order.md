@@ -21,7 +21,7 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 3. authorize            │  AuthZ, consumer rate limiting, WAF metadata
+│ 3. authorize            │  AuthZ, OPA decisions, consumer rate limiting, WAF metadata
 └────────────┬────────────┘
              │
              ▼
@@ -89,9 +89,9 @@ Connection/Session In
 └─────────────────────────┘
 ```
 
-Body-aware plugins such as `graphql`, request-side `body_validator`, `waf`, `ai_request_guard`, and `ai_prompt_shield` now pre-buffer only matching request bodies (for example JSON `POST` requests). Non-matching requests can continue on the faster streaming path.
+Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_validator`, `waf`, `ai_request_guard`, and `ai_prompt_shield` now pre-buffer only matching request bodies (for example JSON `POST` requests). Non-matching requests can continue on the faster streaming path.
 
-`waf` request metadata inspection (path, query, headers, cookies, and method) runs in the `authorize` phase at priority 2930, after authentication and earlier authorization plugins such as `access_control`, `mesh_authz`, and consumer-aware `rate_limiting`. Authenticated proxies that reject during auth/authz therefore avoid WAF scan cost, while public/no-auth proxies still run WAF before backend dispatch. WAF request-body inspection remains on the final backend-visible request body.
+`waf` request metadata inspection (path, query, headers, cookies, and method) runs in the `authorize` phase at priority 2930, after authentication and earlier authorization plugins such as `access_control`, `mesh_authz`, `opa`, and consumer-aware `rate_limiting`. Authenticated proxies that reject during auth/authz therefore avoid WAF scan cost, while public/no-auth proxies still run WAF before backend dispatch. WAF request-body inspection remains on the final backend-visible request body.
 
 **Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS and UDP+DTLS listeners it runs after the frontend TLS/DTLS handshake and before the backend connection/session is opened, so plugins can inspect the client certificate without spending upstream capacity first. Frontend TLS/DTLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection/session immediately and do not dial the backend. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`.
 
@@ -120,6 +120,7 @@ Body-aware plugins such as `graphql`, request-side `body_validator`, `waf`, `ai_
 | `udp_logging` | | ✓ | Sends stream connection logs to UDP/DTLS endpoint |
 | `ws_logging` | | ✓ | Sends stream connection logs to WebSocket endpoint |
 | `prometheus_metrics` | | ✓ | Records `ferrum_stream_connections_total` counter and `ferrum_stream_duration_ms` histogram |
+| `api_chargeback_sink` | | ✓ | Exports durable stream charge events or snapshot deltas to ClickHouse |
 | `workload_metrics` | ✓ | ✓ | Adds mesh workload/source labels to stream metadata and emits mesh spans when Telemetry providers are configured |
 | `transaction_debugger` | | ✓ | Prints debug info for stream connections |
 
@@ -224,12 +225,12 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
-| **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `ai_semantic_cache` (2700), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `ai_request_guard` (2975), `ai_federation` (2985), `mesh_route_dispatch` (2995) |
+| **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `oauth2_introspection` (1050), `oidc_relying_party` (1075), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `ai_semantic_cache` (2700), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_request_guard` (2975), `ai_federation` (2985), `mesh_route_dispatch` (2995) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `load_testing` (3080), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_response_guard` (4075), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
-| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `proxy_alerts` (9250), `prometheus_metrics` (9300), `api_chargeback` (9350), `workload_metrics` (9360), `__mesh_bpf_metrics` (9365) |
+| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `proxy_alerts` (9250), `prometheus_metrics` (9300), `api_chargeback` (9350), `api_chargeback_sink` (9351), `workload_metrics` (9360), `__mesh_bpf_metrics` (9365) |
 
 `soap_ws_security` keeps AuthN-band priority 1500 for ordering, but validates SOAP bodies in `before_proxy` after request-body buffering is available.
 
@@ -260,58 +261,63 @@ Given all built-in plugins enabled, the execution order is:
 | 13 | `spiffe_identity` | 940 | on_request_received, on_stream_connect |
 | 14 | `mtls_auth` | 950 | authenticate, on_stream_connect |
 | 15 | `jwks_auth` | 1000 | authenticate |
-| 16 | `jwt_auth` | 1100 | authenticate |
-| 17 | `key_auth` | 1200 | authenticate |
-| 18 | `ldap_auth` | 1250 | authenticate |
-| 19 | `basic_auth` | 1300 | authenticate |
-| 20 | `hmac_auth` | 1400 | authenticate |
-| 21 | `soap_ws_security` | 1500 | before_proxy |
-| 22 | `access_control` | 2000 | authorize, on_stream_connect |
-| 23 | `tcp_connection_throttle` | 2050 | on_stream_connect, on_stream_disconnect |
-| 24 | `mesh_authz` | 2075 | authorize, on_stream_connect |
-| 25 | `ai_semantic_cache` | 2700 | before_proxy, after_proxy, on_final_response_body |
-| 26 | `request_deduplication` | 2750 | before_proxy, on_final_response_body |
-| 27 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
-| 28 | `ws_message_size_limiting` | 2810 | on_ws_frame |
-| 29 | `graphql` | 2850 | before_proxy |
-| 30 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
-| 31 | `ws_rate_limiting` | 2910 | on_ws_frame |
-| 32 | `udp_rate_limiting` | 2915 | on_udp_datagram |
-| 33 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 34 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body |
-| 35 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
-| 36 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
-| 37 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 38 | `ai_federation` | 2985 | before_proxy |
-| 39 | `mesh_route_dispatch` | 2995 | before_proxy |
-| 40 | `request_transformer` | 3000 | before_proxy, transform_request_body |
-| 41 | `serverless_function` | 3025 | before_proxy |
-| 42 | `response_mock` | 3030 | before_proxy |
-| 43 | `grpc_deadline` | 3050 | before_proxy |
-| 44 | `request_mirror` | 3075 | before_proxy |
-| 45 | `load_testing` | 3080 | before_proxy |
-| 46 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 47 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
-| 48 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 49 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
-| 50 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
-| 51 | `ai_token_metrics` | 4100 | on_response_body |
-| 52 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
-| 53 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 54 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 55 | `statsd_logging` | 9075 | log, on_stream_disconnect |
-| 56 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 57 | `tcp_logging` | 9125 | log, on_stream_disconnect |
-| 58 | `kafka_logging` | 9150 | log, on_stream_disconnect |
-| 59 | `loki_logging` | 9155 | log, on_stream_disconnect |
-| 60 | `udp_logging` | 9160 | log, on_stream_disconnect |
-| 61 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 62 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 63 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
-| 64 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
-| 65 | `api_chargeback` | 9350 | log |
-| 66 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
-| 67 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
+| 16 | `oauth2_introspection` | 1050 | authenticate, before_proxy |
+| 17 | `oidc_relying_party` | 1075 | authenticate, before_proxy |
+| 18 | `jwt_auth` | 1100 | authenticate |
+| 19 | `key_auth` | 1200 | authenticate |
+| 20 | `ldap_auth` | 1250 | authenticate |
+| 21 | `basic_auth` | 1300 | authenticate |
+| 22 | `hmac_auth` | 1400 | authenticate |
+| 23 | `soap_ws_security` | 1500 | before_proxy |
+| 24 | `access_control` | 2000 | authorize, on_stream_connect |
+| 25 | `tcp_connection_throttle` | 2050 | on_stream_connect, on_stream_disconnect |
+| 26 | `mesh_authz` | 2075 | authorize, on_stream_connect |
+| 27 | `opa` | 2080 | authorize |
+| 28 | `ai_semantic_cache` | 2700 | before_proxy, after_proxy, on_final_response_body |
+| 29 | `request_deduplication` | 2750 | before_proxy, on_final_response_body |
+| 30 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
+| 31 | `ws_message_size_limiting` | 2810 | on_ws_frame |
+| 32 | `graphql` | 2850 | before_proxy |
+| 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
+| 34 | `ws_rate_limiting` | 2910 | on_ws_frame |
+| 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
+| 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body |
+| 38 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
+| 39 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
+| 40 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, on_final_response_body |
+| 41 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 42 | `ai_federation` | 2985 | before_proxy |
+| 43 | `mesh_route_dispatch` | 2995 | before_proxy |
+| 44 | `request_transformer` | 3000 | before_proxy, transform_request_body |
+| 45 | `serverless_function` | 3025 | before_proxy |
+| 46 | `response_mock` | 3030 | before_proxy |
+| 47 | `grpc_deadline` | 3050 | before_proxy |
+| 48 | `request_mirror` | 3075 | before_proxy |
+| 49 | `load_testing` | 3080 | before_proxy |
+| 50 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
+| 51 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 52 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 53 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 54 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
+| 55 | `ai_token_metrics` | 4100 | on_response_body |
+| 56 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 57 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 58 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 59 | `statsd_logging` | 9075 | log, on_stream_disconnect |
+| 60 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 61 | `tcp_logging` | 9125 | log, on_stream_disconnect |
+| 62 | `kafka_logging` | 9150 | log, on_stream_disconnect |
+| 63 | `loki_logging` | 9155 | log, on_stream_disconnect |
+| 64 | `udp_logging` | 9160 | log, on_stream_disconnect |
+| 65 | `ws_logging` | 9175 | log, on_stream_disconnect |
+| 66 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 67 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
+| 68 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 69 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
+| 70 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
+| 71 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
+| 72 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
 
 ## Why This Order Matters
 
@@ -347,7 +353,7 @@ Browser preflight (`OPTIONS`) requests must be answered before authentication. I
 
 ### Authentication before authorization (1000s before 2000s)
 
-Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer` and/or `ctx.authenticated_identity`). Authorization plugins like `access_control` then decide *whether* that identity is allowed — by consumer username, ACL group membership, or both. Running auth first is required — ACL checks are meaningless without a verified identity.
+Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer` and/or `ctx.authenticated_identity`). Authorization plugins like `access_control` and `opa` then decide *whether* that identity is allowed — by consumer username, ACL group membership, or external policy. Running auth first is required — authorization checks are meaningless without a verified identity.
 
 After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller. `X-Consumer-Username` uses the mapped Consumer username when available, otherwise an external auth header/display identity (for example from `jwks_auth`), otherwise the raw external authenticated identity.
 
@@ -363,6 +369,10 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 **Header exposure** (`expose_headers: true`): When enabled, the plugin injects `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, and `x-ratelimit-identity` headers on both upstream requests (`before_proxy`) and downstream responses (`after_proxy`). This lets backends and clients see current rate-limit state without additional lookups. Disabled by default so gateway admins control whether limit details are exposed.
 
 **Redis mode** (`sync_mode: "redis"`): rate-limit counter plugins support only `local` and `redis` storage; database-backed counters are intentionally unsupported. `rate_limiting`, `ai_rate_limiter`, `graphql`, `grpc_method_router`, and `udp_rate_limiting` use Redis for coordinated counters across multiple gateway instances. `ws_rate_limiting` also supports Redis, but only to externalize its per-connection counters; because WebSocket connection IDs are process-local, it namespaces keys per gateway instance to avoid cross-instance collisions rather than sharing a portable connection budget across reconnects. When Redis is unavailable, these plugins automatically fall back to local in-memory state and switch back when connectivity is restored. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+
+### OpenAPI validation runs after body validation (priority 2960)
+
+`openapi_validator` runs after the generic `body_validator` so explicit per-proxy body checks can fail first, then the generated OpenAPI contract can enforce operation-specific schemas. It runs before AI request policy and request transformation, which means contract mismatches are caught before the request body is reshaped or sent to an upstream.
 
 ### AI Plugins: PII shield → guard → federation → metrics → rate limiter (2925–4200)
 
@@ -491,6 +501,8 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `spiffe_identity` | ✓ | ✓ | ✓ | ✓ | ✓ | Extracts SPIFFE IDs from TLS/DTLS client certificates |
 | `mtls_auth` | ✓ | ✓ | ✓ | ✓ | ✓ | Requires TLS/DTLS client certificate |
 | `jwks_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
+| `oauth2_introspection` | ✓ | ✓ | ✓ | | | Requires HTTP bearer token headers or query params |
+| `oidc_relying_party` | ✓ | ✓ | ✓ | | | Browser-oriented HTTP authentication flow |
 | `jwt_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `ldap_auth` | ✓ | ✓ | ✓ | | | Requires HTTP Basic auth header; authenticates against LDAP directory |
@@ -499,6 +511,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `soap_ws_security` | ✓ | | | | | SOAP XML body parsing (text/xml, application/soap+xml) |
 | `access_control` | ✓ | ✓ | ✓ | ✓ | ✓ | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `mesh_authz` | ✓ | ✓ | ✓ | ✓ | ✓ | Applies Layer 2 mesh policy using SPIFFE or HBONE identities |
+| `opa` | ✓ | | | | | Delegates HTTP request authorization to an OPA Data API policy |
 | `tcp_connection_throttle` | | | | ✓ | | Tracks active TCP connections per Consumer or client IP |
 | `grpc_web` | ✓ | ✓ | | | | Translates gRPC-Web (browser) ↔ native gRPC (HTTP/2) |
 | `grpc_method_router` | | ✓ | | | | gRPC method-level access control and rate limiting |
@@ -514,6 +527,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions) |
 | `response_mock` | ✓ | ✓ | | | | Returns mock responses for API testing before backends are ready |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
+| `openapi_validator` | ✓ | | | | | Validates bodies against generated OpenAPI operation schemas |
 | `spec_expose` | ✓ | | | | | HTTP-only; requires prefix listen_path |
 | `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |
 | `response_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy response body size limits |
@@ -540,7 +554,8 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `transaction_debugger` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `proxy_alerts` | ✓ | ✓ | ✓ | ✓ | ✓ | Anomaly notifications across all protocols |
 | `prometheus_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Metrics for all protocols |
-| `api_chargeback` | ✓ | ✓ | ✓ | | | Charges for HTTP-family protocols |
+| `api_chargeback` | ✓ | ✓ | ✓ | ✓ | ✓ | In-memory charge accumulator for HTTP-family, WebSocket bandwidth, and stream sessions |
+| `api_chargeback_sink` | ✓ | ✓ | ✓ | ✓ | ✓ | Durable ClickHouse charge event/snapshot exporter |
 | `workload_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Adds Istio/GAMMA mesh identity labels to metadata |
 | `otel_tracing` | ✓ | ✓ | ✓ | ✓ | ✓ | Tracing for all protocols |
 

@@ -29,6 +29,7 @@ use crate::config::types::{
 };
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::load_balancer::LoadBalancerCache;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use dashmap::DashMap;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -63,6 +64,34 @@ fn active_target_key(upstream_id: &str, target: &UpstreamTarget) -> String {
 /// Build a plain "host:port" key for passive health state lookups.
 fn host_port_key(target: &UpstreamTarget) -> String {
     format!("{}:{}", target.host, target.port)
+}
+
+fn format_probe_socket_addr(host: &str, port: u16) -> String {
+    if !host.starts_with('[') && host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+fn format_probe_url(scheme: &str, host: &str, port: u16, path: &str) -> String {
+    let host = if !host.starts_with('[') && host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    };
+    format!("{}://{}:{}{}", scheme, host, port, path)
+}
+
+fn load_probe_tls_material(
+    source_value: &str,
+    kind: MaterialKind,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let source = CertSource::parse(source_value, kind);
+    load_material_blocking(&source, kind)
+        .map(|material| material.bytes.expose_secret().to_vec())
+        .map_err(|e| format!("{label}: {e}"))
 }
 
 /// Re-export the cap from types so runtime and validation share one value.
@@ -786,7 +815,7 @@ impl HealthChecker {
         let healthy_status_codes = config.healthy_status_codes.clone();
         let client = upstream_client.clone();
         let scheme = if config.use_tls { "https" } else { "http" };
-        let url = format!("{}://{}:{}{}", scheme, host, port, config.http_path);
+        let url = format_probe_url(scheme, &host, port, &config.http_path);
         let udp_payload = config
             .udp_probe_payload
             .as_deref()
@@ -937,7 +966,7 @@ async fn http_probe(
 
 /// TCP health probe — attempts a TCP connection within the timeout.
 async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
-    let addr = format!("{}:{}", host, port);
+    let addr = format_probe_socket_addr(host, port);
     match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
         Ok(Ok(_stream)) => true,
         Ok(Err(e)) => {
@@ -961,7 +990,7 @@ async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
 
 /// UDP health probe — sends a payload and waits for any response within the timeout.
 async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> bool {
-    let addr = format!("{}:{}", host, port);
+    let addr = format_probe_socket_addr(host, port);
     let bind_addr = if host.parse::<std::net::Ipv6Addr>().is_ok() {
         "[::]:0"
     } else {
@@ -1019,7 +1048,7 @@ async fn grpc_probe(
     global_no_verify: bool,
 ) -> bool {
     let scheme = if use_tls { "https" } else { "http" };
-    let endpoint_url = format!("{}://{}:{}", scheme, host, port);
+    let endpoint_url = format_probe_url(scheme, host, port, "");
 
     let endpoint = match tonic::transport::Endpoint::from_shared(endpoint_url) {
         Ok(ep) => ep.timeout(timeout).connect_timeout(timeout),
@@ -1074,13 +1103,13 @@ async fn grpc_probe(
 
         // Load CA certs (upstream → global → system roots)
         if let Some(ca_path) = tls_config.server_ca_cert_path.as_deref().or(global_ca_path) {
-            match std::fs::read(ca_path) {
+            match load_probe_tls_material(ca_path, MaterialKind::CaBundle, "gRPC health probe CA") {
                 Ok(pem) => {
                     let cert = tonic::transport::Certificate::from_pem(pem);
                     tonic_tls = tonic_tls.ca_certificate(cert);
                 }
                 Err(e) => {
-                    debug!("gRPC health probe: failed to read CA {}: {}", ca_path, e);
+                    debug!("gRPC health probe: failed to load CA: {}", e);
                 }
             }
         } else {
@@ -1091,13 +1120,24 @@ async fn grpc_probe(
         let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
         let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
         if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-            match (std::fs::read(cert_path), std::fs::read(key_path)) {
+            match (
+                load_probe_tls_material(
+                    cert_path,
+                    MaterialKind::Cert,
+                    "gRPC health probe client cert",
+                ),
+                load_probe_tls_material(
+                    key_path,
+                    MaterialKind::Key,
+                    "gRPC health probe client key",
+                ),
+            ) {
                 (Ok(cert_pem), Ok(key_pem)) => {
                     let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
                     tonic_tls = tonic_tls.identity(identity);
                 }
                 (Err(e), _) | (_, Err(e)) => {
-                    debug!("gRPC health probe: failed to read client cert/key: {}", e);
+                    debug!("gRPC health probe: failed to load client cert/key: {}", e);
                 }
             }
         }
@@ -1214,7 +1254,8 @@ async fn build_grpc_probe_channel_no_verify(
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
     };
     if let Some(ca_path) = ca_path
-        && let Ok(ca_data) = std::fs::read(ca_path)
+        && let Ok(ca_data) =
+            load_probe_tls_material(ca_path, MaterialKind::CaBundle, "gRPC health probe CA")
     {
         for cert in rustls_pemfile::certs(&mut &ca_data[..]).flatten() {
             let _ = root_store.add(cert);
@@ -1226,8 +1267,15 @@ async fn build_grpc_probe_channel_no_verify(
     let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
     let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
     let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        let cert_data = std::fs::read(cert_path)?;
-        let key_data = std::fs::read(key_path)?;
+        let cert_data = load_probe_tls_material(
+            cert_path,
+            MaterialKind::Cert,
+            "gRPC health probe client cert",
+        )
+        .map_err(std::io::Error::other)?;
+        let key_data =
+            load_probe_tls_material(key_path, MaterialKind::Key, "gRPC health probe client key")
+                .map_err(std::io::Error::other)?;
         let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
             .filter_map(|r| r.ok())
             .collect();
@@ -1250,10 +1298,9 @@ async fn build_grpc_probe_channel_no_verify(
         let tls_connector = tls_connector.clone();
         let host = host_owned.clone();
         async move {
-            let addr = format!(
-                "{}:{}",
+            let addr = format_probe_socket_addr(
                 uri.host().unwrap_or("127.0.0.1"),
-                uri.port_u16().unwrap_or(443)
+                uri.port_u16().unwrap_or(443),
             );
             let tcp = tokio::net::TcpStream::connect(&addr).await?;
             let server_name = ServerName::try_from(host)
@@ -1374,23 +1421,19 @@ fn build_health_check_client_with_tls(
         .as_ref()
         .or(global_ca_path.as_ref());
     if let Some(ca_path) = ca_path {
-        if let Ok(ca_data) = std::fs::read(ca_path) {
+        if let Ok(ca_data) =
+            load_probe_tls_material(ca_path, MaterialKind::CaBundle, "Health check CA")
+        {
             if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_data) {
                 // reqwest 0.13: `tls_certs_only` replaces the trust store entirely,
                 // matching the project's "CA exclusivity" rule (no webpki mixing
                 // when a custom CA is provided).
                 builder = builder.tls_certs_only([ca_cert]);
             } else {
-                tracing::warn!(
-                    "Health check: failed to parse CA cert from {}, using system roots",
-                    ca_path
-                );
+                tracing::warn!("Health check: failed to parse CA cert, using system roots");
             }
         } else {
-            tracing::warn!(
-                "Health check: failed to read CA cert from {}, using system roots",
-                ca_path
-            );
+            tracing::warn!("Health check: failed to load CA cert, using system roots");
         }
     }
 
@@ -1404,7 +1447,10 @@ fn build_health_check_client_with_tls(
         .as_ref()
         .or(global_key_path.as_ref());
     if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        match (std::fs::read(cert_path), std::fs::read(key_path)) {
+        match (
+            load_probe_tls_material(cert_path, MaterialKind::Cert, "Health check client cert"),
+            load_probe_tls_material(key_path, MaterialKind::Key, "Health check client key"),
+        ) {
             (Ok(cert_data), Ok(key_data)) => {
                 let mut combined = cert_data;
                 combined.extend_from_slice(b"\n");
@@ -1414,17 +1460,12 @@ fn build_health_check_client_with_tls(
                         builder = builder.identity(identity);
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Health check: failed to parse client identity from {} + {}: {}",
-                            cert_path,
-                            key_path,
-                            e
-                        );
+                        tracing::warn!("Health check: failed to parse client identity: {}", e);
                     }
                 }
             }
             (Err(e), _) | (_, Err(e)) => {
-                tracing::warn!("Health check: failed to read client cert/key: {}", e);
+                tracing::warn!("Health check: failed to load client cert/key: {}", e);
             }
         }
     }
@@ -1505,7 +1546,7 @@ mod tests {
     use std::sync::Once;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, UdpSocket};
     use tokio_rustls::TlsAcceptor;
 
     static INIT_CRYPTO: Once = Once::new();
@@ -1558,6 +1599,79 @@ mod tests {
         });
 
         port
+    }
+
+    async fn spawn_ipv6_plain_http_server() -> u16 {
+        let addr =
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0);
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+            let _ = stream.shutdown().await;
+        });
+
+        port
+    }
+
+    #[test]
+    fn probe_address_formatting_brackets_ipv6_literals() {
+        assert_eq!(format_probe_socket_addr("::1", 8443), "[::1]:8443");
+        assert_eq!(
+            format_probe_url("https", "::1", 8443, "/health"),
+            "https://[::1]:8443/health"
+        );
+        assert_eq!(
+            format_probe_url("http", "backend.local", 8080, "/health"),
+            "http://backend.local:8080/health"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_connects_to_ipv6_literal() {
+        let addr =
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0);
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+
+        assert!(tcp_probe("::1", port, Duration::from_secs(2)).await);
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_probe_connects_to_ipv6_literal() {
+        let addr =
+            std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0);
+        let socket = UdpSocket::bind(addr).await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let responder = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let (_, peer) = socket.recv_from(&mut buf).await.unwrap();
+            socket.send_to(b"o", peer).await.unwrap();
+        });
+
+        assert!(udp_probe("::1", port, Duration::from_secs(2), b"p").await);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_probe_connects_to_ipv6_literal() {
+        let port = spawn_ipv6_plain_http_server().await;
+        let client = reqwest::Client::new();
+        let url = format_probe_url("http", "::1", port, "/health");
+
+        assert!(http_probe(&client, &url, Duration::from_secs(2), &[200]).await);
     }
 
     /// Default-built health-check client (verify ON) MUST reject a

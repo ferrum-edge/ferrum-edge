@@ -189,12 +189,15 @@ async fn test_all_plugins_available() {
         "transaction_debugger",
         "transaction_log_schema",
         "jwks_auth",
+        "oauth2_introspection",
+        "oidc_relying_party",
         "jwt_auth",
         "key_auth",
         "basic_auth",
         "ldap_auth",
         "hmac_auth",
         "mtls_auth",
+        "openapi_validator",
         "compression",
         "cors",
         "access_control",
@@ -243,12 +246,14 @@ async fn test_all_plugins_available() {
         "spec_expose",
         "spiffe_identity",
         "mesh_authz",
+        "opa",
         "mesh_route_dispatch",
         "mesh_outbound_registry",
         "workload_metrics",
         "__mesh_bpf_metrics",
         "ai_federation",
         "api_chargeback",
+        "api_chargeback_sink",
         "fault_injection",
         "proxy_alerts",
     ]
@@ -284,6 +289,32 @@ async fn test_plugin_creation_all_plugins() {
             "jwks_auth" => {
                 json!({"providers": [{"jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json"}]})
             }
+            "oauth2_introspection" => json!({
+                "providers": [{
+                    // Loopback endpoint so client_auth "none" is accepted.
+                    "introspection_endpoint": "http://127.0.0.1:9/introspect",
+                    "client_auth": {"method": "none"}
+                }]
+            }),
+            "oidc_relying_party" => json!({
+                "providers": [{
+                    "issuer": "https://issuer.example.com",
+                    "authorization_endpoint": "https://issuer.example.com/authorize",
+                    "token_endpoint": "https://issuer.example.com/token",
+                    "jwks_uri": "https://issuer.example.com/jwks",
+                    "client_id": "ferrum-gateway",
+                    "client_auth": {"method": "client_secret_basic", "client_secret": "secret"},
+                    "scopes": ["openid", "profile"],
+                    "redirect_uri": "https://app.example.com/oauth/callback",
+                    "callback_path": "/oauth/callback",
+                    "logout_path": "/oauth/logout"
+                }],
+                "session": {
+                    "store": "cookie",
+                    "encryption_secret": "01234567890123456789012345678901"
+                },
+                "behavior": {"trusted_redirect_hosts": ["app.example.com"]}
+            }),
             "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
             "access_control" => json!({"allowed_consumers": ["testuser"]}),
             "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
@@ -317,6 +348,22 @@ async fn test_plugin_creation_all_plugins() {
             "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
             "ws_rate_limiting" => json!({"frames_per_second": 100}),
             "body_validator" => json!({"required_fields": ["name"]}),
+            "openapi_validator" => json!({
+                "operations": [{
+                    "method": "GET",
+                    "path_template": "/health",
+                    "path_regex": "^/health$",
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {
+                                    "type": "object"
+                                }
+                            }
+                        }
+                    }
+                }]
+            }),
             "graphql" => json!({"max_depth": 100}),
             "grpc_method_router" => json!({"allow_methods": ["test.Svc/Method"]}),
             "grpc_deadline" => json!({"max_deadline_ms": 30000}),
@@ -334,6 +381,17 @@ async fn test_plugin_creation_all_plugins() {
             "spiffe_identity" => json!({}),
             "api_chargeback" => {
                 json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]})
+            }
+            "api_chargeback_sink" => {
+                json!({
+                    "clickhouse": {
+                        "url": "http://127.0.0.1:8123",
+                        "database": "default",
+                        "table": "ferrum_charge_events"
+                    },
+                    "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}],
+                    "spool": {"enabled": false}
+                })
             }
             "ai_response_guard" => json!({"pii_patterns": ["ssn"], "action": "reject"}),
             // ai_request_guard rejects no-op configs — supply at least one policy.
@@ -355,6 +413,12 @@ async fn test_plugin_creation_all_plugins() {
             }
             "mesh_outbound_registry" => {
                 json!({"registry": ["reviews.default.svc.cluster.local"]})
+            }
+            "opa" => {
+                json!({
+                    "opa_host": "http://127.0.0.1:8181",
+                    "policy_path": "ferrum/authz/allow"
+                })
             }
             "proxy_alerts" => json!({
                 "channels": {

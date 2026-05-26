@@ -72,3 +72,34 @@ async fn test_second_signal_fails_first_succeeds() {
     let err = result.unwrap_err().to_string();
     assert!(err.contains("bad-listener"));
 }
+
+#[tokio::test]
+async fn test_timeout_is_overall_deadline_not_per_signal() {
+    let (tx1, rx1) = oneshot::channel();
+    let (_tx2, rx2) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tx1.send(());
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(220),
+        wait_for_start_signals(
+            vec![
+                ("slow-listener".into(), rx1),
+                ("missing-listener".into(), rx2),
+            ],
+            Duration::from_millis(150),
+        ),
+    )
+    .await
+    .expect("startup wait should enforce one overall deadline");
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("missing-listener"),
+        "expected timeout to report the pending listener, got: {err}"
+    );
+}

@@ -215,6 +215,8 @@ fn extract_error_code(e: &ExtractError) -> &'static str {
         ExtractError::PluginContainsCredentials { .. } => "PluginContainsCredentials",
         ExtractError::ProxyUpstreamIdMismatch { .. } => "ProxyUpstreamIdMismatch",
         ExtractError::InvalidTagName { .. } => "InvalidTagName",
+        ExtractError::UnsupportedExternalRef { .. } => "UnsupportedExternalRef",
+        ExtractError::SchemaTooDeep { .. } => "SchemaTooDeep",
     }
 }
 
@@ -240,7 +242,9 @@ fn extract_error_status(e: &ExtractError) -> StatusCode {
         | ExtractError::PluginProxyIdMismatch { .. }
         | ExtractError::PluginContainsCredentials { .. }
         | ExtractError::ProxyUpstreamIdMismatch { .. }
-        | ExtractError::InvalidTagName { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        | ExtractError::InvalidTagName { .. }
+        | ExtractError::UnsupportedExternalRef { .. }
+        | ExtractError::SchemaTooDeep { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 

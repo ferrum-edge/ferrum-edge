@@ -725,6 +725,8 @@ async fn handle_h3_request(
 
     // Build request context (client_ip resolved below after headers are parsed)
     let mut ctx = RequestContext::new(socket_ip.to_owned(), method.clone(), path.clone());
+    ctx.metadata
+        .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
     // Use the actual UDP listener port so port-scoped plugins such as mesh
     // outbound registry and mesh authz see the same frontend port that accepted
     // the H3 request. Fall back to the configured HTTPS port only if Quinn
@@ -820,9 +822,11 @@ async fn handle_h3_request(
         }
     }
 
-    // Validate query parameter count
+    // Validate query parameter count (skip empty segments from consecutive '&').
+    // Keep this in sync with the H1/H2 proxy path so `?a=1&&b=2` counts as
+    // two parameters across all frontend protocols.
     if state.max_query_params > 0 && !query_string.is_empty() {
-        let param_count = query_string.split('&').count();
+        let param_count = crate::proxy::count_query_params(&query_string);
         if param_count > state.max_query_params {
             record_request(&state, 400);
             let body = format!(
@@ -996,13 +1000,15 @@ async fn handle_h3_request(
 
     // Per-IP concurrent request limiting (same as HTTP/1.1 and HTTP/2 paths).
     let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
-        let count = counts
-            .entry(ctx.client_ip.clone())
-            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
-        let current = count
-            .value()
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
+        let current = {
+            let count = counts
+                .entry(ctx.client_ip.clone())
+                .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+            count
+                .value()
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1
+        };
         let guard = Some(crate::proxy::PerIpRequestGuard {
             ip: ctx.client_ip.clone(),
             counts: counts.clone(),
@@ -1955,7 +1961,7 @@ async fn handle_h3_request(
                 let h3_error_class = classify_h3_error(&e);
                 crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
                 let is_client_request_body_disconnect =
-                    err_msg.contains("client disconnected while sending request body");
+                    is_h3_client_request_body_disconnect(&err_msg);
                 // H3 frontend → H3 backend path: QUIC failure here means the
                 // cached H3 capability lied (backend probably lost UDP), so
                 // downgrade the classification. The next H3 request is free
@@ -1971,7 +1977,14 @@ async fn handle_h3_request(
                 let h3_error_body = r#"{"error":"Backend unavailable"}"#;
                 send_h3_response(&mut stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
 
-                // Record outcome for CB/health even on failure
+                // Record outcome for CB/health even on failure.
+                // Frontend client aborts while uploading request bodies are
+                // client-caused and must not poison backend CB/passive health.
+                let (outcome_connection_error, outcome_error_class) =
+                    h3_streaming_body_failure_outcome(
+                        is_client_request_body_disconnect,
+                        h3_error_class,
+                    );
                 crate::proxy::backend_dispatch::record_backend_outcome(
                     &state,
                     &proxy,
@@ -1980,8 +1993,10 @@ async fn handle_h3_request(
                     upstream_target.as_deref(),
                     cb_target_key.as_deref(),
                     502,
-                    true,
+                    outcome_connection_error,
+                    outcome_error_class,
                     cb_is_half_open_probe,
+                    false,
                     backend_start.elapsed(),
                 );
 
@@ -2056,7 +2071,9 @@ async fn handle_h3_request(
                 cb_target_key.as_deref(),
                 502,
                 false,
+                None,
                 cb_is_half_open_probe,
+                false,
                 backend_start.elapsed(),
             );
             record_request(&state, 502);
@@ -2249,7 +2266,9 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             response_status,
             false,
+            None,
             cb_is_half_open_probe,
+            false,
             backend_start.elapsed(),
         );
 
@@ -2534,7 +2553,9 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             response_status,
             connection_error,
+            h3_error_class,
             cb_is_half_open_probe,
+            false,
             backend_start.elapsed(),
         );
 
@@ -2768,7 +2789,9 @@ async fn handle_h3_request(
             final_cb_target_key.as_deref(),
             response_status,
             !h3_request_on_wire,
+            h3_error_class,
             cb_retry_probe_slot_available,
+            false,
             backend_start.elapsed(),
         );
 
@@ -3239,6 +3262,23 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
     // attempt committed the body should consult `e.request_on_wire()`
     // separately rather than re-deriving it from `error_class`.
     crate::http3::client::classify_http3_error(e.as_error().as_ref())
+}
+
+fn is_h3_client_request_body_disconnect(err_msg: &str) -> bool {
+    err_msg
+        .to_ascii_lowercase()
+        .contains("client disconnected while sending request body")
+}
+
+fn h3_streaming_body_failure_outcome(
+    is_client_request_body_disconnect: bool,
+    h3_error_class: crate::retry::ErrorClass,
+) -> (bool, Option<crate::retry::ErrorClass>) {
+    if is_client_request_body_disconnect {
+        (false, Some(crate::retry::ErrorClass::ClientDisconnect))
+    } else {
+        (true, Some(h3_error_class))
+    }
 }
 
 /// Outcome of a streaming H3 proxy operation.
@@ -4173,6 +4213,45 @@ mod h3_streaming_outcome_tests {
     //! is reported as a transport failure for CB regardless of the
     //! HTTP status the backend chose.
     use crate::retry::ErrorClass;
+
+    #[test]
+    fn request_body_upload_client_disconnect_maps_to_neutral_outcome() {
+        let (connection_error, error_class) =
+            super::h3_streaming_body_failure_outcome(true, ErrorClass::ConnectionClosed);
+
+        assert!(
+            !connection_error,
+            "H3 frontend upload aborts are client-caused and must not count \
+             as backend connection failures"
+        );
+        assert_eq!(error_class, Some(ErrorClass::ClientDisconnect));
+    }
+
+    #[test]
+    fn request_body_upload_backend_failure_keeps_original_class() {
+        let (connection_error, error_class) =
+            super::h3_streaming_body_failure_outcome(false, ErrorClass::ProtocolError);
+
+        assert!(
+            connection_error,
+            "non-client H3 streaming-body failures still represent backend \
+             connection failures"
+        );
+        assert_eq!(error_class, Some(ErrorClass::ProtocolError));
+    }
+
+    #[test]
+    fn request_body_upload_client_disconnect_detection_is_case_insensitive() {
+        for err_msg in [
+            "client disconnected while sending request body: stream closed",
+            "Client disconnected while sending request body: stream closed",
+        ] {
+            assert!(
+                super::is_h3_client_request_body_disconnect(err_msg),
+                "{err_msg:?} must be recognized as a client upload abort"
+            );
+        }
+    }
 
     /// Mirrors the predicate in `handle_h3_request`'s streaming branch.
     /// Kept as a free function so the test can assert against it

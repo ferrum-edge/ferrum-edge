@@ -69,11 +69,103 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+  test-pkcs11-softhsm:
+    name: PKCS#11 SoftHSM Smoke Test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-test-pkcs11"
+
+      - name: Install SoftHSM and OpenSC tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y softhsm2 opensc
+
+      - name: Initialize SoftHSM token
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/softhsm/tokens"
+          cat > "$RUNNER_TEMP/softhsm/softhsm2.conf" <<EOF
+          directories.tokendir = $RUNNER_TEMP/softhsm/tokens
+          objectstore.backend = file
+          log.level = ERROR
+          slots.removable = false
+          EOF
+          export SOFTHSM2_CONF="$RUNNER_TEMP/softhsm/softhsm2.conf"
+          softhsm2-util --init-token --free --label ferrum-ci --so-pin 1234 --pin 123456
+          pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
+            --login --pin 123456 --token-label ferrum-ci \
+            --keypairgen --key-type rsa:2048 \
+            --label edge-rsa --id 01 --usage-sign
+          echo "SOFTHSM2_CONF=$SOFTHSM2_CONF" >> "$GITHUB_ENV"
+
+      - name: Run PKCS#11 signer smoke test
+        run: cargo test --features pkcs11 --lib tls::pkcs11::tests::signer_loads_configured_token_and_signs -- --ignored
+        env:
+          FERRUM_PKCS11_MODULE_PATH: /usr/lib/softhsm/libsofthsm2.so
+          FERRUM_PKCS11_PIN: "123456"
+          FERRUM_PKCS11_TEST_KEY_SOURCE: "pkcs11://edge-rsa?pin_env=FERRUM_PKCS11_PIN&id_hex=01"
+          RUST_BACKTRACE: 1
+
+  build-integration-tests-archive:
+    name: Build Integration Tests Archive
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-test-integration-archive"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@213ccc1a076163c093f914550b94feb90fab916d # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Build ferrum-cni binary
+        # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, which
+        # Cargo bakes in as target/debug/ferrum-cni under the workspace path
+        # used to build the archive. Keep archive builders and shard runners on
+        # matching OS/arch + checkout layout, or update this artifact/path with
+        # any future runner/workspace/target-dir change.
+        run: cargo build --bin ferrum-cni
+
+      - name: Build integration tests archive
+        # Nextest archives are native binaries, so the file and artifact names
+        # include runner OS/arch. Future non-Linux shards must build and
+        # download their matching archive instead of sharing this Linux one.
+        run: |
+          archive_file="integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
+          cargo nextest archive \
+            --test integration_tests \
+            --archive-file "$archive_file"
+
+      - name: Upload integration tests archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: integration-tests-archive-${{ runner.os }}-${{ runner.arch }}
+          path: integration-tests-${{ runner.os }}-${{ runner.arch }}.tar.zst
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload ferrum-cni binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}
+          path: target/debug/ferrum-cni
+          retention-days: 1
+          if-no-files-found: error
+
   test-integration:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below groups the 57 test files into 5 logical buckets sized roughly by
+    # below groups the 58 test files into 5 logical buckets sized roughly by
     # test count (admin-api ~153, admin-config ~152, mesh-routing ~158,
     # mesh-platform ~60, protocols-data-plane ~150). Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
@@ -81,6 +173,7 @@ jobs:
     # parallelism not core utilisation — same shape as `test-functional`.
     name: Integration Tests (${{ matrix.shard }})
     if: github.event_name == 'pull_request'
+    needs: build-integration-tests-archive
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -113,6 +206,7 @@ jobs:
               integration::log_schema_integration_tests
               integration::log_schema_registry_tests
               integration::deferred_log_tests
+              integration::api_chargeback_sink_tests
           - shard: mesh-routing
             # End-to-end mesh dispatch + authz + DestinationRule + sidecar
             # tests. Heaviest mesh slice tests since each one stands up a
@@ -173,9 +267,13 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - uses: ./.github/actions/setup-rust-ci
+      - name: Install Rust
+        # The shard runs a prebuilt nextest archive, so it only needs `cargo`
+        # on PATH for `cargo nextest`; sccache, rust-cache, protoc, and fast
+        # linker setup belong in the archive build job.
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          shared-key: "ci-test"
+          toolchain: stable
 
       - name: Install cargo-nextest
         # Same prebuilt-binary install action as `test-functional`. Nextest
@@ -185,20 +283,43 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Download integration tests archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: integration-tests-archive-${{ runner.os }}-${{ runner.arch }}
+          path: .
+
+      - name: Download prebuilt ferrum-cni binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}
+          path: target/debug
+
+      - name: Mark ferrum-cni binary executable
+        # actions/download-artifact does not preserve the executable bit.
+        run: chmod +x target/debug/ferrum-cni
+
       - name: Run integration test shard
         # Mirrors the `test-functional` shard runner. Each filter line is a
         # substring matched against the full test path
         # (`integration::<file_module>::<test_name>`) — nextest ORs them.
         # Listing the file-module prefix scopes the shard to one set of
         # files without per-test enumeration.
+        #
+        # `--archive-file` skips per-shard recompiles. `--workspace-remap .`
+        # rewrites compile-time workspace paths to this runner's checkout so
+        # runtime fixture lookups keep resolving against the checked-out repo.
         run: |
           set -e
+          archive_file="integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           filters=()
           while IFS= read -r filter; do
             [ -z "$filter" ] && continue
             filters+=("$filter")
           done <<< "$INTEGRATION_FILTERS"
-          cargo nextest run --test integration_tests \
+          cargo nextest run \
+            --archive-file "$archive_file" \
+            --workspace-remap . \
             --no-fail-fast \
             "${filters[@]}"
         env:
@@ -300,18 +421,53 @@ jobs:
         # Shared across every test-functional shard via download-artifact so
         # the ~60s `cargo build --bin ferrum-edge` step runs once instead of
         # six times. Functional tests look for ./target/debug/ferrum-edge;
-        # shards re-create that path on download.
+        # shards re-create that path on download. The artifact name includes
+        # OS/arch because the downloaded binary is native to this runner.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ferrum-edge-debug
+          name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
           path: target/debug/ferrum-edge
+          retention-days: 1
+          if-no-files-found: error
+
+  build-functional-tests-archive:
+    name: Build Functional Tests Archive
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-test-functional"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@213ccc1a076163c093f914550b94feb90fab916d # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Build functional tests archive
+        # Nextest archives are native binaries, so the file and artifact names
+        # include runner OS/arch. Future non-Linux shards must build and
+        # download their matching archive instead of sharing this Linux one.
+        run: |
+          archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
+          cargo nextest archive \
+            --test functional_tests \
+            --archive-file "$archive_file"
+
+      - name: Upload functional tests archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: functional-tests-archive-${{ runner.os }}-${{ runner.arch }}
+          path: functional-tests-${{ runner.os }}-${{ runner.arch }}.tar.zst
           retention-days: 1
           if-no-files-found: error
 
   test-functional:
     name: Functional Tests (${{ matrix.shard }})
     if: github.event_name == 'pull_request'
-    needs: build-gateway-binary
+    needs: [build-gateway-binary, build-functional-tests-archive]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -359,6 +515,7 @@ jobs:
               functional_sse_test
               functional_stream_listener_failure_test
               functional_tcp_proxy_test
+              functional_tcp_splice_backend_timeout_test
               functional_udp_proxy_test
               functional_websocket_test
               scripted_backend_h2_tests
@@ -367,6 +524,32 @@ jobs:
               scripted_backend_network_sim_tests
               scripted_backend_tests
               scripted_backend_udp_tests
+              functional_query_param_limits_test
+              functional_streaming_request_body_limits_test
+              functional_streaming_response_body_limits_test
+              functional_tcp_idle_timeout_env_test
+              functional_websocket_frame_limit_test
+              functional_websocket_connection_limit_test
+              functional_header_read_timeout_test
+              functional_response_body_limits_test
+              functional_request_body_limits_test
+              functional_header_limits_test
+              functional_early_data_test
+              functional_ws_origin_test
+              functional_allowed_methods_test
+              functional_forwarded_via_headers_test
+              functional_streaming_latency_tracking_test
+              functional_chunked_request_size_limits_test
+              functional_chunked_response_size_limits_test
+              functional_body_size_limits_test
+              functional_url_query_limits_test
+              functional_header_size_limits_test
+              functional_protocol_h3_request_body_test
+              functional_protocol_h3_body_limit_config_test
+              functional_protocol_h2_body_limit_config_test
+              functional_protocol_body_limit_config_test
+              functional_h3_authority_validation_test
+              functional_websocket_limits_test
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and
             # race when nextest runs this shard in parallel.
@@ -399,6 +582,7 @@ jobs:
               functional_service_discovery_test
               functional_tls_lifecycle_test
               functional_tls_only_test
+              functional_client_ip_env_test
     services:
       redis:
         image: redis:7-alpine
@@ -421,9 +605,13 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - uses: ./.github/actions/setup-rust-ci
+      - name: Install Rust
+        # The shard runs a prebuilt nextest archive, so it only needs `cargo`
+        # on PATH for `cargo nextest`; sccache, rust-cache, protoc, and fast
+        # linker setup belong in the archive build job.
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          shared-key: "ci-test-functional"
+          toolchain: stable
 
       - name: Install cargo-nextest
         # Prebuilt binaries from taiki-e/install-action — no compile time.
@@ -437,12 +625,18 @@ jobs:
       - name: Download prebuilt gateway binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: ferrum-edge-debug
+          name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
           path: target/debug
 
       - name: Mark gateway binary executable
         # actions/download-artifact does not preserve the executable bit.
         run: chmod +x target/debug/ferrum-edge
+
+      - name: Download functional tests archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: functional-tests-archive-${{ runner.os }}-${{ runner.arch }}
+          path: .
 
       - name: Run functional test shard
         # ── Single nextest invocation per shard ───────────────────────────
@@ -450,6 +644,10 @@ jobs:
         # fingerprint-check + libtest startup (~3–5s) every iteration. With
         # 7–13 filters per shard that was 30–60s of pure overhead. Here we
         # collect the filters into an argv array and let nextest OR them.
+        #
+        # `--archive-file` skips per-shard recompiles. `--workspace-remap .`
+        # rewrites the archive's compile-time workspace path to this runner's
+        # checkout so runtime fixtures under tests/ keep resolving correctly.
         #
         # `--run-ignored=all` mirrors libtest's `--include-ignored` so the
         # non-ignored harness unit tests bundled into the functional_tests
@@ -468,6 +666,7 @@ jobs:
         # cargo fingerprint check on first call.
         run: |
           set -e
+          archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           filters=()
           while IFS= read -r filter; do
             [ -z "$filter" ] && continue
@@ -477,7 +676,9 @@ jobs:
           if [ -n "${NEXTEST_JOBS:-}" ]; then
             nextest_args+=("-j" "$NEXTEST_JOBS")
           fi
-          cargo nextest run --test functional_tests \
+          cargo nextest run \
+            --archive-file "$archive_file" \
+            --workspace-remap . \
             --run-ignored=all \
             --no-fail-fast \
             -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)' \
@@ -639,26 +840,51 @@ jobs:
           cd /tmp/gateway-api
           : > "$results/gateway-api-conformance-test.json"
           status=0
+          # Each subtest is retried up to MAX_ATTEMPTS times. The upstream
+          # conformance helpers (e.g. WaitForHTTPRouteStatusToHaveACondition)
+          # poll the kube-apiserver for ~60s before giving up with
+          # "context deadline exceeded". On a cold kind cluster with the
+          # GitHub-hosted runner under variable load that window is sometimes
+          # missed even when the controller is otherwise healthy — the next
+          # attempt reuses the existing cluster + controller pod and almost
+          # always passes. A real regression in Ferrum's status writer would
+          # fail every attempt, so the retry catches infrastructure flakes
+          # without masking real bugs.
+          MAX_ATTEMPTS=2
           for test_name in $GATEWAY_API_CONFORMANCE_TESTS; do
             echo "::group::Gateway API conformance: ${test_name}"
-            test_log="$results/gateway-api-conformance-${test_name}.json"
             test_report="$results/gateway-api-conformance-${test_name}-report.yaml"
-            go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
-              --gateway-class=ferrum \
-              --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
-              --run-test="$test_name" \
-              --cleanup-base-resources=false \
-              --organization=Ferrum \
-              --project="Ferrum Edge" \
-              --url=https://github.com/ferrum-edge/ferrum-edge \
-              --version="${GITHUB_SHA}" \
-              --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
-              --report-output="$test_report" \
-              2>&1 | tee "$test_log"
-            test_status=${PIPESTATUS[0]}
-            cat "$test_log" >> "$results/gateway-api-conformance-test.json"
+            test_status=1
+            # Per-attempt log paths so a flaky first attempt's diagnostics
+            # survive the retry. The aggregate JSON appends every attempt.
+            for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+              if [ "$attempt" -gt 1 ]; then
+                echo "::warning title=Gateway API conformance retry::${test_name} attempt ${attempt}/${MAX_ATTEMPTS}"
+              fi
+              test_log="$results/gateway-api-conformance-${test_name}-attempt${attempt}.json"
+              if go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
+                --gateway-class=ferrum \
+                --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
+                --run-test="$test_name" \
+                --cleanup-base-resources=false \
+                --organization=Ferrum \
+                --project="Ferrum Edge" \
+                --url=https://github.com/ferrum-edge/ferrum-edge \
+                --version="${GITHUB_SHA}" \
+                --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
+                --report-output="$test_report" \
+                2>&1 | tee "$test_log"; then
+                test_status=0
+              else
+                test_status=${PIPESTATUS[0]}
+              fi
+              cat "$test_log" >> "$results/gateway-api-conformance-test.json"
+              if [ "$test_status" -eq 0 ]; then
+                break
+              fi
+            done
             if [ "$test_status" -ne 0 ]; then
-              echo "::error title=Gateway API conformance failed::${test_name} exited with ${test_status}"
+              echo "::error title=Gateway API conformance failed::${test_name} exited with ${test_status} after ${MAX_ATTEMPTS} attempt(s)"
               status="$test_status"
             fi
             echo "::endgroup::"
@@ -724,9 +950,11 @@ jobs:
     needs:
       - test-unit
       - test-lib
+      - build-integration-tests-archive
       - test-integration
       - test-conformance
       - build-gateway-binary
+      - build-functional-tests-archive
       - test-functional
       - gateway-api-conformance
     runs-on: ubuntu-latest
@@ -739,17 +967,21 @@ jobs:
           echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
           echo "| Unit | ${{ needs.test-unit.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Inline lib | ${{ needs.test-lib.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration archive build | ${{ needs.build-integration-tests-archive.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Integration | ${{ needs.test-integration.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Mesh conformance | ${{ needs.test-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Gateway binary build | ${{ needs.build-gateway-binary.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Functional archive build | ${{ needs.build-functional-tests-archive.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Functional shards | ${{ needs.test-functional.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Gateway API conformance | ${{ needs.gateway-api-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
 
           if [ "${{ needs.test-unit.result }}" != "success" ] ||
              [ "${{ needs.test-lib.result }}" != "success" ] ||
+             [ "${{ needs.build-integration-tests-archive.result }}" != "success" ] ||
              [ "${{ needs.test-integration.result }}" != "success" ] ||
              [ "${{ needs.test-conformance.result }}" != "success" ] ||
              [ "${{ needs.build-gateway-binary.result }}" != "success" ] ||
+             [ "${{ needs.build-functional-tests-archive.result }}" != "success" ] ||
              [ "${{ needs.test-functional.result }}" != "success" ] ||
              [ "${{ needs.gateway-api-conformance.result }}" != "success" ]; then
             exit 1

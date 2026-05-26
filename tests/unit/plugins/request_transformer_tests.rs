@@ -955,6 +955,20 @@ async fn test_request_transformer_rejects_non_string_key() {
 }
 
 #[tokio::test]
+async fn test_request_transformer_rejects_invalid_header_key() {
+    for key in ["bad header", "x:bad", "x/bad", "x\nbad"] {
+        let err = RequestTransformer::new(&json!({
+            "rules": [
+                {"operation": "add", "target": "header", "key": key, "value": "v"}
+            ]
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("expected invalid header key to be rejected: {key:?}"));
+        assert!(err.contains("valid HTTP header name"), "got: {err}");
+    }
+}
+
+#[tokio::test]
 async fn test_request_transformer_rejects_non_string_value() {
     let err = RequestTransformer::new(&json!({
         "rules": [
@@ -976,6 +990,18 @@ async fn test_request_transformer_rejects_non_string_new_key() {
     .err()
     .expect("expected error for non-string new_key");
     assert!(err.contains("'new_key' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_invalid_header_new_key() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "X-Old", "new_key": "bad header"}
+        ]
+    }))
+    .err()
+    .expect("expected invalid header new_key to be rejected");
+    assert!(err.contains("valid HTTP header name"), "got: {err}");
 }
 
 // ── JSON null value preservation on body rules ───────────────────────────

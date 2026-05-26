@@ -50,15 +50,25 @@ impl<F: Future> Future for LazyTimeout<F> {
     type Output = Result<F::Output, LazyTimeoutError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(sleep) = self.sleep.as_mut() {
+            if sleep.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(LazyTimeoutError));
+            }
+
+            if let Poll::Ready(v) = self.future.as_mut().poll(cx) {
+                return Poll::Ready(Ok(v));
+            }
+
+            return Poll::Pending;
+        }
+
         // Always try the inner future first (fast path -- no timer allocated)
         if let Poll::Ready(v) = self.future.as_mut().poll(cx) {
             return Poll::Ready(Ok(v));
         }
 
         // Inner future is Pending -- create timeout timer if not yet initialized
-        if self.sleep.is_none() {
-            self.sleep = Some(Box::pin(tokio::time::sleep(self.duration)));
-        }
+        self.sleep = Some(Box::pin(tokio::time::sleep(self.duration)));
 
         // Check the timeout timer
         if let Some(sleep) = self.sleep.as_mut()

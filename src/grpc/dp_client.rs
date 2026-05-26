@@ -23,6 +23,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::sync::watch;
 use tonic::metadata::MetadataValue;
 use tonic::transport::channel::ClientTlsConfig;
 use tonic::transport::{Certificate, Channel, Identity};
@@ -37,6 +38,7 @@ use crate::config::types::GatewayConfig;
 use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
 use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
 use crate::proxy::{IncrementalApplyOutcome, ProxyState};
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 /// Tracks the DP's connection status to its Control Plane.
 /// Shared between the DP gRPC client and the admin API (`GET /cluster`).
@@ -126,6 +128,12 @@ pub struct DpGrpcTlsConfig {
     pub no_verify: bool,
 }
 
+pub struct DpGrpcTlsReload {
+    pub env_config: Arc<EnvConfig>,
+    pub label: &'static str,
+    pub revision_rx: watch::Receiver<u64>,
+}
+
 /// Build the DP/mesh gRPC TLS client config from shared env settings.
 pub fn build_dp_grpc_tls_config(
     env_config: &EnvConfig,
@@ -156,25 +164,30 @@ pub fn build_dp_grpc_tls_config(
         )?;
     }
 
-    let ca_cert_pem =
-        if let Some(ref path) = env_config.dp_grpc_tls_ca_cert_path {
-            Some(std::fs::read(path).map_err(|e| {
-                anyhow::anyhow!("Failed to read {label} gRPC TLS CA cert {path}: {e}")
-            })?)
-        } else {
-            None
-        };
+    let ca_cert_pem = if let Some(ref path) = env_config.dp_grpc_tls_ca_cert_path {
+        Some(load_grpc_material(
+            path,
+            MaterialKind::CaBundle,
+            &format!("{label} gRPC TLS CA cert"),
+        )?)
+    } else {
+        None
+    };
 
     let (client_cert_pem, client_key_pem) = if let (Some(cert_path), Some(key_path)) = (
         &env_config.dp_grpc_tls_client_cert_path,
         &env_config.dp_grpc_tls_client_key_path,
     ) {
-        let cert = std::fs::read(cert_path).map_err(|e| {
-            anyhow::anyhow!("Failed to read {label} gRPC TLS client cert {cert_path}: {e}")
-        })?;
-        let key = std::fs::read(key_path).map_err(|e| {
-            anyhow::anyhow!("Failed to read {label} gRPC TLS client key {key_path}: {e}")
-        })?;
+        let cert = load_grpc_material(
+            cert_path,
+            MaterialKind::Cert,
+            &format!("{label} gRPC TLS client cert"),
+        )?;
+        let key = load_grpc_material(
+            key_path,
+            MaterialKind::Key,
+            &format!("{label} gRPC TLS client key"),
+        )?;
         (Some(cert), Some(key))
     } else {
         (None, None)
@@ -196,6 +209,17 @@ pub fn build_dp_grpc_tls_config(
         client_key_pem,
         no_verify: env_config.dp_grpc_tls_no_verify,
     }))
+}
+
+fn load_grpc_material(
+    raw: &str,
+    kind: MaterialKind,
+    label: &str,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let source = CertSource::parse(raw, kind);
+    let material = load_material_blocking(&source, kind)
+        .map_err(|e| anyhow::anyhow!("Failed to load {label} {}: {e}", source.source_id()))?;
+    Ok(material.bytes.expose_secret().to_vec())
 }
 
 /// JWT token lifetime for DP-generated tokens (59 minutes, under the 1-hour ceiling).
@@ -289,7 +313,8 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     jwt_secret: GrpcJwtSecret,
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
-    tls_config: Option<DpGrpcTlsConfig>,
+    mut tls_config: Option<DpGrpcTlsConfig>,
+    tls_reload: Option<DpGrpcTlsReload>,
     startup_ready: Option<Arc<AtomicBool>>,
     namespace: String,
     primary_retry_secs: u64,
@@ -328,6 +353,10 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     let mut current_cp_index: usize = 0;
     let mut backoff_secs = BACKOFF_INITIAL_SECS;
     let mut full_cycle_count: u32 = 0;
+    let mut last_tls_revision = tls_reload
+        .as_ref()
+        .map(|reload| *reload.revision_rx.borrow())
+        .unwrap_or(0);
 
     loop {
         if let Some(ref rx) = shutdown_rx
@@ -335,6 +364,31 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         {
             info!("DP client shutting down");
             return;
+        }
+
+        if let Some(reload) = tls_reload.as_ref() {
+            let revision = *reload.revision_rx.borrow();
+            if revision != last_tls_revision {
+                last_tls_revision = revision;
+                match build_dp_grpc_tls_config(&reload.env_config, &cp_urls, reload.label) {
+                    Ok(next_config) => {
+                        tls_config = next_config;
+                        info!(
+                            revision,
+                            "{} gRPC TLS material reloaded; reconnecting to CP with rotated material",
+                            reload.label
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            revision,
+                            error = %error,
+                            "{} gRPC TLS source revision changed but rebuild failed; keeping previous TLS material",
+                            reload.label
+                        );
+                    }
+                }
+            }
         }
 
         let cp_url = &cp_urls[current_cp_index];
@@ -401,20 +455,33 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     backoff_secs = BACKOFF_INITIAL_SECS;
                     continue;
                 }
+                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                    info!("{} gRPC TLS source changed; reconnecting CP stream", tls_reload.as_ref().map(|reload| reload.label).unwrap_or("DP"));
+                    update_state_disconnected(&connection_state, cp_url, is_primary);
+                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    continue;
+                }
             }
         } else {
-            connect_and_subscribe_with_startup_ready(
-                cp_url,
-                &jwt_secret,
-                &node_id,
-                &proxy_state,
-                tls_config.as_ref(),
-                startup_ready.clone(),
-                &namespace,
-                connection_state.as_ref(),
-                is_primary,
-            )
-            .await
+            tokio::select! {
+                res = connect_and_subscribe_with_startup_ready(
+                    cp_url,
+                    &jwt_secret,
+                    &node_id,
+                    &proxy_state,
+                    tls_config.as_ref(),
+                    startup_ready.clone(),
+                    &namespace,
+                    connection_state.as_ref(),
+                    is_primary,
+                ) => res,
+                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                    info!("{} gRPC TLS source changed; reconnecting CP stream", tls_reload.as_ref().map(|reload| reload.label).unwrap_or("DP"));
+                    update_state_disconnected(&connection_state, cp_url, is_primary);
+                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    continue;
+                }
+            }
         };
 
         let mut increase_backoff = true;
@@ -467,22 +534,57 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
 
         if let Some(ref rx) = shutdown_rx {
             let mut rx_clone = rx.clone();
-            tokio::select! {
-                _ = tokio::time::sleep(sleep_duration) => {}
-                _ = async {
-                    while !*rx_clone.borrow() {
-                        if rx_clone.changed().await.is_err() { return; }
+            if tls_reload.is_some() {
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_duration) => {}
+                    _ = async {
+                        while !*rx_clone.borrow() {
+                            if rx_clone.changed().await.is_err() { return; }
+                        }
+                    } => {
+                        info!("DP client shutting down");
+                        return;
                     }
-                } => {
-                    info!("DP client shutting down");
-                    return;
+                    _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                        backoff_secs = BACKOFF_INITIAL_SECS;
+                        continue;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_duration) => {}
+                    _ = async {
+                        while !*rx_clone.borrow() {
+                            if rx_clone.changed().await.is_err() { return; }
+                        }
+                    } => {
+                        info!("DP client shutting down");
+                        return;
+                    }
                 }
             }
         } else {
-            tokio::time::sleep(sleep_duration).await;
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_duration) => {}
+                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    continue;
+                }
+            }
         }
 
         backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
+    }
+}
+
+async fn wait_optional_tls_reload(mut revision_rx: Option<watch::Receiver<u64>>) {
+    let changed = if let Some(revision_rx) = revision_rx.as_mut() {
+        revision_rx.changed().await.is_ok()
+    } else {
+        false
+    };
+    if !changed {
+        std::future::pending::<()>().await;
     }
 }
 

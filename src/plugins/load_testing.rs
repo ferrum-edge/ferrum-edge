@@ -235,14 +235,7 @@ impl LoadTesting {
                                 .to_string(),
                         );
                     }
-                    let parsed = Url::parse(url).map_err(|e| {
-                        format!("load_testing: invalid gateway address '{url}': {e}")
-                    })?;
-                    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-                        return Err(format!(
-                            "load_testing: gateway address '{url}' must be an http(s) URL with a host"
-                        ));
-                    }
+                    validate_gateway_address(url)?;
                     urls.push(url.trim_end_matches('/').to_string());
                 }
                 urls
@@ -266,6 +259,32 @@ impl LoadTesting {
             is_running: Arc::new(AtomicBool::new(false)),
         })
     }
+}
+
+fn validate_gateway_address(url: &str) -> Result<(), String> {
+    let parsed = Url::parse(url)
+        .map_err(|e| format!("load_testing: invalid gateway address '{url}': {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !has_non_empty_authority(url)
+        || parsed.host_str().is_none()
+    {
+        return Err(format!(
+            "load_testing: gateway address '{url}' must be an http(s) URL with a host"
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!(
+            "load_testing: gateway address '{url}' must not include a query or fragment"
+        ));
+    }
+    Ok(())
+}
+
+fn has_non_empty_authority(raw_url: &str) -> bool {
+    raw_url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| !authority.is_empty())
 }
 
 fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {

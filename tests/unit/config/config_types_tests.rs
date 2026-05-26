@@ -1,8 +1,9 @@
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LocalityPreference,
-    PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget, hosts_overlap,
-    validate_host_entry, validate_resource_id, wildcard_matches,
+    AuthMode, BackendScheme, BackendTlsConfig, Consumer, DispatchKind, GatewayConfig,
+    LocalityPreference, PluginAssociation, PluginConfig, PluginScope, Proxy,
+    ResolvedSubsetTrafficPolicy, Upstream, UpstreamTarget, hosts_overlap, validate_host_entry,
+    validate_resource_id, wildcard_matches,
 };
 use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TracingProvider};
 use std::collections::HashMap;
@@ -384,6 +385,288 @@ fn resolve_upstream_tls_projects_sni_and_sans_to_proxy_cache() {
     assert_eq!(
         resolved.san_allow_list,
         vec!["spiffe://cluster.local/ns/default/sa/reviews".to_string()]
+    );
+}
+
+#[test]
+fn normalize_fields_rebuilds_upstream_resolved_tls_after_serde_round_trip() {
+    let mut upstream = make_upstream("reviews-u");
+    upstream.backend_tls_sni = Some("Reviews.Mesh.Internal".to_string());
+    upstream.backend_tls_san_allow_list = vec!["Reviews.Mesh.Internal".to_string()];
+    let mut proxy = make_proxy("reviews-p", "/reviews");
+    proxy.upstream_id = Some("reviews-u".to_string());
+    proxy.resolved_tls.sni = Some("stale.example".to_string());
+
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let json = serde_json::to_string(&config).expect("serialize config");
+    let mut decoded: GatewayConfig = serde_json::from_str(&json).expect("deserialize config");
+    assert_eq!(
+        decoded.proxies[0].resolved_tls.sni, None,
+        "resolved_tls is skipped on the wire and must be rebuilt"
+    );
+
+    decoded.normalize_fields();
+
+    let resolved = &decoded.proxies[0].resolved_tls;
+    assert_eq!(resolved.sni.as_deref(), Some("reviews.mesh.internal"));
+    assert_eq!(resolved.san_allow_list, vec!["reviews.mesh.internal"]);
+    assert_eq!(
+        decoded.upstreams[0].backend_tls_sni.as_deref(),
+        Some("reviews.mesh.internal")
+    );
+}
+
+#[test]
+fn normalize_fields_rebuilds_direct_proxy_resolved_tls_after_mutation() {
+    let mut proxy = make_proxy("direct-p", "/direct");
+    proxy.backend_tls_client_cert_path = Some("/certs/client.pem".to_string());
+    proxy.backend_tls_client_key_path = Some("/certs/client-key.pem".to_string());
+    proxy.backend_tls_server_ca_cert_path = Some("/certs/ca.pem".to_string());
+    proxy.backend_tls_verify_server_cert = false;
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    config.normalize_fields();
+
+    let resolved = &config.proxies[0].resolved_tls;
+    assert_eq!(
+        resolved.client_cert_path.as_deref(),
+        Some("/certs/client.pem")
+    );
+    assert_eq!(
+        resolved.client_key_path.as_deref(),
+        Some("/certs/client-key.pem")
+    );
+    assert_eq!(
+        resolved.server_ca_cert_path.as_deref(),
+        Some("/certs/ca.pem")
+    );
+    assert!(!resolved.verify_server_cert);
+}
+
+#[test]
+fn normalize_fields_reprojects_resolved_tls_after_upstream_mutation() {
+    let mut upstream = make_upstream("reviews-u");
+    upstream.backend_tls_sni = Some("old.mesh.internal".to_string());
+    let mut proxy = make_proxy("reviews-p", "/reviews");
+    proxy.upstream_id = Some("reviews-u".to_string());
+
+    let mut config = GatewayConfig {
+        upstreams: vec![upstream],
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    config.normalize_fields();
+    assert_eq!(
+        config.proxies[0].resolved_tls.sni.as_deref(),
+        Some("old.mesh.internal")
+    );
+
+    config.upstreams[0].backend_tls_sni = Some("New.Mesh.Internal".to_string());
+    config.proxies[0].resolved_tls.sni = Some("stale.mesh.internal".to_string());
+    config.normalize_fields();
+
+    assert_eq!(
+        config.proxies[0].resolved_tls.sni.as_deref(),
+        Some("new.mesh.internal")
+    );
+}
+
+#[test]
+fn resolve_upstream_tls_refreshes_proxy_cache_after_upstream_mutation() {
+    let mut upstream = make_upstream("reviews-u");
+    upstream.backend_tls_server_ca_cert_path = Some("/mesh/ca-a.pem".to_string());
+    upstream.backend_tls_sni = Some("reviews-a.mesh.internal".to_string());
+    upstream.backend_tls_san_allow_list = vec!["reviews-a.mesh.internal".to_string()];
+    upstream.backend_tls_verify_server_cert = false;
+
+    let mut proxy = make_proxy("reviews-p", "/reviews");
+    proxy.upstream_id = Some("reviews-u".to_string());
+
+    let mut config = GatewayConfig {
+        upstreams: vec![upstream],
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    config.resolve_upstream_tls();
+
+    assert_eq!(
+        config.proxies[0]
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref(),
+        Some("/mesh/ca-a.pem")
+    );
+    assert_eq!(
+        config.proxies[0].resolved_tls.sni.as_deref(),
+        Some("reviews-a.mesh.internal")
+    );
+    assert!(!config.proxies[0].resolved_tls.verify_server_cert);
+    let first_digest = config.proxies[0]
+        .resolved_tls
+        .san_allow_list_key_digest
+        .clone();
+
+    config.upstreams[0].backend_tls_server_ca_cert_path = Some("/mesh/ca-b.pem".to_string());
+    config.upstreams[0].backend_tls_sni = Some("reviews-b.mesh.internal".to_string());
+    config.upstreams[0].backend_tls_san_allow_list = vec!["reviews-b.mesh.internal".to_string()];
+    config.upstreams[0].backend_tls_verify_server_cert = true;
+    config.resolve_upstream_tls();
+
+    let resolved = &config.proxies[0].resolved_tls;
+    assert_eq!(
+        resolved.server_ca_cert_path.as_deref(),
+        Some("/mesh/ca-b.pem")
+    );
+    assert_eq!(resolved.sni.as_deref(), Some("reviews-b.mesh.internal"));
+    assert!(resolved.verify_server_cert);
+    assert_ne!(
+        resolved.san_allow_list_key_digest, first_digest,
+        "SAN digest must be recomputed when upstream SAN policy changes"
+    );
+}
+
+#[test]
+fn resolve_upstream_tls_switches_upstream_proxy_back_to_direct_tls() {
+    let mut upstream = make_upstream("reviews-u");
+    upstream.backend_tls_server_ca_cert_path = Some("/mesh/upstream-ca.pem".to_string());
+
+    let mut proxy = make_proxy("reviews-p", "/reviews");
+    proxy.upstream_id = Some("reviews-u".to_string());
+    proxy.backend_tls_server_ca_cert_path = Some("/direct/proxy-ca.pem".to_string());
+    proxy.backend_tls_verify_server_cert = false;
+
+    let mut config = GatewayConfig {
+        upstreams: vec![upstream],
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    config.resolve_upstream_tls();
+
+    assert_eq!(
+        config.proxies[0]
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref(),
+        Some("/mesh/upstream-ca.pem")
+    );
+    assert!(config.proxies[0].resolved_tls.verify_server_cert);
+
+    config.proxies[0].upstream_id = None;
+    config.resolve_upstream_tls();
+
+    let resolved = &config.proxies[0].resolved_tls;
+    assert_eq!(
+        resolved.server_ca_cert_path.as_deref(),
+        Some("/direct/proxy-ca.pem")
+    );
+    assert!(!resolved.verify_server_cert);
+    assert!(
+        resolved.sni.is_none() && resolved.san_allow_list.is_empty(),
+        "direct proxy TLS projection must clear upstream-only SNI/SAN cache state"
+    );
+}
+
+#[test]
+fn resolve_upstream_tls_falls_back_when_subset_overlay_is_empty_or_missing() {
+    let mut upstream = make_upstream("reviews-u");
+    upstream.backend_tls_server_ca_cert_path = Some("/mesh/upstream-ca.pem".to_string());
+    upstream.resolved_subset_tls.insert(
+        "empty".to_string(),
+        ResolvedSubsetTrafficPolicy { tls: None },
+    );
+    upstream.resolved_subset_tls.insert(
+        "canary".to_string(),
+        ResolvedSubsetTrafficPolicy {
+            tls: Some(BackendTlsConfig {
+                server_ca_cert_path: Some("/mesh/canary-ca.pem".to_string()),
+                sni: Some("canary.mesh.internal".to_string()),
+                san_allow_list: vec!["canary.mesh.internal".to_string()],
+                ..BackendTlsConfig::default_verify()
+            }),
+        },
+    );
+    upstream
+        .resolved_subset_tls
+        .get_mut("canary")
+        .and_then(|resolved| resolved.tls.as_mut())
+        .expect("canary tls")
+        .recompute_san_digest();
+
+    let mut empty = make_proxy("empty-p", "/empty");
+    empty.upstream_id = Some("reviews-u".to_string());
+    empty.upstream_subset = Some("empty".to_string());
+    let mut missing = make_proxy("missing-p", "/missing");
+    missing.upstream_id = Some("reviews-u".to_string());
+    missing.upstream_subset = Some("missing".to_string());
+    let mut canary = make_proxy("canary-p", "/canary");
+    canary.upstream_id = Some("reviews-u".to_string());
+    canary.upstream_subset = Some("canary".to_string());
+
+    let mut config = GatewayConfig {
+        upstreams: vec![upstream],
+        proxies: vec![empty, missing, canary],
+        ..empty_config()
+    };
+    config.resolve_upstream_tls();
+
+    assert_eq!(
+        config.proxies[0]
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref(),
+        Some("/mesh/upstream-ca.pem"),
+        "empty subset TLS overlay should fall back to upstream-level TLS"
+    );
+    assert_eq!(
+        config.proxies[1]
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref(),
+        Some("/mesh/upstream-ca.pem"),
+        "missing subset TLS overlay should fall back to upstream-level TLS"
+    );
+    assert_eq!(
+        config.proxies[2]
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref(),
+        Some("/mesh/canary-ca.pem"),
+        "non-empty subset TLS overlay should replace upstream-level TLS"
+    );
+    assert_eq!(
+        config.proxies[2].resolved_tls.sni.as_deref(),
+        Some("canary.mesh.internal")
+    );
+}
+
+#[test]
+fn backend_tls_san_digest_ignores_order_and_duplicate_entries() {
+    let mut with_duplicates = make_upstream("dupes");
+    with_duplicates.backend_tls_san_allow_list = vec![
+        "reviews.mesh.internal".to_string(),
+        "ratings.mesh.internal".to_string(),
+        "reviews.mesh.internal".to_string(),
+    ];
+
+    let mut canonical = make_upstream("canonical");
+    canonical.backend_tls_san_allow_list = vec![
+        "ratings.mesh.internal".to_string(),
+        "reviews.mesh.internal".to_string(),
+    ];
+
+    let with_duplicates = BackendTlsConfig::from_upstream(&with_duplicates);
+    let canonical = BackendTlsConfig::from_upstream(&canonical);
+
+    assert_eq!(
+        with_duplicates.san_allow_list_key_digest, canonical.san_allow_list_key_digest,
+        "duplicate SAN entries should not fragment equivalent backend TLS identities"
     );
 }
 
@@ -1639,6 +1922,37 @@ fn test_validate_host_entry_valid_exact() {
 fn test_validate_host_entry_valid_wildcard() {
     assert!(validate_host_entry("*.example.com").is_ok());
     assert!(validate_host_entry("*.a.example.com").is_ok());
+}
+
+#[test]
+fn test_validate_host_entry_rejects_empty_label() {
+    let err = validate_host_entry("api..example.com").unwrap_err();
+    assert!(err.contains("empty labels"));
+}
+
+#[test]
+fn test_validate_host_entry_rejects_label_edge_hyphen() {
+    let err = validate_host_entry("api.-example.com").unwrap_err();
+    assert!(err.contains("start and end"));
+
+    let err = validate_host_entry("api.example-.com").unwrap_err();
+    assert!(err.contains("start and end"));
+}
+
+#[test]
+fn test_validate_host_entry_rejects_oversized_label() {
+    let host = format!("{}.example.com", "a".repeat(64));
+    let err = validate_host_entry(&host).unwrap_err();
+    assert!(err.contains("label longer than 63"));
+}
+
+#[test]
+fn test_validate_host_entry_rejects_invalid_wildcard_suffix_labels() {
+    let err = validate_host_entry("*.api..example.com").unwrap_err();
+    assert!(err.contains("empty labels"));
+
+    let err = validate_host_entry("*.api-.example.com").unwrap_err();
+    assert!(err.contains("start and end"));
 }
 
 #[test]

@@ -2,9 +2,9 @@
 //!
 //! Default behavior remains static: cert/key files are read once at startup and
 //! rotation requires a restart. When `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`,
-//! a background poll task watches the cert and key files for the proxy HTTPS /
-//! H2 / H3 listeners and (separately) the admin HTTPS listener. On any
-//! fingerprint change (size + mtime), the task rebuilds the
+//! a background poll task watches the configured TLS material sources for the
+//! proxy HTTPS / H2 / H3 listeners and (separately) the admin HTTPS listener.
+//! On any material fingerprint change, the task rebuilds the
 //! `rustls::ServerConfig` using the caller-supplied closure and atomically
 //! swaps it into the shared `SharedFrontendTls` slot. A failed validation
 //! (parse / expired / not-yet-valid / key mismatch / closure error) keeps the
@@ -27,15 +27,17 @@
 //! lives in [`crate::proxy`] under the `gateway_svid_*` watch, and DTLS
 //! material remains a static startup input.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use rustls::ServerConfig;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+
+use crate::tls::source::subscription::{
+    MaterialSetReloadConfig, WatchedMaterialSource, spawn_material_set_reload_task,
+};
 
 /// Shared frontend `ServerConfig` slot. Listeners load this on each new
 /// connection, so a swap takes effect on the next handshake without touching
@@ -55,57 +57,14 @@ pub fn frontend_tls_slot_with(initial: Arc<ServerConfig>) -> SharedFrontendTls {
     Arc::new(ArcSwap::new(Arc::new(Some(initial))))
 }
 
-/// Cheap, comparable per-file fingerprint (length + modified timestamp).
-///
-/// Atomic writes (write to temp file then rename) change both fields, so this
-/// is a sufficient change detector for K8s `Secret`-mounted certs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FrontendTlsFileStamp {
-    len: u64,
-    modified_nanos: Option<u128>,
-}
-
-/// Combined fingerprint for a (cert, key) path pair.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FrontendTlsFingerprint {
-    cert: FrontendTlsFileStamp,
-    key: FrontendTlsFileStamp,
-}
-
-fn frontend_tls_file_stamp(path: &Path) -> Result<FrontendTlsFileStamp, anyhow::Error> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("failed to stat {}: {}", path.display(), e))?;
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos());
-    Ok(FrontendTlsFileStamp {
-        len: metadata.len(),
-        modified_nanos,
-    })
-}
-
-fn frontend_tls_fingerprint(
-    cert_path: &Path,
-    key_path: &Path,
-) -> Result<FrontendTlsFingerprint, anyhow::Error> {
-    Ok(FrontendTlsFingerprint {
-        cert: frontend_tls_file_stamp(cert_path)?,
-        key: frontend_tls_file_stamp(key_path)?,
-    })
-}
-
 /// Configuration for [`spawn_frontend_tls_reload_task`].
 pub struct FrontendTlsReloadConfig {
     /// Human-readable identifier for logs ("proxy https", "admin https",
     /// "mesh inbound"). Surfaces emit a Prometheus label off this name when
     /// metrics are wired up.
     pub surface: &'static str,
-    /// Path to the PEM cert chain to watch.
-    pub cert_path: PathBuf,
-    /// Path to the PEM private key to watch.
-    pub key_path: PathBuf,
+    /// TLS material sources whose fingerprint changes should trigger a rebuild.
+    pub sources: Vec<WatchedMaterialSource>,
     /// Live `SharedFrontendTls` slot the watcher swaps on a validated change.
     pub slot: SharedFrontendTls,
     /// Poll interval; clamp at 1s upstream of this function.
@@ -115,7 +74,7 @@ pub struct FrontendTlsReloadConfig {
     /// apply it with `Endpoint::set_server_config`. The watcher bumps this
     /// after a successful swap; the value is the rotation generation.
     pub revision_tx: watch::Sender<u64>,
-    /// Closure invoked on every change to rebuild the `ServerConfig` from disk.
+    /// Closure invoked on every change to rebuild the `ServerConfig`.
     /// The closure is responsible for the surface-specific options that
     /// startup applied (ALPN advertisement, early-data, kTLS opt-in, client
     /// CA verification, session tickets). A returned `Err` keeps the previous
@@ -125,7 +84,7 @@ pub struct FrontendTlsReloadConfig {
 
 /// Surface-specific rebuild closure.
 pub type FrontendTlsRebuildFn =
-    Box<dyn Fn(&Path, &Path) -> Result<Arc<ServerConfig>, anyhow::Error> + Send + Sync + 'static>;
+    Box<dyn Fn() -> Result<Arc<ServerConfig>, anyhow::Error> + Send + Sync + 'static>;
 
 /// Spawn the frontend TLS file-watch task.
 ///
@@ -140,128 +99,31 @@ pub fn spawn_frontend_tls_reload_task(
     config: FrontendTlsReloadConfig,
     shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> JoinHandle<()> {
-    tokio::spawn(run_frontend_tls_reload_loop(config, shutdown_rx))
-}
-
-async fn run_frontend_tls_reload_loop(
-    config: FrontendTlsReloadConfig,
-    mut shutdown_rx: Option<watch::Receiver<bool>>,
-) {
     let FrontendTlsReloadConfig {
         surface,
-        cert_path,
-        key_path,
+        sources,
         slot,
         interval,
         revision_tx,
         rebuild,
     } = config;
 
-    info!(
-        surface,
-        cert_path = %cert_path.display(),
-        key_path = %key_path.display(),
-        interval_secs = interval.as_secs(),
-        "Frontend TLS live reload watcher started"
-    );
+    let publish_rebuild = Box::new(move || {
+        let new_config = rebuild()?;
+        slot.store(Arc::new(Some(new_config)));
+        Ok(())
+    });
 
-    let mut last_fingerprint = match frontend_tls_fingerprint(&cert_path, &key_path) {
-        Ok(fingerprint) => Some(fingerprint),
-        Err(error) => {
-            warn!(
-                surface,
-                error = %error,
-                "Frontend TLS file watcher could not read startup fingerprint; continuing and will retry"
-            );
-            None
-        }
-    };
-    // Track whether the last stat attempt failed so we only warn on the
-    // transition into the bad state. Without this guard, a deleted file or
-    // a stuck permission error would spam `warn!` every poll interval
-    // (every `interval` seconds) until the file came back.
-    let mut last_stat_failed = last_fingerprint.is_none();
-
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
-            return;
-        }
-
-        if let Some(shutdown) = shutdown_rx.as_mut() {
-            tokio::select! {
-                _ = ticker.tick() => {}
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                    continue;
-                }
-            }
-        } else {
-            ticker.tick().await;
-        }
-
-        let next_fingerprint = match frontend_tls_fingerprint(&cert_path, &key_path) {
-            Ok(fingerprint) => {
-                if last_stat_failed {
-                    info!(
-                        surface,
-                        "Frontend TLS file watcher recovered stat access to cert/key files"
-                    );
-                    last_stat_failed = false;
-                }
-                fingerprint
-            }
-            Err(error) => {
-                if !last_stat_failed {
-                    warn!(
-                        surface,
-                        error = %error,
-                        "Frontend TLS file watcher could not stat cert/key files; keeping current config (silenced until stat succeeds again)"
-                    );
-                    last_stat_failed = true;
-                }
-                continue;
-            }
-        };
-
-        if last_fingerprint.as_ref() == Some(&next_fingerprint) {
-            continue;
-        }
-
-        match rebuild(&cert_path, &key_path) {
-            Ok(new_config) => {
-                slot.store(Arc::new(Some(new_config)));
-                last_fingerprint = Some(next_fingerprint);
-                revision_tx.send_modify(|r| *r = r.saturating_add(1));
-                let revision = *revision_tx.borrow();
-                info!(
-                    surface,
-                    cert_path = %cert_path.display(),
-                    key_path = %key_path.display(),
-                    revision,
-                    "Frontend TLS cert/key reloaded; new handshakes will use rotated material"
-                );
-            }
-            Err(error) => {
-                // Stamp the failing fingerprint so we don't re-warn every
-                // poll while the bad state is stable. The next genuine
-                // change (good or different-bad) will compare unequal and
-                // trigger another rebuild attempt.
-                last_fingerprint = Some(next_fingerprint);
-                warn!(
-                    surface,
-                    cert_path = %cert_path.display(),
-                    key_path = %key_path.display(),
-                    error = %error,
-                    "Frontend TLS cert/key changed but rebuild failed; keeping previous TLS config"
-                );
-            }
-        }
-    }
+    spawn_material_set_reload_task(
+        MaterialSetReloadConfig {
+            surface,
+            sources,
+            interval,
+            revision_tx,
+            rebuild: publish_rebuild,
+        },
+        shutdown_rx,
+    )
 }
 
 #[cfg(test)]
@@ -275,40 +137,9 @@ mod tests {
         assert!(slot.load().is_none());
     }
 
-    #[test]
-    fn frontend_tls_fingerprint_changes_with_mtime() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let cert = dir.path().join("cert.pem");
-        let key = dir.path().join("key.pem");
-        std::fs::write(&cert, b"first cert bytes").expect("write cert");
-        std::fs::write(&key, b"first key bytes").expect("write key");
-
-        let initial = frontend_tls_fingerprint(&cert, &key).expect("initial");
-
-        // Bump the cert file's mtime + content
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&cert, b"second cert bytes that are longer").expect("rewrite cert");
-        let bumped = frontend_tls_fingerprint(&cert, &key).expect("bumped");
-
-        assert_ne!(initial, bumped);
-    }
-
-    #[test]
-    fn frontend_tls_fingerprint_stable_when_files_unchanged() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let cert = dir.path().join("cert.pem");
-        let key = dir.path().join("key.pem");
-        std::fs::write(&cert, b"cert").expect("write cert");
-        std::fs::write(&key, b"key").expect("write key");
-
-        let first = frontend_tls_fingerprint(&cert, &key).expect("first");
-        let second = frontend_tls_fingerprint(&cert, &key).expect("second");
-
-        assert_eq!(first, second);
-    }
-
     #[tokio::test]
     async fn reload_task_swaps_on_change_and_keeps_old_on_failure() {
+        use crate::tls::source::{CertSource, MaterialKind};
         use rustls::crypto::ring::default_provider;
         let _ = default_provider().install_default();
 
@@ -330,7 +161,7 @@ mod tests {
 
         let attempts_clone = attempts.clone();
         let success_clone = success_config.clone();
-        let rebuild: FrontendTlsRebuildFn = Box::new(move |_cert_path: &Path, _key_path: &Path| {
+        let rebuild: FrontendTlsRebuildFn = Box::new(move || {
             let attempt = attempts_clone.fetch_add(1, Ordering::SeqCst);
             if attempt == 0 {
                 Ok(success_clone.clone())
@@ -344,9 +175,23 @@ mod tests {
 
         let task = spawn_frontend_tls_reload_task(
             FrontendTlsReloadConfig {
-                surface: "test",
-                cert_path: cert.clone(),
-                key_path: key.clone(),
+                // Unique surface per test: the force-reload registry is a
+                // process-global keyed by surface, so a shared name lets a
+                // parallel test's task drop this one's force sender and exit
+                // early (`cargo test --lib` runs tests concurrently).
+                surface: "test_frontend_reload_swap",
+                sources: vec![
+                    WatchedMaterialSource::new(
+                        "cert",
+                        CertSource::parse(cert.to_string_lossy().into_owned(), MaterialKind::Cert),
+                        MaterialKind::Cert,
+                    ),
+                    WatchedMaterialSource::new(
+                        "key",
+                        CertSource::parse(key.to_string_lossy().into_owned(), MaterialKind::Key),
+                        MaterialKind::Key,
+                    ),
+                ],
                 slot: slot.clone(),
                 interval: Duration::from_millis(50),
                 revision_tx,
