@@ -10,8 +10,8 @@
 //! line is a bounded-channel send handled off-thread — and decouples access
 //! logging from `FERRUM_LOG_LEVEL`: enabling this plugin is the only on/off
 //! switch, and lowering runtime verbosity never silences it. When no global
-//! writer is installed (validate-only mode, unit tests) it falls back to a
-//! direct synchronous write so output is still produced.
+//! writer is installed (in-process unit tests that never call `init_logging`)
+//! it falls back to a direct synchronous write so output is still produced.
 //!
 //! An optional `filter` (status-code range, minimum latency, errors-only)
 //! gates which transactions are logged; it runs before schema application.
@@ -22,7 +22,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::warn;
 
 use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
@@ -47,16 +47,27 @@ impl StdoutLogging {
             return Err("stdout_logging: config must be an object".to_string());
         }
         let filter = match config.get("filter") {
-            Some(f) if !f.is_null() => Some(Filter {
-                status_code_min: parse_optional_u16(f, "status_code_min")?,
-                status_code_max: parse_optional_u16(f, "status_code_max")?,
-                min_latency_ms: f.get("min_latency_ms").and_then(Value::as_u64),
-                errors_only: f
-                    .get("errors_only")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            }),
-            _ => None,
+            Some(Value::Null) | None => None,
+            Some(Value::Object(filter_config)) => {
+                let status_code_min = parse_optional_u16(filter_config, "status_code_min")?;
+                let status_code_max = parse_optional_u16(filter_config, "status_code_max")?;
+                if let (Some(min), Some(max)) = (status_code_min, status_code_max)
+                    && min > max
+                {
+                    return Err(
+                        "stdout_logging: filter.status_code_min must be less than or equal to filter.status_code_max"
+                            .to_string(),
+                    );
+                }
+                Some(Filter {
+                    status_code_min,
+                    status_code_max,
+                    min_latency_ms: parse_optional_u64(filter_config, "min_latency_ms")?,
+                    errors_only: parse_optional_bool(filter_config, "errors_only")?
+                        .unwrap_or(false),
+                })
+            }
+            Some(_) => return Err("stdout_logging: filter must be an object".to_string()),
         };
         let schema = resolve_schema(config, "stdout_logging")?;
         Ok(Self { filter, schema })
@@ -107,7 +118,7 @@ impl StdoutLogging {
     }
 }
 
-fn parse_optional_u16(config: &Value, key: &str) -> Result<Option<u16>, String> {
+fn parse_optional_u16(config: &Map<String, Value>, key: &str) -> Result<Option<u16>, String> {
     let Some(value) = config.get(key) else {
         return Ok(None);
     };
@@ -117,6 +128,26 @@ fn parse_optional_u16(config: &Value, key: &str) -> Result<Option<u16>, String> 
     u16::try_from(raw)
         .map(Some)
         .map_err(|_| format!("stdout_logging: filter.{key} must be between 0 and 65535"))
+}
+
+fn parse_optional_u64(config: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
+    let Some(value) = config.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| format!("stdout_logging: filter.{key} must be an integer"))
+}
+
+fn parse_optional_bool(config: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
+    let Some(value) = config.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("stdout_logging: filter.{key} must be a boolean"))
 }
 
 /// Write one access-log line to the non-blocking stdout sink.
@@ -131,8 +162,10 @@ fn write_access_log_line(mut json: String) {
             let mut writer = writer.clone();
             let _ = writer.write_all(json.as_bytes());
         }
-        // No global writer installed yet (validate-only mode, unit tests):
-        // fall back to a direct synchronous write so output still appears.
+        // No global writer installed (in-process unit tests that never call
+        // `init_logging`): fall back to a direct synchronous write so output
+        // still appears. `validate` mode does call `init_logging`, so the
+        // global writer is present there.
         None => {
             let _ = std::io::stdout().write_all(json.as_bytes());
         }
@@ -189,6 +222,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::retry::ErrorClass;
+
+    fn http_summary(
+        status: u16,
+        latency_total_ms: f64,
+        error_class: Option<ErrorClass>,
+    ) -> TransactionSummary {
+        TransactionSummary {
+            response_status_code: status,
+            latency_total_ms,
+            error_class,
+            ..TransactionSummary::default()
+        }
+    }
 
     fn stream_summary() -> StreamTransactionSummary {
         StreamTransactionSummary {
@@ -261,5 +308,86 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("between 0 and 65535"), "got: {err}");
+    }
+
+    #[test]
+    fn constructor_accepts_null_and_empty_object_config() {
+        assert!(StdoutLogging::new(&Value::Null).is_ok());
+        assert!(StdoutLogging::new(&json!({})).is_ok());
+        assert!(StdoutLogging::new(&json!({ "filter": null })).is_ok());
+    }
+
+    #[test]
+    fn constructor_rejects_malformed_filter_config() {
+        for (config, expected) in [
+            (json!("bad"), "config must be an object"),
+            (json!({ "filter": "bad" }), "filter must be an object"),
+            (
+                json!({ "filter": { "status_code_min": "500" } }),
+                "filter.status_code_min must be an integer",
+            ),
+            (
+                json!({ "filter": { "status_code_max": 70000 } }),
+                "filter.status_code_max must be between 0 and 65535",
+            ),
+            (
+                json!({ "filter": { "min_latency_ms": "250" } }),
+                "filter.min_latency_ms must be an integer",
+            ),
+            (
+                json!({ "filter": { "errors_only": "true" } }),
+                "filter.errors_only must be a boolean",
+            ),
+            (
+                json!({ "filter": { "status_code_min": 500, "status_code_max": 499 } }),
+                "filter.status_code_min must be less than or equal to filter.status_code_max",
+            ),
+        ] {
+            let err = match StdoutLogging::new(&config) {
+                Ok(_) => panic!("invalid config should fail: {config}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(expected),
+                "expected error containing {expected:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_filter_matches_status_latency_and_error_predicates() {
+        let plugin = StdoutLogging::new(&json!({
+            "filter": {
+                "status_code_min": 500,
+                "status_code_max": 599,
+                "min_latency_ms": 250,
+                "errors_only": true
+            }
+        }))
+        .expect("plugin config");
+
+        assert!(plugin.should_log_http(&http_summary(
+            503,
+            250.0,
+            Some(ErrorClass::ConnectionTimeout)
+        )));
+        // Below the status floor, above the ceiling, under the latency floor, and
+        // without an error class are each individually excluded.
+        assert!(!plugin.should_log_http(&http_summary(
+            499,
+            250.0,
+            Some(ErrorClass::ConnectionTimeout)
+        )));
+        assert!(!plugin.should_log_http(&http_summary(
+            600,
+            250.0,
+            Some(ErrorClass::ConnectionTimeout)
+        )));
+        assert!(!plugin.should_log_http(&http_summary(
+            503,
+            249.0,
+            Some(ErrorClass::ConnectionTimeout)
+        )));
+        assert!(!plugin.should_log_http(&http_summary(503, 250.0, None)));
     }
 }

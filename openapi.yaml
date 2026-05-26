@@ -7808,7 +7808,7 @@ components:
               type: integer
               minimum: 0
               maximum: 65535
-              description: HTTP responses with status > this value are skipped.
+              description: HTTP responses with status > this value are skipped. Must be greater than or equal to status_code_min when both are set, otherwise plugin validation rejects the config.
             min_latency_ms:
               type: integer
               minimum: 0
