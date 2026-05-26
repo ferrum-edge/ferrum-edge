@@ -197,7 +197,7 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_MODE` | **Yes** | — | `database`, `file`, `cp`, `dp`, `migrate` |
-| `FERRUM_LOG_LEVEL` | No | `error` | `error`, `warn`, `info`, `debug`, `trace` |
+| `FERRUM_LOG_LEVEL` | No | `warn` | `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy port (`0` = disabled) |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy port |

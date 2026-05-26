@@ -251,7 +251,6 @@ async fn test_all_plugins_available() {
         "mesh_outbound_registry",
         "workload_metrics",
         "__mesh_bpf_metrics",
-        "access_log",
         "ai_federation",
         "api_chargeback",
         "api_chargeback_sink",

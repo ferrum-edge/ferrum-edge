@@ -99,7 +99,7 @@ src/
 │   ├── request_transformer.rs # Header/query modification
 │   ├── response_caching.rs    # Response caching
 │   ├── response_transformer.rs # Response header modification
-│   ├── stdout_logging.rs      # JSON transaction logging (tracing::info on access_log target)
+│   ├── stdout_logging.rs      # JSON transaction logging to stdout via the non-blocking writer
 │   ├── transaction_debugger.rs # Verbose request/response diagnostics (tracing::debug on transaction_debug target)
 │   └── utils/                 # Plugin utilities
 │       ├── mod.rs

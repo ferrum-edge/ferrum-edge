@@ -43,7 +43,7 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 6. `after_proxy`: response-side counterpart to before_proxy
 7. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
 8. `on_response_body`: AI response guard and token metrics
-9. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback/access_log
+9. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
 10. `on_ws_frame`: WS size, rate, and frame logging
 11. `on_stream_connect` / `on_stream_disconnect`: TCP+TLS after handshake; UDP+DTLS after DTLS handshake
 12. `on_udp_datagram`: bidirectional datagram hooks only when `requires_udp_datagram_hooks()`

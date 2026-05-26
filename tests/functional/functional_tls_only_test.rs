@@ -433,8 +433,8 @@ async fn functional_tls_only_warn_when_plaintext_disabled_and_no_tls() {
             .env("FERRUM_PROXY_HTTP_PORT", "0")
             // Intentionally no FERRUM_FRONTEND_TLS_CERT_PATH / KEY.
             .env("FERRUM_ADMIN_HTTP_PORT", admin_http.to_string())
-            // Logs default to error — bump to warn so we actually see the
-            // target warning.
+            // Pin FERRUM_LOG_LEVEL=warn (also the default) so the target
+            // warning is visible regardless of any inherited level override.
             .env("FERRUM_LOG_LEVEL", "warn")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

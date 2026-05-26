@@ -9,6 +9,8 @@
 
 use std::sync::OnceLock;
 
+use tracing_appender::non_blocking::NonBlocking;
+
 pub mod runtime_overlay;
 
 /// Stable callback that knows how to rebuild the gateway-wide tracing
@@ -51,4 +53,37 @@ pub fn set_log_level_reloader(reloader: Box<dyn LogLevelReloader>) -> Result<(),
 /// no-op rather than a hard error.
 pub fn log_level_reloader() -> Option<&'static dyn LogLevelReloader> {
     RELOADER.get().map(|reloader| reloader.as_ref())
+}
+
+/// Process-global, non-blocking sink for transaction access logs.
+///
+/// The `stdout_logging` plugin writes one JSON line per proxied transaction
+/// or stream disconnect. It must not perform a synchronous
+/// `std::io::stdout().lock()` write on the proxy hot path — under stdout
+/// backpressure that blocks a Tokio worker thread and stalls the runtime. It
+/// must also stay independent of `FERRUM_LOG_LEVEL`: access logging is a
+/// plugin-enablement decision, not a diagnostic verbosity knob, so lowering
+/// the runtime log level must never silence it.
+///
+/// `init_logging` (in the binary) installs a clone of the same
+/// `tracing_appender` non-blocking stdout writer the fmt layers use. Writing
+/// here is a bounded-channel send handled off-thread, and the writer bypasses
+/// the `EnvFilter`/`SeverityWriter` tracing stack entirely. The plugin holds
+/// only a sender clone; the flush-on-exit `WorkerGuard` stays owned by
+/// `run_gateway()`.
+static ACCESS_LOG_WRITER: OnceLock<NonBlocking> = OnceLock::new();
+
+/// Install the process-global access-log writer. Called once from the
+/// binary's `init_logging`. A second call is a no-op (the first writer
+/// stays in effect), matching the single-install contract of the rest of
+/// this module.
+pub fn set_access_log_writer(writer: NonBlocking) {
+    let _ = ACCESS_LOG_WRITER.set(writer);
+}
+
+/// Read access for the access-log sink. `None` before `init_logging` runs
+/// (validate-only mode, unit tests). Callers must fall back to a direct
+/// write so output is still produced in those contexts.
+pub fn access_log_writer() -> Option<&'static NonBlocking> {
+    ACCESS_LOG_WRITER.get()
 }

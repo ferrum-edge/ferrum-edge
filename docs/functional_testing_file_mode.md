@@ -219,7 +219,7 @@ FERRUM_FILE_CONFIG_PATH=/path/to/config.yaml
 # Operating mode
 FERRUM_MODE=file
 
-# Optional: Logging level (default: error)
+# Optional: Logging level (default: warn)
 RUST_LOG=ferrum_edge=debug
 
 # Optional: Proxy ports (defaults: 8000 for HTTP, 8443 for HTTPS)

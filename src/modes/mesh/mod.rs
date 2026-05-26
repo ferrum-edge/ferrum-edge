@@ -2766,11 +2766,17 @@ fn inject_mesh_global_plugins(
 
     // Build access log config with optional filter from Telemetry CRD.
     // `None` means "access logging is explicitly disabled" — we retain-remove
-    // any existing mesh access_log plugin and skip injection, but we MUST NOT
+    // any existing mesh access-log plugin and skip injection, but we MUST NOT
     // short-circuit the rest of inject_mesh_global_plugins (e.g. the bpf_metrics
     // branch below). Earlier versions used `return;` here, which silently
     // skipped bpf_metrics injection/cleanup on NodeWaypoint topology whenever
     // Telemetry CRD disabled access logging.
+    //
+    // The injected sink is `stdout_logging`: it serializes the same
+    // transaction/stream summaries and honors the same `filter` config, and
+    // writes through the non-blocking stdout writer rather than the tracing
+    // fmt stack. The reserved ID stays `__mesh_access_log` so existing
+    // injected plugins are updated in place across upgrades.
     let access_log_config: Option<serde_json::Value> = match &merged_telemetry.access_logging {
         Some(al) if !al.enabled => {
             config
@@ -2788,7 +2794,7 @@ fn inject_mesh_global_plugins(
         ensure_global_plugin(
             config,
             MESH_ACCESS_LOG_PLUGIN_ID,
-            "access_log",
+            "stdout_logging",
             cfg,
             &runtime.namespace,
         );
@@ -6971,8 +6977,9 @@ mod tests {
             .plugin_configs
             .iter()
             .find(|plugin| plugin.id == MESH_ACCESS_LOG_PLUGIN_ID)
-            .expect("access_log plugin injected");
+            .expect("mesh access-log (stdout_logging) plugin injected");
 
+        assert_eq!(access_log.plugin_name, "stdout_logging");
         assert_eq!(access_log.config["filter"]["status_code_min"], 500);
     }
 
@@ -8319,7 +8326,10 @@ mod tests {
                     by_id(MESH_WORKLOAD_METRICS_PLUGIN_ID).plugin_name,
                     "workload_metrics"
                 );
-                assert_eq!(by_id(MESH_ACCESS_LOG_PLUGIN_ID).plugin_name, "access_log");
+                assert_eq!(
+                    by_id(MESH_ACCESS_LOG_PLUGIN_ID).plugin_name,
+                    "stdout_logging"
+                );
                 assert!(
                     prepared
                         .plugin_configs
