@@ -401,6 +401,16 @@ async fn test_xml_required_element_missing() {
 }
 
 #[tokio::test]
+async fn test_xml_required_element_without_validate_xml_is_enforced() {
+    let plugin = BodyValidator::new(&json!({"required_xml_elements": ["item"]})).unwrap();
+    let body = "<root><other>content</other></root>";
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
 async fn test_xml_required_element_prefix_must_not_match() {
     // Body has `<username>` but `<user>` is required — the prefix match
     // alone must not satisfy the requirement.
@@ -1300,6 +1310,23 @@ async fn test_response_xml_invalid() {
 async fn test_response_xml_required_elements() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "response_validate_xml": true,
+        "response_required_xml_elements": ["result"]
+    }))
+    .unwrap();
+    let mut ctx = make_response_ctx();
+    let headers = response_xml_headers();
+    let body = b"<root><data>text</data></root>";
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn test_response_xml_required_elements_without_validate_xml_are_enforced() {
+    let plugin = BodyValidator::new(&serde_json::json!({
         "response_required_xml_elements": ["result"]
     }))
     .unwrap();

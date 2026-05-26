@@ -1255,7 +1255,9 @@ impl Plugin for BodyValidator {
                 self.json_schema.as_ref(),
                 &self.compiled_patterns,
             )
-        } else if is_xml_like_content_type(content_type) && self.validate_xml {
+        } else if is_xml_like_content_type(content_type)
+            && (self.validate_xml || !self.required_xml_elements.is_empty())
+        {
             Self::validate_xml_body(body, &self.required_xml_elements)
         } else {
             Ok(())
@@ -1329,7 +1331,7 @@ impl Plugin for BodyValidator {
                     self.json_schema.as_ref(),
                     &self.compiled_patterns,
                 )
-            } else if is_xml_like_content_type(content_type) && self.validate_xml {
+            } else if is_xml_like_content_type(content_type) && has_xml_validation {
                 Self::validate_xml_body(body_str, &self.required_xml_elements)
             } else {
                 Ok(())
@@ -1471,7 +1473,9 @@ impl Plugin for BodyValidator {
                 self.response_json_schema.as_ref(),
                 &self.response_compiled_patterns,
             )
-        } else if is_xml_like_content_type(content_type) && self.response_validate_xml {
+        } else if is_xml_like_content_type(content_type)
+            && (self.response_validate_xml || !self.response_required_xml_elements.is_empty())
+        {
             Self::validate_xml_body(body_str, &self.response_required_xml_elements)
         } else {
             Ok(())
