@@ -114,6 +114,8 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 - `FERRUM_K8S_CONTROLLER_ENABLED` and `FERRUM_K8S_POD_DISCOVERY_ENABLED` default true inside pods detected by `KUBERNETES_SERVICE_HOST`; outside pods they default false.
 - Explicit operator `false` wins over pod detection.
 - If `FERRUM_K8S_WATCH_NAMESPACES` is unset, watch scope falls back to CP scope: `Single`/`Set` use namespaced watches, `All` uses cluster-wide.
-- Istio status writer patches `status.conditions[]` for AuthorizationPolicy, PeerAuthentication, and DestinationRule when `watch_istio == true`.
-- Status writer failures, such as missing `subresources.status`, warn and no-op.
-- VirtualService, ServiceEntry, RequestAuthentication, Sidecar, Telemetry, and WorkloadEntry status are deferred; do not imply they are implemented.
+- Istio status writer patches `status.conditions[]` (a `FerrumAccepted` condition plus a `status.ferrum.translation` detail block) for all nine translated Istio kinds when `watch_istio == true`: AuthorizationPolicy, PeerAuthentication, RequestAuthentication, DestinationRule, VirtualService, ServiceEntry, WorkloadEntry, Sidecar, and Telemetry. Successful translation writes `FerrumAccepted=True`; a `K8sTranslateError` writes `FerrumAccepted=False`/`Invalid` with the translator's reason so rejections are visible to `kubectl`.
+- Keep `istio_api_resource`/`is_supported_istio_kind` in `src/k8s_controller/istio_status.rs` in lock-step with `ISTIO_CRDS` in `src/k8s_controller/watcher.rs` (group + plural).
+- Parsed-but-unenforced fields are surfaced as `status.ferrum.translation.deferred_fields` rather than only logged: DestinationRule `portLevelSettings[].tls`, per-subset `connectionPool.tcp.connectTimeout`/`outlierDetection`, and `connectionPool.http.{http1MaxPendingRequests,maxRetries,h2UpgradePolicy}`; VirtualService `tcp[]`/`tls[]` routes and `http[].{mirror,mirrorPercentage,corsPolicy,redirect,rewrite}`; Sidecar `ingress[]`. The DR `connectionPool.http` deferred set is mirrored by a translator warning in `src/config_sources/k8s/istio.rs`; keep the two lists in sync.
+- Status writer failures, such as missing `subresources.status`, warn and no-op; they never abort reconcile.
+- `ProxyConfig` is translated but not watched (`ISTIO_CRDS`) and not surfaced by the status writer.

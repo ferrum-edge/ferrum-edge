@@ -1,13 +1,13 @@
-//! Status sub-resource patcher for Istio CRDs (T2-B).
+//! Status sub-resource patcher for Istio CRDs.
 //!
 //! Operators run `kubectl describe authorizationpolicy <name>` (and the
-//! sibling commands for `PeerAuthentication` / `DestinationRule`) to see
-//! how Ferrum interpreted their policy. Without a `status.conditions[]`
-//! block, those commands return only the operator-supplied `spec`, with
-//! no visible signal that Ferrum accepted/rejected the policy or what it
-//! actually programmed. This module fills that gap.
+//! sibling commands for the other Istio CRDs) to see how Ferrum
+//! interpreted their policy. Without a `status.conditions[]` block, those
+//! commands return only the operator-supplied `spec`, with no visible
+//! signal that Ferrum accepted/rejected the policy or what it actually
+//! programmed. This module fills that gap.
 //!
-//! Three CRDs are covered in this PR:
+//! All nine translated Istio CRDs are covered:
 //!
 //! - `AuthorizationPolicy` — status confirms `ALLOW` with no rules
 //!   compiles to a synthetic never-match rule (Istio allow-nothing
@@ -16,19 +16,31 @@
 //!   (UNSET → PERMISSIVE in Istio) and surfaces port-level overrides.
 //! - `DestinationRule` — status reports whether the rule's host could be
 //!   matched and which `connectionPool` knobs landed vs. were deferred.
+//! - `VirtualService` — status reports host/HTTP-route counts and flags
+//!   `tcp`/`tls` route blocks and HTTP `mirror`/`corsPolicy`/`redirect`/
+//!   `rewrite` fields as deferred (the translator only consumes `http`
+//!   routes).
+//! - `ServiceEntry` — status reports the resolved `resolution`/`location`
+//!   and host/endpoint/port counts.
+//! - `RequestAuthentication` — status reports the resolved scope and the
+//!   number of JWT rules (permissive-by-default semantics).
+//! - `Sidecar` — status reports the egress scope and flags `ingress`
+//!   listener config as deferred (Ferrum models egress scoping only).
+//! - `Telemetry` — status reports which sections (tracing / metrics /
+//!   accessLogging) are present.
+//! - `WorkloadEntry` — status reports the derived SPIFFE service account
+//!   and service binding.
 //!
-//! The other Istio CRDs (`VirtualService`, `ServiceEntry`,
-//! `RequestAuthentication`, `Sidecar`, `Telemetry`, `WorkloadEntry`) are
-//! deliberately deferred to a follow-on so this PR stays reviewable.
-//! Adding them follows the exact same pattern as the three CRDs covered
-//! here.
+//! For each kind a rejection (`K8sTranslateError`) flips `FerrumAccepted`
+//! to `False`/`Invalid` with the translator's reason, so a hard rejection
+//! is never silent to operators.
 //!
 //! ## Subresource availability
 //!
 //! Istio's own CRD manifests include `subresources: { status: {} }` on the
-//! three CRDs above, so `patch_status` works against any standard Istio
-//! install. If a cluster has stripped the subresource (rare; usually an
-//! intentional admission-policy decision), `patch_status` returns
+//! Istio CRDs, so `patch_status` works against any standard Istio install.
+//! If a cluster has stripped the subresource (rare; usually an intentional
+//! admission-policy decision), `patch_status` returns
 //! `kube::Error::Api(_)` with `code: 404` — the writer logs a single warn
 //! and otherwise no-ops, never panics, never aborts reconcile. The
 //! Gateway API path uses the same defensive pattern; see [`status.rs`].
@@ -165,10 +177,19 @@ impl IstioStatusWriter {
 /// through the whole pipeline.
 fn istio_api_resource(update: &IstioStatusUpdate) -> Option<ApiResource> {
     let (group, version) = update.api_version.split_once('/')?;
+    // Keep the plural/group mapping in lock-step with `ISTIO_CRDS` in
+    // `src/k8s_controller/watcher.rs` — that array is the source of truth for
+    // which kinds the controller actually watches.
     let plural = match (update.kind.as_str(), group, version) {
         ("AuthorizationPolicy", "security.istio.io", _) => "authorizationpolicies",
         ("PeerAuthentication", "security.istio.io", _) => "peerauthentications",
+        ("RequestAuthentication", "security.istio.io", _) => "requestauthentications",
         ("DestinationRule", "networking.istio.io", _) => "destinationrules",
+        ("VirtualService", "networking.istio.io", _) => "virtualservices",
+        ("ServiceEntry", "networking.istio.io", _) => "serviceentries",
+        ("WorkloadEntry", "networking.istio.io", _) => "workloadentries",
+        ("Sidecar", "networking.istio.io", _) => "sidecars",
+        ("Telemetry", "telemetry.istio.io", _) => "telemetries",
         _ => return None,
     };
     Some(ApiResource {
@@ -208,6 +229,16 @@ pub fn plan_istio_status_updates(
                     &options.istio_root_namespace,
                 ),
                 "DestinationRule" => destination_rule_status(object, result.as_ref()),
+                "VirtualService" => virtual_service_status(object, result.as_ref()),
+                "ServiceEntry" => service_entry_status(object, result.as_ref()),
+                "RequestAuthentication" => request_authentication_status(
+                    object,
+                    result.as_ref(),
+                    &options.istio_root_namespace,
+                ),
+                "WorkloadEntry" => workload_entry_status(object, result.as_ref()),
+                "Sidecar" => sidecar_status(object, result.as_ref()),
+                "Telemetry" => telemetry_status(object, result.as_ref()),
                 _ => return None,
             };
             if status == object.status && ferrum_detail_matches(&object.status, &ferrum_detail) {
@@ -234,7 +265,15 @@ fn ferrum_detail_matches(status: &Value, desired: &Option<Value>) -> bool {
 fn is_supported_istio_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "AuthorizationPolicy" | "PeerAuthentication" | "DestinationRule"
+        "AuthorizationPolicy"
+            | "PeerAuthentication"
+            | "RequestAuthentication"
+            | "DestinationRule"
+            | "VirtualService"
+            | "ServiceEntry"
+            | "WorkloadEntry"
+            | "Sidecar"
+            | "Telemetry"
     )
 }
 
@@ -526,8 +565,10 @@ fn destination_rule_status(
         Ok(_translation) => {
             // T1-C deferred fields: portLevelSettings.tls (parsed but
             // not enforced), per-subset connectionPool.tcp.connectTimeout,
-            // per-subset outlierDetection. Surface them so operators see
-            // the gap in `kubectl describe`.
+            // per-subset outlierDetection, and the parsed-but-dropped
+            // connectionPool.http knobs the translator only warns on
+            // (http1MaxPendingRequests / maxRetries / h2UpgradePolicy).
+            // Surface them so operators see the gap in `kubectl describe`.
             let mut deferred: Vec<&'static str> = Vec::new();
             if has_port_level_tls(&object.spec) {
                 deferred.push("portLevelSettings[].tls (parsed but not enforced)");
@@ -538,6 +579,7 @@ fn destination_rule_status(
             if has_subset_outlier_detection(&object.spec) {
                 deferred.push("subsets[].trafficPolicy.outlierDetection");
             }
+            deferred.extend(deferred_connection_pool_http_fields(&object.spec));
             let message = if deferred.is_empty() {
                 format!("Ferrum accepted this DestinationRule (host: {host})")
             } else {
@@ -620,6 +662,488 @@ fn has_subset_outlier_detection(spec: &Value) -> bool {
                     .is_some()
             })
         })
+}
+
+/// `connectionPool.http` knobs the translator parses but drops with an
+/// operator-visible warning (see `translate_connection_pool_http` in
+/// `src/config_sources/k8s/istio.rs`). Keep this list in sync with the
+/// translator's deferred-field loop.
+const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[
+    (
+        "http1MaxPendingRequests",
+        "trafficPolicy.connectionPool.http.http1MaxPendingRequests (parsed but not enforced)",
+    ),
+    (
+        "maxRetries",
+        "trafficPolicy.connectionPool.http.maxRetries (parsed but not enforced)",
+    ),
+    (
+        "h2UpgradePolicy",
+        "trafficPolicy.connectionPool.http.h2UpgradePolicy (parsed but not enforced)",
+    ),
+];
+
+/// Collect the deferred `connectionPool.http.*` field labels present under
+/// either the top-level `trafficPolicy` or any subset's `trafficPolicy`.
+/// Mirrors the translator's `debug!`-now-`warning` promotion so the same
+/// gap shows up in `kubectl describe`.
+fn deferred_connection_pool_http_fields(spec: &Value) -> Vec<&'static str> {
+    let top_level = spec.get("trafficPolicy");
+    let subset_policies = spec
+        .get("subsets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|subset| subset.get("trafficPolicy"));
+
+    let policies: Vec<&Value> = top_level.into_iter().chain(subset_policies).collect();
+    DEFERRED_CONNECTION_POOL_HTTP_FIELDS
+        .iter()
+        .filter(|(field, _)| {
+            policies.iter().any(|policy| {
+                policy
+                    .get("connectionPool")
+                    .and_then(|cp| cp.get("http"))
+                    .and_then(|http| http.get(field))
+                    .is_some()
+            })
+        })
+        .map(|(_, label)| *label)
+        .collect()
+}
+
+/// Shared tail for the per-kind status builders: stamp a single
+/// `FerrumAccepted` condition onto a clone of the object's existing status
+/// and return it alongside the optional translator-detail block. Mirrors
+/// the inline tail the original three CRDs used so every kind produces an
+/// identical condition shape.
+fn accepted_status(
+    object: &K8sObject,
+    accepted: bool,
+    reason: &str,
+    message: &str,
+    detail: Option<Value>,
+) -> (Value, Option<Value>) {
+    let conditions = vec![condition(
+        object,
+        Some(&object.status),
+        "FerrumAccepted",
+        accepted,
+        reason,
+        message,
+    )];
+    let mut status = object.status.clone();
+    merge_status_conditions(&mut status, &["FerrumAccepted"], conditions);
+    (status, detail)
+}
+
+/// Status for `VirtualService`. The translator only consumes `spec.http`
+/// routes; `spec.tcp` / `spec.tls` route blocks and several HTTP-route
+/// fields (`mirror` / `mirrorPercentage` / `corsPolicy` / `redirect` /
+/// `rewrite`) are parsed-shaped-but-dropped, so they are surfaced as
+/// deferred fields. A `K8sTranslateError` (unsupported match predicate,
+/// bad backend, etc.) flips the condition to `Invalid`.
+fn virtual_service_status(
+    object: &K8sObject,
+    result: Result<&K8sTranslation, &K8sTranslateError>,
+) -> (Value, Option<Value>) {
+    let host_count = object
+        .spec
+        .get("hosts")
+        .and_then(Value::as_array)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let http_route_count = object
+        .spec
+        .get("http")
+        .and_then(Value::as_array)
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    match result {
+        Ok(_translation) => {
+            let deferred = virtual_service_deferred_fields(&object.spec);
+            let message = if deferred.is_empty() {
+                format!(
+                    "Ferrum accepted this VirtualService ({host_count} host(s), {http_route_count} HTTP route(s))"
+                )
+            } else {
+                format!(
+                    "Ferrum accepted this VirtualService ({host_count} host(s), {http_route_count} HTTP route(s)); \
+                     deferred fields: {}",
+                    deferred.join(", ")
+                )
+            };
+            let detail = json!({
+                "translation": {
+                    "hosts": host_count,
+                    "http_routes_translated": http_route_count,
+                    "deferred_fields": deferred,
+                }
+            });
+            accepted_status(object, true, "Accepted", &message, Some(detail))
+        }
+        Err(error) => {
+            let message = format!("Ferrum rejected this VirtualService: {error}");
+            let detail = json!({
+                "translation": {
+                    "hosts": host_count,
+                    "http_routes_translated": http_route_count,
+                    "error": format!("{error}"),
+                }
+            });
+            accepted_status(object, false, "Invalid", &message, Some(detail))
+        }
+    }
+}
+
+/// VirtualService fields the translator parses past but never projects.
+/// `tcp` / `tls` route arrays are ignored wholesale; the listed HTTP-route
+/// fields are not read by the route translator.
+fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
+    let mut deferred: Vec<&'static str> = Vec::new();
+    if spec
+        .get("tcp")
+        .and_then(Value::as_array)
+        .is_some_and(|routes| !routes.is_empty())
+    {
+        deferred.push("tcp[] routes (not translated; only http routes are modeled)");
+    }
+    if spec
+        .get("tls")
+        .and_then(Value::as_array)
+        .is_some_and(|routes| !routes.is_empty())
+    {
+        deferred.push("tls[] routes (not translated; only http routes are modeled)");
+    }
+    let http_routes = spec.get("http").and_then(Value::as_array);
+    for (field, label) in [
+        ("mirror", "http[].mirror (parsed but not projected)"),
+        (
+            "mirrorPercentage",
+            "http[].mirrorPercentage (parsed but not projected)",
+        ),
+        ("corsPolicy", "http[].corsPolicy (parsed but not projected)"),
+        ("redirect", "http[].redirect (parsed but not projected)"),
+        ("rewrite", "http[].rewrite (parsed but not projected)"),
+    ] {
+        if http_routes.is_some_and(|routes| routes.iter().any(|route| route.get(field).is_some())) {
+            deferred.push(label);
+        }
+    }
+    deferred
+}
+
+/// Status for `ServiceEntry`. Reports the resolved `resolution`/`location`
+/// (both default when omitted, matching Istio) and host/endpoint/port
+/// counts so operators can confirm Ferrum's view of an external service.
+fn service_entry_status(
+    object: &K8sObject,
+    result: Result<&K8sTranslation, &K8sTranslateError>,
+) -> (Value, Option<Value>) {
+    let resolution = object
+        .spec
+        .get("resolution")
+        .and_then(Value::as_str)
+        .unwrap_or("NONE")
+        .to_string();
+    let location = object
+        .spec
+        .get("location")
+        .and_then(Value::as_str)
+        .unwrap_or("MESH_EXTERNAL")
+        .to_string();
+    let host_count = object
+        .spec
+        .get("hosts")
+        .and_then(Value::as_array)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let endpoint_count = object
+        .spec
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let port_count = object
+        .spec
+        .get("ports")
+        .and_then(Value::as_array)
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    match result {
+        Ok(_translation) => {
+            let message = format!(
+                "Ferrum accepted this ServiceEntry ({host_count} host(s), resolution: {resolution}, location: {location})"
+            );
+            let detail = json!({
+                "translation": {
+                    "hosts": host_count,
+                    "endpoints": endpoint_count,
+                    "ports": port_count,
+                    "resolution": resolution,
+                    "location": location,
+                }
+            });
+            accepted_status(object, true, "Accepted", &message, Some(detail))
+        }
+        Err(error) => {
+            let message = format!("Ferrum rejected this ServiceEntry: {error}");
+            let detail = json!({
+                "translation": {
+                    "hosts": host_count,
+                    "resolution": resolution,
+                    "location": location,
+                    "error": format!("{error}"),
+                }
+            });
+            accepted_status(object, false, "Invalid", &message, Some(detail))
+        }
+    }
+}
+
+/// Status for `RequestAuthentication`. Surfaces the resolved scope and JWT
+/// rule count, plus a reminder of Istio's permissive-by-default semantics
+/// (RequestAuthentication only declares which JWTs are *valid*, not which
+/// are *required*).
+fn request_authentication_status(
+    object: &K8sObject,
+    result: Result<&K8sTranslation, &K8sTranslateError>,
+    istio_root_namespace: &str,
+) -> (Value, Option<Value>) {
+    let scope = istio_policy_scope_label(object, istio_root_namespace);
+    let jwt_rule_count = object
+        .spec
+        .get("jwtRules")
+        .and_then(Value::as_array)
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    match result {
+        Ok(_translation) => {
+            let message = format!(
+                "Ferrum accepted this RequestAuthentication (scope: {scope}; {jwt_rule_count} JWT rule(s); \
+                 permissive by default — a request with no JWT passes, an invalid JWT is rejected, \
+                 require a JWT via AuthorizationPolicy)"
+            );
+            let detail = json!({
+                "translation": {
+                    "scope": scope,
+                    "jwt_rules": jwt_rule_count,
+                    "enforcement": "permissive",
+                }
+            });
+            accepted_status(object, true, "Accepted", &message, Some(detail))
+        }
+        Err(error) => {
+            let message = format!("Ferrum rejected this RequestAuthentication: {error}");
+            let detail = json!({
+                "translation": {
+                    "scope": scope,
+                    "jwt_rules": jwt_rule_count,
+                    "error": format!("{error}"),
+                }
+            });
+            accepted_status(object, false, "Invalid", &message, Some(detail))
+        }
+    }
+}
+
+/// Status for `WorkloadEntry`. Reports the derived SPIFFE service-account
+/// identity and the service the entry binds to so operators can confirm
+/// the workload's mesh identity without inspecting slice state.
+fn workload_entry_status(
+    object: &K8sObject,
+    result: Result<&K8sTranslation, &K8sTranslateError>,
+) -> (Value, Option<Value>) {
+    let service_account = object
+        .spec
+        .get("serviceAccount")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default")
+        .to_string();
+    let address = object
+        .spec
+        .get("address")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    match result {
+        Ok(_translation) => {
+            let message = format!(
+                "Ferrum accepted this WorkloadEntry (service account: {service_account}; address: {})",
+                if address.is_empty() {
+                    "<none>"
+                } else {
+                    &address
+                }
+            );
+            let detail = json!({
+                "translation": {
+                    "service_account": service_account,
+                    "address": address,
+                }
+            });
+            accepted_status(object, true, "Accepted", &message, Some(detail))
+        }
+        Err(error) => {
+            let message = format!("Ferrum rejected this WorkloadEntry: {error}");
+            let detail = json!({
+                "translation": {
+                    "service_account": service_account,
+                    "error": format!("{error}"),
+                }
+            });
+            accepted_status(object, false, "Invalid", &message, Some(detail))
+        }
+    }
+}
+
+/// Status for `Sidecar`. Ferrum models only the egress scope of a Sidecar;
+/// `ingress` listener configuration is intentionally not modeled and is
+/// surfaced as a deferred field. The egress narrowing itself is gated by
+/// `FERRUM_MESH_SIDECAR_ENFORCED` (Sidecars are always parsed/persisted).
+fn sidecar_status(
+    object: &K8sObject,
+    result: Result<&K8sTranslation, &K8sTranslateError>,
+) -> (Value, Option<Value>) {
+    let egress_entry_count = object
+        .spec
+        .get("egress")
+        .and_then(Value::as_array)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let has_workload_selector = object.spec.get("workloadSelector").is_some();
+    let scope = if has_workload_selector {
+        "WorkloadSelector"
+    } else {
+        "Namespace"
+    };
+
+    match result {
+        Ok(_translation) => {
+            let mut deferred: Vec<&'static str> = Vec::new();
+            if object.spec.get("ingress").is_some() {
+                deferred.push("ingress[] (listener config not modeled; egress scope only)");
+            }
+            let message = if deferred.is_empty() {
+                format!(
+                    "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
+                     egress narrowing gated by FERRUM_MESH_SIDECAR_ENFORCED)"
+                )
+            } else {
+                format!(
+                    "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries); \
+                     deferred fields: {}",
+                    deferred.join(", ")
+                )
+            };
+            let detail = json!({
+                "translation": {
+                    "scope": scope,
+                    "egress_entries": egress_entry_count,
+                    "deferred_fields": deferred,
+                }
+            });
+            accepted_status(object, true, "Accepted", &message, Some(detail))
+        }
+        Err(error) => {
+            let message = format!("Ferrum rejected this Sidecar: {error}");
+            let detail = json!({
+                "translation": {
+                    "scope": scope,
+                    "egress_entries": egress_entry_count,
+                    "error": format!("{error}"),
+                }
+            });
+            accepted_status(object, false, "Invalid", &message, Some(detail))
+        }
+    }
+}
+
+/// Status for `Telemetry`. Reports which top-level sections (tracing /
+/// metrics / accessLogging) the resource declares. Unsupported tracing
+/// provider references are dropped with a translator warning rather than a
+/// hard error, so the condition stays `Accepted` in that case.
+fn telemetry_status(
+    object: &K8sObject,
+    result: Result<&K8sTranslation, &K8sTranslateError>,
+) -> (Value, Option<Value>) {
+    let has_tracing = object
+        .spec
+        .get("tracing")
+        .and_then(Value::as_array)
+        .is_some_and(|v| !v.is_empty());
+    let has_metrics = object
+        .spec
+        .get("metrics")
+        .and_then(Value::as_array)
+        .is_some_and(|v| !v.is_empty());
+    let has_access_logging = object
+        .spec
+        .get("accessLogging")
+        .and_then(Value::as_array)
+        .is_some_and(|v| !v.is_empty());
+
+    let mut sections: Vec<&'static str> = Vec::new();
+    if has_tracing {
+        sections.push("tracing");
+    }
+    if has_metrics {
+        sections.push("metrics");
+    }
+    if has_access_logging {
+        sections.push("accessLogging");
+    }
+
+    match result {
+        Ok(_translation) => {
+            let message = if sections.is_empty() {
+                "Ferrum accepted this Telemetry (no tracing/metrics/accessLogging sections)"
+                    .to_string()
+            } else {
+                format!(
+                    "Ferrum accepted this Telemetry (sections: {})",
+                    sections.join(", ")
+                )
+            };
+            let detail = json!({
+                "translation": {
+                    "sections": sections,
+                }
+            });
+            accepted_status(object, true, "Accepted", &message, Some(detail))
+        }
+        Err(error) => {
+            let message = format!("Ferrum rejected this Telemetry: {error}");
+            let detail = json!({
+                "translation": {
+                    "sections": sections,
+                    "error": format!("{error}"),
+                }
+            });
+            accepted_status(object, false, "Invalid", &message, Some(detail))
+        }
+    }
+}
+
+/// Resolve the Istio policy scope label for selector-driven CRDs
+/// (`RequestAuthentication`, etc.) the same way the translator's
+/// `istio_policy_scope` does: a `selector` means `WorkloadSelector`, the
+/// root namespace means `MeshWide`, otherwise `Namespace`.
+fn istio_policy_scope_label(object: &K8sObject, istio_root_namespace: &str) -> &'static str {
+    if object.spec.get("selector").is_some() {
+        "WorkloadSelector"
+    } else if object.metadata.namespace == istio_root_namespace
+        || object.metadata.namespace.is_empty()
+    {
+        "MeshWide"
+    } else {
+        "Namespace"
+    }
 }
 
 /// Build a K8s-standard `Condition` value. Mirrors the shape used by the
@@ -1189,32 +1713,35 @@ mod tests {
 
     #[test]
     fn supported_kind_filter_skips_unknown_kinds() {
+        // `ProxyConfig` is translated by the Istio translator but the
+        // controller does not watch it (`ISTIO_CRDS`) and the status writer
+        // does not surface it, so the planner must skip it.
         let obj = object(
-            "security.istio.io/v1",
-            "RequestAuthentication",
-            "jwt-req",
+            "networking.istio.io/v1beta1",
+            "ProxyConfig",
+            "default-pc",
             json!({}),
         );
         let updates = plan_istio_status_updates(&[obj], options());
         assert!(
             updates.is_empty(),
-            "RequestAuthentication is deferred; planner should skip it"
+            "ProxyConfig is not a status-writer kind; planner should skip it"
         );
     }
 
     #[test]
     fn api_resource_returns_none_for_unsupported_kind() {
         let update = IstioStatusUpdate {
-            api_version: "networking.istio.io/v1".to_string(),
-            kind: "VirtualService".to_string(),
+            api_version: "networking.istio.io/v1beta1".to_string(),
+            kind: "ProxyConfig".to_string(),
             namespace: "default".to_string(),
-            name: "vs".to_string(),
+            name: "pc".to_string(),
             status: Value::Null,
             ferrum_detail: None,
         };
         assert!(
             istio_api_resource(&update).is_none(),
-            "VirtualService not in this PR's scope; planner already filters it"
+            "ProxyConfig is not a status-writer kind; planner already filters it"
         );
     }
 
@@ -1298,5 +1825,448 @@ mod tests {
             1,
             "stale Ferrum detail must be refreshed even when conditions match"
         );
+    }
+
+    // ── VirtualService ─────────────────────────────────────────────────────
+
+    #[test]
+    fn virtual_service_valid_routes_report_accepted() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "reviews-vs",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    { "route": [
+                        { "destination": { "host": "reviews.default.svc.cluster.local" } }
+                    ] }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        assert_eq!(updates.len(), 1);
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        assert_eq!(c["reason"].as_str(), Some("Accepted"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(detail["translation"]["hosts"].as_u64(), Some(1));
+        assert_eq!(
+            detail["translation"]["http_routes_translated"].as_u64(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn virtual_service_missing_destination_host_is_rejected() {
+        // A route with a destination but no host fails translation.
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "bad-vs",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    { "route": [ { "destination": { "subset": "v1" } } ] }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        assert_eq!(updates.len(), 1);
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+        assert!(c["message"].as_str().unwrap().contains("rejected"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert!(detail["translation"]["error"].is_string());
+    }
+
+    #[test]
+    fn virtual_service_tcp_routes_surface_deferred_field() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "tcp-vs",
+            json!({
+                "hosts": ["db.default.svc.cluster.local"],
+                "tcp": [ { "route": [ { "destination": { "host": "db.default.svc.cluster.local" } } ] } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("tcp[]")),
+            "tcp routes should be flagged as deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_mirror_surfaces_deferred_field() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "mirror-vs",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "mirror": { "host": "reviews-canary.default.svc.cluster.local" }
+                    }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("mirror")),
+            "http[].mirror should be flagged as deferred, got {deferred:?}"
+        );
+    }
+
+    // ── ServiceEntry ───────────────────────────────────────────────────────
+
+    #[test]
+    fn service_entry_valid_reports_accepted_with_resolution_and_location() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "ServiceEntry",
+            "external-api",
+            json!({
+                "hosts": ["api.example.com"],
+                "resolution": "DNS",
+                "location": "MESH_EXTERNAL",
+                "ports": [ { "number": 443, "name": "https", "protocol": "TLS" } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        assert!(c["message"].as_str().unwrap().contains("DNS"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(detail["translation"]["resolution"].as_str(), Some("DNS"));
+        assert_eq!(
+            detail["translation"]["location"].as_str(),
+            Some("MESH_EXTERNAL")
+        );
+        assert_eq!(detail["translation"]["ports"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn service_entry_without_hosts_is_rejected() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "ServiceEntry",
+            "no-hosts",
+            json!({ "resolution": "DNS" }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+    }
+
+    // ── RequestAuthentication ────────────────────────────────────────────────
+
+    #[test]
+    fn request_authentication_valid_reports_accepted_and_permissive() {
+        let obj = object(
+            "security.istio.io/v1",
+            "RequestAuthentication",
+            "jwt-req",
+            json!({
+                "selector": { "matchLabels": { "app": "api" } },
+                "jwtRules": [ { "issuer": "https://issuer.example.com" } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        assert!(c["message"].as_str().unwrap().contains("permissive"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(detail["translation"]["jwt_rules"].as_u64(), Some(1));
+        assert_eq!(
+            detail["translation"]["scope"].as_str(),
+            Some("WorkloadSelector")
+        );
+        assert_eq!(
+            detail["translation"]["enforcement"].as_str(),
+            Some("permissive")
+        );
+    }
+
+    #[test]
+    fn request_authentication_missing_issuer_is_rejected() {
+        // jwtRules[].issuer is required; an entry without it fails translation.
+        let obj = object(
+            "security.istio.io/v1",
+            "RequestAuthentication",
+            "bad-jwt",
+            json!({ "jwtRules": [ { "audiences": ["aud"] } ] }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+    }
+
+    // ── WorkloadEntry ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn workload_entry_valid_reports_accepted_with_service_account() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "WorkloadEntry",
+            "vm-1",
+            json!({
+                "address": "10.0.0.5",
+                "serviceAccount": "payments",
+                "labels": { "app": "payments" }
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["service_account"].as_str(),
+            Some("payments")
+        );
+        assert_eq!(detail["translation"]["address"].as_str(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn workload_entry_cross_namespace_service_is_rejected() {
+        // A `service` host pointing at a different namespace is rejected by
+        // the translator; status must surface the rejection.
+        let obj = object(
+            "networking.istio.io/v1",
+            "WorkloadEntry",
+            "vm-cross",
+            json!({
+                "address": "10.0.0.6",
+                "serviceAccount": "payments",
+                "service": "payments.other-ns.svc.cluster.local"
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+    }
+
+    // ── Sidecar ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sidecar_valid_egress_reports_accepted() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "default-sidecar",
+            json!({
+                "workloadSelector": { "labels": { "app": "frontend" } },
+                "egress": [ { "hosts": ["./*", "istio-system/*"] } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(detail["translation"]["egress_entries"].as_u64(), Some(1));
+        assert_eq!(
+            detail["translation"]["scope"].as_str(),
+            Some("WorkloadSelector")
+        );
+    }
+
+    #[test]
+    fn sidecar_ingress_surfaces_deferred_field() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "ingress-sidecar",
+            json!({
+                "ingress": [ { "port": { "number": 9080, "protocol": "HTTP", "name": "http" }, "defaultEndpoint": "127.0.0.1:8080" } ],
+                "egress": [ { "hosts": ["./*"] } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("ingress")),
+            "Sidecar ingress should be flagged as deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_invalid_egress_is_rejected() {
+        // egress[].hosts must be a non-empty array; an empty array is rejected.
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "bad-sidecar",
+            json!({ "egress": [ { "hosts": [] } ] }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+    }
+
+    // ── Telemetry ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn telemetry_valid_reports_accepted_with_sections() {
+        let obj = object(
+            "telemetry.istio.io/v1",
+            "Telemetry",
+            "mesh-default",
+            json!({
+                "metrics": [ { "providers": [ { "name": "prometheus" } ] } ],
+                "accessLogging": [ { "disabled": false } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let sections: Vec<&str> = detail["translation"]["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(sections.contains(&"metrics"));
+        assert!(sections.contains(&"accessLogging"));
+    }
+
+    #[test]
+    fn telemetry_invalid_tracing_mode_is_rejected() {
+        // tracing.match.mode of an unknown value is rejected by the translator.
+        let obj = object(
+            "telemetry.istio.io/v1",
+            "Telemetry",
+            "bad-telemetry",
+            json!({
+                "tracing": [ { "match": { "mode": "NONSENSE" } } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+    }
+
+    // ── api_resource mapping for newly-covered kinds ─────────────────────────
+
+    #[test]
+    fn api_resource_maps_all_translated_istio_kinds() {
+        let cases = [
+            (
+                "security.istio.io/v1",
+                "RequestAuthentication",
+                "security.istio.io",
+                "requestauthentications",
+            ),
+            (
+                "networking.istio.io/v1",
+                "VirtualService",
+                "networking.istio.io",
+                "virtualservices",
+            ),
+            (
+                "networking.istio.io/v1",
+                "ServiceEntry",
+                "networking.istio.io",
+                "serviceentries",
+            ),
+            (
+                "networking.istio.io/v1",
+                "WorkloadEntry",
+                "networking.istio.io",
+                "workloadentries",
+            ),
+            (
+                "networking.istio.io/v1",
+                "Sidecar",
+                "networking.istio.io",
+                "sidecars",
+            ),
+            (
+                "telemetry.istio.io/v1",
+                "Telemetry",
+                "telemetry.istio.io",
+                "telemetries",
+            ),
+        ];
+        for (api_version, kind, group, plural) in cases {
+            let update = IstioStatusUpdate {
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                namespace: "default".to_string(),
+                name: "x".to_string(),
+                status: Value::Null,
+                ferrum_detail: None,
+            };
+            let ar = istio_api_resource(&update)
+                .unwrap_or_else(|| panic!("expected ApiResource for {kind}"));
+            assert_eq!(ar.group, group, "group mismatch for {kind}");
+            assert_eq!(ar.plural, plural, "plural mismatch for {kind}");
+            assert_eq!(ar.kind, kind);
+        }
     }
 }

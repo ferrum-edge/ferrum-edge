@@ -9,12 +9,14 @@
 //! the unit tests assert the patch shape directly via `istio_status_patch`.
 //!
 //! What this file exercises:
-//! - Mixed cluster snapshots: an AuthorizationPolicy, a PeerAuthentication,
-//!   and a DestinationRule in the same snapshot all generate updates.
+//! - Mixed cluster snapshots: every translated Istio kind in one snapshot
+//!   generates a status update (all nine kinds are covered).
 //! - Resource accepted vs. rejected: rejected resources still produce a
-//!   `FerrumAccepted: False` update so operators see the failure.
-//! - Skip behaviour: deferred Istio kinds (e.g. `RequestAuthentication`)
-//!   do not produce updates in this PR's scope.
+//!   `FerrumAccepted: False` update so operators see the failure — including
+//!   the newly-covered kinds (VirtualService, ServiceEntry,
+//!   RequestAuthentication, Sidecar, Telemetry, WorkloadEntry).
+//! - Skip behaviour: kinds the status writer does not own (e.g. the
+//!   translated-but-unwatched `ProxyConfig`) do not produce updates.
 //! - Stability: the same input always produces the same set of updates
 //!   (no nondeterminism), and `lastTransitionTime` is preserved across
 //!   no-op replans.
@@ -71,11 +73,11 @@ fn find_condition<'a>(conditions: &'a [Value], condition_type: &str) -> &'a Valu
         .unwrap_or_else(|| panic!("missing condition {condition_type}"))
 }
 
-/// A realistic mesh-config snapshot produces one update per supported
-/// Istio kind. Deferred kinds (RequestAuthentication, VirtualService,
-/// Sidecar, Telemetry, ServiceEntry, WorkloadEntry) are silently skipped
-/// — they show up as no updates in the plan, so operators don't see a
-/// stale "Ferrum doesn't manage this" condition.
+/// A realistic mesh-config snapshot produces one update for every
+/// translated Istio kind (all nine are covered). A translated-but-unwatched
+/// kind (`ProxyConfig`) is silently skipped — it shows up as no update in
+/// the plan, so operators don't see a stale "Ferrum doesn't manage this"
+/// condition for a resource the status writer doesn't own.
 #[test]
 fn mixed_istio_snapshot_emits_update_per_supported_kind() {
     let objects = vec![
@@ -97,7 +99,6 @@ fn mixed_istio_snapshot_emits_update_per_supported_kind() {
             "reviews",
             json!({ "host": "reviews.default.svc.cluster.local" }),
         ),
-        // Deferred — must not produce an update in this PR's scope.
         object(
             "security.istio.io/v1",
             "RequestAuthentication",
@@ -110,20 +111,212 @@ fn mixed_istio_snapshot_emits_update_per_supported_kind() {
             "edge-vs",
             json!({ "hosts": ["api.example.com"] }),
         ),
+        object(
+            "networking.istio.io/v1",
+            "ServiceEntry",
+            "external",
+            json!({ "hosts": ["api.example.com"], "resolution": "DNS" }),
+        ),
+        object(
+            "networking.istio.io/v1",
+            "WorkloadEntry",
+            "vm-1",
+            json!({ "address": "10.0.0.5", "serviceAccount": "payments" }),
+        ),
+        object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "egress-scope",
+            json!({ "egress": [{ "hosts": ["./*"] }] }),
+        ),
+        object(
+            "telemetry.istio.io/v1",
+            "Telemetry",
+            "mesh-default",
+            json!({ "accessLogging": [{ "disabled": false }] }),
+        ),
+        // Translated but not watched / not a status-writer kind: must be skipped.
+        object(
+            "networking.istio.io/v1beta1",
+            "ProxyConfig",
+            "default-pc",
+            json!({}),
+        ),
     ];
 
     let updates = plan_istio_status_updates(&objects, options());
     assert_eq!(
         updates.len(),
-        3,
-        "expected one update per supported kind, got {updates:?}"
+        9,
+        "expected one update per translated Istio kind, got {updates:?}"
     );
-    assert!(updates.iter().any(|u| u.kind == "AuthorizationPolicy"));
-    assert!(updates.iter().any(|u| u.kind == "PeerAuthentication"));
-    assert!(updates.iter().any(|u| u.kind == "DestinationRule"));
-    // Deferred kinds must NOT appear.
-    assert!(updates.iter().all(|u| u.kind != "RequestAuthentication"));
-    assert!(updates.iter().all(|u| u.kind != "VirtualService"));
+    for kind in [
+        "AuthorizationPolicy",
+        "PeerAuthentication",
+        "DestinationRule",
+        "RequestAuthentication",
+        "VirtualService",
+        "ServiceEntry",
+        "WorkloadEntry",
+        "Sidecar",
+        "Telemetry",
+    ] {
+        assert!(
+            updates.iter().any(|u| u.kind == kind),
+            "expected an update for {kind}, got {updates:?}"
+        );
+    }
+    // ProxyConfig is not a status-writer kind and must not appear.
+    assert!(updates.iter().all(|u| u.kind != "ProxyConfig"));
+}
+
+/// Each newly-covered kind produces a `FerrumAccepted: True` condition on
+/// valid input. This complements the inline unit tests by asserting the
+/// integration-level invariant across all six new kinds in one place.
+#[test]
+fn newly_covered_kinds_report_accepted_on_valid_input() {
+    let cases = vec![
+        object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "vs-ok",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [{ "route": [{ "destination": { "host": "reviews.default.svc.cluster.local" } }] }]
+            }),
+        ),
+        object(
+            "networking.istio.io/v1",
+            "ServiceEntry",
+            "se-ok",
+            json!({ "hosts": ["api.example.com"], "resolution": "DNS" }),
+        ),
+        object(
+            "security.istio.io/v1",
+            "RequestAuthentication",
+            "ra-ok",
+            json!({ "jwtRules": [{ "issuer": "https://issuer.example.com" }] }),
+        ),
+        object(
+            "networking.istio.io/v1",
+            "WorkloadEntry",
+            "we-ok",
+            json!({ "address": "10.0.0.9", "serviceAccount": "payments" }),
+        ),
+        object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "sc-ok",
+            json!({ "egress": [{ "hosts": ["./*"] }] }),
+        ),
+        object(
+            "telemetry.istio.io/v1",
+            "Telemetry",
+            "tel-ok",
+            json!({ "metrics": [{ "providers": [{ "name": "prometheus" }] }] }),
+        ),
+    ];
+
+    for obj in cases {
+        let kind = obj.kind.clone();
+        let name = obj.metadata.name.clone();
+        let updates = plan_istio_status_updates(&[obj], options());
+        let update = update_for(&updates, &kind, &name);
+        let condition = find_condition(
+            update.status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(
+            condition["status"].as_str(),
+            Some("True"),
+            "{kind}/{name} should be Accepted"
+        );
+        assert_eq!(condition["reason"].as_str(), Some("Accepted"));
+    }
+}
+
+/// Each newly-covered kind produces a `FerrumAccepted: False`/`Invalid`
+/// condition (with a translator error in the detail block) when the
+/// resource is rejected — a hard rejection must never be silent to
+/// operators.
+#[test]
+fn newly_covered_kinds_report_invalid_on_rejection() {
+    let cases = vec![
+        // VirtualService: route destination without a host.
+        object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "vs-bad",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [{ "route": [{ "destination": { "subset": "v1" } }] }]
+            }),
+        ),
+        // ServiceEntry: missing hosts.
+        object(
+            "networking.istio.io/v1",
+            "ServiceEntry",
+            "se-bad",
+            json!({ "resolution": "DNS" }),
+        ),
+        // RequestAuthentication: jwtRules entry without issuer.
+        object(
+            "security.istio.io/v1",
+            "RequestAuthentication",
+            "ra-bad",
+            json!({ "jwtRules": [{ "audiences": ["a"] }] }),
+        ),
+        // WorkloadEntry: cross-namespace service host.
+        object(
+            "networking.istio.io/v1",
+            "WorkloadEntry",
+            "we-bad",
+            json!({
+                "address": "10.0.0.9",
+                "serviceAccount": "payments",
+                "service": "payments.other-ns.svc.cluster.local"
+            }),
+        ),
+        // Sidecar: empty egress hosts array.
+        object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "sc-bad",
+            json!({ "egress": [{ "hosts": [] }] }),
+        ),
+        // Telemetry: unsupported tracing match mode.
+        object(
+            "telemetry.istio.io/v1",
+            "Telemetry",
+            "tel-bad",
+            json!({ "tracing": [{ "match": { "mode": "NONSENSE" } }] }),
+        ),
+    ];
+
+    for obj in cases {
+        let kind = obj.kind.clone();
+        let name = obj.metadata.name.clone();
+        let updates = plan_istio_status_updates(&[obj], options());
+        let update = update_for(&updates, &kind, &name);
+        let condition = find_condition(
+            update.status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(
+            condition["status"].as_str(),
+            Some("False"),
+            "{kind}/{name} should be rejected"
+        );
+        assert_eq!(condition["reason"].as_str(), Some("Invalid"));
+        let detail = update
+            .ferrum_detail
+            .as_ref()
+            .unwrap_or_else(|| panic!("{kind}/{name} should carry a detail block"));
+        assert!(
+            detail["translation"]["error"].is_string(),
+            "{kind}/{name} detail should carry the translator error"
+        );
+    }
 }
 
 /// A rejected resource still produces an update; the planner doesn't

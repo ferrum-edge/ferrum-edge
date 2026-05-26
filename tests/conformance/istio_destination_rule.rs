@@ -4,8 +4,10 @@
 //! fields that operators set on a DR. Each test translates a focused DR and
 //! asserts the field landed on the resolved Mesh data model.
 //!
-//! Where Ferrum intentionally defers a field (debug-logged but no enforcement
-//! yet) the test registers `Status::Deferred` with the tracking note.
+//! Where Ferrum intentionally defers a field (parsed and warned about, but no
+//! enforcement yet) the test registers `Status::Deferred` with the tracking
+//! note. Deferred fields are also surfaced in the DestinationRule
+//! `status.ferrum.translation.deferred_fields` block by the Istio controller.
 
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
@@ -196,16 +198,17 @@ fn dr_connection_pool_http_http2_max_requests() {
 }
 
 /// Deferred T1-C set: `http1MaxPendingRequests` / `maxRetries` / `h2UpgradePolicy`.
-/// Translator parses them, emits a `debug!` line, but does not project. The
-/// conformance assertion is the translation does not fail when the field is
-/// set, and no overlay slot is populated.
+/// Translator parses them and emits an operator-visible warning, but does not
+/// project. The conformance assertion is the translation does not fail when the
+/// field is set, and no overlay slot is populated. The Istio controller also
+/// surfaces these in the DestinationRule `status.ferrum.translation.deferred_fields`.
 #[test]
-fn dr_connection_pool_http_deferred_fields_debug_logged() {
+fn dr_connection_pool_http_deferred_fields_warned() {
     register_feature!(
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.http.{http1MaxPendingRequests,maxRetries,h2UpgradePolicy}",
         status = Status::Deferred,
-        notes = "T1-C deferred set: translator emits debug! but no projection slot today.",
+        notes = "T1-C deferred set: translator warns + surfaces in status deferred_fields; no projection slot today.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",

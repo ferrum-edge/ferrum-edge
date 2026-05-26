@@ -783,7 +783,7 @@ fn translate_traffic_policy(
     let connection_pool_http = value
         .get("connectionPool")
         .and_then(|cp| cp.get("http"))
-        .map(|http| translate_connection_pool_http(object, http))
+        .map(|http| translate_connection_pool_http(acc, object, http))
         .transpose()?
         .flatten();
 
@@ -964,12 +964,16 @@ fn parse_keepalive_duration_seconds(
 ///
 /// Supported fields (T1-C scope): `maxRequestsPerConnection`, `idleTimeout`,
 /// `http2MaxRequests`. Deferred fields (`http1MaxPendingRequests`,
-/// `maxRetries`, `h2UpgradePolicy`) are detected and emitted as a `debug!`
-/// line so operators see the gateway acknowledging the field but otherwise
-/// dropped. Returning `Ok(None)` from this function signals "block was
-/// present but no supported field was set" so the caller can skip emitting
-/// an empty overlay on the slice.
+/// `maxRetries`, `h2UpgradePolicy`) are detected and pushed onto
+/// `acc.warnings` so operators see the gateway acknowledging the field but
+/// otherwise dropping it — the Istio status writer
+/// (`src/k8s_controller/istio_status.rs`) promotes the same fields into the
+/// DestinationRule `status.ferrum.translation.deferred_fields` list so the
+/// gap is visible from `kubectl describe`. Returning `Ok(None)` from this
+/// function signals "block was present but no supported field was set" so
+/// the caller can skip emitting an empty overlay on the slice.
 fn translate_connection_pool_http(
+    acc: &mut K8sAccumulator,
     object: &K8sObject,
     http: &Value,
 ) -> Result<Option<crate::modes::mesh::config::MeshConnectionPoolHttp>, K8sTranslateError> {
@@ -992,17 +996,20 @@ fn translate_connection_pool_http(
         None => None,
     };
 
-    // Deferred fields: surface a debug line so operators know the gateway
-    // saw the field but is not yet enforcing it. Keep this list in sync
-    // with docs/mesh.md's `connectionPool.http.*` status table.
+    // Deferred fields: surface an operator-visible warning so the gateway
+    // acknowledges the field but signals it is not yet enforced. The Istio
+    // status writer mirrors the same field list into the DestinationRule
+    // `status.ferrum.translation.deferred_fields` block so the gap is also
+    // visible from `kubectl describe`. Keep this list in sync with
+    // `DEFERRED_CONNECTION_POOL_HTTP_FIELDS` in
+    // `src/k8s_controller/istio_status.rs` and docs/mesh.md's
+    // `connectionPool.http.*` status table.
     for field in ["http1MaxPendingRequests", "maxRetries", "h2UpgradePolicy"] {
         if http.get(field).is_some() {
-            tracing::debug!(
-                rule = %object.metadata.name,
-                namespace = %object.metadata.namespace,
-                field = field,
-                "DestinationRule connectionPool.http.{field} is parsed but not yet projected; tracked as a follow-on (T1-C deferred set)"
-            );
+            acc.warnings.push(format!(
+                "DestinationRule {}/{}: connectionPool.http.{field} is parsed but not yet projected; tracked as a follow-on (T1-C deferred set)",
+                object.metadata.namespace, object.metadata.name
+            ));
         }
     }
 
@@ -13065,11 +13072,13 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_silently_accepts_deferred_http_fields() {
+    fn destination_rule_accepts_deferred_http_fields_with_warning() {
         // `http1MaxPendingRequests`, `maxRetries`, and `h2UpgradePolicy` are
         // tracked T1-C follow-ons. The translator should not fail when
         // operators set them (they would never be able to upgrade off Istio
-        // otherwise); the gateway logs a debug line and drops them.
+        // otherwise); the gateway emits an operator-visible warning per
+        // deferred field and drops them. The Istio status writer mirrors
+        // these into `status.ferrum.translation.deferred_fields`.
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -13090,6 +13099,16 @@ extensionProviders:
             options(),
         )
         .expect("translation succeeds despite deferred fields");
+        for field in ["http1MaxPendingRequests", "maxRetries", "h2UpgradePolicy"] {
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(field) && w.contains("not yet projected")),
+                "expected a deferred-field warning mentioning {field}; warnings = {:?}",
+                result.warnings
+            );
+        }
         let dr = &result.config.mesh.unwrap().destination_rules[0];
         let http = dr
             .traffic_policy
