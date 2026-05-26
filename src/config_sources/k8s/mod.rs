@@ -790,6 +790,17 @@ pub(crate) fn selector_from_istio(value: Option<&Value>) -> HashMap<String, Stri
         .unwrap_or_default()
 }
 
+pub(crate) fn sidecar_selector_from_istio(value: Option<&Value>) -> HashMap<String, String> {
+    value
+        .and_then(|selector| {
+            selector
+                .get("labels")
+                .or_else(|| selector.get("matchLabels"))
+        })
+        .map(string_map)
+        .unwrap_or_default()
+}
+
 fn is_empty_object(value: &Value) -> bool {
     value.as_object().is_none_or(serde_json::Map::is_empty)
 }

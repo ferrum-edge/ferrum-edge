@@ -63,8 +63,8 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::config_sources::k8s::{
-    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, selector_from_istio,
-    translate_k8s_objects_with_filter,
+    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
+    sidecar_selector_from_istio, translate_k8s_objects_with_filter,
 };
 
 /// Field manager used on every `patch_status` call. Kubernetes uses this
@@ -1030,7 +1030,7 @@ fn sidecar_status(
     let has_workload_selector = object
         .spec
         .get("workloadSelector")
-        .is_some_and(|selector| !selector_from_istio(Some(selector)).is_empty());
+        .is_some_and(|selector| !sidecar_selector_from_istio(Some(selector)).is_empty());
     let scope = if has_workload_selector {
         "WorkloadSelector"
     } else if object.metadata.namespace == istio_root_namespace
@@ -2152,7 +2152,7 @@ mod tests {
             "Sidecar",
             "default-sidecar",
             json!({
-                "workloadSelector": { "matchLabels": { "app": "frontend" } },
+                "workloadSelector": { "labels": { "app": "frontend" } },
                 "egress": [ { "hosts": ["./*", "istio-system/*"] } ]
             }),
         );
@@ -2177,7 +2177,7 @@ mod tests {
             "Sidecar",
             "empty-selector",
             json!({
-                "workloadSelector": { "matchLabels": {} },
+                "workloadSelector": { "labels": {} },
                 "egress": [ { "hosts": ["./*"] } ]
             }),
         );

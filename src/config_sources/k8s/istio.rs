@@ -25,8 +25,8 @@ use super::{
     optional_port_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
     request_termination_plugin_for_proxy, resource_id, route_local_fault_value_for_rule,
     route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
-    selector_from_istio, string_array, string_field, string_map, upstream_for_route,
-    workload_entry_service_key_from_host,
+    selector_from_istio, sidecar_selector_from_istio, string_array, string_field, string_map,
+    upstream_for_route, workload_entry_service_key_from_host,
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
@@ -407,7 +407,7 @@ fn sidecar(
 ) -> Result<MeshSidecar, K8sTranslateError> {
     let workload_selector = match object.spec.get("workloadSelector") {
         Some(selector_value) => {
-            let labels = selector_from_istio(Some(selector_value));
+            let labels = sidecar_selector_from_istio(Some(selector_value));
             if labels.is_empty() {
                 None
             } else {
@@ -13132,7 +13132,7 @@ extensionProviders:
                 "Sidecar",
                 serde_json::json!({
                     "workloadSelector": {
-                        "matchLabels": {"app": "frontend"}
+                        "labels": {"app": "frontend"}
                     },
                     "egress": [
                         {
@@ -13220,7 +13220,7 @@ extensionProviders:
             &[object(
                 "Sidecar",
                 serde_json::json!({
-                    "workloadSelector": {"matchLabels": {"app": "frontend"}},
+                    "workloadSelector": {"labels": {"app": "frontend"}},
                     "ingress": [
                         {"port": {"number": 8080, "protocol": "HTTP", "name": "http"}}
                     ]
@@ -13290,7 +13290,7 @@ extensionProviders:
             &[object(
                 "Sidecar",
                 serde_json::json!({
-                    "workloadSelector": {"matchLabels": {"app": "frontend"}},
+                    "workloadSelector": {"labels": {"app": "frontend"}},
                     "egress": [
                         {"hosts": ["*/*"]}
                     ]
@@ -13313,15 +13313,15 @@ extensionProviders:
     }
 
     #[test]
-    fn sidecar_with_empty_workload_selector_matchlabels_is_namespace_default() {
-        // workloadSelector present but matchLabels empty → treat as no
+    fn sidecar_with_empty_workload_selector_labels_is_namespace_default() {
+        // workloadSelector present but labels empty → treat as no
         // selector. Mirrors Istio: a Sidecar with an empty selector applies
         // to every workload in the namespace (i.e. namespace-default).
         let result = translate_k8s_objects(
             &[object(
                 "Sidecar",
                 serde_json::json!({
-                    "workloadSelector": {"matchLabels": {}},
+                    "workloadSelector": {"labels": {}},
                     "egress": [
                         {"hosts": ["*/*"]}
                     ]
@@ -13335,7 +13335,34 @@ extensionProviders:
         assert_eq!(mesh.sidecars.len(), 1);
         assert!(
             mesh.sidecars[0].workload_selector.is_none(),
-            "empty matchLabels should round-trip to no selector"
+            "empty labels should round-trip to no selector"
+        );
+    }
+
+    #[test]
+    fn sidecar_matchlabels_selector_remains_compatibility_fallback() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "workloadSelector": {"matchLabels": {"app": "frontend"}},
+                    "egress": [
+                        {"hosts": ["*/*"]}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let selector = mesh.sidecars[0]
+            .workload_selector
+            .as_ref()
+            .expect("fallback matchLabels selector should be preserved");
+        assert_eq!(
+            selector.labels.get("app").map(String::as_str),
+            Some("frontend")
         );
     }
 
