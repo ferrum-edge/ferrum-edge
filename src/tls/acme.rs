@@ -1180,7 +1180,11 @@ fn is_non_canonical_numeric_host(host: &str) -> bool {
     if host.is_empty() {
         return false;
     }
-    if host.starts_with("0x") || host.starts_with("0X") {
+    if (host.starts_with("0x") || host.starts_with("0X"))
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b'.' || b == b'x' || b == b'X')
+    {
         return true;
     }
     if host.bytes().all(|b| b.is_ascii_digit()) {
@@ -2385,19 +2389,22 @@ mod tests {
     #[test]
     fn non_canonical_numeric_host_detection() {
         for (host, expected) in [
-            ("2130706433", true),    // decimal integer
-            ("0x7f000001", true),    // hex integer
-            ("0XA9FEA9FE", true),    // hex integer uppercase prefix
-            ("0x7f.0.0.1", true),    // hex-dotted
-            ("0177.0.0.1", true),    // octal-dotted
-            ("127.1", true),         // abbreviated dotted
-            ("192.168.1", true),     // abbreviated 3-segment
-            ("beef.cafe", false),    // hex-only hostname
-            ("dead.cab", false),     // hex-only hostname
-            ("abc.def.1a2b", false), // mixed hex hostname
-            ("localhost", false),    // alpha hostname
-            ("example.com", false),  // normal hostname
-            ("", false),             // empty
+            ("2130706433", true),         // decimal integer
+            ("0x7f000001", true),         // hex integer
+            ("0XA9FEA9FE", true),         // hex integer uppercase prefix
+            ("0x7f.0.0.1", true),         // hex-dotted
+            ("0177.0.0.1", true),         // octal-dotted
+            ("127.1", true),              // abbreviated dotted
+            ("192.168.1", true),          // abbreviated 3-segment
+            ("beef.cafe", false),         // hex-only hostname
+            ("dead.cab", false),          // hex-only hostname
+            ("abc.def.1a2b", false),      // mixed hex hostname
+            ("localhost", false),         // alpha hostname
+            ("example.com", false),       // normal hostname
+            ("0x-ca.example.com", false), // 0x-prefixed hostname with non-hex chars
+            ("0xlab.io", false),          // 0x-prefixed hostname with non-hex chars
+            ("0xproject.com", false),     // 0x-prefixed hostname with non-hex chars
+            ("", false),                  // empty
         ] {
             assert_eq!(
                 is_non_canonical_numeric_host(host),
