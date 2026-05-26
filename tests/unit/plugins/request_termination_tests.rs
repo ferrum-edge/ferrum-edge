@@ -144,6 +144,35 @@ fn test_trigger_rejects_ambiguous_fields() {
     assert!(err.contains("only one"), "got: {err}");
 }
 
+#[test]
+fn test_trigger_rejects_path_prefix_without_leading_slash() {
+    // Request paths come from `req.uri().path()` and are always rooted at '/'.
+    // A prefix like "admin" can never match `/admin/...`, so reject it at
+    // construction instead of silently never firing.
+    let err = RequestTermination::new(&json!({
+        "trigger": { "path_prefix": "admin" }
+    }))
+    .err()
+    .expect("path_prefix without a leading slash should be rejected");
+
+    assert!(err.contains("path_prefix"), "got: {err}");
+    assert!(err.contains("start with '/'"), "got: {err}");
+}
+
+#[test]
+fn test_trigger_rejects_path_prefix_with_control_chars() {
+    // CR/LF (and other control characters) never survive request-line parsing,
+    // so a prefix containing them can never match a live request.
+    let err = RequestTermination::new(&json!({
+        "trigger": { "path_prefix": "/admin\r\nx-bad: yes" }
+    }))
+    .err()
+    .expect("path_prefix with control characters should be rejected");
+
+    assert!(err.contains("path_prefix"), "got: {err}");
+    assert!(err.contains("control characters"), "got: {err}");
+}
+
 // === Custom body ===
 
 #[tokio::test]

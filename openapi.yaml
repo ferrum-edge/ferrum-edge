@@ -11484,22 +11484,22 @@ components:
           type: object
           description: >-
             Optional trigger condition. Without a trigger every request on the
-            proxy is terminated (maintenance-mode default). When both
-            `path_prefix` and `header` are provided, the plugin uses
-            `path_prefix` and ignores `header` — configure only one at a time
-            for predictable behavior.
+            proxy is terminated (maintenance-mode default). Set only one of
+            `path_prefix` or `header`; configuring both is rejected.
           properties:
             path_prefix:
               type: string
               description: >-
                 Only terminate when the request path starts with this prefix.
-                Takes precedence over `header` if both are set.
+                Must start with `/` and contain no control characters; request
+                paths are always rooted at `/`, so other values can never
+                match. Mutually exclusive with `header`.
             header:
               type: string
               description: >-
                 Only terminate when this request header is present. The
-                comparison is case-insensitive on the header name. Ignored
-                when `path_prefix` is also set.
+                comparison is case-insensitive on the header name. Mutually
+                exclusive with `path_prefix`.
             header_value:
               type: string
               default: ""

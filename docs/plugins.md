@@ -2190,7 +2190,7 @@ The response body and `Content-Type` are rendered **once** at construction time 
 | `body` | String | `""` | Explicit response body. When set (non-empty) it is returned verbatim and `message` is ignored. |
 | `content_type` | String | `application/json` | Response `Content-Type` header. Substring match for `json` / `xml` decides how `message` is rendered. |
 | `message` | String | `"Service unavailable"` | Builds the default JSON / XML / plain-text body when `body` is empty. JSON and XML special characters are escaped automatically. |
-| `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix. Mutually exclusive with `trigger.header`. |
+| `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix. Must start with `/` and contain no control characters — request paths are always rooted at `/`, so other values can never match. Mutually exclusive with `trigger.header`. |
 | `trigger.header` | String | _(none)_ | Only terminate when this request header is present. Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
 | `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`. Empty matches any value. |
 
