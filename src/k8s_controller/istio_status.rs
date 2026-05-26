@@ -63,7 +63,7 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::config_sources::k8s::{
-    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
+    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, selector_from_istio,
     translate_k8s_objects_with_filter,
 };
 
@@ -237,7 +237,7 @@ pub fn plan_istio_status_updates(
                     &options.istio_root_namespace,
                 ),
                 "WorkloadEntry" => workload_entry_status(object, result.as_ref()),
-                "Sidecar" => sidecar_status(object, result.as_ref()),
+                "Sidecar" => sidecar_status(object, result.as_ref(), &options.istio_root_namespace),
                 "Telemetry" => telemetry_status(object, result.as_ref()),
                 _ => return None,
             };
@@ -684,11 +684,17 @@ const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[
 ];
 
 /// Collect the deferred `connectionPool.http.*` field labels present under
-/// either the top-level `trafficPolicy` or any subset's `trafficPolicy`.
+/// the top-level `trafficPolicy`, `trafficPolicy.portLevelSettings[]`, or any
+/// subset's `trafficPolicy`.
 /// Mirrors the translator's `debug!`-now-`warning` promotion so the same
 /// gap shows up in `kubectl describe`.
 fn deferred_connection_pool_http_fields(spec: &Value) -> Vec<&'static str> {
     let top_level = spec.get("trafficPolicy");
+    let port_level_policies = top_level
+        .and_then(|policy| policy.get("portLevelSettings"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
     let subset_policies = spec
         .get("subsets")
         .and_then(Value::as_array)
@@ -696,7 +702,11 @@ fn deferred_connection_pool_http_fields(spec: &Value) -> Vec<&'static str> {
         .flatten()
         .filter_map(|subset| subset.get("trafficPolicy"));
 
-    let policies: Vec<&Value> = top_level.into_iter().chain(subset_policies).collect();
+    let policies: Vec<&Value> = top_level
+        .into_iter()
+        .chain(port_level_policies)
+        .chain(subset_policies)
+        .collect();
     DEFERRED_CONNECTION_POOL_HTTP_FIELDS
         .iter()
         .filter(|(field, _)| {
@@ -1009,6 +1019,7 @@ fn workload_entry_status(
 fn sidecar_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
+    istio_root_namespace: &str,
 ) -> (Value, Option<Value>) {
     let egress_entry_count = object
         .spec
@@ -1016,9 +1027,16 @@ fn sidecar_status(
         .and_then(Value::as_array)
         .map(|v| v.len())
         .unwrap_or(0);
-    let has_workload_selector = object.spec.get("workloadSelector").is_some();
+    let has_workload_selector = object
+        .spec
+        .get("workloadSelector")
+        .is_some_and(|selector| !selector_from_istio(Some(selector)).is_empty());
     let scope = if has_workload_selector {
         "WorkloadSelector"
+    } else if object.metadata.namespace == istio_root_namespace
+        || object.metadata.namespace.is_empty()
+    {
+        "MeshWide"
     } else {
         "Namespace"
     };
@@ -1543,6 +1561,40 @@ mod tests {
                 .iter()
                 .any(|f| f.contains("portLevelSettings[].tls")),
             "deferred_fields should mention portLevelSettings[].tls, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_with_port_level_http_deferred_field_surfaces_deferred_field() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "DestinationRule",
+            "port-http-dr",
+            json!({
+                "host": "reviews.default.svc.cluster.local",
+                "trafficPolicy": {
+                    "portLevelSettings": [
+                        {
+                            "port": { "number": 8080 },
+                            "connectionPool": {
+                                "http": { "maxRetries": 3 }
+                            }
+                        }
+                    ]
+                }
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("maxRetries")),
+            "deferred_fields should mention port-level maxRetries, got {deferred:?}"
         );
     }
 
@@ -2100,7 +2152,7 @@ mod tests {
             "Sidecar",
             "default-sidecar",
             json!({
-                "workloadSelector": { "labels": { "app": "frontend" } },
+                "workloadSelector": { "matchLabels": { "app": "frontend" } },
                 "egress": [ { "hosts": ["./*", "istio-system/*"] } ]
             }),
         );
@@ -2116,6 +2168,40 @@ mod tests {
             detail["translation"]["scope"].as_str(),
             Some("WorkloadSelector")
         );
+    }
+
+    #[test]
+    fn sidecar_empty_selector_reports_namespace_scope() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "empty-selector",
+            json!({
+                "workloadSelector": { "matchLabels": {} },
+                "egress": [ { "hosts": ["./*"] } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(detail["translation"]["scope"].as_str(), Some("Namespace"));
+    }
+
+    #[test]
+    fn sidecar_root_namespace_default_reports_mesh_wide_scope() {
+        let mut obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "root-default",
+            json!({ "egress": [{ "hosts": ["*/*"] }] }),
+        );
+        obj.metadata.namespace = "istio-config".to_string();
+
+        let updates = plan_istio_status_updates(
+            &[obj],
+            options().with_istio_root_namespace("istio-config".to_string()),
+        );
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(detail["translation"]["scope"].as_str(), Some("MeshWide"));
     }
 
     #[test]
