@@ -145,14 +145,18 @@ fn parse_trigger(config: &Value) -> Result<Trigger, String> {
                 "request_termination: 'trigger.path_prefix' must be a non-empty string".to_string(),
             );
         }
-        // The trigger matches against `ctx.path`, which is the parsed request
-        // target from `req.uri().path()`: always rooted at '/' and free of
-        // control characters (CR/LF never survive request-line parsing). A
-        // prefix that breaks either rule can never match a live request, so
-        // reject it here instead of letting the plugin silently never fire.
-        if !path.starts_with('/') {
+        // The trigger matches against `ctx.path`, the parsed request target
+        // from `req.uri().path()`. A live request target is either origin-form
+        // (rooted at '/') or — for a server-wide `OPTIONS *` — asterisk-form,
+        // which the `http` crate exposes as the path "*". Either way it carries
+        // no control characters, since CR/LF never survive request-line
+        // parsing. A prefix that is neither rooted at '/' nor exactly "*" can
+        // never prefix any live request path, so reject it here instead of
+        // letting the plugin silently never fire.
+        if path != "*" && !path.starts_with('/') {
             return Err(
-                "request_termination: 'trigger.path_prefix' must start with '/'".to_string(),
+                "request_termination: 'trigger.path_prefix' must start with '/' or be \"*\" (asterisk-form OPTIONS target)"
+                    .to_string(),
             );
         }
         if path.chars().any(char::is_control) {

@@ -11491,9 +11491,10 @@ components:
               type: string
               description: >-
                 Only terminate when the request path starts with this prefix.
-                Must start with `/` and contain no control characters; request
-                paths are always rooted at `/`, so other values can never
-                match. Mutually exclusive with `header`.
+                Must start with `/`, or be exactly `*` to match the
+                asterisk-form target of a server-wide `OPTIONS *` request, and
+                contain no control characters; any other value can never match
+                a request path. Mutually exclusive with `header`.
             header:
               type: string
               description: >-

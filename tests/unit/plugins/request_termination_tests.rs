@@ -146,9 +146,10 @@ fn test_trigger_rejects_ambiguous_fields() {
 
 #[test]
 fn test_trigger_rejects_path_prefix_without_leading_slash() {
-    // Request paths come from `req.uri().path()` and are always rooted at '/'.
-    // A prefix like "admin" can never match `/admin/...`, so reject it at
-    // construction instead of silently never firing.
+    // Request paths come from `req.uri().path()`, which is origin-form (rooted
+    // at '/') for ordinary requests. A prefix like "admin" can never match
+    // `/admin/...`, so reject it at construction instead of silently never
+    // firing. The lone asterisk-form exception ("*") is covered separately.
     let err = RequestTermination::new(&json!({
         "trigger": { "path_prefix": "admin" }
     }))
@@ -157,6 +158,38 @@ fn test_trigger_rejects_path_prefix_without_leading_slash() {
 
     assert!(err.contains("path_prefix"), "got: {err}");
     assert!(err.contains("start with '/'"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_trigger_accepts_asterisk_form_path_prefix() {
+    // `OPTIONS *` (server-wide options) has an asterisk-form request target,
+    // which `req.uri().path()` exposes as "*". A `path_prefix` of "*" is the
+    // only non-'/'-rooted value that can match a live request, so it must be
+    // accepted and must fire on that request — and only that request.
+    let plugin = RequestTermination::new(&json!({
+        "trigger": { "path_prefix": "*" }
+    }))
+    .expect("path_prefix \"*\" matches asterisk-form requests and must be accepted");
+
+    // Matches the asterisk-form target carried by `OPTIONS *`.
+    let mut asterisk_ctx = make_ctx("OPTIONS", "*");
+    assert!(
+        matches!(
+            plugin.on_request_received(&mut asterisk_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "path_prefix \"*\" should terminate an asterisk-form request"
+    );
+
+    // Does not match ordinary origin-form paths.
+    let mut origin_ctx = make_ctx("GET", "/admin");
+    assert!(
+        matches!(
+            plugin.on_request_received(&mut origin_ctx).await,
+            PluginResult::Continue
+        ),
+        "path_prefix \"*\" must not terminate origin-form requests"
+    );
 }
 
 #[test]
