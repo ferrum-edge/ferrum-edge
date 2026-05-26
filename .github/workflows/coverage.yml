@@ -195,6 +195,20 @@ jobs:
           find target/llvm-cov-target -name '*.profraw' -print
           test -n "$(find target/llvm-cov-target -name '*.profraw' -print -quit)"
 
+      - name: Restore executable bit on instrumented binaries
+        run: |
+          set -euo pipefail
+          # actions/upload-artifact stores files in a zip that drops the Unix
+          # executable bit (actions/upload-artifact#38, actions/toolkit#1722).
+          # cargo-llvm-cov's report step only collects files whose exec bit is
+          # set as object files (is_object: `mode & 0o111 != 0`), so the
+          # downloaded instrumented test binaries arrive non-executable and the
+          # report fails with "not found object files". Rust links these
+          # binaries without a file extension, so restore +x on the
+          # extension-less files (this leaves .profraw/.rlib/.rmeta/.o at 644,
+          # matching a local llvm-cov run).
+          find target/llvm-cov-target -type f ! -name '*.*' -exec chmod +x {} +
+
       - name: Generate coverage reports
         run: |
           set -euo pipefail
