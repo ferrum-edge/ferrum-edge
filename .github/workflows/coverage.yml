@@ -151,14 +151,31 @@ jobs:
           INTEGRATION_FILTERS: ${{ matrix.filters }}
           RUST_BACKTRACE: 1
 
-      - name: List coverage profile data
-        run: find target/llvm-cov-target -name '*.profraw' -print
+      - name: Package coverage data
+        run: |
+          set -euo pipefail
+          # `cargo llvm-cov report` only needs the *.profraw profile data and
+          # the linked instrumented binaries. Ship just those in a tar and drop
+          # the dependency rlibs/rmeta, codegen-unit .o files, dep-info, and the
+          # incremental and fingerprint caches: report never reads them and they
+          # are the bulk of the target dir. tar also preserves the Unix
+          # executable bit that actions/upload-artifact's zip would otherwise
+          # drop (actions/upload-artifact#38, actions/toolkit#1722), so the
+          # merge job needs no chmod to make the binaries discoverable as object
+          # files (cargo-llvm-cov's is_object requires `mode & 0o111 != 0`).
+          find target/llvm-cov-target \
+            -type d \( -name incremental -o -name .fingerprint \) -prune -o \
+            -type f ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' ! -name '*.o' -print \
+            > coverage-files.txt
+          echo "packaging $(grep -c '' coverage-files.txt) files ($(grep -c '\.profraw$' coverage-files.txt) profraw)"
+          tar -cf "coverage-${{ matrix.shard }}.tar" -T coverage-files.txt
+          ls -lh "coverage-${{ matrix.shard }}.tar"
 
-      - name: Upload coverage profile data
+      - name: Upload coverage data
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: coverage-profraw-${{ matrix.shard }}
-          path: target/llvm-cov-target/
+          name: coverage-data-${{ matrix.shard }}
+          path: coverage-${{ matrix.shard }}.tar
           retention-days: 1
           if-no-files-found: error
 
@@ -182,32 +199,30 @@ jobs:
       - name: Install llvm tools
         run: rustup component add llvm-tools-preview
 
-      - name: Download coverage profile data
+      - name: Download coverage data
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: coverage-profraw-*
-          path: target/llvm-cov-target
+          pattern: coverage-data-*
+          path: coverage-data
           merge-multiple: true
 
-      - name: Verify downloaded profile data
+      - name: Extract coverage data
         run: |
           set -euo pipefail
+          # Each shard tar holds *.profraw plus the instrumented binaries with
+          # their executable bit intact (see the shard "Package coverage data"
+          # step), so cargo-llvm-cov can collect them as object files without a
+          # chmod. Binaries shared across shards (e.g. the integration_tests
+          # binary) are identical and simply overwrite.
+          shopt -s nullglob
+          archives=(coverage-data/*.tar)
+          test "${#archives[@]}" -gt 0
+          for archive in "${archives[@]}"; do
+            echo "extracting ${archive}"
+            tar -xpf "${archive}"
+          done
           find target/llvm-cov-target -name '*.profraw' -print
           test -n "$(find target/llvm-cov-target -name '*.profraw' -print -quit)"
-
-      - name: Restore executable bit on instrumented binaries
-        run: |
-          set -euo pipefail
-          # actions/upload-artifact stores files in a zip that drops the Unix
-          # executable bit (actions/upload-artifact#38, actions/toolkit#1722).
-          # cargo-llvm-cov's report step only collects files whose exec bit is
-          # set as object files (is_object: `mode & 0o111 != 0`), so the
-          # downloaded instrumented test binaries arrive non-executable and the
-          # report fails with "not found object files". Rust links these
-          # binaries without a file extension, so restore +x on the
-          # extension-less files (this leaves .profraw/.rlib/.rmeta/.o at 644,
-          # matching a local llvm-cov run).
-          find target/llvm-cov-target -type f ! -name '*.*' -exec chmod +x {} +
 
       - name: Generate coverage reports
         run: |
