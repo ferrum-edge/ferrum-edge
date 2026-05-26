@@ -3442,7 +3442,6 @@ paths:
                 - api_chargeback_sink
                 - workload_metrics
                 - fault_injection
-                - access_log
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -7791,8 +7790,33 @@ components:
 
     StdoutLoggingConfig:
       type: object
-      description: "Plugin: stdout_logging — Logs JSON transaction summaries to stdout."
+      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to stdout through the non-blocking writer, so logging never blocks request-processing threads. Independent of FERRUM_LOG_LEVEL: enabling the plugin is the on/off switch. The optional filter (when present) runs before schema application. Mesh mode injects this plugin to honor a Telemetry CRD's accessLogging configuration."
       properties:
+        filter:
+          type: object
+          description: >-
+            Optional predicate that suppresses log entries before they are
+            serialized. All present fields must match for an entry to be
+            logged. When omitted, every transaction is logged.
+          properties:
+            status_code_min:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              description: HTTP responses with status < this value are skipped. Stream summaries (no HTTP status) are always skipped when any status_code_* bound is set.
+            status_code_max:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              description: HTTP responses with status > this value are skipped. Must be greater than or equal to status_code_min when both are set, otherwise plugin validation rejects the config.
+            min_latency_ms:
+              type: integer
+              minimum: 0
+              description: Skip summaries whose total latency / stream duration is below this many milliseconds.
+            errors_only:
+              type: boolean
+              default: false
+              description: Skip summaries with no error_class (and no connection_error for streams).
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -8153,43 +8177,6 @@ components:
             Mutually exclusive with `schema`. Note: Loki labels
             (`build_http_labels` / `build_stream_labels`) read typed summary
             fields and are NOT affected by `rename:`. See docs/log_schema.md.
-
-    AccessLogConfig:
-      type: object
-      description: "Plugin: access_log — Emits identity-aware transaction summaries to the `mesh_access_log` tracing target. Additive to the other logging sinks; the filter (when present) runs before schema application."
-      properties:
-        filter:
-          type: object
-          description: >-
-            Optional predicate that suppresses log entries before they are
-            serialized. All present fields must match for an entry to be
-            logged. When omitted, every transaction is logged.
-          properties:
-            status_code_min:
-              type: integer
-              minimum: 0
-              maximum: 65535
-              description: HTTP responses with status < this value are skipped. Stream summaries (no HTTP status) are always skipped when any status_code_* bound is set.
-            status_code_max:
-              type: integer
-              minimum: 0
-              maximum: 65535
-              description: HTTP responses with status > this value are skipped.
-            min_latency_ms:
-              type: integer
-              minimum: 0
-              description: Skip summaries whose total latency / stream duration is below this many milliseconds.
-            errors_only:
-              type: boolean
-              default: false
-              description: Skip summaries with no error_class (and no connection_error for streams).
-        schema:
-          $ref: "#/components/schemas/SummaryLogSchema"
-        schema_ref:
-          type: string
-          description: >-
-            Name of a schema registered by a `transaction_log_schema` plugin.
-            Mutually exclusive with `schema`. See docs/log_schema.md.
 
     StatsdLoggingConfig:
       type: object

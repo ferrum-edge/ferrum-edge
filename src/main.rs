@@ -212,8 +212,18 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
         tracing_appender::non_blocking::NonBlockingBuilder::default()
             .buffered_lines_limit(log_buffer_capacity)
             .finish(std::io::stderr());
+    // Hand the access-log sink (the `stdout_logging` plugin) a clone of the
+    // non-blocking stdout writer so per-transaction JSON lines go through the
+    // same backpressure-aware worker thread the tracing layers use, but
+    // bypass the `EnvFilter`/`SeverityWriter` stack. That keeps access logs
+    // (a) off the Tokio hot path — a channel send, never a blocking
+    // `stdout().lock()` write — and (b) decoupled from `FERRUM_LOG_LEVEL`, so
+    // lowering runtime verbosity never silences them and the plugin's
+    // enablement is the only on/off switch. Set before the branches below
+    // move `stdout_writer` into the fallback fmt layer.
+    crate::logging::set_access_log_writer(stdout_writer.clone());
     let log_level =
-        config::conf_file::resolve_ferrum_var("FERRUM_LOG_LEVEL").unwrap_or_else(|| "error".into());
+        config::conf_file::resolve_ferrum_var("FERRUM_LOG_LEVEL").unwrap_or_else(|| "warn".into());
     let log_counter_enabled =
         config::conf_file::resolve_ferrum_var("FERRUM_METRICS_LOG_COUNTER_ENABLED")
             .map(|value| value.eq_ignore_ascii_case("true") || value == "1")

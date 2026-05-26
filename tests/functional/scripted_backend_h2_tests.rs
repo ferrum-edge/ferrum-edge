@@ -55,14 +55,16 @@ fn require_logs(harness: &GatewayHarness) -> String {
 ///   returns Err on the streaming-body dispatch (GOAWAY pre-headers,
 ///   RST during early header exchange). Emitted at ERROR level so it
 ///   survives any `RUST_LOG` filter that doesn't suppress ERROR (the
-///   gateway's default is `error`). This is the signal a reviewer
+///   gateway's default is `warn`, which still shows ERROR). This is the
+///   signal a reviewer
 ///   testing with restrictive `RUST_LOG` will see and was the only
 ///   one they reported.
 /// * `BODY_ERROR_CLASS_FIELD` — `"body_error_class":"..."` in the
 ///   `TransactionSummary` access-log JSON, fired by the deferred body
 ///   logger when the response stream errors after headers were already
-///   forwarded. Requires `RUST_LOG=info,access_log=info` and the
-///   `stdout_logging` plugin (both wired in by `spawn_grpc_harness`).
+///   forwarded. Requires the `stdout_logging` plugin (wired in by
+///   `spawn_grpc_harness`); the access-log JSON is written straight to
+///   stdout, independent of `RUST_LOG` / `FERRUM_LOG_LEVEL`.
 /// * `REJECTION_PHASE_FIELD` — `"rejection_phase":"grpc_backend_error"`
 ///   inside the access-log JSON's metadata, fired by the synchronous
 ///   gRPC backend-error path in `src/proxy/mod.rs`. Same loading
@@ -145,9 +147,9 @@ fn grpc_file_config(port: u16, overrides: Value) -> String {
             proxy_obj.insert(k.clone(), v.clone());
         }
     }
-    // `stdout_logging` emits the `TransactionSummary` as a JSON line on the
-    // `access_log` target at INFO. This is what the protocol-classification
-    // assertions below grep for (`"error_class":"..."` and
+    // `stdout_logging` emits the `TransactionSummary` as a JSON line on
+    // stdout, independent of the log-level filter. This is what the
+    // protocol-classification assertions below grep for (`"error_class":"..."` and
     // `"rejection_phase":"grpc_backend_error"`) — structured signals that
     // beat the old broad substring checks ("grpc", "backend"), which
     // matched ordinary startup / routing logs and would have silently
@@ -171,26 +173,28 @@ fn grpc_file_config(port: u16, overrides: Value) -> String {
 /// Spawn a gateway harness with the Phase-2 test defaults.
 ///
 /// All tests in this module need the same harness setup:
-///   * `.log_level("info")` so the `stdout_logging` access log at INFO
-///     is emitted,
-///   * `.env("RUST_LOG", "info,access_log=info")` so a reviewer or CI
-///     machine with `RUST_LOG=error` (or similar) in their shell
-///     doesn't silently suppress the access log — `EnvFilter` reads
-///     `RUST_LOG` first and only falls back to `FERRUM_LOG_LEVEL` when
-///     it's unset. Matches the pattern in
+///   * `.log_level("info")` so the gateway's runtime tracing logs (e.g.
+///     the `gRPC backend request failed` ERROR signal) are visible,
+///   * `.env("RUST_LOG", "info")` so a reviewer or CI machine with
+///     `RUST_LOG=error` (or similar) in their shell doesn't suppress
+///     those runtime logs — `EnvFilter` reads `RUST_LOG` first and only
+///     falls back to `FERRUM_LOG_LEVEL` when it's unset. The
+///     `stdout_logging` access-log JSON is written to stdout
+///     independent of this filter, so the access-log signals hold
+///     regardless. Matches the pattern in
 ///     `tests/functional/functional_logging_test.rs`.
 ///   * `.capture_output()` so `captured_combined()` can read back the
 ///     subprocess's stdout/stderr files.
 ///
 /// Centralizing these avoids drift — Phase-1 shipped with bare
 /// `.log_level("info")` on each builder call, and a reviewer's
-/// inherited `RUST_LOG` caused the access-log assertions in the
+/// inherited `RUST_LOG` caused the runtime-log signal in the
 /// GOAWAY/RST tests to regress until this helper was introduced.
 async fn spawn_grpc_harness(yaml: String) -> GatewayHarness {
     GatewayHarness::builder()
         .file_config(yaml)
         .log_level("info")
-        .env("RUST_LOG", "info,access_log=info")
+        .env("RUST_LOG", "info")
         .capture_output()
         .spawn()
         .await
@@ -289,11 +293,12 @@ async fn h2_goaway_mid_request_handled_gracefully() {
     // signal. See [`has_backend_error_signal`] for the three accepted
     // markers and why ANY of them satisfies the "gateway noticed the
     // failure and classified it" guarantee. We use `OR` (rather than
-    // requiring all three) because their availability depends on
-    // `RUST_LOG`: the access-log fields require INFO-level filtering,
-    // while the `gRPC backend request failed` ERROR log fires at the
-    // gateway's default level and is what reviewer environments with
-    // restrictive `RUST_LOG` will see. None of the signals appear on
+    // requiring all three) because their availability differs by
+    // environment: the access-log fields are written to stdout by
+    // `stdout_logging` regardless of the log filter, while the `gRPC
+    // backend request failed` ERROR log fires at the gateway's default
+    // level and is what reviewer environments with restrictive
+    // `RUST_LOG` will see. None of the signals appear on
     // the happy path or in ordinary startup / routing logs, so each is
     // load-bearing on its own.
     let logs = collect_flushed_logs(&harness).await;
@@ -783,7 +788,7 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
         .mode_in_process()
         .file_config(yaml)
         .log_level("info")
-        .env("RUST_LOG", "info,access_log=info")
+        .env("RUST_LOG", "info")
         .spawn()
         .await
         .expect("spawn gateway");

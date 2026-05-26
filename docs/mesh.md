@@ -1061,6 +1061,8 @@ Datadog export groups spans by trace in the Agent v0.3 payload shape and sends t
 - `enabled`: toggle (default true). When false, the access log plugin is not injected.
 - `filter`: optional `AccessLogFilter` with `status_code_min`, `status_code_max`, `min_latency_ms`, and `errors_only`.
 
+The access log is injected as a `stdout_logging` global under the reserved id `__mesh_access_log` (carrying the `filter` above). Like every auto-injected global, an operator-managed global of the **same plugin type** overrides it: if you define your own global `stdout_logging`, the `__mesh_access_log` injection is suppressed so transactions are not logged twice, and the Telemetry CRD's `accessLogging.filter` is **not** applied on top of your plugin. To keep the mesh-managed filter, leave access logging to the injected plugin (do not also define a global `stdout_logging`), or fold the equivalent `filter` into your own global `stdout_logging` config.
+
 ## Kubernetes Injector
 
 `FERRUM_MODE=injector` runs a Kubernetes admission webhook that injects Ferrum mesh sidecars into pods. The injector only produces JSON patches; all mesh runtime work happens in `FERRUM_MODE=mesh`.
@@ -1202,7 +1204,7 @@ Mesh mode automatically injects these global plugins with reserved IDs:
 | `__mesh_authz` | `mesh_authz` | 2075 | Evaluate MeshPolicy authorization rules |
 | `__mesh_workload_metrics` | `workload_metrics` | (default) | Istio/GAMMA RED metric labels from SPIFFE/HBONE identity |
 | `__mesh_request_auth` | `jwks_auth` | (default) | JWT validation from MeshRequestAuthentication rules |
-| `__mesh_access_log` | `access_log` | (default) | Access logging with optional Telemetry API filters |
+| `__mesh_access_log` | `stdout_logging` | (default) | Access logging with optional Telemetry API filters |
 
 An operator-managed global plugin of the same type takes precedence over mesh-injected plugins (explicit override). See [plugin_execution_order.md](plugin_execution_order.md) for the full lifecycle phase matrix.
 

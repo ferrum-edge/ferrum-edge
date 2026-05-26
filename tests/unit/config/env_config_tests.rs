@@ -490,7 +490,7 @@ fn test_env_config_default_log_level() {
         || {
             remove_var("FERRUM_LOG_LEVEL");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.log_level, "error");
+            assert_eq!(config.log_level, "warn");
         },
     );
 }

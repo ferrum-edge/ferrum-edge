@@ -31,7 +31,7 @@ impl LoggingTestHarness {
             .jwt_secret("logging-test-secret-key-1234567890ab")
             .jwt_issuer("ferrum-edge-logging-test")
             .log_level("info")
-            .env("RUST_LOG", "info,access_log=info")
+            .env("RUST_LOG", "info")
             .capture_output()
             .spawn()
             .await?;
@@ -226,33 +226,21 @@ fn parse_log_lines(raw: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Extract access_log entries and parse their nested TransactionSummary JSON.
+/// Extract `stdout_logging` access-log entries from captured stdout.
 ///
-/// Handles both wire shapes:
-///
-/// 1. Legacy tracing-wrapped: `{"target":"access_log","fields":{"message":"…"}}`,
-///    where the `message` field is itself a serialized `TransactionSummary`.
-/// 2. Direct-write (PR #1131 `stdout_logging`): one JSON line per transaction
-///    that *is* the serialized `TransactionSummary`, with no tracing envelope.
-///    Discriminated by the presence of a top-level `proxy_id` field — every
-///    transaction summary serialization includes it, and tracing log records
-///    on this stream never put `proxy_id` at the top level.
+/// `stdout_logging` writes one JSON line per transaction that *is* the
+/// serialized `TransactionSummary`, with no tracing envelope — it goes
+/// straight to the non-blocking stdout writer, bypassing the tracing fmt
+/// layer and the `FERRUM_LOG_LEVEL` / `RUST_LOG` filter. Entries are
+/// discriminated from ordinary tracing log records by the presence of a
+/// top-level `proxy_id` field: every transaction summary serialization
+/// includes it, and tracing log records on this stream never put
+/// `proxy_id` at the top level.
 fn extract_access_logs(log_lines: &[Value]) -> Vec<Value> {
     log_lines
         .iter()
-        .filter_map(|entry| {
-            if entry.get("target").and_then(|t| t.as_str()) == Some("access_log") {
-                let msg = entry
-                    .get("fields")
-                    .and_then(|f| f.get("message"))
-                    .and_then(|m| m.as_str())?;
-                return serde_json::from_str::<Value>(msg).ok();
-            }
-            if entry.is_object() && entry.get("proxy_id").is_some() {
-                return Some(entry.clone());
-            }
-            None
-        })
+        .filter(|entry| entry.is_object() && entry.get("proxy_id").is_some())
+        .cloned()
         .collect()
 }
 

@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use http::header::HeaderName;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 
@@ -179,7 +180,12 @@ impl Oauth2Introspection {
             }
 
             let issuer = optional_non_empty_string(prov_obj, "issuer", idx)?;
-            let audiences = parse_string_array(prov_obj, "audiences", idx)?;
+            // Canonicalize audiences (sort + dedup) so equivalent audience sets map to
+            // one cache partition: `["a","b"]` and `["b","a"]` are equivalent under
+            // `audience_matches`, and dedup does not change membership.
+            let mut audiences = parse_string_array(prov_obj, "audiences", idx)?;
+            audiences.sort();
+            audiences.dedup();
             let required_scopes = parse_string_array(prov_obj, "required_scopes", idx)?;
             let required_roles = parse_string_array(prov_obj, "required_roles", idx)?;
             let scope_claim = optional_provider_claim_path(prov_obj, "scope_claim", idx)?;
@@ -220,14 +226,16 @@ impl Oauth2Introspection {
                 );
             }
 
-            let cache_key = format!(
-                "{}|{}",
-                endpoint
-                    .as_ref()
-                    .map(|parsed| parsed.url.as_str())
-                    .or_else(|| discovery.as_ref().map(|parsed| parsed.url.as_str()))
-                    .unwrap_or("pending"),
-                client_auth.client_id_for_cache()
+            let endpoint_for_key = endpoint
+                .as_ref()
+                .map(|parsed| parsed.url.as_str())
+                .or_else(|| discovery.as_ref().map(|parsed| parsed.url.as_str()))
+                .unwrap_or("pending");
+            let cache_key = introspection_cache_key(
+                endpoint_for_key,
+                client_auth.client_id_for_cache(),
+                issuer.as_deref(),
+                &audiences,
             );
             let cache = get_or_create_introspection_cache(
                 &cache_key,
@@ -614,6 +622,48 @@ impl Oauth2Introspection {
             _ => Oauth2ExtractedCredential::Missing,
         }
     }
+}
+
+/// Builds the global introspection-cache partition key for a provider.
+///
+/// The positive/negative caches are process-global and keyed by this string, so the
+/// key must fully capture every input that affects whether a cached introspection
+/// result may be reused: the endpoint (or `"pending"` discovery placeholder), the
+/// client id used for endpoint authentication, and the issuer/audience constraints
+/// enforced after a cache miss in `introspect_with_provider`. Omitting the policy
+/// material lets a token validated by a permissive provider be served from cache to a
+/// stricter provider sharing endpoint+client_id, bypassing its `iss`/`aud` checks.
+///
+/// Components are length-prefixed before hashing so no arrangement of delimiter bytes
+/// (e.g. `|` or `,`) inside any single field can collide with a functionally
+/// different policy. `issuer` is tagged so `None` is distinct from `Some("")`.
+/// Callers must pass canonicalized (sorted, deduped) audiences so equivalent audience
+/// sets map to the same key.
+fn introspection_cache_key(
+    endpoint: &str,
+    client_id: &str,
+    issuer: Option<&str>,
+    audiences: &[String],
+) -> String {
+    fn absorb(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = Sha256::new();
+    absorb(&mut hasher, endpoint.as_bytes());
+    absorb(&mut hasher, client_id.as_bytes());
+    match issuer {
+        Some(issuer) => {
+            hasher.update([1u8]);
+            absorb(&mut hasher, issuer.as_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
+    hasher.update((audiences.len() as u64).to_le_bytes());
+    for audience in audiences {
+        absorb(&mut hasher, audience.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 enum IntrospectionDecision {
@@ -1354,6 +1404,58 @@ fn validate_discovered_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn introspection_cache_key_partitions_by_policy_and_is_collision_resistant() {
+        let base = introspection_cache_key("https://idp/i", "cid", None, &[]);
+
+        // Differing issuer or audiences must produce distinct partitions.
+        assert_ne!(
+            base,
+            introspection_cache_key("https://idp/i", "cid", Some("https://iss"), &[])
+        );
+        assert_ne!(
+            base,
+            introspection_cache_key("https://idp/i", "cid", None, &["aud".to_string()])
+        );
+        // `None` issuer is distinct from an empty-string issuer.
+        assert_ne!(
+            base,
+            introspection_cache_key("https://idp/i", "cid", Some(""), &[])
+        );
+        // Endpoint and client id remain part of the partition.
+        assert_ne!(
+            base,
+            introspection_cache_key("https://idp/i", "other", None, &[])
+        );
+        assert_ne!(
+            base,
+            introspection_cache_key("https://other/i", "cid", None, &[])
+        );
+
+        // Delimiter bytes inside fields cannot forge a collision across distinct
+        // policies (the pre-hardening `|`/`,` join could).
+        assert_ne!(
+            introspection_cache_key("https://idp/i", "cid", Some("X|stuff"), &["a".to_string()]),
+            introspection_cache_key("https://idp/i", "cid", Some("X"), &["stuff|a".to_string()])
+        );
+
+        // Same policy yields the same key (cache reuse for equivalent providers).
+        assert_eq!(
+            introspection_cache_key(
+                "https://idp/i",
+                "cid",
+                Some("https://iss"),
+                &["a".to_string(), "b".to_string()]
+            ),
+            introspection_cache_key(
+                "https://idp/i",
+                "cid",
+                Some("https://iss"),
+                &["a".to_string(), "b".to_string()]
+            )
+        );
+    }
 
     #[test]
     fn local_introspection_host_accepts_loopback_and_localhost_only() {

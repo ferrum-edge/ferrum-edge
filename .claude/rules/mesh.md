@@ -56,7 +56,7 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 
 ## Mesh Plugin Injection
 
-- `inject_mesh_global_plugins()` auto-injects reserved-ID globals on slice apply: `__mesh_spiffe_identity` priority 940, `__mesh_authz` priority 2075, `__mesh_workload_metrics`, `__mesh_request_auth` only when JWT rules exist, and `__mesh_access_log`.
+- `inject_mesh_global_plugins()` auto-injects reserved-ID globals on slice apply: `__mesh_spiffe_identity` priority 940, `__mesh_authz` priority 2075, `__mesh_workload_metrics`, `__mesh_request_auth` only when JWT rules exist, and `__mesh_access_log` (a `stdout_logging` instance carrying the Telemetry `accessLogging` filter).
 - Operator-managed globals of the same type override mesh-injected plugins.
 - Mesh plugin injection must preserve normal plugin lifecycle ordering and transaction logging.
 

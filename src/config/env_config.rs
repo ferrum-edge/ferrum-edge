@@ -1881,7 +1881,7 @@ impl EnvConfig {
             [core]
             dns_overrides: HashMap<String, String> = "FERRUM_DNS_OVERRIDES" => HashMap::new();
             namespace: String = "FERRUM_NAMESPACE" => "ferrum".to_string();
-            log_level: String = "FERRUM_LOG_LEVEL" => "error".to_string();
+            log_level: String = "FERRUM_LOG_LEVEL" => "warn".to_string();
             log_buffer_capacity: usize = "FERRUM_LOG_BUFFER_CAPACITY" => 128_000usize;
             secret_refresh_interval_seconds: u64 = "FERRUM_SECRET_REFRESH_INTERVAL_SECONDS" => crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS, clamp(1u64, 86_400u64);
             acme_auto_renew_enabled: bool = "FERRUM_ACME_AUTO_RENEW_ENABLED" => false;

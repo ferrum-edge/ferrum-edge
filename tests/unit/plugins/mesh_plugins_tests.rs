@@ -9,13 +9,11 @@ use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
     WorkloadSelector,
 };
-use ferrum_edge::plugins::access_log::AccessLog;
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, StreamConnectionContext,
-    TransactionSummary, available_plugins, create_plugin, is_security_plugin, priority,
-    validate_plugin_config,
+    Plugin, PluginResult, RequestContext, StreamConnectionContext, available_plugins,
+    create_plugin, is_security_plugin,
 };
 use serde_json::json;
 
@@ -111,7 +109,6 @@ fn mesh_plugins_are_registered() {
     assert!(available.contains(&"mesh_authz"));
     assert!(available.contains(&"mesh_outbound_registry"));
     assert!(available.contains(&"workload_metrics"));
-    assert!(available.contains(&"access_log"));
     assert!(is_security_plugin("mesh_authz"));
     assert!(is_security_plugin("mesh_outbound_registry"));
     assert!(create_plugin("mesh_authz", &json!({})).unwrap().is_some());
@@ -125,7 +122,6 @@ fn mesh_plugins_are_registered() {
             .unwrap()
             .is_some()
     );
-    assert!(create_plugin("access_log", &json!({})).unwrap().is_some());
 }
 
 #[test]
@@ -1430,46 +1426,6 @@ async fn workload_metrics_rejects_invalid_trust_domain_alias() {
     assert!(
         err.contains("Bad.Trust"),
         "error should mention bad alias, got: {err}"
-    );
-}
-
-#[tokio::test]
-async fn access_log_is_all_protocol_logging_plugin() {
-    let plugin = AccessLog::new(&json!({})).expect("plugin config");
-
-    assert_eq!(plugin.name(), "access_log");
-    assert_eq!(plugin.priority(), priority::ACCESS_LOG);
-    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
-    plugin.log(&TransactionSummary::default()).await;
-}
-
-#[test]
-fn access_log_validation_path_rejects_invalid_filter() {
-    validate_plugin_config(
-        "access_log",
-        &json!({
-            "filter": {
-                "status_code_min": 400,
-                "status_code_max": 599,
-                "min_latency_ms": 250,
-                "errors_only": true
-            }
-        }),
-    )
-    .expect("valid access_log filter config should pass");
-
-    let err = validate_plugin_config(
-        "access_log",
-        &json!({
-            "filter": {
-                "min_latency_ms": "slow"
-            }
-        }),
-    )
-    .expect_err("invalid filter should fail through plugin registry validation");
-    assert!(
-        err.contains("filter.min_latency_ms must be an integer"),
-        "unexpected error: {err}"
     );
 }
 

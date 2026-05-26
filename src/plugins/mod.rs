@@ -16,7 +16,6 @@
 //! Non-security plugins that fail validation are skipped with a warning.
 
 pub mod access_control;
-pub mod access_log;
 pub mod ai_federation;
 pub mod ai_prompt_shield;
 pub mod ai_rate_limiter;
@@ -1510,7 +1509,6 @@ pub mod priority {
     /// metric-emitter plugins so its `log` hook runs after all
     /// transaction-summary serialization.
     pub const MESH_BPF_METRICS: u16 = 9365;
-    pub const ACCESS_LOG: u16 = 9375;
     /// `transaction_log_schema` is a config-only plugin with no lifecycle
     /// hooks; its priority is irrelevant in practice but is kept at the
     /// top of the logging band so any future hook would run after all
@@ -2205,7 +2203,6 @@ pub fn create_plugin_with_http_client(
             };
             Ok(Some(Arc::new(plugin)))
         }
-        "access_log" => Ok(Some(Arc::new(access_log::AccessLog::new(config)?))),
         _ => {
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client)?;
@@ -2344,7 +2341,6 @@ pub fn available_plugins() -> Vec<&'static str> {
         "workload_metrics",
         "__mesh_bpf_metrics",
         "fault_injection",
-        "access_log",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins

@@ -125,7 +125,7 @@ fn sidecar_prepare_injects_default_mesh_plugins() {
     );
     assert!(
         ids.contains(MESH_ACCESS_LOG_PLUGIN_ID),
-        "access_log plugin injected, got {ids:?}"
+        "mesh access-log (stdout_logging) plugin injected, got {ids:?}"
     );
 }
 
