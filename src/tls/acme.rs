@@ -1172,6 +1172,26 @@ fn validate_acme_directory_url(directory_url: &str) -> Result<(), AcmeError> {
     Ok(())
 }
 
+/// Detects non-canonical numeric IPv4 representations that `IpAddr::parse()` rejects
+/// but system resolvers (getaddrinfo) interpret as real addresses: decimal integers
+/// (`2130706433`), hex integers (`0x7f000001`), hex-dotted (`0x7f.0.0.1`), abbreviated
+/// dotted (`127.1`), and octal dotted (`0177.0.0.1`).
+fn is_non_canonical_numeric_host(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    if host.starts_with("0x") || host.starts_with("0X") {
+        return true;
+    }
+    if host.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    host.contains('.')
+        && host
+            .split('.')
+            .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Enforces SSRF policy on an operator-supplied ACME `directory_url` before any
 /// outbound ACME network activity.
 ///
@@ -1226,14 +1246,7 @@ pub(crate) fn validate_acme_directory_url_ssrf_policy(
                 "host IP {ip} is not a public address"
             )));
         }
-    } else if host_ip
-        .bytes()
-        .all(|b| b.is_ascii_hexdigit() || b == b'.' || b == b'x' || b == b'X')
-    {
-        // System resolvers (getaddrinfo) interpret decimal integers (2130706433),
-        // abbreviated dotted (127.1), hex-prefixed (0x7f.0.0.1), and on some
-        // platforms octal (0177.0.0.1) as IP addresses. Rust's IpAddr only parses
-        // standard dotted-decimal/colon-hex, so those forms slip past the gate above.
+    } else if is_non_canonical_numeric_host(host_ip) {
         return Err(AcmeError::BlockedDirectoryUrl(format!(
             "non-standard numeric host '{host_ip}' is not permitted; use a hostname or standard dotted-decimal IP"
         )));
@@ -2370,6 +2383,31 @@ mod tests {
     }
 
     #[test]
+    fn non_canonical_numeric_host_detection() {
+        for (host, expected) in [
+            ("2130706433", true),    // decimal integer
+            ("0x7f000001", true),    // hex integer
+            ("0XA9FEA9FE", true),    // hex integer uppercase prefix
+            ("0x7f.0.0.1", true),    // hex-dotted
+            ("0177.0.0.1", true),    // octal-dotted
+            ("127.1", true),         // abbreviated dotted
+            ("192.168.1", true),     // abbreviated 3-segment
+            ("beef.cafe", false),    // hex-only hostname
+            ("dead.cab", false),     // hex-only hostname
+            ("abc.def.1a2b", false), // mixed hex hostname
+            ("localhost", false),    // alpha hostname
+            ("example.com", false),  // normal hostname
+            ("", false),             // empty
+        ] {
+            assert_eq!(
+                is_non_canonical_numeric_host(host),
+                expected,
+                "is_non_canonical_numeric_host({host:?}) should be {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn directory_url_ssrf_policy_accepts_public_ips_and_hostnames() {
         // Public CAs (hostnames) and public IP literals are permitted. Hostnames
         // resolving to private IPs are a documented gap (no DNS resolution here).
@@ -2378,7 +2416,10 @@ mod tests {
             " https://acme-staging-v02.api.letsencrypt.org/directory ", // trimmed
             "https://1.1.1.1/dir",                                      // public IPv4 literal
             "https://[2606:4700:4700::1111]/dir",                       // public IPv6 literal
-            "https://localhost/dir", // hostname gap: not blocked here
+            "https://localhost/dir",    // hostname gap: not blocked here
+            "https://beef.cafe/dir",    // hex-only hostname is not a numeric IP
+            "https://dead.cab/dir",     // hex-only hostname is not a numeric IP
+            "https://abc.def.1a2b/dir", // mixed hex hostname
         ] {
             assert!(
                 validate_acme_directory_url_ssrf_policy(ok).is_ok(),
