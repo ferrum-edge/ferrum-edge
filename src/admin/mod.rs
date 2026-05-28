@@ -703,8 +703,26 @@ pub async fn handle_admin_request(
         ));
     }
 
-    // Prometheus metrics endpoint (unauthenticated for scraping)
+    // Prometheus metrics endpoint (authenticated)
     if path == "/metrics" && method == Method::GET {
+        if let Err(err) = state.jwt_manager.verify_request(
+            req.headers()
+                .get("authorization")
+                .and_then(|h| h.to_str().ok()),
+        ) {
+            let message = match err {
+                JwtError::MissingHeader => "Missing Authorization header".to_string(),
+                JwtError::InvalidHeaderFormat => "Invalid Authorization header format".to_string(),
+                JwtError::VerificationFailed(msg) => {
+                    format!("Token verification failed: {}", msg)
+                }
+            };
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": message}),
+            ));
+        }
+
         let registry = crate::plugins::prometheus_metrics::global_registry();
         let inventory = tls_management::collect_inventory(&state);
         registry.refresh_tls_certificate_inventory(&inventory);
