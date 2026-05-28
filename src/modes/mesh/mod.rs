@@ -3632,6 +3632,7 @@ async fn serve_mesh_runtime(
             runtime.node_id.clone(),
             runtime.namespace.clone(),
             remote_grpc_tls,
+            env_config.backend_allow_ips.clone(),
         )
     } else {
         None

@@ -57,6 +57,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::config::BackendAllowIps;
 use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret};
 use crate::identity::TrustDomain;
 use crate::modes::mesh::config::{AppProtocol, MeshService, MultiClusterConfig, Workload};
@@ -680,6 +681,8 @@ pub struct RemoteDiscoveryConfig {
     /// Optional DP gRPC client TLS material, split by remote CP URL scheme so an
     /// HTTPS remote is not affected by the local CP URL scheme.
     pub tls_config: RemoteDiscoveryTlsConfig,
+    /// Backend IP allow policy applied to resolved remote CP hostnames.
+    pub backend_allow_ips: BackendAllowIps,
 }
 
 impl RemoteDiscoveryConfig {
@@ -692,6 +695,7 @@ impl RemoteDiscoveryConfig {
         node_id: String,
         namespace: String,
         tls_config: RemoteDiscoveryTlsConfig,
+        backend_allow_ips: BackendAllowIps,
     ) -> Option<Self> {
         if interval_seconds == 0 {
             return None;
@@ -703,6 +707,7 @@ impl RemoteDiscoveryConfig {
             node_id,
             namespace,
             tls_config,
+            backend_allow_ips,
         })
     }
 }
@@ -1032,6 +1037,7 @@ pub struct NativeRemoteSource {
     jwt_secret: GrpcJwtSecret,
     tls_config: Option<DpGrpcTlsConfig>,
     request_timeout: Duration,
+    backend_allow_ips: BackendAllowIps,
 }
 
 impl NativeRemoteSource {
@@ -1046,6 +1052,7 @@ impl NativeRemoteSource {
                 .tls_config
                 .for_control_plane_url(&ctx.control_plane_url),
             request_timeout: ctx.config.request_timeout,
+            backend_allow_ips: ctx.config.backend_allow_ips.clone(),
         }
     }
 }
@@ -1060,6 +1067,7 @@ impl RemoteServiceSource for NativeRemoteSource {
             &self.jwt_secret,
             self.tls_config.as_ref(),
             self.request_timeout,
+            &self.backend_allow_ips,
         )
         .await
     }
@@ -1103,6 +1111,7 @@ async fn fetch_remote_slice_endpoints(
     jwt_secret: &GrpcJwtSecret,
     tls_config: Option<&DpGrpcTlsConfig>,
     request_timeout: Duration,
+    backend_allow_ips: &BackendAllowIps,
 ) -> Result<RemoteClusterEndpoints, String> {
     use crate::grpc::dp_client::generate_dp_jwt_with_issuer;
     use crate::grpc::proto::MeshSubscribeRequest;
@@ -1113,6 +1122,7 @@ async fn fetch_remote_slice_endpoints(
     use tonic::transport::Channel;
 
     let attempt = async {
+        validate_control_plane_url_resolved_ips(control_plane_url, backend_allow_ips).await?;
         let mut endpoint = Channel::from_shared(control_plane_url.to_string())
             .map_err(|e| format!("invalid control_plane_url: {e}"))?
             .connect_timeout(Duration::from_secs(10));
@@ -1177,6 +1187,44 @@ async fn fetch_remote_slice_endpoints(
     tokio::time::timeout(request_timeout, attempt)
         .await
         .map_err(|_| "remote MeshSubscribe timed out".to_string())?
+}
+
+async fn validate_control_plane_url_resolved_ips(
+    control_plane_url: &str,
+    backend_allow_ips: &BackendAllowIps,
+) -> Result<(), String> {
+    let uri = control_plane_url
+        .parse::<http::Uri>()
+        .map_err(|e| format!("invalid control_plane_url: {e}"))?;
+    let host = uri
+        .host()
+        .ok_or_else(|| "control_plane_url has no host".to_string())?;
+    let port = uri.port_u16().unwrap_or_else(|| {
+        if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        }
+    });
+    let mut resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("resolve remote CP host '{host}': {e}"))?;
+    let mut saw_any = false;
+    for addr in &mut resolved {
+        saw_any = true;
+        let ip = addr.ip();
+        if !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips) {
+            return Err(format!(
+                "resolved remote CP host '{host}' to disallowed IP {ip} under FERRUM_BACKEND_ALLOW_IPS={backend_allow_ips}"
+            ));
+        }
+    }
+    if !saw_any {
+        return Err(format!(
+            "resolve remote CP host '{host}': no addresses returned"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
