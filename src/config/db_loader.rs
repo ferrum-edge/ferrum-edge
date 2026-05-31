@@ -5303,9 +5303,7 @@ fn row_to_proxy(
 
     Ok(Proxy {
         id,
-        namespace: row
-            .try_get::<String, _>("namespace")
-            .unwrap_or_else(|_| crate::config::types::default_namespace()),
+        namespace: row_namespace_or_default(row),
         name: row.try_get("name").ok(),
         hosts,
         // Propagate decode errors — silently defaulting to None would turn a
@@ -5514,9 +5512,7 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
 
     Ok(Consumer {
         id: row.try_get("id")?,
-        namespace: row
-            .try_get::<String, _>("namespace")
-            .unwrap_or_else(|_| crate::config::types::default_namespace()),
+        namespace: row_namespace_or_default(row),
         username: row.try_get("username")?,
         custom_id: row.try_get("custom_id").ok(),
         credentials,
@@ -5555,9 +5551,7 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
 
     Ok(PluginConfig {
         id: row.try_get("id")?,
-        namespace: row
-            .try_get::<String, _>("namespace")
-            .unwrap_or_else(|_| crate::config::types::default_namespace()),
+        namespace: row_namespace_or_default(row),
         plugin_name: row.try_get("plugin_name")?,
         config: config_val,
         scope: match scope_str.as_str() {
@@ -5682,9 +5676,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
 
     Ok(Upstream {
         id: row.try_get("id")?,
-        namespace: row
-            .try_get::<String, _>("namespace")
-            .unwrap_or_else(|_| crate::config::types::default_namespace()),
+        namespace: row_namespace_or_default(row),
         name: row.try_get("name").ok(),
         targets,
         algorithm,
@@ -5804,9 +5796,7 @@ fn row_to_api_spec_with_content(
 
     Ok(ApiSpec {
         id: row.try_get("id")?,
-        namespace: row
-            .try_get::<String, _>("namespace")
-            .unwrap_or_else(|_| crate::config::types::default_namespace()),
+        namespace: row_namespace_or_default(row),
         proxy_id: row.try_get("proxy_id")?,
         spec_version: row.try_get("spec_version")?,
         spec_format,
@@ -5857,6 +5847,11 @@ fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, a
 
 fn audit_ts_string(ts: &DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+fn row_namespace_or_default(row: &AnyRow) -> String {
+    row.try_get::<String, _>("namespace")
+        .unwrap_or_else(|_| crate::config::types::default_namespace())
 }
 
 /// Parse a datetime column from a database row, falling back to `Utc::now()` if
