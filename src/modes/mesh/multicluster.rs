@@ -64,12 +64,14 @@ use tracing::{debug, info, warn};
 use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret};
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{AppProtocol, MeshService, MultiClusterConfig, Workload};
+use crate::modes::mesh::config_consumer::common::{
+    BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs as common_next_backoff_secs,
+};
 
 /// Backoff bounds shared with [`super::federation`] and
 /// `src/grpc/dp_client.rs`. One cross-cluster backoff curve for operators to
 /// reason about.
-pub(crate) const REMOTE_BACKOFF_INITIAL_SECS: u64 = 1;
-pub(crate) const REMOTE_BACKOFF_MAX_SECS: u64 = 30;
+pub(crate) const REMOTE_BACKOFF_INITIAL_SECS: u64 = BACKOFF_INITIAL_SECS;
 
 /// Defense-in-depth cap on the number of workloads / services a single remote
 /// cluster may contribute. A misbehaving (or compromised) remote CP cannot
@@ -1084,27 +1086,8 @@ async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
     }
 }
 
-fn jittered_backoff(backoff_secs: u64) -> Duration {
-    // ±25% jitter, identical curve to federation / dp_client.
-    let base_ms = backoff_secs.saturating_mul(1000);
-    let jitter_span = base_ms / 4;
-    let jitter = if jitter_span == 0 {
-        0
-    } else {
-        // Cheap deterministic-ish jitter without pulling in rand: mix the
-        // monotonic clock. Range is [-jitter_span, +jitter_span).
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64)
-            .unwrap_or(0);
-        (nanos % (jitter_span * 2)) as i64 - jitter_span as i64
-    };
-    let total = (base_ms as i64 + jitter).max(0) as u64;
-    Duration::from_millis(total)
-}
-
 fn next_backoff_secs(current: u64) -> u64 {
-    current.saturating_mul(2).min(REMOTE_BACKOFF_MAX_SECS)
+    common_next_backoff_secs(current, true)
 }
 
 fn sanitize_url_for_logging(url: &str) -> String {

@@ -38,13 +38,21 @@ use tracing::{debug, info, warn};
 
 use crate::identity::TrustDomain;
 use crate::modes::mesh::config::{JwtAuthority, MultiClusterConfig, TrustBundle, TrustBundleSet};
+use crate::modes::mesh::config_consumer::common::{
+    BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs as common_next_backoff_secs,
+};
+#[cfg(test)]
+use crate::modes::mesh::config_consumer::common::{
+    BACKOFF_MAX_SECS, jittered_backoff_with_entropy as common_jittered_backoff_with_entropy,
+};
 use crate::plugins::utils::http_client::PluginHttpClient;
 
-/// Backoff bounds shared with `src/grpc/dp_client.rs`. The federation poller
-/// intentionally mirrors the CP-reconnect cadence so an operator-tuned cluster
-/// has only one cross-cluster backoff curve to reason about.
-pub(crate) const FEDERATION_BACKOFF_INITIAL_SECS: u64 = 1;
-pub(crate) const FEDERATION_BACKOFF_MAX_SECS: u64 = 30;
+/// Initial backoff bound shared with `src/grpc/dp_client.rs`. The federation
+/// poller intentionally mirrors the CP-reconnect cadence so an operator-tuned
+/// cluster has only one cross-cluster backoff curve to reason about.
+pub(crate) const FEDERATION_BACKOFF_INITIAL_SECS: u64 = BACKOFF_INITIAL_SECS;
+#[cfg(test)]
+const FEDERATION_BACKOFF_MAX_SECS: u64 = BACKOFF_MAX_SECS;
 
 /// Hard cap on federation response body size. A real SPIFFE bundle is
 /// kilobytes — even a generous JWKS with several authorities fits well
@@ -1045,39 +1053,13 @@ fn reject_unsafe_ipv6(ip: &std::net::Ipv6Addr) -> Result<(), String> {
     Ok(())
 }
 
-fn jittered_backoff(backoff_secs: u64) -> Duration {
-    jittered_backoff_with_entropy(backoff_secs, random_backoff_entropy())
-}
-
-fn random_backoff_entropy() -> u64 {
-    let rng = ring::rand::SystemRandom::new();
-    let mut bytes = [0u8; 8];
-    if ring::rand::SecureRandom::fill(&rng, &mut bytes).is_ok() {
-        return u64::from_ne_bytes(bytes);
-    }
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
-pub(crate) fn jittered_backoff_with_entropy(backoff_secs: u64, entropy: u64) -> Duration {
-    let base_ms = backoff_secs.saturating_mul(1000);
-    let jitter_range_ms = base_ms / 4;
-    let jitter_ms = if jitter_range_ms > 0 {
-        let full_range = jitter_range_ms.saturating_mul(2);
-        (entropy % full_range) as i64 - jitter_range_ms as i64
-    } else {
-        0
-    };
-    let sleep_ms = (base_ms as i64 + jitter_ms).max(100) as u64;
-    Duration::from_millis(sleep_ms)
+#[cfg(test)]
+fn jittered_backoff_with_entropy(backoff_secs: u64, entropy: u64) -> Duration {
+    common_jittered_backoff_with_entropy(backoff_secs, entropy)
 }
 
 pub(crate) fn next_backoff_secs(current_secs: u64) -> u64 {
-    current_secs
-        .saturating_mul(2)
-        .min(FEDERATION_BACKOFF_MAX_SECS)
+    common_next_backoff_secs(current_secs, true)
 }
 
 /// Merge the live federation snapshot into the static [`TrustBundleSet`] the
