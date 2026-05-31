@@ -157,10 +157,20 @@ fn build_dns_cached_fallback_client(dns_cache: Option<DnsCache>) -> reqwest::Cli
     builder.build().unwrap_or_else(|e| {
         tracing::error!(
             "Failed to build minimal DNS-cached fallback plugin client: {}. \
-             Using reqwest::Client::new() as a last resort — DNS will bypass the gateway cache.",
+             Falling back to a no-redirect minimal plugin client as a last resort.",
             e
         );
-        reqwest::Client::new()
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|e2| {
+                tracing::error!(
+                    "Failed to build fallback plugin client with redirect policy set: {}. \
+                     Using reqwest::Client::new() as a final fallback.",
+                    e2
+                );
+                reqwest::Client::new()
+            })
     })
 }
 
