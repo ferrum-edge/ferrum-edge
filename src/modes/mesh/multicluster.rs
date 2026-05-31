@@ -976,10 +976,12 @@ async fn remote_discovery_loop(
 /// — a cross-trust-domain confused-deputy hijack.
 ///
 /// Enforcing that every contributed workload carries the declared trust domain,
-/// and that every service workload-ref still points at a surviving workload in
-/// that service namespace, makes ingestion fail closed: a peer under
-/// `eu-west-1.example.com` may only contribute `eu-west-1.example.com`
-/// identities and can no longer impersonate another domain's workloads.
+/// and that every service workload-ref still points at a surviving workload for
+/// that same `(namespace, service_name)`, makes ingestion fail closed: a peer
+/// under `eu-west-1.example.com` may only contribute `eu-west-1.example.com`
+/// identities for the logical service that owns them and can no longer
+/// impersonate another domain's workloads or attach one service's workload to a
+/// different same-namespace service.
 /// Mismatches are dropped (not fatal — one bad endpoint must not blackhole the
 /// whole snapshot) and surfaced via a structured `warn!` so the drops are
 /// observable. If an explicitly-refed service loses all refs, the service is
@@ -1012,12 +1014,13 @@ fn enforce_remote_trust_domain(
         belongs
     });
 
-    let surviving_workload_refs: HashSet<(String, String)> = endpoints
+    let surviving_workload_refs: HashSet<(String, String, String)> = endpoints
         .workloads
         .iter()
         .map(|workload| {
             (
                 workload.namespace.clone(),
+                workload.service_name.clone(),
                 workload.spiffe_id.as_str().to_string(),
             )
         })
@@ -1029,6 +1032,7 @@ fn enforce_remote_trust_domain(
             let belongs = workload_ref.spiffe_id.trust_domain() == declared
                 && surviving_workload_refs.contains(&(
                     service.namespace.clone(),
+                    service.name.clone(),
                     workload_ref.spiffe_id.as_str().to_string(),
                 ));
             if !belongs {
@@ -1428,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn enforce_remote_trust_domain_drops_orphaned_refs_and_empty_services() {
+    fn enforce_remote_trust_domain_drops_orphaned_and_cross_service_refs() {
         let declared = td("eu-west-1.example.com");
         let shared_spiffe = "spiffe://eu-west-1.example.com/ns/default/sa/shared";
         let orphan_spiffe = "spiffe://eu-west-1.example.com/ns/default/sa/orphan";
@@ -1459,18 +1463,15 @@ mod tests {
         );
         assert_eq!(
             endpoints.services.len(),
-            2,
-            "the orphaned service is dropped, while legacy refs to surviving in-domain workloads stay explicit"
+            1,
+            "services with only orphaned or cross-service refs are dropped"
         );
-        let service_names: Vec<_> = endpoints
-            .services
-            .iter()
-            .map(|service| service.name.as_str())
-            .collect();
-        assert!(service_names.contains(&"api"));
-        assert!(service_names.contains(&"payments"));
-        assert!(!service_names.contains(&"orphaned"));
+        assert_eq!(endpoints.services[0].name, "payments");
         assert_eq!(endpoints.services[0].workloads.len(), 1);
+        assert_eq!(
+            endpoints.services[0].workloads[0].spiffe_id.as_str(),
+            shared_spiffe
+        );
     }
 
     #[test]
