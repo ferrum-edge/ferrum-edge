@@ -17,7 +17,6 @@
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use ring::rand::SecureRandom;
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -39,6 +38,7 @@ use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
 use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
 use crate::proxy::{IncrementalApplyOutcome, ProxyState};
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
+use crate::util::backoff::{BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs};
 
 /// Tracks the DP's connection status to its Control Plane.
 /// Shared between the DP gRPC client and the admin API (`GET /cluster`).
@@ -224,9 +224,6 @@ fn load_grpc_material(
 
 /// JWT token lifetime for DP-generated tokens (59 minutes, under the 1-hour ceiling).
 const DP_JWT_TTL_SECONDS: i64 = 3540;
-const BACKOFF_INITIAL_SECS: u64 = 1;
-const BACKOFF_MAX_SECS: u64 = 30;
-
 /// Generate a short-lived HS256 JWT for authenticating the DP to the CP using
 /// the default issuer (`DEFAULT_CP_DP_JWT_ISSUER`).
 ///
@@ -585,44 +582,6 @@ async fn wait_optional_tls_reload(mut revision_rx: Option<watch::Receiver<u64>>)
     };
     if !changed {
         std::future::pending::<()>().await;
-    }
-}
-
-fn jittered_backoff(backoff_secs: u64) -> Duration {
-    jittered_backoff_with_entropy(backoff_secs, random_backoff_entropy())
-}
-
-fn random_backoff_entropy() -> u64 {
-    let rng = ring::rand::SystemRandom::new();
-    let mut bytes = [0u8; 8];
-    if rng.fill(&mut bytes).is_ok() {
-        return u64::from_ne_bytes(bytes);
-    }
-
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
-fn jittered_backoff_with_entropy(backoff_secs: u64, entropy: u64) -> Duration {
-    let base_ms = backoff_secs.saturating_mul(1000);
-    let jitter_range_ms = base_ms / 4;
-    let jitter_ms = if jitter_range_ms > 0 {
-        let full_range = jitter_range_ms.saturating_mul(2);
-        (entropy % full_range) as i64 - jitter_range_ms as i64
-    } else {
-        0
-    };
-    let sleep_ms = (base_ms as i64 + jitter_ms).max(100) as u64;
-    Duration::from_millis(sleep_ms)
-}
-
-fn next_backoff_secs(current_secs: u64, increase: bool) -> u64 {
-    if increase {
-        current_secs.saturating_mul(2).min(BACKOFF_MAX_SECS)
-    } else {
-        BACKOFF_INITIAL_SECS
     }
 }
 
@@ -1249,6 +1208,7 @@ mod tests {
     //! `tests/integration/cp_dp_grpc_tests.rs` via
     //! `test_dp_filters_cross_namespace_resources_from_snapshot`.
     use super::*;
+    use crate::util::backoff::jittered_backoff_with_entropy;
     use chrono::Utc;
     use serde_json::json;
 
