@@ -135,6 +135,118 @@ async fn test_access_control_creation_with_allow_authenticated_identity_only() {
     assert_eq!(plugin.name(), "access_control");
 }
 
+// ---- Finding #3: allow-list + allow_authenticated_identity must be rejected ----
+
+#[tokio::test]
+async fn test_access_control_rejects_allow_list_with_authenticated_identity() {
+    // Security regression (finding #3): a consumer allow-list combined with
+    // `allow_authenticated_identity=true` is a fail-open footgun — the allow-list
+    // keys off mapped Consumers and is never applied to an unmapped external
+    // identity, so the combination would silently bypass the allow-list. It must
+    // be rejected at construction (admin API 400 / file-mode startup failure).
+    let config = json!({
+        "allowed_consumers": ["alice"],
+        "allow_authenticated_identity": true
+    });
+    let err = match AccessControl::new(&config) {
+        Ok(_) => panic!("allow_consumers + allow_authenticated_identity must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("allow_authenticated_identity"), "got: {err}");
+    assert!(err.contains("allow-list"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_access_control_rejects_allowed_groups_with_authenticated_identity() {
+    // Same fail-open footgun via the group allow-list (finding #3).
+    let config = json!({
+        "allowed_groups": ["engineering"],
+        "allow_authenticated_identity": true
+    });
+    let err = match AccessControl::new(&config) {
+        Ok(_) => panic!("allowed_groups + allow_authenticated_identity must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("allow_authenticated_identity"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_access_control_deny_list_with_authenticated_identity_is_allowed() {
+    // A deny-list combined with `allow_authenticated_identity` remains valid:
+    // `disallowed_consumers` IS applied to the external identity string, so the
+    // combination is meaningful (revoke a compromised external principal).
+    let config = json!({
+        "disallowed_consumers": ["compromised"],
+        "allow_authenticated_identity": true
+    });
+    let plugin = AccessControl::new(&config).unwrap();
+    assert_eq!(plugin.name(), "access_control");
+}
+
+// ---- Finding #4: unknown/misspelled config keys must be rejected ----
+
+#[tokio::test]
+async fn test_access_control_rejects_unknown_key_alone() {
+    // A misspelled allow key on its own must fail config validation rather than
+    // be silently dropped (finding #4).
+    let config = json!({
+        "allowed_consumer": ["alice"]
+    });
+    let err = match AccessControl::new(&config) {
+        Ok(_) => panic!("unknown config key must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("allowed_consumer"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_access_control_rejects_unknown_key_alongside_valid_key() {
+    // The concrete defect from finding #4: a valid deny-list key masks a typo'd
+    // allow-list key. Without rejection this silently degrades an intended
+    // allow-list ("deny all except alice") into a deny-list-only policy
+    // ("allow all except bad"). Must be rejected at construction.
+    let config = json!({
+        "disallowed_consumers": ["bad"],
+        "allowed_consumer": ["alice"]
+    });
+    let err = match AccessControl::new(&config) {
+        Ok(_) => panic!("unknown config key alongside a valid key must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("allowed_consumer"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_access_control_rejects_misspelled_keys() {
+    // The specific typos called out in finding #4.
+    for typo in [
+        json!({"disallow_consumers": ["bad"], "allowed_consumers": ["alice"]}),
+        json!({"allow_authenticated_identitiy": true, "disallowed_consumers": ["bad"]}),
+    ] {
+        let err = match AccessControl::new(&typo) {
+            Ok(_) => panic!("misspelled key must be rejected: {typo}"),
+            Err(err) => err,
+        };
+        assert!(err.contains("unknown config key"), "got: {err} for {typo}");
+    }
+}
+
+#[tokio::test]
+async fn test_access_control_accepts_all_known_keys() {
+    // The full set of known keys (without the rejected allow-list + bypass combo)
+    // must still construct, so the unknown-key guard has no false positives.
+    let config = json!({
+        "allowed_consumers": ["alice"],
+        "disallowed_consumers": ["bad"],
+        "allowed_groups": ["engineering"],
+        "disallowed_groups": ["banned"]
+    });
+    let plugin = AccessControl::new(&config).unwrap();
+    assert_eq!(plugin.name(), "access_control");
+}
+
 // ---- Consumer username tests ----
 
 #[tokio::test]

@@ -779,6 +779,7 @@ impl AiSemanticCache {
         }
     }
 
+    #[allow(dead_code)] // Used by external tests through crate::_test_support; the bin target has no such caller.
     pub(crate) async fn rebuild_vector_index_for_tests(&self) {
         let Some(semantic) = self.semantic.as_ref() else {
             return;

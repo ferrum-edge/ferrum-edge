@@ -822,7 +822,7 @@ async fn test_consumer_takes_precedence_over_authenticated_identity() {
     assert_reject(result, Some(429));
 }
 
-// ── Non-parseable path passes through (no enforcement) ──
+// ── Non-parseable path: additive policies pass through, allow-list fails closed ──
 
 #[tokio::test]
 async fn test_unparseable_path_skips_enforcement() {
@@ -835,6 +835,86 @@ async fn test_unparseable_path_skips_enforcement() {
 
     let mut ctx = create_grpc_context("/not-a-grpc-path");
     let _ = plugin.on_request_received(&mut ctx).await;
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_unparseable_path_skips_enforcement_rate_limit_only() {
+    // Rate-limit-only config is additive: an unparseable path matches no
+    // configured method, so there is nothing to enforce and it continues.
+    let config = json!({
+        "method_rate_limits": {
+            "/pkg.Svc/Create": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    let mut ctx = create_grpc_context("/svc/method/extra");
+    let _ = plugin.on_request_received(&mut ctx).await;
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+// Regression for finding #21: under a strict allow-list (deny-by-default), a
+// gRPC POST whose :path cannot be parsed as `/package.Service/Method` must
+// FAIL CLOSED (Reject 403 -> trailers-only gRPC PERMISSION_DENIED), not slip
+// past the allow-list gate. Several malformed shapes that leave
+// grpc_full_method unset are exercised.
+#[tokio::test]
+async fn test_unparseable_path_fails_closed_under_allow_list() {
+    let config = json!({
+        "allow_methods": ["/pkg.Svc/Allowed"]
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    // Each path is unparseable by parse_grpc_path: extra slash, empty service,
+    // empty method, single segment, no leading slash.
+    for path in [
+        "/svc/method/extra",
+        "//Method",
+        "/pkg.Svc/",
+        "/onlyone",
+        "not-a-grpc-path",
+    ] {
+        let mut ctx = create_grpc_context(path);
+        let _ = plugin.on_request_received(&mut ctx).await;
+        // Precondition: the path genuinely did not parse into gRPC metadata.
+        assert!(
+            !ctx.metadata.contains_key("grpc_full_method"),
+            "path {path:?} unexpectedly parsed; test no longer exercises the fail-closed branch"
+        );
+
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(403));
+    }
+}
+
+// A normally allowed path still passes after the fail-closed change, confirming
+// the fix does not over-reject parseable, listed methods.
+#[tokio::test]
+async fn test_allow_list_still_permits_listed_method_after_fail_closed_fix() {
+    let config = json!({
+        "allow_methods": ["/pkg.Svc/Allowed"]
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    let mut ctx = create_grpc_context("/pkg.Svc/Allowed");
+    let _ = plugin.on_request_received(&mut ctx).await;
+    assert_eq!(
+        ctx.metadata.get("grpc_full_method").unwrap(),
+        "pkg.Svc/Allowed"
+    );
+
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);

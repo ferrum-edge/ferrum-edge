@@ -455,8 +455,10 @@ async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
             "scope": "proxy",
             "proxy_id": "proxy-jwks-acl-external-allow",
             "enabled": true,
+            // `allow_authenticated_identity` admits the unmapped external identity.
+            // It cannot be combined with an allow-list (`allowed_consumers`), which
+            // is rejected at config validation, so this config uses the flag alone.
             "config": {
-                "allowed_consumers": ["alice"],
                 "allow_authenticated_identity": true
             }
         }),

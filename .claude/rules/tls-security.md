@@ -79,6 +79,7 @@ paths:
 ## Pooling And Non-Rustls Paths
 
 - Reqwest TLS paths use distinct `reqwest::Client` instances per cert/trust identity.
+- The shared `PluginHttpClient` disables HTTP redirect following (`reqwest::redirect::Policy::none()`) in every constructor, matching the backend proxy client. A server-returned 3xx is surfaced to the caller, never chased, so a spoofed/compromised upstream cannot bounce plugin egress (log/webhook sinks, OIDC/JWKS discovery, AI federation) to an internal or cloud-metadata host. First-hop host pinning in callers like `jwks_auth` is necessary but not sufficient; the `DnsCacheResolver` IP screen (`check_backend_ip_allowed`) only blocks private/loopback/link-local under a restrictive `FERRUM_BACKEND_ALLOW_IPS`, not the default `Both`.
 - Rustls direct H2 and gRPC paths configure TLS per connection.
 - `kafka_logging` uses librdkafka/OpenSSL: map `FERRUM_TLS_CA_BUNDLE_PATH` to `ssl.ca.location`, `FERRUM_TLS_NO_VERIFY` to `enable.ssl.certificate.verification=false`, and CRL to `producer_config.ssl.crl.location`.
 - Redis applies global TLS flags through `PluginHttpClient` accessors.

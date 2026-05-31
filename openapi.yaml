@@ -10526,14 +10526,55 @@ components:
 
     AccessControlConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: access_control — consumer-based and group-based allow/deny for
         HTTP-family and TCP/UDP stream proxies. Evaluation order: deny
         (consumer username → group) then allow (consumer username → group).
         Deny always overrides allow. At least one of `allowed_consumers`,
         `disallowed_consumers`, `allowed_groups`, `disallowed_groups`, or
-        `allow_authenticated_identity=true` must be configured. Use
+        `allow_authenticated_identity=true` must be configured. Unknown config
+        keys are rejected. `allow_authenticated_identity=true` cannot be combined
+        with an allow-list (`allowed_consumers`/`allowed_groups`) because the
+        allow-list is not applied to unmapped external identities. Use
         ip_restriction for IP/CIDR rules.
+      allOf:
+        - anyOf:
+            - required: [allowed_consumers]
+              properties:
+                allowed_consumers:
+                  minItems: 1
+            - required: [disallowed_consumers]
+              properties:
+                disallowed_consumers:
+                  minItems: 1
+            - required: [allowed_groups]
+              properties:
+                allowed_groups:
+                  minItems: 1
+            - required: [disallowed_groups]
+              properties:
+                disallowed_groups:
+                  minItems: 1
+            - required: [allow_authenticated_identity]
+              properties:
+                allow_authenticated_identity:
+                  enum: [true]
+        - not:
+            allOf:
+              - required: [allow_authenticated_identity]
+                properties:
+                  allow_authenticated_identity:
+                    enum: [true]
+              - anyOf:
+                  - required: [allowed_consumers]
+                    properties:
+                      allowed_consumers:
+                        minItems: 1
+                  - required: [allowed_groups]
+                    properties:
+                      allowed_groups:
+                        minItems: 1
       properties:
         allowed_consumers:
           type: array
@@ -10574,7 +10615,9 @@ components:
           description: >-
             Allow requests whose `ctx.authenticated_identity` is set by an
             external auth plugin (e.g. jwks_auth) even when no gateway Consumer
-            was mapped.
+            was mapped. Cannot be combined with an allow-list
+            (`allowed_consumers`/`allowed_groups`); the deny-list
+            `disallowed_consumers` is still applied to the external identity.
 
     TcpConnectionThrottleConfig:
       type: object

@@ -343,7 +343,29 @@ impl Plugin for GrpcMethodRouter {
         let full_method: &str = match ctx.metadata.get("grpc_full_method") {
             Some(m) => m.as_str(),
             None => {
-                // Path wasn't parseable as gRPC — skip enforcement
+                // Path wasn't parseable as gRPC (on_request_received left
+                // grpc_full_method unset). Deny-list and rate-limit policies are
+                // additive — an unparseable path matches no entry, so there is
+                // nothing to enforce and the request continues. An allow-list,
+                // however, is deny-by-default: only explicitly listed methods may
+                // pass. A request whose :path cannot be parsed (and so could never
+                // match an allow entry) must FAIL CLOSED rather than slip past the
+                // gate. The 403 is normalized to a trailers-only gRPC
+                // PERMISSION_DENIED error by the proxy's reject handling.
+                if self.allow_methods.is_some() {
+                    debug!(
+                        path = %ctx.path,
+                        plugin = "grpc_method_router",
+                        "Rejecting gRPC request with unparseable method path under allow-list"
+                    );
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: grpc_json_error_body(
+                            "gRPC method path could not be parsed".to_string(),
+                        ),
+                        headers: grpc_content_type_header(),
+                    };
+                }
                 return PluginResult::Continue;
             }
         };

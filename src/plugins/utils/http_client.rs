@@ -11,6 +11,9 @@
 //! - **HTTP/2 multiplexing**: Multiple log/metric streams over one connection
 //! - **Idle timeout**: Stale connections cleaned up automatically
 //! - **DNS caching**: Uses the gateway's `DnsCache` for shared, warmed DNS
+//! - **No redirect following**: outbound calls reach only the configured
+//!   endpoint; server-chosen 3xx targets (e.g. a cloud metadata IP) are never
+//!   followed — SSRF defense-in-depth
 //!
 //! # Usage for plugin authors
 //!
@@ -147,7 +150,9 @@ impl std::fmt::Debug for PluginHttpClient {
 /// If even this minimal builder fails, only then fall back to
 /// `reqwest::Client::new()` (an exceptional, doubly-degraded path).
 fn build_dns_cached_fallback_client(dns_cache: Option<DnsCache>) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+    // Even this degraded fallback must not follow redirects — see
+    // `PluginHttpClient::new()` for the SSRF rationale.
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if let Some(dns_cache) = dns_cache {
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
@@ -175,6 +180,10 @@ impl PluginHttpClient {
     /// - Custom CA bundle from `FERRUM_TLS_CA_BUNDLE_PATH` (internal CAs)
     /// - `FERRUM_TLS_NO_VERIFY` support (skip TLS verification)
     /// - 30s connect timeout, 60s request timeout (generous for log sinks)
+    /// - Redirect following disabled via `reqwest::redirect::Policy::none()`:
+    ///   plugin egress reaches only the configured endpoint, never a
+    ///   server-chosen 3xx target (SSRF defense-in-depth — mirrors the backend
+    ///   proxy client in `connection_pool.rs`)
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool_config: &PoolConfig,
@@ -198,6 +207,18 @@ impl PluginHttpClient {
             .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(60))
+            // Never auto-follow redirects on plugin outbound calls. A
+            // compromised or spoofed upstream (e.g. an OIDC IdP whose JWKS or
+            // discovery endpoint passes the first-hop same-host check in
+            // jwks_auth's `validate_discovered_jwks_uri`) could otherwise
+            // return a 3xx pointing at an attacker-chosen host such as the
+            // cloud metadata endpoint (http://169.254.169.254/...), and reqwest
+            // would follow it. Host/issuer pinning only validates the first
+            // hop, and the `DnsCacheResolver` IP screen only rejects
+            // private/loopback/link-local targets under a restrictive
+            // `FERRUM_BACKEND_ALLOW_IPS` (not the default `Both`). Mirrors the
+            // backend proxy client in `connection_pool.rs`.
+            .redirect(reqwest::redirect::Policy::none())
             .danger_accept_invalid_certs(tls_no_verify)
             .dns_resolver(Arc::new(resolver));
 
@@ -317,7 +338,12 @@ impl PluginHttpClient {
             .pool_max_idle_per_host(config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
             .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(60));
+            .timeout(Duration::from_secs(60))
+            // Disable redirect following — see `new()` for the SSRF rationale.
+            // This cache-less constructor (tests / fallback, also backs
+            // `Default`) applies the same egress policy so plugin outbound
+            // calls cannot be bounced to a server-chosen host.
+            .redirect(reqwest::redirect::Policy::none());
 
         if config.enable_http_keep_alive {
             builder = builder.tcp_keepalive(Duration::from_secs(config.tcp_keepalive_seconds));
@@ -789,5 +815,108 @@ mod fallback_tests {
             initial_len,
             after_len
         );
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    //! SSRF defense-in-depth: the shared plugin HTTP client must NOT follow
+    //! 3xx redirects. A spoofed/compromised upstream (e.g. an OIDC IdP whose
+    //! JWKS endpoint passes jwks_auth's first-hop same-host check) could
+    //! otherwise redirect a plugin-initiated fetch to an attacker-chosen host
+    //! such as the cloud metadata endpoint. These tests stand up a local
+    //! listener that answers every request with a same-host 302 and assert the
+    //! client surfaces the 302 verbatim — exactly one request, never chased.
+    //!
+    //! Inline (like `fallback_tests`) because they exercise client
+    //! construction behavior — `new()` and `from_pool_config()` — directly.
+    use super::*;
+    use crate::dns::DnsConfig;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Spawn a listener that answers every request with a same-host 302
+    /// (`Location: http://<self>/chased`), counting how many requests it
+    /// served. If the client followed the redirect it would loop back here and
+    /// the counter would climb past 1 (and reqwest would ultimately error with
+    /// "too many redirects"); with `Policy::none()` the client stops at the
+    /// first 302.
+    async fn spawn_redirecting_server() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_task = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                count_task.fetch_add(1, Ordering::SeqCst);
+                // Read the request line/headers so the client's write side
+                // drains; the contents are irrelevant to the assertion.
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = "redirected";
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/chased\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        (format!("http://{addr}/"), count)
+    }
+
+    async fn assert_redirect_not_followed(client: &PluginHttpClient) {
+        let (url, count) = spawn_redirecting_server().await;
+        let resp = client
+            .get()
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("request should succeed and return the 302, not error");
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "client must surface the 3xx instead of following it; a followed \
+             redirect would loop and change the status"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "exactly one request must reach the server; >1 means the redirect \
+             was chased"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_pool_config_does_not_follow_redirects() {
+        // Exercises the cache-less constructor (also backs `Default`).
+        let client = PluginHttpClient::default();
+        assert_redirect_not_followed(&client).await;
+    }
+
+    #[tokio::test]
+    async fn new_does_not_follow_redirects() {
+        // Exercises the production constructor (DNS-cache path).
+        let client = PluginHttpClient::new(
+            &PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            1000,
+            0,
+            100,
+            false,
+            None,
+            Arc::new(Vec::new()),
+            crate::config::types::DEFAULT_NAMESPACE,
+            BackendAllowIps::Both,
+            Arc::new(Vec::new()),
+            0,
+        );
+        assert_redirect_not_followed(&client).await;
     }
 }

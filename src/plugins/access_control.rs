@@ -12,8 +12,15 @@
 //!    The `disallowed_consumers` list is still applied to the external identity
 //!    string (e.g. JWKS `sub` claim), so operators can revoke a compromised
 //!    externally-authenticated principal without a gateway Consumer mapping.
-//!    Group allow/deny lists are NOT applied to external identities — there is
-//!    no Consumer-mapped `acl_groups` for an unmapped external principal.
+//!    Neither the consumer ALLOW-list nor the group allow/deny lists are applied
+//!    to an unmapped external identity: there is no Consumer-mapped `acl_groups`,
+//!    and `allowed_consumers` keys off gateway Consumer usernames rather than the
+//!    external identity string. Because a blanket external-identity bypass and a
+//!    strict consumer/group allow-list express contradictory intents, `new()`
+//!    rejects `allow_authenticated_identity=true` combined with any allow-list
+//!    (`allowed_consumers`/`allowed_groups`); the contradiction is caught at
+//!    config validation instead of silently bypassing the allow-list for the
+//!    whole class of externally-authenticated-but-unmapped callers.
 //!
 //! IP-based access control lives in the `ip_restriction` plugin so all client-IP
 //! enforcement is centralized in one place.
@@ -51,6 +58,7 @@ impl AccessControl {
             .ok_or_else(|| format!("access_control: config must be an object, got: {config}"))?;
 
         reject_removed_ip_keys(object)?;
+        reject_unknown_keys(object)?;
 
         let allowed = parse_string_set(object, "allowed_consumers")?;
         let disallowed = parse_string_set(object, "disallowed_consumers")?;
@@ -67,6 +75,19 @@ impl AccessControl {
         {
             return Err(
                 "access_control: at least one of 'allowed_consumers', 'disallowed_consumers', 'allowed_groups', 'disallowed_groups', or 'allow_authenticated_identity=true' is required".to_string()
+            );
+        }
+
+        // A consumer/group allow-list and a blanket external-identity bypass are
+        // contradictory intents. The allow-list keys off mapped-Consumer usernames
+        // and `acl_groups`, which never apply to an unmapped external identity, so
+        // enabling `allow_authenticated_identity` alongside an allow-list would
+        // silently bypass that allow-list for every externally-authenticated-but-
+        // unmapped caller. Reject the combination at construction so it fails
+        // config validation instead of failing open at request time.
+        if has_allow_rules && allow_authenticated_identity {
+            return Err(
+                "access_control: 'allow_authenticated_identity=true' cannot be combined with an allow-list ('allowed_consumers'/'allowed_groups'); the allow-list keys off mapped Consumers and is not applied to unmapped external identities, so the combination would bypass the allow-list".to_string()
             );
         }
 
@@ -94,7 +115,11 @@ impl AccessControl {
                 {
                     // Apply the consumer deny list to the external identity string
                     // (e.g. JWKS `sub` claim). Group denylists are not applicable —
-                    // external identities have no Consumer-mapped `acl_groups`.
+                    // external identities have no Consumer-mapped `acl_groups`. The
+                    // allow-list (`allowed_consumers`/`allowed_groups`) is likewise
+                    // not consulted here; `new()` rejects combining it with
+                    // `allow_authenticated_identity`, so `has_allow_rules` is always
+                    // false on this path.
                     if self.disallowed_consumers.contains(identity) {
                         warn!(
                             consumer = %identity,
@@ -184,6 +209,27 @@ fn reject_removed_ip_keys(object: &serde_json::Map<String, Value>) -> Result<(),
             return Err(format!(
                 "access_control: '{key}' was removed; use the ip_restriction plugin for IP rules"
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject any unrecognized config key so a misspelled allow/deny key fails
+/// config validation instead of being silently dropped (which would leave a
+/// weaker-than-intended policy). Mirrors serde `deny_unknown_fields`. The
+/// removed legacy IP keys are handled separately by `reject_removed_ip_keys`
+/// with their own migration message.
+fn reject_unknown_keys(object: &serde_json::Map<String, Value>) -> Result<(), String> {
+    const KNOWN_KEYS: [&str; 5] = [
+        "allowed_consumers",
+        "disallowed_consumers",
+        "allowed_groups",
+        "disallowed_groups",
+        "allow_authenticated_identity",
+    ];
+    for key in object.keys() {
+        if !KNOWN_KEYS.contains(&key.as_str()) {
+            return Err(format!("access_control: unknown config key '{key}'"));
         }
     }
     Ok(())

@@ -41,11 +41,11 @@ use crate::modes::mesh::config::{JwtAuthority, MultiClusterConfig, TrustBundle, 
 use crate::modes::mesh::config_consumer::common::{
     BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs as common_next_backoff_secs,
 };
+use crate::plugins::utils::http_client::PluginHttpClient;
 #[cfg(test)]
-use crate::modes::mesh::config_consumer::common::{
+use crate::util::backoff::{
     BACKOFF_MAX_SECS, jittered_backoff_with_entropy as common_jittered_backoff_with_entropy,
 };
-use crate::plugins::utils::http_client::PluginHttpClient;
 
 /// Initial backoff bound shared with `src/grpc/dp_client.rs`. The federation
 /// poller intentionally mirrors the CP-reconnect cadence so an operator-tuned
