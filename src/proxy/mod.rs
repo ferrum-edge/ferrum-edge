@@ -8520,26 +8520,7 @@ pub(crate) fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {
 }
 
 pub(crate) fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
-    match status {
-        StatusCode::BAD_REQUEST => grpc_proxy::grpc_status::INVALID_ARGUMENT,
-        StatusCode::METHOD_NOT_ALLOWED => grpc_proxy::grpc_status::UNIMPLEMENTED,
-        StatusCode::UNAUTHORIZED => grpc_proxy::grpc_status::UNAUTHENTICATED,
-        StatusCode::FORBIDDEN => grpc_proxy::grpc_status::PERMISSION_DENIED,
-        StatusCode::NOT_FOUND => grpc_proxy::grpc_status::NOT_FOUND,
-        StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => {
-            grpc_proxy::grpc_status::DEADLINE_EXCEEDED
-        }
-        StatusCode::CONFLICT => grpc_proxy::grpc_status::ABORTED,
-        StatusCode::PRECONDITION_FAILED => grpc_proxy::grpc_status::FAILED_PRECONDITION,
-        StatusCode::PAYLOAD_TOO_LARGE
-        | StatusCode::URI_TOO_LONG
-        | StatusCode::TOO_MANY_REQUESTS => grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-        StatusCode::NOT_IMPLEMENTED => grpc_proxy::grpc_status::UNIMPLEMENTED,
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => {
-            grpc_proxy::grpc_status::UNAVAILABLE
-        }
-        _ => grpc_proxy::grpc_status::INTERNAL,
-    }
+    grpc_proxy::http_reject_status_to_grpc_status(status)
 }
 
 pub(crate) fn normalize_reject_response(

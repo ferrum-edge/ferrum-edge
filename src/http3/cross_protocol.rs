@@ -107,7 +107,6 @@ use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use tracing::{debug, error, warn};
 
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
-use crate::http3::server::h3_http_status_to_grpc_status;
 use crate::load_balancer::LoadBalancer;
 use crate::plugins::{Plugin, PluginResult, RequestContext};
 use crate::proxy::ProxyState;
@@ -2833,7 +2832,7 @@ where
         return if matches!(flavor, HttpFlavor::Grpc) {
             write_grpc_error(
                 stream,
-                h3_http_status_to_grpc_status(StatusCode::BAD_GATEWAY),
+                grpc_proxy::h3_http_reject_status_to_grpc_status(StatusCode::BAD_GATEWAY),
                 "Plugin rejection normalization failed",
                 backend_start,
                 bytes_sent,

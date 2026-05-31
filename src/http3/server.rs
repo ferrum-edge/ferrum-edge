@@ -4423,7 +4423,9 @@ fn h3_grpc_reject_signal(
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("grpc-status"))
         .and_then(|(_, value)| value.parse::<u32>().ok())
-        .unwrap_or_else(|| h3_http_status_to_grpc_status(http_status));
+        .unwrap_or_else(|| {
+            crate::proxy::grpc_proxy::h3_http_reject_status_to_grpc_status(http_status)
+        });
     let grpc_message: std::borrow::Cow<'static, str> = headers
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("grpc-message"))
@@ -4488,32 +4490,6 @@ fn sanitize_grpc_message(message: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
-}
-
-/// Map an HTTP status we would have emitted (e.g., 413, 404, 400) to the
-/// matching gRPC status code. Duplicated from `proxy/mod.rs::map_http_reject_status_to_grpc_status`
-/// to avoid promoting the original across module boundaries — this is a
-/// pure, trivial mapping and the H3 server needs a local version anyway
-/// because it's called from the admission path, not the dispatch path.
-pub(crate) fn h3_http_status_to_grpc_status(status: StatusCode) -> u32 {
-    use crate::proxy::grpc_proxy::grpc_status;
-    match status {
-        StatusCode::BAD_REQUEST => grpc_status::INVALID_ARGUMENT,
-        StatusCode::METHOD_NOT_ALLOWED => grpc_status::UNIMPLEMENTED,
-        StatusCode::UNAUTHORIZED => grpc_status::UNAUTHENTICATED,
-        StatusCode::FORBIDDEN => grpc_status::PERMISSION_DENIED,
-        StatusCode::NOT_FOUND => grpc_status::NOT_FOUND,
-        StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => grpc_status::DEADLINE_EXCEEDED,
-        StatusCode::CONFLICT => grpc_status::ABORTED,
-        StatusCode::PRECONDITION_FAILED => grpc_status::FAILED_PRECONDITION,
-        StatusCode::PAYLOAD_TOO_LARGE
-        | StatusCode::URI_TOO_LONG
-        | StatusCode::TOO_MANY_REQUESTS => grpc_status::RESOURCE_EXHAUSTED,
-        StatusCode::NOT_IMPLEMENTED => grpc_status::UNIMPLEMENTED,
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => grpc_status::UNAVAILABLE,
-        StatusCode::TOO_EARLY => grpc_status::UNAVAILABLE,
-        _ => grpc_status::INTERNAL,
-    }
 }
 
 fn strip_query_params(url: &str) -> &str {
