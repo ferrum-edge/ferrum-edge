@@ -264,6 +264,22 @@ pub(super) fn redacted_endpoint_url(raw: &str) -> String {
     url.to_string()
 }
 
+pub(super) async fn dispatch_json_payload(
+    webhook_url: &str,
+    channel: &'static str,
+    client_label: &'static str,
+    payload: &Value,
+    http: &PluginHttpClient,
+) -> Result<(), String> {
+    let redacted_url = redacted_endpoint_url(webhook_url);
+    let req = http.get().post(webhook_url).json(payload);
+    let resp = http
+        .execute_redacted(req, client_label, &redacted_url)
+        .await
+        .map_err(|e| format!("{channel} dispatch failed: {e}"))?;
+    finalize_dispatch_response(resp, channel, &redacted_url).await
+}
+
 async fn drain_response_body_redacted(
     resp: reqwest::Response,
     channel: &str,

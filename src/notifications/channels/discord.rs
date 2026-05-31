@@ -9,10 +9,7 @@ use serde_json::{Value, json};
 use crate::plugins::utils::http_client::PluginHttpClient;
 
 use super::super::notification::Notification;
-use super::{
-    finalize_dispatch_response, redacted_endpoint_url, resolve_optional_string,
-    validate_webhook_url,
-};
+use super::{dispatch_json_payload, resolve_optional_string, validate_webhook_url};
 
 #[derive(Debug, Clone)]
 pub struct DiscordChannel {
@@ -78,13 +75,14 @@ impl DiscordChannel {
         http: &PluginHttpClient,
     ) -> Result<(), String> {
         let payload = self.build_payload(notification);
-        let redacted_url = redacted_endpoint_url(&self.webhook_url);
-        let req = http.get().post(self.webhook_url.as_ref()).json(&payload);
-        let resp = http
-            .execute_redacted(req, "notification_discord", &redacted_url)
-            .await
-            .map_err(|e| format!("discord dispatch failed: {e}"))?;
-        finalize_dispatch_response(resp, "discord", &redacted_url).await
+        dispatch_json_payload(
+            &self.webhook_url,
+            "discord",
+            "notification_discord",
+            &payload,
+            http,
+        )
+        .await
     }
 }
 
