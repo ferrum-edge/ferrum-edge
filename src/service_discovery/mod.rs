@@ -15,7 +15,7 @@ use crate::config::types::{
 };
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
-use crate::load_balancer::LoadBalancerCache;
+use crate::load_balancer::{LoadBalancerCache, target_host_port_key};
 use crate::plugins::PluginHttpClient;
 use crate::request_epoch::RequestEpochStore;
 use dashmap::DashMap;
@@ -617,14 +617,12 @@ pub fn merge_targets(
     static_targets: &[UpstreamTarget],
     discovered: &[UpstreamTarget],
 ) -> Vec<UpstreamTarget> {
-    let static_keys: std::collections::HashSet<String> = static_targets
-        .iter()
-        .map(|t| format!("{}:{}", t.host, t.port))
-        .collect();
+    let static_keys: std::collections::HashSet<String> =
+        static_targets.iter().map(target_host_port_key).collect();
 
     let mut merged = static_targets.to_vec();
     for target in discovered {
-        let key = format!("{}:{}", target.host, target.port);
+        let key = target_host_port_key(target);
         if !static_keys.contains(&key) {
             merged.push(target.clone());
         }
