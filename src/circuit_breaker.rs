@@ -153,11 +153,7 @@ impl CircuitBreaker {
             STATE_HALF_OPEN => {
                 if is_half_open_probe {
                     // Decrement in-flight counter so new probe requests can be admitted
-                    let _ = self.half_open_in_flight.fetch_update(
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                        |v| v.checked_sub(1),
-                    );
+                    self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
                 }
                 // Re-check state: another thread may have reopened the circuit
                 // between our initial load and now.
@@ -189,11 +185,7 @@ impl CircuitBreaker {
                 // our can_execute() and this record_success(). We still own a slot
                 // from when the breaker was HALF_OPEN, so decrement it. The
                 // checked_sub prevents underflow if this is a spurious call.
-                let _ = self.half_open_in_flight.fetch_update(
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                    |v| v.checked_sub(1),
-                );
+                self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
             }
             STATE_CLOSED => {
                 // A different half-open probe can close the breaker before
@@ -201,11 +193,7 @@ impl CircuitBreaker {
                 // half-open slot from its can_execute() admission, so release
                 // it even though the state is already CLOSED.
                 if is_half_open_probe {
-                    let _ = self.half_open_in_flight.fetch_update(
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                        |v| v.checked_sub(1),
-                    );
+                    self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
                 }
                 // Reset failure count on success
                 if self.failure_count.load(Ordering::Relaxed) > 0 {
@@ -224,9 +212,7 @@ impl CircuitBreaker {
         if !is_half_open_probe {
             return;
         }
-        let _ = self
-            .half_open_in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
+        self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
     }
 
     /// Record a failed response.
@@ -251,11 +237,7 @@ impl CircuitBreaker {
             if !self.config.trip_on_connection_errors {
                 // Filtered failure — release the probe slot without state transition
                 if is_half_open_probe {
-                    let _ = self.half_open_in_flight.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |v| v.checked_sub(1),
-                    );
+                    self.release_half_open_slot(Ordering::AcqRel, Ordering::Acquire);
                 }
                 return;
             }
@@ -263,11 +245,7 @@ impl CircuitBreaker {
             // Non-failure status codes are neutral — release probe slot without
             // state transition
             if is_half_open_probe {
-                let _ = self.half_open_in_flight.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |v| v.checked_sub(1),
-                );
+                self.release_half_open_slot(Ordering::AcqRel, Ordering::Acquire);
             }
             return;
         }
@@ -327,11 +305,7 @@ impl CircuitBreaker {
                     // clobbering a value that hasn't been decremented yet. The count
                     // reaches 0 naturally as all probes report in, and transitioning
                     // to OPEN prevents new probes from being admitted.
-                    let _ = self.half_open_in_flight.fetch_update(
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                        |v| v.checked_sub(1),
-                    );
+                    self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
                 }
                 warn!("Circuit breaker reopening (probe failed)");
                 self.state.store(STATE_OPEN, Ordering::SeqCst);
@@ -341,14 +315,16 @@ impl CircuitBreaker {
                 // A concurrent record_failure already reopened the circuit between
                 // our can_execute() (when it was HALF_OPEN) and now. We still own
                 // a slot, so decrement it.
-                let _ = self.half_open_in_flight.fetch_update(
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                    |v| v.checked_sub(1),
-                );
+                self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
             }
             _ => {}
         }
+    }
+
+    fn release_half_open_slot(&self, set_order: Ordering, fetch_order: Ordering) {
+        let _ = self
+            .half_open_in_flight
+            .fetch_update(set_order, fetch_order, |v| v.checked_sub(1));
     }
 
     /// Get the config for this circuit breaker.
