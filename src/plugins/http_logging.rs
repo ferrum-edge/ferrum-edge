@@ -19,7 +19,7 @@ use serde_json::Value;
 use super::utils::log_schema::{SummaryLogEntryBatchView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
-    handle_http_batch_response, parse_http_endpoint, validate_batch_config,
+    handle_http_batch_response, parse_custom_headers, parse_http_endpoint, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
@@ -44,28 +44,7 @@ impl HttpLogging {
 
         let (endpoint_url, endpoint_hostname) = parse_http_endpoint(config, "http_logging")?;
 
-        // Build custom headers list from the `custom_headers` object.
-        // Header names are validated and normalized to lowercase per RFC 7230.
-        // Duplicate header names (case-insensitive) are deduplicated — last value wins.
-        let mut custom_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
-        if let Some(custom_headers_value) = config.get("custom_headers") {
-            let map = custom_headers_value
-                .as_object()
-                .ok_or_else(|| "http_logging: 'custom_headers' must be an object".to_string())?;
-            for (key, value) in map {
-                let v = value.as_str().ok_or_else(|| {
-                    format!("http_logging: custom_headers['{key}'] must be a string")
-                })?;
-                let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
-                    format!("http_logging: invalid custom_headers name '{key}': {e}")
-                })?;
-                let header_value = HeaderValue::from_str(v).map_err(|e| {
-                    format!("http_logging: invalid custom_headers value for '{key}': {e}")
-                })?;
-                custom_headers.retain(|(existing, _)| *existing != header_name);
-                custom_headers.push((header_name, header_value));
-            }
-        }
+        let custom_headers = parse_custom_headers(config, "http_logging")?;
 
         let batch_defaults = BatchConfigDefaults {
             batch_size_key: "batch_size",

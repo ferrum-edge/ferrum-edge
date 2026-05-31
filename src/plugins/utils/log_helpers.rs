@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use url::{Host, Url};
 
@@ -160,6 +161,35 @@ pub fn parse_http_endpoint(
     };
 
     Ok((endpoint_url, hostname))
+}
+
+pub fn parse_custom_headers(
+    config: &Value,
+    plugin_name: &'static str,
+) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
+    let mut custom_headers = Vec::new();
+    let Some(custom_headers_value) = config.get("custom_headers") else {
+        return Ok(custom_headers);
+    };
+
+    let map = custom_headers_value
+        .as_object()
+        .ok_or_else(|| format!("{plugin_name}: 'custom_headers' must be an object"))?;
+    for (key, value) in map {
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("{plugin_name}: custom_headers['{key}'] must be a string"))?;
+        let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
+            format!("{plugin_name}: invalid custom_headers name '{key}': {error}")
+        })?;
+        let header_value = HeaderValue::from_str(value).map_err(|error| {
+            format!("{plugin_name}: invalid custom_headers value for '{key}': {error}")
+        })?;
+        custom_headers.retain(|(existing, _)| *existing != header_name);
+        custom_headers.push((header_name, header_value));
+    }
+
+    Ok(custom_headers)
 }
 
 fn has_non_empty_authority(endpoint_url: &str) -> bool {

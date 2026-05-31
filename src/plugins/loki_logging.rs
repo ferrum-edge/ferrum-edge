@@ -30,7 +30,8 @@ use tracing::warn;
 use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, PluginHttpClient, RetryPolicy,
-    build_batch_config, handle_http_batch_response, parse_http_endpoint, validate_batch_config,
+    build_batch_config, handle_http_batch_response, parse_custom_headers, parse_http_endpoint,
+    validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
@@ -118,25 +119,7 @@ impl LokiLogging {
             include_status_class,
         };
 
-        let mut custom_headers = Vec::new();
-        if let Some(headers) = config.get("custom_headers") {
-            let headers_obj = headers
-                .as_object()
-                .ok_or_else(|| "loki_logging: 'custom_headers' must be an object".to_string())?;
-            for (key, value) in headers_obj {
-                let header = value.as_str().ok_or_else(|| {
-                    format!("loki_logging: custom_headers['{key}'] must be a string")
-                })?;
-                let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
-                    format!("loki_logging: invalid custom_headers name '{key}': {error}")
-                })?;
-                let header_value = HeaderValue::from_str(header).map_err(|error| {
-                    format!("loki_logging: invalid custom_headers value for '{key}': {error}")
-                })?;
-                custom_headers.retain(|(existing, _)| *existing != header_name);
-                custom_headers.push((header_name, header_value));
-            }
-        }
+        let custom_headers = parse_custom_headers(config, "loki_logging")?;
 
         let authorization_header = match optional_non_empty_string(config, "authorization_header")?
         {

@@ -6,7 +6,7 @@ use std::time::Duration;
 use ferrum_edge::plugins::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, LoggerHooks, MAX_BATCH_SIZE,
     MAX_BUFFER_CAPACITY, RetryPolicy, build_batch_config, handle_http_batch_response,
-    parse_http_endpoint, validate_batch_config,
+    parse_custom_headers, parse_http_endpoint, validate_batch_config,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -181,6 +181,66 @@ fn parse_http_endpoint_rejects_unusable_endpoint_forms() {
         assert!(
             parse_http_endpoint(&config, "batching_logger_endpoint").is_err(),
             "expected unusable endpoint to be rejected: {config}"
+        );
+    }
+}
+
+#[test]
+fn parse_custom_headers_accepts_and_deduplicates_names() {
+    let headers = parse_custom_headers(
+        &json!({
+            "custom_headers": {
+                "X-Custom": "first",
+                "x-custom": "second",
+                "DD-API-KEY": "datadog"
+            }
+        }),
+        "batching_logger_headers",
+    )
+    .unwrap();
+
+    assert_eq!(headers.len(), 2);
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(name, _)| name.as_str() == "x-custom")
+            .and_then(|(_, value)| value.to_str().ok()),
+        Some("second")
+    );
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(name, _)| name.as_str() == "dd-api-key")
+            .and_then(|(_, value)| value.to_str().ok()),
+        Some("datadog")
+    );
+}
+
+#[test]
+fn parse_custom_headers_rejects_invalid_shapes() {
+    for (config, expected) in [
+        (
+            json!({"custom_headers": []}),
+            "'custom_headers' must be an object",
+        ),
+        (
+            json!({"custom_headers": {"X-Test": 1}}),
+            "custom_headers['X-Test'] must be a string",
+        ),
+        (
+            json!({"custom_headers": {"Bad Header": "value"}}),
+            "invalid custom_headers name",
+        ),
+        (
+            json!({"custom_headers": {"X-Test": "bad\u{0001}value"}}),
+            "invalid custom_headers value",
+        ),
+    ] {
+        let err = parse_custom_headers(&config, "batching_logger_headers")
+            .expect_err("expected custom header config to be rejected");
+        assert!(
+            err.contains(expected),
+            "error should include {expected:?}, got: {err}"
         );
     }
 }
