@@ -16,11 +16,11 @@ use tracing::{info, warn};
 
 use crate::config::EnvConfig;
 use crate::config::db_backend::{DatabaseBackend, redact_url};
+use crate::tls::source::MaterialKind;
 use crate::tls::source::subscription::{
     AsyncMaterialSetReloadConfig, WatchedMaterialSource, material_set_poll_interval,
     source_is_refreshable, spawn_async_material_set_reload_task,
 };
-use crate::tls::source::{CertSource, MaterialKind};
 
 const DATABASE_TLS_SURFACE: &str = "database_tls";
 
@@ -130,21 +130,21 @@ pub(crate) fn db_tls_watched_sources(env_config: &EnvConfig) -> Vec<WatchedMater
     let mut seen = BTreeSet::new();
     let mut sources = Vec::new();
 
-    push_db_tls_source(
+    super::tls_source_util::push_watched_tls_source(
         &mut sources,
         &mut seen,
         "db_ca",
         env_config.db_tls_ca_cert_path.as_deref(),
         MaterialKind::CaBundle,
     );
-    push_db_tls_source(
+    super::tls_source_util::push_watched_tls_source(
         &mut sources,
         &mut seen,
         "db_client_cert",
         env_config.db_tls_client_cert_path.as_deref(),
         MaterialKind::Cert,
     );
-    push_db_tls_source(
+    super::tls_source_util::push_watched_tls_source(
         &mut sources,
         &mut seen,
         "db_client_key",
@@ -153,26 +153,6 @@ pub(crate) fn db_tls_watched_sources(env_config: &EnvConfig) -> Vec<WatchedMater
     );
 
     sources
-}
-
-fn push_db_tls_source(
-    sources: &mut Vec<WatchedMaterialSource>,
-    seen: &mut BTreeSet<(MaterialKind, String)>,
-    label: &'static str,
-    source_value: Option<&str>,
-    kind: MaterialKind,
-) {
-    let Some(source_value) = source_value else {
-        return;
-    };
-    if source_value.trim().is_empty() {
-        return;
-    }
-
-    let source = CertSource::parse(source_value.to_string(), kind);
-    if seen.insert((kind, source.pool_key_component())) {
-        sources.push(WatchedMaterialSource::new(label, source, kind));
-    }
 }
 
 #[cfg(test)]

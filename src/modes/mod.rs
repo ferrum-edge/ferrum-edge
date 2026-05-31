@@ -29,6 +29,7 @@ pub mod migrate;
 pub mod node_agent;
 pub mod node_agent_cni_server;
 pub mod tls_reload;
+pub(crate) mod tls_source_util;
 
 use std::sync::Arc;
 #[cfg(feature = "acme")]

@@ -10,11 +10,11 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::EnvConfig;
+use crate::tls::source::MaterialKind;
 use crate::tls::source::subscription::{
     MaterialSetReloadConfig, WatchedMaterialSource, material_set_poll_interval,
     source_is_refreshable, spawn_material_set_reload_task,
 };
-use crate::tls::source::{CertSource, MaterialKind};
 use crate::tls::{
     self, CrlList, FrontendTlsReloadConfig, SharedFrontendTls, TlsPolicy, frontend_tls_slot_with,
     spawn_frontend_tls_reload_task,
@@ -183,28 +183,28 @@ pub(crate) fn cp_grpc_watched_sources(env_config: &EnvConfig) -> Vec<WatchedMate
     let mut seen = BTreeSet::new();
     let mut sources = Vec::new();
 
-    push_grpc_tls_source(
+    super::tls_source_util::push_watched_tls_source(
         &mut sources,
         &mut seen,
         "cp_grpc_cert",
         env_config.cp_grpc_tls_cert_path.as_deref(),
         MaterialKind::Cert,
     );
-    push_grpc_tls_source(
+    super::tls_source_util::push_watched_tls_source(
         &mut sources,
         &mut seen,
         "cp_grpc_key",
         env_config.cp_grpc_tls_key_path.as_deref(),
         MaterialKind::Key,
     );
-    push_grpc_tls_source(
+    super::tls_source_util::push_watched_tls_source(
         &mut sources,
         &mut seen,
         "cp_grpc_client_ca",
         env_config.cp_grpc_tls_client_ca_path.as_deref(),
         MaterialKind::CaBundle,
     );
-    push_grpc_tls_source(
+    super::tls_source_util::push_watched_tls_source(
         &mut sources,
         &mut seen,
         "cp_grpc_crl",
@@ -219,21 +219,21 @@ pub(crate) fn dp_grpc_watched_sources(env_config: &EnvConfig) -> Vec<WatchedMate
     let mut seen = BTreeSet::new();
     let mut sources = Vec::new();
 
-    push_grpc_tls_source(
+    super::tls_source_util::push_watched_tls_source(
         &mut sources,
         &mut seen,
         "dp_grpc_ca",
         env_config.dp_grpc_tls_ca_cert_path.as_deref(),
         MaterialKind::CaBundle,
     );
-    push_grpc_tls_source(
+    super::tls_source_util::push_watched_tls_source(
         &mut sources,
         &mut seen,
         "dp_grpc_client_cert",
         env_config.dp_grpc_tls_client_cert_path.as_deref(),
         MaterialKind::Cert,
     );
-    push_grpc_tls_source(
+    super::tls_source_util::push_watched_tls_source(
         &mut sources,
         &mut seen,
         "dp_grpc_client_key",
@@ -242,26 +242,6 @@ pub(crate) fn dp_grpc_watched_sources(env_config: &EnvConfig) -> Vec<WatchedMate
     );
 
     sources
-}
-
-fn push_grpc_tls_source(
-    sources: &mut Vec<WatchedMaterialSource>,
-    seen: &mut BTreeSet<(MaterialKind, String)>,
-    label: &'static str,
-    source_value: Option<&str>,
-    kind: MaterialKind,
-) {
-    let Some(source_value) = source_value else {
-        return;
-    };
-    if source_value.trim().is_empty() {
-        return;
-    }
-
-    let source = CertSource::parse(source_value.to_string(), kind);
-    if seen.insert((kind, source.pool_key_component())) {
-        sources.push(WatchedMaterialSource::new(label, source, kind));
-    }
 }
 
 #[cfg(test)]
