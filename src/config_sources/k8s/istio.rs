@@ -23,11 +23,12 @@ use super::{
     SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
     mesh_route_dispatch_can_emit_rule, mesh_route_dispatch_has_unsupported_predicate,
     mesh_route_dispatch_plugin_from_rules, mesh_route_dispatch_rules_for_proxy,
-    optional_port_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
-    request_termination_plugin_for_proxy, resource_id, route_local_fault_value_for_rule,
-    route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
-    selector_from_istio, sidecar_selector_from_istio, string_array, string_field, string_map,
-    upstream_for_route, workload_entry_service_key_from_host,
+    optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
+    proxy_for_route, request_termination_plugin_for_proxy, resource_id,
+    route_local_fault_value_for_rule, route_request_transformer_plugin_for_proxy,
+    route_response_transformer_plugin_for_proxy, selector_from_istio, sidecar_selector_from_istio,
+    string_array, string_field, string_map, upstream_for_route,
+    workload_entry_service_key_from_host,
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
@@ -2817,26 +2818,7 @@ fn service_host_components<'a>(
 }
 
 fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateError> {
-    let Some(weight_value) = route.get("weight") else {
-        return Ok(0);
-    };
-    let Some(weight) = weight_value.as_u64() else {
-        return Err(invalid_resource(
-            object,
-            format!(
-                "VirtualService route.weight must be between 0 and {MAX_TARGET_WEIGHT} (got {weight_value})"
-            ),
-        ));
-    };
-    if weight > u64::from(MAX_TARGET_WEIGHT) {
-        return Err(invalid_resource(
-            object,
-            format!(
-                "VirtualService route.weight must be between 0 and {MAX_TARGET_WEIGHT} (got {weight})"
-            ),
-        ));
-    }
-    Ok(weight as u32)
+    optional_target_weight_field(object, route, "VirtualService route.weight", 0)
 }
 
 /// Extract Istio VirtualService `http[].retries` into a Ferrum [`RetryConfig`].

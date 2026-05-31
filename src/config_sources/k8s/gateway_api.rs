@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
+use crate::config::types::BackendScheme;
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
 };
@@ -13,8 +13,9 @@ use super::{
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sAccumulator, K8sObject, K8sResourceKey,
     K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
     RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
-    invalid_resource, mesh_route_dispatch_plugin_from_rules, optional_port_field, port_from_u64,
-    proxy_for_route, resource_id, service_dns_name, string_array, string_field, upstream_for_route,
+    invalid_resource, mesh_route_dispatch_plugin_from_rules, optional_port_field,
+    optional_target_weight_field, port_from_u64, proxy_for_route, resource_id, service_dns_name,
+    string_array, string_field, upstream_for_route,
 };
 use crate::config::types::{PluginConfig, Proxy};
 
@@ -1518,26 +1519,7 @@ fn route_backends(
 }
 
 fn backend_weight(object: &K8sObject, backend_ref: &Value) -> Result<u32, K8sTranslateError> {
-    let Some(weight_value) = backend_ref.get("weight") else {
-        return Ok(1);
-    };
-    let Some(weight) = weight_value.as_u64() else {
-        return Err(invalid_resource(
-            object,
-            format!(
-                "backendRefs[].weight must be between 0 and {MAX_TARGET_WEIGHT} (got {weight_value})"
-            ),
-        ));
-    };
-    if weight > u64::from(MAX_TARGET_WEIGHT) {
-        return Err(invalid_resource(
-            object,
-            format!(
-                "backendRefs[].weight must be between 0 and {MAX_TARGET_WEIGHT} (got {weight})"
-            ),
-        ));
-    }
-    Ok(weight as u32)
+    optional_target_weight_field(object, backend_ref, "backendRefs[].weight", 1)
 }
 
 fn l4_route_proxies(

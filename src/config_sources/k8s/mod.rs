@@ -17,8 +17,8 @@ use serde_json::Value;
 
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
-    PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode, RetryConfig, Upstream,
-    UpstreamTarget, default_namespace,
+    MAX_TARGET_WEIGHT, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
+    RetryConfig, Upstream, UpstreamTarget, default_namespace,
 };
 use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::MeshConfig;
@@ -795,6 +795,38 @@ pub(crate) fn optional_port_field(
         .and_then(Value::as_u64)
         .map(|raw| port_from_u64(object, raw, field))
         .transpose()
+}
+
+pub(crate) fn optional_target_weight_field(
+    object: &K8sObject,
+    value: &Value,
+    field: &str,
+    default: u32,
+) -> Result<u32, K8sTranslateError> {
+    value
+        .get("weight")
+        .map(|weight| target_weight_from_value(object, weight, field))
+        .unwrap_or(Ok(default))
+}
+
+pub(crate) fn target_weight_from_value(
+    object: &K8sObject,
+    value: &Value,
+    field: &str,
+) -> Result<u32, K8sTranslateError> {
+    let Some(weight) = value.as_u64() else {
+        return Err(invalid_resource(
+            object,
+            format!("{field} must be between 0 and {MAX_TARGET_WEIGHT} (got {value})"),
+        ));
+    };
+    if weight > u64::from(MAX_TARGET_WEIGHT) {
+        return Err(invalid_resource(
+            object,
+            format!("{field} must be between 0 and {MAX_TARGET_WEIGHT} (got {weight})"),
+        ));
+    }
+    Ok(weight as u32)
 }
 
 pub(crate) fn selector_from_istio(value: Option<&Value>) -> HashMap<String, String> {
