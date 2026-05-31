@@ -5,7 +5,7 @@ use tonic::transport::{Certificate, Identity};
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, build_dp_grpc_tls_config};
 pub use crate::util::backoff::{BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs};
 #[cfg(test)]
-use crate::util::backoff::{BACKOFF_MAX_SECS, jittered_backoff_with_entropy};
+pub(crate) use crate::util::backoff::{BACKOFF_MAX_SECS, jittered_backoff_with_entropy};
 
 pub fn tonic_tls_config(tls: &DpGrpcTlsConfig) -> tonic::transport::ClientTlsConfig {
     let mut client_tls = tonic::transport::ClientTlsConfig::new();
