@@ -42,6 +42,30 @@ fn warn_fd_pressure_disabled_once() {
     });
 }
 
+fn pressure_ratio(current: u64, max: u64) -> f64 {
+    if max > 0 {
+        current as f64 / max as f64
+    } else {
+        0.0
+    }
+}
+
+fn red_probability_for_pressure(
+    ratio: f64,
+    pressure_threshold: f64,
+    critical_threshold: f64,
+) -> u32 {
+    if ratio >= critical_threshold {
+        RED_PROBABILITY_SCALE
+    } else if ratio >= pressure_threshold {
+        let range = critical_threshold - pressure_threshold;
+        let position = ratio - pressure_threshold;
+        ((position / range) * RED_PROBABILITY_SCALE as f64) as u32
+    } else {
+        0
+    }
+}
+
 /// Scale factor for RED (Random Early Detection) drop probability.
 ///
 /// The probability is stored as an integer in [0, RED_PROBABILITY_SCALE] where
@@ -272,29 +296,17 @@ impl OverloadState {
                 file_descriptors: FdPressure {
                     current: fd_current,
                     max: fd_max,
-                    ratio: if fd_max > 0 {
-                        fd_current as f64 / fd_max as f64
-                    } else {
-                        0.0
-                    },
+                    ratio: pressure_ratio(fd_current, fd_max),
                 },
                 connections: ConnPressure {
                     current: conn_current,
                     max: conn_max,
-                    ratio: if conn_max > 0 {
-                        conn_current as f64 / conn_max as f64
-                    } else {
-                        0.0
-                    },
+                    ratio: pressure_ratio(conn_current, conn_max),
                 },
                 requests: ReqPressure {
                     current: req_current,
                     max: req_max,
-                    ratio: if req_max > 0 {
-                        req_current as f64 / req_max as f64
-                    } else {
-                        0.0
-                    },
+                    ratio: pressure_ratio(req_current, req_max),
                 },
                 event_loop_latency_us: self.loop_latency_us.load(Ordering::Relaxed),
             },
@@ -823,31 +835,19 @@ pub fn start_monitor(
             let fd_current = count_open_fds();
             state.fd_current.store(fd_current, Ordering::Relaxed);
 
-            let fd_ratio = if fd_limit > 0 {
-                fd_current as f64 / fd_limit as f64
-            } else {
-                0.0
-            };
+            let fd_ratio = pressure_ratio(fd_current, fd_limit);
 
             // ── Connection pressure ──
             // Uses the active_connections counter maintained by ConnectionGuard
             // (covers HTTP/1.1, H2, H3, gRPC, and stream proxy connections).
             let conn_used = state.active_connections.load(Ordering::Relaxed);
             state.conn_current.store(conn_used, Ordering::Relaxed);
-            let conn_ratio = if max_connections > 0 {
-                conn_used as f64 / max_connections as f64
-            } else {
-                0.0
-            };
+            let conn_ratio = pressure_ratio(conn_used, max_connections as u64);
 
             // ── Request pressure ──
             let req_used = state.active_requests.load(Ordering::Relaxed);
             state.req_current.store(req_used, Ordering::Relaxed);
-            let req_ratio = if max_requests > 0 {
-                req_used as f64 / max_requests as f64
-            } else {
-                0.0 // unlimited — never triggers pressure
-            };
+            let req_ratio = pressure_ratio(req_used, max_requests as u64);
 
             // ── Event loop latency ──
             let loop_latency = measure_event_loop_latency().await;
@@ -878,34 +878,22 @@ pub fn start_monitor(
             // For BOTH fd and connection pressure, compute probability independently
             // and take the max. This gives a smooth ramp from 0% at the pressure
             // threshold to 100% at the critical threshold.
-            let fd_red_prob = if fd_ratio >= config.fd_critical_threshold {
-                RED_PROBABILITY_SCALE // 100% drop
-            } else if fd_ratio >= config.fd_pressure_threshold {
-                let range = config.fd_critical_threshold - config.fd_pressure_threshold;
-                let position = fd_ratio - config.fd_pressure_threshold;
-                ((position / range) * RED_PROBABILITY_SCALE as f64) as u32
-            } else {
-                0
-            };
-            let conn_red_prob = if conn_ratio >= config.conn_critical_threshold {
-                RED_PROBABILITY_SCALE // 100% drop
-            } else if conn_ratio >= config.conn_pressure_threshold {
-                let range = config.conn_critical_threshold - config.conn_pressure_threshold;
-                let position = conn_ratio - config.conn_pressure_threshold;
-                ((position / range) * RED_PROBABILITY_SCALE as f64) as u32
-            } else {
-                0
-            };
+            let fd_red_prob = red_probability_for_pressure(
+                fd_ratio,
+                config.fd_pressure_threshold,
+                config.fd_critical_threshold,
+            );
+            let conn_red_prob = red_probability_for_pressure(
+                conn_ratio,
+                config.conn_pressure_threshold,
+                config.conn_critical_threshold,
+            );
             let req_red_prob = if max_requests > 0 {
-                if req_ratio >= config.req_critical_threshold {
-                    RED_PROBABILITY_SCALE
-                } else if req_ratio >= config.req_pressure_threshold {
-                    let range = config.req_critical_threshold - config.req_pressure_threshold;
-                    let position = req_ratio - config.req_pressure_threshold;
-                    ((position / range) * RED_PROBABILITY_SCALE as f64) as u32
-                } else {
-                    0
-                }
+                red_probability_for_pressure(
+                    req_ratio,
+                    config.req_pressure_threshold,
+                    config.req_critical_threshold,
+                )
             } else {
                 0
             };
@@ -1323,6 +1311,28 @@ mod tests {
             });
         }
         assert_eq!(fired, 1, "warn-once latch must fire exactly once");
+    }
+
+    #[test]
+    fn pressure_ratio_handles_unbounded_max() {
+        assert_eq!(pressure_ratio(5, 0), 0.0);
+        assert_eq!(pressure_ratio(5, 10), 0.5);
+    }
+
+    #[test]
+    fn red_probability_for_pressure_tracks_threshold_ramp() {
+        assert_eq!(red_probability_for_pressure(0.79, 0.80, 0.95), 0);
+        assert_eq!(
+            red_probability_for_pressure(0.95, 0.80, 0.95),
+            RED_PROBABILITY_SCALE
+        );
+        assert_eq!(
+            red_probability_for_pressure(1.00, 0.80, 0.95),
+            RED_PROBABILITY_SCALE
+        );
+
+        let midpoint = red_probability_for_pressure(0.875, 0.80, 0.95);
+        assert!((511..=513).contains(&midpoint));
     }
 
     /// Verify that the RED shedding rate matches the configured probability
