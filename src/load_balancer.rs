@@ -883,14 +883,27 @@ impl LoadBalancerCache {
 /// state per-upstream, preventing cross-upstream contamination when different
 /// upstreams contain overlapping host:port targets.
 pub fn target_key(upstream_id: &str, target: &UpstreamTarget) -> String {
-    format!("{}::{}:{}", upstream_id, target.host, target.port)
+    let mut key = String::with_capacity(upstream_id.len() + 2 + target.host.len() + 6);
+    key.push_str(upstream_id);
+    key.push_str("::");
+    write_target_host_port_key(&mut key, target);
+    key
 }
 
 /// Build a plain "host:port" key for a target (no upstream scoping).
 /// Used for sticky session cookies, active connection tracking, latency EWMA,
 /// and other contexts where the key is already scoped to a single LoadBalancer.
 pub fn target_host_port_key(target: &UpstreamTarget) -> String {
-    format!("{}:{}", target.host, target.port)
+    let mut key = String::with_capacity(target.host.len() + 6);
+    write_target_host_port_key(&mut key, target);
+    key
+}
+
+/// Append the plain "host:port" target key into a reusable buffer.
+pub(crate) fn write_target_host_port_key(buf: &mut String, target: &UpstreamTarget) {
+    use std::fmt::Write;
+
+    let _ = write!(buf, "{}:{}", target.host, target.port);
 }
 
 /// Build the pre-computed locality-LB state from an operator's
@@ -1735,7 +1748,6 @@ impl LoadBalancer {
     /// Uses a thread-local buffer to construct the lookup key without allocation.
     #[inline]
     fn find_target_key(&self, target: &UpstreamTarget) -> Option<&str> {
-        use std::fmt::Write;
         thread_local! {
             static TARGET_KEY_BUF: std::cell::RefCell<String> =
                 std::cell::RefCell::new(String::with_capacity(64));
@@ -1743,7 +1755,7 @@ impl LoadBalancer {
         TARGET_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
-            let _ = write!(buf, "{}:{}", target.host, target.port);
+            write_target_host_port_key(&mut buf, target);
             self.target_index
                 .get(buf.as_str())
                 .map(|&i| self.host_port_keys[i].as_str())

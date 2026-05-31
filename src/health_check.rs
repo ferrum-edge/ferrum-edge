@@ -28,19 +28,19 @@ use crate::config::types::{
     UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsCacheResolver};
-use crate::load_balancer::LoadBalancerCache;
+use crate::load_balancer::{
+    LoadBalancerCache, target_host_port_key, target_key, write_target_host_port_key,
+};
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use dashmap::DashMap;
-use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-// Thread-local buffer for formatting "host:port" keys in `report_response()`.
-// Avoids a `String` allocation on every proxied response (hot path).
-// Matches the pattern used in `load_balancer.rs::find_target_key()`.
+// Thread-local buffer for formatting "host:port" keys in `report_response()`;
+// avoids a `String` allocation on every proxied response (hot path).
 thread_local! {
     static HP_KEY_BUF: std::cell::RefCell<String> =
         std::cell::RefCell::new(String::with_capacity(64));
@@ -53,17 +53,6 @@ async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
             return;
         }
     }
-}
-
-/// Build a key for active health state: "upstream_id::host:port".
-/// Shared across all proxies referencing the same upstream.
-fn active_target_key(upstream_id: &str, target: &UpstreamTarget) -> String {
-    format!("{}::{}:{}", upstream_id, target.host, target.port)
-}
-
-/// Build a plain "host:port" key for passive health state lookups.
-fn host_port_key(target: &UpstreamTarget) -> String {
-    format!("{}:{}", target.host, target.port)
 }
 
 fn format_probe_socket_addr(host: &str, port: u16) -> String {
@@ -439,7 +428,7 @@ impl HealthChecker {
         let active_keys: std::collections::HashSet<String> = new_config
             .upstreams
             .iter()
-            .flat_map(|u| u.targets.iter().map(move |t| active_target_key(&u.id, t)))
+            .flat_map(|u| u.targets.iter().map(move |t| target_key(&u.id, t)))
             .collect();
         self.active_unhealthy_targets
             .retain(|key, _| active_keys.contains(key));
@@ -491,7 +480,7 @@ impl HealthChecker {
         HP_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
-            let _ = write!(buf, "{}:{}", target.host, target.port);
+            write_target_host_port_key(&mut buf, target);
 
             // Get or create target health state within this proxy's partition.
             // Fast path: get() uses a shared read lock (most requests hit this).
@@ -587,7 +576,7 @@ impl HealthChecker {
         // other upstreams' entries must be preserved.
         let active_keys: std::collections::HashSet<String> = current_targets
             .iter()
-            .map(|t| active_target_key(upstream_id, t))
+            .map(|t| target_key(upstream_id, t))
             .collect();
         self.active_unhealthy_targets.retain(|key, _| {
             key.split_once("::")
@@ -633,7 +622,7 @@ impl HealthChecker {
             return;
         };
         let current_keys: std::collections::HashSet<String> =
-            current_targets.iter().map(host_port_key).collect();
+            current_targets.iter().map(target_host_port_key).collect();
         proxy_state
             .unhealthy
             .retain(|key, _| current_keys.contains(key));
@@ -681,7 +670,7 @@ impl HealthChecker {
     ) -> tokio::task::JoinHandle<()> {
         let passive_health = self.passive_health.clone();
         let hp_keys: std::collections::HashSet<String> =
-            targets.iter().map(host_port_key).collect();
+            targets.iter().map(target_host_port_key).collect();
         let check_interval = Duration::from_secs(std::cmp::max(healthy_after_seconds / 4, 1));
         let recovery_ms = healthy_after_seconds * 1000;
 
@@ -801,7 +790,7 @@ impl HealthChecker {
         upstream_client: &Arc<reqwest::Client>,
         tls_config: &BackendTlsConfig,
     ) -> tokio::task::JoinHandle<()> {
-        let key = active_target_key(upstream_id, target);
+        let key = target_key(upstream_id, target);
         let interval = Duration::from_secs(config.interval_seconds);
         let timeout = Duration::from_millis(config.timeout_ms);
         let healthy_threshold = config.healthy_threshold;
