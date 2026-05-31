@@ -50,10 +50,7 @@ async fn fetch_with_client(
     reference: &str,
     key: &str,
 ) -> Result<String, String> {
-    let (secret_id, json_key) = match reference.split_once('#') {
-        Some((id, k)) => (id, Some(k)),
-        None => (reference, None),
-    };
+    let (secret_id, json_key) = super::split_reference_field(reference);
 
     let resp = client
         .get_secret_value()

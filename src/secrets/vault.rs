@@ -62,10 +62,7 @@ async fn fetch_with_client(
     key: &str,
 ) -> Result<String, String> {
     // Parse the reference: path#json_key
-    let (path, json_key) = match reference.split_once('#') {
-        Some((p, k)) => (p, Some(k)),
-        None => (reference, None),
-    };
+    let (path, json_key) = super::split_reference_field(reference);
 
     // Parse mount and path from the reference
     // Format: <mount>/data/<secret_path> (KV v2 convention)
