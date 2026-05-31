@@ -159,6 +159,13 @@ fn dns_hostname_key(hostname: &str) -> Cow<'_, str> {
     }
 }
 
+fn dns_name_without_trailing_root(name: impl std::fmt::Display) -> String {
+    let mut name = name.to_string();
+    let len_without_root = name.trim_end_matches('.').len();
+    name.truncate(len_without_root);
+    name
+}
+
 /// A cached DNS entry with TTL and stale-while-revalidate support.
 #[derive(Debug, Clone)]
 struct DnsCacheEntry {
@@ -851,10 +858,8 @@ impl DnsCache {
                                 let RData::SRV(ref srv) = record.data else {
                                     continue;
                                 };
-                                let target = srv.target.to_string();
-                                // Remove trailing dot if present
-                                let target = target.trim_end_matches('.');
-                                if let Ok(ip_lookup) = self.resolver.lookup_ip(target).await {
+                                let target = dns_name_without_trailing_root(&srv.target);
+                                if let Ok(ip_lookup) = self.resolver.lookup_ip(&target).await {
                                     let addrs: Vec<IpAddr> = ip_lookup.iter().collect();
                                     if !addrs.is_empty() {
                                         // Use the shorter of SRV TTL and A/AAAA TTL
@@ -926,9 +931,11 @@ impl DnsCache {
             let RData::SRV(ref srv) = record.data else {
                 continue;
             };
-            let target = srv.target.to_string();
-            let target = target.trim_end_matches('.').to_string();
-            results.push((target, srv.port, srv.weight));
+            results.push((
+                dns_name_without_trailing_root(&srv.target),
+                srv.port,
+                srv.weight,
+            ));
         }
 
         Ok(results)
@@ -1473,6 +1480,18 @@ mod tests {
             stale_ttl_seconds: 0,
             ..DnsConfig::default()
         }
+    }
+
+    #[test]
+    fn dns_name_without_trailing_root_strips_root_label() {
+        assert_eq!(
+            dns_name_without_trailing_root("service.example.com."),
+            "service.example.com"
+        );
+        assert_eq!(
+            dns_name_without_trailing_root("service.example.com"),
+            "service.example.com"
+        );
     }
 
     #[test]
