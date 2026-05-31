@@ -3610,7 +3610,7 @@ async fn handle_list_namespaces(state: &AdminState) -> Result<Response<Full<Byte
 
 // ---- Helpers ----
 
-fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
+pub(in crate::admin) fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
     Response::builder()
         .status(status)

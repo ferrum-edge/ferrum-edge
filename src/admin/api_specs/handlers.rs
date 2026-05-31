@@ -1986,24 +1986,8 @@ fn percent_decode(s: &str) -> Result<String, ApiSpecError> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Small JSON response helper (avoids importing the private fn from admin::mod)
-// ---------------------------------------------------------------------------
-
 fn json_resp(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
-    let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
-    Response::builder()
-        .status(status)
-        .header("Content-Type", "application/json")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
-        .body(Full::new(Bytes::from(body_str)))
-        .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::from(
-                "{\"error\":\"Internal Server Error\"}",
-            )))
-        })
+    super::super::json_response(status, body)
 }
 
 // ---------------------------------------------------------------------------
