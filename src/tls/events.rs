@@ -6,7 +6,6 @@
 //! restarts.
 
 use std::collections::VecDeque;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -356,35 +355,9 @@ fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         EVENT_LOG_FILE_NAME,
         Uuid::new_v4().simple()
     ));
-    write_private_file(&tmp_path, bytes)?;
+    crate::tls::private_file::write_private_file(&tmp_path, bytes)
+        .map_err(|error| error.to_string())?;
     std::fs::rename(&tmp_path, path).map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    file.write_all(bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    file.write_all(bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
     Ok(())
 }
 

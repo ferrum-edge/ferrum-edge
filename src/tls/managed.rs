@@ -5,7 +5,7 @@
 //! needs it to rebuild configs, but API summaries never serialize it.
 
 use std::collections::BTreeMap;
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -703,33 +703,8 @@ pub fn global_store() -> Result<Arc<ManagedTlsStore>, String> {
         .clone()
 }
 
-#[cfg(unix)]
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ManagedTlsError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-    file.write_all(bytes)
-        .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-    file.sync_all()
-        .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ManagedTlsError> {
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-    file.write_all(bytes)
-        .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-    file.sync_all()
+    crate::tls::private_file::write_private_file(path, bytes)
         .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
     Ok(())
 }

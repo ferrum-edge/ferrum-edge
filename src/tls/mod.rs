@@ -23,6 +23,7 @@ pub mod inventory;
 pub mod managed;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
+pub(crate) mod private_file;
 pub mod source;
 // `spiffe` exposes Phase A scaffolding for Phase C — every public item is
 // dead from the binary's perspective until a later phase wires it in.

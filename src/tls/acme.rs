@@ -13,7 +13,7 @@
 #![cfg_attr(not(feature = "acme"), allow(dead_code))]
 
 use std::collections::BTreeMap;
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 #[cfg(feature = "acme")]
@@ -2316,33 +2316,8 @@ pub mod client {
     }
 }
 
-#[cfg(unix)]
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), AcmeError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| AcmeError::Write(error.to_string()))?;
-    file.write_all(bytes)
-        .map_err(|error| AcmeError::Write(error.to_string()))?;
-    file.sync_all()
-        .map_err(|error| AcmeError::Write(error.to_string()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), AcmeError> {
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| AcmeError::Write(error.to_string()))?;
-    file.write_all(bytes)
-        .map_err(|error| AcmeError::Write(error.to_string()))?;
-    file.sync_all()
+    crate::tls::private_file::write_private_file(path, bytes)
         .map_err(|error| AcmeError::Write(error.to_string()))?;
     Ok(())
 }
