@@ -399,10 +399,14 @@ impl RequestDeduplication {
         if completed_hint == 0 || completed_hint.saturating_add(inflight_hint) <= self.max_entries {
             return;
         }
-        // Eviction is opportunistic on proxy paths; if another caller is
-        // already trimming, skip instead of parking a Tokio worker.
-        let Ok(_guard) = self.eviction_lock.try_lock() else {
-            return;
+        // Capacity eviction runs after completed responses have already been
+        // cached. Once the configured bound is exceeded, wait for any active
+        // trim instead of skipping this trim attempt; otherwise concurrent
+        // completions can retain cached bodies above max_entries until a much
+        // later TTL cleanup.
+        let _guard = match self.eviction_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
         };
         self.evict_completed_over_capacity_locked(
             self.completed_count.load(Ordering::Relaxed),
