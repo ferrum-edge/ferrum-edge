@@ -93,13 +93,12 @@ fn populated_rsa_jwks() -> serde_json::Value {
     })
 }
 
-/// Regression test for finding #28: a successful JWKS fetch that returns zero
-/// keys must NOT wipe a previously-populated cache. The first fetch populates
-/// the store; the second fetch returns `{"keys": []}` and must leave the
-/// last-known-good key in place so authentication keeps working through a
-/// transient empty 200 (e.g. a mid-rotation IdP).
+/// An authoritative successful JWKS fetch that returns zero keys must clear a
+/// previously-populated cache. Operators and IdPs can intentionally publish an
+/// empty JWKS to revoke all signing keys after compromise; retaining old keys
+/// would keep revoked tokens or keys trusted until process restart.
 #[tokio::test]
-async fn test_empty_fetch_retains_last_known_good_keys() {
+async fn test_empty_fetch_clears_last_known_good_keys() {
     let server = wiremock::MockServer::start().await;
 
     // Priority 1 (highest), exhausted after a single hit: serves the populated
@@ -134,25 +133,26 @@ async fn test_empty_fetch_retains_last_known_good_keys() {
     assert!(store.has_keys());
     assert!(store.get_key("k1").is_some());
 
-    // Second fetch returns zero keys; the cache must be retained, not wiped.
+    // Second fetch returns zero keys; the cache must be cleared so revoked
+    // signing keys are no longer accepted.
     let count = store
         .fetch_keys()
         .await
         .expect("empty fetch should succeed without error");
-    assert_eq!(count, 1, "empty fetch must report the retained key count");
+    assert_eq!(count, 0, "empty fetch must report the new empty key count");
     assert!(
-        store.has_keys(),
-        "an empty 200 must not discard last-known-good keys"
+        !store.has_keys(),
+        "an authoritative empty 200 must discard last-known-good keys"
     );
     assert!(
-        store.get_key("k1").is_some(),
-        "the previously cached key must still be present"
+        store.get_key("k1").is_none(),
+        "the previously cached key must no longer be present"
     );
 }
 
 /// An initially-empty store that receives an empty fetch stays empty and does
 /// not error — initial population is still allowed to observe a legitimately
-/// empty JWKS (the cache-retention guard only protects a non-empty cache).
+/// empty JWKS.
 #[tokio::test]
 async fn test_empty_fetch_on_empty_store_stays_empty() {
     let server = wiremock::MockServer::start().await;
