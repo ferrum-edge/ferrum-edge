@@ -361,7 +361,23 @@ async fn body_encoding_specials_trigger_buffering_without_body_rules() {
     binary_req_ctx
         .headers
         .insert("content-type".into(), "application/octet-stream".into());
-    assert!(!plugin.should_buffer_request_body(&binary_req_ctx));
+    assert!(plugin.should_buffer_request_body(&binary_req_ctx));
+    let headers = binary_req_ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut binary_req_ctx,
+            &headers,
+            b"file=%252e%252e%252fetc",
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        binary_req_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
 
     let mut resp_ctx = ctx("GET", "/download");
     let response_headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
@@ -394,7 +410,14 @@ async fn body_encoding_specials_trigger_buffering_without_body_rules() {
             b"file=%252e%252e%252fetc",
         )
         .await;
-    assert!(matches!(result, PluginResult::Continue));
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        binary_resp_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
 }
 
 #[tokio::test]
