@@ -697,6 +697,40 @@ async fn body_overlong_utf8_marker_is_flagged_as_encoding_evasion() {
 }
 
 #[tokio::test]
+async fn body_overlong_utf8_marker_respects_legacy_encoding_enforcement() {
+    // Operators who already enforced FE-ENCODING-001 used that rule as the
+    // broad encoding-evasion block. Keep overlong UTF-8 on that enforcement
+    // path while also reporting the dedicated FE-ENCODING-002 hit.
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, b"path=%c0%ae%c0%aetarget")
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
+    let hits = ctx.metadata.get("waf.rule_hits").map(String::as_str);
+    assert!(
+        hits.is_some_and(
+            |hits| hits.contains("FE-ENCODING-001") && hits.contains("FE-ENCODING-002")
+        ),
+        "overlong-UTF8 marker must raise both compatibility and dedicated encoding rules"
+    );
+}
+
+#[tokio::test]
 async fn body_double_encoding_marker_is_flagged_as_encoding_evasion() {
     // Companion to #40: a double-encoded marker (`%252e`) in a body — which
     // the URL-only check never inspected — is now flagged.

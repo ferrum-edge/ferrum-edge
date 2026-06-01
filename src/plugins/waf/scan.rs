@@ -547,10 +547,10 @@ impl Waf {
     /// UTF-8 to U+FFFD), and encodings stacked deeper than the layered-decode
     /// round cap so the decoded payload never reaches the body regex set. Flag
     /// both against the raw body text so they are surfaced through the same
-    /// rules as URL-side checks rather than silently forwarded. Double-encoding,
-    /// percent-null, and beyond-cap residuals use FE-ENCODING-001; overlong
-    /// UTF-8 uses FE-ENCODING-002 so per-rule modes and overrides remain
-    /// effective.
+    /// rules as URL-side checks rather than silently forwarded. FE-ENCODING-001
+    /// remains the compatibility enforcement path for all encoding evasions;
+    /// overlong UTF-8 also raises FE-ENCODING-002 so its dedicated per-rule modes
+    /// and overrides remain effective.
     ///
     /// `residual_encoding` is the beyond-cap signal reported by
     /// `decoded_variants_with_residual`, threaded in so the layered decode runs
@@ -567,7 +567,8 @@ impl Waf {
             let flagged = residual_encoding
                 || (percent_markers_present
                     && (decode::has_double_encoded_marker(text)
-                        || decode::has_percent_null_byte(text)));
+                        || decode::has_percent_null_byte(text)
+                        || decode::has_overlong_utf8_marker(text)));
             if flagged {
                 self.push_special(outcome, rule_index, text, ctx);
             }
