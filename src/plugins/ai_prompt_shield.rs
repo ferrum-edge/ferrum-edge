@@ -285,9 +285,6 @@ impl AiPromptShield {
                 // those endpoints. Each field may be a string, an array of
                 // strings, or an array of `{type:"text", text:"..."}` parts.
                 for field in CONTENT_SCAN_FIELDS {
-                    if *field == "system" && self.exclude_roles.contains("system") {
-                        continue;
-                    }
                     if let Some(value) = json.get(field) {
                         collect_field_text(value, &self.exclude_roles, &mut texts);
                     }
@@ -429,9 +426,6 @@ impl AiPromptShield {
         // symmetric — otherwise PII in `prompt`/`input`/`system` would be
         // reported as redacted but forwarded unredacted (a fail-open bypass).
         for field in CONTENT_SCAN_FIELDS {
-            if *field == "system" && self.exclude_roles.contains("system") {
-                continue;
-            }
             if let Some(value) = json.get_mut(field) {
                 redact_field_text(value, &self.exclude_roles, &|text| self.redact_text(text));
             }

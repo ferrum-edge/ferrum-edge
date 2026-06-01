@@ -1004,7 +1004,7 @@ async fn test_content_mode_responses_input_honors_exclude_roles() {
 }
 
 #[tokio::test]
-async fn test_content_mode_top_level_system_honors_exclude_roles() {
+async fn test_content_mode_top_level_system_is_not_role_excluded() {
     let plugin = AiPromptShield::new(&json!({
         "patterns": ["ssn"],
         "exclude_roles": ["system"]
@@ -1017,7 +1017,35 @@ async fn test_content_mode_top_level_system_honors_exclude_roles() {
         "messages": [{"role": "user", "content": "clean request"}]
     }));
     let mut headers = make_post_headers();
-    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_content_mode_top_level_system_redaction_is_not_role_excluded() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["ssn"],
+        "exclude_roles": ["system"]
+    }))
+    .unwrap();
+
+    let body = serde_json::to_vec(&json!({
+        "model": "claude-3-5-sonnet",
+        "system": "operator sample 123-45-6789",
+        "messages": [{"role": "user", "content": "clean request"}]
+    }))
+    .unwrap();
+
+    let result = plugin
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("expected redacted body");
+    let v: serde_json::Value = serde_json::from_slice(&result).unwrap();
+    let system = v["system"].as_str().unwrap();
+    assert!(
+        system.contains("[REDACTED:ssn]") && !system.contains("123-45-6789"),
+        "top-level system field must be redacted: {system}"
+    );
 }
 
 #[tokio::test]
