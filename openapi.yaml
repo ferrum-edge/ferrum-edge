@@ -12631,7 +12631,7 @@ components:
             endpoint:
               type: string
               format: uri
-              description: Embeddings endpoint URL.
+              description: Embeddings endpoint URL. Literal IP hosts are checked against FERRUM_BACKEND_ALLOW_IPS; hostname resolution is checked by the shared plugin HTTP client at request time.
             model:
               type: string
               description: Embedding model sent in the request body.
@@ -12771,8 +12771,9 @@ components:
                 default: high
               action:
                 type: string
-                enum: [allow, warn, reject]
+                enum: [warn, reject]
                 default: reject
+                description: Custom rules can warn or reject. Use allow_topics for allowlist semantics.
               examples:
                 type: array
                 minItems: 1
@@ -12790,7 +12791,9 @@ components:
           properties:
             log_raw_text:
               type: boolean
+              enum: [false]
               default: false
+              description: Reserved for future explicit raw-text logging. true is rejected in this release.
             include_snippet_hash:
               type: boolean
               default: true

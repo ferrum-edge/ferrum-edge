@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::OnceCell;
-use url::Url;
+use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::sse::parse_sse_data_frames;
@@ -210,6 +210,7 @@ struct SemanticRule {
     severity: Severity,
     action: Action,
     examples: Vec<String>,
+    example_token_sets: Vec<HashSet<String>>,
     threshold: f32,
     applies_to: Vec<SegmentKind>,
     builtin_pack: Option<String>,
@@ -220,6 +221,7 @@ struct AllowTopic {
     id: String,
     description: Option<String>,
     examples: Vec<String>,
+    example_token_sets: Vec<HashSet<String>>,
     threshold: f32,
     action_on_no_match: Action,
 }
@@ -255,7 +257,6 @@ struct ExtractionConfig {
 
 #[derive(Debug, Clone)]
 struct PrivacyConfig {
-    log_raw_text: bool,
     include_snippet_hash: bool,
 }
 
@@ -380,8 +381,13 @@ impl AiSemanticFirewall {
         };
 
         let privacy_object = optional_object(config, "privacy")?;
+        if optional_bool_in_object(privacy_object, "log_raw_text")?.unwrap_or(false) {
+            return Err(
+                "ai_semantic_firewall: privacy.log_raw_text is reserved for future use and must be false"
+                    .to_string(),
+            );
+        }
         let privacy = PrivacyConfig {
-            log_raw_text: optional_bool_in_object(privacy_object, "log_raw_text")?.unwrap_or(false),
             include_snippet_hash: optional_bool_in_object(privacy_object, "include_snippet_hash")?
                 .unwrap_or(true),
         };
@@ -464,7 +470,7 @@ impl AiSemanticFirewall {
             );
         }
 
-        let provider = parse_provider_config(config)?;
+        let provider = parse_provider_config(config, http_client.backend_allow_ips())?;
         if provider.is_none() {
             return Err(
                 "ai_semantic_firewall: provider config is required when semantic rules are active"
@@ -542,14 +548,19 @@ impl AiSemanticFirewall {
             if segment.direction != direction {
                 continue;
             }
+            let normalized_text = normalize_for_match(&segment.text);
+            let text_tokens = token_set_from_normalized(&normalized_text);
 
             for rule in &self.rules {
                 if !rule.direction.includes(direction) || !rule.applies_to.contains(&segment.kind) {
                     continue;
                 }
+                if !rule_text_context_allows(rule.id.as_str(), segment.kind, &normalized_text) {
+                    continue;
+                }
 
-                let score = builtin_lexical_score(rule.id.as_str(), segment.kind, &segment.text)
-                    .or_else(|| example_overlap_score(&segment.text, &rule.examples));
+                let score = builtin_lexical_score(rule.id.as_str(), segment.kind, &normalized_text)
+                    .or_else(|| example_overlap_score(&text_tokens, &rule.example_token_sets));
 
                 if let Some(score) = score
                     && score >= rule.threshold
@@ -565,7 +576,8 @@ impl AiSemanticFirewall {
 
             if direction == Direction::Request {
                 for topic in &self.allow_topics {
-                    if let Some(score) = example_overlap_score(&segment.text, &topic.examples)
+                    if let Some(score) =
+                        example_overlap_score(&text_tokens, &topic.example_token_sets)
                         && score >= topic.threshold
                     {
                         matches.push(RuleMatch {
@@ -620,8 +632,12 @@ impl AiSemanticFirewall {
         let mut matches = Vec::new();
         for (segment, segment_embedding) in candidate_segments.iter().zip(segment_embeddings.iter())
         {
+            let normalized_text = normalize_for_match(&segment.text);
             for rule in &self.rules {
                 if !rule.direction.includes(direction) || !rule.applies_to.contains(&segment.kind) {
+                    continue;
+                }
+                if !rule_text_context_allows(rule.id.as_str(), segment.kind, &normalized_text) {
                     continue;
                 }
                 let Some(rule_embeddings) = index.rule_embeddings.get(rule.id.as_str()) else {
@@ -1065,13 +1081,6 @@ impl AiSemanticFirewall {
                 sanitize_provider_error(provider_error),
             );
         }
-
-        if self.privacy.log_raw_text {
-            ctx.metadata.insert(
-                "ai_semantic_firewall.raw_text_logging".to_string(),
-                "enabled".to_string(),
-            );
-        }
     }
 
     fn handle_decision(
@@ -1217,6 +1226,12 @@ impl Plugin for AiSemanticFirewall {
         if json.get("stream").and_then(Value::as_bool) == Some(true) {
             ctx.metadata
                 .insert("ai_request_streaming".to_string(), "true".to_string());
+            if self.inspect_response && self.has_response_rules {
+                ctx.metadata.insert(
+                    "ai_semantic_firewall.response_inspection_skipped".to_string(),
+                    "streaming".to_string(),
+                );
+            }
         }
 
         if !self.inspect_request || !self.has_request_rules {
@@ -1288,6 +1303,9 @@ impl Plugin for AiSemanticFirewall {
             .map(String::as_str)
             .unwrap_or("");
         let segments = if is_event_stream_content_type(content_type) {
+            // This only runs if the response was buffered by another response-body
+            // plugin or mode. Normal streaming SSE is intentionally skipped and
+            // signaled from the request path when `stream: true` is present.
             let frames = parse_sse_data_frames(body);
             let mut segments = Vec::new();
             for (index, frame) in frames.iter().enumerate() {
@@ -1554,6 +1572,7 @@ struct BuiltinRuleSpec {
 
 fn builtin_rule(ids: &mut HashSet<String>, spec: BuiltinRuleSpec) -> Result<SemanticRule, String> {
     ensure_unique_id(ids, spec.id)?;
+    let example_token_sets = precompute_example_token_sets(&spec.examples);
     Ok(SemanticRule {
         id: spec.id.to_string(),
         description: None,
@@ -1561,6 +1580,7 @@ fn builtin_rule(ids: &mut HashSet<String>, spec: BuiltinRuleSpec) -> Result<Sema
         severity: spec.severity,
         action: spec.action,
         examples: spec.examples,
+        example_token_sets,
         threshold: spec.threshold,
         applies_to: spec.applies_to,
         builtin_pack: Some(spec.pack.to_string()),
@@ -1697,6 +1717,7 @@ fn parse_allow_topics(
         topics.push(AllowTopic {
             id,
             description: optional_string_from_object(object, "description")?.map(str::to_string),
+            example_token_sets: precompute_example_token_sets(&examples),
             examples,
             threshold,
             action_on_no_match,
@@ -1736,6 +1757,7 @@ fn parse_deny_topics(
             direction: DirectionScope::Both,
             severity: Severity::High,
             action,
+            example_token_sets: precompute_example_token_sets(&examples),
             examples,
             threshold,
             applies_to: all_text_kinds(),
@@ -1779,12 +1801,18 @@ fn parse_custom_rules(
             optional_string_from_object(object, "action")?.unwrap_or(default_action.as_str()),
             &format!("custom_rules[{index}].action"),
         )?;
+        if action == Action::Allow {
+            return Err(format!(
+                "ai_semantic_firewall: custom_rules[{index}].action 'allow' has no allowlist semantics; use allow_topics instead"
+            ));
+        }
         rules.push(SemanticRule {
             id,
             description: optional_string_from_object(object, "description")?.map(str::to_string),
             direction,
             severity,
             action,
+            example_token_sets: precompute_example_token_sets(&examples),
             examples,
             threshold,
             applies_to: all_text_kinds(),
@@ -1794,7 +1822,10 @@ fn parse_custom_rules(
     Ok(rules)
 }
 
-fn parse_provider_config(config: &Value) -> Result<Option<ProviderConfig>, String> {
+fn parse_provider_config(
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendAllowIps,
+) -> Result<Option<ProviderConfig>, String> {
     let Some(provider) = optional_object(config, "provider")? else {
         return Ok(None);
     };
@@ -1809,14 +1840,7 @@ fn parse_provider_config(config: &Value) -> Result<Option<ProviderConfig>, Strin
     }
 
     let endpoint = required_non_empty_string(provider.get("endpoint"), "provider.endpoint")?;
-    let parsed = Url::parse(&endpoint)
-        .map_err(|_| "ai_semantic_firewall: provider.endpoint must be a valid URL".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("ai_semantic_firewall: provider.endpoint must use http or https".to_string());
-    }
-    if parsed.host_str().is_none() {
-        return Err("ai_semantic_firewall: provider.endpoint must include a host".to_string());
-    }
+    validate_provider_endpoint(&endpoint, backend_allow_ips)?;
 
     let model = optional_string_from_object(provider, "model")?
         .map(str::trim)
@@ -1843,6 +1867,35 @@ fn parse_provider_config(config: &Value) -> Result<Option<ProviderConfig>, Strin
         api_key,
         request_timeout: Duration::from_millis(request_timeout_ms),
     }))
+}
+
+fn validate_provider_endpoint(
+    endpoint: &str,
+    backend_allow_ips: &crate::config::BackendAllowIps,
+) -> Result<(), String> {
+    let parsed = Url::parse(endpoint)
+        .map_err(|_| "ai_semantic_firewall: provider.endpoint must be a valid URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("ai_semantic_firewall: provider.endpoint must use http or https".to_string());
+    }
+
+    let host = parsed
+        .host()
+        .ok_or_else(|| "ai_semantic_firewall: provider.endpoint must include a host".to_string())?;
+    let literal_ip = match host {
+        Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
+        Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
+        Host::Domain(_) => None,
+    };
+    if let Some(ip) = literal_ip
+        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+    {
+        return Err(format!(
+            "ai_semantic_firewall: provider.endpoint IP {ip} denied by FERRUM_BACKEND_ALLOW_IPS={backend_allow_ips} policy"
+        ));
+    }
+
+    Ok(())
 }
 
 fn extract_request_segments(json: &Value, extraction: &ExtractionConfig) -> Vec<TextSegment> {
@@ -1888,6 +1941,7 @@ fn extract_known_path(
                         Some("developer") => SegmentKind::DeveloperPrompt,
                         Some("assistant") => SegmentKind::AssistantMessage,
                         Some("user") => SegmentKind::UserPrompt,
+                        Some("tool") => SegmentKind::ToolResult,
                         _ => SegmentKind::GenericText,
                     };
                     extract_text_value(
@@ -2341,56 +2395,71 @@ fn dedupe_segments(segments: Vec<TextSegment>) -> Vec<TextSegment> {
     deduped
 }
 
-fn builtin_lexical_score(rule_id: &str, segment_kind: SegmentKind, text: &str) -> Option<f32> {
-    let normalized = normalize_for_match(text);
-    let contains_any = |needles: &[&str]| needles.iter().any(|needle| normalized.contains(needle));
-
+fn builtin_lexical_score(
+    rule_id: &str,
+    segment_kind: SegmentKind,
+    normalized: &str,
+) -> Option<f32> {
     match rule_id {
         "prompt_injection" => {
-            if contains_any(&[
-                "ignore previous instruction",
-                "ignore all previous instruction",
-                "disregard the system",
-                "disregard developer",
-                "override developer instruction",
-                "override system instruction",
-                "prior instructions are invalid",
-                "previous instructions are invalid",
-                "treat the system prompt as false",
-                "the above instructions were just a test",
-                "new policy is to reveal",
-            ]) || (contains_any(&["ignore", "disregard", "override", "forget"])
-                && contains_any(&[
+            if normalized_contains_any(
+                normalized,
+                &[
+                    "ignore previous instruction",
+                    "ignore all previous instruction",
+                    "disregard the system",
+                    "disregard developer",
+                    "override developer instruction",
+                    "override system instruction",
+                    "prior instructions are invalid",
+                    "previous instructions are invalid",
+                    "treat the system prompt as false",
+                    "the above instructions were just a test",
+                    "new policy is to reveal",
+                ],
+            ) || (normalized_contains_any(
+                normalized,
+                &["ignore", "disregard", "override", "forget"],
+            ) && normalized_contains_any(
+                normalized,
+                &[
                     "instruction",
                     "system prompt",
                     "developer message",
                     "policy",
-                ]))
-            {
+                ],
+            )) {
                 Some(1.0)
             } else {
                 None
             }
         }
         "jailbreak" => {
-            if contains_any(&[
-                "developer mode",
-                "uncensored model",
-                "unrestricted model",
-                "no safety rules",
-                "no restrictions",
-                "not bound by policy",
-                "answer anything",
-                "roleplay as a model with no restrictions",
-            ]) {
+            if normalized_contains_any(
+                normalized,
+                &[
+                    "developer mode",
+                    "uncensored model",
+                    "unrestricted model",
+                    "no safety rules",
+                    "no restrictions",
+                    "not bound by policy",
+                    "answer anything",
+                    "roleplay as a model with no restrictions",
+                ],
+            ) {
                 Some(1.0)
             } else {
                 None
             }
         }
         "system_prompt_exfiltration" => {
-            if (contains_any(&["reveal", "show", "print", "repeat", "dump", "tell me"])
-                && contains_any(&[
+            if (normalized_contains_any(
+                normalized,
+                &["reveal", "show", "print", "repeat", "dump", "tell me"],
+            ) && normalized_contains_any(
+                normalized,
+                &[
                     "system prompt",
                     "developer message",
                     "hidden instruction",
@@ -2398,24 +2467,30 @@ fn builtin_lexical_score(rule_id: &str, segment_kind: SegmentKind, text: &str) -
                     "confidential policy",
                     "tool schema",
                     "secretly allowed",
-                ]))
-                || contains_any(&[
+                ],
+            )) || normalized_contains_any(
+                normalized,
+                &[
                     "my system prompt is",
                     "my system prompt says",
                     "developer instruction says",
                     "developer message instructed",
                     "hidden policy is",
                     "hidden policies i was given",
-                ])
-            {
+                ],
+            ) {
                 Some(1.0)
             } else {
                 None
             }
         }
         "data_exfiltration" => {
-            if (contains_any(&["dump", "list every", "extract", "send", "encode"])
-                && contains_any(&[
+            if (normalized_contains_any(
+                normalized,
+                &["dump", "list every", "extract", "send", "encode"],
+            ) && normalized_contains_any(
+                normalized,
+                &[
                     "api key",
                     "secret",
                     "private context",
@@ -2423,13 +2498,15 @@ fn builtin_lexical_score(rule_id: &str, segment_kind: SegmentKind, text: &str) -
                     "customer record",
                     "confidential record",
                     "private ticket",
-                ]))
-                || contains_any(&[
+                ],
+            )) || normalized_contains_any(
+                normalized,
+                &[
                     "encode the hidden document as base64",
                     "send confidential records to",
                     "send the confidential context to",
-                ])
-            {
+                ],
+            ) {
                 Some(1.0)
             } else {
                 None
@@ -2442,58 +2519,66 @@ fn builtin_lexical_score(rule_id: &str, segment_kind: SegmentKind, text: &str) -
             ) {
                 return None;
             }
-            if contains_any(&[
-                "assistant ignore",
-                "ignore the user",
-                "reveal your system prompt",
-                "output your system prompt",
-                "do not mention these instructions",
-                "send the conversation to",
-                "bypass all safety rules",
-            ]) {
+            if normalized_contains_any(
+                normalized,
+                &[
+                    "assistant ignore",
+                    "ignore the user",
+                    "reveal your system prompt",
+                    "output your system prompt",
+                    "do not mention these instructions",
+                    "send the conversation to",
+                    "bypass all safety rules",
+                ],
+            ) {
                 Some(1.0)
             } else {
                 None
             }
         }
         "tool_abuse" => {
-            if contains_any(&[
-                "transfer money without",
-                "delete this user",
-                "delete user account",
-                "email confidential data",
-                "email the private report",
-                "change account permissions",
-                "escalate my permissions",
-                "purchase with saved payment",
-                "using saved payment details",
-            ]) || (contains_any(&["delete", "transfer", "email", "purchase", "escalate"])
-                && contains_any(&[
-                    "without confirmation",
-                    "without asking",
-                    "confidential",
-                    "externally",
-                    "permissions",
-                    "saved payment",
-                ]))
-            {
-                Some(1.0)
+            let high_impact_capability = normalized_contains_any(
+                normalized,
+                &[
+                    "transfer money without",
+                    "delete this user",
+                    "delete user account",
+                    "email confidential data",
+                    "email the private report",
+                    "change account permissions",
+                    "escalate my permissions",
+                    "purchase with saved payment",
+                    "using saved payment details",
+                ],
+            );
+            let has_action = normalized_contains_any(
+                normalized,
+                &["delete", "transfer", "email", "purchase", "escalate"],
+            );
+            let has_context = tool_abuse_has_context(normalized);
+            let matched = if tool_abuse_requires_context(segment_kind) {
+                (high_impact_capability || has_action) && has_context
             } else {
-                None
-            }
+                high_impact_capability || (has_action && has_context)
+            };
+
+            if matched { Some(1.0) } else { None }
         }
         "response_leakage" => {
-            if contains_any(&[
-                "my system prompt is",
-                "my system prompt says",
-                "developer instruction says",
-                "developer message instructed",
-                "hidden policy is",
-                "secret key is",
-                "confidential context contains",
-                "internal customer record says",
-                "private document",
-            ]) {
+            if normalized_contains_any(
+                normalized,
+                &[
+                    "my system prompt is",
+                    "my system prompt says",
+                    "developer instruction says",
+                    "developer message instructed",
+                    "hidden policy is",
+                    "secret key is",
+                    "confidential context contains",
+                    "internal customer record says",
+                    "private document",
+                ],
+            ) {
                 Some(1.0)
             } else {
                 None
@@ -2503,18 +2588,61 @@ fn builtin_lexical_score(rule_id: &str, segment_kind: SegmentKind, text: &str) -
     }
 }
 
-fn example_overlap_score(text: &str, examples: &[String]) -> Option<f32> {
-    let text_tokens = token_set(text);
+fn rule_text_context_allows(rule_id: &str, segment_kind: SegmentKind, normalized: &str) -> bool {
+    rule_id != "tool_abuse"
+        || !tool_abuse_requires_context(segment_kind)
+        || tool_abuse_has_context(normalized)
+}
+
+fn tool_abuse_requires_context(segment_kind: SegmentKind) -> bool {
+    matches!(
+        segment_kind,
+        SegmentKind::ToolDefinition | SegmentKind::ToolCall
+    )
+}
+
+fn tool_abuse_has_context(normalized: &str) -> bool {
+    normalized_contains_any(
+        normalized,
+        &[
+            "without confirmation",
+            "without asking",
+            "without approval",
+            "without authorization",
+            "bypass approval",
+            "confidential",
+            "external",
+            "externally",
+            "permission",
+            "permissions",
+            "saved payment",
+            "private report",
+            "private data",
+        ],
+    )
+}
+
+fn normalized_contains_any(normalized: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| normalized.contains(needle))
+}
+
+fn precompute_example_token_sets(examples: &[String]) -> Vec<HashSet<String>> {
+    examples.iter().map(|example| token_set(example)).collect()
+}
+
+fn example_overlap_score(
+    text_tokens: &HashSet<String>,
+    example_token_sets: &[HashSet<String>],
+) -> Option<f32> {
     if text_tokens.is_empty() {
         return None;
     }
     let mut best = 0.0_f32;
-    for example in examples {
-        let example_tokens = token_set(example);
+    for example_tokens in example_token_sets {
         if example_tokens.is_empty() {
             continue;
         }
-        let intersection = text_tokens.intersection(&example_tokens).count() as f32;
+        let intersection = text_tokens.intersection(example_tokens).count() as f32;
         let denominator = text_tokens.len().min(example_tokens.len()) as f32;
         if denominator > 0.0 {
             best = best.max(intersection / denominator);
@@ -2524,7 +2652,12 @@ fn example_overlap_score(text: &str, examples: &[String]) -> Option<f32> {
 }
 
 fn token_set(text: &str) -> HashSet<String> {
-    normalize_for_match(text)
+    let normalized = normalize_for_match(text);
+    token_set_from_normalized(&normalized)
+}
+
+fn token_set_from_normalized(normalized: &str) -> HashSet<String> {
+    normalized
         .split_whitespace()
         .filter(|token| token.len() >= 3 && !STOPWORDS.contains(token))
         .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
@@ -2592,12 +2725,21 @@ fn parse_openai_embedding_response(
     }
 
     let mut rows: Vec<(usize, EmbeddingVector)> = Vec::with_capacity(data.len());
+    let mut seen_indices = vec![false; expected_count];
     for (fallback_index, item) in data.iter().enumerate() {
         let index = item
             .get("index")
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(fallback_index);
+        if index >= expected_count {
+            return Err(format!(
+                "data[{fallback_index}].index {index} is out of range for expected count {expected_count}"
+            ));
+        }
+        if std::mem::replace(&mut seen_indices[index], true) {
+            return Err(format!("duplicate embedding index {index}"));
+        }
         let values = item
             .get("embedding")
             .and_then(Value::as_array)
@@ -2622,6 +2764,11 @@ fn parse_openai_embedding_response(
         rows.push((index, EmbeddingVector::from_raw(values)?));
     }
     rows.sort_by_key(|(index, _)| *index);
+    for (expected_index, (actual_index, _)) in rows.iter().enumerate() {
+        if *actual_index != expected_index {
+            return Err(format!("missing embedding index {expected_index}"));
+        }
+    }
     Ok(rows.into_iter().map(|(_, vector)| vector).collect())
 }
 

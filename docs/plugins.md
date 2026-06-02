@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 66 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 67 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -3333,7 +3333,7 @@ Semantically inspects LLM request and response bodies for prompt injection, jail
 
 **Priority:** 2968
 
-**Ordering and buffering:** Runs after body/OpenAPI validation and before `ai_request_guard`, `ai_semantic_cache`, and `ai_federation`, so semantically unsafe prompts are evaluated before they can reach semantic cache or a federated provider. Request buffering is only enabled for JSON `POST` requests. Response inspection uses the existing response-body buffering hooks for JSON and buffered SSE-shaped responses; pass-through streaming responses and gRPC protobuf payloads are not guaranteed to receive full v1 response enforcement.
+**Ordering and buffering:** Runs after body/OpenAPI validation and before `ai_request_guard`, `ai_semantic_cache`, and `ai_federation`, so semantically unsafe prompts are evaluated before they can reach semantic cache or a federated provider. Request buffering is only enabled for JSON `POST` requests. Response inspection uses the existing response-body buffering hooks for JSON and buffered SSE-shaped responses. Streaming LLM responses are intentionally not buffered by this plugin; response-side packs such as `response_leakage`, response-side `system_prompt_exfiltration`, and response-side `tool_abuse` do not inspect streamed completion chunks in v1. When a JSON request declares `stream: true`, the plugin records `ai_semantic_firewall.response_inspection_skipped=streaming` so operators can audit the skip. gRPC protobuf payloads are also not inspected by v1 response enforcement.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -3344,7 +3344,7 @@ Semantically inspects LLM request and response bodies for prompt injection, jail
 | `on_error` | string | `warn` | Provider/evaluation failure behavior: `warn`, `allow`, or `reject` |
 | `default_action` | string | `reject` | Default action for built-in/custom rules: `reject` or `warn` |
 | `provider.type` | string | required | `openai_compatible_embeddings` |
-| `provider.endpoint` | string | required | OpenAI-compatible embeddings endpoint |
+| `provider.endpoint` | string | required | OpenAI-compatible embeddings endpoint. Literal IP hosts are checked against `FERRUM_BACKEND_ALLOW_IPS`; hostname resolution is checked by the shared plugin HTTP client at request time |
 | `provider.model` | string | optional | Embedding model name |
 | `provider.api_key_env` | string | optional | Environment variable holding the provider API key; the variable must exist after Ferrum startup secret resolution and is sent as `Authorization: Bearer ...` |
 | `provider.request_timeout_ms` | u64 | `5000` | Per-request embedding provider timeout in milliseconds |
@@ -3353,12 +3353,12 @@ Semantically inspects LLM request and response bodies for prompt injection, jail
 | `extraction.response_json_paths` | string[] | common LLM paths | Supported response extraction paths. When configured, this list replaces the defaults and controls all inspected response fields |
 | `allow_topics` | object[] | `[]` | Mandatory request-side semantic allow topics; no match rejects or warns by topic config |
 | `deny_topics` | object[] | `[]` | Customer-defined semantic deny topics |
-| `custom_rules` | object[] | `[]` | Customer-defined semantic rules with `direction`, `severity`, `action`, `examples`, and `threshold` |
-| `privacy.log_raw_text` | bool | `false` | Reserved for future explicit raw-text logging; raw prompt/response text is not written by default |
+| `custom_rules` | object[] | `[]` | Customer-defined semantic rules with `direction`, `severity`, `action` (`reject` or `warn`), `examples`, and `threshold`. Use `allow_topics` for allowlist semantics |
+| `privacy.log_raw_text` | bool | `false` | Reserved for future explicit raw-text logging. `true` is rejected in this release; raw prompt/response text is not written by metadata or logs |
 | `privacy.include_snippet_hash` | bool | `true` | Include SHA-256 hashes of matched segments for correlation |
 | `expose_rule_id_to_client` | bool | `false` | Include rule IDs in reject bodies |
 
-Built-in rules use a small lexical fast path for obvious attacks and an embedding similarity pass for semantic matches. Rule embeddings are initialized lazily on the first request and guarded to avoid first-request stampedes. The embedding pass sends extracted prompt, document, tool, and response text to `provider.endpoint`; use an approved embedding service, private embedding gateway, or tenant-aware proxy for sensitive workloads.
+Built-in rules use a small lexical fast path for obvious attacks and an embedding similarity pass for semantic matches. Rule embeddings are initialized lazily on the first request and guarded to avoid first-request stampedes. The embedding pass sends extracted prompt, document, tool, and response text to `provider.endpoint` in plaintext over the configured scheme; use HTTPS or a trusted private embedding gateway and vet the provider as a data processor for sensitive workloads. Each embedding request uses `provider.request_timeout_ms` (default `5000`) so slow providers do not inherit the shared plugin client's broader 60s request timeout.
 
 The default `on_error: warn` is fail-open: provider outages, parse errors, or timeouts continue the request and emit provider-error metadata. Use `on_error: reject` when policy evaluation must fail closed, especially for `allow_topics` where a provider outage otherwise prevents proving the request is in an allowed topic.
 
@@ -3389,7 +3389,7 @@ builtins:
 
 `examples_mode: append` keeps Ferrum's default examples and adds customer examples to the same built-in rule ID and pack metadata. `examples_mode: replace` uses only the supplied semantic examples for that pack. Built-in lexical fast paths remain active while a built-in pack is enabled; disable the pack and use `custom_rules` when the goal is a fully customer-owned rule.
 
-**Metadata keys:** `ai_semantic_firewall.enabled`, `.mode`, `.direction`, `.decision`, `.action`, `.rule_ids`, `.rule_packs`, `.max_score`, `.max_severity`, `.segment_kinds`, `.matcher_type`, and `.snippet_hashes`. Dry-run decisions also emit `.would_action`; provider failures emit `.provider_error`.
+**Metadata keys:** `ai_semantic_firewall.enabled`, `.mode`, `.direction`, `.decision`, `.action`, `.rule_ids`, `.rule_packs`, `.max_score`, `.max_severity`, `.segment_kinds`, `.matcher_type`, and `.snippet_hashes`. Dry-run decisions also emit `.would_action`; provider failures emit `.provider_error`; `stream: true` requests with response rules emit `.response_inspection_skipped=streaming`.
 
 **Basic protection:**
 
