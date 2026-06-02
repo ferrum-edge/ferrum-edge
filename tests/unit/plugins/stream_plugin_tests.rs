@@ -771,6 +771,17 @@ fn test_http_grpc_plugins_complete_coverage() {
             "ai_prompt_shield",
             json!({"endpoint": "http://example.com/shield"}),
         ),
+        (
+            "ai_semantic_firewall",
+            json!({
+                "provider": {
+                    "type": "openai_compatible_embeddings",
+                    "endpoint": "http://127.0.0.1:9/v1/embeddings",
+                    "model": "test-embedding-model"
+                },
+                "builtins": {"prompt_injection": true}
+            }),
+        ),
     ];
 
     for (name, config) in plugins {

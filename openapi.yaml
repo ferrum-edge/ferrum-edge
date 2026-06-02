@@ -3474,6 +3474,7 @@ paths:
                 - ai_request_guard
                 - ai_rate_limiter
                 - ai_prompt_shield
+                - ai_semantic_firewall
                 - ai_response_guard
                 - ai_semantic_cache
                 - ai_federation
@@ -6018,7 +6019,7 @@ components:
             oauth2_introspection, oidc_relying_party, hmac_auth, ldap_auth,
             mtls_auth, access_control,
             tcp_connection_throttle, ip_restriction, waf, security_headers, mesh_authz, opa,
-            mesh_outbound_registry, openapi_validator) are validation-fatal: invalid config blocks
+            mesh_outbound_registry, openapi_validator, ai_semantic_firewall) are validation-fatal: invalid config blocks
             gateway startup in file mode, and on DB/CP polling the new config
             snapshot is rejected as a whole (the gateway keeps serving the
             prior good config). Non-security plugins with invalid config are
@@ -12562,6 +12563,202 @@ components:
           description: >-
             Reject requests missing grpc-timeout with HTTP 400. Takes
             precedence over default_deadline_ms.
+
+    AiSemanticFirewallConfig:
+      type: object
+      description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata."
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        inspect:
+          type: object
+          properties:
+            request:
+              type: boolean
+              default: true
+            response:
+              type: boolean
+              default: true
+          description: Request and response inspection toggles.
+        mode:
+          type: string
+          enum: [enforce, dry_run]
+          default: enforce
+          description: Dry-run mode never rejects and emits would_action metadata.
+        on_error:
+          type: string
+          enum: [warn, allow, reject]
+          default: warn
+          description: Behavior when embedding/evaluation fails.
+        default_action:
+          type: string
+          enum: [reject, warn]
+          default: reject
+          description: Default action for built-in semantic rules.
+        provider:
+          type: object
+          required: [type, endpoint]
+          properties:
+            type:
+              type: string
+              enum: [openai_compatible_embeddings]
+              description: OpenAI-compatible embeddings provider.
+            endpoint:
+              type: string
+              format: uri
+              description: Embeddings endpoint URL.
+            model:
+              type: string
+              description: Embedding model sent in the request body.
+            api_key_env:
+              type: string
+              description: Environment variable holding the provider API key. Sent as Authorization Bearer when present.
+          description: Required when the plugin has active rules.
+        builtins:
+          type: object
+          properties:
+            prompt_injection:
+              type: boolean
+            jailbreak:
+              type: boolean
+            system_prompt_exfiltration:
+              type: boolean
+            data_exfiltration:
+              type: boolean
+            indirect_prompt_injection:
+              type: boolean
+            tool_abuse:
+              type: boolean
+            response_leakage:
+              type: boolean
+          description: Built-in rule packs. When omitted, all built-ins are enabled; when provided, omitted packs are disabled.
+        extraction:
+          type: object
+          properties:
+            request_json_paths:
+              type: array
+              items:
+                type: string
+              default:
+                - "$.messages[*].content"
+                - "$.input"
+                - "$.instructions"
+                - "$.context"
+                - "$.documents[*].text"
+                - "$.retrieved_context[*].content"
+                - "$.tool_results[*].content"
+              description: Supported simple request extraction paths.
+            response_json_paths:
+              type: array
+              items:
+                type: string
+              default:
+                - "$.choices[*].message.content"
+                - "$.choices[*].delta.content"
+                - "$.output_text"
+                - "$.output[*].content[*].text"
+              description: Supported simple response extraction paths.
+        allow_topics:
+          type: array
+          items:
+            type: object
+            required: [id, examples]
+            properties:
+              id:
+                type: string
+              description:
+                type: string
+              examples:
+                type: array
+                minItems: 1
+                items:
+                  type: string
+              threshold:
+                type: number
+                format: float
+                minimum: 0
+                maximum: 1
+                default: 0.74
+              action_on_no_match:
+                type: string
+                enum: [reject, warn]
+                default: reject
+          description: Mandatory request-side semantic allow topics.
+        deny_topics:
+          type: array
+          items:
+            type: object
+            required: [id, examples]
+            properties:
+              id:
+                type: string
+              description:
+                type: string
+              examples:
+                type: array
+                minItems: 1
+                items:
+                  type: string
+              threshold:
+                type: number
+                format: float
+                minimum: 0
+                maximum: 1
+                default: 0.78
+              action:
+                type: string
+                enum: [reject, warn]
+                default: reject
+          description: Customer-defined request/response semantic deny topics.
+        custom_rules:
+          type: array
+          items:
+            type: object
+            required: [id, examples]
+            properties:
+              id:
+                type: string
+              description:
+                type: string
+              direction:
+                type: string
+                enum: [request, response, both]
+                default: both
+              severity:
+                type: string
+                enum: [low, medium, high, critical]
+                default: high
+              action:
+                type: string
+                enum: [allow, warn, reject]
+                default: reject
+              examples:
+                type: array
+                minItems: 1
+                items:
+                  type: string
+              threshold:
+                type: number
+                format: float
+                minimum: 0
+                maximum: 1
+                default: 0.80
+          description: Customer-defined semantic rules.
+        privacy:
+          type: object
+          properties:
+            log_raw_text:
+              type: boolean
+              default: false
+            include_snippet_hash:
+              type: boolean
+              default: true
+          description: Raw prompt/response text is not written by default; hashes are for correlation only.
+        expose_rule_id_to_client:
+          type: boolean
+          default: false
+          description: Include matched rule IDs in reject responses.
 
     AiSemanticCacheConfig:
       type: object

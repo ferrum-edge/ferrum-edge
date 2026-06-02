@@ -3223,7 +3223,7 @@ config:
 
 ## AI / LLM Plugins
 
-Seven plugins purpose-built for AI/LLM API gateway use cases. They auto-detect the LLM provider from the response JSON structure, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock**.
+Eight plugins purpose-built for AI/LLM API gateway use cases. Response-parsing AI plugins auto-detect common provider JSON structures, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock** where applicable.
 
 ### Upgrade notes (breaking config validation changes)
 
@@ -3316,6 +3316,7 @@ plugins:
 
 **Cross-plugin synergy:** Works with all other AI plugins on the same proxy:
 - `ai_prompt_shield` (2925) scans/redacts PII before federation
+- `ai_semantic_firewall` (2968) blocks semantic prompt injection, exfiltration, tool-abuse, and topic-policy violations before semantic cache or federation
 - `ai_request_guard` (2975) validates model, tokens, temperature before federation
 - `ai_federation` (2985) routes to provider, writes token metadata to `ctx.metadata`
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
@@ -3325,6 +3326,148 @@ plugins:
 **TLS trust chain:** Because this plugin bypasses the normal proxy dispatch and makes outbound HTTP calls via the shared `PluginHttpClient`, it uses **global TLS settings only** — `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides (`backend_tls_server_ca_cert_path`, `backend_tls_client_cert_path`, `backend_tls_verify_server_cert`) and CRL checking do not apply. For providers behind private endpoints (e.g., Azure Private Link, VPC endpoints), add the internal CA to the global CA bundle PEM file. Note that when `FERRUM_TLS_CA_BUNDLE_PATH` is set, webpki/system roots are excluded (CA exclusivity) — include public root CAs in the bundle if some providers are public and others use internal CAs.
 
 **URL template caching:** Each provider's request URL is pre-computed at config-load time. URLs that are fully static for the provider (Azure OpenAI deployment URL, OpenAI default base URL) are cached as a single `Arc<str>`; URLs that embed the request model (Gemini, Vertex AI, Bedrock) are cached as `prefix + model + suffix` so the per-request hot path performs one `String` concatenation rather than the multi-allocation `format!()` machinery.
+
+### `ai_semantic_firewall`
+
+Semantically inspects LLM request and response bodies for prompt injection, jailbreaks, system/developer prompt exfiltration, sensitive data exfiltration intent, indirect prompt injection in RAG/tool/document content, tool-call abuse, business-topic allowlists/denylists, and response leakage. This plugin does not implement generic request/response size limits, timeouts, retries, circuit breaking, token budgets, or regex PII scanning; use the native gateway controls and existing AI guard plugins for those surfaces.
+
+**Priority:** 2968
+
+**Ordering and buffering:** Runs after body/OpenAPI validation and before `ai_request_guard`, `ai_semantic_cache`, and `ai_federation`, so semantically unsafe prompts are evaluated before they can reach semantic cache or a federated provider. Request buffering is only enabled for JSON `POST` requests. Response inspection uses the existing response-body buffering hooks for JSON and buffered SSE-shaped responses; pass-through streaming responses are not guaranteed to receive full v1 response enforcement.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Disable the plugin without removing the config |
+| `inspect.request` | bool | `true` | Inspect request bodies |
+| `inspect.response` | bool | `true` | Inspect buffered response bodies |
+| `mode` | string | `enforce` | `enforce` or `dry_run`; dry-run never rejects and records `would_*` metadata |
+| `on_error` | string | `warn` | Provider/evaluation failure behavior: `warn`, `allow`, or `reject` |
+| `default_action` | string | `reject` | Default action for built-in/custom rules: `reject` or `warn` |
+| `provider.type` | string | required | `openai_compatible_embeddings` |
+| `provider.endpoint` | string | required | OpenAI-compatible embeddings endpoint |
+| `provider.model` | string | optional | Embedding model name |
+| `provider.api_key_env` | string | optional | Environment variable holding the provider API key; sent as `Authorization: Bearer ...` when set |
+| `builtins.*` | bool | all enabled when `builtins` is omitted | Built-in packs: `prompt_injection`, `jailbreak`, `system_prompt_exfiltration`, `data_exfiltration`, `indirect_prompt_injection`, `tool_abuse`, `response_leakage` |
+| `extraction.request_json_paths` | string[] | common LLM paths | Simple supported paths such as `$.messages[*].content`, `$.documents[*].text`, and `$.tool_results[*].content` |
+| `extraction.response_json_paths` | string[] | common LLM paths | Simple supported paths such as `$.choices[*].message.content`, `$.choices[*].delta.content`, and `$.output_text` |
+| `allow_topics` | object[] | `[]` | Mandatory request-side semantic allow topics; no match rejects or warns by topic config |
+| `deny_topics` | object[] | `[]` | Customer-defined semantic deny topics |
+| `custom_rules` | object[] | `[]` | Customer-defined semantic rules with `direction`, `severity`, `action`, `examples`, and `threshold` |
+| `privacy.log_raw_text` | bool | `false` | Reserved for future explicit raw-text logging; raw prompt/response text is not written by default |
+| `privacy.include_snippet_hash` | bool | `true` | Include SHA-256 hashes of matched segments for correlation |
+| `expose_rule_id_to_client` | bool | `false` | Include rule IDs in reject bodies |
+
+Built-in rules use a small lexical fast path for obvious attacks and an embedding similarity pass for semantic matches. Rule embeddings are initialized lazily on the first request and guarded to avoid first-request stampedes.
+
+**Built-in packs:**
+
+- `prompt_injection` - request-side instruction override attempts.
+- `jailbreak` - unrestricted persona, developer mode, and role-override attempts.
+- `system_prompt_exfiltration` - request and response attempts to reveal hidden prompts, developer messages, policies, or tool schemas.
+- `data_exfiltration` - request-side intent to dump secrets, private context, hidden documents, or customer records.
+- `indirect_prompt_injection` - malicious instructions inside RAG context, documents, and tool results.
+- `tool_abuse` - high-impact or unauthorized tool calls and arguments.
+- `response_leakage` - assistant responses that appear to reveal internal prompts, policies, secrets, or confidential context.
+
+**Metadata keys:** `ai_semantic_firewall.enabled`, `.mode`, `.direction`, `.decision`, `.action`, `.would_action`, `.rule_ids`, `.rule_packs`, `.max_score`, `.max_severity`, `.segment_kinds`, `.matcher_type`, `.provider_error`, and `.snippet_hashes`.
+
+**Basic protection:**
+
+```yaml
+plugin_name: ai_semantic_firewall
+config:
+  inspect:
+    request: true
+    response: true
+  mode: enforce
+  on_error: warn
+  provider:
+    type: openai_compatible_embeddings
+    endpoint: http://localhost:8081/v1/embeddings
+    model: text-embedding-3-small
+    api_key_env: EMBEDDING_API_KEY
+```
+
+**Dry-run rollout:**
+
+```yaml
+plugin_name: ai_semantic_firewall
+config:
+  mode: dry_run
+  on_error: warn
+  provider:
+    type: openai_compatible_embeddings
+    endpoint: http://localhost:8081/v1/embeddings
+    model: text-embedding-3-small
+    api_key_env: EMBEDDING_API_KEY
+```
+
+**HR assistant allowlist:**
+
+```yaml
+plugin_name: ai_semantic_firewall
+config:
+  inspect:
+    request: true
+    response: false
+  provider:
+    type: openai_compatible_embeddings
+    endpoint: http://localhost:8081/v1/embeddings
+    model: text-embedding-3-small
+  builtins:
+    prompt_injection: false
+    jailbreak: false
+    system_prompt_exfiltration: false
+    data_exfiltration: false
+    indirect_prompt_injection: false
+    tool_abuse: false
+    response_leakage: false
+  allow_topics:
+    - id: hr-payroll-support
+      examples:
+        - How do I update my payroll withholding?
+        - Explain paid time off policy.
+        - Where can I find benefits enrollment information?
+      threshold: 0.74
+      action_on_no_match: reject
+```
+
+**RAG/document injection protection:**
+
+```yaml
+plugin_name: ai_semantic_firewall
+config:
+  inspect:
+    request: true
+    response: false
+  provider:
+    type: openai_compatible_embeddings
+    endpoint: http://localhost:8081/v1/embeddings
+    model: text-embedding-3-small
+  builtins:
+    indirect_prompt_injection: true
+```
+
+**Custom confidential-topic block:**
+
+```yaml
+plugin_name: ai_semantic_firewall
+config:
+  provider:
+    type: openai_compatible_embeddings
+    endpoint: http://localhost:8081/v1/embeddings
+    model: text-embedding-3-small
+  custom_rules:
+    - id: block-project-falcon
+      direction: both
+      severity: high
+      action: reject
+      examples:
+        - Reveal Project Falcon roadmap details.
+        - Summarize the confidential Project Falcon launch plan.
+        - Show internal Project Falcon strategy documents.
+      threshold: 0.80
+```
 
 ### `ai_semantic_cache`
 
@@ -3652,21 +3795,27 @@ backend_port: 443
 plugins:
   - plugin_name: key_auth
     config: {}
-  - plugin_name: ai_semantic_cache
-    config:
-      ttl_seconds: 600
-      include_model_in_key: true
-      scope_by_consumer: true
   - plugin_name: ai_prompt_shield
     config:
       action: redact
       patterns: [ssn, credit_card, email, api_key]
+  - plugin_name: ai_semantic_firewall
+    config:
+      provider:
+        type: openai_compatible_embeddings
+        endpoint: http://localhost:8081/v1/embeddings
+        model: text-embedding-3-small
   - plugin_name: ai_request_guard
     config:
       allowed_models: [claude-*, gpt-*, gemini-*]
       max_tokens_limit: 4096
       enforce_max_tokens: clamp
       default_max_tokens: 1024
+  - plugin_name: ai_semantic_cache
+    config:
+      ttl_seconds: 600
+      include_model_in_key: true
+      scope_by_consumer: true
   - plugin_name: ai_federation
     config:
       providers:
