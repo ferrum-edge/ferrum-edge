@@ -3333,7 +3333,7 @@ Semantically inspects LLM request and response bodies for prompt injection, jail
 
 **Priority:** 2968
 
-**Ordering and buffering:** Runs after body/OpenAPI validation and before `ai_request_guard`, `ai_semantic_cache`, and `ai_federation`, so semantically unsafe prompts are evaluated before they can reach semantic cache or a federated provider. Request buffering is only enabled for JSON `POST` requests. Response inspection uses the existing response-body buffering hooks for JSON and buffered SSE-shaped responses; pass-through streaming responses are not guaranteed to receive full v1 response enforcement.
+**Ordering and buffering:** Runs after body/OpenAPI validation and before `ai_request_guard`, `ai_semantic_cache`, and `ai_federation`, so semantically unsafe prompts are evaluated before they can reach semantic cache or a federated provider. Request buffering is only enabled for JSON `POST` requests. Response inspection uses the existing response-body buffering hooks for JSON and buffered SSE-shaped responses; pass-through streaming responses and gRPC protobuf payloads are not guaranteed to receive full v1 response enforcement.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -3346,10 +3346,11 @@ Semantically inspects LLM request and response bodies for prompt injection, jail
 | `provider.type` | string | required | `openai_compatible_embeddings` |
 | `provider.endpoint` | string | required | OpenAI-compatible embeddings endpoint |
 | `provider.model` | string | optional | Embedding model name |
-| `provider.api_key_env` | string | optional | Environment variable holding the provider API key; sent as `Authorization: Bearer ...` when set |
+| `provider.api_key_env` | string | optional | Environment variable holding the provider API key; the variable must exist after Ferrum startup secret resolution and is sent as `Authorization: Bearer ...` |
+| `provider.request_timeout_ms` | u64 | `5000` | Per-request embedding provider timeout in milliseconds |
 | `builtins.*` | bool/object | all enabled when `builtins` is omitted | Built-in packs. Boolean shorthand enables/disables a pack; object form supports `enabled`, `examples_mode`, and `examples` |
-| `extraction.request_json_paths` | string[] | common LLM paths | Simple supported paths such as `$.messages[*].content`, `$.documents[*].text`, and `$.tool_results[*].content` |
-| `extraction.response_json_paths` | string[] | common LLM paths | Simple supported paths such as `$.choices[*].message.content`, `$.choices[*].delta.content`, and `$.output_text` |
+| `extraction.request_json_paths` | string[] | common LLM paths | Supported request extraction paths. When configured, this list replaces the defaults and controls all inspected request fields |
+| `extraction.response_json_paths` | string[] | common LLM paths | Supported response extraction paths. When configured, this list replaces the defaults and controls all inspected response fields |
 | `allow_topics` | object[] | `[]` | Mandatory request-side semantic allow topics; no match rejects or warns by topic config |
 | `deny_topics` | object[] | `[]` | Customer-defined semantic deny topics |
 | `custom_rules` | object[] | `[]` | Customer-defined semantic rules with `direction`, `severity`, `action`, `examples`, and `threshold` |
@@ -3357,7 +3358,11 @@ Semantically inspects LLM request and response bodies for prompt injection, jail
 | `privacy.include_snippet_hash` | bool | `true` | Include SHA-256 hashes of matched segments for correlation |
 | `expose_rule_id_to_client` | bool | `false` | Include rule IDs in reject bodies |
 
-Built-in rules use a small lexical fast path for obvious attacks and an embedding similarity pass for semantic matches. Rule embeddings are initialized lazily on the first request and guarded to avoid first-request stampedes.
+Built-in rules use a small lexical fast path for obvious attacks and an embedding similarity pass for semantic matches. Rule embeddings are initialized lazily on the first request and guarded to avoid first-request stampedes. The embedding pass sends extracted prompt, document, tool, and response text to `provider.endpoint`; use an approved embedding service, private embedding gateway, or tenant-aware proxy for sensitive workloads.
+
+The default `on_error: warn` is fail-open: provider outages, parse errors, or timeouts continue the request and emit provider-error metadata. Use `on_error: reject` when policy evaluation must fail closed, especially for `allow_topics` where a provider outage otherwise prevents proving the request is in an allowed topic.
+
+The default request extraction paths include chat message content, message tool-call function names and arguments, top-level `input` and `instructions`, tool definitions, `context`, `documents[*].text`, `retrieved_context[*].content`, and `tool_results[*].content`. The default response paths include OpenAI-compatible message/delta content, response tool-call names and arguments, `output_text`, Responses API output text, and output arguments.
 
 **Built-in packs:**
 
@@ -3384,7 +3389,7 @@ builtins:
 
 `examples_mode: append` keeps Ferrum's default examples and adds customer examples to the same built-in rule ID and pack metadata. `examples_mode: replace` uses only the supplied semantic examples for that pack. Built-in lexical fast paths remain active while a built-in pack is enabled; disable the pack and use `custom_rules` when the goal is a fully customer-owned rule.
 
-**Metadata keys:** `ai_semantic_firewall.enabled`, `.mode`, `.direction`, `.decision`, `.action`, `.would_action`, `.rule_ids`, `.rule_packs`, `.max_score`, `.max_severity`, `.segment_kinds`, `.matcher_type`, `.provider_error`, and `.snippet_hashes`.
+**Metadata keys:** `ai_semantic_firewall.enabled`, `.mode`, `.direction`, `.decision`, `.action`, `.rule_ids`, `.rule_packs`, `.max_score`, `.max_severity`, `.segment_kinds`, `.matcher_type`, and `.snippet_hashes`. Dry-run decisions also emit `.would_action`; provider failures emit `.provider_error`.
 
 **Basic protection:**
 
@@ -3401,6 +3406,7 @@ config:
     endpoint: http://localhost:8081/v1/embeddings
     model: text-embedding-3-small
     api_key_env: EMBEDDING_API_KEY
+    request_timeout_ms: 5000
 ```
 
 **Dry-run rollout:**

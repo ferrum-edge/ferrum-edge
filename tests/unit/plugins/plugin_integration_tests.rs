@@ -226,6 +226,7 @@ async fn test_all_plugins_available() {
         "ai_prompt_shield",
         "ai_response_guard",
         "ai_semantic_cache",
+        "ai_semantic_firewall",
         "geo_restriction",
         "request_deduplication",
         "ws_message_size_limiting",
@@ -372,6 +373,13 @@ async fn test_plugin_creation_all_plugins() {
             "ai_federation" => {
                 json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})
             }
+            "ai_semantic_firewall" => json!({
+                "provider": {
+                    "type": "openai_compatible_embeddings",
+                    "endpoint": "http://127.0.0.1:9/v1/embeddings",
+                    "request_timeout_ms": 100
+                }
+            }),
             "ldap_auth" => json!({
                 "ldap_url": "ldap://ldap.example.com:389",
                 "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"

@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
+use tokio::sync::OnceCell;
 use url::Url;
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
@@ -19,8 +20,13 @@ use super::{HTTP_GRPC_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, Request
 
 const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
     "$.messages[*].content",
+    "$.messages[*].tool_calls[*].function.name",
+    "$.messages[*].tool_calls[*].function.arguments",
     "$.input",
     "$.instructions",
+    "$.tools[*].function.name",
+    "$.tools[*].function.description",
+    "$.tools[*].function.parameters",
     "$.context",
     "$.documents[*].text",
     "$.retrieved_context[*].content",
@@ -29,9 +35,14 @@ const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
 
 const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     "$.choices[*].message.content",
+    "$.choices[*].message.tool_calls[*].function.name",
+    "$.choices[*].message.tool_calls[*].function.arguments",
     "$.choices[*].delta.content",
+    "$.choices[*].delta.tool_calls[*].function.name",
+    "$.choices[*].delta.tool_calls[*].function.arguments",
     "$.output_text",
     "$.output[*].content[*].text",
+    "$.output[*].arguments",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +264,7 @@ struct ProviderConfig {
     endpoint: String,
     model: Option<String>,
     api_key: Option<String>,
+    request_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -322,7 +334,7 @@ pub struct AiSemanticFirewall {
     expose_rule_id_to_client: bool,
     has_request_rules: bool,
     has_response_rules: bool,
-    rule_embeddings: Mutex<Option<Arc<RuleEmbeddingIndex>>>,
+    rule_embeddings: OnceCell<Arc<RuleEmbeddingIndex>>,
 }
 
 impl AiSemanticFirewall {
@@ -417,7 +429,7 @@ impl AiSemanticFirewall {
                 expose_rule_id_to_client,
                 has_request_rules: false,
                 has_response_rules: false,
-                rule_embeddings: Mutex::new(None),
+                rule_embeddings: OnceCell::new(),
             });
         }
 
@@ -452,17 +464,9 @@ impl AiSemanticFirewall {
 
         let has_request_rules = inspect_request
             && (!allow_topics.is_empty()
-                || rules.iter().any(|rule| {
-                    rule.direction.includes(Direction::Request)
-                        && rule.applies_to.iter().any(|kind| {
-                            !matches!(
-                                kind,
-                                SegmentKind::AssistantMessage
-                                    | SegmentKind::SystemPrompt
-                                    | SegmentKind::DeveloperPrompt
-                            ) || matches!(rule.direction, DirectionScope::Both)
-                        })
-                }));
+                || rules
+                    .iter()
+                    .any(|rule| rule.direction.includes(Direction::Request)));
         let has_response_rules = inspect_response
             && rules
                 .iter()
@@ -490,7 +494,7 @@ impl AiSemanticFirewall {
             expose_rule_id_to_client,
             has_request_rules,
             has_response_rules,
-            rule_embeddings: Mutex::new(None),
+            rule_embeddings: OnceCell::new(),
         })
     }
 
@@ -654,11 +658,20 @@ impl AiSemanticFirewall {
         &self,
         provider: &ProviderConfig,
     ) -> Result<Arc<RuleEmbeddingIndex>, String> {
-        let mut guard = self.rule_embeddings.lock().await;
-        if let Some(index) = guard.as_ref() {
-            return Ok(Arc::clone(index));
-        }
+        self.rule_embeddings
+            .get_or_try_init(|| async {
+                self.build_rule_embedding_index(provider)
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+            .map(Arc::clone)
+    }
 
+    async fn build_rule_embedding_index(
+        &self,
+        provider: &ProviderConfig,
+    ) -> Result<RuleEmbeddingIndex, String> {
         let mut inputs = Vec::new();
         let mut rule_ranges = Vec::new();
         for rule in &self.rules {
@@ -685,12 +698,10 @@ impl AiSemanticFirewall {
             allow_topic_embeddings.insert(id, embeddings[start..end].to_vec());
         }
 
-        let index = Arc::new(RuleEmbeddingIndex {
+        Ok(RuleEmbeddingIndex {
             rule_embeddings,
             allow_topic_embeddings,
-        });
-        *guard = Some(Arc::clone(&index));
-        Ok(index)
+        })
     }
 
     async fn embed_texts(
@@ -713,6 +724,7 @@ impl AiSemanticFirewall {
             .http_client
             .get()
             .post(&provider.endpoint)
+            .timeout(provider.request_timeout)
             .json(&payload);
         if let Some(api_key) = &provider.api_key {
             request = request.header("Authorization", format!("Bearer {api_key}"));
@@ -785,8 +797,13 @@ impl AiSemanticFirewall {
             .cloned()
             .collect();
         if let Some(top) = negative_matches.first() {
+            let action = if negative_matches.iter().any(|m| m.action == Action::Reject) {
+                Action::Reject
+            } else {
+                top.action
+            };
             return FirewallDecision {
-                action: top.action,
+                action,
                 dry_run: self.mode == EnforcementMode::DryRun,
                 matches: negative_matches,
             };
@@ -900,14 +917,12 @@ impl AiSemanticFirewall {
                 decision.action.as_str().to_string()
             },
         );
-        ctx.metadata.insert(
-            "ai_semantic_firewall.would_action".to_string(),
-            if decision.dry_run {
-                decision.action.as_str().to_string()
-            } else {
-                String::new()
-            },
-        );
+        if decision.dry_run {
+            ctx.metadata.insert(
+                "ai_semantic_firewall.would_action".to_string(),
+                decision.action.as_str().to_string(),
+            );
+        }
 
         let rule_ids = join_unique(
             decision
@@ -1029,11 +1044,6 @@ impl AiSemanticFirewall {
                 "ai_semantic_firewall.provider_error".to_string(),
                 sanitize_provider_error(provider_error),
             );
-        } else {
-            ctx.metadata.insert(
-                "ai_semantic_firewall.provider_error".to_string(),
-                String::new(),
-            );
         }
 
         if self.privacy.log_raw_text {
@@ -1057,31 +1067,34 @@ impl AiSemanticFirewall {
             return PluginResult::Continue;
         }
 
-        let rule_fragment = if self.expose_rule_id_to_client {
-            let rule_ids = join_unique(
+        let rule_ids = if self.expose_rule_id_to_client {
+            Some(join_unique(
                 decision
                     .matches
                     .iter()
                     .map(|m| m.rule_id.as_str())
                     .collect::<Vec<_>>(),
-            );
-            format!(r#","rule_ids":"{}""#, json_escape(&rule_ids))
+            ))
         } else {
-            String::new()
+            None
         };
 
         match direction {
             Direction::Request => PluginResult::Reject {
                 status_code: 403,
-                body: format!(
-                    r#"{{"error":{{"code":"ai_semantic_firewall_rejected","message":"Request violates AI semantic firewall policy."{rule_fragment}}}}}"#
+                body: rejection_body(
+                    "ai_semantic_firewall_rejected",
+                    "Request violates AI semantic firewall policy.",
+                    rule_ids.as_deref(),
                 ),
                 headers: json_headers(),
             },
             Direction::Response => PluginResult::Reject {
                 status_code: 502,
-                body: format!(
-                    r#"{{"error":{{"code":"ai_semantic_firewall_response_blocked","message":"AI response was blocked by semantic firewall policy."{rule_fragment}}}}}"#
+                body: rejection_body(
+                    "ai_semantic_firewall_response_blocked",
+                    "AI response was blocked by semantic firewall policy.",
+                    rule_ids.as_deref(),
                 ),
                 headers: json_headers(),
             },
@@ -1112,8 +1125,11 @@ impl AiSemanticFirewall {
 
         PluginResult::Reject {
             status_code: 503,
-            body: r#"{"error":{"code":"ai_semantic_firewall_unavailable","message":"AI semantic firewall policy could not be evaluated."}}"#
-                .to_string(),
+            body: rejection_body(
+                "ai_semantic_firewall_unavailable",
+                "AI semantic firewall policy could not be evaluated.",
+                None,
+            ),
             headers: json_headers(),
         }
     }
@@ -1134,7 +1150,9 @@ impl Plugin for AiSemanticFirewall {
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.enabled && self.inspect_request && self.has_request_rules
+        self.enabled
+            && ((self.inspect_request && self.has_request_rules)
+                || (self.inspect_response && self.has_response_rules))
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
@@ -1151,7 +1169,7 @@ impl Plugin for AiSemanticFirewall {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.enabled || !self.inspect_request || !self.has_request_rules {
+        if !self.enabled {
             return PluginResult::Continue;
         }
         if ctx.method != "POST" {
@@ -1164,17 +1182,26 @@ impl Plugin for AiSemanticFirewall {
             return PluginResult::Continue;
         }
 
-        let Some(body) = ctx.metadata.get("request_body").map(String::as_str) else {
+        let Some(body) = ctx.metadata.get("request_body").cloned() else {
             return PluginResult::Continue;
         };
         if body.trim().is_empty() {
             return PluginResult::Continue;
         }
 
-        let json: Value = match serde_json::from_str(body) {
+        let json: Value = match serde_json::from_str(&body) {
             Ok(json) => json,
             Err(_) => return PluginResult::Continue,
         };
+
+        if json.get("stream").and_then(Value::as_bool) == Some(true) {
+            ctx.metadata
+                .insert("ai_request_streaming".to_string(), "true".to_string());
+        }
+
+        if !self.inspect_request || !self.has_request_rules {
+            return PluginResult::Continue;
+        }
 
         let segments = extract_request_segments(&json, &self.extraction);
         if segments.is_empty() {
@@ -1778,114 +1805,29 @@ fn parse_provider_config(config: &Value) -> Result<Option<ProviderConfig>, Strin
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let api_key = api_key_env.and_then(|env_name| std::env::var(env_name).ok());
+    let api_key = match api_key_env {
+        Some(env_name) => Some(std::env::var(&env_name).map_err(|_| {
+            format!(
+                "ai_semantic_firewall: provider.api_key_env {env_name:?} is set but the environment variable is not present"
+            )
+        })?),
+        None => None,
+    };
+    let request_timeout_ms =
+        optional_positive_u64_from_object(provider, "request_timeout_ms")?.unwrap_or(5_000);
 
     Ok(Some(ProviderConfig {
         endpoint,
         model,
         api_key,
+        request_timeout: Duration::from_millis(request_timeout_ms),
     }))
 }
 
 fn extract_request_segments(json: &Value, extraction: &ExtractionConfig) -> Vec<TextSegment> {
     let mut segments = Vec::new();
-
-    if let Some(messages) = json.get("messages").and_then(Value::as_array) {
-        for (message_index, message) in messages.iter().enumerate() {
-            let role = message.get("role").and_then(Value::as_str);
-            let kind = match role {
-                Some("system") => SegmentKind::SystemPrompt,
-                Some("developer") => SegmentKind::DeveloperPrompt,
-                Some("assistant") => SegmentKind::AssistantMessage,
-                Some("user") => SegmentKind::UserPrompt,
-                _ => SegmentKind::GenericText,
-            };
-            extract_text_value(
-                message.get("content"),
-                Direction::Request,
-                kind,
-                role.map(str::to_string),
-                Some(format!("$.messages[{message_index}].content")),
-                &mut segments,
-            );
-
-            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-                for (call_index, call) in tool_calls.iter().enumerate() {
-                    let function = call.get("function").unwrap_or(call);
-                    extract_text_value(
-                        function.get("name"),
-                        Direction::Request,
-                        SegmentKind::ToolCall,
-                        role.map(str::to_string),
-                        Some(format!(
-                            "$.messages[{message_index}].tool_calls[{call_index}].function.name"
-                        )),
-                        &mut segments,
-                    );
-                    extract_text_value(
-                        function.get("arguments"),
-                        Direction::Request,
-                        SegmentKind::ToolArguments,
-                        role.map(str::to_string),
-                        Some(format!(
-                            "$.messages[{message_index}].tool_calls[{call_index}].function.arguments"
-                        )),
-                        &mut segments,
-                    );
-                }
-            }
-        }
-    }
-
-    extract_text_value(
-        json.get("instructions"),
-        Direction::Request,
-        SegmentKind::DeveloperPrompt,
-        None,
-        Some("$.instructions".to_string()),
-        &mut segments,
-    );
-    extract_text_value(
-        json.get("input"),
-        Direction::Request,
-        SegmentKind::UserPrompt,
-        None,
-        Some("$.input".to_string()),
-        &mut segments,
-    );
-
-    if let Some(tools) = json.get("tools").and_then(Value::as_array) {
-        for (tool_index, tool) in tools.iter().enumerate() {
-            let function = tool.get("function").unwrap_or(tool);
-            extract_text_value(
-                function.get("name"),
-                Direction::Request,
-                SegmentKind::ToolDefinition,
-                None,
-                Some(format!("$.tools[{tool_index}].function.name")),
-                &mut segments,
-            );
-            extract_text_value(
-                function.get("description"),
-                Direction::Request,
-                SegmentKind::ToolDefinition,
-                None,
-                Some(format!("$.tools[{tool_index}].function.description")),
-                &mut segments,
-            );
-            extract_text_value(
-                function.get("parameters"),
-                Direction::Request,
-                SegmentKind::ToolDefinition,
-                None,
-                Some(format!("$.tools[{tool_index}].function.parameters")),
-                &mut segments,
-            );
-        }
-    }
-
     for path in &extraction.request_json_paths {
-        extract_known_path(json, Direction::Request, path, &mut segments);
+        extract_known_path(json, Direction::Request, path, None, &mut segments);
     }
 
     dedupe_segments(segments)
@@ -1897,104 +1839,14 @@ fn extract_response_segments_from_json(
     prefix: Option<String>,
     segments: &mut Vec<TextSegment>,
 ) {
-    let path = |suffix: String| -> String {
-        match &prefix {
-            Some(prefix) => format!("{prefix}.{suffix}"),
-            None => suffix,
-        }
-    };
-
-    if let Some(choices) = json.get("choices").and_then(Value::as_array) {
-        for (choice_index, choice) in choices.iter().enumerate() {
-            extract_text_value(
-                choice.get("message").and_then(|m| m.get("content")),
-                Direction::Response,
-                SegmentKind::AssistantMessage,
-                Some("assistant".to_string()),
-                Some(path(format!("$.choices[{choice_index}].message.content"))),
-                segments,
-            );
-            extract_text_value(
-                choice.get("delta").and_then(|m| m.get("content")),
-                Direction::Response,
-                SegmentKind::AssistantMessage,
-                Some("assistant".to_string()),
-                Some(path(format!("$.choices[{choice_index}].delta.content"))),
-                segments,
-            );
-
-            for field in ["message", "delta"] {
-                if let Some(tool_calls) = choice
-                    .get(field)
-                    .and_then(|message| message.get("tool_calls"))
-                    .and_then(Value::as_array)
-                {
-                    for (call_index, call) in tool_calls.iter().enumerate() {
-                        let function = call.get("function").unwrap_or(call);
-                        extract_text_value(
-                            function.get("name"),
-                            Direction::Response,
-                            SegmentKind::ToolCall,
-                            Some("assistant".to_string()),
-                            Some(path(format!(
-                                "$.choices[{choice_index}].{field}.tool_calls[{call_index}].function.name"
-                            ))),
-                            segments,
-                        );
-                        extract_text_value(
-                            function.get("arguments"),
-                            Direction::Response,
-                            SegmentKind::ToolArguments,
-                            Some("assistant".to_string()),
-                            Some(path(format!(
-                                "$.choices[{choice_index}].{field}.tool_calls[{call_index}].function.arguments"
-                            ))),
-                            segments,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    extract_text_value(
-        json.get("output_text"),
-        Direction::Response,
-        SegmentKind::AssistantMessage,
-        Some("assistant".to_string()),
-        Some(path("$.output_text".to_string())),
-        segments,
-    );
-
-    if let Some(output) = json.get("output").and_then(Value::as_array) {
-        for (output_index, item) in output.iter().enumerate() {
-            if let Some(content) = item.get("content").and_then(Value::as_array) {
-                for (content_index, part) in content.iter().enumerate() {
-                    extract_text_value(
-                        part.get("text"),
-                        Direction::Response,
-                        SegmentKind::AssistantMessage,
-                        Some("assistant".to_string()),
-                        Some(path(format!(
-                            "$.output[{output_index}].content[{content_index}].text"
-                        ))),
-                        segments,
-                    );
-                }
-            }
-            extract_text_value(
-                item.get("arguments"),
-                Direction::Response,
-                SegmentKind::ToolArguments,
-                Some("assistant".to_string()),
-                Some(path(format!("$.output[{output_index}].arguments"))),
-                segments,
-            );
-        }
-    }
-
     for response_path in &extraction.response_json_paths {
-        extract_known_path(json, Direction::Response, response_path, segments);
+        extract_known_path(
+            json,
+            Direction::Response,
+            response_path,
+            prefix.as_deref(),
+            segments,
+        );
     }
 }
 
@@ -2002,6 +1854,7 @@ fn extract_known_path(
     json: &Value,
     direction: Direction,
     path: &str,
+    prefix: Option<&str>,
     segments: &mut Vec<TextSegment>,
 ) {
     match path {
@@ -2021,18 +1874,37 @@ fn extract_known_path(
                         direction,
                         kind,
                         role.map(str::to_string),
-                        Some(format!("$.messages[{index}].content")),
+                        Some(prefixed_json_path(
+                            prefix,
+                            format!("$.messages[{index}].content"),
+                        )),
                         segments,
                     );
                 }
             }
         }
+        "$.messages[*].tool_calls[*].function.name" => extract_message_tool_calls(
+            json,
+            direction,
+            "name",
+            SegmentKind::ToolCall,
+            prefix,
+            segments,
+        ),
+        "$.messages[*].tool_calls[*].function.arguments" => extract_message_tool_calls(
+            json,
+            direction,
+            "arguments",
+            SegmentKind::ToolArguments,
+            prefix,
+            segments,
+        ),
         "$.input" => extract_text_value(
             json.get("input"),
             direction,
             SegmentKind::UserPrompt,
             None,
-            Some("$.input".to_string()),
+            Some(prefixed_json_path(prefix, "$.input".to_string())),
             segments,
         ),
         "$.instructions" => extract_text_value(
@@ -2040,7 +1912,31 @@ fn extract_known_path(
             direction,
             SegmentKind::DeveloperPrompt,
             None,
-            Some("$.instructions".to_string()),
+            Some(prefixed_json_path(prefix, "$.instructions".to_string())),
+            segments,
+        ),
+        "$.tools[*].function.name" => extract_tool_definitions(
+            json,
+            direction,
+            "name",
+            SegmentKind::ToolDefinition,
+            prefix,
+            segments,
+        ),
+        "$.tools[*].function.description" => extract_tool_definitions(
+            json,
+            direction,
+            "description",
+            SegmentKind::ToolDefinition,
+            prefix,
+            segments,
+        ),
+        "$.tools[*].function.parameters" => extract_tool_definitions(
+            json,
+            direction,
+            "parameters",
+            SegmentKind::ToolDefinition,
+            prefix,
             segments,
         ),
         "$.context" => extract_text_value(
@@ -2048,7 +1944,7 @@ fn extract_known_path(
             direction,
             SegmentKind::RagContext,
             None,
-            Some("$.context".to_string()),
+            Some(prefixed_json_path(prefix, "$.context".to_string())),
             segments,
         ),
         "$.documents[*].text" => extract_array_field(
@@ -2057,6 +1953,7 @@ fn extract_known_path(
             SegmentKind::Document,
             "text",
             "$.documents",
+            prefix,
             segments,
         ),
         "$.retrieved_context[*].content" => extract_array_field(
@@ -2065,6 +1962,7 @@ fn extract_known_path(
             SegmentKind::RagContext,
             "content",
             "$.retrieved_context",
+            prefix,
             segments,
         ),
         "$.tool_results[*].content" => extract_array_field(
@@ -2073,6 +1971,7 @@ fn extract_known_path(
             SegmentKind::ToolResult,
             "content",
             "$.tool_results",
+            prefix,
             segments,
         ),
         "$.choices[*].message.content" => {
@@ -2085,12 +1984,33 @@ fn extract_known_path(
                         direction,
                         SegmentKind::AssistantMessage,
                         Some("assistant".to_string()),
-                        Some(format!("$.choices[{index}].message.content")),
+                        Some(prefixed_json_path(
+                            prefix,
+                            format!("$.choices[{index}].message.content"),
+                        )),
                         segments,
                     );
                 }
             }
         }
+        "$.choices[*].message.tool_calls[*].function.name" => extract_choice_tool_calls(
+            json,
+            direction,
+            "message",
+            "name",
+            SegmentKind::ToolCall,
+            prefix,
+            segments,
+        ),
+        "$.choices[*].message.tool_calls[*].function.arguments" => extract_choice_tool_calls(
+            json,
+            direction,
+            "message",
+            "arguments",
+            SegmentKind::ToolArguments,
+            prefix,
+            segments,
+        ),
         "$.choices[*].delta.content" => {
             if let Some(choices) = json.get("choices").and_then(Value::as_array) {
                 for (index, choice) in choices.iter().enumerate() {
@@ -2101,18 +2021,39 @@ fn extract_known_path(
                         direction,
                         SegmentKind::AssistantMessage,
                         Some("assistant".to_string()),
-                        Some(format!("$.choices[{index}].delta.content")),
+                        Some(prefixed_json_path(
+                            prefix,
+                            format!("$.choices[{index}].delta.content"),
+                        )),
                         segments,
                     );
                 }
             }
         }
+        "$.choices[*].delta.tool_calls[*].function.name" => extract_choice_tool_calls(
+            json,
+            direction,
+            "delta",
+            "name",
+            SegmentKind::ToolCall,
+            prefix,
+            segments,
+        ),
+        "$.choices[*].delta.tool_calls[*].function.arguments" => extract_choice_tool_calls(
+            json,
+            direction,
+            "delta",
+            "arguments",
+            SegmentKind::ToolArguments,
+            prefix,
+            segments,
+        ),
         "$.output_text" => extract_text_value(
             json.get("output_text"),
             direction,
             SegmentKind::AssistantMessage,
             Some("assistant".to_string()),
-            Some("$.output_text".to_string()),
+            Some(prefixed_json_path(prefix, "$.output_text".to_string())),
             segments,
         ),
         "$.output[*].content[*].text" => {
@@ -2125,8 +2066,11 @@ fn extract_known_path(
                                 direction,
                                 SegmentKind::AssistantMessage,
                                 Some("assistant".to_string()),
-                                Some(format!(
-                                    "$.output[{output_index}].content[{content_index}].text"
+                                Some(prefixed_json_path(
+                                    prefix,
+                                    format!(
+                                        "$.output[{output_index}].content[{content_index}].text"
+                                    ),
                                 )),
                                 segments,
                             );
@@ -2135,7 +2079,127 @@ fn extract_known_path(
                 }
             }
         }
+        "$.output[*].arguments" => {
+            if let Some(output) = json.get("output").and_then(Value::as_array) {
+                for (output_index, item) in output.iter().enumerate() {
+                    extract_text_value(
+                        item.get("arguments"),
+                        direction,
+                        SegmentKind::ToolArguments,
+                        Some("assistant".to_string()),
+                        Some(prefixed_json_path(
+                            prefix,
+                            format!("$.output[{output_index}].arguments"),
+                        )),
+                        segments,
+                    );
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+fn extract_message_tool_calls(
+    json: &Value,
+    direction: Direction,
+    field: &str,
+    kind: SegmentKind,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    if let Some(messages) = json.get("messages").and_then(Value::as_array) {
+        for (message_index, message) in messages.iter().enumerate() {
+            let role = message.get("role").and_then(Value::as_str);
+            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for (call_index, call) in tool_calls.iter().enumerate() {
+                    let function = call.get("function").unwrap_or(call);
+                    extract_text_value(
+                        function.get(field),
+                        direction,
+                        kind,
+                        role.map(str::to_string),
+                        Some(prefixed_json_path(
+                            prefix,
+                            format!(
+                                "$.messages[{message_index}].tool_calls[{call_index}].function.{field}"
+                            ),
+                        )),
+                        segments,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn extract_tool_definitions(
+    json: &Value,
+    direction: Direction,
+    field: &str,
+    kind: SegmentKind,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    if let Some(tools) = json.get("tools").and_then(Value::as_array) {
+        for (tool_index, tool) in tools.iter().enumerate() {
+            let function = tool.get("function").unwrap_or(tool);
+            extract_text_value(
+                function.get(field),
+                direction,
+                kind,
+                None,
+                Some(prefixed_json_path(
+                    prefix,
+                    format!("$.tools[{tool_index}].function.{field}"),
+                )),
+                segments,
+            );
+        }
+    }
+}
+
+fn extract_choice_tool_calls(
+    json: &Value,
+    direction: Direction,
+    choice_field: &str,
+    tool_field: &str,
+    kind: SegmentKind,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    if let Some(choices) = json.get("choices").and_then(Value::as_array) {
+        for (choice_index, choice) in choices.iter().enumerate() {
+            if let Some(tool_calls) = choice
+                .get(choice_field)
+                .and_then(|message| message.get("tool_calls"))
+                .and_then(Value::as_array)
+            {
+                for (call_index, call) in tool_calls.iter().enumerate() {
+                    let function = call.get("function").unwrap_or(call);
+                    extract_text_value(
+                        function.get(tool_field),
+                        direction,
+                        kind,
+                        Some("assistant".to_string()),
+                        Some(prefixed_json_path(
+                            prefix,
+                            format!(
+                                "$.choices[{choice_index}].{choice_field}.tool_calls[{call_index}].function.{tool_field}"
+                            ),
+                        )),
+                        segments,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn prefixed_json_path(prefix: Option<&str>, suffix: String) -> String {
+    match prefix {
+        Some(prefix) => format!("{prefix}.{suffix}"),
+        None => suffix,
     }
 }
 
@@ -2145,6 +2209,7 @@ fn extract_array_field(
     kind: SegmentKind,
     field: &str,
     base_path: &str,
+    prefix: Option<&str>,
     segments: &mut Vec<TextSegment>,
 ) {
     if let Some(items) = value.and_then(Value::as_array) {
@@ -2154,7 +2219,10 @@ fn extract_array_field(
                 direction,
                 kind,
                 None,
-                Some(format!("{base_path}[{index}].{field}")),
+                Some(prefixed_json_path(
+                    prefix,
+                    format!("{base_path}[{index}].{field}"),
+                )),
                 segments,
             );
         }
@@ -2551,12 +2619,15 @@ fn json_headers() -> HashMap<String, String> {
     HashMap::from([("content-type".to_string(), "application/json".to_string())])
 }
 
-fn json_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
+fn rejection_body(code: &str, message: &str, rule_ids: Option<&str>) -> String {
+    let mut error = json!({
+        "code": code,
+        "message": message,
+    });
+    if let (Some(rule_ids), Value::Object(map)) = (rule_ids, &mut error) {
+        map.insert("rule_ids".to_string(), Value::String(rule_ids.to_string()));
+    }
+    json!({ "error": error }).to_string()
 }
 
 fn sanitize_provider_error(error: &str) -> String {
@@ -2576,6 +2647,9 @@ fn sanitize_provider_error(error: &str) -> String {
 fn request_text_kinds() -> Vec<SegmentKind> {
     vec![
         SegmentKind::UserPrompt,
+        SegmentKind::SystemPrompt,
+        SegmentKind::DeveloperPrompt,
+        SegmentKind::AssistantMessage,
         SegmentKind::GenericText,
         SegmentKind::RagContext,
         SegmentKind::Document,
@@ -2672,6 +2746,26 @@ fn optional_threshold(value: Option<&Value>, field: &str) -> Result<Option<f32>,
         ));
     }
     Ok(Some(number as f32))
+}
+
+fn optional_positive_u64_from_object(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    let Some(number) = value.as_u64() else {
+        return Err(format!(
+            "ai_semantic_firewall: provider.{field} must be a positive integer"
+        ));
+    };
+    if number == 0 {
+        return Err(format!(
+            "ai_semantic_firewall: provider.{field} must be greater than 0"
+        ));
+    }
+    Ok(Some(number))
 }
 
 fn parse_action(value: &str, field: &str) -> Result<Action, String> {

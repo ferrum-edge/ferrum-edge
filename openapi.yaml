@@ -12637,7 +12637,13 @@ components:
               description: Embedding model sent in the request body.
             api_key_env:
               type: string
-              description: Environment variable holding the provider API key. Sent as Authorization Bearer when present.
+              description: Environment variable holding the provider API key. The variable must exist after Ferrum startup secret resolution and is sent as Authorization Bearer when present.
+            request_timeout_ms:
+              type: integer
+              format: uint64
+              minimum: 1
+              default: 5000
+              description: Per-request embedding provider timeout in milliseconds.
           description: Required when the plugin has active rules.
         builtins:
           type: object
@@ -12666,23 +12672,33 @@ components:
                 type: string
               default:
                 - "$.messages[*].content"
+                - "$.messages[*].tool_calls[*].function.name"
+                - "$.messages[*].tool_calls[*].function.arguments"
                 - "$.input"
                 - "$.instructions"
+                - "$.tools[*].function.name"
+                - "$.tools[*].function.description"
+                - "$.tools[*].function.parameters"
                 - "$.context"
                 - "$.documents[*].text"
                 - "$.retrieved_context[*].content"
                 - "$.tool_results[*].content"
-              description: Supported simple request extraction paths.
+              description: Supported simple request extraction paths. When configured, this list replaces the defaults.
             response_json_paths:
               type: array
               items:
                 type: string
               default:
                 - "$.choices[*].message.content"
+                - "$.choices[*].message.tool_calls[*].function.name"
+                - "$.choices[*].message.tool_calls[*].function.arguments"
                 - "$.choices[*].delta.content"
+                - "$.choices[*].delta.tool_calls[*].function.name"
+                - "$.choices[*].delta.tool_calls[*].function.arguments"
                 - "$.output_text"
                 - "$.output[*].content[*].text"
-              description: Supported simple response extraction paths.
+                - "$.output[*].arguments"
+              description: Supported simple response extraction paths. When configured, this list replaces the defaults.
         allow_topics:
           type: array
           items:
