@@ -12564,6 +12564,30 @@ components:
             Reject requests missing grpc-timeout with HTTP 400. Takes
             precedence over default_deadline_ms.
 
+    AiSemanticFirewallBuiltinPackConfig:
+      oneOf:
+        - type: boolean
+          description: Boolean shorthand. true enables the pack with Ferrum defaults; false disables it.
+        - type: object
+          properties:
+            enabled:
+              type: boolean
+              default: true
+              description: Enable or disable this built-in pack.
+            examples_mode:
+              type: string
+              enum: [append, replace]
+              default: append
+              description: Append customer examples to Ferrum defaults or replace the semantic example set for this pack.
+            examples:
+              type: array
+              minItems: 1
+              items:
+                type: string
+              description: Customer semantic examples for this built-in pack.
+          description: Object form for tuning a built-in AI semantic firewall pack.
+      description: Built-in pack toggle or tuning object.
+
     AiSemanticFirewallConfig:
       type: object
       description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata."
@@ -12619,20 +12643,20 @@ components:
           type: object
           properties:
             prompt_injection:
-              type: boolean
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
             jailbreak:
-              type: boolean
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
             system_prompt_exfiltration:
-              type: boolean
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
             data_exfiltration:
-              type: boolean
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
             indirect_prompt_injection:
-              type: boolean
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
             tool_abuse:
-              type: boolean
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
             response_leakage:
-              type: boolean
-          description: Built-in rule packs. When omitted, all built-ins are enabled; when provided, omitted packs are disabled.
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
+          description: Built-in rule packs. When omitted, all built-ins are enabled; when provided, omitted packs are disabled. Object form can append or replace semantic examples per pack while keeping the built-in rule ID and pack metadata.
         extraction:
           type: object
           properties:
