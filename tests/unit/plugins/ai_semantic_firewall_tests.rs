@@ -184,6 +184,9 @@ fn invalid_configs_are_rejected() {
             }
         }),
         json!({
+            "provider": provider("https://user:pass@example.com/v1/embeddings")
+        }),
+        json!({
             "provider": provider("http://127.0.0.1:9/v1/embeddings"),
             "extraction": {"request_json_paths": ["$.messages[*].typo"]}
         }),
@@ -215,6 +218,22 @@ fn provider_endpoint_rejects_literal_ips_denied_by_backend_policy() {
     );
 }
 
+#[test]
+fn provider_endpoint_rejects_embedded_credentials() {
+    let mut config = config_with_builtin("prompt_injection");
+    config["provider"] = provider("https://user:pass@example.com/v1/embeddings");
+
+    let result = AiSemanticFirewall::new(&config, PluginHttpClient::default());
+
+    let Err(error) = result else {
+        panic!("credential-bearing provider endpoint should be rejected");
+    };
+    assert!(
+        error.contains("provider.endpoint must not include username or password"),
+        "unexpected error: {error}"
+    );
+}
+
 #[tokio::test]
 async fn direct_prompt_injection_is_rejected_with_metadata() {
     let plugin = plugin(&config_with_builtin("prompt_injection"));
@@ -238,6 +257,52 @@ async fn direct_prompt_injection_is_rejected_with_metadata() {
         Some("reject")
     );
     assert_firewall_metadata_omits(&ctx, raw);
+}
+
+#[tokio::test]
+async fn short_subset_of_example_does_not_lexically_reject() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(|req: &Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let inputs = body["input"].as_array().unwrap();
+            let data: Vec<Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    let text = input.as_str().unwrap_or("").to_ascii_lowercase();
+                    let embedding = if text.starts_with("what is") {
+                        vec![0.0, 1.0]
+                    } else {
+                        vec![1.0, 0.0]
+                    };
+                    json!({"index": index, "embedding": embedding})
+                })
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({"data": data}))
+        })
+        .mount(&server)
+        .await;
+
+    let mut config = config_with_builtin("system_prompt_exfiltration");
+    config["inspect"] = json!({"request": true, "response": false});
+    config["provider"] = provider(&format!("{}/v1/embeddings", server.uri()));
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{"role": "user", "content": "What is a system prompt?"}]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("")
+    );
 }
 
 #[tokio::test]
@@ -517,6 +582,20 @@ async fn accept_sse_does_not_bypass_json_response_inspection() {
     assert!(plugin.should_buffer_response_body(&ctx));
     assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
     assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+}
+
+#[tokio::test]
+async fn response_only_policy_does_not_request_buffer_json_requests() {
+    let mut config = config_with_builtin("response_leakage");
+    config["inspect"] = json!({"request": false, "response": true});
+    let plugin = plugin(&config);
+    let ctx = make_post_ctx(&json!({
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    assert!(plugin.requires_response_body_buffering());
 }
 
 #[tokio::test]
@@ -873,6 +952,40 @@ async fn allowlist_no_match_rejects_after_successful_semantic_check() {
             .get("ai_semantic_firewall.rule_ids")
             .map(String::as_str),
         Some("allow_topics:no_match")
+    );
+}
+
+#[tokio::test]
+async fn allowlist_no_match_rejects_when_extraction_is_empty() {
+    let config = json!({
+        "inspect": {"request": true, "response": false},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins(),
+        "allow_topics": [{
+            "id": "hr-payroll-support",
+            "examples": ["Explain paid time off policy."],
+            "threshold": 0.90,
+            "action_on_no_match": "reject"
+        }]
+    });
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "prompt": "Tell me whether this contract clause is enforceable."
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(403));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("allow_topics:no_match")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.provider_error")
     );
 }
 

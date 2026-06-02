@@ -853,7 +853,7 @@ impl AiSemanticFirewall {
                 };
             }
 
-            if semantic_evaluated || self.provider.is_none() {
+            if semantic_evaluated || segments.is_empty() || self.provider.is_none() {
                 let no_match_action = if self
                     .allow_topics
                     .iter()
@@ -1183,9 +1183,7 @@ impl Plugin for AiSemanticFirewall {
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.enabled
-            && ((self.inspect_request && self.has_request_rules)
-                || (self.inspect_response && self.has_response_rules))
+        self.enabled && self.inspect_request && self.has_request_rules
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
@@ -1243,7 +1241,7 @@ impl Plugin for AiSemanticFirewall {
         }
 
         let segments = extract_request_segments(&json, &self.extraction);
-        if segments.is_empty() {
+        if segments.is_empty() && self.allow_topics.is_empty() {
             return PluginResult::Continue;
         }
 
@@ -1882,6 +1880,12 @@ fn validate_provider_endpoint(
         .map_err(|_| "ai_semantic_firewall: provider.endpoint must be a valid URL".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("ai_semantic_firewall: provider.endpoint must use http or https".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "ai_semantic_firewall: provider.endpoint must not include username or password; use provider.api_key_env for credentials"
+                .to_string(),
+        );
     }
 
     let host = parsed
@@ -2648,7 +2652,7 @@ fn example_overlap_score(
             continue;
         }
         let intersection = text_tokens.intersection(example_tokens).count() as f32;
-        let denominator = text_tokens.len().min(example_tokens.len()) as f32;
+        let denominator = example_tokens.len() as f32;
         if denominator > 0.0 {
             best = best.max(intersection / denominator);
         }
