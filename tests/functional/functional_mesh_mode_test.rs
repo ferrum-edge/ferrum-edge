@@ -34,9 +34,10 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequest};
-use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshService, ServicePort, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+    AppProtocol, MeshService, MtlsMode, PeerAuthentication, ServicePort, Workload, WorkloadPort,
+    WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::XdsAdsServer;
@@ -898,4 +899,222 @@ async fn functional_mesh_mode_starts_after_xds_ads() {
     }
 
     panic!("mesh mode did not start from xDS ADS after {RETRY_ATTEMPTS} attempts\n{last_failure}");
+}
+
+// ── Runtime inbound mTLS fail-closed enforcement (issue #1523) ──────────────
+
+/// Generated gateway SVID file paths (leaf cert + PKCS#8 key + trust bundle).
+struct GeneratedGatewaySvid {
+    cert_path: String,
+    key_path: String,
+    trust_bundle_path: String,
+}
+
+/// Write a valid gateway SVID (a SPIFFE-SAN leaf signed by a fresh root, plus
+/// that root as the trust bundle) into `dir`, returning the three file paths.
+/// Mirrors the SVID shape `load_svid_bundle_from_files` accepts so the running
+/// mesh loads it as a real workload identity.
+fn generate_gateway_svid(dir: &std::path::Path, spiffe_id: &str) -> GeneratedGatewaySvid {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa,
+        Issuer, KeyPair, KeyUsagePurpose,
+    };
+
+    let not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+    let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+
+    // Root CA — also serves as the trust bundle.
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    ca_params.not_before = not_before;
+    ca_params.not_after = not_after;
+    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+    let ca_pem = ca_cert.pem();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    // Leaf SVID carrying the SPIFFE URI SAN, signed by the root.
+    let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let mut leaf_params = CertificateParams::default();
+    leaf_params.distinguished_name = DistinguishedName::new();
+    let id = SpiffeId::new(spiffe_id).expect("valid SPIFFE ID");
+    leaf_params
+        .subject_alt_names
+        .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+    leaf_params.is_ca = IsCa::ExplicitNoCa;
+    leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    leaf_params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    leaf_params.not_before = not_before;
+    leaf_params.not_after = not_after;
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("leaf cert");
+
+    let cert_path = dir.join("gateway-svid.crt");
+    let key_path = dir.join("gateway-svid.key");
+    let trust_bundle_path = dir.join("gateway-svid-bundle.pem");
+    std::fs::write(&cert_path, leaf_cert.pem()).expect("write svid cert");
+    std::fs::write(&key_path, leaf_key.serialize_pem()).expect("write svid key");
+    std::fs::write(&trust_bundle_path, ca_pem).expect("write trust bundle");
+
+    let to_str = |p: PathBuf| p.to_str().expect("svid path is UTF-8").to_string();
+    GeneratedGatewaySvid {
+        cert_path: to_str(cert_path),
+        key_path: to_str(key_path),
+        trust_bundle_path: to_str(trust_bundle_path),
+    }
+}
+
+/// A mesh slice whose (namespace-scoped) PeerAuthentication resolves the inbound
+/// mTLS mode to DISABLE, so the inbound termination listener would serve
+/// plaintext.
+fn disable_peer_auth_slice(node_id: &str) -> MeshSlice {
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-disable".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Disable,
+            port_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// Production mesh must FAIL CLOSED when the resolved inbound listener would
+/// serve plaintext. Here a valid gateway SVID loads (so ProxyState construction
+/// succeeds), but PeerAuthentication resolves to DISABLE — the runtime inbound
+/// fail-closed gate must refuse to start instead of binding a plaintext sidecar
+/// inbound listener. (FERRUM_MESH_ALLOW_NO_CA is set by the spawn helper; this
+/// asserts production ignores it.)
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_mode_production_refuses_plaintext_inbound_listener() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    let node_id = "functional-mesh-prod-disable-refuse";
+    let temp = TempDir::new().expect("temp dir");
+    let svid = generate_gateway_svid(temp.path(), "spiffe://cluster.local/ns/ferrum/sa/test");
+    let cp = start_static_mesh_cp(disable_peer_auth_slice(node_id)).await;
+    let mut request_rx = cp.request_rx.clone();
+    let ports = reserve_mesh_ports().await;
+    let inbound_port = ports.inbound;
+    let mut child = spawn_mesh_gateway(
+        &temp,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp.addr,
+            ports,
+            node_id,
+            config_protocol: "native",
+            topology: "sidecar",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", svid.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", svid.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    svid.trust_bundle_path.clone(),
+                ),
+            ],
+        },
+    );
+
+    let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
+    let status = wait_for_child_exit(&mut child, STARTUP_TIMEOUT).await;
+    if status.is_none() {
+        kill_child(&mut child);
+    }
+    cp.shutdown().await;
+
+    let output = captured_output(&temp);
+    assert!(
+        subscribe.is_some(),
+        "sidecar should consume the initial mesh slice before the inbound fail-closed gate runs\n{output}"
+    );
+    assert!(
+        matches!(status, Some(status) if !status.success()),
+        "production mesh with a DISABLE (plaintext) inbound listener should exit non-zero; status={status:?}\n{output}"
+    );
+    assert!(
+        output.contains("FERRUM_MESH_PRODUCTION_MODE=true") && output.contains("inbound"),
+        "expected the runtime inbound fail-closed refusal in output\n{output}"
+    );
+    assert!(
+        tcp_port_stays_closed(inbound_port, Duration::from_millis(500)).await,
+        "a plaintext inbound listener must not bind after the fail-closed refusal\n{output}"
+    );
+}
+
+/// A valid gateway SVID, with NO explicit FERRUM_FRONTEND_TLS_* material, must
+/// back the inbound listener's server identity so it serves mTLS (issue #1523,
+/// gap #3). In production this is self-checking: if the SVID did NOT back the
+/// server identity, the listener would resolve to plaintext under the default
+/// PERMISSIVE mode and the runtime gate would refuse to start — so a bound
+/// inbound listener on a live child proves the SVID backs an mTLS-capable one.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_mode_production_binds_mtls_inbound_with_gateway_svid() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-prod-svid-{attempt}");
+        let temp = TempDir::new().expect("temp dir");
+        let svid = generate_gateway_svid(temp.path(), "spiffe://cluster.local/ns/ferrum/sa/test");
+        let cp = start_static_mesh_cp(initial_mesh_slice(&node_id)).await;
+        let mut request_rx = cp.request_rx.clone();
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svid.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svid.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        svid.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
+        let inbound_listening = wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await;
+
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        if subscribe.is_some() && inbound_listening {
+            return;
+        }
+
+        last_failure = format!(
+            "attempt {attempt}: subscribe={:?}, inbound_listening={inbound_listening}\n{}",
+            subscribe.as_ref().map(|r| (&r.node_id, &r.namespace)),
+            captured_output(&temp)
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    panic!(
+        "production mesh did not bind an mTLS inbound listener from gateway SVID material after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    );
 }

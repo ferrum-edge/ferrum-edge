@@ -3329,15 +3329,19 @@ impl EnvConfig {
                 // ferrum.conf / EnvConfig) so a config-file-only value can never
                 // make them disagree and silently re-open the posture.
                 //
-                // LIMITATION (tracked in #1523): this is a config-time *presence*
-                // check. It does NOT verify the SVID files actually load, nor
-                // that the inbound listener will present a server cert / require
-                // mTLS at runtime — `build_mesh_inbound_spiffe_slot` turns load
-                // failures into `None` and `load_mesh_frontend_tls` returns `None`
-                // under PERMISSIVE with no frontend identity, so a listener can
-                // still come up plaintext. Making that runtime path fail closed in
-                // production (and wiring the CA backend to issue SVIDs) is the
-                // robust follow-up.
+                // This stays the fast early *presence* check for the obvious
+                // misconfig (no identity material named at all). It cannot see
+                // whether the SVID files actually load, nor whether the resolved
+                // PeerAuthentication mode would still leave the inbound listener
+                // serving plaintext. The robust runtime complement (#1523) closes
+                // those escapes at the mesh TLS-setup path where the listener's
+                // real posture is known (`enforce_mesh_inbound_fail_closed` in
+                // `src/modes/mesh`): a configured-but-unloadable SVID, or an
+                // inbound termination listener that would come up plaintext, is
+                // fatal in production (and in dev unless FERRUM_MESH_ALLOW_NO_CA=
+                // true). Residual follow-up: wiring FERRUM_MESH_CA_BACKEND to
+                // issue/rotate SVIDs into the data plane (still validated-but-inert
+                // here — only file-based gateway SVID material gives identity).
                 if !has_workload_identity {
                     if crate::identity::production_mode() {
                         // Master prod guardrail: like bootstrap_dev_root and
@@ -3353,13 +3357,10 @@ impl EnvConfig {
                                 .into(),
                         );
                     }
-                    // Env-only read, matching the rest of the guardrail family.
-                    let allow_no_ca = std::env::var("FERRUM_MESH_ALLOW_NO_CA")
-                        .map(|v| {
-                            let v = v.trim();
-                            v.eq_ignore_ascii_case("true") || v == "1"
-                        })
-                        .unwrap_or(false);
+                    // Canonical env-only read (shared with the runtime
+                    // inbound-TLS fail-closed gate so the two can never disagree),
+                    // matching the rest of the guardrail family.
+                    let allow_no_ca = crate::identity::allow_no_ca();
                     if allow_no_ca {
                         tracing::warn!(
                             "FERRUM_MESH_ALLOW_NO_CA=true: mesh is starting with NO workload \

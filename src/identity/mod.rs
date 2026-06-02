@@ -59,6 +59,33 @@ pub fn production_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// Canonical read of the `FERRUM_MESH_ALLOW_NO_CA` dev opt-in — the per-posture
+/// sibling to `FERRUM_MESH_CA_BOOTSTRAP_DEV` / `FERRUM_MESH_ALLOW_STATIC_ID`.
+///
+/// When `true`, a `mesh` data plane with **no usable workload identity** is
+/// permitted to start with an insecure plaintext inbound posture (dev/test
+/// only). Both gates that key on it consult this single helper so they cannot
+/// disagree: the config-time presence check in [`crate::config::EnvConfig`]
+/// validation, and the runtime inbound-TLS fail-closed enforcement in
+/// `src/modes/mesh` (which sees the listener's *actual* resolved posture).
+///
+/// Like [`production_mode`] it is read directly from the environment —
+/// intentionally **not** parsed into `EnvConfig` — so a config-file-only value
+/// can never re-open the posture. Callers MUST check [`production_mode`] first:
+/// this opt-out is ignored unconditionally under
+/// `FERRUM_MESH_PRODUCTION_MODE=true` (see `.claude/rules/tls-security.md`; do
+/// not collapse the per-posture opt-ins into one flag).
+pub fn allow_no_ca() -> bool {
+    std::env::var("FERRUM_MESH_ALLOW_NO_CA")
+        .map(|v| {
+            // Match `production_mode`'s truthy spellings (`true` / `1`,
+            // case-insensitive) so the two reads stay symmetric.
+            let v = v.trim();
+            v.eq_ignore_ascii_case("true") || v == "1"
+        })
+        .unwrap_or(false)
+}
+
 /// A single fetched X.509-SVID with its surrounding trust material.
 ///
 /// Hot-swapped by [`workload_api::fetch_loop`] / [`rotation`] via `ArcSwap`

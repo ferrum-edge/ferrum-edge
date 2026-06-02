@@ -39,7 +39,11 @@ currently enrolled (machine-gated) set, which is the authoritative answer to
   value is not yet wired to load a runtime SVID) **fails startup closed** (no mTLS ⇒ PERMISSIVE would accept plaintext)
   unless `FERRUM_MESH_ALLOW_NO_CA=true`, and `FERRUM_MESH_PRODUCTION_MODE=true`
   refuses it unconditionally — so the GA path cannot silently degrade to
-  unauthenticated plaintext.
+  unauthenticated plaintext. This is enforced at **both** config-validation time
+  (presence check) and **runtime** (`enforce_mesh_inbound_fail_closed`): the
+  gateway SVID also backs the inbound listener's server cert, and a resolved
+  inbound listener that would still come up plaintext (PeerAuthentication
+  DISABLE, no usable server identity, or an unloadable SVID verifier) is refused.
 - **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), `Ambient` HBONE, `EastWestGateway`
   SNI passthrough, HTTP-family `EgressGateway`, `ServiceWaypoint` (GAMMA),
   trust-bundle federation.
