@@ -252,6 +252,7 @@ async fn test_all_plugins_available() {
         "workload_metrics",
         "__mesh_bpf_metrics",
         "ai_federation",
+        "mcp_gateway",
         "api_chargeback",
         "api_chargeback_sink",
         "fault_injection",
@@ -372,6 +373,16 @@ async fn test_plugin_creation_all_plugins() {
             "ai_federation" => {
                 json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})
             }
+            "mcp_gateway" => json!({
+                "mode": "transparent_proxy",
+                "endpoint": {"path": "/mcp"},
+                "servers": {
+                    "tools": {
+                        "upstream_url": "http://mcp-gateway.example/mcp",
+                        "namespace": "tools"
+                    }
+                }
+            }),
             "ldap_auth" => json!({
                 "ldap_url": "ldap://ldap.example.com:389",
                 "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
