@@ -1799,6 +1799,15 @@ pub(crate) async fn apply_request_body_plugins(
     headers: &HashMap<String, String>,
     body_bytes: Vec<u8>,
 ) -> Vec<u8> {
+    apply_request_body_plugins_with_context(plugins, None, headers, body_bytes).await
+}
+
+pub(crate) async fn apply_request_body_plugins_with_context(
+    plugins: &[Arc<dyn Plugin>],
+    mut ctx: Option<&mut RequestContext>,
+    headers: &HashMap<String, String>,
+    body_bytes: Vec<u8>,
+) -> Vec<u8> {
     if body_bytes.is_empty() || !plugins.iter().any(|plugin| plugin.modifies_request_body()) {
         return body_bytes;
     }
@@ -1807,9 +1816,15 @@ pub(crate) async fn apply_request_body_plugins(
     let mut current = body_bytes;
     for plugin in plugins {
         if plugin.modifies_request_body()
-            && let Some(transformed) = plugin
-                .transform_request_body(&current, content_type, headers)
-                .await
+            && let Some(transformed) = if let Some(ctx) = ctx.as_deref_mut() {
+                plugin
+                    .transform_request_body_with_context(ctx, &current, content_type, headers)
+                    .await
+            } else {
+                plugin
+                    .transform_request_body(&current, content_type, headers)
+                    .await
+            }
         {
             current = transformed;
         }
@@ -12829,7 +12844,7 @@ async fn proxy_to_backend(
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
-    ctx: Option<&mut RequestContext>,
+    mut ctx: Option<&mut RequestContext>,
     // Real, read-only request context for the response-side buffering decision.
     // Distinct from `ctx` above, which is the request-body-hook clone and is
     // `None` unless request-body buffering is active.
@@ -13319,7 +13334,13 @@ async fn proxy_to_backend(
                     body_bytes.len() as u64,
                     std::sync::atomic::Ordering::Release,
                 );
-                let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
+                let body_bytes = apply_request_body_plugins_with_context(
+                    plugins,
+                    ctx.as_deref_mut(),
+                    headers,
+                    body_bytes,
+                )
+                .await;
                 match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
@@ -13436,7 +13457,13 @@ async fn proxy_to_backend(
                 );
 
                 // Transform request body via plugins (JSON field rename, add, remove, etc.)
-                let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
+                let body_bytes = apply_request_body_plugins_with_context(
+                    plugins,
+                    ctx.as_deref_mut(),
+                    headers,
+                    body_bytes,
+                )
+                .await;
                 match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
@@ -15258,7 +15285,7 @@ async fn proxy_to_backend_http3(
     headers: &HashMap<String, String>,
     client_request_body: ClientRequestBody,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
-    ctx: Option<&mut RequestContext>,
+    mut ctx: Option<&mut RequestContext>,
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
     is_tls: bool,
@@ -15660,7 +15687,9 @@ async fn proxy_to_backend_http3(
 
     ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
 
-    let request_body = apply_request_body_plugins(plugins, headers, request_body).await;
+    let request_body =
+        apply_request_body_plugins_with_context(plugins, ctx.as_deref_mut(), headers, request_body)
+            .await;
     match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
         PluginResult::Continue => {}
         reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {

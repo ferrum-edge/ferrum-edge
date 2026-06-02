@@ -13131,14 +13131,27 @@ components:
           properties:
             downstream_session_header:
               type: string
-              default: MCP-Session-Id
+              default: mcp-session-id
             upstream_session_header:
               type: string
-              default: MCP-Session-Id
+              default: mcp-session-id
             initialize_upstreams:
               type: string
               enum: [lazy, startup, passthrough]
               default: lazy
+              description: startup is accepted as a V1 alias for lazy because upstream MCP initialize requires a downstream client session.
+            session_ttl_seconds:
+              type: integer
+              format: uint64
+              default: 3600
+              minimum: 1
+              description: Idle downstream MCP session lifetime before eviction.
+            max_sessions:
+              type: integer
+              format: uint64
+              default: 16384
+              minimum: 1
+              description: Maximum downstream MCP sessions retained by this plugin instance; oldest sessions are evicted when the cap is reached.
         capabilities:
           type: object
           properties:
@@ -13192,6 +13205,7 @@ components:
               initialize_strategy:
                 type: string
                 enum: [lazy, startup, passthrough]
+                description: Overrides sessions.initialize_upstreams for this server; startup is accepted as a V1 alias for lazy.
         policy:
           type: object
           properties:
@@ -13229,6 +13243,7 @@ components:
             log_raw_arguments:
               type: boolean
               default: false
+              description: Copies raw MCP tool arguments into request metadata. Arguments can contain secrets or PII; prefer log_argument_hash unless the logging path is explicitly protected.
             log_argument_hash:
               type: boolean
               default: true

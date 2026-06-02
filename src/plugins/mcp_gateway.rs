@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tracing::warn;
 use url::Url;
 
 use crate::config::types::BackendScheme;
@@ -22,7 +23,13 @@ use crate::config::types::BackendScheme;
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+const DEFAULT_SESSION_TTL_SECONDS: u64 = 3600;
+const DEFAULT_MAX_SESSIONS: usize = 16_384;
 const METADATA_REWRITE_KEY: &str = "mcp.needs_request_rewrite";
+const METADATA_REWRITE_METHOD_KEY: &str = "mcp.rewrite.method";
+const METADATA_REWRITE_PARAM_KEY: &str = "mcp.rewrite.param";
+const METADATA_REWRITE_PUBLIC_VALUE_KEY: &str = "mcp.rewrite.public_value";
+const METADATA_REWRITE_UPSTREAM_VALUE_KEY: &str = "mcp.rewrite.upstream_value";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpGatewayMode {
@@ -132,6 +139,8 @@ struct McpSessionConfig {
     downstream_session_header: String,
     upstream_session_header: String,
     initialize_upstreams: InitializeStrategy,
+    session_ttl: Duration,
+    max_sessions: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -233,7 +242,7 @@ struct McpEnvelope {
     message_kind: McpMessageKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ToolCatalogEntry {
     public_name: String,
     upstream_name: String,
@@ -245,6 +254,8 @@ struct ToolCatalogEntry {
     description: Option<String>,
     annotations: Option<Value>,
     enabled: bool,
+    hidden_from_discovery: bool,
+    input_validator: Arc<jsonschema::Validator>,
     #[allow(dead_code)] // Stored for drift/operational metadata extensions.
     discovered_at: DateTime<Utc>,
     schema_hash: String,
@@ -283,7 +294,7 @@ struct ResourceCatalogEntry {
     uri_hash: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct McpCatalog {
     tools: HashMap<String, ToolCatalogEntry>,
     prompts: HashMap<String, PromptCatalogEntry>,
@@ -323,6 +334,7 @@ struct DownstreamMcpSession {
     client_info: Option<Value>,
     client_capabilities: Option<Value>,
     upstream_sessions: HashMap<String, UpstreamMcpSession>,
+    last_seen: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +357,8 @@ pub struct McpGateway {
     servers: HashMap<String, McpServerConfig>,
     primary_server_id: String,
     catalog: Arc<RwLock<McpCatalog>>,
+    catalog_refresh_lock: Arc<Mutex<()>>,
+    upstream_init_lock: Arc<Mutex<()>>,
     session_store: Arc<DashMap<String, DownstreamMcpSession>>,
     policy: McpPolicy,
     validation: McpValidationConfig,
@@ -392,11 +406,21 @@ impl McpGateway {
         if servers.is_empty() {
             return Err("mcp_gateway: 'servers' must not be empty".to_string());
         }
-        let enabled_server_ids: Vec<&str> = servers
+        if sessions.initialize_upstreams == InitializeStrategy::Startup
+            || servers
+                .values()
+                .any(|server| server.initialize_strategy == InitializeStrategy::Startup)
+        {
+            warn!(
+                "mcp_gateway startup upstream initialization is treated as lazy in V1 because MCP initialize requires a downstream session"
+            );
+        }
+        let mut enabled_server_ids: Vec<String> = servers
             .values()
             .filter(|server| server.enabled)
-            .map(|server| server.server_id.as_str())
+            .map(|server| server.server_id.clone())
             .collect();
+        enabled_server_ids.sort();
         if enabled_server_ids.is_empty() {
             return Err("mcp_gateway: at least one server must be enabled".to_string());
         }
@@ -421,7 +445,7 @@ impl McpGateway {
         let primary_server_id = enabled_server_ids
             .first()
             .ok_or_else(|| "mcp_gateway: at least one server must be enabled".to_string())?
-            .to_string();
+            .clone();
 
         Ok(Self {
             enabled,
@@ -434,6 +458,8 @@ impl McpGateway {
             servers,
             primary_server_id,
             catalog: Arc::new(RwLock::new(McpCatalog::default())),
+            catalog_refresh_lock: Arc::new(Mutex::new(())),
+            upstream_init_lock: Arc::new(Mutex::new(())),
             session_store: Arc::new(DashMap::new()),
             policy,
             validation,
@@ -529,12 +555,13 @@ impl McpGateway {
     }
 
     fn upstream_session_id(&self, downstream_id: &str, server_id: &str) -> Option<String> {
-        self.session_store.get(downstream_id).and_then(|session| {
-            session
-                .upstream_sessions
-                .get(server_id)
-                .and_then(|upstream| upstream.upstream_session_id.clone())
-        })
+        self.downstream_session_clone(downstream_id)
+            .and_then(|session| {
+                session
+                    .upstream_sessions
+                    .get(server_id)
+                    .and_then(|upstream| upstream.upstream_session_id.clone())
+            })
     }
 
     fn set_route_to_server(
@@ -566,8 +593,92 @@ impl McpGateway {
         }
     }
 
+    fn mark_request_rewrite(
+        ctx: &mut RequestContext,
+        method: &str,
+        param: &str,
+        public_value: &str,
+        upstream_value: &str,
+    ) {
+        ctx.metadata
+            .insert(METADATA_REWRITE_KEY.to_string(), "true".to_string());
+        ctx.metadata
+            .insert(METADATA_REWRITE_METHOD_KEY.to_string(), method.to_string());
+        ctx.metadata
+            .insert(METADATA_REWRITE_PARAM_KEY.to_string(), param.to_string());
+        ctx.metadata.insert(
+            METADATA_REWRITE_PUBLIC_VALUE_KEY.to_string(),
+            public_value.to_string(),
+        );
+        ctx.metadata.insert(
+            METADATA_REWRITE_UPSTREAM_VALUE_KEY.to_string(),
+            upstream_value.to_string(),
+        );
+    }
+
     fn primary_server(&self) -> Option<&McpServerConfig> {
         self.servers.get(&self.primary_server_id)
+    }
+
+    fn session_is_expired(&self, session: &DownstreamMcpSession) -> bool {
+        session.last_seen.elapsed() >= self.sessions.session_ttl
+    }
+
+    fn evict_expired_sessions(&self) {
+        let expired: Vec<String> = self
+            .session_store
+            .iter()
+            .filter(|entry| self.session_is_expired(entry.value()))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for session_id in expired {
+            self.session_store.remove(&session_id);
+        }
+    }
+
+    fn evict_oldest_session_if_needed(&self) {
+        while self.session_store.len() >= self.sessions.max_sessions {
+            let oldest = self
+                .session_store
+                .iter()
+                .min_by_key(|entry| entry.value().last_seen)
+                .map(|entry| entry.key().clone());
+            let Some(session_id) = oldest else {
+                break;
+            };
+            if self.session_store.remove(&session_id).is_none() {
+                break;
+            }
+        }
+    }
+
+    fn touch_downstream_session(&self, downstream_session_id: &str) -> bool {
+        let expired = self
+            .session_store
+            .get(downstream_session_id)
+            .is_some_and(|session| self.session_is_expired(&session));
+        if expired {
+            self.session_store.remove(downstream_session_id);
+            return false;
+        }
+        if let Some(mut session) = self.session_store.get_mut(downstream_session_id) {
+            session.last_seen = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn downstream_session_clone(
+        &self,
+        downstream_session_id: &str,
+    ) -> Option<DownstreamMcpSession> {
+        if !self.touch_downstream_session(downstream_session_id) {
+            return None;
+        }
+        self.session_store
+            .get(downstream_session_id)
+            .map(|session| session.clone())
     }
 
     fn create_downstream_session(
@@ -576,6 +687,8 @@ impl McpGateway {
         client_info: Option<Value>,
         client_capabilities: Option<Value>,
     ) -> String {
+        self.evict_expired_sessions();
+        self.evict_oldest_session_if_needed();
         let downstream_session_id = uuid::Uuid::new_v4().to_string();
         let upstream_sessions = self
             .servers
@@ -600,6 +713,7 @@ impl McpGateway {
                 client_info,
                 client_capabilities,
                 upstream_sessions,
+                last_seen: Instant::now(),
             },
         );
         downstream_session_id
@@ -618,9 +732,9 @@ impl McpGateway {
         if server.initialize_strategy == InitializeStrategy::Passthrough {
             return Ok(None);
         }
+        let _guard = self.upstream_init_lock.lock().await;
         if self
-            .session_store
-            .get(downstream_session_id)
+            .downstream_session_clone(downstream_session_id)
             .and_then(|session| {
                 session
                     .upstream_sessions
@@ -634,9 +748,7 @@ impl McpGateway {
         }
 
         let session = self
-            .session_store
-            .get(downstream_session_id)
-            .map(|session| session.clone())
+            .downstream_session_clone(downstream_session_id)
             .ok_or_else(|| "downstream MCP session is not initialized".to_string())?;
         let body = json!({
             "jsonrpc": "2.0",
@@ -666,8 +778,22 @@ impl McpGateway {
             .http_client
             .execute_tracked(request, "mcp_gateway.initialize", &ctx.plugin_http_call_ns)
             .await
-            .map_err(|error| format!("failed to initialize upstream MCP server: {error}"))?;
+            .map_err(|error| {
+                warn!(
+                    server_id = %server.server_id,
+                    method = "initialize",
+                    error = %error,
+                    "MCP upstream initialize request failed"
+                );
+                format!("failed to initialize upstream MCP server: {error}")
+            })?;
         if !response.status().is_success() {
+            warn!(
+                server_id = %server.server_id,
+                method = "initialize",
+                status = %response.status(),
+                "MCP upstream initialize returned non-success status"
+            );
             return Err(format!(
                 "upstream MCP initialize returned HTTP {}",
                 response.status()
@@ -679,20 +805,73 @@ impl McpGateway {
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
 
-        if let Some(mut session) = self.session_store.get_mut(downstream_session_id)
-            && let Some(upstream) = session.upstream_sessions.get_mut(server_id)
-        {
-            upstream.initialized = true;
-            upstream.upstream_session_id = upstream_session_id.clone();
+        if let Some(mut session) = self.session_store.get_mut(downstream_session_id) {
+            session.last_seen = Instant::now();
+            if let Some(upstream) = session.upstream_sessions.get_mut(server_id) {
+                upstream.initialized = true;
+                upstream.upstream_session_id = upstream_session_id.clone();
+            }
         }
         Ok(upstream_session_id)
     }
 
     fn protocol_version_for_session(&self, downstream_session_id: &str) -> String {
-        self.session_store
-            .get(downstream_session_id)
+        self.downstream_session_clone(downstream_session_id)
             .map(|session| session.protocol_version.clone())
             .unwrap_or_else(|| self.supported_protocol_versions[0].clone())
+    }
+
+    async fn remove_downstream_session(
+        &self,
+        downstream_session_id: &str,
+        ctx: &RequestContext,
+    ) -> bool {
+        let Some((_, session)) = self.session_store.remove(downstream_session_id) else {
+            return false;
+        };
+        for (server_id, upstream) in session.upstream_sessions {
+            let Some(upstream_session_id) = upstream.upstream_session_id else {
+                continue;
+            };
+            if !upstream.initialized {
+                continue;
+            }
+            let Some(server) = self.servers.get(&server_id) else {
+                continue;
+            };
+            let request = self
+                .http_client
+                .get()
+                .delete(&server.upstream_url)
+                .header(&self.sessions.upstream_session_header, upstream_session_id)
+                .header("mcp-protocol-version", session.protocol_version.as_str());
+            match self
+                .http_client
+                .execute_tracked(
+                    request,
+                    "mcp_gateway.session_delete",
+                    &ctx.plugin_http_call_ns,
+                )
+                .await
+            {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => {
+                    warn!(
+                        server_id = %server.server_id,
+                        status = %response.status(),
+                        "MCP upstream session delete returned non-success status"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        server_id = %server.server_id,
+                        error = %error,
+                        "MCP upstream session delete failed"
+                    );
+                }
+            }
+        }
+        true
     }
 
     async fn request_upstream_json(
@@ -733,17 +912,36 @@ impl McpGateway {
                 &ctx.plugin_http_call_ns,
             )
             .await
-            .map_err(|error| format!("upstream MCP request failed: {error}"))?;
+            .map_err(|error| {
+                warn!(
+                    server_id = %server.server_id,
+                    method,
+                    error = %error,
+                    "MCP upstream request failed"
+                );
+                format!("upstream MCP request failed: {error}")
+            })?;
         if !response.status().is_success() {
+            warn!(
+                server_id = %server.server_id,
+                method,
+                status = %response.status(),
+                "MCP upstream request returned non-success status"
+            );
             return Err(format!(
                 "upstream MCP request returned HTTP {}",
                 response.status()
             ));
         }
-        response
-            .json::<Value>()
-            .await
-            .map_err(|error| format!("upstream MCP response was not JSON: {error}"))
+        response.json::<Value>().await.map_err(|error| {
+            warn!(
+                server_id = %server.server_id,
+                method,
+                error = %error,
+                "MCP upstream response was not JSON"
+            );
+            format!("upstream MCP response was not JSON: {error}")
+        })
     }
 
     async fn ensure_catalog(
@@ -751,6 +949,19 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
     ) -> Result<(), String> {
+        if self
+            .downstream_session_clone(downstream_session_id)
+            .is_none()
+        {
+            return Err("downstream MCP session is not initialized".to_string());
+        }
+        {
+            let catalog = self.catalog.read().await;
+            if !catalog.is_stale(self.discovery.cache_ttl) {
+                return Ok(());
+            }
+        }
+        let _guard = self.catalog_refresh_lock.lock().await;
         {
             let catalog = self.catalog.read().await;
             if !catalog.is_stale(self.discovery.cache_ttl) {
@@ -881,6 +1092,18 @@ impl McpGateway {
             .cloned()
             .unwrap_or_else(|| json!({"type": "object"}));
         let schema_hash = hash_value(&input_schema);
+        let input_validator = match jsonschema::validator_for(&input_schema) {
+            Ok(validator) => Arc::new(validator),
+            Err(error) => {
+                warn!(
+                    server_id = %server.server_id,
+                    tool = %name,
+                    error = %error,
+                    "Skipping MCP tool with invalid inputSchema"
+                );
+                return None;
+            }
+        };
         let description = item
             .get("description")
             .and_then(Value::as_str)
@@ -898,6 +1121,8 @@ impl McpGateway {
             && !explicitly_configured)
             || (schema_changed
                 && self.discovery.on_schema_change == DiscoveryBehavior::HideUntilConfigured);
+        let hidden_from_discovery =
+            hidden_by_discovery || policy_action == PolicyAction::HideFromDiscovery;
         let enabled = policy_action == PolicyAction::Allow && !hidden_by_discovery;
         Some(ToolCatalogEntry {
             public_name,
@@ -913,6 +1138,8 @@ impl McpGateway {
             description,
             annotations: item.get("annotations").cloned(),
             enabled,
+            hidden_from_discovery,
+            input_validator,
             discovered_at,
             schema_hash,
             description_hash,
@@ -1057,8 +1284,9 @@ impl McpGateway {
             .tools
             .values()
             .filter(|entry| {
-                entry.enabled
-                    || !(self.discovery.hide_denied_items || self.policy.hide_denied_tools)
+                !entry.hidden_from_discovery
+                    && (entry.enabled
+                        || !(self.discovery.hide_denied_items || self.policy.hide_denied_tools))
             })
             .map(tool_entry_to_public_value)
             .collect();
@@ -1257,7 +1485,7 @@ impl McpGateway {
                 ctx.metadata
                     .insert("mcp.arguments".to_string(), arguments.to_string());
             }
-            match validate_json_schema(&entry.input_schema, arguments) {
+            match validate_json_schema(&entry.input_validator, arguments) {
                 Ok(()) => {
                     if self.observability.emit_metadata {
                         ctx.metadata
@@ -1301,8 +1529,13 @@ impl McpGateway {
             );
         }
         self.set_route_to_server(ctx, headers, server, Some(downstream_session_id));
-        ctx.metadata
-            .insert(METADATA_REWRITE_KEY.to_string(), "true".to_string());
+        Self::mark_request_rewrite(
+            ctx,
+            "tools/call",
+            "name",
+            &public_name,
+            &entry.upstream_name,
+        );
         PluginResult::Continue
     }
 
@@ -1365,15 +1598,22 @@ impl McpGateway {
             ctx.metadata
                 .insert("mcp.item_type".to_string(), "prompt".to_string());
             ctx.metadata
-                .insert("mcp.prompt_name".to_string(), public_name);
+                .insert("mcp.prompt_name".to_string(), public_name.clone());
             ctx.metadata
                 .insert("mcp.server_id".to_string(), entry.server_id.clone());
-            ctx.metadata
-                .insert("mcp.upstream_prompt_name".to_string(), entry.upstream_name);
+            ctx.metadata.insert(
+                "mcp.upstream_prompt_name".to_string(),
+                entry.upstream_name.clone(),
+            );
         }
         self.set_route_to_server(ctx, headers, server, Some(downstream_session_id));
-        ctx.metadata
-            .insert(METADATA_REWRITE_KEY.to_string(), "true".to_string());
+        Self::mark_request_rewrite(
+            ctx,
+            "prompts/get",
+            "name",
+            &public_name,
+            &entry.upstream_name,
+        );
         PluginResult::Continue
     }
 
@@ -1436,13 +1676,18 @@ impl McpGateway {
             ctx.metadata
                 .insert("mcp.item_type".to_string(), "resource".to_string());
             ctx.metadata
-                .insert("mcp.resource_uri".to_string(), public_uri);
+                .insert("mcp.resource_uri".to_string(), public_uri.clone());
             ctx.metadata
                 .insert("mcp.server_id".to_string(), entry.server_id.clone());
         }
         self.set_route_to_server(ctx, headers, server, Some(downstream_session_id));
-        ctx.metadata
-            .insert(METADATA_REWRITE_KEY.to_string(), "true".to_string());
+        Self::mark_request_rewrite(
+            ctx,
+            "resources/read",
+            "uri",
+            &public_uri,
+            &entry.upstream_uri,
+        );
         PluginResult::Continue
     }
 
@@ -1554,7 +1799,7 @@ impl Plugin for McpGateway {
                 return PluginResult::Continue;
             }
             if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
-                self.session_store.remove(&session_id);
+                self.remove_downstream_session(&session_id, ctx).await;
                 ctx.metadata
                     .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
             }
@@ -1588,6 +1833,9 @@ impl Plugin for McpGateway {
         self.emit_envelope_metadata(ctx, &envelope);
         let protocol_version = self.mark_protocol_version(ctx, headers, Some(&envelope));
         if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
+            if self.mode == McpGatewayMode::AggregateRouter {
+                self.touch_downstream_session(&session_id);
+            }
             ctx.metadata
                 .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
         }
@@ -1738,8 +1986,9 @@ impl Plugin for McpGateway {
         }
     }
 
-    async fn transform_request_body(
+    async fn transform_request_body_with_context(
         &self,
+        ctx: &mut RequestContext,
         body: &[u8],
         _content_type: Option<&str>,
         _request_headers: &HashMap<String, String>,
@@ -1747,36 +1996,37 @@ impl Plugin for McpGateway {
         if !self.enabled || self.mode != McpGatewayMode::AggregateRouter {
             return None;
         }
-        let mut value: Value = serde_json::from_slice(body).ok()?;
-        let method = value.get("method")?.as_str()?.to_string();
-        let params = value.get_mut("params")?.as_object_mut()?;
-        match method.as_str() {
-            "tools/call" => {
-                let public_name = params.get("name")?.as_str()?.to_string();
-                let catalog = self.catalog.read().await;
-                let entry = catalog.tools.get(&public_name)?;
-                params.insert(
-                    "name".to_string(),
-                    Value::String(entry.upstream_name.clone()),
-                );
-            }
-            "prompts/get" => {
-                let public_name = params.get("name")?.as_str()?.to_string();
-                let catalog = self.catalog.read().await;
-                let entry = catalog.prompts.get(&public_name)?;
-                params.insert(
-                    "name".to_string(),
-                    Value::String(entry.upstream_name.clone()),
-                );
-            }
-            "resources/read" => {
-                let public_uri = params.get("uri")?.as_str()?.to_string();
-                let catalog = self.catalog.read().await;
-                let entry = catalog.resources.get(&public_uri)?;
-                params.insert("uri".to_string(), Value::String(entry.upstream_uri.clone()));
-            }
-            _ => return None,
+        if ctx.metadata.remove(METADATA_REWRITE_KEY).as_deref() != Some("true") {
+            return None;
         }
+        let method = ctx.metadata.remove(METADATA_REWRITE_METHOD_KEY)?;
+        let param = ctx.metadata.remove(METADATA_REWRITE_PARAM_KEY)?;
+        let public_value = ctx.metadata.remove(METADATA_REWRITE_PUBLIC_VALUE_KEY)?;
+        let upstream_value = ctx.metadata.remove(METADATA_REWRITE_UPSTREAM_VALUE_KEY)?;
+
+        let mut value: Value = serde_json::from_slice(body).ok()?;
+        let request_method = value.get("method")?.as_str()?;
+        if request_method != method {
+            warn!(
+                expected_method = %method,
+                actual_method = %request_method,
+                "Skipping MCP request rewrite because routed method does not match buffered body"
+            );
+            return None;
+        }
+        let params = value.get_mut("params")?.as_object_mut()?;
+        let current_value = params.get(&param)?.as_str()?;
+        if current_value != public_value {
+            warn!(
+                method = %method,
+                param = %param,
+                expected_value_hash = %hash_str(&public_value),
+                actual_value_hash = %hash_str(current_value),
+                "Skipping MCP request rewrite because routed value does not match buffered body"
+            );
+            return None;
+        }
+        params.insert(param, Value::String(upstream_value));
         serde_json::to_vec(&value).ok()
     }
 
@@ -1832,9 +2082,7 @@ fn parse_mcp_envelope(body: &[u8]) -> Result<McpEnvelope, String> {
     })
 }
 
-fn validate_json_schema(schema: &Value, instance: &Value) -> Result<(), String> {
-    let validator =
-        jsonschema::validator_for(schema).map_err(|error| format!("invalid schema: {error}"))?;
+fn validate_json_schema(validator: &jsonschema::Validator, instance: &Value) -> Result<(), String> {
     validator
         .validate(instance)
         .map_err(|error| format!("schema validation failed: {error}"))
@@ -1847,7 +2095,13 @@ fn json_rpc_error(
     internal_detail: Option<String>,
 ) -> PluginResult {
     let mut metadata = Map::new();
-    if internal_detail.is_some() {
+    if let Some(detail) = internal_detail.as_deref() {
+        warn!(
+            code,
+            message,
+            internal_detail = %detail,
+            "MCP gateway returning JSON-RPC error"
+        );
         metadata.insert(
             "gateway".to_string(),
             Value::String("mcp_gateway".to_string()),
@@ -2130,6 +2384,20 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
             .unwrap_or("lazy"),
         "sessions.initialize_upstreams",
     )?;
+    let session_ttl_seconds = optional_u64_from_object(sessions, "session_ttl_seconds")?
+        .unwrap_or(DEFAULT_SESSION_TTL_SECONDS);
+    if session_ttl_seconds == 0 {
+        return Err(
+            "mcp_gateway: 'sessions.session_ttl_seconds' must be greater than zero".to_string(),
+        );
+    }
+    let max_sessions =
+        optional_u64_from_object(sessions, "max_sessions")?.unwrap_or(DEFAULT_MAX_SESSIONS as u64);
+    if max_sessions == 0 {
+        return Err("mcp_gateway: 'sessions.max_sessions' must be greater than zero".to_string());
+    }
+    let max_sessions = usize::try_from(max_sessions)
+        .map_err(|_| "mcp_gateway: 'sessions.max_sessions' is too large".to_string())?;
     Ok(McpSessionConfig {
         downstream_session_header: optional_string_from_object(
             sessions,
@@ -2139,6 +2407,8 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
         upstream_session_header: optional_string_from_object(sessions, "upstream_session_header")?
             .unwrap_or_else(|| "mcp-session-id".to_string()),
         initialize_upstreams,
+        session_ttl: Duration::from_secs(session_ttl_seconds),
+        max_sessions,
     })
 }
 

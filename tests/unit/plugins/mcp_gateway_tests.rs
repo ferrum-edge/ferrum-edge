@@ -148,6 +148,11 @@ async fn start_mcp_catalog_server() -> MockServer {
         )
         .mount(&server)
         .await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
     server
 }
 
@@ -176,7 +181,7 @@ async fn initialize(plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>) -
 fn registered_and_exposes_expected_basics() {
     let plugin = create_plugin(
         "mcp_gateway",
-        &transparent_config("http://github-mcp.internal:8080/mcp"),
+        &transparent_config("http://github-mcp.example:8080/mcp"),
     )
     .unwrap()
     .unwrap();
@@ -248,7 +253,7 @@ fn invalid_config_shapes_are_rejected() {
 async fn transparent_post_sets_direct_route_override_and_metadata() {
     let plugin = create_plugin(
         "mcp_gateway",
-        &transparent_config("http://github-mcp.internal:8080/mcp"),
+        &transparent_config("http://github-mcp.example:8080/mcp"),
     )
     .unwrap()
     .unwrap();
@@ -264,13 +269,13 @@ async fn transparent_post_sets_direct_route_override_and_metadata() {
     assert_eq!(ctx.route_override_backend_scheme, Some(BackendScheme::Http));
     assert_eq!(
         ctx.route_override_backend_host.as_deref(),
-        Some("github-mcp.internal")
+        Some("github-mcp.example")
     );
     assert_eq!(ctx.route_override_backend_port, Some(8080));
     assert_eq!(ctx.route_override_path.as_deref(), Some("/mcp"));
     assert_eq!(
         headers.get("host").map(String::as_str),
-        Some("github-mcp.internal:8080")
+        Some("github-mcp.example:8080")
     );
     assert_eq!(
         ctx.metadata.get("mcp.method").map(String::as_str),
@@ -340,6 +345,120 @@ async fn aggregate_tools_list_namespaces_and_hides_denied_or_unconfigured_tools(
 }
 
 #[tokio::test]
+async fn aggregate_tools_list_keeps_discovery_hidden_tools_hidden_when_denied_tools_are_visible() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["discovery"]["hide_denied_items"] = json!(false);
+    config["policy"]["hide_denied_tools"] = json!(false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    let mut tool_names: Vec<&str> = body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    tool_names.sort_unstable();
+    assert_eq!(tool_names, vec!["github.create_pr", "github.merge_pr"]);
+}
+
+#[tokio::test]
+async fn aggregate_sessions_are_bounded() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"max_sessions": 1, "session_ttl_seconds": 3600});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let evicted_session_id = initialize(&plugin).await;
+    let live_session_id = initialize(&plugin).await;
+    assert_ne!(evicted_session_id, live_session_id);
+
+    let (mut evicted_ctx, mut evicted_headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    }));
+    evicted_headers.insert("mcp-session-id".to_string(), evicted_session_id);
+    let result = plugin
+        .before_proxy(&mut evicted_ctx, &mut evicted_headers)
+        .await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32006);
+
+    let (mut live_ctx, mut live_headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/list",
+        "params": {}
+    }));
+    live_headers.insert("mcp-session-id".to_string(), live_session_id);
+    let result = plugin.before_proxy(&mut live_ctx, &mut live_headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert!(body["result"]["tools"].as_array().is_some());
+}
+
+#[tokio::test]
+async fn aggregate_passthrough_unknown_methods_uses_deterministic_primary_server() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &json!({
+            "enabled": true,
+            "mode": "aggregate_router",
+            "endpoint": {"path": "/mcp"},
+            "capabilities": {"passthrough_unknown_methods": true},
+            "servers": {
+                "zeta": {
+                    "upstream_url": "http://zeta-mcp.example/mcp",
+                    "namespace": "zeta",
+                    "enabled": true,
+                    "expose_tools": true
+                },
+                "alpha": {
+                    "upstream_url": "http://alpha-mcp.example/mcp",
+                    "namespace": "alpha",
+                    "enabled": true,
+                    "expose_tools": true
+                }
+            }
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "vendor/custom",
+        "params": {}
+    }));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("alpha-mcp.example")
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.server_id").map(String::as_str),
+        Some("alpha")
+    );
+}
+
+#[tokio::test]
 async fn aggregate_tool_call_validates_arguments_routes_and_rewrites_name() {
     let server = start_mcp_catalog_server().await;
     let plugin = create_plugin(
@@ -397,7 +516,8 @@ async fn aggregate_tool_call_validates_arguments_routes_and_rewrites_name() {
     );
 
     let rewritten = plugin
-        .transform_request_body(
+        .transform_request_body_with_context(
+            &mut ctx,
             serde_json::to_vec(&body).unwrap().as_slice(),
             Some("application/json"),
             &headers,
@@ -407,6 +527,49 @@ async fn aggregate_tool_call_validates_arguments_routes_and_rewrites_name() {
     let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
     assert_eq!(rewritten["params"]["name"], "create_pr");
     assert_eq!(rewritten["params"]["arguments"]["repo"], "payments-api");
+}
+
+#[tokio::test]
+async fn aggregate_delete_tears_down_upstream_session() {
+    let server = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut list_ctx, mut list_headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    }));
+    list_headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let _ = plugin.before_proxy(&mut list_ctx, &mut list_headers).await;
+
+    let mut ctx = create_test_context();
+    ctx.method = "DELETE".to_string();
+    ctx.path = "/mcp".to_string();
+    let mut headers = HashMap::from([("mcp-session-id".to_string(), session_id)]);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body, json!({}));
+
+    let requests = server.received_requests().await.unwrap();
+    let delete = requests
+        .iter()
+        .find(|request| request.method.as_str() == "DELETE")
+        .expect("upstream DELETE should be sent");
+    assert_eq!(
+        delete
+            .headers
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("upstream-session")
+    );
 }
 
 #[tokio::test]

@@ -3730,16 +3730,18 @@ config:
     on_new_tool: hide_until_configured
     on_schema_change: hide_until_configured
   sessions:
-    downstream_session_header: MCP-Session-Id
-    upstream_session_header: MCP-Session-Id
+    downstream_session_header: mcp-session-id
+    upstream_session_header: mcp-session-id
     initialize_upstreams: lazy
+    session_ttl_seconds: 3600
+    max_sessions: 16384
   servers:
     github:
-      upstream_url: http://github-mcp.internal/mcp
+      upstream_url: http://github-mcp.example/mcp
       namespace: github
       expose_tools: true
     jira:
-      upstream_url: http://jira-mcp.internal/mcp
+      upstream_url: http://jira-mcp.example/mcp
       namespace: jira
       expose_tools: true
   policy:
@@ -3752,6 +3754,8 @@ config:
   validation:
     validate_tool_arguments: true
 ```
+
+`sessions.max_sessions` and `sessions.session_ttl_seconds` bound downstream MCP sessions; idle or oldest sessions are evicted before accepting new `initialize` calls. `initialize_upstreams: startup` is accepted as a V1 alias for `lazy` because MCP upstream initialization requires a downstream client session. If `observability.log_raw_arguments` is enabled, raw MCP tool arguments are copied into request metadata and may contain secrets or PII; prefer the default argument hashing unless the logging path is explicitly protected.
 
 ---
 
