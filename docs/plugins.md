@@ -3755,7 +3755,7 @@ config:
     validate_tool_arguments: true
 ```
 
-`sessions.max_sessions` and `sessions.session_ttl_seconds` bound downstream MCP sessions; idle or oldest sessions are evicted before accepting new `initialize` calls. `initialize_upstreams: startup` is accepted as a V1 alias for `lazy` because MCP upstream initialization requires a downstream client session. If `observability.log_raw_arguments` is enabled, raw MCP tool arguments are copied into request metadata and may contain secrets or PII; prefer the default argument hashing unless the logging path is explicitly protected.
+`sessions.max_sessions` and `sessions.session_ttl_seconds` bound downstream MCP sessions; idle or oldest sessions are evicted before accepting new `initialize` calls. `initialize_upstreams: startup` is accepted as a V1 alias for `lazy` because MCP upstream initialization requires a downstream client session. In `aggregate_router` mode, `capabilities.advertise_completions: true` requires `capabilities.passthrough_unknown_methods: true` so `completion/complete` is routed instead of advertised without support. If `observability.log_raw_arguments` is enabled, raw MCP tool arguments are copied into request metadata and may contain secrets or PII; prefer the default argument hashing unless the logging path is explicitly protected.
 
 ---
 

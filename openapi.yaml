@@ -13170,6 +13170,7 @@ components:
             advertise_completions:
               type: boolean
               default: false
+              description: In aggregate_router mode, requires passthrough_unknown_methods=true until explicit completion routing is implemented.
             advertise_tasks:
               type: boolean
               default: false

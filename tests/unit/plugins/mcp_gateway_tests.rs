@@ -256,6 +256,81 @@ async fn start_mcp_error_server() -> MockServer {
     server
 }
 
+async fn start_mcp_initialize_error_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "initialize-error",
+            "error": {
+                "code": -32602,
+                "message": "unsupported protocol version"
+            }
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "fallback",
+            "result": {
+                "tools": [
+                    {
+                        "name": "create_pr",
+                        "inputSchema": { "type": "object" }
+                    }
+                ]
+            }
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn start_mcp_tool_collision_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/one"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "one",
+            "result": {
+                "tools": [
+                    {
+                        "name": "b.c",
+                        "inputSchema": { "type": "object" }
+                    }
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/two"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "two",
+            "result": {
+                "tools": [
+                    {
+                        "name": "c",
+                        "inputSchema": { "type": "object" }
+                    }
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
 async fn initialize(plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>) -> String {
     let (mut ctx, mut headers) = mcp_ctx(json!({
         "jsonrpc": "2.0",
@@ -333,6 +408,17 @@ fn invalid_config_shapes_are_rejected() {
             "servers": {
                 "github": { "upstream_url": "http://github/mcp", "namespace": "dup" },
                 "jira": { "upstream_url": "http://jira/mcp", "namespace": "dup" }
+            }
+        }),
+        json!({
+            "mode": "aggregate_router",
+            "endpoint": { "path": "/mcp" },
+            "capabilities": {
+                "advertise_completions": true,
+                "passthrough_unknown_methods": false
+            },
+            "servers": {
+                "github": { "upstream_url": "http://github/mcp", "namespace": "github" }
             }
         }),
         json!({
@@ -578,6 +664,73 @@ async fn aggregate_resource_templates_list_returns_resource_templates() {
             .unwrap()
             .starts_with("mcp://github/")
     );
+    assert!(
+        templates[0]["uriTemplate"]
+            .as_str()
+            .unwrap()
+            .contains("{path}")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_resource_read_routes_and_rewrites_template_generated_uri() {
+    let server = start_mcp_resource_templates_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(plugin.needs_final_request_body_context());
+    let session_id = initialize(&plugin).await;
+
+    let (mut list_ctx, mut list_headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "resources/templates/list",
+        "params": {}
+    }));
+    list_headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let result = plugin.before_proxy(&mut list_ctx, &mut list_headers).await;
+    let (_, body, _) = reject_json(result);
+    let public_template = body["result"]["resourceTemplates"][0]["uriTemplate"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let public_uri = public_template.replace("{path}", "README.md");
+    let read_body = json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "resources/read",
+        "params": {
+            "uri": public_uri
+        }
+    });
+    let (mut ctx, mut headers) = mcp_ctx(read_body.clone());
+    headers.insert("mcp-session-id".to_string(), session_id);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(ctx.route_override_backend_scheme, Some(BackendScheme::Http));
+    assert_eq!(ctx.route_override_path.as_deref(), Some("/mcp"));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.upstream_resource_uri")
+            .map(String::as_str),
+        Some("file:///project/README.md")
+    );
+
+    let rewritten = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            serde_json::to_vec(&read_body).unwrap().as_slice(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("resource read should be rewritten");
+    let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(rewritten["params"]["uri"], "file:///project/README.md");
 }
 
 #[tokio::test]
@@ -639,6 +792,116 @@ async fn aggregate_tools_list_treats_upstream_json_rpc_errors_as_failures() {
     assert_eq!(status, 200);
     assert_eq!(body["error"]["code"], -32006);
     assert!(body["result"].is_null());
+}
+
+#[tokio::test]
+async fn aggregate_initialize_treats_upstream_json_rpc_errors_as_failures() {
+    let server = start_mcp_initialize_error_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32006);
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().any(|request| {
+        request
+            .body_json::<Value>()
+            .ok()
+            .and_then(|body| {
+                body.get("method")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .as_deref()
+            == Some("initialize")
+    }));
+    assert!(!requests.iter().any(|request| {
+        request
+            .body_json::<Value>()
+            .ok()
+            .and_then(|body| {
+                body.get("method")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .as_deref()
+            == Some("notifications/initialized")
+    }));
+}
+
+#[tokio::test]
+async fn aggregate_tools_list_rejects_colliding_public_tool_names() {
+    let server = start_mcp_tool_collision_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &json!({
+            "enabled": true,
+            "mode": "aggregate_router",
+            "endpoint": {"path": "/mcp"},
+            "sessions": {"initialize_upstreams": "passthrough"},
+            "discovery": {
+                "aggregate_tools": true,
+                "aggregate_resources": false,
+                "aggregate_prompts": false,
+                "namespace_separator": ".",
+                "on_new_tool": "allow"
+            },
+            "servers": {
+                "one": {
+                    "upstream_url": format!("{}/one", server.uri()),
+                    "namespace": "a",
+                    "enabled": true,
+                    "expose_tools": true,
+                    "expose_resources": false,
+                    "expose_prompts": false
+                },
+                "two": {
+                    "upstream_url": format!("{}/two", server.uri()),
+                    "namespace": "a.b",
+                    "enabled": true,
+                    "expose_tools": true,
+                    "expose_resources": false,
+                    "expose_prompts": false
+                }
+            },
+            "policy": {
+                "default_action": "allow"
+            }
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32006);
+    assert_eq!(body["error"]["message"], "MCP catalog unavailable");
 }
 
 #[tokio::test]
