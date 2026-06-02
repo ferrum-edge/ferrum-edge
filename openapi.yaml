@@ -3477,6 +3477,7 @@ paths:
                 - ai_response_guard
                 - ai_semantic_cache
                 - ai_federation
+                - mcp_gateway
                 - ws_message_size_limiting
                 - ws_frame_logging
                 - ws_rate_limiting
@@ -6018,7 +6019,7 @@ components:
             oauth2_introspection, oidc_relying_party, hmac_auth, ldap_auth,
             mtls_auth, access_control,
             tcp_connection_throttle, ip_restriction, waf, security_headers, mesh_authz, opa,
-            mesh_outbound_registry, openapi_validator) are validation-fatal: invalid config blocks
+            mesh_outbound_registry, openapi_validator, mcp_gateway) are validation-fatal: invalid config blocks
             gateway startup in file mode, and on DB/CP polling the new config
             snapshot is rejected as a whole (the gateway keeps serving the
             prior good config). Non-security plugins with invalid config are
@@ -13070,6 +13071,173 @@ components:
           type: boolean
           default: true
           description: Trigger fallback when the provider is unreachable (DNS/TCP/TLS failure).
+
+    McpGatewayConfig:
+      type: object
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, tool argument JSON Schema validation, and mcp.* metadata emission. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins."
+      required: [mode, endpoint, servers]
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        mode:
+          type: string
+          enum: [transparent_proxy, aggregate_router]
+        endpoint:
+          type: object
+          required: [path]
+          properties:
+            path:
+              type: string
+              description: Public MCP endpoint path, such as /mcp.
+            protocol_versions:
+              type: array
+              minItems: 1
+              items:
+                type: string
+              default: ["2025-11-25"]
+        discovery:
+          type: object
+          properties:
+            aggregate_tools:
+              type: boolean
+              default: true
+            aggregate_resources:
+              type: boolean
+              default: true
+            aggregate_prompts:
+              type: boolean
+              default: true
+            namespace_separator:
+              type: string
+              default: "."
+            cache_ttl_seconds:
+              type: integer
+              format: uint64
+              default: 300
+            hide_denied_items:
+              type: boolean
+              default: true
+            on_new_tool:
+              type: string
+              enum: [allow, allow_immediately, expose, hide_until_configured]
+              default: hide_until_configured
+            on_schema_change:
+              type: string
+              enum: [allow, allow_immediately, expose, hide_until_configured]
+              default: hide_until_configured
+        sessions:
+          type: object
+          properties:
+            downstream_session_header:
+              type: string
+              default: MCP-Session-Id
+            upstream_session_header:
+              type: string
+              default: MCP-Session-Id
+            initialize_upstreams:
+              type: string
+              enum: [lazy, startup, passthrough]
+              default: lazy
+        capabilities:
+          type: object
+          properties:
+            advertise_tools:
+              type: boolean
+              default: true
+            advertise_resources:
+              type: boolean
+              default: true
+            advertise_prompts:
+              type: boolean
+              default: true
+            advertise_logging:
+              type: boolean
+              default: false
+            advertise_completions:
+              type: boolean
+              default: false
+            advertise_tasks:
+              type: boolean
+              default: false
+            passthrough_unknown_methods:
+              type: boolean
+              default: false
+        servers:
+          type: object
+          minProperties: 1
+          additionalProperties:
+            type: object
+            required: [upstream_url, namespace]
+            properties:
+              upstream_url:
+                type: string
+                format: uri
+                description: HTTP or HTTPS upstream MCP endpoint URL. Credentials, query, and fragment are rejected.
+              namespace:
+                type: string
+                description: Public namespace prefix used for tool and prompt names.
+              enabled:
+                type: boolean
+                default: true
+              expose_tools:
+                type: boolean
+                default: true
+              expose_resources:
+                type: boolean
+                default: false
+              expose_prompts:
+                type: boolean
+                default: false
+              initialize_strategy:
+                type: string
+                enum: [lazy, startup, passthrough]
+        policy:
+          type: object
+          properties:
+            default_action:
+              type: string
+              enum: [allow, deny]
+              default: deny
+            hide_denied_tools:
+              type: boolean
+              default: true
+            tools:
+              type: object
+              additionalProperties:
+                type: object
+                required: [action]
+                properties:
+                  action:
+                    type: string
+                    enum: [allow, deny, hide_from_discovery]
+        validation:
+          type: object
+          properties:
+            validate_tool_arguments:
+              type: boolean
+              default: true
+            validate_tool_results:
+              type: boolean
+              default: false
+        observability:
+          type: object
+          properties:
+            emit_metadata:
+              type: boolean
+              default: true
+            log_raw_arguments:
+              type: boolean
+              default: false
+            log_argument_hash:
+              type: boolean
+              default: true
+            log_raw_results:
+              type: boolean
+              default: false
+            log_result_hash:
+              type: boolean
+              default: false
 
     ApiChargebackConfig:
       type: object

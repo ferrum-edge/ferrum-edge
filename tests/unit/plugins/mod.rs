@@ -45,6 +45,7 @@ mod key_auth_tests;
 mod ldap_auth_tests;
 mod load_testing_tests;
 mod loki_logging_tests;
+mod mcp_gateway_tests;
 mod mesh_plugins_tests;
 mod mtls_auth_tests;
 mod oauth2_introspection_tests;

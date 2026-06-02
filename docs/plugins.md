@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 66 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 67 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -3702,6 +3702,56 @@ plugins:
 ```
 
 > **Note:** When `ai_federation` is active, it short-circuits the proxy via `RejectBinary`, so `ai_token_metrics`, `ai_response_guard`, and `ai_semantic_cache` do not fire on the response path. The federation plugin writes the same metadata keys directly. The `ai_rate_limiter` records token usage via `applies_after_proxy_on_reject` on the rejection path.
+
+---
+
+## MCP / Agent Tool Gateway Plugin
+
+### `mcp_gateway`
+
+HTTP-only Model Context Protocol gateway for AI agent tool traffic. `transparent_proxy` mode preserves MCP JSON-RPC and session headers while routing one Ferrum endpoint to one upstream MCP server. `aggregate_router` mode exposes one Ferrum MCP endpoint for multiple upstream MCP servers, synthesizes downstream `initialize`, lazily initializes upstream sessions, aggregates `tools/list`, `resources/list`, and `prompts/list`, namespaces public names, routes `tools/call`, `resources/read`, and `prompts/get`, rewrites public names back to upstream names, validates tool arguments against discovered `inputSchema`, and emits `mcp.*` metadata for existing Ferrum authz, logging, tracing, chargeback, and alert plugins.
+
+The plugin deliberately does not implement generic auth, rate limiting, retry, timeout, WAF, tracing, DLP, or semantic safety behavior.
+
+**Priority:** 2992
+
+```yaml
+plugin_name: mcp_gateway
+scope: proxy
+config:
+  enabled: true
+  mode: aggregate_router
+  endpoint:
+    path: /mcp
+    protocol_versions: ["2025-11-25"]
+  discovery:
+    namespace_separator: "."
+    cache_ttl_seconds: 300
+    on_new_tool: hide_until_configured
+    on_schema_change: hide_until_configured
+  sessions:
+    downstream_session_header: MCP-Session-Id
+    upstream_session_header: MCP-Session-Id
+    initialize_upstreams: lazy
+  servers:
+    github:
+      upstream_url: http://github-mcp.internal/mcp
+      namespace: github
+      expose_tools: true
+    jira:
+      upstream_url: http://jira-mcp.internal/mcp
+      namespace: jira
+      expose_tools: true
+  policy:
+    default_action: deny
+    tools:
+      github.create_pr:
+        action: allow
+      jira.create_issue:
+        action: allow
+  validation:
+    validate_tool_arguments: true
+```
 
 ---
 

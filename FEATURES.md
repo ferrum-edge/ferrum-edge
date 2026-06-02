@@ -83,7 +83,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ## Plugin System
 
-- 66 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 67 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Three plugin scopes: **global** (all proxies), **proxy** (single proxy), **proxy_group** (shared across a subset of proxies) — scoped plugins replace global plugins of the same name. Proxy-group plugins share a single instance across all associated proxies, so stateful plugins (e.g., rate_limiting) share counters across the group
@@ -137,6 +137,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **AI Prompt Shield** — PII detection and redaction in prompts with built-in patterns (SSN, credit card, email, phone, API keys, AWS keys, IBAN) and custom regex support
 - **AI Semantic Cache** — LLM response caching with normalized exact-match keys by default, optional embedding-based semantic similarity through configurable OpenAI-compatible, Voyage/Claude, Cohere, Gemini/Vertex, Mistral, or Bedrock embedding formats, local HNSW vector search, and local or Redis exact-response storage
 - **AI Response Guard** — output-side content guardrails: PII detection in responses, blocked phrase filtering, and response format validation
+- **MCP Gateway** — Agent Tool Gateway for HTTP-based MCP JSON-RPC traffic. Supports transparent proxying, aggregate-router initialize/catalog/session mediation, namespaced `tools/list` and `tools/call` routing, basic resource/prompt routing, tool argument JSON Schema validation, deny/hide tool policy, and `mcp.*` metadata for existing Ferrum policy, logging, tracing, chargeback, and alerting plugins
 
 ### WebSocket Plugins
 
