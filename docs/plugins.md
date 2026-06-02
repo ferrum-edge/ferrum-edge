@@ -3333,7 +3333,7 @@ Semantically inspects LLM request and response bodies for prompt injection, jail
 
 **Priority:** 2968
 
-**Ordering and buffering:** Runs after body/OpenAPI validation and before `ai_request_guard`, `ai_semantic_cache`, and `ai_federation`, so semantically unsafe prompts are evaluated before they can reach semantic cache or a federated provider. Request buffering is only enabled for JSON `POST` requests. Response inspection uses the existing response-body buffering hooks for JSON and buffered SSE-shaped responses. Streaming LLM responses are intentionally not buffered by this plugin; response-side packs such as `response_leakage`, response-side `system_prompt_exfiltration`, and response-side `tool_abuse` do not inspect streamed completion chunks in v1. When a JSON request declares `stream: true`, the plugin records `ai_semantic_firewall.response_inspection_skipped=streaming` so operators can audit the skip. gRPC protobuf payloads are also not inspected by v1 response enforcement.
+**Ordering and buffering:** Runs after body/OpenAPI validation and before `ai_request_guard`, `ai_semantic_cache`, and `ai_federation`, so semantically unsafe prompts are evaluated before they can reach semantic cache or a federated provider. The plugin is HTTP-only. Request buffering is only enabled for JSON `POST` requests. Response inspection uses the existing response-body buffering hooks for JSON and buffered SSE-shaped responses. Streaming LLM responses are intentionally not buffered by this plugin; response-side packs such as `response_leakage`, response-side `system_prompt_exfiltration`, and response-side `tool_abuse` do not inspect streamed completion chunks in v1. When a JSON request declares `stream: true`, the plugin records `ai_semantic_firewall.response_inspection_skipped=streaming` so operators can audit the skip. Native gRPC protobuf payloads are not inspected.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -3821,7 +3821,7 @@ config:
 
 ### AI Plugin Composition Example
 
-A typical AI gateway proxy combining all seven AI plugins with `ai_federation` for multi-provider routing:
+A typical AI gateway proxy combining all eight AI plugins with `ai_federation` for multi-provider routing:
 
 ```yaml
 # Proxy config — ai_federation handles provider routing, so backend_host is unused

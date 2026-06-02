@@ -537,7 +537,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
 | `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli) |
 | `ai_prompt_shield` | ✓ | ✓ | | | | Scans JSON request bodies for PII |
-| `ai_semantic_firewall` | ✓ | ✓ | | | | Semantically inspects LLM JSON request and response bodies |
+| `ai_semantic_firewall` | ✓ | | | | | HTTP-only semantic inspection for LLM JSON request and response bodies |
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
 | `ai_federation` | ✓ | ✓ | | | | Routes to AI providers, normalizes responses |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |

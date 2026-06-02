@@ -16,7 +16,7 @@ use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::sse::parse_sse_data_frames;
-use super::{HTTP_GRPC_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
     "$.messages[*].content",
@@ -305,6 +305,10 @@ impl EmbeddingVector {
                 .fold(0.0_f32, |acc, (left, right)| acc + left * right)
                 .clamp(-1.0, 1.0),
         )
+    }
+
+    fn dimension(&self) -> usize {
+        self.values.len()
     }
 }
 
@@ -643,7 +647,7 @@ impl AiSemanticFirewall {
                 let Some(rule_embeddings) = index.rule_embeddings.get(rule.id.as_str()) else {
                     continue;
                 };
-                let score = max_cosine(segment_embedding, rule_embeddings);
+                let score = max_cosine(segment_embedding, rule_embeddings)?;
                 if score >= rule.threshold {
                     matches.push(self.build_match(rule, segment, score, MatcherType::Semantic));
                 }
@@ -656,7 +660,7 @@ impl AiSemanticFirewall {
                     else {
                         continue;
                     };
-                    let score = max_cosine(segment_embedding, topic_embeddings);
+                    let score = max_cosine(segment_embedding, topic_embeddings)?;
                     if score >= topic.threshold {
                         matches.push(RuleMatch {
                             rule_id: topic.id.clone(),
@@ -1175,7 +1179,7 @@ impl Plugin for AiSemanticFirewall {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        HTTP_GRPC_PROTOCOLS
+        HTTP_ONLY_PROTOCOLS
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
@@ -1270,6 +1274,7 @@ impl Plugin for AiSemanticFirewall {
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
             && ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
+            && !is_native_grpc_request(ctx)
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -2702,11 +2707,33 @@ fn sort_matches(matches: &mut [RuleMatch]) {
     });
 }
 
-fn max_cosine(segment_embedding: &EmbeddingVector, rule_embeddings: &[EmbeddingVector]) -> f32 {
-    rule_embeddings
-        .iter()
-        .filter_map(|rule_embedding| segment_embedding.cosine(rule_embedding))
-        .fold(0.0_f32, f32::max)
+fn max_cosine(
+    segment_embedding: &EmbeddingVector,
+    rule_embeddings: &[EmbeddingVector],
+) -> Result<f32, String> {
+    let mut best = 0.0_f32;
+    for rule_embedding in rule_embeddings {
+        let Some(score) = segment_embedding.cosine(rule_embedding) else {
+            return Err(format!(
+                "embedding dimension mismatch: request vector has {} dimensions, rule vector has {} dimensions",
+                segment_embedding.dimension(),
+                rule_embedding.dimension()
+            ));
+        };
+        best = best.max(score);
+    }
+    Ok(best)
+}
+
+fn is_native_grpc_request(ctx: &RequestContext) -> bool {
+    ctx.headers
+        .get("content-type")
+        .is_some_and(|content_type| is_native_grpc_content_type(content_type))
+}
+
+fn is_native_grpc_content_type(content_type: &str) -> bool {
+    let normalized = content_type.trim().to_ascii_lowercase();
+    normalized.starts_with("application/grpc") && !normalized.starts_with("application/grpc-web")
 }
 
 fn parse_openai_embedding_response(
@@ -2805,7 +2832,9 @@ fn sanitize_provider_error(error: &str) -> String {
         "embedding request failed".to_string()
     } else if error.contains("embedding response parse failed") {
         "embedding response parse failed".to_string()
-    } else if error.contains("embedding response invalid") {
+    } else if error.contains("embedding response invalid")
+        || error.contains("embedding dimension mismatch")
+    {
         "embedding response invalid".to_string()
     } else {
         "embedding provider error".to_string()

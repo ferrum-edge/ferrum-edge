@@ -3,7 +3,7 @@
 use ferrum_edge::config::{BackendAllowIps, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, PluginHttpClient, RequestContext,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext,
     ai_semantic_firewall::AiSemanticFirewall, create_plugin, priority,
 };
 use serde_json::{Value, json};
@@ -111,7 +111,7 @@ async fn plugin_name_priority_protocols_and_registration() {
     let plugin = plugin(&config);
     assert_eq!(plugin.name(), "ai_semantic_firewall");
     assert_eq!(plugin.priority(), priority::AI_SEMANTIC_FIREWALL);
-    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
+    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(plugin.requires_request_body_buffering());
 
     let created = create_plugin("ai_semantic_firewall", &config)
@@ -520,6 +520,19 @@ async fn accept_sse_does_not_bypass_json_response_inspection() {
 }
 
 #[tokio::test]
+async fn native_grpc_request_does_not_force_response_body_buffering() {
+    let mut config = config_with_builtin("response_leakage");
+    config["inspect"] = json!({"request": false, "response": true});
+    let plugin = plugin(&config);
+    let mut ctx = create_test_context();
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+
+    assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/grpc")));
+}
+
+#[tokio::test]
 async fn stream_true_request_disables_response_body_buffering() {
     let mut config = config_with_builtin("response_leakage");
     config["inspect"] = json!({"request": false, "response": true});
@@ -689,6 +702,63 @@ async fn provider_error_rejects_when_configured_fail_closed() {
             .get("ai_semantic_firewall.provider_error")
             .map(String::as_str),
         Some("embedding request failed")
+    );
+}
+
+#[tokio::test]
+async fn embedding_dimension_mismatch_honors_fail_closed_policy() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(|req: &Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let inputs = body["input"].as_array().unwrap();
+            let data: Vec<Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    let text = input.as_str().unwrap_or("").to_ascii_lowercase();
+                    let embedding = if text.contains("approved topic") {
+                        vec![1.0, 0.0]
+                    } else {
+                        vec![1.0, 0.0, 0.0]
+                    };
+                    json!({"index": index, "embedding": embedding})
+                })
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({"data": data}))
+        })
+        .mount(&server)
+        .await;
+
+    let config = json!({
+        "inspect": {"request": true, "response": false},
+        "on_error": "reject",
+        "provider": provider(&format!("{}/v1/embeddings", server.uri())),
+        "builtins": disabled_builtins(),
+        "custom_rules": [{
+            "id": "semantic-only",
+            "direction": "request",
+            "action": "reject",
+            "severity": "high",
+            "examples": ["Discuss approved topic"],
+            "threshold": 0.99
+        }]
+    });
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{"role": "user", "content": "A completely unrelated harmless prompt."}]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(503));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.provider_error")
+            .map(String::as_str),
+        Some("embedding response invalid")
     );
 }
 
