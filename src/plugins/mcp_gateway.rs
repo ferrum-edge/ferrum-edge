@@ -30,6 +30,7 @@ const METADATA_REWRITE_METHOD_KEY: &str = "mcp.rewrite.method";
 const METADATA_REWRITE_PARAM_KEY: &str = "mcp.rewrite.param";
 const METADATA_REWRITE_PUBLIC_VALUE_KEY: &str = "mcp.rewrite.public_value";
 const METADATA_REWRITE_UPSTREAM_VALUE_KEY: &str = "mcp.rewrite.upstream_value";
+const MAX_MCP_PAGINATION_PAGES: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpGatewayMode {
@@ -324,6 +325,12 @@ impl McpCatalog {
             None => true,
         }
     }
+}
+
+#[derive(Debug)]
+enum McpCatalogError {
+    SessionNotFound,
+    Refresh(String),
 }
 
 #[derive(Debug, Clone)]
@@ -681,6 +688,25 @@ impl McpGateway {
             .map(|session| session.clone())
     }
 
+    fn require_live_downstream_session(
+        &self,
+        headers: &HashMap<String, String>,
+        id: Option<Value>,
+    ) -> Result<String, PluginResult> {
+        let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
+            return Err(json_rpc_error(
+                id,
+                -32005,
+                "Upstream MCP session unavailable",
+                None,
+            ));
+        };
+        if !self.touch_downstream_session(&session_id) {
+            return Err(session_not_found_response());
+        }
+        Ok(session_id)
+    }
+
     fn create_downstream_session(
         &self,
         protocol_version: String,
@@ -805,6 +831,14 @@ impl McpGateway {
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
 
+        self.send_upstream_initialized_notification(
+            ctx,
+            downstream_session_id,
+            server,
+            upstream_session_id.as_deref(),
+        )
+        .await?;
+
         if let Some(mut session) = self.session_store.get_mut(downstream_session_id) {
             session.last_seen = Instant::now();
             if let Some(upstream) = session.upstream_sessions.get_mut(server_id) {
@@ -813,6 +847,63 @@ impl McpGateway {
             }
         }
         Ok(upstream_session_id)
+    }
+
+    async fn send_upstream_initialized_notification(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+        server: &McpServerConfig,
+        upstream_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        });
+        let mut request = self
+            .http_client
+            .get()
+            .post(&server.upstream_url)
+            .header("content-type", "application/json")
+            .header("accept", "application/json")
+            .header(
+                "mcp-protocol-version",
+                self.protocol_version_for_session(downstream_session_id),
+            );
+        if let Some(session_id) = upstream_session_id {
+            request = request.header(&self.sessions.upstream_session_header, session_id);
+        }
+        let response = self
+            .http_client
+            .execute_tracked(
+                request.json(&body),
+                "mcp_gateway.initialized_notification",
+                &ctx.plugin_http_call_ns,
+            )
+            .await
+            .map_err(|error| {
+                warn!(
+                    server_id = %server.server_id,
+                    method = "notifications/initialized",
+                    error = %error,
+                    "MCP upstream initialized notification failed"
+                );
+                format!("failed to send upstream MCP initialized notification: {error}")
+            })?;
+        if !response.status().is_success() {
+            warn!(
+                server_id = %server.server_id,
+                method = "notifications/initialized",
+                status = %response.status(),
+                "MCP upstream initialized notification returned non-success status"
+            );
+            return Err(format!(
+                "upstream MCP initialized notification returned HTTP {}",
+                response.status()
+            ));
+        }
+        Ok(())
     }
 
     fn protocol_version_for_session(&self, downstream_session_id: &str) -> String {
@@ -933,7 +1024,7 @@ impl McpGateway {
                 response.status()
             ));
         }
-        response.json::<Value>().await.map_err(|error| {
+        let response_body = response.json::<Value>().await.map_err(|error| {
             warn!(
                 server_id = %server.server_id,
                 method,
@@ -941,19 +1032,84 @@ impl McpGateway {
                 "MCP upstream response was not JSON"
             );
             format!("upstream MCP response was not JSON: {error}")
-        })
+        })?;
+        if let Some(error) = response_body.get("error") {
+            let error_code = error.get("code").and_then(Value::as_i64);
+            let error_message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown MCP JSON-RPC error");
+            warn!(
+                server_id = %server.server_id,
+                method,
+                error_code,
+                error_message = %error_message,
+                "MCP upstream returned JSON-RPC error"
+            );
+            return Err(format!("upstream MCP {method} returned JSON-RPC error"));
+        }
+        Ok(response_body)
+    }
+
+    async fn request_upstream_list_pages(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+        server: &McpServerConfig,
+        method: &str,
+        result_key: &str,
+    ) -> Result<Vec<Value>, String> {
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_MCP_PAGINATION_PAGES {
+            let params = match cursor.as_deref() {
+                Some(cursor) => json!({ "cursor": cursor }),
+                None => json!({}),
+            };
+            let response = self
+                .request_upstream_json(ctx, downstream_session_id, server, method, params)
+                .await?;
+            let result = response
+                .get("result")
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("upstream MCP {method} response missing result"))?;
+            let page_items = result
+                .get(result_key)
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    format!("upstream MCP {method} response missing result.{result_key}")
+                })?;
+            items.extend(page_items.iter().cloned());
+            cursor = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|cursor| !cursor.is_empty())
+                .map(ToOwned::to_owned);
+            if cursor.is_none() {
+                return Ok(items);
+            }
+        }
+        warn!(
+            server_id = %server.server_id,
+            method,
+            max_pages = MAX_MCP_PAGINATION_PAGES,
+            "MCP upstream pagination exceeded maximum page count"
+        );
+        Err(format!(
+            "upstream MCP {method} pagination exceeded {MAX_MCP_PAGINATION_PAGES} pages"
+        ))
     }
 
     async fn ensure_catalog(
         &self,
         ctx: &RequestContext,
         downstream_session_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), McpCatalogError> {
         if self
             .downstream_session_clone(downstream_session_id)
             .is_none()
         {
-            return Err("downstream MCP session is not initialized".to_string());
+            return Err(McpCatalogError::SessionNotFound);
         }
         {
             let catalog = self.catalog.read().await;
@@ -968,7 +1124,9 @@ impl McpGateway {
                 return Ok(());
             }
         }
-        self.refresh_catalog(ctx, downstream_session_id).await
+        self.refresh_catalog(ctx, downstream_session_id)
+            .await
+            .map_err(McpCatalogError::Refresh)
     }
 
     async fn refresh_catalog(
@@ -984,21 +1142,15 @@ impl McpGateway {
 
         for server in self.servers.values().filter(|server| server.enabled) {
             if self.discovery.aggregate_tools && server.expose_tools {
-                let response = self
-                    .request_upstream_json(
+                let items = self
+                    .request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
                         server,
                         "tools/list",
-                        json!({}),
+                        "tools",
                     )
                     .await?;
-                let items = response
-                    .get("result")
-                    .and_then(|result| result.get("tools"))
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
                 for item in items {
                     if let Some(entry) =
                         self.tool_entry_from_value(server, item, discovered_at, &old_catalog)
@@ -1008,21 +1160,15 @@ impl McpGateway {
                 }
             }
             if self.discovery.aggregate_prompts && server.expose_prompts {
-                let response = self
-                    .request_upstream_json(
+                let items = self
+                    .request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
                         server,
                         "prompts/list",
-                        json!({}),
+                        "prompts",
                     )
                     .await?;
-                let items = response
-                    .get("result")
-                    .and_then(|result| result.get("prompts"))
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
                 for item in items {
                     if let Some(entry) = self.prompt_entry_from_value(server, item, discovered_at) {
                         prompts.insert(entry.public_name.clone(), entry);
@@ -1030,21 +1176,15 @@ impl McpGateway {
                 }
             }
             if self.discovery.aggregate_resources && server.expose_resources {
-                let response = self
-                    .request_upstream_json(
+                let items = self
+                    .request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
                         server,
                         "resources/list",
-                        json!({}),
+                        "resources",
                     )
                     .await?;
-                let items = response
-                    .get("result")
-                    .and_then(|result| result.get("resources"))
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
                 for item in items {
                     if let Some(entry) = self.resource_entry_from_value(server, item, discovered_at)
                     {
@@ -1262,12 +1402,7 @@ impl McpGateway {
         downstream_session_id: &str,
     ) -> PluginResult {
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32006,
-                "MCP catalog unavailable",
-                Some(error),
-            );
+            return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
         let catalog = self.catalog.read().await;
         if self.observability.emit_metadata {
@@ -1308,12 +1443,7 @@ impl McpGateway {
         downstream_session_id: &str,
     ) -> PluginResult {
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32006,
-                "MCP catalog unavailable",
-                Some(error),
-            );
+            return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
         let catalog = self.catalog.read().await;
         if self.observability.emit_metadata {
@@ -1350,12 +1480,7 @@ impl McpGateway {
         downstream_session_id: &str,
     ) -> PluginResult {
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32006,
-                "MCP catalog unavailable",
-                Some(error),
-            );
+            return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
         let catalog = self.catalog.read().await;
         if self.observability.emit_metadata {
@@ -1385,6 +1510,61 @@ impl McpGateway {
         )
     }
 
+    async fn aggregate_resource_templates_list(
+        &self,
+        ctx: &mut RequestContext,
+        envelope: &McpEnvelope,
+        downstream_session_id: &str,
+    ) -> PluginResult {
+        let mut resource_templates = Vec::new();
+        for server in self
+            .servers
+            .values()
+            .filter(|server| server.enabled && server.expose_resources)
+        {
+            let items = match self
+                .request_upstream_list_pages(
+                    ctx,
+                    downstream_session_id,
+                    server,
+                    "resources/templates/list",
+                    "resourceTemplates",
+                )
+                .await
+            {
+                Ok(items) => items,
+                Err(error) => {
+                    return json_rpc_error(
+                        envelope.id.clone(),
+                        -32006,
+                        "MCP resource template catalog unavailable",
+                        Some(error),
+                    );
+                }
+            };
+            resource_templates.extend(
+                items
+                    .into_iter()
+                    .filter_map(|item| resource_template_to_public_value(server, item)),
+            );
+        }
+        if self.observability.emit_metadata {
+            ctx.metadata.insert(
+                "mcp.route_decision".to_string(),
+                "synthetic_response".to_string(),
+            );
+        }
+        json_response(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": envelope.id.clone().unwrap_or(Value::Null),
+                "result": { "resourceTemplates": resource_templates }
+            }),
+            None,
+        )
+    }
+
     async fn route_tool_call(
         &self,
         ctx: &mut RequestContext,
@@ -1393,12 +1573,7 @@ impl McpGateway {
         downstream_session_id: &str,
     ) -> PluginResult {
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32006,
-                "MCP catalog unavailable",
-                Some(error),
-            );
+            return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
         let public_name = match envelope
             .params
@@ -1547,12 +1722,7 @@ impl McpGateway {
         downstream_session_id: &str,
     ) -> PluginResult {
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32006,
-                "MCP catalog unavailable",
-                Some(error),
-            );
+            return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
         let public_name = match envelope
             .params
@@ -1625,12 +1795,7 @@ impl McpGateway {
         downstream_session_id: &str,
     ) -> PluginResult {
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32006,
-                "MCP catalog unavailable",
-                Some(error),
-            );
+            return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
         let public_uri = match envelope
             .params
@@ -1749,6 +1914,10 @@ impl Plugin for McpGateway {
         self.enabled && self.matches_endpoint(ctx) && ctx.method.eq_ignore_ascii_case("POST")
     }
 
+    fn needs_final_request_body_context(&self) -> bool {
+        self.enabled && self.mode == McpGatewayMode::AggregateRouter
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -1799,6 +1968,9 @@ impl Plugin for McpGateway {
                 return PluginResult::Continue;
             }
             if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
+                if !self.touch_downstream_session(&session_id) {
+                    return session_not_found_response();
+                }
                 self.remove_downstream_session(&session_id, ctx).await;
                 ctx.metadata
                     .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
@@ -1832,9 +2004,13 @@ impl Plugin for McpGateway {
         };
         self.emit_envelope_metadata(ctx, &envelope);
         let protocol_version = self.mark_protocol_version(ctx, headers, Some(&envelope));
+        let method = envelope.method.as_deref().unwrap_or_default();
         if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
-            if self.mode == McpGatewayMode::AggregateRouter {
-                self.touch_downstream_session(&session_id);
+            if self.mode == McpGatewayMode::AggregateRouter
+                && method != "initialize"
+                && !self.touch_downstream_session(&session_id)
+            {
+                return session_not_found_response();
             }
             ctx.metadata
                 .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
@@ -1844,7 +2020,6 @@ impl Plugin for McpGateway {
             return self.handle_transparent_post(ctx, headers, &envelope);
         }
 
-        let method = envelope.method.as_deref().unwrap_or_default();
         match method {
             "initialize" => {
                 let version =
@@ -1887,6 +2062,9 @@ impl Plugin for McpGateway {
                     "mcp.route_decision".to_string(),
                     "synthetic_response".to_string(),
                 );
+                if envelope.message_kind == McpMessageKind::Notification {
+                    return empty_response(202);
+                }
                 json_response(
                     200,
                     json!({
@@ -1898,79 +2076,75 @@ impl Plugin for McpGateway {
                 )
             }
             "tools/list" => {
-                let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
-                    return json_rpc_error(
-                        envelope.id.clone(),
-                        -32005,
-                        "Upstream MCP session unavailable",
-                        None,
-                    );
-                };
+                let session_id =
+                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
+                        Ok(session_id) => session_id,
+                        Err(result) => return result,
+                    };
                 self.aggregate_tools_list(ctx, &envelope, &session_id).await
             }
             "tools/call" => {
-                let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
-                    return json_rpc_error(
-                        envelope.id.clone(),
-                        -32005,
-                        "Upstream MCP session unavailable",
-                        None,
-                    );
-                };
+                let session_id =
+                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
+                        Ok(session_id) => session_id,
+                        Err(result) => return result,
+                    };
                 self.route_tool_call(ctx, headers, &envelope, &session_id)
                     .await
             }
             "prompts/list" => {
-                let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
-                    return json_rpc_error(
-                        envelope.id.clone(),
-                        -32005,
-                        "Upstream MCP session unavailable",
-                        None,
-                    );
-                };
+                let session_id =
+                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
+                        Ok(session_id) => session_id,
+                        Err(result) => return result,
+                    };
                 self.aggregate_prompts_list(ctx, &envelope, &session_id)
                     .await
             }
             "prompts/get" => {
-                let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
-                    return json_rpc_error(
-                        envelope.id.clone(),
-                        -32005,
-                        "Upstream MCP session unavailable",
-                        None,
-                    );
-                };
+                let session_id =
+                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
+                        Ok(session_id) => session_id,
+                        Err(result) => return result,
+                    };
                 self.route_prompt_get(ctx, headers, &envelope, &session_id)
                     .await
             }
-            "resources/list" | "resources/templates/list" => {
-                let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
-                    return json_rpc_error(
-                        envelope.id.clone(),
-                        -32005,
-                        "Upstream MCP session unavailable",
-                        None,
-                    );
-                };
+            "resources/list" => {
+                let session_id =
+                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
+                        Ok(session_id) => session_id,
+                        Err(result) => return result,
+                    };
                 self.aggregate_resources_list(ctx, &envelope, &session_id)
                     .await
             }
+            "resources/templates/list" => {
+                let session_id =
+                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
+                        Ok(session_id) => session_id,
+                        Err(result) => return result,
+                    };
+                self.aggregate_resource_templates_list(ctx, &envelope, &session_id)
+                    .await
+            }
             "resources/read" => {
-                let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
-                    return json_rpc_error(
-                        envelope.id.clone(),
-                        -32005,
-                        "Upstream MCP session unavailable",
-                        None,
-                    );
-                };
+                let session_id =
+                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
+                        Ok(session_id) => session_id,
+                        Err(result) => return result,
+                    };
                 self.route_resource_read(ctx, headers, &envelope, &session_id)
                     .await
             }
             _ if self.capabilities.passthrough_unknown_methods => {
                 if let Some(server) = self.primary_server() {
                     let session_id = self.downstream_session_id_from_headers(headers);
+                    if let Some(session_id) = session_id.as_deref()
+                        && !self.touch_downstream_session(session_id)
+                    {
+                        return session_not_found_response();
+                    }
                     self.set_route_to_server(ctx, headers, server, session_id.as_deref());
                     PluginResult::Continue
                 } else {
@@ -2123,6 +2297,17 @@ fn json_rpc_error(
     )
 }
 
+fn catalog_error_response(
+    id: Option<Value>,
+    message: &str,
+    error: McpCatalogError,
+) -> PluginResult {
+    match error {
+        McpCatalogError::SessionNotFound => session_not_found_response(),
+        McpCatalogError::Refresh(error) => json_rpc_error(id, -32006, message, Some(error)),
+    }
+}
+
 fn json_response(
     status_code: u16,
     body: Value,
@@ -2137,6 +2322,18 @@ fn json_response(
         body: body.to_string(),
         headers,
     }
+}
+
+fn empty_response(status_code: u16) -> PluginResult {
+    PluginResult::Reject {
+        status_code,
+        body: String::new(),
+        headers: HashMap::new(),
+    }
+}
+
+fn session_not_found_response() -> PluginResult {
+    empty_response(404)
 }
 
 fn tool_entry_to_public_value(entry: &ToolCatalogEntry) -> Value {
@@ -2192,6 +2389,34 @@ fn resource_entry_to_public_value(entry: &ResourceCatalogEntry) -> Value {
         object.insert("mimeType".to_string(), Value::String(mime_type.clone()));
     }
     Value::Object(object)
+}
+
+fn resource_template_to_public_value(server: &McpServerConfig, item: Value) -> Option<Value> {
+    let upstream_uri_template = item.get("uriTemplate")?.as_str()?;
+    let mut object = Map::new();
+    object.insert(
+        "uriTemplate".to_string(),
+        Value::String(public_resource_uri(
+            &server.server_id,
+            upstream_uri_template,
+        )),
+    );
+    if let Some(name) = item.get("name").and_then(Value::as_str) {
+        object.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    if let Some(description) = item.get("description").and_then(Value::as_str) {
+        object.insert(
+            "description".to_string(),
+            Value::String(format!("[{}] {}", server.namespace, description)),
+        );
+    }
+    if let Some(mime_type) = item.get("mimeType").and_then(Value::as_str) {
+        object.insert("mimeType".to_string(), Value::String(mime_type.to_string()));
+    }
+    if let Some(annotations) = item.get("annotations") {
+        object.insert("annotations".to_string(), annotations.clone());
+    }
+    Some(Value::Object(object))
 }
 
 fn namespaced(namespace: &str, separator: &str, upstream_name: &str) -> String {
