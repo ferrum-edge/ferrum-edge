@@ -15,7 +15,7 @@ use tokio::sync::OnceCell;
 use url::Url;
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
-use super::utils::sse::{is_sse_request, parse_sse_data_frames};
+use super::utils::sse::parse_sse_data_frames;
 use super::{HTTP_GRPC_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
@@ -412,7 +412,6 @@ impl AiSemanticFirewall {
                     .collect()
             }),
         };
-
         if !enabled {
             return Ok(Self {
                 enabled,
@@ -432,6 +431,17 @@ impl AiSemanticFirewall {
                 rule_embeddings: OnceCell::new(),
             });
         }
+
+        validate_extraction_paths(
+            &extraction.request_json_paths,
+            DEFAULT_REQUEST_JSON_PATHS,
+            "extraction.request_json_paths",
+        )?;
+        validate_extraction_paths(
+            &extraction.response_json_paths,
+            DEFAULT_RESPONSE_JSON_PATHS,
+            "extraction.response_json_paths",
+        )?;
 
         if !inspect_request && !inspect_response {
             return Err(
@@ -876,6 +886,16 @@ impl AiSemanticFirewall {
         Some(hex::encode(digest))
     }
 
+    fn should_handle_provider_error(
+        &self,
+        decision: &FirewallDecision,
+        provider_error: Option<&str>,
+    ) -> bool {
+        provider_error.is_some()
+            && (decision.matches.is_empty()
+                || (self.on_error == OnErrorAction::Reject && decision.action != Action::Reject))
+    }
+
     fn write_decision_metadata(
         &self,
         ctx: &mut RequestContext,
@@ -1209,7 +1229,7 @@ impl Plugin for AiSemanticFirewall {
         }
 
         let outcome = self.evaluate(Direction::Request, &segments).await;
-        if outcome.provider_error.is_some() && outcome.decision.matches.is_empty() {
+        if self.should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref()) {
             return self.handle_provider_error(
                 ctx,
                 Direction::Request,
@@ -1234,7 +1254,6 @@ impl Plugin for AiSemanticFirewall {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
-            && !is_sse_request(ctx)
             && ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
     }
 
@@ -1243,9 +1262,11 @@ impl Plugin for AiSemanticFirewall {
         ctx: &RequestContext,
         content_type: Option<&str>,
     ) -> bool {
-        self.should_buffer_response_body(ctx)
-            && content_type
-                .is_some_and(|ct| is_json_content_type(ct) || is_event_stream_content_type(ct))
+        if !self.should_buffer_response_body(ctx) {
+            return false;
+        }
+
+        content_type.is_some_and(|ct| is_json_content_type(ct) && !is_event_stream_content_type(ct))
     }
 
     async fn on_response_body(
@@ -1295,7 +1316,7 @@ impl Plugin for AiSemanticFirewall {
         }
 
         let outcome = self.evaluate(Direction::Response, &segments).await;
-        if outcome.provider_error.is_some() && outcome.decision.matches.is_empty() {
+        if self.should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref()) {
             return self.handle_provider_error(
                 ctx,
                 Direction::Response,
@@ -2766,6 +2787,21 @@ fn optional_positive_u64_from_object(
         ));
     }
     Ok(Some(number))
+}
+
+fn validate_extraction_paths(
+    paths: &[String],
+    supported_paths: &[&str],
+    field: &str,
+) -> Result<(), String> {
+    for (index, path) in paths.iter().enumerate() {
+        if !supported_paths.contains(&path.as_str()) {
+            return Err(format!(
+                "ai_semantic_firewall: {field}[{index}] contains unsupported path {path:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_action(value: &str, field: &str) -> Result<Action, String> {
