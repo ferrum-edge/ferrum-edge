@@ -362,7 +362,7 @@ enum McpCatalogError {
     Refresh(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct DownstreamMcpSession {
     #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
     downstream_session_id: String,
@@ -370,6 +370,7 @@ struct DownstreamMcpSession {
     client_info: Option<Value>,
     client_capabilities: Option<Value>,
     upstream_sessions: HashMap<String, UpstreamMcpSession>,
+    catalog: Arc<RwLock<McpCatalog>>,
     last_seen: Instant,
 }
 
@@ -392,7 +393,6 @@ pub struct McpGateway {
     capabilities: McpCapabilitiesConfig,
     servers: HashMap<String, McpServerConfig>,
     primary_server_id: String,
-    catalog: Arc<RwLock<McpCatalog>>,
     catalog_refresh_lock: Arc<Mutex<()>>,
     upstream_init_lock: Arc<Mutex<()>>,
     session_store: Arc<DashMap<String, DownstreamMcpSession>>,
@@ -502,7 +502,6 @@ impl McpGateway {
             capabilities,
             servers,
             primary_server_id,
-            catalog: Arc::new(RwLock::new(McpCatalog::default())),
             catalog_refresh_lock: Arc::new(Mutex::new(())),
             upstream_init_lock: Arc::new(Mutex::new(())),
             session_store: Arc::new(DashMap::new()),
@@ -620,6 +619,7 @@ impl McpGateway {
         ctx.route_override_backend_host = Some(server.target.host.clone());
         ctx.route_override_backend_port = Some(server.target.port);
         ctx.route_override_path = Some(server.target.path.clone());
+        ctx.route_override_path_is_absolute = true;
         ctx.route_override_authority = Some(server.target.authority.clone());
         headers.insert("host".to_string(), server.target.authority.clone());
         if let Some(downstream_id) = downstream_session_id
@@ -726,6 +726,11 @@ impl McpGateway {
             .map(|session| session.clone())
     }
 
+    fn catalog_for_session(&self, downstream_session_id: &str) -> Option<Arc<RwLock<McpCatalog>>> {
+        self.downstream_session_clone(downstream_session_id)
+            .map(|session| session.catalog)
+    }
+
     fn require_live_downstream_session(
         &self,
         headers: &HashMap<String, String>,
@@ -777,6 +782,7 @@ impl McpGateway {
                 client_info,
                 client_capabilities,
                 upstream_sessions,
+                catalog: Arc::new(RwLock::new(McpCatalog::default())),
                 last_seen: Instant::now(),
             },
         );
@@ -1175,26 +1181,23 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
     ) -> Result<(), McpCatalogError> {
-        if self
-            .downstream_session_clone(downstream_session_id)
-            .is_none()
+        let catalog_lock = self
+            .catalog_for_session(downstream_session_id)
+            .ok_or(McpCatalogError::SessionNotFound)?;
         {
-            return Err(McpCatalogError::SessionNotFound);
-        }
-        {
-            let catalog = self.catalog.read().await;
+            let catalog = catalog_lock.read().await;
             if !catalog.is_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
         let _guard = self.catalog_refresh_lock.lock().await;
         {
-            let catalog = self.catalog.read().await;
+            let catalog = catalog_lock.read().await;
             if !catalog.is_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        self.refresh_catalog(ctx, downstream_session_id)
+        self.refresh_catalog(ctx, downstream_session_id, &catalog_lock)
             .await
             .map_err(McpCatalogError::Refresh)
     }
@@ -1204,26 +1207,23 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
     ) -> Result<(), McpCatalogError> {
-        if self
-            .downstream_session_clone(downstream_session_id)
-            .is_none()
+        let catalog_lock = self
+            .catalog_for_session(downstream_session_id)
+            .ok_or(McpCatalogError::SessionNotFound)?;
         {
-            return Err(McpCatalogError::SessionNotFound);
-        }
-        {
-            let catalog = self.catalog.read().await;
+            let catalog = catalog_lock.read().await;
             if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
         let _guard = self.catalog_refresh_lock.lock().await;
         {
-            let catalog = self.catalog.read().await;
+            let catalog = catalog_lock.read().await;
             if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        self.refresh_resource_templates(ctx, downstream_session_id)
+        self.refresh_resource_templates(ctx, downstream_session_id, &catalog_lock)
             .await
             .map_err(McpCatalogError::Refresh)
     }
@@ -1232,8 +1232,9 @@ impl McpGateway {
         &self,
         ctx: &RequestContext,
         downstream_session_id: &str,
+        catalog_lock: &Arc<RwLock<McpCatalog>>,
     ) -> Result<(), String> {
-        let old_catalog = self.catalog.read().await.clone();
+        let old_catalog = catalog_lock.read().await.clone();
         let mut tools = HashMap::new();
         let mut prompts = HashMap::new();
         let mut resources = HashMap::new();
@@ -1299,7 +1300,7 @@ impl McpGateway {
             }
         }
 
-        let mut catalog = self.catalog.write().await;
+        let mut catalog = catalog_lock.write().await;
         let changed = catalog.tools.keys().collect::<HashSet<_>>() != tools.keys().collect()
             || catalog.prompts.keys().collect::<HashSet<_>>() != prompts.keys().collect()
             || catalog.resources.keys().collect::<HashSet<_>>() != resources.keys().collect()
@@ -1323,6 +1324,7 @@ impl McpGateway {
         &self,
         ctx: &RequestContext,
         downstream_session_id: &str,
+        catalog_lock: &Arc<RwLock<McpCatalog>>,
     ) -> Result<(), String> {
         let mut resource_templates = HashMap::new();
         let discovered_at = Utc::now();
@@ -1350,7 +1352,7 @@ impl McpGateway {
             }
         }
 
-        let mut catalog = self.catalog.write().await;
+        let mut catalog = catalog_lock.write().await;
         let changed = catalog.resource_templates.keys().collect::<HashSet<_>>()
             != resource_templates.keys().collect();
         catalog.resource_templates = resource_templates;
@@ -1602,7 +1604,10 @@ impl McpGateway {
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
             return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
-        let catalog = self.catalog.read().await;
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
         if self.observability.emit_metadata {
             ctx.metadata.insert(
                 "mcp.route_decision".to_string(),
@@ -1643,7 +1648,10 @@ impl McpGateway {
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
             return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
-        let catalog = self.catalog.read().await;
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
         if self.observability.emit_metadata {
             ctx.metadata.insert(
                 "mcp.route_decision".to_string(),
@@ -1680,7 +1688,10 @@ impl McpGateway {
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
             return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
-        let catalog = self.catalog.read().await;
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
         if self.observability.emit_metadata {
             ctx.metadata.insert(
                 "mcp.route_decision".to_string(),
@@ -1724,7 +1735,10 @@ impl McpGateway {
                 error,
             );
         }
-        let catalog = self.catalog.read().await;
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
         let resource_templates: Vec<Value> = catalog
             .resource_templates
             .values()
@@ -1786,7 +1800,10 @@ impl McpGateway {
             ctx.metadata
                 .insert("mcp.item_name".to_string(), public_name.clone());
         }
-        let catalog = self.catalog.read().await;
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
         let Some(entry) = catalog.tools.get(&public_name).cloned() else {
             if self.observability.emit_metadata {
                 ctx.metadata
@@ -1927,7 +1944,10 @@ impl McpGateway {
                 );
             }
         };
-        let catalog = self.catalog.read().await;
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
         let Some(entry) = catalog.prompts.get(&public_name).cloned() else {
             return json_rpc_error(envelope.id.clone(), -32008, "Unknown MCP prompt", None);
         };
@@ -2003,7 +2023,10 @@ impl McpGateway {
             }
         };
         let route = if catalog_error.is_none() {
-            let catalog = self.catalog.read().await;
+            let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+                return session_not_found_response();
+            };
+            let catalog = catalog_lock.read().await;
             catalog
                 .resources
                 .get(&public_uri)
@@ -2024,7 +2047,10 @@ impl McpGateway {
                         error,
                     );
                 }
-                let catalog = self.catalog.read().await;
+                let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+                    return session_not_found_response();
+                };
+                let catalog = catalog_lock.read().await;
                 let Some(route) = resource_template_route(&catalog, &public_uri) else {
                     if let Some(error) = catalog_error {
                         return catalog_error_response(
@@ -2362,13 +2388,23 @@ impl Plugin for McpGateway {
             }
             _ if self.capabilities.passthrough_unknown_methods => {
                 if let Some(server) = self.primary_server() {
-                    let session_id = self.downstream_session_id_from_headers(headers);
-                    if let Some(session_id) = session_id.as_deref()
-                        && !self.touch_downstream_session(session_id)
+                    let session_id =
+                        match self.require_live_downstream_session(headers, envelope.id.clone()) {
+                            Ok(session_id) => session_id,
+                            Err(result) => return result,
+                        };
+                    if let Err(error) = self
+                        .ensure_upstream_initialized(&session_id, &server.server_id, ctx)
+                        .await
                     {
-                        return session_not_found_response();
+                        return json_rpc_error(
+                            envelope.id.clone(),
+                            -32005,
+                            "Upstream MCP session unavailable",
+                            Some(error),
+                        );
                     }
-                    self.set_route_to_server(ctx, headers, server, session_id.as_deref());
+                    self.set_route_to_server(ctx, headers, server, Some(&session_id));
                     PluginResult::Continue
                 } else {
                     json_rpc_error(

@@ -560,6 +560,11 @@ pub struct RequestContext {
     /// path; VS-derived proxies never set `strip_listen_path`, so the override
     /// is the literal forwarded path.
     pub route_override_path: Option<String>,
+    /// Treat `route_override_path` as an absolute backend path by disabling
+    /// `strip_listen_path` on the effective proxy. Used by direct upstream
+    /// routers when the override is already the final upstream URL path rather
+    /// than a virtual-service rewrite relative to the selected public route.
+    pub route_override_path_is_absolute: bool,
     /// Plugin-set override for the `Host` / `:authority` forwarded to the
     /// backend. Set by `mesh_route_dispatch` for an Istio
     /// `VirtualService.http[].rewrite.authority`. The proxy dispatch path
@@ -655,6 +660,7 @@ impl RequestContext {
             route_override_request_transform: None,
             route_override_response_transform: None,
             route_override_path: None,
+            route_override_path_is_absolute: false,
             route_override_authority: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
@@ -713,6 +719,7 @@ impl RequestContext {
             route_override_request_transform: self.route_override_request_transform.clone(),
             route_override_response_transform: self.route_override_response_transform.clone(),
             route_override_path: self.route_override_path.clone(),
+            route_override_path_is_absolute: self.route_override_path_is_absolute,
             route_override_authority: self.route_override_authority.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
@@ -938,6 +945,8 @@ impl RequestContext {
         // it with the backend's own host.
         let preserve_host_changed =
             self.route_override_authority.is_some() && !proxy.preserve_host_header;
+        let strip_listen_path_changed =
+            self.route_override_path_is_absolute && proxy.strip_listen_path;
 
         if !upstream_id_changed
             && !backend_host_changed
@@ -948,6 +957,7 @@ impl RequestContext {
             && !backend_read_timeout_changed
             && !retry_changed
             && !preserve_host_changed
+            && !strip_listen_path_changed
         {
             return proxy;
         }
@@ -986,6 +996,9 @@ impl RequestContext {
         }
         if preserve_host_changed {
             overridden.preserve_host_header = true;
+        }
+        if strip_listen_path_changed {
+            overridden.strip_listen_path = false;
         }
         Arc::new(overridden)
     }
@@ -2788,5 +2801,27 @@ mod tests {
             Some("/certs/canary-ca.pem")
         );
         assert!(!result.resolved_tls.verify_server_cert);
+    }
+
+    #[test]
+    fn absolute_route_override_path_disables_listen_path_stripping() {
+        let proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "stable.svc",
+            "backend_port": 8080,
+            "listen_path": "/mcp",
+            "strip_listen_path": true
+        }))
+        .expect("minimal proxy should deserialize");
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/mcp".to_string(),
+        );
+        ctx.route_override_path = Some("/mcp".to_string());
+        ctx.route_override_path_is_absolute = true;
+
+        let result = ctx.apply_route_overrides(Arc::new(proxy));
+        assert!(!result.strip_listen_path);
     }
 }

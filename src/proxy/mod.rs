@@ -6582,6 +6582,14 @@ fn push_backend_path(url: &mut String, backend_path: &str, remaining_path: &str)
     url.push_str(remaining_path);
 }
 
+fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
+    if host.contains(':') && !host.starts_with('[') {
+        std::borrow::Cow::Owned(format!("[{host}]"))
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
 /// Build a WebSocket backend URL using a specific target host/port,
 /// respecting strip_listen_path, backend_path, and query string.
 ///
@@ -6631,11 +6639,12 @@ pub(crate) fn build_websocket_backend_url_with_target(
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
     let path_layout = backend_path_layout(backend_path, remaining_path);
+    let rendered_host = url_render_host(host);
 
     // Pre-calculate capacity and build in a single buffer.
     let capacity = scheme.len()
         + 3 // "://"
-        + host.len()
+        + rendered_host.len()
         + 6 // ":PORT" (max 5 digits + colon)
         + path_layout.len
         + if query_string.is_empty() {
@@ -6645,7 +6654,7 @@ pub(crate) fn build_websocket_backend_url_with_target(
         };
 
     let mut url = String::with_capacity(capacity);
-    let _ = write!(url, "{}://{}:{}", scheme, host, port);
+    let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
     push_backend_path(&mut url, backend_path, remaining_path);
 
     if !query_string.is_empty() {
@@ -12291,12 +12300,13 @@ pub fn build_backend_url_with_target(
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
     let path_layout = backend_path_layout(backend_path, remaining_path);
+    let rendered_host = url_render_host(host);
 
     // Build URL in a single buffer, writing the path segments directly to avoid
     // an intermediate `full_path` String allocation from format!().
     let capacity = scheme.len()
         + 3
-        + host.len()
+        + rendered_host.len()
         + 6
         + path_layout.len
         + if query_string.is_empty() {
@@ -12305,7 +12315,7 @@ pub fn build_backend_url_with_target(
             1 + query_string.len()
         };
     let mut url = String::with_capacity(capacity);
-    let _ = write!(url, "{}://{}:{}", scheme, host, port);
+    let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
 
     push_backend_path(&mut url, backend_path, remaining_path);
 
@@ -17259,6 +17269,27 @@ mod tests {
             None,
         );
         assert_eq!(url, "ws://backend.local:8080/a/b");
+    }
+
+    #[test]
+    fn backend_url_brackets_ipv6_literal_host() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.dispatch_kind = DispatchKind::HttpPool;
+        proxy.backend_path = None;
+        proxy.strip_listen_path = false;
+
+        let url = build_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None);
+        assert_eq!(url, "http://[::1]:8080/mcp");
+    }
+
+    #[test]
+    fn websocket_backend_url_brackets_ipv6_literal_host() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.strip_listen_path = false;
+
+        let url = build_websocket_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None);
+        assert_eq!(url, "ws://[::1]:8080/mcp");
     }
 
     #[test]
