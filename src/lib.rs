@@ -90,7 +90,7 @@ pub mod _test_support {
     }
 
     pub fn soap_find_element_by_wsu_id_for_test(xml: &str, id: &str) -> Option<String> {
-        crate::plugins::soap_ws_security::find_element_by_wsu_id(xml, id)
+        crate::plugins::soap_ws_security::find_element_by_wsu_id_in_range(xml, 0, xml.len(), id)
     }
 
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────

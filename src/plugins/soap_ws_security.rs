@@ -1738,12 +1738,9 @@ fn find_attribute(element: &str, attr_name: &str) -> Option<String> {
     None
 }
 
-/// Find an element by its wsu:Id attribute value.
-pub(crate) fn find_element_by_wsu_id(xml: &str, id: &str) -> Option<String> {
-    find_element_by_wsu_id_in_range(xml, 0, xml.len(), id)
-}
-
-fn find_element_by_wsu_id_in_range(
+/// Find an element by its wsu:Id attribute value within the byte range
+/// `[range_start, range_end)` of `xml`.
+pub(crate) fn find_element_by_wsu_id_in_range(
     xml: &str,
     range_start: usize,
     range_end: usize,

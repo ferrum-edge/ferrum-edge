@@ -348,7 +348,7 @@ fn count_wsu_id_occurrences_fails_closed_on_unterminated_comment() {
 fn find_element_by_wsu_id_skips_comment_content_like_counter() {
     let xml = r#"
         <!-- <Signed wsu:Id="X">signed bytes</Signed> -->
-        <Unsigned wsu:Id="X">backend bytes</Unsigned>
+        <Unsigned xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" wsu:Id="X">backend bytes</Unsigned>
     "#;
 
     assert_eq!(
