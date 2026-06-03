@@ -1118,3 +1118,206 @@ async fn functional_mesh_mode_production_binds_mtls_inbound_with_gateway_svid() 
         "production mesh did not bind an mTLS inbound listener from gateway SVID material after {RETRY_ATTEMPTS} attempts\n{last_failure}"
     );
 }
+
+/// Server + client SVIDs under a **shared** CA. `generate_gateway_svid` mints a
+/// fresh CA per call, so it can't drive a two-sided handshake; this signs both
+/// leaves from one root and returns the CA as the server's trust bundle, so the
+/// server STRICT verifier accepts the client SVID. Server material is written to
+/// files (for `FERRUM_GATEWAY_SVID_*`); the client cert/key are returned in PEM
+/// for a `reqwest::Identity`.
+struct MeshPeerSvids {
+    server_cert_path: String,
+    server_key_path: String,
+    trust_bundle_path: String,
+    client_cert_pem: String,
+    client_key_pem: String,
+}
+
+fn generate_mesh_peer_svids(
+    dir: &std::path::Path,
+    server_spiffe: &str,
+    client_spiffe: &str,
+) -> MeshPeerSvids {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa,
+        Issuer, KeyPair, KeyUsagePurpose,
+    };
+
+    let not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+    let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+
+    // Shared root CA — also the trust bundle both peers verify against.
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    ca_params.not_before = not_before;
+    ca_params.not_after = not_after;
+    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+    let ca_pem = ca_cert.pem();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let leaf = |spiffe: &str| -> (String, String) {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        let id = SpiffeId::new(spiffe).expect("valid SPIFFE ID");
+        params
+            .subject_alt_names
+            .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let cert = params.signed_by(&key, &issuer).expect("leaf cert");
+        (cert.pem(), key.serialize_pem())
+    };
+
+    let (server_cert_pem, server_key_pem) = leaf(server_spiffe);
+    let (client_cert_pem, client_key_pem) = leaf(client_spiffe);
+
+    let server_cert_path = dir.join("server-svid.crt");
+    let server_key_path = dir.join("server-svid.key");
+    let trust_bundle_path = dir.join("mesh-ca.pem");
+    std::fs::write(&server_cert_path, &server_cert_pem).expect("write server cert");
+    std::fs::write(&server_key_path, &server_key_pem).expect("write server key");
+    std::fs::write(&trust_bundle_path, &ca_pem).expect("write trust bundle");
+
+    let to_str = |p: PathBuf| p.to_str().expect("svid path is UTF-8").to_string();
+    MeshPeerSvids {
+        server_cert_path: to_str(server_cert_path),
+        server_key_path: to_str(server_key_path),
+        trust_bundle_path: to_str(trust_bundle_path),
+        client_cert_pem,
+        client_key_pem,
+    }
+}
+
+/// A mesh slice whose mesh-wide PeerAuthentication resolves the inbound mTLS mode
+/// to STRICT, so the sidecar inbound listener requires + verifies a peer cert.
+fn strict_peer_auth_slice(node_id: &str) -> MeshSlice {
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// Live two-sided mTLS into the sidecar inbound listener (P1 keystone, Increment
+/// A — beyond #1525, which only asserts the listener *binds*). With a STRICT
+/// PeerAuthentication and the gateway SVID backing the inbound server identity,
+/// a real peer presenting a **shared-CA** client SVID must complete the inbound
+/// mTLS handshake, while a client with **no** certificate must be rejected at
+/// the handshake. This exercises the real sidecar↔sidecar mTLS identity path; the
+/// request→authz→backend leg (which needs real capture/routing) is covered by the
+/// kind `mesh-e2e-sidecar` workflow (Increment B).
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_mode_strict_inbound_requires_peer_svid() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    let node_id = "functional-mesh-strict-mtls";
+    let temp = TempDir::new().expect("temp dir");
+    let peers = generate_mesh_peer_svids(
+        temp.path(),
+        "spiffe://cluster.local/ns/ferrum/sa/server",
+        "spiffe://cluster.local/ns/default/sa/client",
+    );
+    let cp = start_static_mesh_cp(strict_peer_auth_slice(node_id)).await;
+    let ports = reserve_mesh_ports().await;
+    let inbound_port = ports.inbound;
+    let mut child = spawn_mesh_gateway(
+        &temp,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp.addr,
+            ports,
+            node_id,
+            config_protocol: "native",
+            topology: "sidecar",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                (
+                    "FERRUM_GATEWAY_SVID_CERT_PATH",
+                    peers.server_cert_path.clone(),
+                ),
+                (
+                    "FERRUM_GATEWAY_SVID_KEY_PATH",
+                    peers.server_key_path.clone(),
+                ),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    peers.trust_bundle_path.clone(),
+                ),
+            ],
+        },
+    );
+
+    let listening = wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await;
+    let url = format!("https://127.0.0.1:{inbound_port}/");
+
+    // Peer presenting the shared-CA client SVID: the STRICT verifier accepts it,
+    // so the mTLS handshake completes (the HTTP outcome past TLS is irrelevant —
+    // routing-to-backend is the kind workflow's job).
+    let with_cert = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .identity(
+            reqwest::Identity::from_pem(
+                format!("{}\n{}", peers.client_cert_pem, peers.client_key_pem).as_bytes(),
+            )
+            .expect("client identity"),
+        )
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("with-cert client")
+        .get(&url)
+        .send()
+        .await;
+
+    // No client certificate: STRICT must reject at the TLS handshake.
+    let no_cert = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("no-cert client")
+        .get(&url)
+        .send()
+        .await;
+
+    let output = captured_output(&temp);
+    kill_child(&mut child);
+    cp.shutdown().await;
+
+    assert!(
+        listening,
+        "production sidecar should bind its mTLS inbound listener\n{output}"
+    );
+    assert!(
+        no_cert.is_err(),
+        "STRICT inbound must reject a client presenting no certificate\n{output}"
+    );
+    assert!(
+        with_cert.is_ok()
+            || !with_cert
+                .as_ref()
+                .err()
+                .map(reqwest::Error::is_connect)
+                .unwrap_or(false),
+        "a peer presenting a shared-CA SVID must complete the inbound mTLS handshake \
+         (failed at connect): {with_cert:?}\n{output}"
+    );
+}
