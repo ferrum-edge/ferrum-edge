@@ -511,6 +511,7 @@ jobs:
           - shard: plugins
             filters: |
               functional_ai_plugins_test
+              functional_ai_semantic_firewall_streaming_test
               functional_grpc_plugins_test
               functional_logging_plugins_test
               functional_logging_test
