@@ -153,6 +153,41 @@ pub fn encode_sse_error_event(code: &str, message: &str) -> bytes::Bytes {
     bytes::Bytes::from(format!("event: error\ndata: {payload}\n\ndata: [DONE]\n\n"))
 }
 
+/// Floor `idx` down to the nearest UTF-8 char boundary at or below it in `s`.
+/// Window release/overlap offsets are computed from byte lengths, so callers
+/// snap them here before slicing to avoid panicking on multi-byte content.
+pub fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Byte index just past the last sentence-terminating `.`/`!`/`?` that is
+/// followed by whitespace (or end of text) in `s`, or `None` when `s` holds no
+/// complete sentence. Lets streamed inspection release windows at sentence
+/// granularity. Terminators are ASCII, so the returned index is always a char
+/// boundary. Intentionally simple — an abbreviation or decimal just yields an
+/// earlier (still safe) window boundary.
+pub fn last_sentence_boundary(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut last = None;
+    for i in 0..bytes.len() {
+        if matches!(bytes[i], b'.' | b'!' | b'?')
+            && bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace)
+        {
+            last = Some(i + 1);
+        }
+    }
+    last
+}
+
+/// Byte index just past the last paragraph break (blank line) in `s`, or `None`.
+pub fn last_paragraph_boundary(s: &str) -> Option<usize> {
+    s.rfind("\n\n").map(|i| i + 2)
+}
+
 /// Logical role of a reassembled streaming-SSE text fragment, so callers can map
 /// it onto their own segment taxonomy without re-deriving the JSON shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +252,23 @@ pub struct SseReassembler {
 impl SseReassembler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The assistant prose reassembled so far — chat-completion `delta.content`
+    /// across choices (in choice-index order) followed by Responses-API output
+    /// text. This is the stream that windowed inspection scans for sentence /
+    /// paragraph boundaries; tool-call arguments are inspected separately. With
+    /// parallel choices (`n > 1`) the texts are concatenated, which is an
+    /// approximation — `n = 1` is the dominant streaming case.
+    pub fn assistant_content(&self) -> String {
+        let mut combined = String::new();
+        for (_choice, text) in &self.content {
+            combined.push_str(text);
+        }
+        for (_key, text) in &self.responses_text {
+            combined.push_str(text);
+        }
+        combined
     }
 
     /// Accumulate one already-parsed SSE `data:` frame.
@@ -588,6 +640,47 @@ mod tests {
         let frames = parse_sse_data_frames(&bytes);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["error"]["message"], "line1\nline2 \"q\"");
+    }
+
+    #[test]
+    fn assistant_content_concatenates_choice_and_responses_text() {
+        let mut r = SseReassembler::new();
+        for frame in parse_sse_data_frames(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
+        ) {
+            r.push_frame(&frame);
+        }
+        assert_eq!(r.assistant_content(), "Hello world.");
+    }
+
+    #[test]
+    fn last_sentence_boundary_finds_terminator_before_whitespace() {
+        assert_eq!(last_sentence_boundary("Hello world. More"), Some(12));
+        // Last terminator+whitespace wins: '!' at index 8 → boundary 9.
+        assert_eq!(last_sentence_boundary("One. Two! Three"), Some(9));
+        assert_eq!(
+            last_sentence_boundary("ends.").map(|i| &"ends."[..i]),
+            Some("ends.")
+        );
+        // No terminator-then-space (or end): no complete sentence.
+        assert_eq!(last_sentence_boundary("no boundary here"), None);
+        assert_eq!(last_sentence_boundary("mid.dle"), None);
+    }
+
+    #[test]
+    fn last_paragraph_boundary_finds_blank_line() {
+        assert_eq!(last_paragraph_boundary("para one\n\npara two"), Some(10));
+        assert_eq!(last_paragraph_boundary("single line"), None);
+    }
+
+    #[test]
+    fn floor_char_boundary_snaps_into_multibyte_content() {
+        let s = "aé"; // 'a' (1 byte) + 'é' (2 bytes) => len 3
+        assert_eq!(floor_char_boundary(s, 2), 1); // index 2 is mid-'é' → floor to 1
+        assert_eq!(floor_char_boundary(s, 1), 1);
+        assert_eq!(floor_char_boundary(s, 3), 3);
+        assert_eq!(floor_char_boundary(s, 99), 3); // clamps to len
     }
 
     fn reassemble(body: &[u8]) -> Vec<SseText> {
