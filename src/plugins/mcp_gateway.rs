@@ -413,8 +413,10 @@ impl McpGateway {
             .ok_or_else(|| "mcp_gateway: config must be an object".to_string())?;
 
         let enabled = optional_bool(object, "enabled")?.unwrap_or(true);
-        let mode =
-            McpGatewayMode::parse(optional_string(object, "mode")?.unwrap_or("transparent_proxy"))?;
+        let mode = McpGatewayMode::parse(
+            optional_string(object, "mode")?
+                .ok_or_else(|| "mcp_gateway: 'mode' is required".to_string())?,
+        )?;
 
         let endpoint = optional_object(object, "endpoint")?;
         let endpoint_path = optional_string_from_object(endpoint, "path")?
@@ -490,20 +492,34 @@ impl McpGateway {
                     .to_string(),
             );
         }
-        if mode == McpGatewayMode::AggregateRouter
-            && capabilities.advertise_completions
-            && !capabilities.passthrough_unknown_methods
-        {
-            return Err(
-                "mcp_gateway: capabilities.advertise_completions requires capabilities.passthrough_unknown_methods=true in aggregate_router mode until completion routing is implemented"
-                    .to_string(),
-            );
+        if mode == McpGatewayMode::AggregateRouter && !capabilities.passthrough_unknown_methods {
+            // These capabilities have no dedicated dispatch in V1. Advertising them
+            // in the synthetic initialize response would make compliant clients call
+            // methods (completion/complete, logging/setLevel, tasks/*) that the
+            // dispatcher answers with -32601. Require passthrough so they are at
+            // least routed to the primary upstream until they are implemented.
+            for (advertised, capability) in [
+                (capabilities.advertise_completions, "advertise_completions"),
+                (capabilities.advertise_logging, "advertise_logging"),
+                (capabilities.advertise_tasks, "advertise_tasks"),
+            ] {
+                if advertised {
+                    return Err(format!(
+                        "mcp_gateway: capabilities.{capability} requires capabilities.passthrough_unknown_methods=true in aggregate_router mode until that method is routed or implemented"
+                    ));
+                }
+            }
         }
 
         let primary_server_id = enabled_server_ids
             .first()
             .ok_or_else(|| "mcp_gateway: at least one server must be enabled".to_string())?
             .clone();
+
+        // session_store is read/touched on every aggregate request and written on
+        // initialize/eviction, so size its shards per the hot-path DashMap invariant
+        // (honors FERRUM_POOL_SHARD_AMOUNT via the shared http client).
+        let session_shard_amount = http_client.pool_shard_amount();
 
         Ok(Self {
             enabled,
@@ -518,7 +534,7 @@ impl McpGateway {
             catalog_refresh_lock: Arc::new(Mutex::new(())),
             upstream_init_lock: Arc::new(Mutex::new(())),
             session_admission_lock: Arc::new(Mutex::new(())),
-            session_store: Arc::new(DashMap::new()),
+            session_store: Arc::new(DashMap::with_shard_amount(session_shard_amount)),
             policy,
             validation,
             observability,
@@ -2345,6 +2361,35 @@ impl Plugin for McpGateway {
         self.emit_envelope_metadata(ctx, &envelope);
         let protocol_version = self.mark_protocol_version(ctx, headers, Some(&envelope));
         let method = envelope.method.as_deref().unwrap_or_default();
+        // Methods the aggregate router handles itself are all JSON-RPC requests.
+        // A notification-form one (no id) is accepted with 202/no body and must run
+        // none of the request-side side effects, so this guard precedes protocol
+        // validation and the session touch/validation below: a stale session header
+        // must not turn it into a 404, a live one must not bump last_seen, and no
+        // catalog refresh or routing may occur. Genuine notifications/*,
+        // notification-form ping, and passthrough/unknown methods keep their handling
+        // in the match below. Transparent mode forwards notifications to its single
+        // upstream, so this only applies in aggregate mode.
+        if self.mode == McpGatewayMode::AggregateRouter
+            && envelope.message_kind == McpMessageKind::Notification
+            && matches!(
+                method,
+                "initialize"
+                    | "tools/list"
+                    | "tools/call"
+                    | "prompts/list"
+                    | "prompts/get"
+                    | "resources/list"
+                    | "resources/templates/list"
+                    | "resources/read"
+            )
+        {
+            ctx.metadata.insert(
+                "mcp.route_decision".to_string(),
+                "synthetic_response".to_string(),
+            );
+            return empty_response(202);
+        }
         if method != "initialize"
             && let Some(version) = protocol_version.as_deref()
             && !self
@@ -2380,32 +2425,6 @@ impl Plugin for McpGateway {
 
         if self.mode == McpGatewayMode::TransparentProxy {
             return self.handle_transparent_post(ctx, headers, &envelope);
-        }
-
-        // Methods the aggregate router handles itself are all JSON-RPC requests.
-        // If one arrives without an id it is a (malformed) notification: accept it
-        // with 202/no body and run none of the request-side side effects (session
-        // requirement, catalog refresh, routing, an id:null response). Genuine
-        // `notifications/*`, notification-form `ping`, and passthrough/unknown
-        // methods keep their existing handling in the match below.
-        if envelope.message_kind == McpMessageKind::Notification
-            && matches!(
-                method,
-                "initialize"
-                    | "tools/list"
-                    | "tools/call"
-                    | "prompts/list"
-                    | "prompts/get"
-                    | "resources/list"
-                    | "resources/templates/list"
-                    | "resources/read"
-            )
-        {
-            ctx.metadata.insert(
-                "mcp.route_decision".to_string(),
-                "synthetic_response".to_string(),
-            );
-            return empty_response(202);
         }
 
         match method {

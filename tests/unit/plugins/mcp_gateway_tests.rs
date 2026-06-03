@@ -779,6 +779,24 @@ fn invalid_config_shapes_are_rejected() {
             "validation": { "validate_tool_results": true },
             "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } }
         }),
+        // mode is required (no silent default).
+        json!({
+            "endpoint": { "path": "/mcp" },
+            "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } }
+        }),
+        // advertise_logging without passthrough advertises an unhandled capability.
+        json!({
+            "mode": "aggregate_router",
+            "endpoint": { "path": "/mcp" },
+            "capabilities": { "advertise_logging": true, "passthrough_unknown_methods": false },
+            "servers": {
+                "github": {
+                    "upstream_url": "http://github/mcp",
+                    "namespace": "github",
+                    "expose_tools": true
+                }
+            }
+        }),
     ] {
         assert!(
             create_plugin("mcp_gateway", &config).is_err(),
@@ -2114,5 +2132,39 @@ async fn aggregate_notification_form_request_methods_are_accepted_without_side_e
     assert!(
         server.received_requests().await.unwrap().is_empty(),
         "notification-form tools/list must not refresh the upstream catalog"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_notification_form_request_with_unknown_session_is_accepted() {
+    // Unreachable upstream: a notification must short-circuit before any session
+    // validation or routing, so no network call happens.
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+
+    // tools/list with no id and a session header that was never created. The
+    // notification guard must run before session validation, so this is accepted
+    // with 202 instead of rejected as session-not-found (404).
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert(
+        "mcp-session-id".to_string(),
+        "never-initialized".to_string(),
+    );
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_raw(result);
+    assert_eq!(status, 202);
+    assert!(body.is_empty());
+    assert_eq!(
+        ctx.metadata.get("mcp.route_decision").map(String::as_str),
+        Some("synthetic_response")
     );
 }

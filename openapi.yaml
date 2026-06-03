@@ -13169,6 +13169,7 @@ components:
             advertise_logging:
               type: boolean
               default: false
+              description: In aggregate_router mode, requires passthrough_unknown_methods=true until logging methods are routed or implemented.
             advertise_completions:
               type: boolean
               default: false
@@ -13176,6 +13177,7 @@ components:
             advertise_tasks:
               type: boolean
               default: false
+              description: In aggregate_router mode, requires passthrough_unknown_methods=true until task methods are routed or implemented.
             passthrough_unknown_methods:
               type: boolean
               default: false
