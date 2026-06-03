@@ -195,6 +195,33 @@ async fn test_reconcile_starts_tcp_listener() {
 }
 
 #[tokio::test]
+async fn test_reconcile_starts_single_hosted_passthrough_as_sni_listener() {
+    let port = ephemeral_port().await;
+    let mut proxy = create_stream_proxy("tcp-sni", BackendScheme::Tcp, port);
+    proxy.passthrough = true;
+    proxy.hosts = vec!["secure.example.com".to_string()];
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+
+    let manager = create_manager(config);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "SNI passthrough listener should start without failures: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("single hosted passthrough proxy should use the SNI listener key");
+
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn test_reconcile_starts_udp_listener() {
     let port = ephemeral_port().await;
     let config = GatewayConfig {

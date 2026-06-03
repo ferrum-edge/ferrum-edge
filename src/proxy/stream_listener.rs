@@ -625,9 +625,11 @@ impl StreamListenerManager {
             })
             .collect();
 
-        // Detect passthrough port groups: multiple passthrough proxies sharing a port.
-        // These get a single shared listener keyed by "__sni_{port}" instead of individual
-        // proxy_id keys. The listener dispatches connections based on SNI.
+        // Detect passthrough port groups that must be resolved by SNI.
+        // Multiple passthrough proxies sharing a port need one shared listener keyed by
+        // "__sni_{port}". A single passthrough proxy with configured hosts also needs
+        // SNI resolution so those host predicates are enforced instead of becoming a
+        // port-wide catch-all.
         let mut passthrough_groups: std::collections::HashMap<u16, Vec<String>> =
             std::collections::HashMap::new();
         for (proxy_id, (port, _protocol, _frontend_tls, passthrough, _)) in &desired {
@@ -638,8 +640,17 @@ impl StreamListenerManager {
                     .push(proxy_id.clone());
             }
         }
-        // Only ports with 2+ passthrough proxies are SNI-routed groups
-        passthrough_groups.retain(|_, ids| ids.len() > 1);
+        passthrough_groups.retain(|_, ids| {
+            ids.len() > 1
+                || ids.iter().any(|id| {
+                    epoch
+                        .config
+                        .proxies
+                        .iter()
+                        .find(|p| p.id.as_str() == id.as_str())
+                        .is_some_and(|p| !p.hosts.is_empty())
+                })
+        });
         // Sort IDs for stable comparison on reconcile
         for ids in passthrough_groups.values_mut() {
             ids.sort();
@@ -1119,7 +1130,7 @@ impl StreamListenerManager {
 
         loop {
             let current_config = self.config.load();
-            let desired: Vec<(String, u16, BackendScheme, bool, bool)> = current_config
+            let desired: Vec<(String, u16, BackendScheme, bool, bool, bool)> = current_config
                 .proxies
                 .iter()
                 .filter(|p| p.dispatch_kind.is_stream())
@@ -1131,6 +1142,7 @@ impl StreamListenerManager {
                             p.effective_scheme(),
                             p.frontend_tls,
                             p.passthrough,
+                            !p.hosts.is_empty(),
                         )
                     })
                 })
@@ -1140,12 +1152,14 @@ impl StreamListenerManager {
                 return Ok(());
             }
 
-            // Detect SNI port groups to map proxy_ids to their listener key
-            let mut pt_port_count: std::collections::HashMap<u16, usize> =
+            // Detect SNI port groups to map proxy_ids to their listener key.
+            let mut pt_ports: std::collections::HashMap<u16, (usize, bool)> =
                 std::collections::HashMap::new();
-            for (_, port, _, _, passthrough) in &desired {
+            for (_, port, _, _, passthrough, has_hosts) in &desired {
                 if *passthrough {
-                    *pt_port_count.entry(*port).or_default() += 1;
+                    let entry = pt_ports.entry(*port).or_default();
+                    entry.0 += 1;
+                    entry.1 |= *has_hosts;
                 }
             }
 
@@ -1153,14 +1167,17 @@ impl StreamListenerManager {
                 let listeners = self.listeners.lock().await;
                 desired
                     .iter()
-                    .all(|(proxy_id, port, scheme, frontend_tls, passthrough)| {
-                        // For SNI groups, the listener key is "__sni_{port}" not the proxy_id
-                        let key =
-                            if *passthrough && pt_port_count.get(port).copied().unwrap_or(0) > 1 {
-                                format!("__sni_{}", port)
-                            } else {
-                                proxy_id.clone()
-                            };
+                    .all(|(proxy_id, port, scheme, frontend_tls, passthrough, _)| {
+                        // For SNI groups, the listener key is "__sni_{port}" not the proxy_id.
+                        let key = if *passthrough
+                            && pt_ports
+                                .get(port)
+                                .is_some_and(|(count, has_hosts)| *count > 1 || *has_hosts)
+                        {
+                            format!("__sni_{}", port)
+                        } else {
+                            proxy_id.clone()
+                        };
                         listeners.get(&key).is_some_and(|handle| {
                             handle.listen_port == *port
                                 && handle.scheme == *scheme

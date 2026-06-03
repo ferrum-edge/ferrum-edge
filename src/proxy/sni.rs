@@ -316,10 +316,6 @@ pub fn resolve_proxy_by_sni<'a>(
     proxy_ids: &'a [String],
     config: &crate::config::types::GatewayConfig,
 ) -> Option<&'a str> {
-    if proxy_ids.len() == 1 {
-        return Some(&proxy_ids[0]);
-    }
-
     let mut fallback: Option<&'a str> = None;
 
     for proxy_id in proxy_ids {

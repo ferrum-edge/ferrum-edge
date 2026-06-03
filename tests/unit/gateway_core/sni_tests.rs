@@ -487,13 +487,29 @@ fn test_resolve_proxy_no_sni_uses_fallback() {
 }
 
 #[test]
-fn test_resolve_proxy_single_id_always_matches() {
+fn test_resolve_proxy_single_id_enforces_hosts() {
     let config = make_test_config(vec![make_proxy("only", vec!["specific.com"])]);
+    let ids = vec!["only".to_string()];
+    assert_eq!(
+        resolve_proxy_by_sni(Some("specific.com"), &ids, &config),
+        Some("only")
+    );
+    assert_eq!(
+        resolve_proxy_by_sni(Some("anything.com"), &ids, &config),
+        None
+    );
+    assert_eq!(resolve_proxy_by_sni(None, &ids, &config), None);
+}
+
+#[test]
+fn test_resolve_proxy_single_id_empty_hosts_is_fallback() {
+    let config = make_test_config(vec![make_proxy("only", vec![])]);
     let ids = vec!["only".to_string()];
     assert_eq!(
         resolve_proxy_by_sni(Some("anything.com"), &ids, &config),
         Some("only")
     );
+    assert_eq!(resolve_proxy_by_sni(None, &ids, &config), Some("only"));
 }
 
 // ── TCP stream peek timeout (slow-loris defense) ─────────────────────────────
