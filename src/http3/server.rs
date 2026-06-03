@@ -4295,7 +4295,16 @@ async fn proxy_to_backend_h3_streaming(
                     .mark_h3_unsupported(proxy, upstream_target);
             }
             let h3_error_body = r#"{"error":"Backend unavailable"}"#;
-            send_h3_response(h3_stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
+            // Do NOT propagate a send error here: this path already started
+            // least-connections LB tracking before dispatch, so returning `Err`
+            // would skip the caller's `record_backend_outcome` and leak the
+            // active-connection count for the selected target when the client
+            // disconnects during the reject write. Report the disconnect so the
+            // caller still records the outcome and releases the connection —
+            // same contract as the size-limit / after_proxy reject paths below.
+            let reject_sent = send_h3_response(h3_stream, StatusCode::BAD_GATEWAY, h3_error_body)
+                .await
+                .is_ok();
             return Ok(H3StreamResult {
                 status: 502,
                 // No backend response was received (pre-headers dispatch
@@ -4304,7 +4313,7 @@ async fn proxy_to_backend_h3_streaming(
                 error_class: Some(h3_error_class),
                 body_completed: false,
                 bytes_streamed: 0,
-                client_disconnected: false,
+                client_disconnected: !reject_sent,
                 body_error_class: None,
                 request_on_wire,
             });
