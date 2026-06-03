@@ -13132,9 +13132,11 @@ components:
             downstream_session_header:
               type: string
               default: mcp-session-id
+              description: Must be a valid HTTP header name; rejected at config validation otherwise.
             upstream_session_header:
               type: string
               default: mcp-session-id
+              description: Must be a valid HTTP header name; rejected at config validation otherwise.
             initialize_upstreams:
               type: string
               enum: [lazy, startup, passthrough]
@@ -13180,6 +13182,9 @@ components:
         servers:
           type: object
           minProperties: 1
+          propertyNames:
+            pattern: '^[A-Za-z0-9._-]+$'
+            description: Server ids are embedded in public mcp:// resource URIs, so they must be URI-safe (ASCII alphanumerics, '.', '_', '-').
           additionalProperties:
             type: object
             required: [upstream_url, namespace]

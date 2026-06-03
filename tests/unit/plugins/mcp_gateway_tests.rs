@@ -752,6 +752,26 @@ fn invalid_config_shapes_are_rejected() {
             "endpoint": { "path": "/mcp", "protocol_versions": ["2025-03-26"] },
             "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } }
         }),
+        // Server id with a URI-reserved '/' would parse back to the wrong id in
+        // public mcp:// resource URIs.
+        json!({
+            "mode": "aggregate_router",
+            "endpoint": { "path": "/mcp" },
+            "servers": {
+                "team/a": {
+                    "upstream_url": "http://x/mcp",
+                    "namespace": "github",
+                    "expose_tools": true
+                }
+            }
+        }),
+        // Invalid HTTP header name for a configured session header.
+        json!({
+            "mode": "transparent_proxy",
+            "endpoint": { "path": "/mcp" },
+            "sessions": { "downstream_session_header": "bad header" },
+            "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } }
+        }),
     ] {
         assert!(
             create_plugin("mcp_gateway", &config).is_err(),
@@ -1941,5 +1961,75 @@ async fn aggregate_tool_call_rejects_invalid_arguments_as_json_rpc_error() {
     assert_eq!(
         ctx.metadata.get("mcp.route_decision").map(String::as_str),
         Some("deny")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_initialize_notification_is_accepted_without_minting_session() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+
+    // `initialize` without a JSON-RPC id is a notification: it must be accepted
+    // with 202/no body and must not mint a synthetic session.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "unit-test", "version": "1" }
+        }
+    }));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, response_headers) = reject_raw(result);
+    assert_eq!(status, 202);
+    assert!(body.is_empty());
+    assert!(!response_headers.contains_key("mcp-session-id"));
+    assert_eq!(
+        ctx.metadata.get("mcp.route_decision").map(String::as_str),
+        Some("synthetic_response")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_routing_strips_synthetic_downstream_session_id_from_upstream() {
+    let server = start_mcp_stateless_tools_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    // Passthrough upstream init => the gateway never holds an upstream session
+    // id, so the synthetic downstream id must be stripped rather than forwarded.
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config["policy"] = json!({"default_action": "allow"});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 40).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "tools/call",
+        "params": {
+            "name": "github.stateless_tool",
+            "arguments": {}
+        }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(ctx.route_override_backend_scheme, Some(BackendScheme::Http));
+    assert_eq!(
+        headers.get("mcp-session-id"),
+        None,
+        "synthetic downstream session id must not leak to a passthrough upstream"
     );
 }

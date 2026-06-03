@@ -400,6 +400,7 @@ pub struct McpGateway {
     primary_server_id: String,
     catalog_refresh_lock: Arc<Mutex<()>>,
     upstream_init_lock: Arc<Mutex<()>>,
+    session_admission_lock: Arc<Mutex<()>>,
     session_store: Arc<DashMap<String, DownstreamMcpSession>>,
     policy: McpPolicy,
     validation: McpValidationConfig,
@@ -518,6 +519,7 @@ impl McpGateway {
             primary_server_id,
             catalog_refresh_lock: Arc::new(Mutex::new(())),
             upstream_init_lock: Arc::new(Mutex::new(())),
+            session_admission_lock: Arc::new(Mutex::new(())),
             session_store: Arc::new(DashMap::new()),
             policy,
             validation,
@@ -637,6 +639,15 @@ impl McpGateway {
         ctx.route_override_path_is_absolute = true;
         ctx.route_override_authority = Some(server.target.authority.clone());
         headers.insert("host".to_string(), server.target.authority.clone());
+        if self.mode == McpGatewayMode::AggregateRouter {
+            // The downstream session id is Ferrum's synthetic id, which the
+            // upstream never issued. Strip it before forwarding so passthrough /
+            // stateless upstreams (no mediated upstream session id) don't reject
+            // the call as an unknown MCP session. A real upstream session id, if
+            // one exists, is re-added below. Transparent mode passes the client's
+            // session header straight through to its single upstream.
+            remove_header(headers, &self.sessions.downstream_session_header);
+        }
         if let Some(downstream_id) = downstream_session_id
             && let Some(upstream_id) = self.upstream_session_id(downstream_id, &server.server_id)
         {
@@ -775,6 +786,14 @@ impl McpGateway {
         client_info: Option<Value>,
         client_capabilities: Option<Value>,
     ) -> String {
+        // Serialize the eviction + insert sequence so concurrent `initialize`
+        // calls cannot each pass the cap check before any of them inserts and
+        // collectively grow `session_store` past `max_sessions`. `initialize`
+        // is an infrequent per-client-session operation, so holding this lock
+        // (matching the existing `upstream_init_lock` pattern) is acceptable;
+        // the eviction work only does upstream I/O when sessions are actually
+        // expired or over the cap.
+        let _admission_guard = self.session_admission_lock.lock().await;
         self.evict_expired_sessions(ctx).await;
         self.evict_oldest_session_if_needed(ctx).await;
         let downstream_session_id = uuid::Uuid::new_v4().to_string();
@@ -2364,6 +2383,17 @@ impl Plugin for McpGateway {
 
         match method {
             "initialize" => {
+                // An `initialize` carrying no JSON-RPC id is a notification.
+                // `initialize` is defined as a request, so this is malformed:
+                // accept it with 202/no body per Streamable HTTP and do not
+                // allocate a session slot for it.
+                if envelope.message_kind == McpMessageKind::Notification {
+                    ctx.metadata.insert(
+                        "mcp.route_decision".to_string(),
+                        "synthetic_response".to_string(),
+                    );
+                    return empty_response(202);
+                }
                 let version =
                     protocol_version.unwrap_or_else(|| self.supported_protocol_versions[0].clone());
                 if !self.supported_protocol_versions.contains(&version) {
@@ -3064,6 +3094,13 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
         .map(String::as_str)
 }
 
+/// Remove every header entry whose name matches `name` case-insensitively.
+/// Header map keys are not guaranteed to be lowercased (see `header_value`'s
+/// fallback), so match by `eq_ignore_ascii_case` rather than a single lookup.
+fn remove_header(headers: &mut HashMap<String, String>, name: &str) {
+    headers.retain(|key, _| !key.eq_ignore_ascii_case(name));
+}
+
 fn optional_object<'a>(
     object: &'a Map<String, Value>,
     key: &str,
@@ -3229,14 +3266,19 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
     }
     let max_sessions = usize::try_from(max_sessions)
         .map_err(|_| "mcp_gateway: 'sessions.max_sessions' is too large".to_string())?;
+    let downstream_session_header =
+        optional_string_from_object(sessions, "downstream_session_header")?
+            .unwrap_or_else(|| "mcp-session-id".to_string());
+    validate_session_header_name(
+        &downstream_session_header,
+        "sessions.downstream_session_header",
+    )?;
+    let upstream_session_header = optional_string_from_object(sessions, "upstream_session_header")?
+        .unwrap_or_else(|| "mcp-session-id".to_string());
+    validate_session_header_name(&upstream_session_header, "sessions.upstream_session_header")?;
     Ok(McpSessionConfig {
-        downstream_session_header: optional_string_from_object(
-            sessions,
-            "downstream_session_header",
-        )?
-        .unwrap_or_else(|| "mcp-session-id".to_string()),
-        upstream_session_header: optional_string_from_object(sessions, "upstream_session_header")?
-            .unwrap_or_else(|| "mcp-session-id".to_string()),
+        downstream_session_header,
+        upstream_session_header,
         initialize_upstreams,
         session_ttl: Duration::from_secs(session_ttl_seconds),
         max_sessions,
@@ -3355,6 +3397,7 @@ fn parse_servers(
         if server_id.trim().is_empty() {
             return Err("mcp_gateway: server IDs must not be empty".to_string());
         }
+        validate_server_id(server_id)?;
         let object = value
             .as_object()
             .ok_or_else(|| format!("mcp_gateway: server {server_id:?} must be an object"))?;
@@ -3467,4 +3510,35 @@ fn validate_path(path: &str, field: &str) -> Result<(), String> {
         return Err(format!("mcp_gateway: '{field}' must be a non-empty path"));
     }
     Ok(())
+}
+
+/// Server ids are embedded verbatim into public `mcp://{server_id}/...` resource
+/// and resource-template URIs that `public_resource_uri_parts` later parses back
+/// by splitting at the first `/`. Restrict them to a URI-safe identifier subset
+/// so a `/` (or other reserved delimiter) cannot make an advertised resource URI
+/// parse back to the wrong server id and become unroutable.
+fn validate_server_id(server_id: &str) -> Result<(), String> {
+    if !server_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "mcp_gateway: server id {server_id:?} must contain only ASCII alphanumerics, '.', '_', or '-'"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a configured MCP session header name as a syntactically valid HTTP
+/// header name, so invalid characters (spaces, control bytes) are rejected at
+/// config time instead of failing every routed upstream request at runtime.
+fn validate_session_header_name(value: &str, field: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("mcp_gateway: '{field}' must not be empty"));
+    }
+    http::header::HeaderName::from_bytes(value.as_bytes())
+        .map(|_| ())
+        .map_err(|_| {
+            format!("mcp_gateway: '{field}' must be a valid HTTP header name, got {value:?}")
+        })
 }
