@@ -335,6 +335,23 @@ impl Plugin for ResponseTransformer {
         !self.body_rules.is_empty()
     }
 
+    fn may_rewrite_response_content_type(&self, ctx: &RequestContext) -> bool {
+        self.rules_enabled()
+            && (self.header_rules.iter().any(|rule| match rule.operation {
+                HeaderOp::Add | HeaderOp::Update | HeaderOp::Remove => rule.key == "content-type",
+                HeaderOp::Rename => {
+                    rule.key == "content-type"
+                        || rule
+                            .new_key
+                            .as_deref()
+                            .is_some_and(|new_key| new_key == "content-type")
+                }
+            }) || ctx
+                .route_override_response_transform
+                .as_ref()
+                .is_some_and(|rules| rules.iter().any(|rule| rule.key == "content-type")))
+    }
+
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // Honor the RTDS runtime kill-switch here, mirroring the early
         // `return None` in `transform_response_body`. When the overlay disables

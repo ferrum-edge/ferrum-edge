@@ -840,13 +840,11 @@ pub(crate) fn should_stream_response_body(
 /// configured, since a retry may need to replay the response body and a
 /// non-final attempt must stay buffered.
 ///
-/// The decision keys off the *backend's* response `Content-Type`. An
-/// `after_proxy` plugin can still rewrite `content-type` afterward; if it
-/// relabels a non-inspectable type as an inspectable one after a downgrade, the
-/// WAF body scan (which runs only on buffered responses) is skipped. This is an
-/// accepted, narrow trade-off: a fully consistent decision would require
-/// deferring buffer/stream selection until after `after_proxy`, and
-/// body-transforming plugins (which force buffering) are unaffected.
+/// The decision keys off the *backend's* response `Content-Type`, but only when
+/// no later `after_proxy` hook can rewrite that header for this request. If a
+/// header-only plugin may relabel a non-inspectable backend type as an
+/// inspectable final type, the response stays buffered so final response-body
+/// hooks (including WAF scans) still see the client-visible representation.
 pub(crate) fn refine_stream_response_for_content_type(
     stream_response: bool,
     proxy: &Proxy,
@@ -864,6 +862,12 @@ pub(crate) fn refine_stream_response_for_content_type(
     let Some(ctx) = ctx else {
         return false;
     };
+    if plugins
+        .iter()
+        .any(|plugin| plugin.may_rewrite_response_content_type(ctx))
+    {
+        return false;
+    }
     let content_type = response_headers.get("content-type").map(String::as_str);
     // Keep buffering only while at least one plugin still needs the body for
     // this content-type; otherwise stream it straight through.
@@ -16352,6 +16356,8 @@ mod tests {
 
     struct RejectHeaderPlugin;
 
+    struct ResponseContentTypeRewritePlugin;
+
     #[async_trait]
     impl Plugin for ResponseBufferPlugin {
         fn name(&self) -> &str {
@@ -16394,6 +16400,17 @@ mod tests {
             content_type: Option<&str>,
         ) -> bool {
             content_type == Some(self.buffer_content_type)
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for ResponseContentTypeRewritePlugin {
+        fn name(&self) -> &str {
+            "response_content_type_rewrite_plugin"
+        }
+
+        fn may_rewrite_response_content_type(&self, _ctx: &RequestContext) -> bool {
+            true
         }
     }
 
@@ -17793,6 +17810,23 @@ mod tests {
             false,
             &proxy,
             &plugins,
+            Some(&ctx),
+            &binary_headers,
+        ));
+
+        // If a later header-only after_proxy hook may rewrite Content-Type,
+        // keep the body buffered so final body hooks inspect the final
+        // client-visible representation after that relabeling.
+        let content_type_rewrite_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(ContentTypeBufferPlugin {
+                buffer_content_type: "application/json",
+            }),
+            Arc::new(ResponseContentTypeRewritePlugin),
+        ];
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &content_type_rewrite_plugins,
             Some(&ctx),
             &binary_headers,
         ));

@@ -128,6 +128,11 @@ impl Plugin for SecurityHeaders {
     fn applies_after_proxy_on_reject(&self) -> bool {
         true
     }
+
+    fn may_rewrite_response_content_type(&self, _ctx: &RequestContext) -> bool {
+        self.set.iter().any(|(name, _)| name == "content-type")
+            || self.remove.iter().any(|name| name == "content-type")
+    }
 }
 
 fn find_header_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {

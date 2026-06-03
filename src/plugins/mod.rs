@@ -1936,6 +1936,18 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin can rewrite, add, remove, or rename the
+    /// response `Content-Type` in `after_proxy` for the current request.
+    ///
+    /// The proxy may otherwise downgrade a response from buffered to streaming
+    /// after seeing backend headers for plugins such as WAF that only inspect
+    /// selected content-types. If a later header-only plugin can relabel that
+    /// response to an inspectable content-type, the final client-visible body
+    /// must remain buffered so final response-body hooks still run.
+    fn may_rewrite_response_content_type(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs the entire response body buffered
     /// in memory before forwarding to the client. When any active plugin
     /// returns `true`, the gateway forces buffered mode for that proxy
