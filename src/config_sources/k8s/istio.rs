@@ -2271,17 +2271,6 @@ fn l4_route_destination(
     Ok((host.to_string(), port))
 }
 
-/// Translate VirtualService L4 routes into Ferrum stream proxies, reusing the
-/// same stream + SNI machinery as gateway / east-west passthrough:
-///   - `spec.tls[]` → a **passthrough** TCP proxy keyed by SNI (`hosts =
-///     match.sniHosts`), forwarding the encrypted bytes to the destination (no
-///     TLS termination).
-///   - `spec.tcp[]` → a plain TCP proxy keyed by `listen_port`.
-///
-/// `match.port` selects the listen port (falling back to the destination port
-/// when omitted). Unsupported match predicates (source-identity / CIDR /
-/// gateways) and weighted splitting fail closed via the helpers above.
-
 fn virtual_service_l4_proxy_id(
     route_kind: &str,
     namespace: &str,
@@ -2298,6 +2287,16 @@ fn virtual_service_l4_proxy_id(
         .replace(['/', '.'], "-")
 }
 
+/// Translate VirtualService L4 routes into Ferrum stream proxies, reusing the
+/// same stream + SNI machinery as gateway / east-west passthrough:
+///   - `spec.tls[]` → a **passthrough** TCP proxy keyed by SNI (`hosts =
+///     match.sniHosts`), forwarding the encrypted bytes to the destination (no
+///     TLS termination).
+///   - `spec.tcp[]` → a plain TCP proxy keyed by `listen_port`.
+///
+/// `match.port` selects the listen port (falling back to the destination port
+/// when omitted). Unsupported match predicates (source-identity / CIDR /
+/// gateways) and weighted splitting fail closed via the helpers above.
 fn virtual_service_l4_proxies(
     object: &K8sObject,
     acc: &K8sAccumulator,
