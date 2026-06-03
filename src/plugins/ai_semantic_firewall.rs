@@ -1431,9 +1431,20 @@ impl Plugin for AiSemanticFirewall {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        self.requires_response_body_buffering()
-            && ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
-            && !is_native_grpc_request(ctx)
+        if !self.requires_response_body_buffering() || is_native_grpc_request(ctx) {
+            return false;
+        }
+        // `buffer` mode pins this response onto the buffered path even when an
+        // earlier request plugin (e.g. `ai_prompt_shield`, which runs first and
+        // writes `ai_request_streaming=true` on streamed requests) already set the
+        // shared flag that otherwise suppresses buffering. The buffer-mode marker
+        // — set on the request path only for a detected `stream: true` — takes
+        // precedence so the two plugins compose instead of silently disabling
+        // response inspection.
+        if buffer_streaming_marker_set(ctx) {
+            return true;
+        }
+        ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1452,18 +1463,13 @@ impl Plugin for AiSemanticFirewall {
         if is_event_stream_content_type(content_type) {
             // Pin an event stream onto the buffered path only when `buffer` mode
             // actually flagged THIS request from a detected `stream: true` JSON
-            // POST (the request-path marker below). Unrelated SSE — a `GET`
-            // EventSource endpoint, or a backend that unexpectedly returns an
-            // unbounded stream — must keep streaming; buffering it would collect
-            // until `max_response_body_size_bytes` and 502 instead. (Already-
-            // buffered bodies are still inspected in `on_response_body`
-            // regardless of this gate.)
+            // POST (the request-path marker). Unrelated SSE — a `GET` EventSource
+            // endpoint, or a backend that unexpectedly returns an unbounded
+            // stream — must keep streaming; buffering it would collect until
+            // `max_response_body_size_bytes` and 502 instead. (Already-buffered
+            // bodies are still inspected in `on_response_body` regardless.)
             return self.streaming_response == StreamingResponsePolicy::Buffer
-                && ctx
-                    .metadata
-                    .get(RESPONSE_INSPECTION_KEY)
-                    .map(String::as_str)
-                    == Some(STREAMING_BUFFERED_MARKER);
+                && buffer_streaming_marker_set(ctx);
         }
 
         is_json_content_type(content_type)
@@ -2187,31 +2193,49 @@ fn is_sse_delta_response_path(path: &str) -> bool {
     SSE_DELTA_RESPONSE_PATHS.contains(&path)
 }
 
-/// Map a reassembled SSE fragment onto a response-direction [`TextSegment`],
-/// dropping it when its canonical response path is not in the configured
-/// `response_json_paths` (honoring operator extraction overrides).
+/// Map a reassembled SSE fragment onto a response-direction [`TextSegment`].
+///
+/// A reassembled streaming fragment corresponds to one or more canonical
+/// response paths — the streaming `delta.*` form plus its non-streaming
+/// equivalent(s) that catch the same content in a buffered response. The segment
+/// is kept when **any** of those equivalents is enabled in `response_json_paths`,
+/// so an extraction override that lists only the non-streaming path (e.g.
+/// `$.output_text`, or `$.choices[*].message.content`) still inspects the
+/// streamed equivalent instead of silently dropping it.
 fn sse_text_to_segment(text: SseText, extraction: &ExtractionConfig) -> Option<TextSegment> {
-    let (path_pattern, kind) = match text.kind {
-        SseTextKind::ChatContent => ("$.choices[*].delta.content", SegmentKind::AssistantMessage),
+    let (path_patterns, kind): (&[&str], SegmentKind) = match text.kind {
+        SseTextKind::ChatContent => (
+            &["$.choices[*].delta.content", "$.choices[*].message.content"],
+            SegmentKind::AssistantMessage,
+        ),
         SseTextKind::ChatToolName => (
-            "$.choices[*].delta.tool_calls[*].function.name",
+            &[
+                "$.choices[*].delta.tool_calls[*].function.name",
+                "$.choices[*].message.tool_calls[*].function.name",
+            ],
             SegmentKind::ToolCall,
         ),
         SseTextKind::ChatToolArguments => (
-            "$.choices[*].delta.tool_calls[*].function.arguments",
+            &[
+                "$.choices[*].delta.tool_calls[*].function.arguments",
+                "$.choices[*].message.tool_calls[*].function.arguments",
+            ],
             SegmentKind::ToolArguments,
         ),
-        SseTextKind::ResponsesText => {
-            ("$.output[*].content[*].text", SegmentKind::AssistantMessage)
-        }
-        SseTextKind::ResponsesArguments => ("$.output[*].arguments", SegmentKind::ToolArguments),
+        SseTextKind::ResponsesText => (
+            &["$.output[*].content[*].text", "$.output_text"],
+            SegmentKind::AssistantMessage,
+        ),
+        SseTextKind::ResponsesArguments => (&["$.output[*].arguments"], SegmentKind::ToolArguments),
     };
 
-    if !extraction
-        .response_json_paths
-        .iter()
-        .any(|configured| configured == path_pattern)
-    {
+    let enabled = path_patterns.iter().any(|pattern| {
+        extraction
+            .response_json_paths
+            .iter()
+            .any(|configured| configured == pattern)
+    });
+    if !enabled {
         return None;
     }
 
@@ -3044,6 +3068,17 @@ fn max_cosine(
         best = best.max(score);
     }
     Ok(best)
+}
+
+/// Whether `buffer` mode flagged this request's streamed response for buffering
+/// (set on the request path only for a detected `stream: true` JSON POST). Both
+/// response-buffering gates consult this so they agree, and it lets buffer mode
+/// override a shared `ai_request_streaming` flag set by another plugin.
+fn buffer_streaming_marker_set(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .get(RESPONSE_INSPECTION_KEY)
+        .map(String::as_str)
+        == Some(STREAMING_BUFFERED_MARKER)
 }
 
 fn is_native_grpc_request(ctx: &RequestContext) -> bool {

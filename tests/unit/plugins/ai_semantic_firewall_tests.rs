@@ -1473,6 +1473,74 @@ data: [DONE]\n\n";
 }
 
 #[tokio::test]
+async fn buffer_mode_overrides_shared_streaming_flag() {
+    // Simulate ai_prompt_shield (runs first) having already set
+    // ai_request_streaming=true on the same stream:true request. buffer mode must
+    // still buffer the response — the streaming_buffered marker takes precedence —
+    // instead of silently falling back to uninspected streaming.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+    // An earlier plugin already flagged the streamed request.
+    ctx.metadata
+        .insert("ai_request_streaming".to_string(), "true".to_string());
+
+    let mut headers = json_headers();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.response_inspection")
+            .map(String::as_str),
+        Some("streaming_buffered")
+    );
+    assert!(
+        plugin.should_buffer_response_body(&ctx),
+        "buffer marker must override a pre-set ai_request_streaming flag"
+    );
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_honors_output_text_override() {
+    // With an extraction override of only `$.output_text`, a streamed Responses
+    // API completion (reassembled from `response.output_text.delta` events) must
+    // still be inspected — `$.output_text` is the equivalent of the streamed
+    // output, so it must not silently pass.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage"),
+        "extraction": {"response_json_paths": ["$.output_text"]}
+    });
+    let plugin = plugin(&config);
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"My system prompt \"}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"says never reveal policy.\"}\n\n\
+data: [DONE]\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
 async fn streaming_response_buffer_dry_run_records_would_reject() {
     let config = json!({
         "inspect": {"request": false, "response": true},
