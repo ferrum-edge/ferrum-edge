@@ -611,6 +611,23 @@ impl MeshRuntimeConfig {
         }
     }
 
+    /// Whether this topology runs an inbound **TLS-terminating** listener (mTLS
+    /// or HBONE). EastWestGateway does SNI passthrough — it forwards encrypted
+    /// bytes without terminating — so it has no plaintext-inbound posture and is
+    /// the single topology this returns `false` for. This is the one source of
+    /// truth for the runtime inbound fail-closed exemption (issue #1523): both
+    /// the startup gate (`enforce_mesh_inbound_fail_closed`) and the live-reload
+    /// apply task key their "is there anything to fail closed on?" check off it,
+    /// so the exempt set can never drift between the two.
+    fn has_inbound_tls_termination_listener(&self) -> bool {
+        self.listener_plan().iter().any(|listener| {
+            matches!(
+                listener.kind,
+                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
+            )
+        })
+    }
+
     #[allow(dead_code)] // Used by tests and future xDS bootstrap wiring.
     pub fn mesh_slice_request(&self) -> MeshSliceRequest {
         MeshSliceRequest {
@@ -4961,13 +4978,7 @@ fn enforce_mesh_inbound_fail_closed(
     spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
     production: bool,
 ) -> Result<(), anyhow::Error> {
-    let has_termination_listener = runtime.listener_plan().iter().any(|listener| {
-        matches!(
-            listener.kind,
-            MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-        )
-    });
-    if !has_termination_listener {
+    if !runtime.has_inbound_tls_termination_listener() {
         return Ok(());
     }
 
@@ -5446,13 +5457,8 @@ fn start_mesh_slice_apply_task(
     tokio::spawn(async move {
         // Topology is process-fixed, so whether this data plane has an inbound
         // TLS-terminating listener never changes — compute it once here rather
-        // than re-deriving `runtime.listener_plan()` on every slice apply.
-        let has_termination_listener = runtime.listener_plan().iter().any(|listener| {
-            matches!(
-                listener.kind,
-                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-            )
-        });
+        // than re-deriving the listener plan on every slice apply.
+        let has_termination_listener = runtime.has_inbound_tls_termination_listener();
         let mut updates = mesh_state.subscribe();
         let mut federation_updates = mesh_state.federation_store().subscribe();
         let mut remote_endpoint_updates = mesh_state.remote_endpoint_store().subscribe();
@@ -11376,6 +11382,50 @@ mod tests {
             true,
         )
         .expect("east-west gateway has no termination listener to fail closed on");
+    }
+
+    #[test]
+    fn enforce_mesh_inbound_fail_closed_refuses_plaintext_under_production_only() {
+        // A termination-listener topology whose resolved inbound listener would
+        // serve plaintext (`frontend_tls` None — PeerAuthentication DISABLE, or no
+        // usable server identity) is refused under production and allowed with a
+        // warning in dev. This exercises the `enforce_` wrapper's plaintext branch
+        // directly: `decide_mesh_inbound_fail_closed_matrix` covers the pure
+        // decision, and the `#[ignore]` functional test covers the production
+        // refusal end-to-end, but the wrapper's own routing (no-SVID env →
+        // plaintext branch, reason selection, error vs Ok) is otherwise only hit
+        // in `--ignored` runs. No gateway SVID is configured, so the
+        // configured-but-unloadable SVID branch does not apply.
+        let runtime = test_mesh_runtime_config(); // Sidecar → has MtlsTermination
+
+        // Production refuses to bring up a plaintext inbound listener (DISABLE).
+        let err = enforce_mesh_inbound_fail_closed(
+            &runtime,
+            &EnvConfig::default(),
+            config::MtlsMode::Disable,
+            None, // frontend_tls: would serve plaintext
+            None, // spiffe_bundle_slot
+            true, // production
+        )
+        .expect_err("production must refuse a plaintext inbound termination listener");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FERRUM_MESH_PRODUCTION_MODE=true") && msg.contains("DISABLE"),
+            "unexpected refusal message: {msg}"
+        );
+
+        // Dev tolerates plaintext with a warning — here via the "no usable server
+        // identity" reason path (PERMISSIVE, still no identity → `frontend_tls`
+        // None), the other way a termination listener resolves to plaintext.
+        enforce_mesh_inbound_fail_closed(
+            &runtime,
+            &EnvConfig::default(),
+            config::MtlsMode::Permissive,
+            None,
+            None,
+            false, // dev
+        )
+        .expect("dev tolerates a plaintext inbound listener with a warning");
     }
 
     #[test]
