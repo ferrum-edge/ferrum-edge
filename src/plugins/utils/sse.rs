@@ -168,13 +168,6 @@ impl SseReassembler {
         Self::default()
     }
 
-    /// Parse and accumulate every `data:` frame in a fully-buffered SSE body.
-    pub fn push_body(&mut self, body: &[u8]) {
-        for frame in parse_sse_data_frames(body) {
-            self.push_frame(&frame);
-        }
-    }
-
     /// Accumulate one already-parsed SSE `data:` frame.
     pub fn push_frame(&mut self, frame: &Value) {
         self.push_chat_completion_deltas(frame);
@@ -489,7 +482,9 @@ mod tests {
 
     fn reassemble(body: &[u8]) -> Vec<SseText> {
         let mut reassembler = SseReassembler::new();
-        reassembler.push_body(body);
+        for frame in parse_sse_data_frames(body) {
+            reassembler.push_frame(&frame);
+        }
         reassembler.into_texts()
     }
 

@@ -46,6 +46,27 @@ const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     "$.output[*].arguments",
 ];
 
+/// Chat-completions streaming `delta.*` response paths. These are reassembled
+/// across frames by [`SseReassembler`]; per-frame extraction must skip them or
+/// it re-introduces the meaningless per-fragment segments reassembly exists to
+/// avoid. Non-delta paths (`message.*`, `output_text`, `output[*].*`) are not
+/// listed here because per-frame extraction handles them correctly — they never
+/// match a streaming `delta` frame, so there is no double counting.
+const SSE_DELTA_RESPONSE_PATHS: &[&str] = &[
+    "$.choices[*].delta.content",
+    "$.choices[*].delta.tool_calls[*].function.name",
+    "$.choices[*].delta.tool_calls[*].function.arguments",
+];
+
+/// Metadata key recording how a streamed response was handled. Set on the
+/// request path by `buffer` mode; read on the response path to pin only the
+/// matching event stream onto the buffered path.
+const RESPONSE_INSPECTION_KEY: &str = "ai_semantic_firewall.response_inspection";
+
+/// Value written to [`RESPONSE_INSPECTION_KEY`] when `buffer` mode detects a
+/// `stream: true` request and intends to buffer its SSE response.
+const STREAMING_BUFFERED_MARKER: &str = "streaming_buffered";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Request,
@@ -1337,8 +1358,8 @@ impl Plugin for AiSemanticFirewall {
 
             if buffer_streamed_response {
                 ctx.metadata.insert(
-                    "ai_semantic_firewall.response_inspection".to_string(),
-                    "streaming_buffered".to_string(),
+                    RESPONSE_INSPECTION_KEY.to_string(),
+                    STREAMING_BUFFERED_MARKER.to_string(),
                 );
             } else {
                 ctx.metadata
@@ -1429,12 +1450,20 @@ impl Plugin for AiSemanticFirewall {
         };
 
         if is_event_stream_content_type(content_type) {
-            // Only `buffer` mode pins event streams onto the buffered path; every
-            // other mode lets SSE stream through (default fail-open `skip`, or the
-            // request was already 400'd under `reject`). `should_buffer_response_body`
-            // above already returned `false` when `ai_request_streaming` is set, so
-            // a `skip`/`reject` stream never reaches here.
-            return self.streaming_response == StreamingResponsePolicy::Buffer;
+            // Pin an event stream onto the buffered path only when `buffer` mode
+            // actually flagged THIS request from a detected `stream: true` JSON
+            // POST (the request-path marker below). Unrelated SSE — a `GET`
+            // EventSource endpoint, or a backend that unexpectedly returns an
+            // unbounded stream — must keep streaming; buffering it would collect
+            // until `max_response_body_size_bytes` and 502 instead. (Already-
+            // buffered bodies are still inspected in `on_response_body`
+            // regardless of this gate.)
+            return self.streaming_response == StreamingResponsePolicy::Buffer
+                && ctx
+                    .metadata
+                    .get(RESPONSE_INSPECTION_KEY)
+                    .map(String::as_str)
+                    == Some(STREAMING_BUFFERED_MARKER);
         }
 
         is_json_content_type(content_type)
@@ -2094,45 +2123,68 @@ fn extract_response_segments_from_json(
 /// Reassemble a fully-buffered SSE chat-completion / Responses-API response into
 /// response-direction segments.
 ///
-/// Streaming bodies arrive as many tiny delta frames
-/// (`data: {"choices":[{"delta":{"content":"Hel"}}]}`); inspecting each frame in
-/// isolation is meaningless, so the deltas are concatenated per choice / tool
-/// call into coherent text first (see [`SseReassembler`]). Only fragments whose
-/// canonical JSON path is enabled in `response_json_paths` are kept, preserving
-/// operator extraction overrides.
+/// Two passes, merged and deduped, so the buffered path inspects everything in
+/// the body:
 ///
-/// Falls back to per-frame extraction when no streaming deltas are recognized —
-/// e.g. a backend that buffered a non-delta event stream — so such a body is
-/// still inspected rather than silently passing.
+/// 1. **Delta reassembly.** Streaming bodies arrive as many tiny delta frames
+///    (`data: {"choices":[{"delta":{"content":"Hel"}}]}`); inspecting each frame
+///    in isolation is meaningless, so the deltas are concatenated per choice /
+///    tool call into coherent text first (see [`SseReassembler`]).
+/// 2. **Per-frame non-delta extraction.** A buffered stream can also carry
+///    non-delta JSON events — a final `choices[].message.content` / `output_text`
+///    summary, or a side-channel event — which could smuggle a violation past a
+///    clean delta stream. These are extracted per frame using only the non-delta
+///    paths; the chat-completions `delta.*` paths are excluded here because pass
+///    (1) already covers them and per-frame extraction would re-introduce the
+///    per-fragment segments reassembly exists to avoid.
+///
+/// Only fragments whose canonical JSON path is enabled in `response_json_paths`
+/// are kept, preserving operator extraction overrides.
 fn reassemble_sse_response_segments(
     body: &[u8],
     extraction: &ExtractionConfig,
 ) -> Vec<TextSegment> {
-    let mut reassembler = SseReassembler::new();
-    reassembler.push_body(body);
-    let texts = reassembler.into_texts();
-
-    if !texts.is_empty() {
-        let segments: Vec<TextSegment> = texts
-            .into_iter()
-            .filter_map(|text| sse_text_to_segment(text, extraction))
-            .collect();
-        return dedupe_segments(segments);
-    }
-
-    // No recognized streaming deltas: preserve the original per-frame extraction
-    // so non-delta buffered event streams are not skipped.
     let frames = parse_sse_data_frames(body);
-    let mut segments = Vec::new();
-    for (index, frame) in frames.iter().enumerate() {
-        extract_response_segments_from_json(
-            frame,
-            extraction,
-            Some(format!("sse[{index}]")),
-            &mut segments,
-        );
+
+    let mut reassembler = SseReassembler::new();
+    for frame in &frames {
+        reassembler.push_frame(frame);
     }
+    let mut segments: Vec<TextSegment> = reassembler
+        .into_texts()
+        .into_iter()
+        .filter_map(|text| sse_text_to_segment(text, extraction))
+        .collect();
+
+    let non_delta_paths: Vec<String> = extraction
+        .response_json_paths
+        .iter()
+        .filter(|path| !is_sse_delta_response_path(path))
+        .cloned()
+        .collect();
+    if !non_delta_paths.is_empty() {
+        let non_delta_extraction = ExtractionConfig {
+            request_json_paths: Vec::new(),
+            response_json_paths: non_delta_paths,
+        };
+        for (index, frame) in frames.iter().enumerate() {
+            extract_response_segments_from_json(
+                frame,
+                &non_delta_extraction,
+                Some(format!("sse[{index}]")),
+                &mut segments,
+            );
+        }
+    }
+
     dedupe_segments(segments)
+}
+
+/// Whether a response JSON path is a chat-completions streaming `delta.*` path
+/// handled by [`SseReassembler`] (and therefore excluded from per-frame
+/// extraction in [`reassemble_sse_response_segments`]).
+fn is_sse_delta_response_path(path: &str) -> bool {
+    SSE_DELTA_RESPONSE_PATHS.contains(&path)
 }
 
 /// Map a reassembled SSE fragment onto a response-direction [`TextSegment`],

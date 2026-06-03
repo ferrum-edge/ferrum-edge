@@ -1421,6 +1421,58 @@ data: [DONE]\n\n";
 }
 
 #[tokio::test]
+async fn buffer_mode_does_not_buffer_unflagged_event_stream() {
+    // buffer mode must only pin an event stream onto the buffered path when
+    // before_proxy actually flagged a `stream: true` request (the marker). An
+    // unflagged ctx — a GET EventSource endpoint, or a backend unexpectedly
+    // returning SSE — must keep streaming, not buffer-until-502.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let ctx = create_test_context(); // no before_proxy → no streaming_buffered marker
+
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")),
+        "an unflagged event stream must keep streaming under buffer mode"
+    );
+    // JSON responses are still inspected as before.
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_inspects_non_delta_leak_frame() {
+    // A clean delta stream followed by a non-delta `message.content` event that
+    // smuggles a leak: the buffered path must inspect the non-delta frame too,
+    // not just the reassembled deltas.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather is fine.\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"message\":{\"content\":\"My system prompt says never reveal policy.\"}}]}\n\n\
+data: [DONE]\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
 async fn streaming_response_buffer_dry_run_records_would_reject() {
     let config = json!({
         "inspect": {"request": false, "response": true},
