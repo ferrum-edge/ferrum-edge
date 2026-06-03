@@ -1408,7 +1408,7 @@ async fn aggregate_initialize_treats_upstream_json_rpc_errors_as_failures() {
 }
 
 #[tokio::test]
-async fn aggregate_tools_list_rejects_colliding_public_tool_names() {
+async fn aggregate_tools_list_skips_colliding_public_tool_names() {
     let server = start_mcp_tool_collision_server().await;
     let plugin = create_plugin(
         "mcp_gateway",
@@ -1462,8 +1462,15 @@ async fn aggregate_tools_list_rejects_colliding_public_tool_names() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     let (status, body, _) = reject_json(result);
     assert_eq!(status, 200);
-    assert_eq!(body["error"]["code"], -32006);
-    assert_eq!(body["error"]["message"], "MCP catalog unavailable");
+    // Colliding public names are skipped (exposed by neither upstream, so never
+    // routed to the wrong one) rather than failing the whole catalog. Both tools
+    // here collide to the same public name, so the tool list is empty and no
+    // catalog error is returned.
+    assert!(
+        body["error"].is_null(),
+        "collision must not fail the catalog: {body}"
+    );
+    assert_eq!(body["result"]["tools"], json!([]));
 }
 
 #[tokio::test]
@@ -2167,4 +2174,122 @@ async fn aggregate_notification_form_request_with_unknown_session_is_accepted() 
         ctx.metadata.get("mcp.route_decision").map(String::as_str),
         Some("synthetic_response")
     );
+}
+
+#[tokio::test]
+async fn aggregate_missing_session_header_returns_400() {
+    // Unreachable upstream is fine: the missing-session check fires before any
+    // upstream call.
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+
+    // A request method (has an id) but no Mcp-Session-Id header.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/list",
+        "params": {}
+    }));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    // 400 (missing) is distinct from 404 (terminated/unknown) and the message
+    // reflects the real cause rather than blaming the upstream.
+    assert_eq!(status, 400);
+    assert_eq!(body["id"], 5);
+    assert_eq!(body["error"]["code"], -32600);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Missing"),
+        "message should name the missing session header: {body}"
+    );
+}
+
+async fn start_mcp_collision_survivor_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/one"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "one",
+            "result": {
+                "tools": [
+                    { "name": "b.c", "inputSchema": { "type": "object" } },
+                    { "name": "unique", "inputSchema": { "type": "object" } }
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/two"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "two",
+            "result": {
+                "tools": [
+                    { "name": "c", "inputSchema": { "type": "object" } }
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn aggregate_tools_list_skips_collision_keeps_other_tools() {
+    let server = start_mcp_collision_survivor_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &json!({
+            "enabled": true,
+            "mode": "aggregate_router",
+            "endpoint": {"path": "/mcp"},
+            "sessions": {"initialize_upstreams": "passthrough"},
+            "discovery": {
+                "aggregate_tools": true,
+                "aggregate_resources": false,
+                "aggregate_prompts": false,
+                "namespace_separator": ".",
+                "on_new_tool": "allow"
+            },
+            "servers": {
+                "one": {
+                    "upstream_url": format!("{}/one", server.uri()),
+                    "namespace": "a",
+                    "enabled": true,
+                    "expose_tools": true,
+                    "expose_resources": false,
+                    "expose_prompts": false
+                },
+                "two": {
+                    "upstream_url": format!("{}/two", server.uri()),
+                    "namespace": "a.b",
+                    "enabled": true,
+                    "expose_tools": true,
+                    "expose_resources": false,
+                    "expose_prompts": false
+                }
+            },
+            "policy": {"default_action": "allow"}
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    // "a.b.c" collides (server one's "b.c" vs server two's "c") and is dropped
+    // from both; the non-colliding "a.unique" survives — one bad name no longer
+    // takes down the whole catalog.
+    let names = aggregate_tool_names(&plugin, &session_id, 60).await;
+    assert_eq!(names, vec!["a.unique"]);
 }

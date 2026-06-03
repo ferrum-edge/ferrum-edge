@@ -373,6 +373,10 @@ struct DownstreamMcpSession {
     client_capabilities: Option<Value>,
     upstream_sessions: HashMap<String, UpstreamMcpSession>,
     catalog: Arc<RwLock<McpCatalog>>,
+    // Per-session catalog refresh lock: serializes discovery for *this* session's
+    // catalog only, so a slow upstream refreshing one session does not block
+    // discovery for unrelated sessions (the catalog is per-session by design).
+    catalog_refresh_lock: Arc<Mutex<()>>,
     last_seen: Instant,
 }
 
@@ -383,6 +387,10 @@ struct UpstreamMcpSession {
     upstream_session_id: Option<String>,
     protocol_version: Option<String>,
     initialized: bool,
+    // Per-(session, server) initialize lock: serializes the upstream initialize +
+    // notifications/initialized round trip for this one upstream session, so a slow
+    // upstream does not stall initialization for other sessions or other servers.
+    init_lock: Arc<Mutex<()>>,
 }
 
 /// MCP-aware gateway/router plugin.
@@ -396,8 +404,10 @@ pub struct McpGateway {
     capabilities: McpCapabilitiesConfig,
     servers: HashMap<String, McpServerConfig>,
     primary_server_id: String,
-    catalog_refresh_lock: Arc<Mutex<()>>,
-    upstream_init_lock: Arc<Mutex<()>>,
+    // Catalog-refresh and upstream-initialize locks are scoped per-session and
+    // per-(session, server) respectively (see DownstreamMcpSession /
+    // UpstreamMcpSession), not globally, so one slow upstream cannot serialize
+    // discovery or initialization across unrelated client sessions.
     session_admission_lock: Arc<Mutex<()>>,
     session_store: Arc<DashMap<String, DownstreamMcpSession>>,
     policy: McpPolicy,
@@ -531,8 +541,6 @@ impl McpGateway {
             capabilities,
             servers,
             primary_server_id,
-            catalog_refresh_lock: Arc::new(Mutex::new(())),
-            upstream_init_lock: Arc::new(Mutex::new(())),
             session_admission_lock: Arc::new(Mutex::new(())),
             session_store: Arc::new(DashMap::with_shard_amount(session_shard_amount)),
             policy,
@@ -783,12 +791,10 @@ impl McpGateway {
         ctx: &RequestContext,
     ) -> Result<String, PluginResult> {
         let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
-            return Err(json_rpc_error(
-                id,
-                -32005,
-                "Upstream MCP session unavailable",
-                None,
-            ));
+            // No session header at all: the client never initialized (or dropped
+            // the header). Per MCP Streamable HTTP this is HTTP 400, distinct from
+            // the 404 that signals a terminated/unknown session and prompts re-init.
+            return Err(missing_session_response(id));
         };
         if !self.touch_downstream_session(&session_id, ctx).await {
             return Err(session_not_found_response());
@@ -806,10 +812,9 @@ impl McpGateway {
         // Serialize the eviction + insert sequence so concurrent `initialize`
         // calls cannot each pass the cap check before any of them inserts and
         // collectively grow `session_store` past `max_sessions`. `initialize`
-        // is an infrequent per-client-session operation, so holding this lock
-        // (matching the existing `upstream_init_lock` pattern) is acceptable;
-        // the eviction work only does upstream I/O when sessions are actually
-        // expired or over the cap.
+        // is an infrequent per-client-session operation, so holding this lock is
+        // acceptable; the eviction work only does upstream I/O when sessions are
+        // actually expired or over the cap.
         let _admission_guard = self.session_admission_lock.lock().await;
         self.evict_expired_sessions(ctx).await;
         self.evict_oldest_session_if_needed(ctx).await;
@@ -826,6 +831,7 @@ impl McpGateway {
                         upstream_session_id: None,
                         protocol_version: None,
                         initialized: false,
+                        init_lock: Arc::new(Mutex::new(())),
                     },
                 )
             })
@@ -839,6 +845,7 @@ impl McpGateway {
                 client_capabilities,
                 upstream_sessions,
                 catalog: Arc::new(RwLock::new(McpCatalog::default())),
+                catalog_refresh_lock: Arc::new(Mutex::new(())),
                 last_seen: Instant::now(),
             },
         );
@@ -858,7 +865,19 @@ impl McpGateway {
         if server.initialize_strategy == InitializeStrategy::Passthrough {
             return Ok(None);
         }
-        let _guard = self.upstream_init_lock.lock().await;
+        // Per-(session, server) lock: only the same upstream session serializes
+        // here, so concurrent first-touch of different sessions/servers proceeds
+        // in parallel and a slow upstream does not block unrelated initializes.
+        let init_lock = self
+            .downstream_session_clone(downstream_session_id)
+            .and_then(|session| {
+                session
+                    .upstream_sessions
+                    .get(server_id)
+                    .map(|upstream| Arc::clone(&upstream.init_lock))
+            })
+            .ok_or_else(|| "downstream MCP session is not initialized".to_string())?;
+        let _guard = init_lock.lock().await;
         if let Some(upstream_session_id) = self
             .downstream_session_clone(downstream_session_id)
             .and_then(|session| {
@@ -1261,23 +1280,24 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
     ) -> Result<(), McpCatalogError> {
-        let catalog_lock = self
-            .catalog_for_session(downstream_session_id)
+        let session = self
+            .downstream_session_clone(downstream_session_id)
             .ok_or(McpCatalogError::SessionNotFound)?;
+        let catalog_lock = &session.catalog;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.is_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        let _guard = self.catalog_refresh_lock.lock().await;
+        let _guard = session.catalog_refresh_lock.lock().await;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.is_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        self.refresh_catalog(ctx, downstream_session_id, &catalog_lock)
+        self.refresh_catalog(ctx, downstream_session_id, catalog_lock)
             .await
             .map_err(McpCatalogError::Refresh)
     }
@@ -1287,23 +1307,24 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
     ) -> Result<(), McpCatalogError> {
-        let catalog_lock = self
-            .catalog_for_session(downstream_session_id)
+        let session = self
+            .downstream_session_clone(downstream_session_id)
             .ok_or(McpCatalogError::SessionNotFound)?;
+        let catalog_lock = &session.catalog;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        let _guard = self.catalog_refresh_lock.lock().await;
+        let _guard = session.catalog_refresh_lock.lock().await;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        self.refresh_resource_templates(ctx, downstream_session_id, &catalog_lock)
+        self.refresh_resource_templates(ctx, downstream_session_id, catalog_lock)
             .await
             .map_err(McpCatalogError::Refresh)
     }
@@ -1318,6 +1339,9 @@ impl McpGateway {
         let mut tools = HashMap::new();
         let mut prompts = HashMap::new();
         let mut resources = HashMap::new();
+        let mut collided_tools = HashSet::new();
+        let mut collided_prompts = HashSet::new();
+        let mut collided_resources = HashSet::new();
         let discovered_at = Utc::now();
 
         for server in self.servers.values().filter(|server| server.enabled) {
@@ -1336,12 +1360,14 @@ impl McpGateway {
                         self.tool_entry_from_value(server, item, discovered_at, &old_catalog)
                     {
                         let public_name = entry.public_name.clone();
-                        if let Some(existing) = tools.insert(public_name.clone(), entry) {
-                            return Err(format!(
-                                "duplicate public MCP tool name {public_name:?} from servers {:?} and {:?}",
-                                existing.server_id, server.server_id
-                            ));
-                        }
+                        insert_catalog_entry(
+                            &mut tools,
+                            &mut collided_tools,
+                            public_name,
+                            entry,
+                            &server.server_id,
+                            "tool",
+                        );
                     }
                 }
             }
@@ -1357,7 +1383,15 @@ impl McpGateway {
                     .await?;
                 for item in items {
                     if let Some(entry) = self.prompt_entry_from_value(server, item, discovered_at) {
-                        prompts.insert(entry.public_name.clone(), entry);
+                        let public_name = entry.public_name.clone();
+                        insert_catalog_entry(
+                            &mut prompts,
+                            &mut collided_prompts,
+                            public_name,
+                            entry,
+                            &server.server_id,
+                            "prompt",
+                        );
                     }
                 }
             }
@@ -1374,7 +1408,15 @@ impl McpGateway {
                 for item in items {
                     if let Some(entry) = self.resource_entry_from_value(server, item, discovered_at)
                     {
-                        resources.insert(entry.public_uri.clone(), entry);
+                        let public_uri = entry.public_uri.clone();
+                        insert_catalog_entry(
+                            &mut resources,
+                            &mut collided_resources,
+                            public_uri,
+                            entry,
+                            &server.server_id,
+                            "resource",
+                        );
                     }
                 }
             }
@@ -2931,6 +2973,61 @@ fn empty_response(status_code: u16) -> PluginResult {
 
 fn session_not_found_response() -> PluginResult {
     empty_response(404)
+}
+
+/// Insert a discovered catalog entry under `key`, skipping (and warning on) any
+/// public-name collision across upstreams. A colliding name is exposed by
+/// *neither* upstream: that prevents silent routing to the wrong upstream (the
+/// original collision concern) while keeping the rest of the catalog usable
+/// rather than failing discovery wholesale. Applied uniformly to tools, prompts,
+/// and resources so collision behavior is consistent across item types.
+fn insert_catalog_entry<T>(
+    map: &mut HashMap<String, T>,
+    collided: &mut HashSet<String>,
+    key: String,
+    entry: T,
+    server_id: &str,
+    item_kind: &str,
+) {
+    if collided.contains(&key) {
+        warn!(
+            public_name = %key,
+            server_id,
+            item_kind,
+            "skipping MCP catalog entry: public name already collided across upstreams"
+        );
+        return;
+    }
+    if map.remove(&key).is_some() {
+        collided.insert(key.clone());
+        warn!(
+            public_name = %key,
+            server_id,
+            item_kind,
+            "skipping colliding MCP catalog entries: duplicate public name across upstreams"
+        );
+        return;
+    }
+    map.insert(key, entry);
+}
+
+/// HTTP 400 for a request that requires an MCP session but carried no session
+/// header. Distinct from `session_not_found_response` (404 = terminated/unknown
+/// session): the message reflects the real cause (the client never sent
+/// `Mcp-Session-Id`) rather than attributing it to the upstream.
+fn missing_session_response(id: Option<Value>) -> PluginResult {
+    json_response(
+        400,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id.unwrap_or(Value::Null),
+            "error": {
+                "code": -32600,
+                "message": "Missing Mcp-Session-Id header; call initialize to obtain a session"
+            }
+        }),
+        None,
+    )
 }
 
 fn tool_entry_to_public_value(entry: &ToolCatalogEntry) -> Value {
