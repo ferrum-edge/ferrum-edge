@@ -3330,14 +3330,11 @@ impl EnvConfig {
                 // make them disagree and silently re-open the posture.
                 //
                 // LIMITATION (tracked in #1523): this is a config-time *presence*
-                // check. It does NOT verify the SVID files actually load, nor
-                // that the inbound listener will present a server cert / require
-                // mTLS at runtime — `build_mesh_inbound_spiffe_slot` turns load
-                // failures into `None` and `load_mesh_frontend_tls` returns `None`
-                // under PERMISSIVE with no frontend identity, so a listener can
-                // still come up plaintext. Making that runtime path fail closed in
-                // production (and wiring the CA backend to issue SVIDs) is the
-                // robust follow-up.
+                // check. It does NOT verify the SVID files actually load. Runtime
+                // mesh TLS setup still fails closed separately in production when
+                // PeerAuthentication requires TLS but no inbound frontend server
+                // certificate/key is configured. Wiring the CA backend to issue
+                // SVIDs remains a follow-up.
                 if !has_workload_identity {
                     if crate::identity::production_mode() {
                         // Master prod guardrail: like bootstrap_dev_root and

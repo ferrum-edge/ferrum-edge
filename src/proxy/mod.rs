@@ -7818,8 +7818,10 @@ impl ListenerTlsSource {
     /// Whether this source REQUIRES a TLS config to serve a connection.
     /// Generic dynamic HTTPS listeners must fail closed when their slot is
     /// empty. Mesh inbound live reload is different: `None` is the intentional
-    /// representation for PeerAuthentication `DISABLE` and for permissive mode
-    /// without frontend TLS materials, so it must fall through to plaintext.
+    /// representation for PeerAuthentication `DISABLE` and for non-production
+    /// permissive mode without frontend TLS materials, so it must fall through
+    /// to plaintext. Production mesh TLS setup rejects that permissive
+    /// no-server-identity posture before the listener starts.
     fn requires_tls(&self) -> bool {
         match self {
             Self::Static { .. } | Self::MeshInbound => false,
@@ -20674,7 +20676,7 @@ mod tests {
     /// `Dynamic` is only constructed for TLS-terminating HTTPS listeners and
     /// must fail closed when its slot is empty. `MeshInbound` uses the same
     /// slot shape for PeerAuthentication live reload, where `None` is a valid
-    /// plaintext state for DISABLE/permissive-without-materials.
+    /// plaintext state for DISABLE or non-production permissive-without-materials.
     #[test]
     fn listener_tls_source_dynamic_requires_tls_but_mesh_inbound_allows_plaintext() {
         let slot = crate::tls::empty_frontend_tls_slot();

@@ -4676,6 +4676,9 @@ fn resolve_mesh_inbound_client_auth(
 /// Build the mesh frontend TLS configuration respecting the resolved mTLS mode.
 ///
 /// - `Strict` / `Permissive`: Load TLS with the appropriate client-auth mode.
+/// - Production `Permissive`: fail closed if the inbound server certificate/key
+///   is absent, because gateway SVID material is outbound identity and does not
+///   configure the listener certificate.
 /// - `Disable`: Return `None` (plaintext listener).
 fn load_mesh_frontend_tls(
     env_config: &EnvConfig,
@@ -4697,6 +4700,12 @@ fn load_mesh_frontend_tls(
         if mtls_mode == config::MtlsMode::Strict {
             return Err(anyhow::anyhow!(
                 "Mesh PeerAuthentication STRICT requires FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH"
+            ));
+        }
+        if crate::identity::production_mode() {
+            return Err(anyhow::anyhow!(
+                "FERRUM_MESH_PRODUCTION_MODE=true requires FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH for mesh PeerAuthentication {:?}; gateway SVID material does not configure the inbound mesh server certificate",
+                mtls_mode
             ));
         }
         return Ok(None);
@@ -5609,6 +5618,21 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
+    fn with_production_mode<F: FnOnce()>(value: &str, f: F) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let key = "FERRUM_MESH_PRODUCTION_MODE";
+        let previous = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, value) };
+
+        f();
+
+        if let Some(previous) = previous {
+            unsafe { std::env::set_var(key, previous) };
+        } else {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
     fn with_mesh_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let keys = [
@@ -5647,6 +5671,7 @@ mod tests {
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
             "FERRUM_MESH_CA_BACKEND",
             "FERRUM_MESH_ALLOW_NO_CA",
+            "FERRUM_MESH_PRODUCTION_MODE",
         ];
 
         for key in keys {
@@ -10871,21 +10896,54 @@ mod tests {
 
     #[test]
     fn permissive_peer_auth_allows_missing_frontend_tls_materials() {
-        let env = EnvConfig::default();
-        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        with_production_mode("false", || {
+            let env = EnvConfig::default();
+            let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
 
-        let tls_config = load_mesh_frontend_tls(
-            &env,
-            &tls_policy,
-            &[],
-            config::MtlsMode::Permissive,
-            None,
-            None,
-            None,
-        )
-        .expect("permissive mTLS can run without frontend TLS materials");
+            let tls_config = load_mesh_frontend_tls(
+                &env,
+                &tls_policy,
+                &[],
+                config::MtlsMode::Permissive,
+                None,
+                None,
+                None,
+            )
+            .expect("permissive mTLS can run without frontend TLS materials in dev mode");
 
-        assert!(tls_config.is_none());
+            assert!(tls_config.is_none());
+        });
+    }
+
+    #[test]
+    fn production_permissive_peer_auth_fails_closed_without_frontend_tls_materials() {
+        with_production_mode("true", || {
+            let env = EnvConfig {
+                gateway_svid_cert_path: Some("tests/certs/server.crt".to_string()),
+                gateway_svid_key_path: Some("tests/certs/server.key".to_string()),
+                gateway_svid_trust_bundle_path: Some("tests/certs/ca.crt".to_string()),
+                ..EnvConfig::default()
+            };
+            let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+
+            let err = load_mesh_frontend_tls(
+                &env,
+                &tls_policy,
+                &[],
+                config::MtlsMode::Permissive,
+                None,
+                None,
+                None,
+            )
+            .expect_err(
+                "production PERMISSIVE mesh must not downgrade to plaintext when server TLS is missing",
+            );
+
+            let message = err.to_string();
+            assert!(message.contains("FERRUM_MESH_PRODUCTION_MODE=true"));
+            assert!(message.contains("FERRUM_FRONTEND_TLS_CERT_PATH"));
+            assert!(message.contains("gateway SVID material does not configure"));
+        });
     }
 
     #[test]

@@ -149,7 +149,7 @@ This section consolidates every known residual gap so operators do not have to r
 
 ### mTLS / HBONE operator cautions
 
-- **PERMISSIVE with no client CA degrades to no-auth** — if `PeerAuthentication` resolves to `PERMISSIVE` but neither `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` nor gateway SVID material is configured, client certificates are **not requested or verified** (logged at startup as a `warn!`; resolved through the explicit `PermissiveNoTrustAnchor` decision in `resolve_mesh_inbound_client_auth`). The listener admits unauthenticated peers and no peer SPIFFE identity is recorded. Configure a client CA or SVID material, or use STRICT, when you need PERMISSIVE to actually capture identity.
+- **PERMISSIVE with no client CA degrades to no-auth** — if `PeerAuthentication` resolves to `PERMISSIVE` but neither `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` nor gateway SVID material is configured, client certificates are **not requested or verified** (logged at startup as a `warn!`; resolved through the explicit `PermissiveNoTrustAnchor` decision in `resolve_mesh_inbound_client_auth`). The listener admits unauthenticated peers and no peer SPIFFE identity is recorded. Configure a client CA or SVID material, or use STRICT, when you need PERMISSIVE to actually capture identity. In production (`FERRUM_MESH_PRODUCTION_MODE=true`), PERMISSIVE still requires inbound server TLS material (`FERRUM_FRONTEND_TLS_CERT_PATH` + `FERRUM_FRONTEND_TLS_KEY_PATH`); gateway SVID material is outbound identity and cannot substitute for the listener certificate/key.
 
 ### Federation / multi-cluster
 
