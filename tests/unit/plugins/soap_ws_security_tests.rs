@@ -385,7 +385,7 @@ fn find_element_by_wsu_id_skips_cdata_and_pi_content_like_counter() {
 }
 
 #[test]
-fn find_element_by_wsu_id_resolves_arbitrary_prefixed_id() {
+fn find_element_by_wsu_id_resolves_prefixed_id_bound_to_wsu_namespace() {
     let xml = r#"
         <soap:Body xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
             <Target u:Id="B">signed body bytes</Target>
@@ -394,14 +394,33 @@ fn find_element_by_wsu_id_resolves_arbitrary_prefixed_id() {
 
     assert_eq!(
         soap_count_wsu_id_occurrences_for_test(xml, "B")
-            .expect("prefixed local-name Id should count"),
+            .expect("prefixed local-name Id should count for duplicate protection"),
         1
     );
     let resolved = soap_find_element_by_wsu_id_for_test(xml, "B")
-        .expect("prefixed local-name Id should resolve");
+        .expect("WSU-bound prefixed Id should resolve");
 
     assert!(resolved.starts_with("<Target"));
     assert!(resolved.contains("signed body bytes"));
+}
+
+#[test]
+fn find_element_by_wsu_id_rejects_prefixed_id_bound_to_non_wsu_namespace() {
+    let xml = r#"
+        <soap:Body xmlns:evil="urn:not-wsu">
+            <Target evil:Id="B">signed body bytes</Target>
+        </soap:Body>
+    "#;
+
+    assert_eq!(
+        soap_count_wsu_id_occurrences_for_test(xml, "B")
+            .expect("broad duplicate protection still counts prefixed local-name Id"),
+        1
+    );
+    assert!(
+        soap_find_element_by_wsu_id_for_test(xml, "B").is_none(),
+        "non-WSU namespace prefixes must not resolve as WS-Security Utility IDs"
+    );
 }
 
 #[test]
@@ -2189,6 +2208,35 @@ mod x509_roundtrip {
         assert!(
             matches!(result, PluginResult::Continue),
             "expected Continue with non-wsu WSU namespace prefix, got {:?}",
+            result,
+        );
+    }
+
+    #[tokio::test]
+    async fn rsa_signature_with_non_wsu_prefixed_id_is_rejected() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path()))
+            .expect("plugin should construct with valid RSA cert");
+
+        let body = build_signed_soap_envelope_with_timestamp_prefix(&cert, "evil")
+            .replace(
+                r#"xmlns:evil="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd""#,
+                r#"xmlns:evil="urn:not-wsu""#,
+            );
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 401,
+                    ..
+                }
+            ),
+            "expected Reject for non-WSU prefixed Id, got {:?}",
             result,
         );
     }
