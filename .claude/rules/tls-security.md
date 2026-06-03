@@ -53,7 +53,7 @@ paths:
 - Reload parse, expiry, not-yet-valid, or key mismatch failures keep the previous config and emit `warn!`.
 - In-flight TLS sessions keep their original `ServerConfig`; swapping must not tear down live sessions.
 - DTLS frontend and operator-supplied per-proxy backend TLS paths remain static under frontend live reload.
-- Gateway SVID cert/key/trust-bundle files are watched for backend client SVID rotation. Valid reload updates the SVID slot, preserves CP-delivered trust-bundle override, bumps `|svidg=<generation>`, drains old backend TLS caches, restarts HTTP health probes, and optionally force-drains old-generation pool entries after `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`.
+- Gateway SVID cert/key/trust-bundle files are watched for backend client SVID rotation. Valid reload updates the SVID slot, preserves CP-delivered trust-bundle override, bumps `|svidg=<generation>`, drains old backend TLS caches, restarts HTTP health probes, and optionally force-drains old-generation pool entries after `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS`. This watcher rotates only the **backend (outbound)** identity. When the gateway SVID also backs the **mesh inbound** listener's server cert (issue #1523 — no explicit `FERRUM_FRONTEND_TLS_*` set), that inbound cert is loaded once at startup and is **restart-required** (it does not auto-rotate); a startup `warn!` flags it. Auto-rotating the SVID-backed inbound identity (a live `ResolvesServerCert`) is deferred with the `FERRUM_MESH_CA_BACKEND` rotation work. Do not silently start rotating the inbound server cert without wiring it end-to-end and updating `docs/mesh.md`.
 - Backend CA bundles and ordinary backend client cert/key paths remain restart-required.
 
 ## Backend Trust

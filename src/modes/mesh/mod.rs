@@ -4417,9 +4417,13 @@ struct MeshInboundTlsReloadState {
 /// file material, merging in the slice's federated trust bundles so inbound
 /// peer SANs from federated trust domains validate too. Returns `None` when no
 /// gateway SVID material is configured (the inbound listener then keeps the
-/// operator client-CA chain verification it has always used). A load failure
-/// is logged and treated as `None` so a misconfigured SVID path does not take
-/// the whole listener down — it degrades to the pre-existing chain-only check.
+/// operator client-CA chain verification it has always used). It also returns
+/// `None` (logged) when SVID material *is* configured but fails to load — but
+/// the caller does NOT silently degrade to chain-only in that case (issue
+/// #1523): at startup a configured-but-unloadable SVID is fatal (see the F2
+/// note in the body, and `enforce_mesh_inbound_fail_closed`), and on live reload
+/// the previous trust bundle is retained. See `build_mesh_inbound_spiffe_slot`'s
+/// F2 comment for the precise per-caller disposition.
 fn build_mesh_inbound_spiffe_slot(
     env_config: &EnvConfig,
     slice: Option<&MeshSlice>,
@@ -4652,9 +4656,26 @@ fn load_mesh_frontend_server_identity(
         env_config.gateway_svid_cert_path.as_deref(),
         env_config.gateway_svid_key_path.as_deref(),
     ) {
-        info!(
+        // Operability caveat (issue #1523): this server cert is loaded once here
+        // and pinned for the process lifetime. The gateway SVID file watcher
+        // (`run_gateway_svid_file_rotation_loop`) rotates only the BACKEND
+        // (outbound) identity, so after the file-based SVID rotates this inbound
+        // listener keeps presenting the startup leaf until restart — and once the
+        // pinned leaf expires (~one rotation period), inbound mTLS handshakes
+        // fail. Auto-rotating the SVID-backed inbound identity (a live
+        // `ResolvesServerCert`) is the deferred rotation work tracked alongside
+        // FERRUM_MESH_CA_BACKEND wiring; warn loudly so operators either supply
+        // explicit FERRUM_FRONTEND_TLS_* (with their own rotation) or
+        // restart/rolling-redeploy on SVID rotation.
+        warn!(
             "Mesh inbound listener using gateway SVID material as its TLS server \
-             identity (no explicit FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH set)"
+             identity (no explicit FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH set). \
+             This inbound server certificate is pinned at startup and is NOT \
+             auto-rotated (the gateway SVID file watcher rotates only the backend \
+             identity), so after the SVID rotates this listener keeps presenting \
+             the startup leaf until the gateway is restarted — inbound mTLS will \
+             fail once that leaf expires. Supply FERRUM_FRONTEND_TLS_CERT_PATH / \
+             KEY_PATH with your own rotation, or restart on SVID rotation."
         );
         return Ok(Some(tls::load_mesh_server_identity(
             cert_path,
