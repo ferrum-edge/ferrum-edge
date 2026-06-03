@@ -301,6 +301,7 @@ async fn start_node_agent_admin_listeners(
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+        backend_allow_ips: env_config.backend_allow_ips.clone(),
     };
 
     // Safe-by-default bind: when the operator opts into the node-agent admin

@@ -121,6 +121,7 @@ fn make_admin_state(db: DatabaseStore, max_spec_mib: usize) -> AdminState {
         admin_http_header_read_timeout_seconds: 30,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
     }
 }
 

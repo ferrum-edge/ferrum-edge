@@ -133,6 +133,11 @@ pub struct AdminState {
     pub admin_http_header_read_timeout_seconds: u64,
     /// Admin TLS handshake timeout (seconds). 0 disables.
     pub admin_tls_handshake_timeout_seconds: u64,
+    /// Configured backend IP egress policy (`FERRUM_BACKEND_ALLOW_IPS`). Used to
+    /// validate plugin endpoint IPs at the admin boundary in modes without a
+    /// `ProxyState` (e.g. control plane), so CP-accepted configs match what data
+    /// planes will accept.
+    pub backend_allow_ips: crate::config::BackendAllowIps,
 }
 
 impl AdminState {
@@ -2493,7 +2498,15 @@ fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClien
         .proxy_state
         .as_ref()
         .map(|proxy_state| proxy_state.plugin_http_client.clone())
-        .unwrap_or_default()
+        .unwrap_or_else(|| {
+            // No ProxyState (e.g. control plane): build a validation client that
+            // still carries the configured backend IP policy, so a plugin whose
+            // endpoint resolves to a denied literal IP is rejected at the admin
+            // boundary instead of being accepted here and rejected later by DPs.
+            plugins::PluginHttpClient::default_with_backend_allow_ips(
+                state.backend_allow_ips.clone(),
+            )
+        })
 }
 
 fn validate_plugin_config_definition(

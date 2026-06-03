@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use tokio::sync::OnceCell;
 use url::{Host, Url};
@@ -340,6 +341,12 @@ pub struct AiSemanticFirewall {
     expose_rule_id_to_client: bool,
     has_request_rules: bool,
     has_response_rules: bool,
+    /// True when both directions can produce decision metadata in the same
+    /// transaction (request + response inspection both active with applicable
+    /// rules). In that case decision metadata keys are scoped by direction
+    /// (`ai_semantic_firewall.request.*` / `ai_semantic_firewall.response.*`)
+    /// so the response pass does not overwrite the request-side audit record.
+    metadata_direction_scoped: bool,
     rule_embeddings: OnceCell<Arc<RuleEmbeddingIndex>>,
 }
 
@@ -439,6 +446,7 @@ impl AiSemanticFirewall {
                 expose_rule_id_to_client,
                 has_request_rules: false,
                 has_response_rules: false,
+                metadata_direction_scoped: false,
                 rule_embeddings: OnceCell::new(),
             });
         }
@@ -515,11 +523,17 @@ impl AiSemanticFirewall {
             expose_rule_id_to_client,
             has_request_rules,
             has_response_rules,
+            metadata_direction_scoped: has_request_rules && has_response_rules,
             rule_embeddings: OnceCell::new(),
         })
     }
 
-    async fn evaluate(&self, direction: Direction, segments: &[TextSegment]) -> EvaluationOutcome {
+    async fn evaluate(
+        &self,
+        direction: Direction,
+        segments: &[TextSegment],
+        plugin_http_call_ns: &AtomicU64,
+    ) -> EvaluationOutcome {
         let mut matches = self.lexical_matches(direction, segments);
         let has_reject_match = matches.iter().any(|m| m.action == Action::Reject);
         let mut provider_error = None;
@@ -529,7 +543,10 @@ impl AiSemanticFirewall {
             && !segments.is_empty()
             && let Some(provider) = &self.provider
         {
-            match self.semantic_matches(provider, direction, segments).await {
+            match self
+                .semantic_matches(provider, direction, segments, plugin_http_call_ns)
+                .await
+            {
                 Ok(mut semantic_matches) => {
                     semantic_evaluated = true;
                     matches.append(&mut semantic_matches);
@@ -611,8 +628,11 @@ impl AiSemanticFirewall {
         provider: &ProviderConfig,
         direction: Direction,
         segments: &[TextSegment],
+        plugin_http_call_ns: &AtomicU64,
     ) -> Result<Vec<RuleMatch>, String> {
-        let index = self.rule_embedding_index(provider).await?;
+        let index = self
+            .rule_embedding_index(provider, plugin_http_call_ns)
+            .await?;
         let mut candidate_segments = Vec::new();
 
         for segment in segments {
@@ -632,7 +652,9 @@ impl AiSemanticFirewall {
             .iter()
             .map(|segment| segment.text.clone())
             .collect();
-        let segment_embeddings = self.embed_texts(provider, &segment_inputs).await?;
+        let segment_embeddings = self
+            .embed_texts(provider, &segment_inputs, plugin_http_call_ns)
+            .await?;
 
         let mut matches = Vec::new();
         for (segment, segment_embedding) in candidate_segments.iter().zip(segment_embeddings.iter())
@@ -688,10 +710,11 @@ impl AiSemanticFirewall {
     async fn rule_embedding_index(
         &self,
         provider: &ProviderConfig,
+        plugin_http_call_ns: &AtomicU64,
     ) -> Result<Arc<RuleEmbeddingIndex>, String> {
         self.rule_embeddings
             .get_or_try_init(|| async {
-                self.build_rule_embedding_index(provider)
+                self.build_rule_embedding_index(provider, plugin_http_call_ns)
                     .await
                     .map(Arc::new)
             })
@@ -702,6 +725,7 @@ impl AiSemanticFirewall {
     async fn build_rule_embedding_index(
         &self,
         provider: &ProviderConfig,
+        plugin_http_call_ns: &AtomicU64,
     ) -> Result<RuleEmbeddingIndex, String> {
         let mut inputs = Vec::new();
         let mut rule_ranges = Vec::new();
@@ -718,7 +742,9 @@ impl AiSemanticFirewall {
             allow_ranges.push((topic.id.clone(), start, inputs.len()));
         }
 
-        let embeddings = self.embed_texts(provider, &inputs).await?;
+        let embeddings = self
+            .embed_texts(provider, &inputs, plugin_http_call_ns)
+            .await?;
         let mut rule_embeddings = HashMap::new();
         let mut allow_topic_embeddings = HashMap::new();
 
@@ -739,6 +765,7 @@ impl AiSemanticFirewall {
         &self,
         provider: &ProviderConfig,
         texts: &[String],
+        plugin_http_call_ns: &AtomicU64,
     ) -> Result<Vec<EmbeddingVector>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -763,10 +790,11 @@ impl AiSemanticFirewall {
 
         let response = self
             .http_client
-            .execute_redacted(
+            .execute_redacted_tracked(
                 request,
                 "ai_semantic_firewall_embedding",
                 &provider.redacted_endpoint,
+                plugin_http_call_ns,
             )
             .await
             .map_err(|err| format!("embedding request failed: {err}"))?;
@@ -928,6 +956,20 @@ impl AiSemanticFirewall {
         direction: Direction,
         provider_error: Option<&str>,
     ) {
+        // When both directions inspect within the same transaction, scope the
+        // per-decision keys by direction (`ai_semantic_firewall.request.*` /
+        // `ai_semantic_firewall.response.*`) so the response pass does not
+        // overwrite the request-side audit record. Single-direction configs
+        // keep the unqualified `ai_semantic_firewall.*` keys.
+        let scoped = self.metadata_direction_scoped;
+        let key = |suffix: &str| -> String {
+            if scoped {
+                format!("ai_semantic_firewall.{}.{suffix}", direction.as_str())
+            } else {
+                format!("ai_semantic_firewall.{suffix}")
+            }
+        };
+
         ctx.metadata.insert(
             "ai_semantic_firewall.enabled".to_string(),
             self.enabled.to_string(),
@@ -936,10 +978,8 @@ impl AiSemanticFirewall {
             "ai_semantic_firewall.mode".to_string(),
             self.mode.as_str().to_string(),
         );
-        ctx.metadata.insert(
-            "ai_semantic_firewall.direction".to_string(),
-            direction.as_str().to_string(),
-        );
+        ctx.metadata
+            .insert(key("direction"), direction.as_str().to_string());
 
         let decision_label = if decision.dry_run {
             match decision.action {
@@ -950,12 +990,10 @@ impl AiSemanticFirewall {
         } else {
             decision.action.as_str()
         };
+        ctx.metadata
+            .insert(key("decision"), decision_label.to_string());
         ctx.metadata.insert(
-            "ai_semantic_firewall.decision".to_string(),
-            decision_label.to_string(),
-        );
-        ctx.metadata.insert(
-            "ai_semantic_firewall.action".to_string(),
+            key("action"),
             if decision.dry_run {
                 "allow".to_string()
             } else {
@@ -963,10 +1001,8 @@ impl AiSemanticFirewall {
             },
         );
         if decision.dry_run {
-            ctx.metadata.insert(
-                "ai_semantic_firewall.would_action".to_string(),
-                decision.action.as_str().to_string(),
-            );
+            ctx.metadata
+                .insert(key("would_action"), decision.action.as_str().to_string());
         }
 
         let rule_ids = join_unique(
@@ -1033,44 +1069,25 @@ impl AiSemanticFirewall {
                 .collect::<Vec<_>>(),
         );
 
+        ctx.metadata.insert(key("rule_ids"), rule_ids);
+        ctx.metadata.insert(key("rule_packs"), rule_packs);
         ctx.metadata
-            .insert("ai_semantic_firewall.rule_ids".to_string(), rule_ids);
+            .insert(key("rule_descriptions"), rule_descriptions);
         ctx.metadata
-            .insert("ai_semantic_firewall.rule_packs".to_string(), rule_packs);
-        ctx.metadata.insert(
-            "ai_semantic_firewall.rule_descriptions".to_string(),
-            rule_descriptions,
-        );
-        ctx.metadata.insert(
-            "ai_semantic_firewall.match_directions".to_string(),
-            match_directions,
-        );
-        ctx.metadata.insert(
-            "ai_semantic_firewall.segment_kinds".to_string(),
-            segment_kinds,
-        );
-        ctx.metadata
-            .insert("ai_semantic_firewall.roles".to_string(), roles);
-        ctx.metadata
-            .insert("ai_semantic_firewall.json_paths".to_string(), json_paths);
-        ctx.metadata.insert(
-            "ai_semantic_firewall.matcher_type".to_string(),
-            matcher_types,
-        );
-        ctx.metadata.insert(
-            "ai_semantic_firewall.snippet_hashes".to_string(),
-            snippet_hashes,
-        );
+            .insert(key("match_directions"), match_directions);
+        ctx.metadata.insert(key("segment_kinds"), segment_kinds);
+        ctx.metadata.insert(key("roles"), roles);
+        ctx.metadata.insert(key("json_paths"), json_paths);
+        ctx.metadata.insert(key("matcher_type"), matcher_types);
+        ctx.metadata.insert(key("snippet_hashes"), snippet_hashes);
 
         let max_score = decision
             .matches
             .iter()
             .map(|m| m.score)
             .fold(0.0_f32, f32::max);
-        ctx.metadata.insert(
-            "ai_semantic_firewall.max_score".to_string(),
-            format!("{max_score:.6}"),
-        );
+        ctx.metadata
+            .insert(key("max_score"), format!("{max_score:.6}"));
 
         let max_severity = decision
             .matches
@@ -1079,14 +1096,12 @@ impl AiSemanticFirewall {
             .max_by_key(|severity| severity.rank())
             .map(Severity::as_str)
             .unwrap_or("");
-        ctx.metadata.insert(
-            "ai_semantic_firewall.max_severity".to_string(),
-            max_severity.to_string(),
-        );
+        ctx.metadata
+            .insert(key("max_severity"), max_severity.to_string());
 
         if let Some(provider_error) = provider_error {
             ctx.metadata.insert(
-                "ai_semantic_firewall.provider_error".to_string(),
+                key("provider_error"),
                 sanitize_provider_error(provider_error),
             );
         }
@@ -1250,7 +1265,9 @@ impl Plugin for AiSemanticFirewall {
             return PluginResult::Continue;
         }
 
-        let outcome = self.evaluate(Direction::Request, &segments).await;
+        let outcome = self
+            .evaluate(Direction::Request, &segments, &ctx.plugin_http_call_ns)
+            .await;
         if self.should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref()) {
             return self.handle_provider_error(
                 ctx,
@@ -1341,7 +1358,9 @@ impl Plugin for AiSemanticFirewall {
             return PluginResult::Continue;
         }
 
-        let outcome = self.evaluate(Direction::Response, &segments).await;
+        let outcome = self
+            .evaluate(Direction::Response, &segments, &ctx.plugin_http_call_ns)
+            .await;
         if self.should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref()) {
             return self.handle_provider_error(
                 ctx,
@@ -2353,21 +2372,42 @@ fn extract_text_value(
                         push_segment(direction, kind, role.clone(), child_path, text, segments)
                     }
                     Value::Object(object) => {
-                        let text_value = object.get("text").or_else(|| {
+                        let direct_text = object.get("text").or_else(|| {
                             if object.get("type").and_then(Value::as_str) == Some("input_text") {
                                 object.get("content")
                             } else {
                                 None
                             }
                         });
-                        extract_text_value(
-                            text_value,
-                            direction,
-                            kind,
-                            role.clone(),
-                            child_path,
-                            segments,
-                        );
+                        if let Some(direct_text) = direct_text {
+                            extract_text_value(
+                                Some(direct_text),
+                                direction,
+                                kind,
+                                role.clone(),
+                                child_path,
+                                segments,
+                            );
+                        } else if let Some(content) = object.get("content") {
+                            // Structured message object, e.g. Responses API input
+                            // `[{"role":"user","content":[{"type":"input_text","text":".."}]}]`:
+                            // recurse into the nested content so the prompt text is
+                            // inspected instead of being silently dropped. Prefer the
+                            // element's own role when present for audit attribution.
+                            let nested_role = object
+                                .get("role")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .or_else(|| role.clone());
+                            extract_text_value(
+                                Some(content),
+                                direction,
+                                kind,
+                                nested_role,
+                                child_path,
+                                segments,
+                            );
+                        }
                     }
                     _ => {}
                 }

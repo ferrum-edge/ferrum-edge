@@ -4090,6 +4090,7 @@ fn start_mesh_admin_listeners(
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
         mesh_runtime_state: Some(mesh_state),
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+        backend_allow_ips: env_config.backend_allow_ips.clone(),
     };
 
     let mut handles = Vec::new();

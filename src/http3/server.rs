@@ -3807,19 +3807,28 @@ async fn proxy_to_backend_h3_refined_response(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
-            send_h3_response(
+            // Do NOT propagate a send error here: this refined path already
+            // started least-connections LB tracking before dispatch, so
+            // returning `Err` would skip the caller's `record_backend_outcome`
+            // and leak the active-connection count for the selected target when
+            // the client disconnects during the reject write. Report the
+            // disconnect in the result so the caller still records the outcome
+            // and releases the connection — mirrors the size-limit / after_proxy
+            // reject paths in `stream_h3_open_response_to_client`.
+            let reject_sent = send_h3_response(
                 h3_stream,
                 StatusCode::BAD_GATEWAY,
                 r#"{"error":"Backend unavailable"}"#,
             )
-            .await?;
+            .await
+            .is_ok();
             return Ok(H3RefinedResponse::Streamed(H3StreamResult {
                 status: 502,
                 backend_status: 502,
                 error_class: Some(h3_error_class),
                 body_completed: false,
                 bytes_streamed: 0,
-                client_disconnected: false,
+                client_disconnected: !reject_sent,
                 body_error_class: None,
                 request_on_wire,
             }));
