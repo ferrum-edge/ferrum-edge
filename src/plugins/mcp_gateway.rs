@@ -720,34 +720,6 @@ impl McpGateway {
         session.last_seen.elapsed() >= self.sessions.session_ttl
     }
 
-    async fn evict_expired_sessions(&self, ctx: &RequestContext) {
-        let expired: Vec<String> = self
-            .session_store
-            .iter()
-            .filter(|entry| self.session_is_expired(entry.value()))
-            .map(|entry| entry.key().clone())
-            .collect();
-        for session_id in expired {
-            self.remove_downstream_session(&session_id, ctx).await;
-        }
-    }
-
-    async fn evict_oldest_session_if_needed(&self, ctx: &RequestContext) {
-        while self.session_store.len() >= self.sessions.max_sessions {
-            let oldest = self
-                .session_store
-                .iter()
-                .min_by_key(|entry| entry.value().last_seen)
-                .map(|entry| entry.key().clone());
-            let Some(session_id) = oldest else {
-                break;
-            };
-            if !self.remove_downstream_session(&session_id, ctx).await {
-                break;
-            }
-        }
-    }
-
     async fn touch_downstream_session(
         &self,
         downstream_session_id: &str,
@@ -809,46 +781,93 @@ impl McpGateway {
         client_info: Option<Value>,
         client_capabilities: Option<Value>,
     ) -> String {
-        // Serialize the eviction + insert sequence so concurrent `initialize`
-        // calls cannot each pass the cap check before any of them inserts and
-        // collectively grow `session_store` past `max_sessions`. `initialize`
-        // is an infrequent per-client-session operation, so holding this lock is
-        // acceptable; the eviction work only does upstream I/O when sessions are
-        // actually expired or over the cap.
-        let _admission_guard = self.session_admission_lock.lock().await;
-        self.evict_expired_sessions(ctx).await;
-        self.evict_oldest_session_if_needed(ctx).await;
         let downstream_session_id = uuid::Uuid::new_v4().to_string();
-        let upstream_sessions = self
-            .servers
-            .values()
-            .filter(|server| server.enabled)
-            .map(|server| {
-                (
-                    server.server_id.clone(),
-                    UpstreamMcpSession {
-                        server_id: server.server_id.clone(),
-                        upstream_session_id: None,
-                        protocol_version: None,
-                        initialized: false,
-                        init_lock: Arc::new(Mutex::new(())),
-                    },
-                )
-            })
-            .collect();
-        self.session_store.insert(
-            downstream_session_id.clone(),
-            DownstreamMcpSession {
-                downstream_session_id: downstream_session_id.clone(),
-                protocol_version,
-                client_info,
-                client_capabilities,
-                upstream_sessions,
-                catalog: Arc::new(RwLock::new(McpCatalog::default())),
-                catalog_refresh_lock: Arc::new(Mutex::new(())),
-                last_seen: Instant::now(),
-            },
-        );
+
+        // Enforce the cap and reclaim sessions atomically, but keep upstream
+        // DELETE I/O *out* of the critical section. Under the admission lock we do
+        // only the in-memory work — a single scan that partitions sessions into
+        // expired (always reclaimed) and live (cap-eviction candidates), the
+        // store removals, and the insert — so concurrent `initialize` calls can't
+        // exceed `max_sessions` yet don't serialize behind each other's network
+        // cleanup. The evicted sessions' upstream DELETEs are issued concurrently
+        // after the lock is released.
+        let evicted = {
+            let _admission_guard = self.session_admission_lock.lock().await;
+
+            let mut expired_keys: Vec<String> = Vec::new();
+            let mut live: Vec<(Instant, String)> = Vec::new();
+            for entry in self.session_store.iter() {
+                if self.session_is_expired(entry.value()) {
+                    expired_keys.push(entry.key().clone());
+                } else {
+                    live.push((entry.value().last_seen, entry.key().clone()));
+                }
+            }
+
+            let mut evicted: Vec<DownstreamMcpSession> = Vec::new();
+            for key in expired_keys {
+                if let Some(session) = self.take_downstream_session(&key) {
+                    evicted.push(session);
+                }
+            }
+
+            // After reclaiming expired sessions, evict the oldest live sessions if
+            // still at the cap so there is room for exactly one new session.
+            let target = self.sessions.max_sessions.saturating_sub(1);
+            if live.len() > target {
+                let to_remove = live.len() - target;
+                live.sort_unstable_by_key(|(last_seen, _)| *last_seen);
+                for (_, key) in live.into_iter().take(to_remove) {
+                    if let Some(session) = self.take_downstream_session(&key) {
+                        evicted.push(session);
+                    }
+                }
+            }
+
+            let upstream_sessions = self
+                .servers
+                .values()
+                .filter(|server| server.enabled)
+                .map(|server| {
+                    (
+                        server.server_id.clone(),
+                        UpstreamMcpSession {
+                            server_id: server.server_id.clone(),
+                            upstream_session_id: None,
+                            protocol_version: None,
+                            initialized: false,
+                            init_lock: Arc::new(Mutex::new(())),
+                        },
+                    )
+                })
+                .collect();
+            self.session_store.insert(
+                downstream_session_id.clone(),
+                DownstreamMcpSession {
+                    downstream_session_id: downstream_session_id.clone(),
+                    protocol_version,
+                    client_info,
+                    client_capabilities,
+                    upstream_sessions,
+                    catalog: Arc::new(RwLock::new(McpCatalog::default())),
+                    catalog_refresh_lock: Arc::new(Mutex::new(())),
+                    last_seen: Instant::now(),
+                },
+            );
+            evicted
+        };
+
+        // Tear down evicted sessions' upstreams concurrently, outside the lock, so
+        // eviction never serializes new sessions behind upstream DELETE round trips.
+        if !evicted.is_empty() {
+            futures_util::future::join_all(
+                evicted
+                    .into_iter()
+                    .map(|session| self.delete_upstream_sessions(session, ctx)),
+            )
+            .await;
+        }
+
         downstream_session_id
     }
 
@@ -1090,14 +1109,18 @@ impl McpGateway {
             .unwrap_or_else(|| self.supported_protocol_versions[0].clone())
     }
 
-    async fn remove_downstream_session(
-        &self,
-        downstream_session_id: &str,
-        ctx: &RequestContext,
-    ) -> bool {
-        let Some((_, session)) = self.session_store.remove(downstream_session_id) else {
-            return false;
-        };
+    /// Remove a session from the store without any upstream I/O. Splitting the
+    /// store removal from the upstream `DELETE` lets eviction take sessions under
+    /// the admission lock and issue the network cleanup after releasing it.
+    fn take_downstream_session(&self, downstream_session_id: &str) -> Option<DownstreamMcpSession> {
+        self.session_store
+            .remove(downstream_session_id)
+            .map(|(_, session)| session)
+    }
+
+    /// Issue the upstream `DELETE` for each initialized upstream session of an
+    /// already-removed downstream session. Failures are logged, not fatal.
+    async fn delete_upstream_sessions(&self, session: DownstreamMcpSession, ctx: &RequestContext) {
         for (server_id, upstream) in session.upstream_sessions {
             let Some(upstream_session_id) = upstream.upstream_session_id.clone() else {
                 continue;
@@ -1146,6 +1169,17 @@ impl McpGateway {
                 }
             }
         }
+    }
+
+    async fn remove_downstream_session(
+        &self,
+        downstream_session_id: &str,
+        ctx: &RequestContext,
+    ) -> bool {
+        let Some(session) = self.take_downstream_session(downstream_session_id) else {
+            return false;
+        };
+        self.delete_upstream_sessions(session, ctx).await;
         true
     }
 
