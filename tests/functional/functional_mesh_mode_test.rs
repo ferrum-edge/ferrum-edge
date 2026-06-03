@@ -1121,14 +1121,15 @@ async fn functional_mesh_mode_production_binds_mtls_inbound_with_gateway_svid() 
 
 /// Server + client SVIDs under a **shared** CA. `generate_gateway_svid` mints a
 /// fresh CA per call, so it can't drive a two-sided handshake; this signs both
-/// leaves from one root and returns the CA as the server's trust bundle, so the
-/// server STRICT verifier accepts the client SVID. Server material is written to
-/// files (for `FERRUM_GATEWAY_SVID_*`); the client cert/key are returned in PEM
-/// for a `reqwest::Identity`.
+/// leaves from one root. The CA is returned both as the server's trust-bundle
+/// file (for `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH`) and in PEM for the client
+/// probe's root store, and each leaf carries a `127.0.0.1` SAN so a standard
+/// rustls client can verify the server SVID by address.
 struct MeshPeerSvids {
     server_cert_path: String,
     server_key_path: String,
     trust_bundle_path: String,
+    ca_pem: String,
     client_cert_pem: String,
     client_key_pem: String,
 }
@@ -1140,7 +1141,7 @@ fn generate_mesh_peer_svids(
 ) -> MeshPeerSvids {
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa,
-        Issuer, KeyPair, KeyUsagePurpose,
+        Issuer, KeyPair, KeyUsagePurpose, SanType,
     };
 
     let not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
@@ -1166,6 +1167,14 @@ fn generate_mesh_peer_svids(
         params
             .subject_alt_names
             .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+        // Loopback SAN so the test's rustls client can verify the server SVID by
+        // address (mesh peer verification is SPIFFE-SAN-based; the test client
+        // uses ordinary WebPKI name checking against 127.0.0.1).
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress(std::net::IpAddr::V4(
+                std::net::Ipv4Addr::new(127, 0, 0, 1),
+            )));
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![
@@ -1193,6 +1202,7 @@ fn generate_mesh_peer_svids(
         server_cert_path: to_str(server_cert_path),
         server_key_path: to_str(server_key_path),
         trust_bundle_path: to_str(trust_bundle_path),
+        ca_pem,
         client_cert_pem,
         client_key_pem,
     }
@@ -1217,107 +1227,162 @@ fn strict_peer_auth_slice(node_id: &str) -> MeshSlice {
     }
 }
 
+/// Drive a real mTLS connection to the sidecar inbound listener at
+/// `127.0.0.1:port`, verifying the server SVID against `ca_pem` (the leaf carries
+/// a loopback SAN). With `client_identity = Some((cert_pem, key_pem))` the client
+/// presents a client SVID; with `None` it presents none. Returns `Ok(())` only
+/// when the **two-sided handshake completes and the server accepts client-auth**.
+///
+/// TLS 1.3 subtlety: the client's `connect()` returns before the server validates
+/// the client certificate, so a STRICT server rejecting a missing/untrusted client
+/// cert is only observable *post*-handshake — it fires a `certificate required`
+/// fatal alert that surfaces on the next read. We therefore probe one read while
+/// sending nothing: an accepted peer leaves the server holding the connection open
+/// for the HTTP request (header-read timeout is 10s, so a 3s read blocks → times
+/// out → `Ok`), while a rejected peer's connection is torn down by the alert (read
+/// errors or hits immediate EOF → `Err`). This distinguishes a client-auth failure
+/// from any post-handshake HTTP behavior; a server presenting the wrong identity
+/// instead fails verification up front at `connect()`.
+async fn mesh_inbound_mtls_connect(
+    port: u16,
+    ca_pem: &str,
+    client_identity: Option<(&str, &str)>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+        roots.add(cert)?;
+    }
+    let provider = rustls::crypto::ring::default_provider();
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots);
+    let config = match client_identity {
+        Some((cert_pem, key_pem)) => {
+            let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                .filter_map(|c| c.ok())
+                .collect();
+            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
+                .ok_or("no client private key in PEM")?;
+            builder.with_client_auth_cert(chain, key)?
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())?;
+    // `connect()` resolving `Ok` proves the server SVID verified against `ca_pem`;
+    // under TLS 1.3 it does not yet prove the server accepted *our* client-auth.
+    let mut tls = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+        .await
+        .map_err(|_| "tls handshake timed out")??;
+
+    // Send nothing and read once to observe the post-handshake client-auth verdict
+    // (see the doc comment): block→timeout = accepted, alert/EOF = rejected.
+    let mut buf = [0u8; 1];
+    match tokio::time::timeout(Duration::from_secs(3), tls.read(&mut buf)).await {
+        Err(_) => Ok(()), // server holding the connection open for our request → accepted
+        Ok(Ok(0)) => {
+            Err("server closed the connection post-handshake (client-auth rejected)".into())
+        }
+        Ok(Ok(_)) => Ok(()), // server sent application/preface data → accepted
+        Ok(Err(e)) => Err(format!("post-handshake read failed (client-auth rejected): {e}").into()),
+    }
+}
+
 /// Live two-sided mTLS into the sidecar inbound listener (P1 keystone, Increment
 /// A — beyond #1525, which only asserts the listener *binds*). With a STRICT
-/// PeerAuthentication and the gateway SVID backing the inbound server identity,
-/// a real peer presenting a **shared-CA** client SVID must complete the inbound
-/// mTLS handshake, while a client with **no** certificate must be rejected at
-/// the handshake. This exercises the real sidecar↔sidecar mTLS identity path; the
-/// request→authz→backend leg (which needs real capture/routing) is covered by the
-/// kind `mesh-e2e-sidecar` workflow (Increment B).
+/// PeerAuthentication and the gateway SVID backing the inbound server identity:
+/// a real peer presenting a **shared-CA** client SVID completes the inbound mTLS
+/// handshake (and verifies the server SVID against the shared CA) and is accepted,
+/// while a client presenting **no** certificate is rejected by mTLS client-auth.
+/// The request→authz→backend leg (which needs real capture/routing) is covered by
+/// the kind `mesh-e2e-sidecar` workflow (Increment B). The spawn is retried with
+/// fresh ports per the `tests/**` bind-race rule; the mTLS assertions are not.
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_mode_strict_inbound_requires_peer_svid() {
     ensure_gateway_built().expect("gateway binary built");
 
-    let node_id = "functional-mesh-strict-mtls";
-    let temp = TempDir::new().expect("temp dir");
-    let peers = generate_mesh_peer_svids(
-        temp.path(),
-        "spiffe://cluster.local/ns/ferrum/sa/server",
-        "spiffe://cluster.local/ns/default/sa/client",
-    );
-    let cp = start_static_mesh_cp(strict_peer_auth_slice(node_id)).await;
-    let ports = reserve_mesh_ports().await;
-    let inbound_port = ports.inbound;
-    let mut child = spawn_mesh_gateway(
-        &temp,
-        MeshGatewaySpawnOptions {
-            cp_addr: cp.addr,
-            ports,
-            node_id,
-            config_protocol: "native",
-            topology: "sidecar",
-            waypoint_name: None,
-            env_overrides: vec![
-                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
-                (
-                    "FERRUM_GATEWAY_SVID_CERT_PATH",
-                    peers.server_cert_path.clone(),
-                ),
-                (
-                    "FERRUM_GATEWAY_SVID_KEY_PATH",
-                    peers.server_key_path.clone(),
-                ),
-                (
-                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
-                    peers.trust_bundle_path.clone(),
-                ),
-            ],
-        },
-    );
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-strict-mtls-{attempt}");
+        let temp = TempDir::new().expect("temp dir");
+        let peers = generate_mesh_peer_svids(
+            temp.path(),
+            "spiffe://cluster.local/ns/ferrum/sa/server",
+            "spiffe://cluster.local/ns/default/sa/client",
+        );
+        let cp = start_static_mesh_cp(strict_peer_auth_slice(&node_id)).await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
 
-    let listening = wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await;
-    let url = format!("https://127.0.0.1:{inbound_port}/");
+        if !wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await {
+            // Startup / port-bind flake — retry with fresh ports.
+            last_failure = format!(
+                "attempt {attempt}: inbound listener never bound\n{}",
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
 
-    // Peer presenting the shared-CA client SVID: the STRICT verifier accepts it,
-    // so the mTLS handshake completes (the HTTP outcome past TLS is irrelevant —
-    // routing-to-backend is the kind workflow's job).
-    let with_cert = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .identity(
-            reqwest::Identity::from_pem(
-                format!("{}\n{}", peers.client_cert_pem, peers.client_key_pem).as_bytes(),
-            )
-            .expect("client identity"),
+        // Listener is up — run the real mTLS assertions (these are not retried).
+        let with_cert = mesh_inbound_mtls_connect(
+            inbound_port,
+            &peers.ca_pem,
+            Some((&peers.client_cert_pem, &peers.client_key_pem)),
         )
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("with-cert client")
-        .get(&url)
-        .send()
         .await;
+        let no_cert = mesh_inbound_mtls_connect(inbound_port, &peers.ca_pem, None).await;
 
-    // No client certificate: STRICT must reject at the TLS handshake.
-    let no_cert = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("no-cert client")
-        .get(&url)
-        .send()
-        .await;
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
 
-    let output = captured_output(&temp);
-    kill_child(&mut child);
-    cp.shutdown().await;
+        assert!(
+            with_cert.is_ok(),
+            "a peer presenting a shared-CA SVID must complete the inbound mTLS handshake \
+             and be accepted by STRICT client-auth: {with_cert:?}\n{output}"
+        );
+        assert!(
+            no_cert.is_err(),
+            "STRICT inbound must reject a peer presenting no client certificate: \
+             {no_cert:?}\n{output}"
+        );
+        return;
+    }
 
-    assert!(
-        listening,
-        "production sidecar should bind its mTLS inbound listener\n{output}"
-    );
-    assert!(
-        no_cert.is_err(),
-        "STRICT inbound must reject a client presenting no certificate\n{output}"
-    );
-    assert!(
-        with_cert.is_ok()
-            || !with_cert
-                .as_ref()
-                .err()
-                .map(reqwest::Error::is_connect)
-                .unwrap_or(false),
-        "a peer presenting a shared-CA SVID must complete the inbound mTLS handshake \
-         (failed at connect): {with_cert:?}\n{output}"
+    panic!(
+        "production sidecar never bound its mTLS inbound listener after {RETRY_ATTEMPTS} attempts\n{last_failure}"
     );
 }
