@@ -2669,7 +2669,7 @@ async fn handle_h3_request(
     let raw_request_body_bytes = body_data.len() as u64;
 
     // Transform request body via plugins when buffering is active
-    let body_data = if needs_request_buffering
+    let mut body_data = if needs_request_buffering
         && !body_data.is_empty()
         && capabilities.has(crate::plugin_cache::PluginCapabilities::MODIFIES_REQUEST_BODY)
     {
@@ -2771,7 +2771,47 @@ async fn handle_h3_request(
         balancer.record_connection_start(target);
     }
 
-    if !needs_response_buffering {
+    let can_refine_h3_response_buffering = needs_response_buffering
+        && !has_retry
+        && matches!(
+            proxy.response_body_mode,
+            crate::config::types::ResponseBodyMode::Stream
+        )
+        && maybe_requires_response_body_buffering;
+    let mut refined_buffered_response = None;
+    let refined_streaming_response = if can_refine_h3_response_buffering {
+        let client_ip_for_refined = ctx.client_ip.clone();
+        let is_early_data = ctx.is_early_data;
+        match proxy_to_backend_h3_refined_response(
+            &state,
+            &proxy,
+            &backend_url,
+            &method,
+            &proxy_headers,
+            std::mem::take(&mut body_data),
+            &client_ip_for_refined,
+            upstream_target.as_deref(),
+            &epoch,
+            sticky_cookie_needed,
+            &mut stream,
+            &plugins,
+            &mut ctx,
+            &mut plugin_execution_ns,
+            is_early_data,
+        )
+        .await?
+        {
+            H3RefinedResponse::Streamed(result) => Some(result),
+            H3RefinedResponse::Buffered(result) => {
+                refined_buffered_response = Some(result);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if !needs_response_buffering || refined_streaming_response.is_some() {
         // ===== STREAMING RESPONSE PATH (buffered request body) =====
         // Response body is streamed, but request body was collected because
         // plugins needed it or it was prebuffered.
@@ -2783,30 +2823,34 @@ async fn handle_h3_request(
         // is the canonical `bytes_sent` value for the H3 buffered-request
         // path on both the streaming and buffered response branches.
         let request_body_bytes = raw_request_body_bytes;
-        let streaming_result = proxy_to_backend_h3_streaming(
-            &state,
-            &proxy,
-            &backend_url,
-            &method,
-            &proxy_headers,
-            body_data,
-            &client_ip_owned,
-            upstream_target.as_deref(),
-            &epoch,
-            sticky_cookie_needed,
-            &mut stream,
-            &plugins,
-            &mut ctx,
-            &mut plugin_execution_ns,
-        )
-        .await;
+        let h3_stream_result = if let Some(result) = refined_streaming_response {
+            result
+        } else {
+            let streaming_result = proxy_to_backend_h3_streaming(
+                &state,
+                &proxy,
+                &backend_url,
+                &method,
+                &proxy_headers,
+                body_data,
+                &client_ip_owned,
+                upstream_target.as_deref(),
+                &epoch,
+                sticky_cookie_needed,
+                &mut stream,
+                &plugins,
+                &mut ctx,
+                &mut plugin_execution_ns,
+            )
+            .await;
 
-        let h3_stream_result = match streaming_result {
-            Ok(result) => result,
-            Err(e) => {
-                // Stream may already have partial data sent — log and return
-                debug!("HTTP/3 streaming proxy error: {}", e);
-                return Err(e);
+            match streaming_result {
+                Ok(result) => result,
+                Err(e) => {
+                    // Stream may already have partial data sent — log and return
+                    debug!("HTTP/3 streaming proxy error: {}", e);
+                    return Err(e);
+                }
             }
         };
 
@@ -2962,7 +3006,17 @@ async fn handle_h3_request(
             h3_request_on_wire,
             final_cb_target_key,
             final_target,
-        ) = if let Some(retry_config) = &proxy.retry {
+        ) = if let Some(result) = refined_buffered_response {
+            (
+                result.status,
+                result.body,
+                result.headers,
+                result.error_class,
+                result.request_on_wire,
+                cb_target_key,
+                upstream_target.clone(),
+            )
+        } else if let Some(retry_config) = &proxy.retry {
             let mut attempt = 0u32;
             let mut current_target = upstream_target.clone();
             let mut current_cb_target_key = cb_target_key.clone();
@@ -3673,6 +3727,11 @@ struct H3StreamResult {
     request_on_wire: bool,
 }
 
+enum H3RefinedResponse {
+    Streamed(H3StreamResult),
+    Buffered(H3BufferedDispatchResult),
+}
+
 async fn run_h3_streaming_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -3684,6 +3743,465 @@ async fn run_h3_streaming_after_proxy_hooks(
     let reject = run_after_proxy_hooks(plugins, ctx, response_status, response_headers).await;
     *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     reject
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_h3_refined_response(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    body_bytes: Vec<u8>,
+    client_ip: &str,
+    upstream_target: Option<&UpstreamTarget>,
+    epoch: &crate::request_epoch::RequestEpoch,
+    sticky_cookie_needed: bool,
+    h3_stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    plugin_execution_ns: &mut u64,
+    is_early_data: bool,
+) -> Result<H3RefinedResponse, anyhow::Error> {
+    let h3_headers = build_h3_backend_headers(
+        proxy,
+        upstream_target,
+        headers,
+        client_ip,
+        state,
+        is_early_data,
+    );
+    let body = Bytes::from(body_bytes);
+    let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(proxy);
+
+    let streaming_resp = if let Some(target) = upstream_target {
+        state
+            .h3_pool
+            .request_with_target_streaming(
+                proxy,
+                &target.host,
+                target.port,
+                method,
+                backend_url,
+                &h3_headers,
+                body,
+                tls_config_fn,
+            )
+            .await
+    } else {
+        state
+            .h3_pool
+            .request_streaming(proxy, method, backend_url, &h3_headers, body, tls_config_fn)
+            .await
+    };
+
+    let h3_resp = match streaming_resp {
+        Ok(response) => response,
+        Err(error) => {
+            error!("Backend request failed (HTTP/3 refined): {}", error);
+            let request_on_wire = error.request_on_wire();
+            let h3_error_class = classify_h3_error(&error);
+            crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
+            if crate::proxy::is_h3_transport_error_class(h3_error_class) {
+                state
+                    .backend_capabilities
+                    .mark_h3_unsupported(proxy, upstream_target);
+            }
+            send_h3_response(
+                h3_stream,
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":"Backend unavailable"}"#,
+            )
+            .await?;
+            return Ok(H3RefinedResponse::Streamed(H3StreamResult {
+                status: 502,
+                backend_status: 502,
+                error_class: Some(h3_error_class),
+                body_completed: false,
+                bytes_streamed: 0,
+                client_disconnected: false,
+                body_error_class: None,
+                request_on_wire,
+            }));
+        }
+    };
+
+    let response_status = h3_resp.status;
+    let mut response_headers = h3_resp.headers;
+    response_headers.retain(|name, _| !is_backend_response_strip_header(name));
+
+    if crate::proxy::refine_stream_response_for_content_type(
+        false,
+        proxy,
+        plugins,
+        Some(ctx),
+        &response_headers,
+    ) {
+        let result = stream_h3_open_response_to_client(
+            state,
+            proxy,
+            method,
+            response_status,
+            response_headers,
+            h3_resp.recv_stream,
+            epoch,
+            upstream_target,
+            sticky_cookie_needed,
+            h3_stream,
+            plugins,
+            ctx,
+            plugin_execution_ns,
+        )
+        .await?;
+        return Ok(H3RefinedResponse::Streamed(result));
+    }
+
+    Ok(H3RefinedResponse::Buffered(
+        collect_h3_open_response_body(
+            state,
+            proxy,
+            method,
+            response_status,
+            response_headers,
+            h3_resp.recv_stream,
+            upstream_target,
+        )
+        .await,
+    ))
+}
+
+async fn collect_h3_open_response_body(
+    state: &ProxyState,
+    proxy: &Proxy,
+    method: &str,
+    response_status: u16,
+    response_headers: HashMap<String, String>,
+    mut recv_stream: crate::http3::client::H3RequestStream,
+    upstream_target: Option<&UpstreamTarget>,
+) -> H3BufferedDispatchResult {
+    let content_length = response_headers
+        .get("content-length")
+        .and_then(|value| value.parse::<u64>().ok());
+    if state.max_response_body_size_bytes > 0
+        && content_length.is_some_and(|len| len > state.max_response_body_size_bytes as u64)
+    {
+        return H3BufferedDispatchResult {
+            status: 502,
+            body: br#"{"error":"Backend response body exceeds maximum size"}"#.to_vec(),
+            headers: HashMap::new(),
+            error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+            request_on_wire: true,
+        };
+    }
+
+    let mut response_body = Vec::new();
+    loop {
+        match recv_stream.recv_data().await {
+            Ok(Some(mut chunk)) => {
+                let chunk_bytes = crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                if state.max_response_body_size_bytes > 0
+                    && response_body.len() + chunk_bytes.len() > state.max_response_body_size_bytes
+                {
+                    return H3BufferedDispatchResult {
+                        status: 502,
+                        body: br#"{"error":"Backend response body exceeds maximum size"}"#.to_vec(),
+                        headers: HashMap::new(),
+                        error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+                        request_on_wire: true,
+                    };
+                }
+                response_body.extend_from_slice(&chunk_bytes);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                let received = response_body.len() as u64;
+                if crate::http3::client::is_h3_graceful_close(&error)
+                    && crate::http3::client::is_response_body_complete(
+                        received,
+                        method,
+                        response_status,
+                        content_length,
+                    )
+                {
+                    break;
+                }
+
+                error!(
+                    "Error reading backend h3 response during refined buffering: {}",
+                    error
+                );
+                let h3_error_class = crate::http3::client::classify_http3_error(&error);
+                crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
+                if crate::proxy::is_h3_transport_error_class(h3_error_class) {
+                    state
+                        .backend_capabilities
+                        .mark_h3_unsupported(proxy, upstream_target);
+                }
+                return H3BufferedDispatchResult {
+                    status: 502,
+                    body: br#"{"error":"Backend unavailable"}"#.to_vec(),
+                    headers: HashMap::new(),
+                    error_class: Some(h3_error_class),
+                    request_on_wire: true,
+                };
+            }
+        }
+    }
+
+    H3BufferedDispatchResult {
+        status: response_status,
+        body: response_body,
+        headers: response_headers,
+        error_class: None,
+        request_on_wire: true,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_h3_open_response_to_client(
+    state: &ProxyState,
+    proxy: &Proxy,
+    method: &str,
+    response_status: u16,
+    mut response_headers: HashMap<String, String>,
+    mut recv_stream: crate::http3::client::H3RequestStream,
+    epoch: &crate::request_epoch::RequestEpoch,
+    upstream_target: Option<&UpstreamTarget>,
+    sticky_cookie_needed: bool,
+    h3_stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    plugin_execution_ns: &mut u64,
+) -> Result<H3StreamResult, anyhow::Error> {
+    if state.max_response_body_size_bytes > 0
+        && let Some(len) = response_headers
+            .get("content-length")
+            .and_then(|v| v.parse::<usize>().ok())
+        && len > state.max_response_body_size_bytes
+    {
+        let size_reject_sent = send_h3_response(
+            h3_stream,
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Backend response body exceeds maximum size"}"#,
+        )
+        .await
+        .is_ok();
+        return Ok(H3StreamResult {
+            status: 502,
+            backend_status: response_status,
+            error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+            body_completed: false,
+            bytes_streamed: 0,
+            client_disconnected: !size_reject_sent,
+            body_error_class: None,
+            request_on_wire: true,
+        });
+    }
+
+    if let Some(reject) = run_h3_streaming_after_proxy_hooks(
+        plugins,
+        ctx,
+        response_status,
+        &mut response_headers,
+        plugin_execution_ns,
+    )
+    .await
+    {
+        let reject_status =
+            StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+        let reject_sent =
+            send_h3_reject_response(h3_stream, reject_status, &reject.body, &reject.headers)
+                .await
+                .is_ok();
+        return Ok(H3StreamResult {
+            status: reject.status_code,
+            backend_status: response_status,
+            error_class: None,
+            body_completed: reject_sent,
+            bytes_streamed: if reject_sent {
+                reject.body.len() as u64
+            } else {
+                0
+            },
+            client_disconnected: !reject_sent,
+            body_error_class: if reject_sent {
+                None
+            } else {
+                Some(crate::retry::ErrorClass::ClientDisconnect)
+            },
+            request_on_wire: true,
+        });
+    }
+
+    inject_sticky_cookie(
+        epoch,
+        proxy,
+        upstream_target,
+        sticky_cookie_needed,
+        &mut response_headers,
+    );
+
+    let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut resp_builder =
+        apply_response_headers(Response::builder().status(status), &response_headers);
+    if !response_headers.contains_key("content-type") {
+        resp_builder = resp_builder.header("content-type", "application/json");
+    }
+    let resp = resp_builder
+        .body(())
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
+    if h3_stream.send_response(resp).await.is_err() {
+        return Ok(H3StreamResult {
+            status: response_status,
+            backend_status: response_status,
+            error_class: None,
+            body_completed: false,
+            bytes_streamed: 0,
+            client_disconnected: true,
+            body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
+            request_on_wire: true,
+        });
+    }
+
+    let coalesce_min_bytes = state.env_config.http3_coalesce_min_bytes;
+    let coalesce_max_bytes = state.env_config.http3_coalesce_max_bytes;
+    let flush_interval =
+        std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros);
+    let mut coalesce_buf = BytesMut::with_capacity(coalesce_max_bytes);
+    let mut total_streamed: usize = 0;
+    let flush_timer = tokio::time::sleep(flush_interval);
+    tokio::pin!(flush_timer);
+    let mut stream_done = false;
+    let mut bytes_streamed: u64 = 0;
+    let mut client_disconnected = false;
+    let mut body_completed = false;
+    let mut body_error_class: Option<crate::retry::ErrorClass> = None;
+    let mut terminal_error_class: Option<crate::retry::ErrorClass> = None;
+
+    'outer: loop {
+        tokio::select! {
+            chunk_result = recv_stream.recv_data(), if !stream_done => {
+                match chunk_result {
+                    Ok(Some(mut chunk)) => {
+                        let chunk_len = chunk.remaining();
+                        total_streamed += chunk_len;
+                        if state.max_response_body_size_bytes > 0
+                            && total_streamed > state.max_response_body_size_bytes
+                        {
+                            let _ = h3_stream.finish().await;
+                            terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                            body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                            break 'outer;
+                        }
+                        if crate::http3::config::should_direct_send_response_chunk(
+                            coalesce_buf.len(),
+                            chunk_len,
+                            coalesce_min_bytes,
+                        ) {
+                            let data =
+                                crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                            if h3_stream.send_data(data).await.is_err() {
+                                client_disconnected = true;
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                                break 'outer;
+                            }
+                            bytes_streamed += chunk_len as u64;
+                            flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
+                            continue;
+                        }
+
+                        let chunk_bytes =
+                            crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                        coalesce_buf.extend_from_slice(&chunk_bytes);
+                        if coalesce_buf.len() >= coalesce_min_bytes {
+                            let data = coalesce_buf.split().freeze();
+                            let data_len = data.len() as u64;
+                            if h3_stream.send_data(data).await.is_err() {
+                                client_disconnected = true;
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                                break 'outer;
+                            }
+                            bytes_streamed += data_len;
+                            flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
+                        }
+                    }
+                    Ok(None) => stream_done = true,
+                    Err(error) => {
+                        let content_length = response_headers
+                            .get("content-length")
+                            .and_then(|v| v.parse::<u64>().ok());
+                        let received = total_streamed as u64;
+                        if crate::http3::client::is_h3_graceful_close(&error)
+                            && crate::http3::client::is_response_body_complete(
+                                received,
+                                method,
+                                response_status,
+                                content_length,
+                            )
+                        {
+                            stream_done = true;
+                        } else {
+                            error!("Error reading backend h3 response during refined streaming: {}", error);
+                            if !coalesce_buf.is_empty() {
+                                let data = coalesce_buf.split().freeze();
+                                let data_len = data.len() as u64;
+                                if h3_stream.send_data(data).await.is_ok() {
+                                    bytes_streamed += data_len;
+                                }
+                            }
+                            let _ = h3_stream.finish().await;
+                            let class = crate::http3::client::classify_http3_error(&error);
+                            terminal_error_class = Some(class);
+                            body_error_class = Some(class);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
+                let data = coalesce_buf.split().freeze();
+                let data_len = data.len() as u64;
+                if h3_stream.send_data(data).await.is_err() {
+                    client_disconnected = true;
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    break 'outer;
+                }
+                bytes_streamed += data_len;
+                flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
+            }
+        }
+        if stream_done {
+            if !coalesce_buf.is_empty() {
+                let data = coalesce_buf.split().freeze();
+                let data_len = data.len() as u64;
+                if h3_stream.send_data(data).await.is_err() {
+                    client_disconnected = true;
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    break 'outer;
+                }
+                bytes_streamed += data_len;
+            }
+            match h3_stream.finish().await {
+                Ok(_) => body_completed = true,
+                Err(_) => {
+                    client_disconnected = true;
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                }
+            }
+            break;
+        }
+    }
+
+    Ok(H3StreamResult {
+        status: response_status,
+        backend_status: response_status,
+        error_class: terminal_error_class,
+        body_completed,
+        bytes_streamed,
+        client_disconnected,
+        body_error_class,
+        request_on_wire: true,
+    })
 }
 
 /// Streaming proxy path: sends backend response chunks directly to the H3 client

@@ -4,7 +4,8 @@ use ferrum_edge::config::{BackendAllowIps, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext,
-    ai_semantic_firewall::AiSemanticFirewall, create_plugin, priority,
+    ai_semantic_firewall::AiSemanticFirewall, create_plugin, create_plugin_with_http_client,
+    priority,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -162,6 +163,11 @@ fn invalid_configs_are_rejected() {
         }),
         json!({
             "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+            "builtins": disabled_builtins(),
+            "deny_topics": [{"id": "bad", "examples": ["blocked topic"], "action": "allow"}]
+        }),
+        json!({
+            "provider": provider("http://127.0.0.1:9/v1/embeddings"),
             "builtins": {"prompt_injection": true},
             "custom_rules": [{"id": "prompt_injection", "examples": ["x"]}]
         }),
@@ -198,6 +204,49 @@ fn invalid_configs_are_rejected() {
         let result = AiSemanticFirewall::new(&config, PluginHttpClient::default());
         assert!(result.is_err(), "config should be rejected: {config:?}");
     }
+}
+
+#[test]
+fn factory_validation_uses_supplied_http_client_endpoint_policy() {
+    let mut config = config_with_builtin("prompt_injection");
+    config["provider"] = provider("http://169.254.169.254/v1/embeddings");
+
+    let result = create_plugin_with_http_client(
+        "ai_semantic_firewall",
+        &config,
+        plugin_http_client_with_ip_policy(BackendAllowIps::Public),
+    );
+
+    let Err(error) = result else {
+        panic!("plugin factory should reject provider endpoint denied by supplied policy");
+    };
+    assert!(
+        error.contains("denied by FERRUM_BACKEND_ALLOW_IPS=public policy"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn deny_topics_reject_allow_action() {
+    let config = json!({
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins(),
+        "deny_topics": [{
+            "id": "no-legal-advice",
+            "examples": ["Tell me whether this contract clause is enforceable."],
+            "action": "allow"
+        }]
+    });
+
+    let result = AiSemanticFirewall::new(&config, PluginHttpClient::default());
+
+    let Err(error) = result else {
+        panic!("deny_topics action=allow should be rejected");
+    };
+    assert_eq!(
+        error,
+        "ai_semantic_firewall: deny_topics[0].action must be 'reject' or 'warn', got \"allow\""
+    );
 }
 
 #[test]

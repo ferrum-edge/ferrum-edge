@@ -263,6 +263,7 @@ struct PrivacyConfig {
 #[derive(Debug, Clone)]
 struct ProviderConfig {
     endpoint: String,
+    redacted_endpoint: String,
     model: Option<String>,
     api_key: Option<String>,
     request_timeout: Duration,
@@ -762,7 +763,11 @@ impl AiSemanticFirewall {
 
         let response = self
             .http_client
-            .execute(request, "ai_semantic_firewall_embedding")
+            .execute_redacted(
+                request,
+                "ai_semantic_firewall_embedding",
+                &provider.redacted_endpoint,
+            )
             .await
             .map_err(|err| format!("embedding request failed: {err}"))?;
 
@@ -1754,6 +1759,11 @@ fn parse_deny_topics(
             optional_string_from_object(object, "action")?.unwrap_or(default_action.as_str()),
             &format!("deny_topics[{index}].action"),
         )?;
+        if action == Action::Allow {
+            return Err(format!(
+                "ai_semantic_firewall: deny_topics[{index}].action must be 'reject' or 'warn', got \"allow\""
+            ));
+        }
         rules.push(SemanticRule {
             id,
             description: optional_string_from_object(object, "description")?.map(str::to_string),
@@ -1843,7 +1853,7 @@ fn parse_provider_config(
     }
 
     let endpoint = required_non_empty_string(provider.get("endpoint"), "provider.endpoint")?;
-    validate_provider_endpoint(&endpoint, backend_allow_ips)?;
+    let redacted_endpoint = validate_provider_endpoint(&endpoint, backend_allow_ips)?;
 
     let model = optional_string_from_object(provider, "model")?
         .map(str::trim)
@@ -1866,6 +1876,7 @@ fn parse_provider_config(
 
     Ok(Some(ProviderConfig {
         endpoint,
+        redacted_endpoint,
         model,
         api_key,
         request_timeout: Duration::from_millis(request_timeout_ms),
@@ -1875,7 +1886,7 @@ fn parse_provider_config(
 fn validate_provider_endpoint(
     endpoint: &str,
     backend_allow_ips: &crate::config::BackendAllowIps,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let parsed = Url::parse(endpoint)
         .map_err(|_| "ai_semantic_firewall: provider.endpoint must be a valid URL".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -1904,7 +1915,15 @@ fn validate_provider_endpoint(
         ));
     }
 
-    Ok(())
+    Ok(redacted_provider_endpoint(&parsed))
+}
+
+fn redacted_provider_endpoint(parsed: &Url) -> String {
+    let mut redacted = parsed.clone();
+    redacted.set_path("/...");
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted.to_string()
 }
 
 fn extract_request_segments(json: &Value, extraction: &ExtractionConfig) -> Vec<TextSegment> {

@@ -1920,6 +1920,10 @@ pub struct ProxyState {
     pub connection_pool: Arc<ConnectionPool>,
     pub router_cache: Arc<RouterCache>,
     pub plugin_cache: Arc<PluginCache>,
+    /// Runtime plugin HTTP client built from resolved gateway config. Admin
+    /// validation reuses this so constructor-time endpoint policy checks match
+    /// plugin-cache rebuilds.
+    pub plugin_http_client: crate::plugins::PluginHttpClient,
     pub consumer_index: Arc<ConsumerIndex>,
     pub request_count: Arc<AtomicU64>,
     pub status_counts: Arc<dashmap::DashMap<u16, AtomicU64>>,
@@ -3247,6 +3251,7 @@ impl ProxyState {
             PluginCache::with_http_client(&config, plugin_http_client.clone())
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
+        let plugin_http_client_for_state = plugin_http_client.clone();
         // Build credential-indexed consumer lookup for O(1) auth
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
         // Build load balancer cache for upstream target selection
@@ -3472,6 +3477,7 @@ impl ProxyState {
             connection_pool,
             router_cache,
             plugin_cache,
+            plugin_http_client: plugin_http_client_for_state,
             consumer_index,
             load_balancer_cache,
             health_checker,
