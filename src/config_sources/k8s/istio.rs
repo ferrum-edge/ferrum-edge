@@ -2281,6 +2281,23 @@ fn l4_route_destination(
 /// `match.port` selects the listen port (falling back to the destination port
 /// when omitted). Unsupported match predicates (source-identity / CIDR /
 /// gateways) and weighted splitting fail closed via the helpers above.
+
+fn virtual_service_l4_proxy_id(
+    route_kind: &str,
+    namespace: &str,
+    vs_name: &str,
+    block_index: usize,
+    match_index: usize,
+) -> String {
+    // Keep the reconciler-managed `istio-vs-` prefix while reserving an
+    // underscore-delimited L4 namespace. Kubernetes object names cannot contain
+    // underscores, and the generated numeric suffix does not either, so HTTP
+    // VirtualService IDs built as `istio-vs-<namespace>-<name>-<suffix>` cannot
+    // collide with L4 IDs for hyphenated names such as `foo-tls`.
+    format!("istio-vs-l4_{route_kind}__{namespace}__{vs_name}__{block_index}-{match_index}")
+        .replace(['/', '.'], "-")
+}
+
 fn virtual_service_l4_proxies(
     object: &K8sObject,
     acc: &K8sAccumulator,
@@ -2314,7 +2331,7 @@ fn virtual_service_l4_proxies(
                 let listen_port = optional_port_field(object, m.get("port"), "tls[].match.port")?
                     .unwrap_or(backend_port);
                 let mut proxy = super::proxy_for_route(super::RouteProxySpec {
-                    id: resource_id("istio-vs", namespace, vs_name, &format!("tls-{bi}-{mi}")),
+                    id: virtual_service_l4_proxy_id("tls", namespace, vs_name, bi, mi),
                     namespace: namespace.clone(),
                     hosts: sni_hosts,
                     listen_path: None,
@@ -2358,7 +2375,7 @@ fn virtual_service_l4_proxies(
             };
             for (mi, port) in listen_ports.into_iter().enumerate() {
                 let proxy = super::proxy_for_route(super::RouteProxySpec {
-                    id: resource_id("istio-vs", namespace, vs_name, &format!("tcp-{bi}-{mi}")),
+                    id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, mi),
                     namespace: namespace.clone(),
                     hosts: Vec::new(),
                     listen_path: None,
@@ -8162,6 +8179,67 @@ extensionProviders:
         assert!(
             format!("{err:?}").contains("non-empty match"),
             "expected a non-empty-match rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_l4_proxy_ids_do_not_collide_with_http_route_ids() {
+        let http_vs = object_with_metadata(
+            "VirtualService",
+            "networking.istio.io/v1",
+            "foo-tls",
+            "default",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [
+                        {"uri": {"prefix": "/v1"}},
+                        {"uri": {"prefix": "/v2"}}
+                    ],
+                    "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }]
+            }),
+        );
+        let tls_vs = object_with_metadata(
+            "VirtualService",
+            "networking.istio.io/v1",
+            "foo",
+            "default",
+            serde_json::json!({
+                "hosts": ["secure.example.com"],
+                "tls": [{
+                    "match": [{"sniHosts": ["secure.example.com"], "port": 8443}],
+                    "route": [{"destination": {"host": "secure.default.svc.cluster.local", "port": {"number": 443}}}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[http_vs, tls_vs], options())
+            .expect("HTTP and L4 VirtualServices translate without generated-ID shadowing");
+        let ids: Vec<&str> = result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.id.as_str())
+            .collect();
+
+        assert!(
+            ids.contains(&"istio-vs-default-foo-tls-0-0"),
+            "HTTP route keeps its historical generated ID, got {ids:?}"
+        );
+        let l4_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_port == Some(8443))
+            .expect("TLS stream proxy must materialize instead of being shadowed");
+        assert_eq!(l4_proxy.backend_host, "secure.default.svc.cluster.local");
+        assert!(
+            l4_proxy
+                .id
+                .starts_with("istio-vs-l4_tls__default__foo__0-0"),
+            "L4 proxy must use a boundary-safe ID namespace, got {}",
+            l4_proxy.id
         );
     }
 
