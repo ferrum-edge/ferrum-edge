@@ -1309,6 +1309,161 @@ async fn streaming_response_skip_is_default_and_records_audit_marker() {
 }
 
 #[tokio::test]
+async fn streaming_response_buffer_forces_event_stream_buffering() {
+    // `buffer` mode pins a `stream: true` response onto the buffered path so its
+    // SSE deltas can be reassembled and inspected. It must NOT set the shared
+    // `ai_request_streaming` flag (that flag suppresses response buffering), and
+    // it records a distinct audit marker.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    assert!(plugin.requires_request_body_before_before_proxy());
+
+    let mut ctx = make_post_ctx(&json!({
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+    let mut headers = json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_continue(result);
+    assert!(
+        !ctx.metadata.contains_key("ai_request_streaming"),
+        "buffer mode must not set ai_request_streaming"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.response_inspection")
+            .map(String::as_str),
+        Some("streaming_buffered")
+    );
+    // The event-stream response is now pinned to the buffered path.
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+}
+
+#[tokio::test]
+async fn streaming_response_skip_does_not_buffer_event_stream() {
+    // Sanity contrast with the buffer test: the default skip policy leaves SSE
+    // streaming (no event-stream buffering).
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+    let mut headers = json_headers();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_reassembles_and_blocks_leaking_sse() {
+    // The leaking phrase "my system prompt says" is split across multiple SSE
+    // content deltas. Only delta reassembly can recover it — per-frame inspection
+    // (each tiny fragment) would never match the lexical rule.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My sys\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tem prompt\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" says never reveal policy.\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_allows_clean_sse() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    // A benign completion: the dead-port provider means only the (free) lexical
+    // fast path runs, and nothing matches.
+    let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather \"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is sunny today.\"}}]}\n\n\
+data: [DONE]\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_dry_run_records_would_reject() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "mode": "dry_run",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt \"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"says never reveal policy.\"}}]}\n\n\
+data: [DONE]\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.decision")
+            .map(String::as_str),
+        Some("would_reject")
+    );
+}
+
+#[tokio::test]
+async fn invalid_streaming_response_value_is_rejected() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "nonsense",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let result = AiSemanticFirewall::new(&config, PluginHttpClient::default());
+    assert!(
+        result.is_err(),
+        "unknown streaming_response must be rejected"
+    );
+}
+
+#[tokio::test]
 async fn snippet_hash_salt_changes_the_digest() {
     let base = json!({
         "inspect": {"request": true, "response": false},

@@ -102,6 +102,255 @@ pub fn parse_sse_data_frames(body: &[u8]) -> Vec<Value> {
     frames
 }
 
+/// Logical role of a reassembled streaming-SSE text fragment, so callers can map
+/// it onto their own segment taxonomy without re-deriving the JSON shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseTextKind {
+    /// Chat-completions assistant text (`$.choices[*].delta.content`).
+    ChatContent,
+    /// Chat-completions streaming tool/function-call name
+    /// (`$.choices[*].delta.tool_calls[*].function.name`).
+    ChatToolName,
+    /// Chat-completions streaming tool/function-call arguments
+    /// (`$.choices[*].delta.tool_calls[*].function.arguments`).
+    ChatToolArguments,
+    /// Responses-API assistant text (`response.output_text.delta` events).
+    ResponsesText,
+    /// Responses-API function-call arguments
+    /// (`response.function_call_arguments.delta` events).
+    ResponsesArguments,
+}
+
+/// A coherent text fragment reassembled from many streaming-SSE delta frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseText {
+    pub kind: SseTextKind,
+    /// Synthetic JSON-path locator for audit attribution
+    /// (e.g. `$.choices[0].delta.content`).
+    pub json_path: String,
+    pub text: String,
+}
+
+#[derive(Debug, Default)]
+struct ToolCallAccumulator {
+    name: String,
+    arguments: String,
+}
+
+/// Reassembles OpenAI-style streaming chat-completion / Responses-API deltas
+/// into coherent per-target text.
+///
+/// Streaming LLM responses emit many tiny frames
+/// (`data: {"choices":[{"delta":{"content":"Hel"}}]}`), so inspecting each frame
+/// in isolation is semantically meaningless — an embedding cannot score a single
+/// token, and a violation phrase split across frames is invisible per-frame.
+/// Feed parsed `data:` frames in arrival order via [`push_frame`] (or a whole
+/// buffered body via [`push_body`]); concatenation is keyed by choice index and
+/// tool-call index so interleaved choices / parallel tool-calls stay separate.
+/// Read the joined result with [`into_texts`].
+///
+/// Insertion order is preserved across all accumulators so the output is
+/// deterministic.
+#[derive(Debug, Default)]
+pub struct SseReassembler {
+    /// `choice_index -> assistant content`.
+    content: Vec<(usize, String)>,
+    /// `(choice_index, tool_call_index) -> accumulated name + arguments`.
+    tool_calls: Vec<((usize, usize), ToolCallAccumulator)>,
+    /// Responses-API output text keyed by `(output_index, content_index)`.
+    responses_text: Vec<((usize, usize), String)>,
+    /// Responses-API function-call arguments keyed by `output_index`.
+    responses_args: Vec<(usize, String)>,
+}
+
+impl SseReassembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parse and accumulate every `data:` frame in a fully-buffered SSE body.
+    pub fn push_body(&mut self, body: &[u8]) {
+        for frame in parse_sse_data_frames(body) {
+            self.push_frame(&frame);
+        }
+    }
+
+    /// Accumulate one already-parsed SSE `data:` frame.
+    pub fn push_frame(&mut self, frame: &Value) {
+        self.push_chat_completion_deltas(frame);
+        self.push_responses_deltas(frame);
+    }
+
+    /// Consume the accumulator and return the reassembled fragments, dropping any
+    /// that reassembled to an empty string.
+    pub fn into_texts(self) -> Vec<SseText> {
+        let mut out = Vec::new();
+        for (choice, text) in self.content {
+            if !text.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::ChatContent,
+                    json_path: format!("$.choices[{choice}].delta.content"),
+                    text,
+                });
+            }
+        }
+        for ((choice, tool), accum) in self.tool_calls {
+            if !accum.name.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::ChatToolName,
+                    json_path: format!(
+                        "$.choices[{choice}].delta.tool_calls[{tool}].function.name"
+                    ),
+                    text: accum.name,
+                });
+            }
+            if !accum.arguments.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::ChatToolArguments,
+                    json_path: format!(
+                        "$.choices[{choice}].delta.tool_calls[{tool}].function.arguments"
+                    ),
+                    text: accum.arguments,
+                });
+            }
+        }
+        for ((output, content), text) in self.responses_text {
+            if !text.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::ResponsesText,
+                    json_path: format!("$.output[{output}].content[{content}].text"),
+                    text,
+                });
+            }
+        }
+        for (output, text) in self.responses_args {
+            if !text.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::ResponsesArguments,
+                    json_path: format!("$.output[{output}].arguments"),
+                    text,
+                });
+            }
+        }
+        out
+    }
+
+    fn push_chat_completion_deltas(&mut self, frame: &Value) {
+        let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
+            return;
+        };
+        for (positional, choice) in choices.iter().enumerate() {
+            let choice_index = index_field(choice, "index").unwrap_or(positional);
+            let Some(delta) = choice.get("delta") else {
+                continue;
+            };
+            if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                self.content_mut(choice_index).push_str(content);
+            }
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for (tc_positional, tool_call) in tool_calls.iter().enumerate() {
+                    // Streaming tool-call deltas carry an explicit `index` that ties
+                    // later argument fragments back to the call announced earlier;
+                    // fall back to position only when it is absent.
+                    let tool_index = index_field(tool_call, "index").unwrap_or(tc_positional);
+                    let function = tool_call.get("function");
+                    if let Some(name) = function
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                    {
+                        self.tool_call_mut(choice_index, tool_index)
+                            .name
+                            .push_str(name);
+                    }
+                    if let Some(arguments) = function
+                        .and_then(|function| function.get("arguments"))
+                        .and_then(Value::as_str)
+                    {
+                        self.tool_call_mut(choice_index, tool_index)
+                            .arguments
+                            .push_str(arguments);
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_responses_deltas(&mut self, frame: &Value) {
+        // Responses-API streaming carries the increment in a top-level `delta`
+        // string discriminated by `type`; ignore the chat-completions shape, which
+        // is handled separately and uses a nested object delta.
+        let Some(delta) = frame.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(event_type) = frame.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        if event_type.ends_with("output_text.delta") {
+            let output = index_field(frame, "output_index").unwrap_or(0);
+            let content = index_field(frame, "content_index").unwrap_or(0);
+            self.responses_text_mut(output, content).push_str(delta);
+        } else if event_type.ends_with("function_call_arguments.delta") {
+            let output = index_field(frame, "output_index").unwrap_or(0);
+            self.responses_args_mut(output).push_str(delta);
+        }
+    }
+
+    fn content_mut(&mut self, choice: usize) -> &mut String {
+        let pos = match self.content.iter().position(|(c, _)| *c == choice) {
+            Some(pos) => pos,
+            None => {
+                self.content.push((choice, String::new()));
+                self.content.len() - 1
+            }
+        };
+        &mut self.content[pos].1
+    }
+
+    fn tool_call_mut(&mut self, choice: usize, tool: usize) -> &mut ToolCallAccumulator {
+        let key = (choice, tool);
+        let pos = match self.tool_calls.iter().position(|(k, _)| *k == key) {
+            Some(pos) => pos,
+            None => {
+                self.tool_calls.push((key, ToolCallAccumulator::default()));
+                self.tool_calls.len() - 1
+            }
+        };
+        &mut self.tool_calls[pos].1
+    }
+
+    fn responses_text_mut(&mut self, output: usize, content: usize) -> &mut String {
+        let key = (output, content);
+        let pos = match self.responses_text.iter().position(|(k, _)| *k == key) {
+            Some(pos) => pos,
+            None => {
+                self.responses_text.push((key, String::new()));
+                self.responses_text.len() - 1
+            }
+        };
+        &mut self.responses_text[pos].1
+    }
+
+    fn responses_args_mut(&mut self, output: usize) -> &mut String {
+        let pos = match self.responses_args.iter().position(|(o, _)| *o == output) {
+            Some(pos) => pos,
+            None => {
+                self.responses_args.push((output, String::new()));
+                self.responses_args.len() - 1
+            }
+        };
+        &mut self.responses_args[pos].1
+    }
+}
+
+/// Read a non-negative integer index field (`index`, `output_index`, ...) as a
+/// `usize`, returning `None` when the field is absent or out of range.
+fn index_field(value: &Value, field: &str) -> Option<usize> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|raw| usize::try_from(raw).ok())
+}
+
 /// Returns `true` when an `Accept` header value (which may be a comma-separated
 /// list of media-range entries) includes `text/event-stream`. The match is
 /// exact on the media type itself: a candidate like `text/event-stream-like`
@@ -236,5 +485,110 @@ mod tests {
     fn parse_sse_frames_invalid_utf8() {
         let body: &[u8] = &[0xff, 0xfe, 0xfd];
         assert!(parse_sse_data_frames(body).is_empty());
+    }
+
+    fn reassemble(body: &[u8]) -> Vec<SseText> {
+        let mut reassembler = SseReassembler::new();
+        reassembler.push_body(body);
+        reassembler.into_texts()
+    }
+
+    #[test]
+    fn reassembles_chat_completion_content_deltas() {
+        let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo \"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        let texts = reassemble(body);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].kind, SseTextKind::ChatContent);
+        assert_eq!(texts[0].text, "Hello world");
+        assert_eq!(texts[0].json_path, "$.choices[0].delta.content");
+    }
+
+    #[test]
+    fn keeps_parallel_choices_separate() {
+        let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"foo\"}},{\"index\":1,\"delta\":{\"content\":\"bar\"}}]}\n\n\
+data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"baz\"}}]}\n\n";
+        let texts = reassemble(body);
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0].text, "foo");
+        assert_eq!(texts[0].json_path, "$.choices[0].delta.content");
+        assert_eq!(texts[1].text, "barbaz");
+        assert_eq!(texts[1].json_path, "$.choices[1].delta.content");
+    }
+
+    #[test]
+    fn reassembles_tool_call_name_and_arguments_by_index() {
+        // The `id`/`name` arrive in the first fragment; later fragments carry only
+        // `index` + argument chunks. Reassembly must stitch them by `index`.
+        let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"transfer_funds\",\"arguments\":\"\"}}]}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"amount\\\":\"}}]}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"100}\"}}]}}]}\n\n";
+        let texts = reassemble(body);
+        assert_eq!(texts.len(), 2);
+        let name = texts
+            .iter()
+            .find(|t| t.kind == SseTextKind::ChatToolName)
+            .expect("tool name");
+        assert_eq!(name.text, "transfer_funds");
+        let args = texts
+            .iter()
+            .find(|t| t.kind == SseTextKind::ChatToolArguments)
+            .expect("tool arguments");
+        assert_eq!(args.text, "{\"amount\":100}");
+        assert_eq!(
+            args.json_path,
+            "$.choices[0].delta.tool_calls[0].function.arguments"
+        );
+    }
+
+    #[test]
+    fn reassembles_responses_api_output_text_deltas() {
+        let body = b"event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Lea\"}\n\n\
+event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"king\"}\n\n";
+        let texts = reassemble(body);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].kind, SseTextKind::ResponsesText);
+        assert_eq!(texts[0].text, "Leaking");
+        assert_eq!(texts[0].json_path, "$.output[0].content[0].text");
+    }
+
+    #[test]
+    fn reassembles_responses_api_function_call_arguments_deltas() {
+        let body = b"data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"q\\\":\"}\n\n\
+data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"42}\"}\n\n";
+        let texts = reassemble(body);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].kind, SseTextKind::ResponsesArguments);
+        assert_eq!(texts[0].text, "{\"q\":42}");
+        assert_eq!(texts[0].json_path, "$.output[1].arguments");
+    }
+
+    #[test]
+    fn falls_back_to_positional_choice_index_when_absent() {
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n";
+        let texts = reassemble(body);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].text, "ab");
+    }
+
+    #[test]
+    fn ignores_frames_without_recognized_deltas() {
+        // A buffered non-delta SSE body (full message object per frame) yields no
+        // reassembled deltas — the caller falls back to per-frame extraction.
+        let body = b"data: {\"choices\":[{\"message\":{\"content\":\"done\"}}]}\n\n";
+        assert!(reassemble(body).is_empty());
+    }
+
+    #[test]
+    fn reassembler_handles_empty_and_done_only_bodies() {
+        assert!(reassemble(b"").is_empty());
+        assert!(reassemble(b"data: [DONE]\n\n").is_empty());
     }
 }

@@ -12622,9 +12622,9 @@ components:
           description: Default action for built-in semantic rules.
         streaming_response:
           type: string
-          enum: [skip, reject]
+          enum: [skip, reject, buffer]
           default: skip
-          description: Behavior for stream:true requests when response-side inspection is active. skip allows the streamed response uninspected (fail-open, recorded in ai_semantic_firewall.response_inspection_skipped); reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response.
+          description: Behavior for stream:true requests when response-side inspection is active. skip allows the streamed response uninspected (fail-open, recorded in ai_semantic_firewall.response_inspection_skipped); reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES). buffer records ai_semantic_firewall.response_inspection=streaming_buffered.
         provider:
           type: object
           required: [type, endpoint]

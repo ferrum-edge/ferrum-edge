@@ -2,6 +2,7 @@ mod functional_admin_crud_resources_test;
 mod functional_admin_observability_test;
 mod functional_admin_operations_test;
 mod functional_ai_plugins_test;
+mod functional_ai_semantic_firewall_streaming_test;
 mod functional_allowed_methods_test;
 mod functional_auth_acl_test;
 mod functional_body_size_limits_test;
