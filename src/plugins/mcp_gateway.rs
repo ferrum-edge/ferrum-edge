@@ -178,8 +178,6 @@ impl McpPolicy {
 #[derive(Debug, Clone)]
 struct McpValidationConfig {
     validate_tool_arguments: bool,
-    #[allow(dead_code)] // Parsed for V1 config compatibility; result validation is a V2 path.
-    validate_tool_results: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -640,13 +638,16 @@ impl McpGateway {
         ctx.route_override_authority = Some(server.target.authority.clone());
         headers.insert("host".to_string(), server.target.authority.clone());
         if self.mode == McpGatewayMode::AggregateRouter {
-            // The downstream session id is Ferrum's synthetic id, which the
-            // upstream never issued. Strip it before forwarding so passthrough /
-            // stateless upstreams (no mediated upstream session id) don't reject
-            // the call as an unknown MCP session. A real upstream session id, if
-            // one exists, is re-added below. Transparent mode passes the client's
-            // session header straight through to its single upstream.
+            // Both session headers are gateway-owned in aggregate mode. Strip any
+            // client-supplied value — the synthetic downstream id and any forged
+            // upstream id (including a differently-cased header key) — before
+            // re-adding only the gateway's mediated upstream session id below. This
+            // stops passthrough / stateless upstreams (no mediated upstream session
+            // id) from binding to or rejecting a client-injected session. Transparent
+            // mode passes the client's session header straight through to its single
+            // upstream.
             remove_header(headers, &self.sessions.downstream_session_header);
+            remove_header(headers, &self.sessions.upstream_session_header);
         }
         if let Some(downstream_id) = downstream_session_id
             && let Some(upstream_id) = self.upstream_session_id(downstream_id, &server.server_id)
@@ -2381,19 +2382,34 @@ impl Plugin for McpGateway {
             return self.handle_transparent_post(ctx, headers, &envelope);
         }
 
+        // Methods the aggregate router handles itself are all JSON-RPC requests.
+        // If one arrives without an id it is a (malformed) notification: accept it
+        // with 202/no body and run none of the request-side side effects (session
+        // requirement, catalog refresh, routing, an id:null response). Genuine
+        // `notifications/*`, notification-form `ping`, and passthrough/unknown
+        // methods keep their existing handling in the match below.
+        if envelope.message_kind == McpMessageKind::Notification
+            && matches!(
+                method,
+                "initialize"
+                    | "tools/list"
+                    | "tools/call"
+                    | "prompts/list"
+                    | "prompts/get"
+                    | "resources/list"
+                    | "resources/templates/list"
+                    | "resources/read"
+            )
+        {
+            ctx.metadata.insert(
+                "mcp.route_decision".to_string(),
+                "synthetic_response".to_string(),
+            );
+            return empty_response(202);
+        }
+
         match method {
             "initialize" => {
-                // An `initialize` carrying no JSON-RPC id is a notification.
-                // `initialize` is defined as a request, so this is malformed:
-                // accept it with 202/no body per Streamable HTTP and do not
-                // allocate a session slot for it.
-                if envelope.message_kind == McpMessageKind::Notification {
-                    ctx.metadata.insert(
-                        "mcp.route_decision".to_string(),
-                        "synthetic_response".to_string(),
-                    );
-                    return empty_response(202);
-                }
                 let version =
                     protocol_version.unwrap_or_else(|| self.supported_protocol_versions[0].clone());
                 if !self.supported_protocol_versions.contains(&version) {
@@ -3355,11 +3371,17 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
 
 fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, String> {
     let validation = optional_object(object, "validation")?;
+    // Tool result validation is not implemented in V1. Reject it rather than
+    // silently accepting a config that advertises enforcement that never runs.
+    if optional_bool_from_object(validation, "validate_tool_results")?.unwrap_or(false) {
+        return Err(
+            "mcp_gateway: 'validation.validate_tool_results' is not supported yet; tool result validation is not implemented"
+                .to_string(),
+        );
+    }
     Ok(McpValidationConfig {
         validate_tool_arguments: optional_bool_from_object(validation, "validate_tool_arguments")?
             .unwrap_or(true),
-        validate_tool_results: optional_bool_from_object(validation, "validate_tool_results")?
-            .unwrap_or(false),
     })
 }
 

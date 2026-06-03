@@ -772,6 +772,13 @@ fn invalid_config_shapes_are_rejected() {
             "sessions": { "downstream_session_header": "bad header" },
             "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } }
         }),
+        // validate_tool_results is not implemented; setting true must be rejected.
+        json!({
+            "mode": "transparent_proxy",
+            "endpoint": { "path": "/mcp" },
+            "validation": { "validate_tool_results": true },
+            "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } }
+        }),
     ] {
         assert!(
             create_plugin("mcp_gateway", &config).is_err(),
@@ -2031,5 +2038,81 @@ async fn aggregate_routing_strips_synthetic_downstream_session_id_from_upstream(
         headers.get("mcp-session-id"),
         None,
         "synthetic downstream session id must not leak to a passthrough upstream"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_routing_strips_client_supplied_upstream_session_header() {
+    let server = start_mcp_stateless_tools_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    // Distinct downstream/upstream header names so a client can attempt to inject
+    // the gateway-owned upstream header directly.
+    config["sessions"] = json!({
+        "initialize_upstreams": "passthrough",
+        "downstream_session_header": "mcp-session-id",
+        "upstream_session_header": "mcp-upstream-session"
+    });
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config["policy"] = json!({"default_action": "allow"});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 50).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 51,
+        "method": "tools/call",
+        "params": { "name": "github.stateless_tool", "arguments": {} }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    headers.insert(
+        "mcp-upstream-session".to_string(),
+        "forged-upstream".to_string(),
+    );
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    // The synthetic downstream id and the client-forged upstream id must both be
+    // stripped; a passthrough upstream has no mediated session id to re-add.
+    assert_eq!(headers.get("mcp-session-id"), None);
+    assert_eq!(headers.get("mcp-upstream-session"), None);
+}
+
+#[tokio::test]
+async fn aggregate_notification_form_request_methods_are_accepted_without_side_effects() {
+    let server = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    // A `tools/list` carrying no JSON-RPC id is a notification: it must be
+    // accepted with 202/no body and must not require a session or refresh the
+    // upstream catalog.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_raw(result);
+    assert_eq!(status, 202);
+    assert!(body.is_empty());
+    assert_eq!(
+        ctx.metadata.get("mcp.route_decision").map(String::as_str),
+        Some("synthetic_response")
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "notification-form tools/list must not refresh the upstream catalog"
     );
 }

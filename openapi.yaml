@@ -13240,6 +13240,8 @@ components:
             validate_tool_results:
               type: boolean
               default: false
+              enum: [false]
+              description: Reserved; tool result validation is not implemented yet, so true is rejected at config validation.
         observability:
           type: object
           properties:
