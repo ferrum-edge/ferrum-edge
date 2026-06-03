@@ -75,6 +75,7 @@ const PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
     "ai_prompt_shield",
     "ai_response_guard",
     "ai_semantic_cache",
+    "ai_semantic_firewall",
     "ai_federation",
     "mcp_gateway",
     "ws_message_size_limiting",
@@ -1525,6 +1526,13 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         "ai_request_guard" => json!({"max_messages": 100}),
         "ai_rate_limiter" => json!({"token_limit": 100000}),
         "ai_response_guard" => json!({"pii_patterns": ["ssn"], "action": "reject"}),
+        "ai_semantic_firewall" => json!({
+            "provider": {
+                "type": "openai_compatible_embeddings",
+                "endpoint": "http://127.0.0.1:9/v1/embeddings",
+                "request_timeout_ms": 100
+            }
+        }),
         "ai_federation" => {
             json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})
         }

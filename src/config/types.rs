@@ -237,6 +237,22 @@ pub struct SubsetTrafficPolicy {
     /// upstream-level apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<crate::modes::mesh::config::MeshTrafficPolicyTls>,
+    /// Override the upstream's backend connect timeout (ms) for this subset
+    /// (Istio `subsets[].trafficPolicy.connectionPool.tcp.connectTimeout`).
+    /// `apply_destination_rules` projects this onto `backend_connect_timeout_ms`
+    /// of every proxy whose `upstream_subset` selects this subset, taking
+    /// precedence over the DestinationRule's top-level `connectTimeout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    /// Per-subset passive health (Istio `subsets[].trafficPolicy.outlierDetection`),
+    /// already resolved from the Istio outlier shape. The ejection *thresholds*
+    /// (consecutive errors, interval, base-ejection time, min-health) are
+    /// consulted per-subset by `passive_health_for_target` for proxies bound to
+    /// this subset, overriding the upstream-level passive health. The
+    /// `maxEjectionPercent` *cap* is resolved through the LoadBalancerCache at
+    /// the upstream level and is not yet per-subset (see docs/mesh.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passive_health_check: Option<PassiveHealthCheck>,
 }
 
 /// Per-destination-port traffic policy overrides on an upstream.
@@ -330,6 +346,16 @@ pub struct UpstreamPortOverride {
     /// not expose the same builder knob today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h2_max_concurrent_streams: Option<u32>,
+    /// Per-port backend TLS posture, mapped from DestinationRule
+    /// `portLevelSettings[].tls`. Resolved against the upstream-level TLS at
+    /// apply time and projected onto the per-target effective proxy's
+    /// `resolved_tls` by `resolve_effective_proxy_for_target`, taking
+    /// precedence over the upstream-/subset-level TLS for dials to this port.
+    /// `resolved_tls` identity fields (CA, cert/key, SNI, SAN, verify) are part
+    /// of the backend pool key, so a distinct per-port TLS posture fragments
+    /// its own pool rather than sharing a connection with another port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<BackendTlsConfig>,
 }
 
 /// Per-target TCP keepalive override. Mirrors Istio's
@@ -384,6 +410,7 @@ pub struct ResolvedPortOverride {
     pub http_max_requests_per_connection: Option<u32>,
     pub http_idle_timeout_ms: Option<u64>,
     pub h2_max_concurrent_streams: Option<u32>,
+    pub tls: Option<BackendTlsConfig>,
 }
 
 impl ResolvedPortOverride {
@@ -399,6 +426,7 @@ impl ResolvedPortOverride {
             http_max_requests_per_connection: value.http_max_requests_per_connection,
             http_idle_timeout_ms: value.http_idle_timeout_ms,
             h2_max_concurrent_streams: value.h2_max_concurrent_streams,
+            tls: value.tls.clone(),
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -414,6 +442,7 @@ impl ResolvedPortOverride {
             && self.http_max_requests_per_connection.is_none()
             && self.http_idle_timeout_ms.is_none()
             && self.h2_max_concurrent_streams.is_none()
+            && self.tls.is_none()
     }
 }
 
@@ -452,19 +481,32 @@ pub struct ResolvedSubsetTrafficPolicy {
     /// so the hot path can swap one `BackendTlsConfig` for another without
     /// re-running the overlay).
     pub tls: Option<BackendTlsConfig>,
+    /// Subset-resolved passive health (ejection thresholds), from the subset's
+    /// `outlierDetection`. `Some` when the subset configured outlier detection;
+    /// consulted by `passive_health_for_target` ahead of the upstream-level
+    /// passive health for proxies bound to this subset. The `maxEjectionPercent`
+    /// cap is resolved at the upstream level (LoadBalancerCache) and is not yet
+    /// per-subset.
+    pub passive_health_check: Option<PassiveHealthCheck>,
 }
 
 impl ResolvedSubsetTrafficPolicy {
-    /// Build from a fully-resolved subset `BackendTlsConfig`. Returns `None`
-    /// when the resolved policy carries no fields (so callers can skip
-    /// inserting empty entries into [`Upstream::resolved_subset_tls`]).
-    pub fn from_tls(tls: Option<BackendTlsConfig>) -> Option<Self> {
-        let resolved = Self { tls };
+    /// Build from a fully-resolved subset TLS and/or passive-health overlay.
+    /// Returns `None` when neither is present (so callers can skip inserting
+    /// empty entries into [`Upstream::resolved_subset_tls`]).
+    pub fn new(
+        tls: Option<BackendTlsConfig>,
+        passive_health_check: Option<PassiveHealthCheck>,
+    ) -> Option<Self> {
+        let resolved = Self {
+            tls,
+            passive_health_check,
+        };
         (!resolved.is_empty()).then_some(resolved)
     }
 
     fn is_empty(&self) -> bool {
-        self.tls.is_none()
+        self.tls.is_none() && self.passive_health_check.is_none()
     }
 }
 

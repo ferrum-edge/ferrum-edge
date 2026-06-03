@@ -12,7 +12,7 @@
 # Usage:
 #   - Go to Actions -> "Resources Scale Benchmark" -> "Run workflow"
 #   - Pick the branch (or PR branch) to benchmark
-#   - Choose SQLite (default, no deps) or PostgreSQL
+#   - Choose SQLite (default, no deps), PostgreSQL, or MongoDB
 
 name: Resources Scale Benchmark
 
@@ -27,6 +27,7 @@ on:
         options:
           - sqlite
           - postgres
+          - mongodb
 
 jobs:
   scale-benchmark:
@@ -137,6 +138,38 @@ jobs:
         run: |
           cargo test --test functional_tests \
             test_scale_perf_30k_proxies_postgres \
+            -- --ignored --nocapture 2>&1 | tee /tmp/scale_bench_output.txt
+
+      - name: Start MongoDB container
+        if: inputs.db_type == 'mongodb'
+        run: |
+          # The Rust test checks for "ferrum-scale-test-mongo" by name via `docker inspect`
+          # and cleans the database via `docker exec ... mongosh`.
+          docker run -d --name ferrum-scale-test-mongo \
+            -p 27117:27017 \
+            mongo:7
+
+          # Wait for the container to be ready
+          echo "Waiting for MongoDB to be ready..."
+          for i in $(seq 1 30); do
+            if docker exec ferrum-scale-test-mongo \
+              mongosh --quiet --eval 'db.runCommand({ ping: 1 })' >/dev/null 2>&1; then
+              echo "MongoDB container ready"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "::error::MongoDB did not become ready in 30 seconds"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run scale benchmark (MongoDB)
+        if: inputs.db_type == 'mongodb'
+        timeout-minutes: 90
+        run: |
+          cargo test --test functional_tests \
+            test_scale_perf_30k_proxies_mongodb \
             -- --ignored --nocapture 2>&1 | tee /tmp/scale_bench_output.txt
 
       - name: Parse results and post summary

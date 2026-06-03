@@ -130,6 +130,31 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_updated ON consumers (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_updated ON plugin_configs (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_updated ON upstreams (namespace, updated_at)",
+            // Covering indexes for the incremental-poll deletion diff. Every
+            // poll cycle runs `SELECT id ... WHERE namespace = ?` on these four
+            // tables to detect deletions (see `db_loader::load_table_ids`). The
+            // `(namespace, updated_at)` compounds above satisfy the namespace
+            // filter, but on SQLite (rowid table) and Postgres (heap) `id` is
+            // not in that index, so reading it needs a per-row table access —
+            // an O(rows) walk on every poll. A `(namespace, id)` index makes
+            // the query index-only. This matters most for SQLite, where the
+            // scan runs in-process and competes with the proxy hot path; on a
+            // 30k-resource scale benchmark it is the dominant cause of SQLite's
+            // per-poll cost.
+            //
+            // On MySQL/InnoDB the index is near-redundant: InnoDB appends the
+            // clustered PK (`id`) to every secondary index, so
+            // `(namespace, updated_at)` already answers this query index-only.
+            // It is kept for cross-dialect symmetry; upkeep is cheap because
+            // `id` is immutable — only INSERT/DELETE touch the index, never
+            // routine config edits or the proxy hot path. Both key columns are
+            // VARCHAR(255), the same width as existing namespace-scoped
+            // compounds like `(namespace, name)` / `(namespace, username)`, so
+            // MySQL key-length limits are already proven.
+            "CREATE INDEX IF NOT EXISTS idx_proxies_ns_id ON proxies (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_consumers_ns_id ON consumers (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_id ON plugin_configs (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_id ON upstreams (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_scope ON plugin_configs (namespace, scope)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_plugin_name ON plugin_configs (namespace, plugin_name)",
             // Cold-path index for cross-namespace mesh_route_dispatch lookups in

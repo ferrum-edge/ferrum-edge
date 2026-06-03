@@ -519,9 +519,11 @@ fn root_namespace_peer_authentication_resolves_to_mesh_wide_scope() {
     assert_eq!(detail["translation"]["scope"].as_str(), Some("MeshWide"),);
 }
 
-/// DestinationRule deferred-fields tracking: when an operator uses
-/// `portLevelSettings[].tls`, the detail block surfaces this as a
-/// deferred field so they know Ferrum parsed but didn't enforce it.
+/// DestinationRule deferred-fields tracking: when an operator uses a
+/// parsed-but-unenforced field (here `connectionPool.http.maxRetries`), the
+/// detail block surfaces it as a deferred field so they know Ferrum parsed it
+/// but does not enforce it. (`portLevelSettings[].tls` was the example here
+/// before it became applied per-port, so it is no longer deferred.)
 #[test]
 fn destination_rule_deferred_fields_listed_in_detail() {
     let obj = object(
@@ -531,9 +533,7 @@ fn destination_rule_deferred_fields_listed_in_detail() {
         json!({
             "host": "secured.default.svc.cluster.local",
             "trafficPolicy": {
-                "portLevelSettings": [
-                    { "port": { "number": 443 }, "tls": { "mode": "SIMPLE" } }
-                ]
+                "connectionPool": { "http": { "maxRetries": 3 } }
             }
         }),
     );
@@ -545,7 +545,7 @@ fn destination_rule_deferred_fields_listed_in_detail() {
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    assert!(deferred.iter().any(|f| f.contains("portLevelSettings")));
+    assert!(deferred.iter().any(|f| f.contains("maxRetries")));
     let message = find_condition(
         updates[0].status["conditions"].as_array().unwrap(),
         "FerrumAccepted",

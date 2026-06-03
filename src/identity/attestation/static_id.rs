@@ -29,10 +29,7 @@ pub struct StaticAttestor {
 
 impl StaticAttestor {
     pub fn new(config: StaticAttestorConfig) -> Result<Self, AttestError> {
-        let production = env::var("FERRUM_MESH_PRODUCTION_MODE")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if production {
+        if crate::identity::production_mode() {
             return Err(AttestError::Config(
                 "FERRUM_MESH_PRODUCTION_MODE=true — refusing to construct StaticAttestor"
                     .to_string(),

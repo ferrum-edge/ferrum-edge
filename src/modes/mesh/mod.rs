@@ -1407,6 +1407,12 @@ fn apply_destination_rules(
             // to that port's pool entry. The top-level policy is still applied
             // first so per-port acts as an additive override of the same
             // fields.
+            //
+            // The upstream-level TLS base (this DR's top-level tls, applied
+            // above) is captured owned so the per-port `entry()` mutable borrow
+            // below doesn't conflict with the immutable `from_upstream` read.
+            let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
+            let upstream_id_for_tls = upstream.id.clone();
             for (port, port_policy) in &dr.port_level_settings {
                 if !has_service_discovery && !upstream_target_ports.contains(port) {
                     warn!(
@@ -1417,17 +1423,34 @@ fn apply_destination_rules(
                     );
                     continue;
                 }
-                if port_policy.tls.is_some() {
-                    warn!(
-                        rule = %dr.name,
-                        upstream = %upstream.id,
-                        port = port,
-                        "DestinationRule portLevelSettings.tls is parsed but not enforced per-port today (gateway applies backend TLS policy at upstream/subset scope); non-TLS port-level traffic policy fields are still applied"
-                    );
-                }
+                // Resolve per-port backend TLS over the upstream base, mirroring
+                // the per-subset TLS overlay. Computed before the `override_slot`
+                // mutable borrow. Fail-closed: an unresolvable per-port TLS
+                // (e.g. ISTIO_MUTUAL without SVID material) rejects the slice
+                // rather than silently downgrading the port's backend posture.
+                let resolved_port_tls = if let Some(ref port_tls) = port_policy.tls {
+                    let mut slot = upstream_base_tls.clone();
+                    apply_traffic_policy_tls_to_backend_config(
+                        &mut slot,
+                        port_tls,
+                        runtime,
+                        &format!("{upstream_id_for_tls}/port-{port}"),
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "DestinationRule portLevelSettings.tls projection failed for upstream={upstream_id_for_tls} port={port}: {e}"
+                        )
+                    })?;
+                    Some(slot)
+                } else {
+                    None
+                };
 
                 let override_slot = upstream.port_overrides.entry(*port).or_default();
                 apply_traffic_policy_to_port_override(override_slot, port_policy);
+                if let Some(slot) = resolved_port_tls {
+                    override_slot.tls = Some(slot);
+                }
             }
 
             if !dr.subsets.is_empty() {
@@ -1445,9 +1468,19 @@ fn apply_destination_rules(
                         name: subset.name.clone(),
                         labels: subset.labels.clone(),
                         traffic_policy: subset.traffic_policy.as_ref().map(|sp| {
+                            // Resolve the subset's outlierDetection into a
+                            // PassiveHealthCheck (ejection thresholds) up front,
+                            // the same projection the upstream-level path uses.
+                            let passive_health_check = sp.outlier_detection.as_ref().map(|od| {
+                                let mut passive = PassiveHealthCheck::default();
+                                apply_outlier_detection_to_passive(&mut passive, od);
+                                passive
+                            });
                             SubsetTrafficPolicy {
                                 load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
                                 tls: sp.tls.clone(),
+                                connect_timeout_ms: sp.connect_timeout_ms,
+                                passive_health_check,
                             }
                         }),
                     })
@@ -1460,17 +1493,58 @@ fn apply_destination_rules(
                 upstream.resolved_subset_tls.clear();
             }
 
-            if let Some(timeout_ms) = connect_timeout_ms {
+            // Per-subset `connectionPool.tcp.connectTimeout` overrides the DR
+            // top-level connectTimeout for proxies bound to that subset (Istio:
+            // a subset trafficPolicy field-overrides the DR top-level for that
+            // subset). Captured as owned data so the `upstream` borrow ends
+            // before the `config.proxies` loop below.
+            // Derive subset connectTimeouts from THIS DR's own subsets, not the
+            // accumulated `upstream.subsets` an earlier sorted rule may have
+            // populated. Reading the accumulated set would let a stale subset
+            // timeout from a previous rule shadow this rule's top-level
+            // connectTimeout at the `.or(connect_timeout_ms)` below, breaking
+            // deterministic last-writer-wins for a later rule that defines no
+            // subsets of its own.
+            let subset_connect_timeouts: Vec<(String, u64)> = dr
+                .subsets
+                .iter()
+                .filter_map(|s| {
+                    s.traffic_policy
+                        .as_ref()
+                        .and_then(|tp| tp.connect_timeout_ms)
+                        .map(|ms| (s.name.clone(), ms))
+                })
+                .collect();
+
+            if connect_timeout_ms.is_some() || !subset_connect_timeouts.is_empty() {
                 let upstream_id = upstream.id.clone();
                 let upstream_namespace = upstream.namespace.clone();
                 for proxy in &mut config.proxies {
-                    if proxy.upstream_id.as_deref() == Some(upstream_id.as_str())
-                        && proxy.namespace == upstream_namespace
+                    if proxy.upstream_id.as_deref() != Some(upstream_id.as_str())
+                        || proxy.namespace != upstream_namespace
+                    {
+                        continue;
+                    }
+                    // A subset-bound proxy uses its subset's connectTimeout when
+                    // the subset sets one; otherwise the DR top-level applies
+                    // (as it does to every proxy referencing this upstream).
+                    let effective_ms = proxy
+                        .upstream_subset
+                        .as_deref()
+                        .and_then(|name| {
+                            subset_connect_timeouts
+                                .iter()
+                                .find(|(n, _)| n == name)
+                                .map(|(_, ms)| *ms)
+                        })
+                        .or(connect_timeout_ms);
+                    if let Some(timeout_ms) = effective_ms
                         && proxy.backend_connect_timeout_ms != timeout_ms
                     {
                         debug!(
                             proxy = %proxy.id,
                             upstream = %upstream_id,
+                            subset = proxy.upstream_subset.as_deref().unwrap_or(""),
                             previous_ms = proxy.backend_connect_timeout_ms,
                             new_ms = timeout_ms,
                             rule = %dr.name,
@@ -1519,27 +1593,28 @@ fn resolve_subset_traffic_policy_tls(
         let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
         let mut resolved_map: HashMap<String, ResolvedSubsetTrafficPolicy> = HashMap::new();
         for subset in subsets {
-            let Some(subset_tls) = subset
-                .traffic_policy
-                .as_ref()
-                .and_then(|tp| tp.tls.as_ref())
-            else {
-                continue;
+            let tp = subset.traffic_policy.as_ref();
+            // Per-subset TLS overlay, resolved over the upstream-level TLS.
+            let resolved_tls = if let Some(subset_tls) = tp.and_then(|tp| tp.tls.as_ref()) {
+                let identity = format!("{}/{}", upstream.id, subset.name);
+                let mut slot = upstream_base_tls.clone();
+                apply_traffic_policy_tls_to_backend_config(&mut slot, subset_tls, runtime, &identity)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "DestinationRule subset trafficPolicy.tls projection failed for upstream={} subset={}: {}",
+                            upstream.id,
+                            subset.name,
+                            e
+                        )
+                    })?;
+                Some(slot)
+            } else {
+                None
             };
-            let identity = format!("{}/{}", upstream.id, subset.name);
-            let mut slot = upstream_base_tls.clone();
-            apply_traffic_policy_tls_to_backend_config(
-                &mut slot, subset_tls, runtime, &identity,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "DestinationRule subset trafficPolicy.tls projection failed for upstream={} subset={}: {}",
-                    upstream.id,
-                    subset.name,
-                    e
-                )
-            })?;
-            if let Some(resolved) = ResolvedSubsetTrafficPolicy::from_tls(Some(slot)) {
+            // Per-subset passive health (ejection thresholds), already resolved
+            // from the subset's outlierDetection in apply_destination_rules.
+            let passive = tp.and_then(|tp| tp.passive_health_check.clone());
+            if let Some(resolved) = ResolvedSubsetTrafficPolicy::new(resolved_tls, passive) {
                 resolved_map.insert(subset.name.clone(), resolved);
             }
         }
@@ -4090,6 +4165,7 @@ fn start_mesh_admin_listeners(
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
         mesh_runtime_state: Some(mesh_state),
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+        backend_allow_ips: env_config.backend_allow_ips.clone(),
     };
 
     let mut handles = Vec::new();
@@ -5570,6 +5646,8 @@ mod tests {
             "FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS",
             "FERRUM_POOL_WARMUP_ENABLED",
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
+            "FERRUM_MESH_CA_BACKEND",
+            "FERRUM_MESH_ALLOW_NO_CA",
         ];
 
         for key in keys {
@@ -5577,6 +5655,16 @@ mod tests {
         }
         for (key, value) in vars {
             unsafe { std::env::set_var(key, value) };
+        }
+        // These tests build mesh runtime configs without exercising the
+        // PERMISSIVE-no-CA startup gate; unless the caller pins CA settings,
+        // acknowledge the no-CA dev posture so that gate does not reject the
+        // config under test.
+        if !vars
+            .iter()
+            .any(|(k, _)| *k == "FERRUM_MESH_CA_BACKEND" || *k == "FERRUM_MESH_ALLOW_NO_CA")
+        {
+            unsafe { std::env::set_var("FERRUM_MESH_ALLOW_NO_CA", "true") };
         }
 
         f();
@@ -7069,6 +7157,259 @@ mod tests {
     }
 
     #[test]
+    fn dr_subset_connect_timeout_overrides_top_level_for_subset_bound_proxies() {
+        // Istio precedence: a subset's `trafficPolicy.connectionPool.tcp.connectTimeout`
+        // overrides the DR top-level connectTimeout for proxies bound to that
+        // subset, while proxies with no subset keep the top-level value.
+        let mut config = GatewayConfig {
+            // p1 has no upstream_subset — keeps the top-level connectTimeout.
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        // p2 selects subset v1 — picks up the subset's connectTimeout.
+        let mut p2: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "p2",
+            "namespace": "default",
+            "hosts": ["p2.example.com"],
+            "backend_host": "",
+            "backend_port": 0,
+            "upstream_id": "u1",
+            "upstream_subset": "v1",
+        }))
+        .expect("test proxy with subset");
+        p2.normalize_fields();
+        config.proxies.push(p2);
+
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connect_timeout_ms: Some(5000),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(2000),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let p1 = config.proxies.iter().find(|p| p.id == "p1").expect("p1");
+        let p2 = config.proxies.iter().find(|p| p.id == "p2").expect("p2");
+        assert_eq!(
+            p1.backend_connect_timeout_ms, 5000,
+            "non-subset proxy uses the DR top-level connectTimeout"
+        );
+        assert_eq!(
+            p2.backend_connect_timeout_ms, 2000,
+            "subset-bound proxy uses its subset's connectTimeout (overrides top-level)"
+        );
+    }
+
+    #[test]
+    fn dr_later_rule_top_level_connect_timeout_overrides_earlier_subset() {
+        // Two DestinationRules match the same upstream. The earlier-sorted rule
+        // defines subset v1 with its own connectTimeout; the later-sorted rule
+        // has no subsets but sets a top-level connectTimeout. Last-writer-wins:
+        // the later top-level must override the subset-bound proxy even though an
+        // earlier rule already populated upstream.subsets. Regression guard for
+        // reading the accumulated upstream.subsets instead of the current rule's.
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let mut p2: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "p2",
+            "namespace": "default",
+            "hosts": ["p2.example.com"],
+            "backend_host": "",
+            "backend_port": 0,
+            "upstream_id": "u1",
+            "upstream_subset": "v1",
+        }))
+        .expect("test proxy with subset");
+        p2.normalize_fields();
+        config.proxies.push(p2);
+
+        let slice = MeshSlice {
+            destination_rules: vec![
+                // Earlier (name "reviews-a"): defines subset v1, no top-level.
+                MeshDestinationRule {
+                    name: "reviews-a".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: vec![MeshSubset {
+                        name: "v1".to_string(),
+                        labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                        traffic_policy: Some(MeshTrafficPolicy {
+                            connect_timeout_ms: Some(2000),
+                            ..MeshTrafficPolicy::default()
+                        }),
+                    }],
+                },
+                // Later (name "reviews-b"): no subsets, top-level connectTimeout.
+                MeshDestinationRule {
+                    name: "reviews-b".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(8000),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let p1 = config.proxies.iter().find(|p| p.id == "p1").expect("p1");
+        let p2 = config.proxies.iter().find(|p| p.id == "p2").expect("p2");
+        assert_eq!(
+            p1.backend_connect_timeout_ms, 8000,
+            "non-subset proxy uses the later rule's top-level connectTimeout"
+        );
+        assert_eq!(
+            p2.backend_connect_timeout_ms, 8000,
+            "subset-bound proxy must adopt the later rule's top-level connectTimeout, \
+             not a stale subset timeout from the earlier rule"
+        );
+    }
+
+    #[test]
+    fn dr_port_level_tls_resolves_onto_port_override() {
+        // portLevelSettings[].tls is resolved per-port (over the upstream-level
+        // TLS base) and lands on Upstream.port_overrides[port].tls, ready to
+        // project onto the effective proxy's resolved_tls at dispatch.
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "secure.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        // The test upstream serves port 8080; use it so the entry is not skipped
+        // as a phantom port.
+        let mut port_level = HashMap::new();
+        port_level.insert(
+            8080u16,
+            MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: MtlsMode::Simple,
+                    ca_certificates: Some("/etc/certs/port-8080-ca.pem".to_string()),
+                    sni: Some("port8080.secure.internal".to_string()),
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "secure".to_string(),
+                namespace: "default".to_string(),
+                host: "secure.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: port_level,
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let override_slot = config.upstreams[0]
+            .port_overrides
+            .get(&8080)
+            .expect("port 8080 override exists");
+        let tls = override_slot
+            .tls
+            .as_ref()
+            .expect("port 8080 resolved backend TLS");
+        assert_eq!(
+            tls.server_ca_cert_path.as_deref(),
+            Some("/etc/certs/port-8080-ca.pem"),
+            "per-port TLS resolves the CA for port 8080"
+        );
+        assert_eq!(tls.sni.as_deref(), Some("port8080.secure.internal"));
+    }
+
+    #[test]
+    fn dr_subset_outlier_resolves_passive_health_thresholds() {
+        // A subset's outlierDetection thresholds resolve into the subset's
+        // passive-health overlay on `Upstream.resolved_subset_tls`, consulted by
+        // `passive_health_for_target` for proxies bound to the subset.
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        outlier_detection: Some(MeshOutlierDetection {
+                            consecutive_errors: Some(5),
+                            interval_seconds: Some(20),
+                            base_ejection_seconds: None,
+                            max_ejection_percent: None,
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let resolved = config.upstreams[0]
+            .resolved_subset_tls
+            .get("v1")
+            .expect("v1 subset resolved");
+        let passive = resolved
+            .passive_health_check
+            .as_ref()
+            .expect("v1 subset passive health resolved from outlierDetection");
+        assert_eq!(passive.unhealthy_threshold, 5);
+        assert_eq!(passive.unhealthy_window_seconds, 20);
+    }
+
+    #[test]
     fn dr_subset_tls_projects_onto_proxy_resolved_tls_via_resolve_upstream_tls() {
         // End-to-end: subset overlay reaches `Proxy.resolved_tls` so the pool
         // key construction (which consumes `proxy.resolved_tls`) naturally
@@ -7223,6 +7564,7 @@ mod tests {
                     server_ca_cert_path: Some("/etc/certs/stale-ca.pem".to_string()),
                     ..BackendTlsConfig::default_verify()
                 }),
+                passive_health_check: None,
             },
         );
         let mut config = GatewayConfig {

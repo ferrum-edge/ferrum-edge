@@ -13,9 +13,9 @@
 //! until **after** every assertion that depends on the env state.
 
 #![allow(dead_code)] // used by sibling test files
-use std::sync::Mutex;
-
-pub static ENV_LOCK: Mutex<()> = Mutex::new(());
+// Re-export the process-wide shared env lock so identity tests serialize
+// against config tests that read the same env vars (see tests/unit/env_lock.rs).
+pub use crate::unit::env_lock::ENV_LOCK;
 
 pub struct EnvGuard {
     _lock: std::sync::MutexGuard<'static, ()>,

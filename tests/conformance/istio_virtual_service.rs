@@ -26,7 +26,7 @@ use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::{Value, json};
 
-use crate::conformance::registry::Status;
+use crate::conformance::registry::{Maturity, Status};
 
 const CATEGORY: &str = "istio_virtual_service";
 
@@ -73,6 +73,157 @@ fn ctx(method: &str, path: &str) -> RequestContext {
         method.to_string(),
         path.to_string(),
     )
+}
+
+/// Find an emitted `cors` plugin in a translation result.
+fn cors_plugin_for(translation_input: &[K8sObject]) -> Option<PluginConfig> {
+    let result = translate_k8s_objects(translation_input, options()).expect("translation succeeds");
+    result
+        .config
+        .plugin_configs
+        .into_iter()
+        .find(|p| p.plugin_name == "cors")
+}
+
+/// VS field: `http[].corsPolicy`. Translated to a proxy-scoped `cors` plugin
+/// when its origins are representable (`allowOrigins[].exact` / legacy
+/// `allowOrigin`). GA: this is the common-case CORS surface Istio operators set
+/// on a route. `prefix`/`regex` origin matchers have no `cors` plugin
+/// equivalent and are left unprojected (deferred), not silently approximated.
+#[test]
+fn vs_cors_policy_translated() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "http[].corsPolicy",
+        status = Status::Supported,
+        maturity = Maturity::Ga,
+        notes = "Translated to a proxy-scoped `cors` plugin (allowOrigins[].exact / legacy allowOrigin, allowMethods/allowHeaders/exposeHeaders/maxAge/allowCredentials). prefix/regex origins are left unprojected and reported as a deferred field.",
+    );
+    let cors = cors_plugin_for(&[virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+            "corsPolicy": {
+                "allowOrigins": [{"exact": "https://app.example.com"}],
+                "allowMethods": ["GET", "POST"],
+                "allowHeaders": ["X-Request-Id"],
+                "exposeHeaders": ["X-Trace-Id"],
+                "maxAge": "24h",
+                "allowCredentials": true
+            }
+        }]
+    }))])
+    .expect("corsPolicy with exact origins must emit a cors plugin");
+
+    // Proxy-scoped to the route's proxy.
+    assert_eq!(cors.scope, ferrum_edge::config::types::PluginScope::Proxy);
+    assert!(
+        cors.proxy_id.is_some(),
+        "cors plugin must be proxy-scoped to the route"
+    );
+
+    // Fields mapped from Istio CRD camelCase to the cors plugin's snake_case.
+    assert_eq!(
+        cors.config["allowed_origins"],
+        json!(["https://app.example.com"])
+    );
+    assert_eq!(cors.config["allowed_methods"], json!(["GET", "POST"]));
+    assert_eq!(cors.config["allowed_headers"], json!(["X-Request-Id"]));
+    assert_eq!(cors.config["exposed_headers"], json!(["X-Trace-Id"]));
+    assert_eq!(cors.config["max_age"].as_u64(), Some(86400)); // 24h -> seconds
+    assert_eq!(cors.config["allow_credentials"].as_bool(), Some(true));
+
+    // The emitted config must construct a valid cors plugin.
+    ferrum_edge::plugins::validate_plugin_config("cors", &cors.config)
+        .expect("emitted cors config is valid");
+}
+
+/// A `corsPolicy` whose origins use a `regex`/`prefix` matcher cannot be mapped
+/// to the `cors` plugin's origin model, so the translator leaves it unprojected
+/// (no cors plugin emitted) rather than approximating — routing still applies.
+#[test]
+fn vs_cors_policy_regex_origin_not_projected() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "http[].corsPolicy regex/prefix origins",
+        status = Status::Deferred,
+        notes = "regex/prefix origin matchers have no cors plugin equivalent; left unprojected (deferred) and reported in status.deferred_fields. Use the cors plugin directly.",
+    );
+    assert!(
+        cors_plugin_for(&[virtual_service(json!({
+            "hosts": ["api.example.com"],
+            "http": [{
+                "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+                "corsPolicy": {"allowOrigins": [{"regex": "https://.*\\.example\\.com"}]}
+            }]
+        }))])
+        .is_none(),
+        "regex-origin corsPolicy must not emit a cors plugin"
+    );
+}
+
+/// VS `spec.tls[]` L4 routing → passthrough TCP stream proxy keyed by SNI
+/// (encrypted bytes forwarded, no TLS termination), reusing the gateway /
+/// east-west stream + SNI machinery.
+#[test]
+fn vs_tls_l4_sni_passthrough() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "spec.tls[] SNI L4 routing",
+        status = Status::Supported,
+        notes = "Passthrough TCP proxy keyed by sniHosts. Unsupported matches (sourceLabels/subnets/gateways) and weighted splitting fail closed.",
+    );
+    let result = translate_k8s_objects(
+        &[virtual_service(json!({
+            "hosts": ["tls.example.com"],
+            "tls": [{
+                "match": [{"sniHosts": ["secure.example.com"], "port": 8443}],
+                "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 8443}}}]
+            }]
+        }))],
+        options(),
+    )
+    .expect("tls[] L4 translates");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(8443))
+        .expect("tls[] materializes a passthrough proxy");
+    assert!(proxy.passthrough, "tls[] SNI routing is passthrough");
+    assert_eq!(proxy.hosts, vec!["secure.example.com".to_string()]);
+    assert_eq!(proxy.backend_host, "backend.default.svc.cluster.local");
+}
+
+/// VS `spec.tcp[]` L4 routing → plain TCP stream proxy keyed by `listen_port`.
+#[test]
+fn vs_tcp_l4_port_routing() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "spec.tcp[] L4 routing",
+        status = Status::Supported,
+        notes = "Plain TCP proxy keyed by listen_port. Unsupported matches (sourceLabels/subnets/gateways) and weighted splitting fail closed.",
+    );
+    let result = translate_k8s_objects(
+        &[virtual_service(json!({
+            "hosts": ["db.example.com"],
+            "tcp": [{
+                "match": [{"port": 3306}],
+                "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+            }]
+        }))],
+        options(),
+    )
+    .expect("tcp[] L4 translates");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(3306))
+        .expect("tcp[] materializes a stream proxy");
+    assert!(!proxy.passthrough, "plain tcp[] is not passthrough");
+    assert_eq!(proxy.backend_host, "mysql.default.svc.cluster.local");
+    assert_eq!(proxy.backend_port, 3306);
 }
 
 /// VS predicate: `uri.exact`. The translator collapses this onto a single

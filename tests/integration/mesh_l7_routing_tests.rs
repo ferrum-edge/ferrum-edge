@@ -2350,11 +2350,11 @@ async fn mesh_tier3_redirect_vs_returns_redirect_response() {
     }
 }
 
-/// VirtualService L4 routing (`spec.tcp` / `spec.tls`) fails closed with a
-/// translator error + warning rather than silently dropping the routes.
+/// VirtualService L4 `tcp[]` routing materializes a Ferrum TCP stream proxy
+/// (listen-by-port → destination), reusing the stream machinery.
 #[test]
-fn mesh_tier3_l4_virtual_service_fails_closed() {
-    let err = translate_k8s_objects(
+fn mesh_tier3_l4_tcp_virtual_service_materializes_stream_proxy() {
+    let result = translate_k8s_objects(
         &[object(
             "VirtualService",
             serde_json::json!({
@@ -2367,7 +2367,78 @@ fn mesh_tier3_l4_virtual_service_fails_closed() {
         )],
         options(),
     )
-    .expect_err("VirtualService L4 routing must fail closed, not silently drop");
+    .expect("supported L4 tcp routing must translate, not fail closed");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(3306))
+        .expect("tcp[] route materializes a stream proxy on the matched port");
+    assert_eq!(proxy.backend_host, "mysql.default.svc.cluster.local");
+    assert_eq!(proxy.backend_port, 3306);
+    assert_eq!(
+        proxy.backend_scheme,
+        Some(ferrum_edge::config::types::BackendScheme::Tcp)
+    );
+    assert!(
+        proxy.listen_path.is_none(),
+        "stream proxy has no listen_path"
+    );
+    assert!(!proxy.passthrough, "plain tcp[] is not passthrough");
+}
+
+/// VirtualService L4 `tls[]` routing materializes a passthrough TCP stream proxy
+/// keyed by SNI (encrypted bytes forwarded, no TLS termination).
+#[test]
+fn mesh_tier3_l4_tls_virtual_service_materializes_sni_passthrough_proxy() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["tls.example.com"],
+                "tls": [{
+                    "match": [{"sniHosts": ["secure.example.com"], "port": 8443}],
+                    "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 8443}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("supported L4 tls SNI routing must translate");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(8443))
+        .expect("tls[] route materializes a stream proxy on the matched port");
+    assert!(proxy.passthrough, "tls[] SNI routing is passthrough");
+    assert_eq!(
+        proxy.hosts,
+        vec!["secure.example.com".to_string()],
+        "SNI hosts drive passthrough routing"
+    );
+    assert_eq!(proxy.backend_host, "backend.default.svc.cluster.local");
+    assert_eq!(proxy.backend_port, 8443);
+}
+
+/// VirtualService L4 routing still fails closed on match predicates Ferrum's
+/// stream layer cannot express (here `sourceLabels`), rather than mis-routing.
+#[test]
+fn mesh_tier3_l4_virtual_service_unsupported_match_fails_closed() {
+    let err = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306, "sourceLabels": {"app": "billing"}}],
+                    "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect_err("unsupported L4 match predicate must fail closed");
     let msg = format!("{err}");
-    assert!(msg.contains("L4 routing"), "got: {msg}");
+    assert!(msg.contains("sourceLabels"), "got: {msg}");
 }

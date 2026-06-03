@@ -622,11 +622,23 @@ pub(crate) fn passive_health_for_target<'a>(
     upstream: &'a Upstream,
     target: &UpstreamTarget,
 ) -> Option<&'a PassiveHealthCheck> {
+    // Precedence: per-port override (portLevelSettings[].outlierDetection) >
+    // per-subset (subsets[].trafficPolicy.outlierDetection) > upstream-level.
     proxy
         .dispatch_port_overrides
         .as_ref()
         .and_then(|overrides| overrides.get(&target.port))
         .and_then(|override_config| override_config.passive_health_check.as_ref())
+        .or_else(|| {
+            // Subset-bound proxy: prefer the subset's resolved passive-health
+            // thresholds over the upstream-level ones. (The maxEjectionPercent
+            // cap is still resolved at upstream scope via the LoadBalancerCache.)
+            proxy
+                .upstream_subset
+                .as_deref()
+                .and_then(|subset| upstream.resolved_subset_tls.get(subset))
+                .and_then(|resolved| resolved.passive_health_check.as_ref())
+        })
         .or_else(|| {
             upstream
                 .health_checks

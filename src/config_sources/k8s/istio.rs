@@ -973,13 +973,6 @@ fn translate_port_level_settings(
         }
         let port = port_u64 as u16;
 
-        if entry.get("tls").is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].tls is parsed but not enforced per-port today (gateway applies backend TLS policy at upstream/subset scope); non-TLS port-level traffic policy fields are still applied",
-                object.metadata.namespace, object.metadata.name
-            ));
-        }
-
         let policy = translate_traffic_policy(acc, object, entry)?;
 
         if out.insert(port, policy).is_some() {
@@ -1798,23 +1791,23 @@ fn translate_subset(
         .map(|tp| translate_traffic_policy(acc, object, tp))
         .transpose()?;
 
-    if let Some(ref policy) = traffic_policy {
-        if policy.connect_timeout_ms.is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{} subset '{}' connectionPool.tcp.connectTimeout is currently ignored; only the top-level trafficPolicy connectTimeout applies",
-                object.metadata.namespace, object.metadata.name, name
-            ));
-        }
-        if policy.outlier_detection.is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{} subset '{}' outlierDetection is currently ignored; only the top-level trafficPolicy outlierDetection applies",
-                object.metadata.namespace, object.metadata.name, name
-            ));
-        }
-        // `policy.tls` is now applied per-subset by the cold-path apply in
-        // `src/modes/mesh/mod.rs::resolve_subset_traffic_policy_tls` and
-        // projected onto `Proxy.resolved_tls` for proxies that select this
-        // subset via `upstream_subset`. No warn needed.
+    // A subset's `connectionPool.tcp.connectTimeout`, `tls`, and
+    // `outlierDetection` *thresholds* (consecutive errors / interval /
+    // base-ejection / min-health) are now applied per-subset by the cold-path
+    // apply in `src/modes/mesh/mod.rs`. The one residual is the
+    // `outlierDetection.maxEjectionPercent` *cap*, still resolved at the
+    // upstream level (LoadBalancerCache), so warn when a subset sets outlier
+    // detection that its ejection cap is not yet per-subset.
+    if let Some(policy) = traffic_policy.as_ref()
+        && policy
+            .outlier_detection
+            .as_ref()
+            .is_some_and(|od| od.max_ejection_percent.is_some())
+    {
+        acc.warnings.push(format!(
+            "DestinationRule {}/{} subset '{}' outlierDetection thresholds are applied per-subset, but the maxEjectionPercent cap uses the upstream-level value",
+            object.metadata.namespace, object.metadata.name, name
+        ));
     }
 
     Ok(MeshSubset {
@@ -2195,47 +2188,208 @@ fn dispatch_rules_carry_transform(dispatch_rules: &[Value], field: &str) -> bool
     })
 }
 
+/// Reject the L4 (`tcp[]`/`tls[]`) match predicates Ferrum's stream layer cannot
+/// express. A stream proxy routes by `listen_port` (plus SNI for passthrough
+/// TLS) and has no source-identity or CIDR matching, so silently dropping these
+/// would mis-route — fail closed instead. `sniHosts`/`port` are consumed by the
+/// caller.
+fn reject_unsupported_l4_match(
+    object: &K8sObject,
+    m: &Value,
+    kind: &str,
+) -> Result<(), K8sTranslateError> {
+    for field in [
+        "sourceLabels",
+        "sourceSubnets",
+        "destinationSubnets",
+        "gateways",
+        "sourceNamespace",
+    ] {
+        if m.get(field).is_some() {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.{field} is not supported (Ferrum stream routing keys on port{} only); remove it or model the route as an explicit stream Proxy",
+                    if kind == "tls" { " and SNI" } else { "" }
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the single backend `(host, port)` of an L4 route block. Weighted
+/// multi-destination L4 splitting is rejected fail-closed: a Ferrum stream proxy
+/// forwards to one backend, so splitting would need an upstream-backed stream
+/// proxy (a separate feature) rather than being silently collapsed to one leg.
+fn l4_route_destination(
+    object: &K8sObject,
+    block: &Value,
+    kind: &str,
+    acc: &K8sAccumulator,
+) -> Result<(String, u16), K8sTranslateError> {
+    let routes = block
+        .get("route")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!("VirtualService {kind}[] block requires a route destination"),
+            )
+        })?;
+    if routes.len() > 1 {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService {kind}[] weighted multi-destination splitting is not supported; use a single destination"
+            ),
+        ));
+    }
+    let dest = routes
+        .first()
+        .and_then(|r| r.get("destination"))
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!("VirtualService {kind}[] route requires a destination"),
+            )
+        })?;
+    let host = string_field(dest, "host").ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!("VirtualService {kind}[] route.destination.host is required"),
+        )
+    })?;
+    let port = resolve_destination_port(object, dest, host, acc)?.ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!(
+                "VirtualService {kind}[] route.destination.port is required for stream routing"
+            ),
+        )
+    })?;
+    Ok((host.to_string(), port))
+}
+
+/// Translate VirtualService L4 routes into Ferrum stream proxies, reusing the
+/// same stream + SNI machinery as gateway / east-west passthrough:
+///   - `spec.tls[]` → a **passthrough** TCP proxy keyed by SNI (`hosts =
+///     match.sniHosts`), forwarding the encrypted bytes to the destination (no
+///     TLS termination).
+///   - `spec.tcp[]` → a plain TCP proxy keyed by `listen_port`.
+///
+/// `match.port` selects the listen port (falling back to the destination port
+/// when omitted). Unsupported match predicates (source-identity / CIDR /
+/// gateways) and weighted splitting fail closed via the helpers above.
+fn virtual_service_l4_proxies(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+) -> Result<Vec<Proxy>, K8sTranslateError> {
+    let namespace = &object.metadata.namespace;
+    let vs_name = &object.metadata.name;
+    let mut proxies = Vec::new();
+
+    if let Some(blocks) = object.spec.get("tls").and_then(Value::as_array) {
+        for (bi, block) in blocks.iter().enumerate() {
+            let (backend_host, backend_port) = l4_route_destination(object, block, "tls", acc)?;
+            let matches = block
+                .get("match")
+                .and_then(Value::as_array)
+                .filter(|matches| !matches.is_empty())
+                .ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "VirtualService tls[] route requires a non-empty match with sniHosts",
+                    )
+                })?;
+            for (mi, m) in matches.iter().enumerate() {
+                reject_unsupported_l4_match(object, m, "tls")?;
+                let sni_hosts = string_array(m, "sniHosts");
+                if sni_hosts.is_empty() {
+                    return Err(invalid_resource(
+                        object,
+                        "VirtualService tls[] match requires sniHosts for SNI routing",
+                    ));
+                }
+                let listen_port = optional_port_field(object, m.get("port"), "tls[].match.port")?
+                    .unwrap_or(backend_port);
+                let mut proxy = super::proxy_for_route(super::RouteProxySpec {
+                    id: resource_id("istio-vs", namespace, vs_name, &format!("tls-{bi}-{mi}")),
+                    namespace: namespace.clone(),
+                    hosts: sni_hosts,
+                    listen_path: None,
+                    strip_listen_path: false,
+                    backend_host: backend_host.clone(),
+                    backend_port,
+                    upstream_id: None,
+                    backend_scheme: crate::config::types::BackendScheme::Tcp,
+                    listen_port: Some(listen_port),
+                    retry: None,
+                    backend_read_timeout_ms: None,
+                });
+                proxy.passthrough = true;
+                proxies.push(proxy);
+            }
+        }
+    }
+
+    if let Some(blocks) = object.spec.get("tcp").and_then(Value::as_array) {
+        for (bi, block) in blocks.iter().enumerate() {
+            let (backend_host, backend_port) = l4_route_destination(object, block, "tcp", acc)?;
+            let listen_ports: Vec<u16> = match block.get("match").and_then(Value::as_array) {
+                Some(ms) if !ms.is_empty() => {
+                    let mut ports = Vec::with_capacity(ms.len());
+                    for m in ms {
+                        reject_unsupported_l4_match(object, m, "tcp")?;
+                        if m.get("sniHosts").is_some() {
+                            return Err(invalid_resource(
+                                object,
+                                "VirtualService tcp[] match must not set sniHosts; use tls[] for SNI routing",
+                            ));
+                        }
+                        ports.push(
+                            optional_port_field(object, m.get("port"), "tcp[].match.port")?
+                                .unwrap_or(backend_port),
+                        );
+                    }
+                    ports
+                }
+                _ => vec![backend_port],
+            };
+            for (mi, port) in listen_ports.into_iter().enumerate() {
+                let proxy = super::proxy_for_route(super::RouteProxySpec {
+                    id: resource_id("istio-vs", namespace, vs_name, &format!("tcp-{bi}-{mi}")),
+                    namespace: namespace.clone(),
+                    hosts: Vec::new(),
+                    listen_path: None,
+                    strip_listen_path: false,
+                    backend_host: backend_host.clone(),
+                    backend_port,
+                    upstream_id: None,
+                    backend_scheme: crate::config::types::BackendScheme::Tcp,
+                    listen_port: Some(port),
+                    retry: None,
+                    backend_read_timeout_ms: None,
+                });
+                proxies.push(proxy);
+            }
+        }
+    }
+
+    Ok(proxies)
+}
+
 fn virtual_service_routes(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
 ) -> Result<VsRouteResult, K8sTranslateError> {
-    // L4 routing (`spec.tcp[]` SNI/port → destination and `spec.tls[]` SNI →
-    // destination) is not yet materialized into Ferrum stream/SNI proxies.
-    // FAIL CLOSED rather than silently dropping these routes: a VirtualService
-    // that relies on L4 routing must not appear to translate cleanly while its
-    // TCP/TLS traffic is blackholed. Surface a warning for operator visibility
-    // and reject the resource (consistent with how EnvoyFilter is rejected).
-    let tcp_routes = object.spec.get("tcp").and_then(Value::as_array);
-    let tls_routes = object.spec.get("tls").and_then(Value::as_array);
-    let has_tcp = tcp_routes.is_some_and(|r| !r.is_empty());
-    let has_tls = tls_routes.is_some_and(|r| !r.is_empty());
-    if has_tcp || has_tls {
-        let mut kinds = Vec::with_capacity(2);
-        if has_tcp {
-            kinds.push("spec.tcp");
-        }
-        if has_tls {
-            kinds.push("spec.tls");
-        }
-        let kinds = kinds.join(" / ");
-        acc.warnings.push(format!(
-            "VirtualService '{}/{}' declares L4 routes ({}); Ferrum does not yet materialize \
-             VirtualService L4 (TCP/TLS-SNI) routing and fails closed rather than silently \
-             dropping them. Model L4 routing with an explicit stream Proxy / east-west gateway \
-             SNI passthrough instead.",
-            object.metadata.namespace, object.metadata.name, kinds
-        ));
-        return Err(invalid_resource(
-            object,
-            format!(
-                "VirtualService L4 routing ({kinds}) is not supported; remove the L4 routes or \
-                 model them as a stream Proxy. Failing closed to avoid silently dropping L4 traffic."
-            ),
-        ));
-    }
-
+    // L4 routing: `spec.tls[]` (SNI passthrough) and `spec.tcp[]` (port) are
+    // materialized into Ferrum stream proxies below, reusing the gateway /
+    // east-west stream + SNI machinery. Match predicates Ferrum's stream layer
+    // cannot express (source-identity / CIDR / gateways) and weighted splitting
+    // fail closed inside `virtual_service_l4_proxies`.
     let hosts = string_array(&object.spec, "hosts");
-    let mut proxies = Vec::new();
+    let mut proxies = virtual_service_l4_proxies(object, acc)?;
     let mut upstreams = Vec::new();
     let mut plugins = Vec::new();
     let mut deferred_uri_less_proxies = Vec::new();
@@ -2329,6 +2483,17 @@ fn virtual_service_routes(
             // fire-and-forget task plumbing on the dispatch hot path.
             if let Some(mirror_plugin) = route_mirror_plugin(object, http, acc, &proxy_id)? {
                 route_plugins.push(mirror_plugin);
+            }
+
+            // Istio `http[].corsPolicy`: translate to a proxy-scoped `cors`
+            // plugin when the origins are representable (allowOrigins[].exact /
+            // legacy allowOrigin). prefix/regex origin matchers have no `cors`
+            // plugin equivalent, so they are left unprojected (warned + reported
+            // as a deferred field) rather than silently approximated. Like
+            // mirror this is a route-local plugin, so a route that must collapse
+            // with siblings fails closed via `route_has_uncollapsible_local_policy`.
+            if let Some(cors_plugin) = route_cors_plugin(object, http, &proxy_id) {
+                route_plugins.push(cors_plugin);
             }
 
             // Project the VirtualService `http[].fault` (if any) onto every
@@ -3068,6 +3233,128 @@ fn route_mirror_plugin(
 
 fn parse_istio_duration_secs(raw: &str) -> Option<u64> {
     parse_istio_duration_ms(raw).map(|ms| if ms == 0 { 0 } else { ms.div_ceil(1000) })
+}
+
+/// Collect a non-empty list of strings from a `corsPolicy` array field
+/// (`allowMethods` / `allowHeaders` / `exposeHeaders`). Returns `None` when the
+/// field is absent or has no string entries so the caller omits the key and the
+/// `cors` plugin applies its own default.
+fn cors_string_array(cors: &Value, key: &str) -> Option<Vec<String>> {
+    let values: Vec<String> = cors
+        .get(key)
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    (!values.is_empty()).then_some(values)
+}
+
+/// Extract CORS allowed origins from an Istio `corsPolicy`, mapped to the
+/// `cors` plugin's `allowed_origins` form. Supports `allowOrigins[].exact` (and
+/// the literal `"*"`) plus the legacy `allowOrigin` string list. Returns `None`
+/// if no origins are present or any matcher is unrepresentable (`prefix` /
+/// `regex` / non-string): Ferrum's `cors` plugin has no prefix or regex origin
+/// form, so those are left for the `cors` plugin configured directly rather
+/// than silently approximated.
+fn cors_allowed_origins(cors: &Value) -> Option<Vec<String>> {
+    if let Some(arr) = cors.get("allowOrigins").and_then(Value::as_array) {
+        let mut origins = Vec::with_capacity(arr.len());
+        for entry in arr {
+            // Istio StringMatch: only `exact` maps cleanly to the cors plugin.
+            let exact = entry.get("exact").and_then(Value::as_str)?;
+            origins.push(exact.to_string());
+        }
+        (!origins.is_empty()).then_some(origins)
+    } else if let Some(arr) = cors.get("allowOrigin").and_then(Value::as_array) {
+        // Deprecated Istio field: a plain list of exact origin strings.
+        let mut origins = Vec::with_capacity(arr.len());
+        for entry in arr {
+            origins.push(entry.as_str()?.to_string());
+        }
+        (!origins.is_empty()).then_some(origins)
+    } else {
+        None
+    }
+}
+
+/// Whether a VirtualService `http[].corsPolicy` can be faithfully translated to
+/// a `cors` plugin. Shared by the translator (emit vs. warn-and-skip) and the
+/// Istio status writer (deferred-field reporting) so the two never disagree on
+/// whether a given policy is projected. A policy is translatable when it has at
+/// least one representable origin and any `maxAge` parses as a duration.
+pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
+    let origins_ok = cors_allowed_origins(cors).is_some();
+    let max_age_ok = match cors.get("maxAge") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => parse_istio_duration_secs(s).is_some(),
+        _ => false,
+    };
+    origins_ok && max_age_ok
+}
+
+/// Build a proxy-scoped `cors` plugin for an Istio `VirtualService.http[].corsPolicy`.
+/// Returns `None` when there is no `corsPolicy`, or when the policy is not
+/// faithfully representable (`prefix`/`regex` origins, or an unparseable
+/// `maxAge`) — in that case it is left unprojected (warned, and reported as a
+/// deferred field by the status writer) rather than failing the whole
+/// VirtualService or silently approximating. This reuses the existing `cors`
+/// plugin instead of duplicating preflight/header logic, mirroring the
+/// `request_mirror` approach for `http[].mirror`.
+fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option<PluginConfig> {
+    let cors = http.get("corsPolicy")?;
+    if !cors_policy_translatable(cors) {
+        tracing::warn!(
+            namespace = %object.metadata.namespace,
+            name = %object.metadata.name,
+            "VirtualService http[].corsPolicy is not faithfully translatable (only \
+             allowOrigins[].exact / the legacy allowOrigin list and a parseable maxAge are \
+             supported); leaving it unprojected. Configure the `cors` plugin directly for \
+             prefix/regex origins."
+        );
+        return None;
+    }
+    // Guaranteed `Some` by `cors_policy_translatable`.
+    let origins = cors_allowed_origins(cors).unwrap_or_default();
+
+    let mut config = serde_json::Map::new();
+    config.insert("allowed_origins".to_string(), serde_json::json!(origins));
+    if let Some(methods) = cors_string_array(cors, "allowMethods") {
+        config.insert("allowed_methods".to_string(), serde_json::json!(methods));
+    }
+    if let Some(headers) = cors_string_array(cors, "allowHeaders") {
+        config.insert("allowed_headers".to_string(), serde_json::json!(headers));
+    }
+    if let Some(expose) = cors_string_array(cors, "exposeHeaders") {
+        config.insert("exposed_headers".to_string(), serde_json::json!(expose));
+    }
+    if let Some(max_age) = cors
+        .get("maxAge")
+        .and_then(Value::as_str)
+        .and_then(parse_istio_duration_secs)
+    {
+        config.insert("max_age".to_string(), serde_json::json!(max_age));
+    }
+    if let Some(allow_creds) = cors.get("allowCredentials").and_then(Value::as_bool) {
+        config.insert(
+            "allow_credentials".to_string(),
+            serde_json::json!(allow_creds),
+        );
+    }
+
+    let now = chrono::Utc::now();
+    Some(PluginConfig {
+        id: format!("istio-vs-cors-{proxy_id}"),
+        plugin_name: "cors".to_string(),
+        namespace: object.metadata.namespace.clone(),
+        config: Value::Object(config),
+        scope: crate::config::types::PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    })
 }
 
 pub(super) fn path_match(uri: &Value) -> Option<String> {
@@ -7430,7 +7717,7 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_subset_unsupported_fields_warn() {
+    fn destination_rule_subset_connect_timeout_applied_threshold_only_outlier_no_warn() {
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -7448,21 +7735,72 @@ extensionProviders:
             )],
             options(),
         )
-        .expect("subset with unsupported fields still translates");
+        .expect("subset traffic policy still translates");
+
+        // Per-subset connectTimeout is now applied (overrides backend connect
+        // timeout for subset-bound proxies), so it carries onto the mesh DR
+        // subset and is NOT warned as ignored.
+        let mesh = result.config.mesh.as_ref().expect("mesh config");
+        let subset_tp = mesh.destination_rules[0].subsets[0]
+            .traffic_policy
+            .as_ref()
+            .expect("subset traffic policy translated");
+        assert_eq!(
+            subset_tp.connect_timeout_ms,
+            Some(5000),
+            "subset connectTimeout 5s translates to 5000ms on the mesh DR subset"
+        );
         assert!(
-            result
+            !result
                 .warnings
                 .iter()
                 .any(|w| w.contains("subset 'v1'") && w.contains("connectTimeout")),
-            "expected subset connectTimeout warning, got {:?}",
+            "subset connectTimeout is applied now and must not warn, got {:?}",
             result.warnings
         );
+        // A threshold-only subset outlierDetection (no maxEjectionPercent) is
+        // fully applied per-subset, so it must NOT warn about the ejection cap.
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("subset 'v1'") && w.contains("outlierDetection")),
+            "threshold-only subset outlierDetection must not warn, got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn destination_rule_subset_outlier_max_ejection_percent_warns() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "subsets": [{
+                        "name": "v1",
+                        "labels": {"version": "v1"},
+                        "trafficPolicy": {
+                            "outlierDetection": {
+                                "consecutive5xxErrors": 3,
+                                "maxEjectionPercent": 50
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("subset traffic policy translates");
+
+        // Only the maxEjectionPercent *cap* remains upstream-level, so a subset
+        // that sets it surfaces the residual warning; the thresholds still apply.
         assert!(
             result
                 .warnings
                 .iter()
-                .any(|w| w.contains("subset 'v1'") && w.contains("outlierDetection")),
-            "expected subset outlierDetection warning, got {:?}",
+                .any(|w| w.contains("subset 'v1'") && w.contains("maxEjectionPercent cap")),
+            "subset with maxEjectionPercent must warn about the upstream-level cap, got {:?}",
             result.warnings
         );
     }
@@ -7739,8 +8077,8 @@ extensionProviders:
     }
 
     #[test]
-    fn virtual_service_tcp_route_fails_closed() {
-        let err = translate_k8s_objects(
+    fn virtual_service_tcp_route_materializes_stream_proxy() {
+        let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
                 serde_json::json!({
@@ -7753,13 +8091,29 @@ extensionProviders:
             )],
             options(),
         )
-        .expect_err("VirtualService L4 tcp routing must fail closed");
-        assert!(format!("{err}").contains("L4 routing"), "got: {err}");
+        .expect("VirtualService L4 tcp routing now translates to a stream proxy");
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_port == Some(3306))
+            .expect("tcp[] materializes a stream proxy on the matched port");
+        assert_eq!(proxy.backend_host, "mysql.default.svc.cluster.local");
+        assert_eq!(proxy.backend_port, 3306);
+        assert_eq!(
+            proxy.backend_scheme,
+            Some(crate::config::types::BackendScheme::Tcp)
+        );
+        assert!(!proxy.passthrough, "plain tcp[] is not passthrough");
+        assert!(
+            proxy.listen_path.is_none(),
+            "stream proxy has no listen_path"
+        );
     }
 
     #[test]
-    fn virtual_service_tls_route_fails_closed() {
-        let err = translate_k8s_objects(
+    fn virtual_service_tls_route_materializes_passthrough_proxy() {
+        let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
                 serde_json::json!({
@@ -7772,8 +8126,82 @@ extensionProviders:
             )],
             options(),
         )
-        .expect_err("VirtualService L4 tls routing must fail closed");
-        assert!(format!("{err}").contains("spec.tls"), "got: {err}");
+        .expect("VirtualService L4 tls routing now translates to a passthrough proxy");
+        // No match.port → listen port falls back to the destination port (443).
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_port == Some(443))
+            .expect("tls[] materializes a passthrough proxy");
+        assert!(proxy.passthrough, "tls[] SNI routing is passthrough");
+        assert_eq!(proxy.hosts, vec!["secure.example.com".to_string()]);
+        assert_eq!(proxy.backend_host, "backend.default.svc.cluster.local");
+        assert_eq!(proxy.backend_port, 443);
+    }
+
+    #[test]
+    fn virtual_service_tls_route_empty_match_fails_closed() {
+        // An empty `match: []` on a tls[] route carries no sniHosts to key SNI
+        // routing on. It must be rejected (same as a missing match) rather than
+        // silently emitting no proxy while status reports the VS accepted.
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["secure.example.com"],
+                    "tls": [{
+                        "match": [],
+                        "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 443}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("empty tls[] match must fail closed, not silently drop the route");
+        assert!(
+            format!("{err:?}").contains("non-empty match"),
+            "expected a non-empty-match rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_l4_proxy_ids_use_managed_prefix() {
+        // Generated L4 stream proxies must carry the `istio-vs-` managed prefix
+        // so the K8s reconciler's cleanup allowlist removes them on VS
+        // delete/change instead of leaking + duplicating across reconciles.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["secure.example.com"],
+                    "tls": [{
+                        "match": [{"sniHosts": ["secure.example.com"], "port": 8443}],
+                        "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 443}}}]
+                    }],
+                    "tcp": [{
+                        "match": [{"port": 9000}],
+                        "route": [{"destination": {"host": "raw.default.svc.cluster.local", "port": {"number": 9000}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("VS L4 routing translates");
+        let l4: Vec<&str> = result
+            .config
+            .proxies
+            .iter()
+            .filter(|p| p.listen_port == Some(8443) || p.listen_port == Some(9000))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(l4.len(), 2, "both L4 proxies materialize, got {l4:?}");
+        for id in &l4 {
+            assert!(
+                id.starts_with("istio-vs-") && !id.starts_with("__"),
+                "L4 proxy id must use the managed istio-vs- prefix for reconciler cleanup, got {id}"
+            );
+        }
     }
 
     // -- VirtualService fault injection / retry / timeout ----------------
@@ -13930,12 +14358,19 @@ extensionProviders:
             policy.load_balancer,
             Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest))
         ));
+        // portLevelSettings[].tls is now resolved onto the per-port override and
+        // applied per-port (see src/modes/mesh/mod.rs), so it parses into the
+        // port policy and must NOT emit the old "not enforced per-port" warning.
         assert!(
-            result
+            policy.tls.is_some(),
+            "port-level tls must parse into the port policy, got {policy:?}"
+        );
+        assert!(
+            !result
                 .warnings
                 .iter()
-                .any(|w| w.contains("portLevelSettings[].tls is parsed but not enforced per-port")),
-            "expected warning for unenforced per-port tls, got {:?}",
+                .any(|w| w.contains("not enforced per-port")),
+            "stale per-port tls warning must be gone, got {:?}",
             result.warnings
         );
     }

@@ -577,10 +577,9 @@ fn resolve_upstream_tls_switches_upstream_proxy_back_to_direct_tls() {
 fn resolve_upstream_tls_falls_back_when_subset_overlay_is_empty_or_missing() {
     let mut upstream = make_upstream("reviews-u");
     upstream.backend_tls_server_ca_cert_path = Some("/mesh/upstream-ca.pem".to_string());
-    upstream.resolved_subset_tls.insert(
-        "empty".to_string(),
-        ResolvedSubsetTrafficPolicy { tls: None },
-    );
+    upstream
+        .resolved_subset_tls
+        .insert("empty".to_string(), ResolvedSubsetTrafficPolicy::default());
     upstream.resolved_subset_tls.insert(
         "canary".to_string(),
         ResolvedSubsetTrafficPolicy {
@@ -590,6 +589,7 @@ fn resolve_upstream_tls_falls_back_when_subset_overlay_is_empty_or_missing() {
                 san_allow_list: vec!["canary.mesh.internal".to_string()],
                 ..BackendTlsConfig::default_verify()
             }),
+            passive_health_check: None,
         },
     );
     upstream

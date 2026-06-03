@@ -1,6 +1,7 @@
 mod admin;
 mod cli;
 mod config;
+mod env_lock;
 mod gateway_core;
 mod identity;
 mod notifications;

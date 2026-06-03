@@ -35,6 +35,11 @@ const EXPECTED_INDEX_NAMES: &[&str] = &[
     "idx_consumers_ns_updated",
     "idx_plugin_configs_ns_updated",
     "idx_upstreams_ns_updated",
+    // Covering indexes for the incremental-poll deletion diff.
+    "idx_proxies_ns_id",
+    "idx_consumers_ns_id",
+    "idx_plugin_configs_ns_id",
+    "idx_upstreams_ns_id",
 ];
 
 #[tokio::test]
@@ -61,6 +66,45 @@ async fn test_migration_runner_fresh_database() {
             "Expected index '{}' to exist after V001 migration, found: {:?}",
             expected,
             index_names
+        );
+    }
+}
+
+/// The incremental-poll deletion diff runs `SELECT id ... WHERE namespace = ?`
+/// on all four resource tables every poll cycle (see
+/// `db_loader::load_table_ids`). The `(namespace, id)` covering indexes must
+/// let SQLite answer that query without touching the table b-tree — an
+/// index-only scan — otherwise each poll re-walks every row to read `id`,
+/// which is the dominant cause of SQLite's per-poll cost at scale. SQLite
+/// reports a covering index as "USING COVERING INDEX" in EXPLAIN QUERY PLAN,
+/// and only `(namespace, id)` (not `(namespace, updated_at)`) can cover a
+/// projection of `id`, so a "COVERING INDEX" plan pins the new indexes.
+#[tokio::test]
+async fn test_v001_deletion_diff_uses_covering_index() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+
+    for (table, index) in [
+        ("proxies", "idx_proxies_ns_id"),
+        ("consumers", "idx_consumers_ns_id"),
+        ("plugin_configs", "idx_plugin_configs_ns_id"),
+        ("upstreams", "idx_upstreams_ns_id"),
+    ] {
+        let sql = format!("EXPLAIN QUERY PLAN SELECT id FROM {table} WHERE namespace = ?");
+        let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql)
+            .bind("ferrum")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let plan: String = rows
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("detail").ok())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            plan.contains("COVERING INDEX") && plan.contains(index),
+            "deletion-diff query on `{table}` should use covering index `{index}`, got plan: {plan}"
         );
     }
 }

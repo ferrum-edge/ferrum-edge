@@ -16,10 +16,11 @@
 //!   (UNSET → PERMISSIVE in Istio) and surfaces port-level overrides.
 //! - `DestinationRule` — status reports whether the rule's host could be
 //!   matched and which `connectionPool` knobs landed vs. were deferred.
-//! - `VirtualService` — status reports host/HTTP-route counts. `tcp`/`tls`
-//!   route blocks are rejected fail-closed (reported as `Invalid`); HTTP
-//!   `mirror`/`rewrite`/`redirect` are translated; only `corsPolicy` is
-//!   flagged as a deferred field.
+//! - `VirtualService` — status reports host/HTTP-route counts. `tcp`/`tls` L4
+//!   route blocks are translated to stream proxies (port / SNI-passthrough);
+//!   HTTP `mirror`/`rewrite`/`redirect`/`corsPolicy` are translated. Unsupported
+//!   L4 match predicates (source/CIDR/gateways) and weighted splitting are
+//!   rejected fail-closed (`Invalid`).
 //! - `ServiceEntry` — status reports the resolved `resolution`/`location`
 //!   and host/endpoint/port counts.
 //! - `RequestAuthentication` — status reports the resolved scope and the
@@ -559,21 +560,23 @@ fn destination_rule_status(
 
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
-            // T1-C deferred fields: portLevelSettings.tls (parsed but
-            // not enforced), per-subset connectionPool.tcp.connectTimeout,
-            // per-subset outlierDetection, and the parsed-but-dropped
-            // connectionPool.http knobs the translator only warns on
-            // (http1MaxPendingRequests / maxRetries / h2UpgradePolicy).
-            // Surface them so operators see the gap in `kubectl describe`.
+            // T1-C deferred fields: the per-subset outlierDetection
+            // maxEjectionPercent cap, and the parsed-but-dropped connectionPool.http
+            // knobs the translator only warns on (http1MaxPendingRequests /
+            // maxRetries / h2UpgradePolicy).
+            // Now APPLIED (no longer deferred): per-subset
+            // connectionPool.tcp.connectTimeout (overrides backend_connect_timeout_ms
+            // for subset-bound proxies), portLevelSettings[].tls (per-port backend
+            // TLS projected onto the effective proxy's resolved_tls), and per-subset
+            // outlierDetection *thresholds* (consecutive errors / interval /
+            // base-ejection / min-health) — only the maxEjectionPercent cap remains
+            // upstream-level.
+            // Surface the rest so operators see the gap in `kubectl describe`.
             let mut deferred: Vec<&'static str> = Vec::new();
-            if has_port_level_tls(&object.spec) {
-                deferred.push("portLevelSettings[].tls (parsed but not enforced)");
-            }
-            if has_subset_port_overrides(&object.spec) {
-                deferred.push("subsets[].trafficPolicy.connectionPool.tcp.connectTimeout");
-            }
-            if has_subset_outlier_detection(&object.spec) {
-                deferred.push("subsets[].trafficPolicy.outlierDetection");
+            if has_subset_outlier_max_ejection_percent(&object.spec) {
+                deferred.push(
+                    "subsets[].trafficPolicy.outlierDetection.maxEjectionPercent (thresholds applied per-subset; ejection cap uses upstream-level)",
+                );
             }
             deferred.extend(deferred_connection_pool_http_fields(&object.spec));
             let message = if deferred.is_empty() {
@@ -614,29 +617,12 @@ fn destination_rule_status(
     accepted_status(object, accepted, reason, &message, detail)
 }
 
-fn has_port_level_tls(spec: &Value) -> bool {
-    spec.get("trafficPolicy")
-        .and_then(|tp| tp.get("portLevelSettings"))
-        .and_then(Value::as_array)
-        .is_some_and(|entries| entries.iter().any(|e| e.get("tls").is_some()))
-}
-
-fn has_subset_port_overrides(spec: &Value) -> bool {
-    spec.get("subsets")
-        .and_then(Value::as_array)
-        .is_some_and(|subsets| {
-            subsets.iter().any(|subset| {
-                subset
-                    .get("trafficPolicy")
-                    .and_then(|tp| tp.get("connectionPool"))
-                    .and_then(|cp| cp.get("tcp"))
-                    .and_then(|tcp| tcp.get("connectTimeout"))
-                    .is_some()
-            })
-        })
-}
-
-fn has_subset_outlier_detection(spec: &Value) -> bool {
+/// True only when some subset's `outlierDetection` sets `maxEjectionPercent`.
+/// The thresholds (consecutive errors / interval / base-ejection / min-health)
+/// are applied per-subset, so they are NOT deferred; only the ejection *cap*
+/// still resolves at the upstream level, so a threshold-only subset policy must
+/// not surface a misleading deferred-field warning.
+fn has_subset_outlier_max_ejection_percent(spec: &Value) -> bool {
     spec.get("subsets")
         .and_then(Value::as_array)
         .is_some_and(|subsets| {
@@ -644,6 +630,7 @@ fn has_subset_outlier_detection(spec: &Value) -> bool {
                 subset
                     .get("trafficPolicy")
                     .and_then(|tp| tp.get("outlierDetection"))
+                    .and_then(|od| od.get("maxEjectionPercent"))
                     .is_some()
             })
         })
@@ -733,11 +720,11 @@ fn accepted_status(
 }
 
 /// Status for `VirtualService`. The translator consumes `spec.http` routes
-/// including `mirror` / `rewrite` / `redirect`. `spec.tcp` / `spec.tls`
-/// route blocks are rejected fail-closed and surface through the `Invalid`
-/// arm (as does any `K8sTranslateError` for an unsupported match predicate,
-/// bad backend, etc.). The only HTTP-route field still parsed-but-dropped is
-/// `corsPolicy`, surfaced as a deferred field.
+/// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /
+/// `spec.tls` L4 route blocks (translated to stream proxies: port / SNI
+/// passthrough). Unsupported L4 match predicates / weighted splitting and any
+/// other `K8sTranslateError` (bad backend, etc.) surface through the `Invalid`
+/// arm. `corsPolicy` with prefix/regex origins is the remaining deferred field.
 fn virtual_service_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -794,21 +781,34 @@ fn virtual_service_status(
 
 /// VirtualService HTTP-route fields the translator parses past but never
 /// projects. `tcp` / `tls` route arrays are not listed here: they are
-/// rejected fail-closed by the translator and reported via the `Invalid`
-/// status arm. `corsPolicy` is the only remaining parsed-but-dropped field.
+/// translated to stream proxies (unsupported matches / weighted splitting
+/// surface via the `Invalid` arm, not as deferred). `corsPolicy` is translated
+/// to a `cors` plugin when its origins are representable; it is deferred only
+/// when they are not.
 fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     let mut deferred: Vec<&'static str> = Vec::new();
     // `spec.tcp[]` / `spec.tls[]` are NOT listed as deferred: the translator
-    // rejects them fail-closed with a `K8sTranslateError`, so they surface
-    // through the `Invalid` arm of `virtual_service_status`. `mirror` /
-    // `mirrorPercentage` / `redirect` / `rewrite` are now translated
-    // (request_mirror plugin + dispatch-rule rewrite/redirect), leaving
-    // `corsPolicy` as the only parsed-but-unprojected HTTP-route field.
+    // materializes them as stream proxies, and unsupported matches surface via
+    // the `Invalid` arm of `virtual_service_status`. `mirror` /
+    // `mirrorPercentage` / `redirect` / `rewrite` are translated, and
+    // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
+    // origins are representable (allowOrigins[].exact / legacy allowOrigin and
+    // a parseable maxAge). It remains a deferred field only when it uses an
+    // origin matcher Ferrum cannot map (prefix/regex) or an unparseable maxAge,
+    // in which case the translator leaves it unprojected. The shared
+    // `cors_policy_translatable` predicate keeps the translator and this report
+    // in lockstep.
     let http_routes = spec.get("http").and_then(Value::as_array);
-    if http_routes
-        .is_some_and(|routes| routes.iter().any(|route| route.get("corsPolicy").is_some()))
-    {
-        deferred.push("http[].corsPolicy (parsed but not projected)");
+    if http_routes.is_some_and(|routes| {
+        routes.iter().any(|route| {
+            route
+                .get("corsPolicy")
+                .is_some_and(|cors| !crate::config_sources::k8s::cors_policy_translatable(cors))
+        })
+    }) {
+        deferred.push(
+            "http[].corsPolicy with prefix/regex origins (not projected; use the cors plugin)",
+        );
     }
     deferred
 }
@@ -1563,7 +1563,10 @@ mod tests {
     }
 
     #[test]
-    fn destination_rule_with_port_level_tls_surfaces_deferred_field() {
+    fn destination_rule_with_port_level_tls_is_applied_not_deferred() {
+        // portLevelSettings[].tls is now applied per-port (resolved onto the
+        // effective proxy's resolved_tls at dispatch), so it must NOT be
+        // reported as a deferred field.
         let obj = object(
             "networking.istio.io/v1",
             "DestinationRule",
@@ -1578,6 +1581,11 @@ mod tests {
             }),
         );
         let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
             .as_array()
@@ -1586,10 +1594,77 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred
+            !deferred
                 .iter()
                 .any(|f| f.contains("portLevelSettings[].tls")),
-            "deferred_fields should mention portLevelSettings[].tls, got {deferred:?}"
+            "portLevelSettings[].tls is applied now and must not be deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_threshold_only_subset_outlier_not_deferred() {
+        // A subset outlierDetection that sets only thresholds (no
+        // maxEjectionPercent) is applied per-subset, so the status must NOT
+        // surface the maxEjectionPercent deferred field.
+        let obj = object(
+            "networking.istio.io/v1",
+            "DestinationRule",
+            "outlier-thresholds-dr",
+            json!({
+                "host": "reviews.default.svc.cluster.local",
+                "subsets": [{
+                    "name": "v1",
+                    "labels": {"version": "v1"},
+                    "trafficPolicy": {
+                        "outlierDetection": {"consecutive5xxErrors": 3, "interval": "5s"}
+                    }
+                }]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            !deferred.iter().any(|f| f.contains("maxEjectionPercent")),
+            "threshold-only subset outlierDetection must not surface a maxEjectionPercent deferred field, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_subset_outlier_max_ejection_percent_is_deferred() {
+        // Only the maxEjectionPercent *cap* remains upstream-level, so a subset
+        // that sets it surfaces the residual deferred field.
+        let obj = object(
+            "networking.istio.io/v1",
+            "DestinationRule",
+            "outlier-cap-dr",
+            json!({
+                "host": "reviews.default.svc.cluster.local",
+                "subsets": [{
+                    "name": "v1",
+                    "labels": {"version": "v1"},
+                    "trafficPolicy": {
+                        "outlierDetection": {"consecutive5xxErrors": 3, "maxEjectionPercent": 50}
+                    }
+                }]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("maxEjectionPercent")),
+            "subset with maxEjectionPercent must surface the deferred cap field, got {deferred:?}"
         );
     }
 
@@ -1969,16 +2044,21 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_tcp_routes_are_rejected() {
-        // Tier 3 makes `spec.tcp[]` / `spec.tls[]` fail-closed translator
-        // errors rather than silently-dropped (deferred) fields.
+    fn virtual_service_tcp_unsupported_match_rejected() {
+        // `spec.tcp[]` / `spec.tls[]` are translated to Ferrum stream proxies
+        // (port / SNI-passthrough routing), but match predicates the stream
+        // layer cannot express (here `sourceLabels`) fail closed as `Invalid`
+        // rather than mis-routing.
         let obj = object(
             "networking.istio.io/v1",
             "VirtualService",
             "tcp-vs",
             json!({
                 "hosts": ["db.default.svc.cluster.local"],
-                "tcp": [ { "route": [ { "destination": { "host": "db.default.svc.cluster.local" } } ] } ]
+                "tcp": [ {
+                    "match": [ { "port": 3306, "sourceLabels": { "app": "billing" } } ],
+                    "route": [ { "destination": { "host": "db.default.svc.cluster.local", "port": { "number": 3306 } } } ]
+                } ]
             }),
         );
         let updates = plan_istio_status_updates(&[obj], options());
@@ -1991,15 +2071,39 @@ mod tests {
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         let error = detail["translation"]["error"].as_str().unwrap();
         assert!(
-            error.contains("tcp"),
-            "rejection error should mention tcp, got: {error}"
+            error.contains("sourceLabels"),
+            "rejection error should mention the unsupported match, got: {error}"
         );
     }
 
     #[test]
-    fn virtual_service_cors_policy_deferred_but_mirror_is_not() {
-        // `mirror` is now translated (request_mirror plugin), so it must NOT
-        // be reported as deferred. `corsPolicy` is still parsed-but-dropped.
+    fn virtual_service_supported_tcp_route_is_accepted() {
+        // A plain port-routed `spec.tcp[]` block translates to a stream proxy
+        // and is accepted.
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "tcp-ok-vs",
+            json!({
+                "hosts": ["db.default.svc.cluster.local"],
+                "tcp": [ {
+                    "match": [ { "port": 3306 } ],
+                    "route": [ { "destination": { "host": "db.default.svc.cluster.local", "port": { "number": 3306 } } } ]
+                } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+    }
+
+    #[test]
+    fn virtual_service_cors_policy_exact_origin_not_deferred() {
+        // `mirror` and an exact-origin `corsPolicy` are both translated now, so
+        // neither is reported as deferred.
         let obj = object(
             "networking.istio.io/v1",
             "VirtualService",
@@ -2029,12 +2133,50 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("corsPolicy")),
-            "http[].corsPolicy should be flagged as deferred, got {deferred:?}"
+            !deferred.iter().any(|f| f.contains("corsPolicy")),
+            "exact-origin http[].corsPolicy is translated and must not be deferred, got {deferred:?}"
         );
         assert!(
             !deferred.iter().any(|f| f.contains("mirror")),
             "http[].mirror is translated and must not be deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_cors_policy_regex_origin_deferred() {
+        // A `regex`/`prefix` origin matcher has no `cors` plugin equivalent, so
+        // the translator leaves the policy unprojected and the status writer
+        // reports it as a deferred field (routing still applies, FerrumAccepted=True).
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "cors-vs-regex",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "corsPolicy": { "allowOrigins": [ { "regex": "https://.*\\.example\\.com" } ] }
+                    }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("corsPolicy")),
+            "regex-origin http[].corsPolicy should be flagged as deferred, got {deferred:?}"
         );
     }
 

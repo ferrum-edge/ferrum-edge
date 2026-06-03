@@ -35,6 +35,30 @@ pub use ca::{CaBackend, CertificateAuthority, SharedCa};
 #[allow(unused_imports)]
 pub use spiffe::{SpiffeId, SpiffeIdError, TrustDomain, TrustDomainError};
 
+/// Canonical read of the master mesh production guardrail
+/// (`FERRUM_MESH_PRODUCTION_MODE`).
+///
+/// When `true`, identity-less / dev-only mesh postures are refused
+/// unconditionally: the self-signed CA bootstrap ([`ca::bootstrap::bootstrap_dev_root`]),
+/// the [`attestation::static_id::StaticAttestor`], and a `CaBackend::None` mesh
+/// data plane (enforced in `EnvConfig` validation). Like the other identity
+/// guardrails it is read directly from the environment — intentionally not
+/// parsed into `EnvConfig` — so it stays readable before config load. The
+/// per-posture dev opt-ins (`FERRUM_MESH_CA_BOOTSTRAP_DEV`,
+/// `FERRUM_MESH_ALLOW_STATIC_ID`, `FERRUM_MESH_ALLOW_NO_CA`) stay separate and
+/// must not be collapsed (see `.claude/rules/tls-security.md`).
+pub fn production_mode() -> bool {
+    std::env::var("FERRUM_MESH_PRODUCTION_MODE")
+        .map(|v| {
+            // Accept the same truthy spellings as `EnvConfig`'s bool parser
+            // (`true` / `1`, case-insensitive) so a guardrail can't be bypassed
+            // by a common boolean form.
+            let v = v.trim();
+            v.eq_ignore_ascii_case("true") || v == "1"
+        })
+        .unwrap_or(false)
+}
+
 /// A single fetched X.509-SVID with its surrounding trust material.
 ///
 /// Hot-swapped by [`workload_api::fetch_loop`] / [`rotation`] via `ArcSwap`

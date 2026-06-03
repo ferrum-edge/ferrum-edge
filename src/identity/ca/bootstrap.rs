@@ -54,10 +54,7 @@ pub struct BootstrappedRoot {
 
 /// Returns `true` iff both gates allow bootstrap to run.
 pub fn bootstrap_allowed() -> bool {
-    let production = env::var("FERRUM_MESH_PRODUCTION_MODE")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if production {
+    if crate::identity::production_mode() {
         return false;
     }
     env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV")
@@ -70,10 +67,7 @@ pub fn bootstrap_allowed() -> bool {
 ///
 /// Refuses to run unless [`bootstrap_allowed`] returns `true`.
 pub fn bootstrap_dev_root(config: BootstrapConfig) -> Result<BootstrappedRoot, CaError> {
-    if env::var("FERRUM_MESH_PRODUCTION_MODE")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
+    if crate::identity::production_mode() {
         return Err(CaError::Config(
             "FERRUM_MESH_PRODUCTION_MODE=true — refusing to bootstrap a self-signed root. \
              Provide an existing root via FERRUM_MESH_CA_CERT_PATH / FERRUM_MESH_CA_KEY_PATH."

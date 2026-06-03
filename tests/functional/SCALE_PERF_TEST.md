@@ -38,6 +38,19 @@ docker run -d --name ferrum-scale-test-pg \
 
 The test automatically skips if the container isn't running.
 
+### MongoDB (`test_scale_perf_30k_proxies_mongodb`)
+
+Uses a MongoDB Docker container to measure how the document-store backend scales. The gateway stores its config collections in the `ferrum_scale` database (`FERRUM_MONGO_DATABASE`) and creates the production indexes automatically on startup, so the poll/deletion-diff queries exercise the same `{namespace, updated_at}` / `{namespace, _id}` covering indexes used in production.
+
+**Prerequisite**: Start the MongoDB container:
+
+```bash
+docker run -d --name ferrum-scale-test-mongo \
+  -p 27117:27017 mongo:7
+```
+
+The test automatically skips if the container isn't running, and drops the `ferrum_scale` database (via `docker exec ... mongosh`) at the start of each run for a clean baseline.
+
 ## Test Structure
 
 The test runs in 10 batches. Each batch:
@@ -65,6 +78,10 @@ cargo test --test functional_tests test_scale_perf_30k_proxies \
 
 # PostgreSQL variant (requires Docker container above)
 cargo test --test functional_tests test_scale_perf_30k_proxies_postgres \
+  --all-features -- --ignored --nocapture
+
+# MongoDB variant (requires Docker container above)
+cargo test --test functional_tests test_scale_perf_30k_proxies_mongodb \
   --all-features -- --ignored --nocapture
 ```
 

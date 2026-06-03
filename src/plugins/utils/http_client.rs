@@ -462,6 +462,19 @@ impl PluginHttpClient {
         client
     }
 
+    /// Build a default-pool client carrying a specific backend IP egress policy.
+    ///
+    /// Used for admin plugin-config validation in modes that have no
+    /// `ProxyState` (e.g. control plane), so a plugin's endpoint IP-policy
+    /// check honors the gateway's configured `FERRUM_BACKEND_ALLOW_IPS` rather
+    /// than defaulting open (`BackendAllowIps::Both`). Without this, a CP could
+    /// accept a literal-IP backend endpoint that data planes later reject.
+    pub fn default_with_backend_allow_ips(backend_allow_ips: BackendAllowIps) -> Self {
+        let mut client = Self::from_pool_config(&PoolConfig::default());
+        client.backend_allow_ips = backend_allow_ips;
+        client
+    }
+
     /// Build a plugin HTTP client from pool config with custom slow-call and
     /// retry settings, without a DNS cache.
     ///
@@ -637,6 +650,33 @@ impl PluginHttpClient {
         let request = request.build()?;
         self.execute_request(request, label, Some(accumulator), None)
             .await
+    }
+
+    /// Send a request with redacted logging AND elapsed-time accumulation.
+    ///
+    /// Combines [`execute_redacted`] (logs only `redacted_url`, returns a
+    /// sanitized error string so the full secret-bearing URL never reaches
+    /// logs) with [`execute_tracked`] (adds the round-trip time in nanoseconds
+    /// to `accumulator`). Plugins that make external HTTP calls during the
+    /// request lifecycle use this so the gateway can report
+    /// `latency_plugin_external_io_ms` in transaction logs.
+    pub async fn execute_redacted_tracked(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+        redacted_url: &str,
+        accumulator: &AtomicU64,
+    ) -> Result<reqwest::Response, String> {
+        let request = request.build().map_err(|e| {
+            let error_class = classify_reqwest_error(&e);
+            format!("{error_class} building request to {redacted_url}")
+        })?;
+        self.execute_request(request, label, Some(accumulator), Some(redacted_url))
+            .await
+            .map_err(|e| {
+                let error_class = classify_reqwest_error(&e);
+                format!("{error_class} calling {redacted_url}")
+            })
     }
 
     async fn execute_request(

@@ -123,7 +123,7 @@ jobs:
           shared-key: "ci-test-integration-archive"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@920ab1831fbf4fb3ef75c8ead83556c918bb7290 # v2
+        uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2
         with:
           tool: cargo-nextest
 
@@ -283,7 +283,7 @@ jobs:
         # Same prebuilt-binary install action as `test-functional`. Nextest
         # gives us per-test process isolation, OR'd substring filters via
         # positional args, and a much nicer progress UI than libtest.
-        uses: taiki-e/install-action@920ab1831fbf4fb3ef75c8ead83556c918bb7290 # v2
+        uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2
         with:
           tool: cargo-nextest
 
@@ -455,7 +455,7 @@ jobs:
           shared-key: "ci-test-functional"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@920ab1831fbf4fb3ef75c8ead83556c918bb7290 # v2
+        uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2
         with:
           tool: cargo-nextest
 
@@ -633,7 +633,7 @@ jobs:
         # Nextest's process-per-test model isolates port/process contention
         # and ships built-in slow-test + retry support, which fits this E2E
         # suite better than libtest's shared-process scheduler.
-        uses: taiki-e/install-action@920ab1831fbf4fb3ef75c8ead83556c918bb7290 # v2
+        uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2
         with:
           tool: cargo-nextest
 
@@ -671,7 +671,7 @@ jobs:
         #
         # The filter expression excludes the long stress suites that are
         # intentionally local-only:
-        #   - test_scale_perf_30k_proxies (matches both base + _postgres)
+        #   - test_scale_perf_30k_proxies (matches base + _postgres + _mongodb)
         #   - test_load_stress_10k_proxies (single ignored test in that file)
         #
         # `FERRUM_SKIP_GATEWAY_BUILD=1` makes `ensure_gateway_built()` in the
@@ -1048,8 +1048,9 @@ jobs:
 
       - name: Install nightly Rust with rust-src
         if: steps.changes.outputs.ebpf_changed == 'true'
-        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
+          toolchain: nightly
           components: rust-src
 
       - name: Install stable Rust for shared types
@@ -1112,8 +1113,9 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install nightly Rust with rust-src
-        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
+          toolchain: nightly
           components: rust-src
 
       - uses: ./.github/actions/setup-rust-ci

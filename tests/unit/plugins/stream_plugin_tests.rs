@@ -804,6 +804,17 @@ fn test_http_only_plugins_complete_coverage() {
     let plugins = vec![
         ("response_caching", json!({"ttl_seconds": 60})),
         ("graphql", json!({"max_depth": 100})),
+        (
+            "ai_semantic_firewall",
+            json!({
+                "provider": {
+                    "type": "openai_compatible_embeddings",
+                    "endpoint": "http://127.0.0.1:9/v1/embeddings",
+                    "model": "test-embedding-model"
+                },
+                "builtins": {"prompt_injection": true}
+            }),
+        ),
     ];
 
     for (name, config) in plugins {

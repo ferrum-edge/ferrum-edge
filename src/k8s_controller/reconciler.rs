@@ -592,6 +592,7 @@ fn gateway_config_content_changed(new_config: &GatewayConfig, old_config: &Gatew
 const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
 const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &["gwapi-route-upstream-", "istio-vs-upstream-"];
 const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] = &[
+    "istio-vs-cors-",
     "istio-vs-fi-",
     "istio-vs-mirror-",
     "istio-vs-mrd-",
@@ -1143,6 +1144,59 @@ mod tests {
         );
         assert!(merged.known_namespaces.contains(&"db".to_string()));
         assert!(merged.known_namespaces.contains(&"k8s".to_string()));
+    }
+
+    #[test]
+    fn merge_k8s_translation_removes_stale_vs_l4_and_cors_resources() {
+        // VirtualService L4 stream proxies (istio-vs-tls-/istio-vs-tcp-) and the
+        // per-route cors plugin (istio-vs-cors-) must be cleaned up by the
+        // managed-prefix retain. Otherwise a deleted/changed VirtualService
+        // leaks its old stream proxy and the translator appends duplicate copies
+        // on every later reconcile.
+        let mut active = GatewayConfig::default();
+        active
+            .proxies
+            .push(proxy("istio-vs-ferrum-secure-tls-0-0", "old-tls.internal"));
+        active
+            .proxies
+            .push(proxy("istio-vs-ferrum-raw-tcp-0-0", "old-tcp.internal"));
+        active.plugin_configs.push(plugin_config(
+            "istio-vs-cors-istio-vs-ferrum-api-0",
+            json!({"allowed_origins": ["https://old.example.com"]}),
+        ));
+
+        // VirtualService removed from the cluster → empty k8s overlay.
+        let k8s = GatewayConfig::default();
+        let managed = BTreeSet::from(["ferrum".to_string()]);
+        let merged = merge_k8s_translation(&active, &k8s, &managed);
+
+        assert!(
+            merged
+                .proxies
+                .iter()
+                .all(|p| p.id != "istio-vs-ferrum-secure-tls-0-0"),
+            "stale VS tls[] stream proxy must be removed on reconcile, got {:?}",
+            merged.proxies.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+        assert!(
+            merged
+                .proxies
+                .iter()
+                .all(|p| p.id != "istio-vs-ferrum-raw-tcp-0-0"),
+            "stale VS tcp[] stream proxy must be removed on reconcile"
+        );
+        assert!(
+            merged
+                .plugin_configs
+                .iter()
+                .all(|p| p.id != "istio-vs-cors-istio-vs-ferrum-api-0"),
+            "stale VS cors plugin must be removed on reconcile, got {:?}",
+            merged
+                .plugin_configs
+                .iter()
+                .map(|p| &p.id)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

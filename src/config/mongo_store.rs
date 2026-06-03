@@ -2637,6 +2637,21 @@ mod inner {
                         .build(),
                 )
                 .await?;
+            // Covering index for the incremental-poll deletion diff. Each poll
+            // runs `find({ namespace }, { _id: 1 })` on these four collections
+            // to detect deletions (see `load_collection_ids_filtered`). Unlike
+            // InnoDB, MongoDB does not carry `_id` in secondary indexes, so the
+            // `{namespace, updated_at}` index above would force a FETCH per
+            // matched document just to read `_id`. A `{namespace, _id}` index
+            // makes the query covered (IXSCAN only, no FETCH). Mirrors the SQL
+            // `(namespace, id)` covering indexes in `sql_dialect.rs`.
+            self.proxies()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "_id": 1 })
+                        .build(),
+                )
+                .await?;
 
             // consumers indexes — uniqueness scoped to namespace
             self.consumers()
@@ -2673,6 +2688,14 @@ mod inner {
                         .build(),
                 )
                 .await?;
+            // Covering index for the deletion diff — see proxies above.
+            self.consumers()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "_id": 1 })
+                        .build(),
+                )
+                .await?;
 
             // plugin_configs indexes
             self.plugin_configs()
@@ -2686,6 +2709,14 @@ mod inner {
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "updated_at": 1 })
+                        .build(),
+                )
+                .await?;
+            // Covering index for the deletion diff — see proxies above.
+            self.plugin_configs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "_id": 1 })
                         .build(),
                 )
                 .await?;
@@ -2770,6 +2801,14 @@ mod inner {
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "updated_at": 1 })
+                        .build(),
+                )
+                .await?;
+            // Covering index for the deletion diff — see proxies above.
+            self.upstreams()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "_id": 1 })
                         .build(),
                 )
                 .await?;

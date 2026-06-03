@@ -133,6 +133,11 @@ pub struct AdminState {
     pub admin_http_header_read_timeout_seconds: u64,
     /// Admin TLS handshake timeout (seconds). 0 disables.
     pub admin_tls_handshake_timeout_seconds: u64,
+    /// Configured backend IP egress policy (`FERRUM_BACKEND_ALLOW_IPS`). Used to
+    /// validate plugin endpoint IPs at the admin boundary in modes without a
+    /// `ProxyState` (e.g. control plane), so CP-accepted configs match what data
+    /// planes will accept.
+    pub backend_allow_ips: crate::config::BackendAllowIps,
 }
 
 impl AdminState {
@@ -2488,8 +2493,27 @@ async fn handle_list_plugin_types() -> Result<Response<Full<Bytes>>, hyper::Erro
     ))
 }
 
-fn validate_plugin_config_definition(pc: &PluginConfig) -> Result<(), String> {
-    match plugins::create_plugin(&pc.plugin_name, &pc.config) {
+fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClient {
+    state
+        .proxy_state
+        .as_ref()
+        .map(|proxy_state| proxy_state.plugin_http_client.clone())
+        .unwrap_or_else(|| {
+            // No ProxyState (e.g. control plane): build a validation client that
+            // still carries the configured backend IP policy, so a plugin whose
+            // endpoint resolves to a denied literal IP is rejected at the admin
+            // boundary instead of being accepted here and rejected later by DPs.
+            plugins::PluginHttpClient::default_with_backend_allow_ips(
+                state.backend_allow_ips.clone(),
+            )
+        })
+}
+
+fn validate_plugin_config_definition(
+    pc: &PluginConfig,
+    http_client: plugins::PluginHttpClient,
+) -> Result<(), String> {
+    match plugins::create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client) {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(format!("Unknown plugin name '{}'", pc.plugin_name)),
         Err(err) => Err(err),
@@ -2877,7 +2901,9 @@ async fn handle_batch_create(
                 plugin_config.id, plugin_config.plugin_name
             ));
         }
-        if let Err(err) = validate_plugin_config_definition(plugin_config) {
+        if let Err(err) =
+            validate_plugin_config_definition(plugin_config, plugin_validation_http_client(state))
+        {
             validation_errors.push(format!(
                 "PluginConfig '{}': invalid config: {}",
                 plugin_config.id, err

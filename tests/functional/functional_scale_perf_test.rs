@@ -6,11 +6,12 @@
 //! API keys and records latency/throughput metrics. Resources continue to be
 //! added mid-test to verify gateway resiliency during config updates.
 //!
-//! Two variants:
+//! Three variants:
 //!   - SQLite (always available, no external DB required)
 //!   - PostgreSQL (requires `ferrum-scale-test-pg` Docker container)
+//!   - MongoDB (requires `ferrum-scale-test-mongo` Docker container)
 //!
-//! Both variants use the batch admin API (`POST /batch`) to create resources
+//! All variants use the batch admin API (`POST /batch`) to create resources
 //! in bulk (100 at a time per resource type) for dramatically faster setup.
 //!
 //! Run with:
@@ -82,7 +83,7 @@ impl ScalePerfHarness {
         let temp_dir = TempDir::new()?;
         let db_path = temp_dir.path().join("scale_test.db");
         let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-        Self::try_start(temp_dir, "sqlite", &db_url, "SQLite").await
+        Self::try_start(temp_dir, "sqlite", &db_url, "SQLite", None).await
     }
 
     async fn new_postgres(db_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -112,7 +113,43 @@ impl ScalePerfHarness {
 
     async fn try_new_postgres(db_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
-        Self::try_start(temp_dir, "postgres", db_url, "PostgreSQL").await
+        Self::try_start(temp_dir, "postgres", db_url, "PostgreSQL", None).await
+    }
+
+    async fn new_mongodb(
+        db_url: &str,
+        mongo_database: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::try_new_mongodb(db_url, mongo_database).await {
+                Ok(harness) => return Ok(harness),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Harness startup attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to create harness after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
+    }
+
+    async fn try_new_mongodb(
+        db_url: &str,
+        mongo_database: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new()?;
+        Self::try_start(temp_dir, "mongodb", db_url, "MongoDB", Some(mongo_database)).await
     }
 
     async fn try_start(
@@ -120,6 +157,7 @@ impl ScalePerfHarness {
         db_type: &str,
         db_url: &str,
         db_label: &str,
+        mongo_database: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let jwt_secret = "scale-test-secret-key-1234567890ab".to_string();
         let jwt_issuer = "ferrum-edge-scale-test".to_string();
@@ -171,7 +209,8 @@ impl ScalePerfHarness {
             }
         }
 
-        let child = Command::new(binary_path)
+        let mut command = Command::new(binary_path);
+        command
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
             .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
@@ -180,8 +219,14 @@ impl ScalePerfHarness {
             .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "warn")
-            .spawn()?;
+            .env("FERRUM_LOG_LEVEL", "warn");
+        // MongoDB stores the gateway's config collections in a dedicated data
+        // database, independent of the auth DB in the connection URL. SQL
+        // backends ignore this var, so it is only set for the MongoDB variant.
+        if let Some(database) = mongo_database {
+            command.env("FERRUM_MONGO_DATABASE", database);
+        }
+        let child = command.spawn()?;
 
         let proxy_base_url = format!("http://127.0.0.1:{}", proxy_port);
         let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
@@ -844,6 +889,68 @@ async fn test_scale_perf_30k_proxies_postgres() {
     let harness = ScalePerfHarness::new_postgres(db_url)
         .await
         .expect("Failed to create PostgreSQL test harness");
+
+    run_scale_perf_test(&harness).await;
+}
+
+// ---- MongoDB variant ----
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_scale_perf_30k_proxies_mongodb() {
+    println!("\n============================================================");
+    println!("  Scale Performance Test (MongoDB): 0 -> 30,000 proxies");
+    println!(
+        "  Batch size: {}  |  Perf test: {}s  |  Concurrency: {}",
+        BATCH_SIZE, PERF_TEST_DURATION_SECS, CONCURRENCY
+    );
+    println!("============================================================\n");
+
+    // Check for the MongoDB container
+    // Start with: docker run -d --name ferrum-scale-test-mongo \
+    //   -p 27117:27017 mongo:7
+    if !is_container_running("ferrum-scale-test-mongo") {
+        println!("SKIPPED: ferrum-scale-test-mongo container not running.");
+        println!("Start it with:");
+        println!("  docker run -d --name ferrum-scale-test-mongo \\");
+        println!("    -p 27117:27017 mongo:7");
+        return;
+    }
+
+    // The connection URL points at the container's mapped host port. MongoDB
+    // stores the gateway's config collections in FERRUM_MONGO_DATABASE
+    // (`ferrum_scale`), independent of the URL path / auth database.
+    let db_url = "mongodb://localhost:27117";
+    let mongo_database = "ferrum_scale";
+
+    // Clean the database for a fresh run by dropping it inside the container.
+    // `mongosh` ships with the mongo:7 image, so we exec it there rather than
+    // depending on a host-installed Mongo client.
+    let drop_result = Command::new("docker")
+        .args([
+            "exec",
+            "ferrum-scale-test-mongo",
+            "mongosh",
+            "--quiet",
+            "--eval",
+            "db.getSiblingDB('ferrum_scale').dropDatabase()",
+        ])
+        .output();
+    match drop_result {
+        Ok(o) if o.status.success() => println!("Cleaned MongoDB database"),
+        Ok(o) => {
+            println!(
+                "Warning: mongosh cleanup returned {}: {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            );
+        }
+        Err(e) => println!("Warning: docker/mongosh not available for cleanup: {}", e),
+    }
+
+    let harness = ScalePerfHarness::new_mongodb(db_url, mongo_database)
+        .await
+        .expect("Failed to create MongoDB test harness");
 
     run_scale_perf_test(&harness).await;
 }

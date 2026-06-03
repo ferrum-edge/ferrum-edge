@@ -21,6 +21,8 @@ fn subset_definition_round_trip_json() {
         traffic_policy: Some(SubsetTrafficPolicy {
             load_balancer_algorithm: Some(LoadBalancerAlgorithm::Random),
             tls: None,
+            connect_timeout_ms: None,
+            passive_health_check: None,
         }),
     };
 
@@ -71,6 +73,8 @@ fn subset_traffic_policy_omits_none_fields() {
     let policy = SubsetTrafficPolicy {
         load_balancer_algorithm: None,
         tls: None,
+        connect_timeout_ms: None,
+        passive_health_check: None,
     };
     let json = serde_json::to_string(&policy).unwrap();
     // skip_serializing_if = "Option::is_none" should omit both optional fields,
@@ -95,6 +99,8 @@ fn subset_traffic_policy_tls_round_trip_json() {
             subject_alt_names: vec!["spiffe://mesh.local/ns/default/sa/canary".into()],
             insecure_skip_verify: false,
         }),
+        connect_timeout_ms: None,
+        passive_health_check: None,
     };
 
     let json = serde_json::to_string(&policy).unwrap();
@@ -301,6 +307,8 @@ fn upstream_valid_subsets_pass_validation() {
             traffic_policy: Some(SubsetTrafficPolicy {
                 load_balancer_algorithm: Some(LoadBalancerAlgorithm::Random),
                 tls: None,
+                connect_timeout_ms: None,
+                passive_health_check: None,
             }),
         },
     ]));

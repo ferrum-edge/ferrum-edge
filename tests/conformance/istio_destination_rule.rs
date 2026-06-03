@@ -76,6 +76,79 @@ fn dr_connection_pool_tcp_connect_timeout() {
     assert_eq!(policy.connect_timeout_ms, Some(2000));
 }
 
+/// `subsets[].trafficPolicy.connectionPool.tcp.connectTimeout` — per-subset
+/// connect timeout. Translated onto the mesh DR subset; at slice apply it
+/// overrides `backend_connect_timeout_ms` for proxies whose `upstream_subset`
+/// selects this subset (taking precedence over the DR top-level connectTimeout,
+/// verified by `dr_subset_connect_timeout_overrides_top_level_for_subset_bound_proxies`
+/// in `src/modes/mesh/mod.rs`).
+#[test]
+fn dr_subset_connect_timeout() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "subsets[].trafficPolicy.connectionPool.tcp.connectTimeout",
+        status = Status::Supported,
+        notes = "Per-subset connect timeout: overrides backend_connect_timeout_ms for proxies bound to the subset, taking precedence over the DR top-level connectTimeout.",
+    );
+    let dr = translated(json!({
+        "host": "api.default.svc.cluster.local",
+        "subsets": [{
+            "name": "v1",
+            "labels": {"version": "v1"},
+            "trafficPolicy": {"connectionPool": {"tcp": {"connectTimeout": "2s"}}}
+        }]
+    }));
+    let subset = dr
+        .subsets
+        .iter()
+        .find(|s| s.name == "v1")
+        .expect("v1 subset emitted");
+    let tp = subset
+        .traffic_policy
+        .as_ref()
+        .expect("subset traffic policy emitted");
+    assert_eq!(tp.connect_timeout_ms, Some(2000));
+}
+
+/// `subsets[].trafficPolicy.outlierDetection` — per-subset passive health. The
+/// ejection *thresholds* (consecutive errors / interval / base-ejection /
+/// min-health) are applied per-subset at slice apply, overriding the
+/// upstream-level passive health for subset-bound proxies; the
+/// `maxEjectionPercent` *cap* remains upstream-level. Apply behavior is pinned
+/// by `dr_subset_outlier_resolves_passive_health_thresholds` and
+/// `passive_health_for_target_prefers_subset_over_upstream` in the source crate.
+#[test]
+fn dr_subset_outlier_detection() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "subsets[].trafficPolicy.outlierDetection",
+        status = Status::Supported,
+        notes = "Per-subset outlier thresholds (consecutive errors / interval / base-ejection / min-health) applied per-subset, overriding upstream-level passive health; the maxEjectionPercent cap is still resolved at the upstream level.",
+    );
+    let dr = translated(json!({
+        "host": "api.default.svc.cluster.local",
+        "subsets": [{
+            "name": "v1",
+            "labels": {"version": "v1"},
+            "trafficPolicy": {"outlierDetection": {"consecutive5xxErrors": 5, "interval": "30s"}}
+        }]
+    }));
+    let subset = dr
+        .subsets
+        .iter()
+        .find(|s| s.name == "v1")
+        .expect("v1 subset emitted");
+    let tp = subset
+        .traffic_policy
+        .as_ref()
+        .expect("subset traffic policy emitted");
+    let od = tp
+        .outlier_detection
+        .as_ref()
+        .expect("subset outlierDetection translated");
+    assert_eq!(od.consecutive_errors, Some(5));
+}
+
 /// `trafficPolicy.connectionPool.tcp.maxConnections` — T1-D (PR #897).
 /// Lands on `MeshConnectionPoolTcp.max_connections`.
 #[test]
@@ -403,6 +476,33 @@ fn dr_port_level_settings() {
     assert_eq!(p8080.connect_timeout_ms, Some(1000));
     let p9090 = dr.port_level_settings.get(&9090).expect("port 9090");
     assert_eq!(p9090.connect_timeout_ms, Some(5000));
+}
+
+/// `trafficPolicy.portLevelSettings[].tls` — per-port backend TLS. Resolved at
+/// apply time onto `Upstream.port_overrides[port].tls` and projected onto the
+/// effective proxy's `resolved_tls` for dials to that port (apply behavior is
+/// pinned by `dr_port_level_tls_resolves_onto_port_override` and
+/// `resolve_effective_proxy_applies_per_port_tls` in the source crate).
+#[test]
+fn dr_port_level_tls() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "trafficPolicy.portLevelSettings[].tls",
+        status = Status::Supported,
+        notes = "Per-port backend TLS: resolved onto port_overrides[port].tls and projected onto the effective proxy's resolved_tls. resolved_tls is part of the backend pool key, so a distinct per-port TLS posture fragments its own pool.",
+    );
+    let dr = translated(json!({
+        "host": "secure.default.svc.cluster.local",
+        "trafficPolicy": {
+            "portLevelSettings": [
+                {"port": {"number": 8443}, "tls": {"mode": "SIMPLE", "caCertificates": "/etc/certs/ca.pem"}}
+            ]
+        }
+    }));
+    let port = dr.port_level_settings.get(&8443).expect("port 8443 entry");
+    let tls = port.tls.as_ref().expect("port 8443 tls translated");
+    assert_eq!(tls.mode, MtlsMode::Simple);
+    assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
 }
 
 /// `subsets[]` with per-subset `trafficPolicy` → `SubsetDefinition` +

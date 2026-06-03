@@ -350,6 +350,10 @@ fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> C
         .env("FERRUM_PROXY_HTTP_PORT", "0")
         .env("FERRUM_ADMIN_HTTP_PORT", "0")
         .env("FERRUM_CP_DP_GRPC_JWT_SECRET", GRPC_SECRET)
+        // Mesh mode now fails closed without a CA backend (the PERMISSIVE-no-CA
+        // startup gate). These runtime tests exercise mesh plumbing, not
+        // workload identity, so explicitly acknowledge the no-CA dev posture.
+        .env("FERRUM_MESH_ALLOW_NO_CA", "true")
         .env(
             "FERRUM_DP_CP_GRPC_URLS",
             format!("http://{}", options.cp_addr),

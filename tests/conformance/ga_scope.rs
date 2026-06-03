@@ -56,6 +56,7 @@ pub(crate) const GA_CONTRACT: &[(&str, &str)] = &[
         "istio_destination_rule",
         "trafficPolicy.connectionPool.tcp.maxConnections",
     ),
+    ("istio_virtual_service", "http[].corsPolicy"),
 ];
 
 /// Whether the (suite-completion-dependent) presence gate is enforced.

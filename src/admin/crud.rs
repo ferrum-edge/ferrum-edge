@@ -397,8 +397,11 @@ pub(crate) fn hash_basic_auth_credentials(cred: &mut Value) -> Result<(), String
     super::hash_credential_passwords(cred)
 }
 
-pub(crate) fn validate_plugin_config_definition(pc: &PluginConfig) -> Result<(), String> {
-    super::validate_plugin_config_definition(pc)
+pub(crate) fn validate_plugin_config_definition(
+    state: &AdminState,
+    pc: &PluginConfig,
+) -> Result<(), String> {
+    super::validate_plugin_config_definition(pc, super::plugin_validation_http_client(state))
 }
 
 async fn validate_openapi_validator_precondition(
@@ -956,7 +959,7 @@ impl AdminResource for PluginConfig {
             }
         }
 
-        if let Err(error) = validate_plugin_config_definition(resource) {
+        if let Err(error) = validate_plugin_config_definition(_state, resource) {
             return Err(AfterValidateError::BadRequest(vec![format!(
                 "Invalid plugin config: {}",
                 error

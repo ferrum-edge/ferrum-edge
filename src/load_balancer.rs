@@ -3930,6 +3930,8 @@ mod tests {
             traffic_policy: Some(crate::config::types::SubsetTrafficPolicy {
                 load_balancer_algorithm: Some(LoadBalancerAlgorithm::WeightedRoundRobin),
                 tls: None,
+                connect_timeout_ms: None,
+                passive_health_check: None,
             }),
         }];
         let lb = LoadBalancer::with_subsets(

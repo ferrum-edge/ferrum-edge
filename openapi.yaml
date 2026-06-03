@@ -3474,6 +3474,7 @@ paths:
                 - ai_request_guard
                 - ai_rate_limiter
                 - ai_prompt_shield
+                - ai_semantic_firewall
                 - ai_response_guard
                 - ai_semantic_cache
                 - ai_federation
@@ -6019,7 +6020,7 @@ components:
             oauth2_introspection, oidc_relying_party, hmac_auth, ldap_auth,
             mtls_auth, access_control,
             tcp_connection_throttle, ip_restriction, waf, security_headers, mesh_authz, opa,
-            mesh_outbound_registry, openapi_validator, mcp_gateway) are validation-fatal: invalid config blocks
+            mesh_outbound_registry, openapi_validator, ai_semantic_firewall, mcp_gateway) are validation-fatal: invalid config blocks
             gateway startup in file mode, and on DB/CP polling the new config
             snapshot is rejected as a whole (the gateway keeps serving the
             prior good config). Non-security plugins with invalid config are
@@ -12563,6 +12564,253 @@ components:
           description: >-
             Reject requests missing grpc-timeout with HTTP 400. Takes
             precedence over default_deadline_ms.
+
+    AiSemanticFirewallBuiltinPackConfig:
+      oneOf:
+        - type: boolean
+          description: Boolean shorthand. true enables the pack with Ferrum defaults; false disables it.
+        - type: object
+          properties:
+            enabled:
+              type: boolean
+              default: true
+              description: Enable or disable this built-in pack.
+            examples_mode:
+              type: string
+              enum: [append, replace]
+              default: append
+              description: Append customer examples to Ferrum defaults or replace the semantic example set for this pack.
+            examples:
+              type: array
+              minItems: 1
+              items:
+                type: string
+              description: Customer semantic examples for this built-in pack.
+          description: Object form for tuning a built-in AI semantic firewall pack.
+      description: Built-in pack toggle or tuning object.
+
+    AiSemanticFirewallConfig:
+      type: object
+      description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata."
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        inspect:
+          type: object
+          properties:
+            request:
+              type: boolean
+              default: true
+            response:
+              type: boolean
+              default: true
+          description: Request and response inspection toggles.
+        mode:
+          type: string
+          enum: [enforce, dry_run]
+          default: enforce
+          description: Dry-run mode never rejects and emits would_action metadata.
+        on_error:
+          type: string
+          enum: [warn, allow, reject]
+          default: warn
+          description: Behavior when embedding/evaluation fails.
+        default_action:
+          type: string
+          enum: [reject, warn]
+          default: reject
+          description: Default action for built-in semantic rules.
+        streaming_response:
+          type: string
+          enum: [skip, reject]
+          default: skip
+          description: Behavior for stream:true requests when response-side inspection is active. skip allows the streamed response uninspected (fail-open, recorded in ai_semantic_firewall.response_inspection_skipped); reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response.
+        provider:
+          type: object
+          required: [type, endpoint]
+          properties:
+            type:
+              type: string
+              enum: [openai_compatible_embeddings]
+              description: OpenAI-compatible embeddings provider.
+            endpoint:
+              type: string
+              format: uri
+              description: Embeddings endpoint URL. Literal IP hosts are checked against FERRUM_BACKEND_ALLOW_IPS; hostname resolution is checked by the shared plugin HTTP client at request time.
+            model:
+              type: string
+              description: Embedding model sent in the request body.
+            api_key_env:
+              type: string
+              description: Environment variable holding the provider API key. The variable must exist after Ferrum startup secret resolution and is sent as Authorization Bearer when present.
+            request_timeout_ms:
+              type: integer
+              format: uint64
+              minimum: 1
+              default: 5000
+              description: Per-request embedding provider timeout in milliseconds.
+          description: Required when the plugin has active rules.
+        builtins:
+          type: object
+          properties:
+            prompt_injection:
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
+            jailbreak:
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
+            system_prompt_exfiltration:
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
+            data_exfiltration:
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
+            indirect_prompt_injection:
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
+            tool_abuse:
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
+            response_leakage:
+              $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
+          description: Built-in rule packs. When omitted, all built-ins are enabled; when provided, omitted packs are disabled. Object form can append or replace semantic examples per pack while keeping the built-in rule ID and pack metadata.
+        extraction:
+          type: object
+          properties:
+            request_json_paths:
+              type: array
+              items:
+                type: string
+              default:
+                - "$.messages[*].content"
+                - "$.messages[*].tool_calls[*].function.name"
+                - "$.messages[*].tool_calls[*].function.arguments"
+                - "$.input"
+                - "$.instructions"
+                - "$.tools[*].function.name"
+                - "$.tools[*].function.description"
+                - "$.tools[*].function.parameters"
+                - "$.context"
+                - "$.documents[*].text"
+                - "$.retrieved_context[*].content"
+                - "$.tool_results[*].content"
+              description: Supported simple request extraction paths. When configured, this list replaces the defaults.
+            response_json_paths:
+              type: array
+              items:
+                type: string
+              default:
+                - "$.choices[*].message.content"
+                - "$.choices[*].message.tool_calls[*].function.name"
+                - "$.choices[*].message.tool_calls[*].function.arguments"
+                - "$.choices[*].delta.content"
+                - "$.choices[*].delta.tool_calls[*].function.name"
+                - "$.choices[*].delta.tool_calls[*].function.arguments"
+                - "$.output_text"
+                - "$.output[*].content[*].text"
+                - "$.output[*].arguments"
+              description: Supported simple response extraction paths. When configured, this list replaces the defaults.
+        allow_topics:
+          type: array
+          items:
+            type: object
+            required: [id, examples]
+            properties:
+              id:
+                type: string
+              description:
+                type: string
+              examples:
+                type: array
+                minItems: 1
+                items:
+                  type: string
+              threshold:
+                type: number
+                format: float
+                minimum: 0
+                maximum: 1
+                default: 0.74
+              action_on_no_match:
+                type: string
+                enum: [reject, warn]
+                default: reject
+          description: Mandatory request-side semantic allow topics.
+        deny_topics:
+          type: array
+          items:
+            type: object
+            required: [id, examples]
+            properties:
+              id:
+                type: string
+              description:
+                type: string
+              examples:
+                type: array
+                minItems: 1
+                items:
+                  type: string
+              threshold:
+                type: number
+                format: float
+                minimum: 0
+                maximum: 1
+                default: 0.78
+              action:
+                type: string
+                enum: [reject, warn]
+                default: reject
+          description: Customer-defined request/response semantic deny topics.
+        custom_rules:
+          type: array
+          items:
+            type: object
+            required: [id, examples]
+            properties:
+              id:
+                type: string
+              description:
+                type: string
+              direction:
+                type: string
+                enum: [request, response, both]
+                default: both
+              severity:
+                type: string
+                enum: [low, medium, high, critical]
+                default: high
+              action:
+                type: string
+                enum: [warn, reject]
+                default: reject
+                description: Custom rules can warn or reject. Use allow_topics for allowlist semantics.
+              examples:
+                type: array
+                minItems: 1
+                items:
+                  type: string
+              threshold:
+                type: number
+                format: float
+                minimum: 0
+                maximum: 1
+                default: 0.80
+          description: Customer-defined semantic rules.
+        privacy:
+          type: object
+          properties:
+            log_raw_text:
+              type: boolean
+              enum: [false]
+              default: false
+              description: Reserved for future explicit raw-text logging. true is rejected in this release.
+            include_snippet_hash:
+              type: boolean
+              default: true
+            snippet_hash_salt:
+              type: string
+              description: Optional salt mixed into snippet_hash digests so short/low-entropy matched segments written to logs cannot be reversed by brute force/rainbow tables. Keep consistent across a fleet for correlation and out of the same logs. Unsalted (default) is reversible for short segments.
+          description: Raw prompt/response text is not written by default; hashes are for correlation only.
+        expose_rule_id_to_client:
+          type: boolean
+          default: false
+          description: Include matched rule IDs in reject responses.
 
     AiSemanticCacheConfig:
       type: object

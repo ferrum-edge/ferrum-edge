@@ -9,6 +9,11 @@ mod gateway_api;
 mod istio;
 mod mesh_config;
 
+// Shared with the Istio status writer (`crate::k8s_controller::istio_status`) so
+// the translator's "emit cors plugin vs. leave unprojected" decision and the
+// status writer's deferred-field reporting use one predicate and never diverge.
+pub(crate) use istio::cors_policy_translatable;
+
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
