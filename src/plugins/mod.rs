@@ -947,6 +947,8 @@ impl RequestContext {
             self.route_override_authority.is_some() && !proxy.preserve_host_header;
         let strip_listen_path_changed =
             self.route_override_path_is_absolute && proxy.strip_listen_path;
+        let backend_path_changed =
+            self.route_override_path_is_absolute && proxy.backend_path.is_some();
 
         if !upstream_id_changed
             && !backend_host_changed
@@ -958,6 +960,7 @@ impl RequestContext {
             && !retry_changed
             && !preserve_host_changed
             && !strip_listen_path_changed
+            && !backend_path_changed
         {
             return proxy;
         }
@@ -999,6 +1002,9 @@ impl RequestContext {
         }
         if strip_listen_path_changed {
             overridden.strip_listen_path = false;
+        }
+        if backend_path_changed {
+            overridden.backend_path = None;
         }
         Arc::new(overridden)
     }
@@ -2809,6 +2815,7 @@ mod tests {
             "backend_host": "stable.svc",
             "backend_port": 8080,
             "listen_path": "/mcp",
+            "backend_path": "/placeholder",
             "strip_listen_path": true
         }))
         .expect("minimal proxy should deserialize");
@@ -2823,5 +2830,6 @@ mod tests {
 
         let result = ctx.apply_route_overrides(Arc::new(proxy));
         assert!(!result.strip_listen_path);
+        assert_eq!(result.backend_path, None);
     }
 }

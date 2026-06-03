@@ -349,6 +349,72 @@ async fn start_mcp_zero_arg_tool_server() -> MockServer {
     server
 }
 
+async fn start_mcp_negotiated_protocol_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", "upstream-session")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "initialize",
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": { "name": "negotiated", "version": "1" }
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "result": {
+                "tools": [
+                    {
+                        "name": "versioned_tool",
+                        "inputSchema": { "type": "object" }
+                    }
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn start_mcp_sse_tools_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(
+                    "event: message\n\
+                     data: {\"jsonrpc\":\"2.0\",\"id\":\"tools\",\"result\":{\"tools\":[{\"name\":\"sse_tool\",\"inputSchema\":{\"type\":\"object\"}}]}}\n\n",
+                )
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
 async fn start_mcp_error_server() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -600,7 +666,7 @@ async fn aggregate_tool_names(
     let (_, body, _) = reject_json(result);
     body["result"]["tools"]
         .as_array()
-        .unwrap()
+        .unwrap_or_else(|| panic!("tools/list result missing tools array: {body}"))
         .iter()
         .map(|tool| tool["name"].as_str().unwrap().to_string())
         .collect()
@@ -680,6 +746,11 @@ fn invalid_config_shapes_are_rejected() {
             "endpoint": { "path": "/mcp" },
             "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } },
             "policy": { "tools": { "github.x": { "action": "maybe" } } }
+        }),
+        json!({
+            "mode": "aggregate_router",
+            "endpoint": { "path": "/mcp", "protocol_versions": ["2025-03-26"] },
+            "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } }
         }),
     ] {
         assert!(
@@ -1128,6 +1199,92 @@ async fn aggregate_stateless_upstreams_initialize_once_and_send_streamable_accep
 }
 
 #[tokio::test]
+async fn aggregate_upstream_requests_use_negotiated_protocol_version() {
+    let server = start_mcp_negotiated_protocol_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["endpoint"]["protocol_versions"] = json!(["2025-11-25", "2025-06-18"]);
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config["policy"] = json!({"default_action": "allow"});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 31).await,
+        vec!["github.versioned_tool"]
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let initialized = requests
+        .iter()
+        .find(|request| {
+            request
+                .body_json::<Value>()
+                .ok()
+                .and_then(|body| {
+                    body.get("method")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .as_deref()
+                == Some("notifications/initialized")
+        })
+        .expect("initialized notification should be sent");
+    assert_eq!(
+        initialized
+            .headers
+            .get("mcp-protocol-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2025-06-18")
+    );
+    let tools_list = requests
+        .iter()
+        .find(|request| {
+            request
+                .body_json::<Value>()
+                .ok()
+                .and_then(|body| {
+                    body.get("method")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .as_deref()
+                == Some("tools/list")
+        })
+        .expect("tools/list should be sent");
+    assert_eq!(
+        tools_list
+            .headers
+            .get("mcp-protocol-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2025-06-18")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_tools_list_accepts_upstream_sse_response() {
+    let server = start_mcp_sse_tools_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config["policy"] = json!({"default_action": "allow"});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 32).await,
+        vec!["github.sse_tool"]
+    );
+}
+
+#[tokio::test]
 async fn aggregate_tools_list_treats_upstream_json_rpc_errors_as_failures() {
     let server = start_mcp_error_server().await;
     let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
@@ -1532,6 +1689,33 @@ async fn aggregate_unsupported_http_methods_fail_closed() {
     assert_eq!(
         ctx.metadata.get("mcp.route_decision").map(String::as_str),
         Some("deny")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_unsupported_notifications_return_accepted_without_body() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {
+            "progressToken": "job-1",
+            "progress": 1
+        }
+    }));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_raw(result);
+    assert_eq!(status, 202);
+    assert!(body.is_empty());
+    assert_eq!(
+        ctx.metadata.get("mcp.route_decision").map(String::as_str),
+        Some("synthetic_response")
     );
 }
 

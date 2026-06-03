@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use futures_util::StreamExt;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use regex::Regex;
 use serde_json::{Map, Value, json};
@@ -32,6 +33,7 @@ const METADATA_REWRITE_PARAM_KEY: &str = "mcp.rewrite.param";
 const METADATA_REWRITE_PUBLIC_VALUE_KEY: &str = "mcp.rewrite.public_value";
 const METADATA_REWRITE_UPSTREAM_VALUE_KEY: &str = "mcp.rewrite.upstream_value";
 const MAX_MCP_PAGINATION_PAGES: usize = 100;
+const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MCP_STREAMABLE_HTTP_ACCEPT: &str = "application/json, text/event-stream";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,6 +383,7 @@ struct UpstreamMcpSession {
     #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
     server_id: String,
     upstream_session_id: Option<String>,
+    protocol_version: Option<String>,
     initialized: bool,
 }
 
@@ -431,6 +434,15 @@ impl McpGateway {
         {
             return Err(
                 "mcp_gateway: 'endpoint.protocol_versions' entries must not be empty".to_string(),
+            );
+        }
+        if supported_protocol_versions
+            .iter()
+            .any(|version| version == "2025-03-26")
+        {
+            return Err(
+                "mcp_gateway: endpoint.protocol_versions cannot include 2025-03-26 because JSON-RPC batch messages are not supported in V1"
+                    .to_string(),
             );
         }
 
@@ -776,6 +788,7 @@ impl McpGateway {
                     UpstreamMcpSession {
                         server_id: server.server_id.clone(),
                         upstream_session_id: None,
+                        protocol_version: None,
                         initialized: false,
                     },
                 )
@@ -880,15 +893,8 @@ impl McpGateway {
             .get(&self.sessions.upstream_session_header)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
-        let response_body = response.json::<Value>().await.map_err(|error| {
-            warn!(
-                server_id = %server.server_id,
-                method = "initialize",
-                error = %error,
-                "MCP upstream initialize response was not JSON"
-            );
-            format!("upstream MCP initialize response was not JSON: {error}")
-        })?;
+        let response_body =
+            upstream_response_json(response, &server.server_id, "initialize").await?;
         if let Some(error) = response_body.get("error") {
             let error_code = error.get("code").and_then(Value::as_i64);
             let error_message = error
@@ -912,11 +918,32 @@ impl McpGateway {
             );
             return Err("upstream MCP initialize response missing result".to_string());
         }
+        let negotiated_protocol_version = response_body
+            .get("result")
+            .and_then(|result| result.get("protocolVersion"))
+            .and_then(Value::as_str)
+            .unwrap_or(session.protocol_version.as_str())
+            .to_string();
+        if !self
+            .supported_protocol_versions
+            .iter()
+            .any(|supported| supported == &negotiated_protocol_version)
+        {
+            warn!(
+                server_id = %server.server_id,
+                method = "initialize",
+                protocol_version = %negotiated_protocol_version,
+                "MCP upstream initialize negotiated unsupported protocol version"
+            );
+            return Err(format!(
+                "upstream MCP initialize negotiated unsupported protocol version {negotiated_protocol_version}"
+            ));
+        }
 
         self.send_upstream_initialized_notification(
             ctx,
-            downstream_session_id,
             server,
+            &negotiated_protocol_version,
             upstream_session_id.as_deref(),
         )
         .await?;
@@ -926,6 +953,7 @@ impl McpGateway {
             if let Some(upstream) = session.upstream_sessions.get_mut(server_id) {
                 upstream.initialized = true;
                 upstream.upstream_session_id = upstream_session_id.clone();
+                upstream.protocol_version = Some(negotiated_protocol_version);
             }
         }
         Ok(upstream_session_id)
@@ -934,8 +962,8 @@ impl McpGateway {
     async fn send_upstream_initialized_notification(
         &self,
         ctx: &RequestContext,
-        downstream_session_id: &str,
         server: &McpServerConfig,
+        protocol_version: &str,
         upstream_session_id: Option<&str>,
     ) -> Result<(), String> {
         let body = json!({
@@ -949,10 +977,7 @@ impl McpGateway {
             .post(&server.upstream_url)
             .header("content-type", "application/json")
             .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
-            .header(
-                "mcp-protocol-version",
-                self.protocol_version_for_session(downstream_session_id),
-            );
+            .header("mcp-protocol-version", protocol_version);
         if let Some(session_id) = upstream_session_id {
             request = request.header(&self.sessions.upstream_session_header, session_id);
         }
@@ -994,6 +1019,22 @@ impl McpGateway {
             .unwrap_or_else(|| self.supported_protocol_versions[0].clone())
     }
 
+    fn protocol_version_for_upstream(
+        &self,
+        downstream_session_id: &str,
+        server_id: &str,
+    ) -> String {
+        self.downstream_session_clone(downstream_session_id)
+            .and_then(|session| {
+                session
+                    .upstream_sessions
+                    .get(server_id)
+                    .and_then(|upstream| upstream.protocol_version.clone())
+                    .or(Some(session.protocol_version))
+            })
+            .unwrap_or_else(|| self.supported_protocol_versions[0].clone())
+    }
+
     async fn remove_downstream_session(
         &self,
         downstream_session_id: &str,
@@ -1003,7 +1044,7 @@ impl McpGateway {
             return false;
         };
         for (server_id, upstream) in session.upstream_sessions {
-            let Some(upstream_session_id) = upstream.upstream_session_id else {
+            let Some(upstream_session_id) = upstream.upstream_session_id.clone() else {
                 continue;
             };
             if !upstream.initialized {
@@ -1017,7 +1058,13 @@ impl McpGateway {
                 .get()
                 .delete(&server.upstream_url)
                 .header(&self.sessions.upstream_session_header, upstream_session_id)
-                .header("mcp-protocol-version", session.protocol_version.as_str());
+                .header(
+                    "mcp-protocol-version",
+                    upstream
+                        .protocol_version
+                        .as_deref()
+                        .unwrap_or(session.protocol_version.as_str()),
+                );
             match self
                 .http_client
                 .execute_tracked(
@@ -1072,7 +1119,7 @@ impl McpGateway {
             .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
             .header(
                 "mcp-protocol-version",
-                self.protocol_version_for_session(downstream_session_id),
+                self.protocol_version_for_upstream(downstream_session_id, &server.server_id),
             );
         if let Some(session_id) = upstream_session_id {
             request = request.header(&self.sessions.upstream_session_header, session_id);
@@ -1106,15 +1153,7 @@ impl McpGateway {
                 response.status()
             ));
         }
-        let response_body = response.json::<Value>().await.map_err(|error| {
-            warn!(
-                server_id = %server.server_id,
-                method,
-                error = %error,
-                "MCP upstream response was not JSON"
-            );
-            format!("upstream MCP response was not JSON: {error}")
-        })?;
+        let response_body = upstream_response_json(response, &server.server_id, method).await?;
         if let Some(error) = response_body.get("error") {
             let error_code = error.get("code").and_then(Value::as_i64);
             let error_message = error
@@ -2488,6 +2527,13 @@ impl Plugin for McpGateway {
                     )
                 }
             }
+            _ if envelope.message_kind == McpMessageKind::Notification => {
+                ctx.metadata.insert(
+                    "mcp.route_decision".to_string(),
+                    "synthetic_response".to_string(),
+                );
+                empty_response(202)
+            }
             _ => json_rpc_error(envelope.id.clone(), -32601, "MCP method not found", None),
         }
     }
@@ -2586,6 +2632,160 @@ fn parse_mcp_envelope(body: &[u8]) -> Result<McpEnvelope, String> {
         error,
         message_kind,
     })
+}
+
+async fn upstream_response_json(
+    response: reqwest::Response,
+    server_id: &str,
+    method: &str,
+) -> Result<Value, String> {
+    let is_sse = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|content_type| {
+            content_type
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        });
+    if is_sse {
+        return upstream_sse_json_rpc_response(response, server_id, method).await;
+    }
+
+    let body = response.text().await.map_err(|error| {
+        warn!(
+            server_id,
+            method,
+            error = %error,
+            "MCP upstream response body could not be read"
+        );
+        format!("upstream MCP response body could not be read: {error}")
+    })?;
+
+    serde_json::from_str::<Value>(&body)
+        .or_else(|error| parse_sse_json_rpc_response(&body).ok_or(error))
+        .map_err(|error| {
+            warn!(
+                server_id,
+                method,
+                error = %error,
+                "MCP upstream response was neither JSON nor SSE JSON-RPC"
+            );
+            format!("upstream MCP response was neither JSON nor SSE JSON-RPC: {error}")
+        })
+}
+
+async fn upstream_sse_json_rpc_response(
+    response: reqwest::Response,
+    server_id: &str,
+    method: &str,
+) -> Result<Value, String> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            warn!(
+                server_id,
+                method,
+                error = %error,
+                "MCP upstream SSE response body could not be read"
+            );
+            format!("upstream MCP SSE response body could not be read: {error}")
+        })?;
+        buffer.extend_from_slice(&chunk);
+        if buffer.len() > MAX_UPSTREAM_SSE_EVENT_BYTES {
+            warn!(
+                server_id,
+                method,
+                max_bytes = MAX_UPSTREAM_SSE_EVENT_BYTES,
+                "MCP upstream SSE event exceeded size limit"
+            );
+            return Err(format!(
+                "upstream MCP SSE event exceeded {MAX_UPSTREAM_SSE_EVENT_BYTES} bytes"
+            ));
+        }
+        while let Some((event_end, delimiter_len)) = find_sse_event_delimiter(&buffer) {
+            let event = buffer[..event_end].to_vec();
+            buffer.drain(..event_end + delimiter_len);
+            let event = std::str::from_utf8(&event).map_err(|error| {
+                warn!(
+                    server_id,
+                    method,
+                    error = %error,
+                    "MCP upstream SSE event was not UTF-8"
+                );
+                format!("upstream MCP SSE event was not UTF-8: {error}")
+            })?;
+            if let Some(value) = parse_sse_json_rpc_response(event) {
+                return Ok(value);
+            }
+        }
+    }
+
+    if !buffer.is_empty() {
+        let event = std::str::from_utf8(&buffer).map_err(|error| {
+            warn!(
+                server_id,
+                method,
+                error = %error,
+                "MCP upstream SSE event was not UTF-8"
+            );
+            format!("upstream MCP SSE event was not UTF-8: {error}")
+        })?;
+        if let Some(value) = parse_sse_json_rpc_response(event) {
+            return Ok(value);
+        }
+    }
+
+    warn!(
+        server_id,
+        method, "MCP upstream SSE response did not contain a JSON-RPC response"
+    );
+    Err("upstream MCP SSE response did not contain a JSON-RPC response".to_string())
+}
+
+fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+    [
+        b"\n\n".as_slice(),
+        b"\r\n\r\n".as_slice(),
+        b"\r\r".as_slice(),
+    ]
+    .into_iter()
+    .filter_map(|delimiter| {
+        buffer
+            .windows(delimiter.len())
+            .position(|window| window == delimiter)
+            .map(|position| (position, delimiter.len()))
+    })
+    .min_by_key(|(position, _)| *position)
+}
+
+fn parse_sse_json_rpc_response(body: &str) -> Option<Value> {
+    let normalized = body.replace("\r\n", "\n");
+    for event in normalized.split("\n\n") {
+        let data = event
+            .lines()
+            .filter_map(|line| {
+                line.trim_start()
+                    .strip_prefix("data:")
+                    .map(|data| data.strip_prefix(' ').unwrap_or(data))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        if value.get("id").is_some()
+            && (value.get("result").is_some() || value.get("error").is_some())
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn validate_json_schema(validator: &jsonschema::Validator, instance: &Value) -> Result<(), String> {
