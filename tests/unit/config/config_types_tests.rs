@@ -2,8 +2,8 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, Consumer, DispatchKind, GatewayConfig,
     LocalityPreference, PluginAssociation, PluginConfig, PluginScope, Proxy,
-    ResolvedSubsetTrafficPolicy, Upstream, UpstreamTarget, hosts_overlap, validate_host_entry,
-    validate_resource_id, wildcard_matches,
+    ResolvedSubsetTrafficPolicy, Upstream, UpstreamPortOverride, UpstreamTarget, hosts_overlap,
+    validate_host_entry, validate_resource_id, wildcard_matches,
 };
 use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TracingProvider};
 use std::collections::HashMap;
@@ -417,6 +417,78 @@ fn normalize_fields_rebuilds_upstream_resolved_tls_after_serde_round_trip() {
     assert_eq!(
         decoded.upstreams[0].backend_tls_sni.as_deref(),
         Some("reviews.mesh.internal")
+    );
+}
+
+#[test]
+fn normalize_fields_recomputes_per_port_tls_san_digests_after_serde_round_trip() {
+    let mut upstream = make_upstream("reviews-u");
+    upstream.port_overrides.insert(
+        8443,
+        UpstreamPortOverride {
+            tls: Some(BackendTlsConfig {
+                sni: Some("Reviews.Mesh.Internal".to_string()),
+                san_allow_list: vec!["Reviews.Mesh.Internal".to_string()],
+                ..BackendTlsConfig::default_verify()
+            }),
+            ..UpstreamPortOverride::default()
+        },
+    );
+    upstream.port_overrides.insert(
+        9443,
+        UpstreamPortOverride {
+            tls: Some(BackendTlsConfig {
+                sni: Some("Ratings.Mesh.Internal".to_string()),
+                san_allow_list: vec!["Ratings.Mesh.Internal".to_string()],
+                ..BackendTlsConfig::default_verify()
+            }),
+            ..UpstreamPortOverride::default()
+        },
+    );
+
+    let mut proxy = make_proxy("reviews-p", "/reviews");
+    proxy.upstream_id = Some("reviews-u".to_string());
+
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let json = serde_json::to_string(&config).expect("serialize config");
+    let mut decoded: GatewayConfig = serde_json::from_str(&json).expect("deserialize config");
+    assert!(
+        decoded.upstreams[0]
+            .port_overrides
+            .values()
+            .all(|override_config| override_config
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.san_allow_list_key_digest.is_none())),
+        "per-port TLS SAN digests are skipped on the wire and must be rebuilt"
+    );
+
+    decoded.normalize_fields();
+
+    let dispatch_overrides = decoded.proxies[0]
+        .dispatch_port_overrides
+        .as_ref()
+        .expect("dispatch port overrides projected");
+    let reviews_tls = dispatch_overrides
+        .get(&8443)
+        .and_then(|override_config| override_config.tls.as_ref())
+        .expect("reviews per-port TLS projected");
+    let ratings_tls = dispatch_overrides
+        .get(&9443)
+        .and_then(|override_config| override_config.tls.as_ref())
+        .expect("ratings per-port TLS projected");
+
+    assert_eq!(reviews_tls.sni.as_deref(), Some("reviews.mesh.internal"));
+    assert_eq!(reviews_tls.san_allow_list, vec!["reviews.mesh.internal"]);
+    assert!(reviews_tls.san_allow_list_key_digest.is_some());
+    assert!(ratings_tls.san_allow_list_key_digest.is_some());
+    assert_ne!(
+        reviews_tls.san_allow_list_key_digest, ratings_tls.san_allow_list_key_digest,
+        "distinct per-port SAN policies must fragment backend pool keys"
     );
 }
 

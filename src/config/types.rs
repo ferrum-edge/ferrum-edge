@@ -415,6 +415,10 @@ pub struct ResolvedPortOverride {
 
 impl ResolvedPortOverride {
     pub fn from_upstream_override(value: &UpstreamPortOverride) -> Option<Self> {
+        let mut tls = value.tls.clone();
+        if let Some(tls) = &mut tls {
+            tls.normalize_fields();
+        }
         let resolved = Self {
             connect_timeout_ms: value.connect_timeout_ms,
             algorithm: value.algorithm,
@@ -426,7 +430,7 @@ impl ResolvedPortOverride {
             http_max_requests_per_connection: value.http_max_requests_per_connection,
             http_idle_timeout_ms: value.http_idle_timeout_ms,
             h2_max_concurrent_streams: value.h2_max_concurrent_streams,
-            tls: value.tls.clone(),
+            tls,
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -928,6 +932,18 @@ impl BackendTlsConfig {
 
     pub fn recompute_san_digest(&mut self) {
         self.san_allow_list_key_digest = Self::compute_san_digest(&self.san_allow_list);
+    }
+
+    /// Normalize TLS identity fields and refresh derived SAN pool-key state
+    /// skipped by serde.
+    pub fn normalize_fields(&mut self) {
+        if let Some(sni) = &mut self.sni {
+            *sni = sni.to_ascii_lowercase();
+        }
+        for san in &mut self.san_allow_list {
+            normalize_backend_tls_san_allow_list_entry(san);
+        }
+        self.recompute_san_digest();
     }
 
     pub(crate) fn compute_san_digest(sans: &[String]) -> Option<String> {
@@ -4089,6 +4105,11 @@ impl Upstream {
         }
         for san in &mut self.backend_tls_san_allow_list {
             normalize_backend_tls_san_allow_list_entry(san);
+        }
+        for override_config in self.port_overrides.values_mut() {
+            if let Some(tls) = &mut override_config.tls {
+                tls.normalize_fields();
+            }
         }
     }
 
