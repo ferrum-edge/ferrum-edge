@@ -378,13 +378,17 @@ struct EvaluationOutcome {
     provider_error: Option<String>,
 }
 
-pub struct AiSemanticFirewall {
+/// Shared semantic-inspection engine: rules, provider, the lazily-built
+/// embedding index, and the evaluate / decide / decision-metadata machinery.
+///
+/// Held behind an `Arc` so the buffered request/response paths
+/// ([`AiSemanticFirewall`]) and the streaming `inspect` path (its windowed
+/// inspector) share **one** instance — same rules, one embedding index, one
+/// provider client — instead of duplicating the engine per stream.
+struct FirewallEngine {
     enabled: bool,
-    inspect_request: bool,
-    inspect_response: bool,
     mode: EnforcementMode,
     on_error: OnErrorAction,
-    streaming_response: StreamingResponsePolicy,
     provider: Option<ProviderConfig>,
     http_client: PluginHttpClient,
     rules: Vec<SemanticRule>,
@@ -392,8 +396,6 @@ pub struct AiSemanticFirewall {
     extraction: ExtractionConfig,
     privacy: PrivacyConfig,
     expose_rule_id_to_client: bool,
-    has_request_rules: bool,
-    has_response_rules: bool,
     /// True when both directions can produce decision metadata in the same
     /// transaction (request + response inspection both active with applicable
     /// rules). In that case decision metadata keys are scoped by direction
@@ -401,6 +403,16 @@ pub struct AiSemanticFirewall {
     /// so the response pass does not overwrite the request-side audit record.
     metadata_direction_scoped: bool,
     rule_embeddings: OnceCell<Arc<RuleEmbeddingIndex>>,
+}
+
+pub struct AiSemanticFirewall {
+    enabled: bool,
+    inspect_request: bool,
+    inspect_response: bool,
+    streaming_response: StreamingResponsePolicy,
+    has_request_rules: bool,
+    has_response_rules: bool,
+    engine: Arc<FirewallEngine>,
 }
 
 impl AiSemanticFirewall {
@@ -509,20 +521,23 @@ impl AiSemanticFirewall {
                 enabled,
                 inspect_request,
                 inspect_response,
-                mode,
-                on_error,
                 streaming_response,
-                provider: None,
-                http_client,
-                rules: Vec::new(),
-                allow_topics: Vec::new(),
-                extraction,
-                privacy,
-                expose_rule_id_to_client,
                 has_request_rules: false,
                 has_response_rules: false,
-                metadata_direction_scoped: false,
-                rule_embeddings: OnceCell::new(),
+                engine: Arc::new(FirewallEngine {
+                    enabled,
+                    mode,
+                    on_error,
+                    provider: None,
+                    http_client,
+                    rules: Vec::new(),
+                    allow_topics: Vec::new(),
+                    extraction,
+                    privacy,
+                    expose_rule_id_to_client,
+                    metadata_direction_scoped: false,
+                    rule_embeddings: OnceCell::new(),
+                }),
             });
         }
 
@@ -587,23 +602,28 @@ impl AiSemanticFirewall {
             enabled,
             inspect_request,
             inspect_response,
-            mode,
-            on_error,
             streaming_response,
-            provider,
-            http_client,
-            rules,
-            allow_topics,
-            extraction,
-            privacy,
-            expose_rule_id_to_client,
             has_request_rules,
             has_response_rules,
-            metadata_direction_scoped: has_request_rules && has_response_rules,
-            rule_embeddings: OnceCell::new(),
+            engine: Arc::new(FirewallEngine {
+                enabled,
+                mode,
+                on_error,
+                provider,
+                http_client,
+                rules,
+                allow_topics,
+                extraction,
+                privacy,
+                expose_rule_id_to_client,
+                metadata_direction_scoped: has_request_rules && has_response_rules,
+                rule_embeddings: OnceCell::new(),
+            }),
         })
     }
+}
 
+impl FirewallEngine {
     async fn evaluate(
         &self,
         direction: Direction,
@@ -1403,7 +1423,7 @@ impl Plugin for AiSemanticFirewall {
                     .insert("ai_request_streaming".to_string(), "true".to_string());
                 if self.inspect_response && self.has_response_rules {
                     if self.streaming_response == StreamingResponsePolicy::Reject
-                        && self.mode == EnforcementMode::Enforce
+                        && self.engine.mode == EnforcementMode::Enforce
                     {
                         // Fail closed: a client must not be able to disable response
                         // inspection just by requesting a stream. Record the reject
@@ -1436,16 +1456,20 @@ impl Plugin for AiSemanticFirewall {
             return PluginResult::Continue;
         }
 
-        let segments = extract_request_segments(&json, &self.extraction);
-        if segments.is_empty() && self.allow_topics.is_empty() {
+        let segments = extract_request_segments(&json, &self.engine.extraction);
+        if segments.is_empty() && self.engine.allow_topics.is_empty() {
             return PluginResult::Continue;
         }
 
         let outcome = self
+            .engine
             .evaluate(Direction::Request, &segments, &ctx.plugin_http_call_ns)
             .await;
-        if self.should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref()) {
-            return self.handle_provider_error(
+        if self
+            .engine
+            .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref())
+        {
+            return self.engine.handle_provider_error(
                 ctx,
                 Direction::Request,
                 outcome
@@ -1455,7 +1479,7 @@ impl Plugin for AiSemanticFirewall {
             );
         }
 
-        self.handle_decision(
+        self.engine.handle_decision(
             ctx,
             outcome.decision,
             Direction::Request,
@@ -1536,7 +1560,8 @@ impl Plugin for AiSemanticFirewall {
             // pinned the stream. SSE deltas arrive as many tiny fragments, so they
             // are reassembled into coherent per-choice / per-tool-call text before
             // inspection rather than scored fragment-by-fragment.
-            let (segments, fully_parsed) = reassemble_sse_response_segments(body, &self.extraction);
+            let (segments, fully_parsed) =
+                reassemble_sse_response_segments(body, &self.engine.extraction);
             // `buffer` mode forced this stream onto the buffered path specifically
             // to inspect it. If nothing inspectable was recovered — the body had
             // non-UTF-8 / non-JSON `data:` events, or no extractable content — then
@@ -1545,7 +1570,7 @@ impl Plugin for AiSemanticFirewall {
             // buffered SSE, e.g. pinned by a different plugin, keeps the lenient
             // path: no marker means this branch is skipped.)
             if buffer_streaming_marker_set(ctx) && (!fully_parsed || segments.is_empty()) {
-                return self.handle_uninspectable_buffered_stream(ctx);
+                return self.engine.handle_uninspectable_buffered_stream(ctx);
             }
             segments
         } else if is_json_content_type(content_type) {
@@ -1554,7 +1579,12 @@ impl Plugin for AiSemanticFirewall {
                 Err(_) => return PluginResult::Continue,
             };
             let mut segments = Vec::new();
-            extract_response_segments_from_json(&json, &self.extraction, None, &mut segments);
+            extract_response_segments_from_json(
+                &json,
+                &self.engine.extraction,
+                None,
+                &mut segments,
+            );
             segments
         } else {
             return PluginResult::Continue;
@@ -1565,10 +1595,14 @@ impl Plugin for AiSemanticFirewall {
         }
 
         let outcome = self
+            .engine
             .evaluate(Direction::Response, &segments, &ctx.plugin_http_call_ns)
             .await;
-        if self.should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref()) {
-            return self.handle_provider_error(
+        if self
+            .engine
+            .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref())
+        {
+            return self.engine.handle_provider_error(
                 ctx,
                 Direction::Response,
                 outcome
@@ -1578,7 +1612,7 @@ impl Plugin for AiSemanticFirewall {
             );
         }
 
-        self.handle_decision(
+        self.engine.handle_decision(
             ctx,
             outcome.decision,
             Direction::Response,
