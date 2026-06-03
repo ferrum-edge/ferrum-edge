@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use ferrum_edge::config::types::BackendScheme;
+use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, PluginResult, create_plugin, priority};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -399,6 +399,59 @@ async fn start_mcp_session_scoped_catalog_server() -> MockServer {
     server
 }
 
+async fn start_mcp_schema_change_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "tools-1",
+            "result": {
+                "tools": [
+                    {
+                        "name": "create_pr",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "repo": { "type": "string" }
+                            }
+                        }
+                    }
+                ]
+            }
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "tools-2",
+            "result": {
+                "tools": [
+                    {
+                        "name": "create_pr",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "repo": { "type": "string" },
+                                "title": { "type": "string" }
+                            }
+                        }
+                    }
+                ]
+            }
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    server
+}
+
 async fn initialize(plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>) -> String {
     let (mut ctx, mut headers) = mcp_ctx(json!({
         "jsonrpc": "2.0",
@@ -418,6 +471,28 @@ async fn initialize(plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>) -
         .get("mcp-session-id")
         .expect("synthetic initialize must return an MCP session")
         .clone()
+}
+
+async fn aggregate_tool_names(
+    plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    request_id: i64,
+) -> Vec<String> {
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (_, body, _) = reject_json(result);
+    body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect()
 }
 
 #[test]
@@ -526,6 +601,10 @@ async fn transparent_post_sets_direct_route_override_and_metadata() {
         Some("github-mcp.example")
     );
     assert_eq!(ctx.route_override_backend_port, Some(8080));
+    assert_eq!(
+        ctx.route_override_resolved_tls,
+        Some(BackendTlsConfig::default_verify())
+    );
     assert_eq!(ctx.route_override_path.as_deref(), Some("/mcp"));
     assert!(ctx.route_override_path_is_absolute);
     assert_eq!(
@@ -738,6 +817,32 @@ async fn aggregate_resource_templates_list_returns_resource_templates() {
             .as_str()
             .unwrap()
             .contains("{path}")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_resource_templates_list_honors_resource_aggregation_flag() {
+    let server = start_mcp_resource_templates_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["discovery"]["aggregate_resources"] = json!(false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 17,
+        "method": "resources/templates/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["result"]["resourceTemplates"], json!([]));
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "disabled resource aggregation must not query upstream templates"
     );
 }
 
@@ -1012,6 +1117,40 @@ async fn aggregate_sessions_are_bounded() {
 }
 
 #[tokio::test]
+async fn aggregate_max_session_eviction_deletes_initialized_upstream_session() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"max_sessions": 1, "session_ttl_seconds": 3600});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let evicted_session_id = initialize(&plugin).await;
+    let (mut list_ctx, mut list_headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 18,
+        "method": "tools/list",
+        "params": {}
+    }));
+    list_headers.insert("mcp-session-id".to_string(), evicted_session_id);
+    let _ = plugin.before_proxy(&mut list_ctx, &mut list_headers).await;
+
+    let live_session_id = initialize(&plugin).await;
+    assert!(!live_session_id.is_empty());
+
+    let requests = server.received_requests().await.unwrap();
+    let delete = requests
+        .iter()
+        .find(|request| request.method.as_str() == "DELETE")
+        .expect("max-session eviction should delete initialized upstream session");
+    assert_eq!(
+        delete
+            .headers
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("upstream-session")
+    );
+}
+
+#[tokio::test]
 async fn aggregate_catalogs_are_scoped_per_downstream_session() {
     let server = start_mcp_session_scoped_catalog_server().await;
     let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
@@ -1050,6 +1189,42 @@ async fn aggregate_catalogs_are_scoped_per_downstream_session() {
         .await;
     let (_, second_body, _) = reject_json(result);
     assert_eq!(second_body["result"]["tools"][0]["name"], "github.second");
+}
+
+#[tokio::test]
+async fn aggregate_schema_changed_tools_stay_hidden_until_configured() {
+    let server = start_mcp_schema_change_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["discovery"]["cache_ttl_seconds"] = json!(1);
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["discovery"]["on_schema_change"] = json!("hide_until_configured");
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config["policy"] = json!({"default_action": "allow"});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 22).await,
+        vec!["github.create_pr"]
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert!(
+        aggregate_tool_names(&plugin, &session_id, 23)
+            .await
+            .is_empty(),
+        "schema change should hide the tool"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert!(
+        aggregate_tool_names(&plugin, &session_id, 24)
+            .await
+            .is_empty(),
+        "schema-changed tool should stay hidden after the new schema becomes the catalog baseline"
+    );
 }
 
 #[tokio::test]
@@ -1149,6 +1324,29 @@ async fn aggregate_passthrough_unknown_methods_initialize_upstream_session() {
             .as_deref()
             == Some("notifications/initialized")
     }));
+}
+
+#[tokio::test]
+async fn aggregate_unsupported_http_methods_fail_closed() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "PATCH".to_string();
+    ctx.path = "/mcp".to_string();
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 405);
+    assert_eq!(body["error"], "unsupported MCP aggregate HTTP method");
+    assert_eq!(
+        ctx.metadata.get("mcp.route_decision").map(String::as_str),
+        Some("deny")
+    );
 }
 
 #[tokio::test]

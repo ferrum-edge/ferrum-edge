@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 use url::Url;
 
-use crate::config::types::BackendScheme;
+use crate::config::types::{BackendScheme, BackendTlsConfig};
 
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
 
@@ -256,6 +256,7 @@ struct ToolCatalogEntry {
     description: Option<String>,
     annotations: Option<Value>,
     enabled: bool,
+    hidden_by_discovery: bool,
     hidden_from_discovery: bool,
     input_validator: Arc<jsonschema::Validator>,
     #[allow(dead_code)] // Stored for drift/operational metadata extensions.
@@ -618,6 +619,7 @@ impl McpGateway {
         ctx.route_override_backend_scheme = Some(server.target.scheme);
         ctx.route_override_backend_host = Some(server.target.host.clone());
         ctx.route_override_backend_port = Some(server.target.port);
+        ctx.route_override_resolved_tls = Some(BackendTlsConfig::default_verify());
         ctx.route_override_path = Some(server.target.path.clone());
         ctx.route_override_path_is_absolute = true;
         ctx.route_override_authority = Some(server.target.authority.clone());
@@ -669,7 +671,7 @@ impl McpGateway {
         session.last_seen.elapsed() >= self.sessions.session_ttl
     }
 
-    fn evict_expired_sessions(&self) {
+    async fn evict_expired_sessions(&self, ctx: &RequestContext) {
         let expired: Vec<String> = self
             .session_store
             .iter()
@@ -677,11 +679,11 @@ impl McpGateway {
             .map(|entry| entry.key().clone())
             .collect();
         for session_id in expired {
-            self.session_store.remove(&session_id);
+            self.remove_downstream_session(&session_id, ctx).await;
         }
     }
 
-    fn evict_oldest_session_if_needed(&self) {
+    async fn evict_oldest_session_if_needed(&self, ctx: &RequestContext) {
         while self.session_store.len() >= self.sessions.max_sessions {
             let oldest = self
                 .session_store
@@ -691,19 +693,24 @@ impl McpGateway {
             let Some(session_id) = oldest else {
                 break;
             };
-            if self.session_store.remove(&session_id).is_none() {
+            if !self.remove_downstream_session(&session_id, ctx).await {
                 break;
             }
         }
     }
 
-    fn touch_downstream_session(&self, downstream_session_id: &str) -> bool {
+    async fn touch_downstream_session(
+        &self,
+        downstream_session_id: &str,
+        ctx: &RequestContext,
+    ) -> bool {
         let expired = self
             .session_store
             .get(downstream_session_id)
             .is_some_and(|session| self.session_is_expired(&session));
         if expired {
-            self.session_store.remove(downstream_session_id);
+            self.remove_downstream_session(downstream_session_id, ctx)
+                .await;
             return false;
         }
         if let Some(mut session) = self.session_store.get_mut(downstream_session_id) {
@@ -718,9 +725,6 @@ impl McpGateway {
         &self,
         downstream_session_id: &str,
     ) -> Option<DownstreamMcpSession> {
-        if !self.touch_downstream_session(downstream_session_id) {
-            return None;
-        }
         self.session_store
             .get(downstream_session_id)
             .map(|session| session.clone())
@@ -731,10 +735,11 @@ impl McpGateway {
             .map(|session| session.catalog)
     }
 
-    fn require_live_downstream_session(
+    async fn require_live_downstream_session(
         &self,
         headers: &HashMap<String, String>,
         id: Option<Value>,
+        ctx: &RequestContext,
     ) -> Result<String, PluginResult> {
         let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
             return Err(json_rpc_error(
@@ -744,20 +749,21 @@ impl McpGateway {
                 None,
             ));
         };
-        if !self.touch_downstream_session(&session_id) {
+        if !self.touch_downstream_session(&session_id, ctx).await {
             return Err(session_not_found_response());
         }
         Ok(session_id)
     }
 
-    fn create_downstream_session(
+    async fn create_downstream_session(
         &self,
+        ctx: &RequestContext,
         protocol_version: String,
         client_info: Option<Value>,
         client_capabilities: Option<Value>,
     ) -> String {
-        self.evict_expired_sessions();
-        self.evict_oldest_session_if_needed();
+        self.evict_expired_sessions(ctx).await;
+        self.evict_oldest_session_if_needed(ctx).await;
         let downstream_session_id = uuid::Uuid::new_v4().to_string();
         let upstream_sessions = self
             .servers
@@ -1329,25 +1335,27 @@ impl McpGateway {
         let mut resource_templates = HashMap::new();
         let discovered_at = Utc::now();
 
-        for server in self
-            .servers
-            .values()
-            .filter(|server| server.enabled && server.expose_resources)
-        {
-            let items = self
-                .request_upstream_list_pages(
-                    ctx,
-                    downstream_session_id,
-                    server,
-                    "resources/templates/list",
-                    "resourceTemplates",
-                )
-                .await?;
-            for item in items {
-                if let Some(entry) =
-                    self.resource_template_entry_from_value(server, item, discovered_at)
-                {
-                    resource_templates.insert(entry.public_uri_template.clone(), entry);
+        if self.discovery.aggregate_resources {
+            for server in self
+                .servers
+                .values()
+                .filter(|server| server.enabled && server.expose_resources)
+            {
+                let items = self
+                    .request_upstream_list_pages(
+                        ctx,
+                        downstream_session_id,
+                        server,
+                        "resources/templates/list",
+                        "resourceTemplates",
+                    )
+                    .await?;
+                for item in items {
+                    if let Some(entry) =
+                        self.resource_template_entry_from_value(server, item, discovered_at)
+                    {
+                        resource_templates.insert(entry.public_uri_template.clone(), entry);
+                    }
                 }
             }
         }
@@ -1405,10 +1413,15 @@ impl McpGateway {
             .tools
             .get(&public_name)
             .is_some_and(|old| old.schema_hash != schema_hash);
+        let previously_hidden_by_discovery = old_catalog
+            .tools
+            .get(&public_name)
+            .is_some_and(|old| old.hidden_by_discovery);
         let new_tool = !old_catalog.tools.contains_key(&public_name);
-        let hidden_by_discovery = (new_tool
-            && self.discovery.on_new_tool == DiscoveryBehavior::HideUntilConfigured
-            && !explicitly_configured)
+        let hidden_by_discovery = (previously_hidden_by_discovery && !explicitly_configured)
+            || (new_tool
+                && self.discovery.on_new_tool == DiscoveryBehavior::HideUntilConfigured
+                && !explicitly_configured)
             || (schema_changed
                 && self.discovery.on_schema_change == DiscoveryBehavior::HideUntilConfigured);
         let hidden_from_discovery =
@@ -1428,6 +1441,7 @@ impl McpGateway {
             description,
             annotations: item.get("annotations").cloned(),
             enabled,
+            hidden_by_discovery,
             hidden_from_discovery,
             input_validator,
             discovered_at,
@@ -2217,7 +2231,7 @@ impl Plugin for McpGateway {
                 return PluginResult::Continue;
             }
             if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
-                if !self.touch_downstream_session(&session_id) {
+                if !self.touch_downstream_session(&session_id, ctx).await {
                     return session_not_found_response();
                 }
                 self.remove_downstream_session(&session_id, ctx).await;
@@ -2239,6 +2253,18 @@ impl Plugin for McpGateway {
         }
 
         if !ctx.method.eq_ignore_ascii_case("POST") {
+            if self.mode == McpGatewayMode::AggregateRouter {
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+                return PluginResult::Reject {
+                    status_code: 405,
+                    body: json!({"error": "unsupported MCP aggregate HTTP method"}).to_string(),
+                    headers: HashMap::from([(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
+                };
+            }
             return PluginResult::Continue;
         }
         if !Self::content_type_is_json(headers) {
@@ -2257,7 +2283,7 @@ impl Plugin for McpGateway {
         if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
             if self.mode == McpGatewayMode::AggregateRouter
                 && method != "initialize"
-                && !self.touch_downstream_session(&session_id)
+                && !self.touch_downstream_session(&session_id, ctx).await
             {
                 return session_not_found_response();
             }
@@ -2291,11 +2317,14 @@ impl Plugin for McpGateway {
                     .as_ref()
                     .and_then(|params| params.get("capabilities"))
                     .cloned();
-                let downstream_session_id = self.create_downstream_session(
-                    version.clone(),
-                    client_info,
-                    client_capabilities,
-                );
+                let downstream_session_id = self
+                    .create_downstream_session(
+                        ctx,
+                        version.clone(),
+                        client_info,
+                        client_capabilities,
+                    )
+                    .await;
                 ctx.metadata.insert(
                     "mcp.session.downstream".to_string(),
                     hash_str(&downstream_session_id),
@@ -2325,74 +2354,90 @@ impl Plugin for McpGateway {
                 )
             }
             "tools/list" => {
-                let session_id =
-                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
-                        Ok(session_id) => session_id,
-                        Err(result) => return result,
-                    };
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
                 self.aggregate_tools_list(ctx, &envelope, &session_id).await
             }
             "tools/call" => {
-                let session_id =
-                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
-                        Ok(session_id) => session_id,
-                        Err(result) => return result,
-                    };
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
                 self.route_tool_call(ctx, headers, &envelope, &session_id)
                     .await
             }
             "prompts/list" => {
-                let session_id =
-                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
-                        Ok(session_id) => session_id,
-                        Err(result) => return result,
-                    };
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
                 self.aggregate_prompts_list(ctx, &envelope, &session_id)
                     .await
             }
             "prompts/get" => {
-                let session_id =
-                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
-                        Ok(session_id) => session_id,
-                        Err(result) => return result,
-                    };
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
                 self.route_prompt_get(ctx, headers, &envelope, &session_id)
                     .await
             }
             "resources/list" => {
-                let session_id =
-                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
-                        Ok(session_id) => session_id,
-                        Err(result) => return result,
-                    };
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
                 self.aggregate_resources_list(ctx, &envelope, &session_id)
                     .await
             }
             "resources/templates/list" => {
-                let session_id =
-                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
-                        Ok(session_id) => session_id,
-                        Err(result) => return result,
-                    };
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
                 self.aggregate_resource_templates_list(ctx, &envelope, &session_id)
                     .await
             }
             "resources/read" => {
-                let session_id =
-                    match self.require_live_downstream_session(headers, envelope.id.clone()) {
-                        Ok(session_id) => session_id,
-                        Err(result) => return result,
-                    };
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
                 self.route_resource_read(ctx, headers, &envelope, &session_id)
                     .await
             }
             _ if self.capabilities.passthrough_unknown_methods => {
                 if let Some(server) = self.primary_server() {
-                    let session_id =
-                        match self.require_live_downstream_session(headers, envelope.id.clone()) {
-                            Ok(session_id) => session_id,
-                            Err(result) => return result,
-                        };
+                    let session_id = match self
+                        .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                        .await
+                    {
+                        Ok(session_id) => session_id,
+                        Err(result) => return result,
+                    };
                     if let Err(error) = self
                         .ensure_upstream_initialized(&session_id, &server.server_id, ctx)
                         .await
