@@ -4435,15 +4435,23 @@ fn build_mesh_inbound_spiffe_slot(
 
     // F2 (accepted coupling, documented): `load_svid_bundle_from_files`
     // validates the gateway SVID *leaf* (notBefore/notAfter, non-CA) as well as
-    // the trust-bundle CAs. An expired or mid-rotation gateway leaf therefore
-    // fails the whole load and we fall back to chain-only verification (no
-    // peer-SAN trust-domain check) with only a `warn!`, even though the trust
-    // *bundle* itself could still be valid. We intentionally do not load only
-    // the trust bundle here: the gateway leaf must also be currently valid for
-    // the listener to present a usable server identity, so an expired leaf is a
-    // real operational fault that the chain-only fallback degrades gracefully
-    // around rather than a reason to keep half-loading SVID material. Treating
-    // expired-leaf -> chain-only as the accepted current behavior.
+    // the trust-bundle CAs, so an expired/mid-rotation leaf OR a corrupt trust
+    // bundle fails the whole load and this returns `None`. The disposition is the
+    // CALLER's, and (issue #1523) it is NOT graceful chain-only at startup:
+    //   - Startup: a configured-but-unloadable gateway SVID is a hard fault. The
+    //     SAME material is loaded and validated by `load_gateway_svid_bundle` in
+    //     ProxyState construction (`new_with_bpf_metrics`), which refuses startup
+    //     *first*; `enforce_mesh_inbound_fail_closed` is the inbound-local guard
+    //     for the identical condition. So a configured SVID that fails to load —
+    //     including an expired/mid-rotation leaf — aborts startup; it does not
+    //     silently degrade to chain-only.
+    //   - Live reload: `stage_mesh_inbound_spiffe_bundle` keeps the PREVIOUS trust
+    //     bundle (the running verifier is retained, not dropped to chain-only), so
+    //     a transient mid-rotation failure does not drop inbound trust-domain
+    //     enforcement.
+    // We intentionally do not load only the trust bundle here: the gateway leaf
+    // must also be currently valid for the listener to present a usable server
+    // identity, so an expired leaf is a real fault, not a reason to half-load.
     let mut bundle = match crate::identity::file_loader::load_svid_bundle_from_files(
         std::path::Path::new(cert_path),
         std::path::Path::new(key_path),
@@ -4452,12 +4460,13 @@ fn build_mesh_inbound_spiffe_slot(
     ) {
         Ok(bundle) => bundle,
         Err(error) => {
+            // Neutral report — the caller decides the disposition: fatal at
+            // startup (also independently enforced by `load_gateway_svid_bundle`),
+            // previous-bundle-retained on live reload.
             error!(
                 %error,
-                "Failed to load gateway SVID material for mesh inbound SPIFFE peer \
-                 verification; trust-domain enforcement is now DISABLED until SVID \
-                 material reloads — inbound peers are accepted via chain validation \
-                 only (no peer trust-domain check)"
+                "Failed to load gateway SVID material for the mesh inbound SPIFFE peer \
+                 verifier (startup: fatal; live reload: previous trust bundle retained)"
             );
             return None;
         }
@@ -5091,6 +5100,9 @@ fn plan_mesh_inbound_tls_reload(
     last_snapshot: Option<&MeshInboundTlsReloadSnapshot>,
     spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
     production: bool,
+    // Precomputed once by the apply task (topology is process-fixed) so the reload
+    // path does not re-derive `runtime.listener_plan()` on every slice apply.
+    has_termination_listener: bool,
 ) -> Option<MeshInboundTlsReloadPlan> {
     let next_snapshot = match mesh_inbound_tls_reload_snapshot(&proxy_state.env_config, mtls_mode) {
         Ok(snapshot) => snapshot,
@@ -5147,16 +5159,10 @@ fn plan_mesh_inbound_tls_reload(
             // production sidecar to plaintext. Reject the slice instead (return
             // `None` → the apply task keeps the last-good mTLS config in its
             // entirety; fail-closed by retention, never crashing a live data
-            // plane). Same posture as startup: refused unconditionally under
-            // production, else gated by the dev `FERRUM_MESH_ALLOW_NO_CA` opt-out.
+            // plane). Same posture as startup: refused under production; dev allows
+            // it with a warning (an explicit DISABLE is an intentional choice).
             // Topologies without a TLS-terminating inbound listener (EastWestGateway
-            // SNI passthrough) are exempt.
-            let has_termination_listener = runtime.listener_plan().iter().any(|listener| {
-                matches!(
-                    listener.kind,
-                    MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-                )
-            });
+            // SNI passthrough) are exempt (`has_termination_listener` is false).
             if has_termination_listener && tls_config.is_none() {
                 match decide_mesh_inbound_fail_closed(true, production) {
                     MeshInboundFailClosed::Refuse => {
@@ -5417,6 +5423,15 @@ fn start_mesh_slice_apply_task(
     dns_proxy: Option<Arc<MeshDnsProxy>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Topology is process-fixed, so whether this data plane has an inbound
+        // TLS-terminating listener never changes — compute it once here rather
+        // than re-deriving `runtime.listener_plan()` on every slice apply.
+        let has_termination_listener = runtime.listener_plan().iter().any(|listener| {
+            matches!(
+                listener.kind,
+                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
+            )
+        });
         let mut updates = mesh_state.subscribe();
         let mut federation_updates = mesh_state.federation_store().subscribe();
         let mut remote_endpoint_updates = mesh_state.remote_endpoint_store().subscribe();
@@ -5468,6 +5483,7 @@ fn start_mesh_slice_apply_task(
                                 inbound_tls_reload.last_snapshot.as_ref(),
                                 inbound_tls_reload.spiffe_bundle_slot.as_ref(),
                                 inbound_tls_reload.production,
+                                has_termination_listener,
                             )
                             .map(|plan| (mtls_mode, plan))
                         })
@@ -10401,6 +10417,7 @@ mod tests {
             None,
             None,
             true, // production
+            true, // has a TLS-terminating inbound listener (Sidecar)
         );
         assert!(
             plan.is_none(),
@@ -10418,6 +10435,7 @@ mod tests {
             None,
             None,
             false, // dev
+            true,  // has a TLS-terminating inbound listener (Sidecar)
         );
         assert!(
             matches!(
