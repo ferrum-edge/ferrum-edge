@@ -2127,12 +2127,16 @@ async fn handle_h3_request(
                 let err_msg = e.to_string();
                 if err_msg.contains("exceeds maximum size") {
                     record_request(&state, 413);
-                    send_h3_response(
+                    // Do NOT propagate a send error: record_backend_outcome
+                    // below releases the LB active-connection count, so a `?`
+                    // here would skip it and leak the count when the client
+                    // disconnects during the 413 write.
+                    let _ = send_h3_response(
                         &mut stream,
                         StatusCode::PAYLOAD_TOO_LARGE,
                         r#"{"error":"Request body exceeds maximum size"}"#,
                     )
-                    .await?;
+                    .await;
                     // Balance the record_connection_start above: this early
                     // return was the only exit from this branch that did not
                     // flow through record_backend_outcome, so the
@@ -2192,7 +2196,11 @@ async fn handle_h3_request(
                         .mark_h3_unsupported(&proxy, upstream_target.as_deref());
                 }
                 let h3_error_body = r#"{"error":"Backend unavailable"}"#;
-                send_h3_response(&mut stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
+                // Do NOT propagate a send error: record_backend_outcome below
+                // releases the LB active-connection count, so a `?` here would
+                // skip it and leak the count when the client disconnects during
+                // the 502 write.
+                let _ = send_h3_response(&mut stream, StatusCode::BAD_GATEWAY, h3_error_body).await;
 
                 // Record outcome for CB/health even on failure.
                 // Frontend client aborts while uploading request bodies are
@@ -2286,12 +2294,16 @@ async fn handle_h3_request(
                 .and_then(|v| v.parse::<usize>().ok())
             && len > state.max_response_body_size_bytes
         {
-            send_h3_response(
+            // Do NOT propagate a send error: record_backend_outcome below
+            // releases the LB active-connection count, so a `?` here would skip
+            // it and leak the count when the client disconnects during the
+            // reject write.
+            let _ = send_h3_response(
                 &mut stream,
                 StatusCode::BAD_GATEWAY,
                 r#"{"error":"Backend response body exceeds maximum size"}"#,
             )
-            .await?;
+            .await;
 
             crate::proxy::backend_dispatch::record_backend_outcome(
                 &state,
@@ -3732,6 +3744,34 @@ enum H3RefinedResponse {
     Buffered(H3BufferedDispatchResult),
 }
 
+/// Build the `H3StreamResult` for a pre-headers backend-dispatch failure on the
+/// H3 streaming / refined paths.
+///
+/// `reject_sent` is whether the synthesized 502 write reached the client. A
+/// failed write is reported as `client_disconnected` rather than propagated as
+/// an error: these dispatch functions start least-connections LB tracking before
+/// dispatch and their caller releases the active-connection count via
+/// `record_backend_outcome` off the returned result, so returning `Err` on a
+/// failed reject write would skip that accounting and leak the count. The
+/// backend never produced a response here, so `backend_status` is the
+/// gateway-synthesized 502.
+fn h3_backend_unavailable_stream_result(
+    error_class: crate::retry::ErrorClass,
+    request_on_wire: bool,
+    reject_sent: bool,
+) -> H3StreamResult {
+    H3StreamResult {
+        status: 502,
+        backend_status: 502,
+        error_class: Some(error_class),
+        body_completed: false,
+        bytes_streamed: 0,
+        client_disconnected: !reject_sent,
+        body_error_class: None,
+        request_on_wire,
+    }
+}
+
 async fn run_h3_streaming_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -3822,16 +3862,9 @@ async fn proxy_to_backend_h3_refined_response(
             )
             .await
             .is_ok();
-            return Ok(H3RefinedResponse::Streamed(H3StreamResult {
-                status: 502,
-                backend_status: 502,
-                error_class: Some(h3_error_class),
-                body_completed: false,
-                bytes_streamed: 0,
-                client_disconnected: !reject_sent,
-                body_error_class: None,
-                request_on_wire,
-            }));
+            return Ok(H3RefinedResponse::Streamed(
+                h3_backend_unavailable_stream_result(h3_error_class, request_on_wire, reject_sent),
+            ));
         }
     };
 
@@ -4305,18 +4338,13 @@ async fn proxy_to_backend_h3_streaming(
             let reject_sent = send_h3_response(h3_stream, StatusCode::BAD_GATEWAY, h3_error_body)
                 .await
                 .is_ok();
-            return Ok(H3StreamResult {
-                status: 502,
-                // No backend response was received (pre-headers dispatch
-                // failure); there is no true backend status to report.
-                backend_status: 502,
-                error_class: Some(h3_error_class),
-                body_completed: false,
-                bytes_streamed: 0,
-                client_disconnected: !reject_sent,
-                body_error_class: None,
+            // No backend response was received (pre-headers dispatch failure),
+            // so backend_status is the gateway-synthesized 502.
+            return Ok(h3_backend_unavailable_stream_result(
+                h3_error_class,
                 request_on_wire,
-            });
+                reject_sent,
+            ));
         }
     };
 
@@ -5552,6 +5580,46 @@ mod h3_streaming_outcome_tests {
             "backend-emitted 5xx without any error class is a status failure, \
              not a connection failure"
         );
+    }
+
+    #[test]
+    fn backend_unavailable_reject_write_failure_is_recorded_not_propagated() {
+        // Regression for the LB active-connection leak: the H3 backend-dispatch
+        // failure paths (`proxy_to_backend_h3_refined_response` and
+        // `proxy_to_backend_h3_streaming`) must report a failed 502 reject write
+        // as `client_disconnected` and STILL return a recordable result, so the
+        // caller runs `record_backend_outcome` and releases the active-connection
+        // count. Propagating the send error with `?` (the old behavior) skipped
+        // that accounting and leaked one count per backend-failure + client
+        // disconnect. The inline native-H3 reject paths share the same contract
+        // by swallowing the send error instead of returning a result.
+        let disconnected = super::h3_backend_unavailable_stream_result(
+            ErrorClass::ProtocolError,
+            /* request_on_wire = */ true,
+            /* reject_sent = */ false,
+        );
+        assert!(
+            disconnected.client_disconnected,
+            "a failed 502 reject write must be reported as a client disconnect"
+        );
+        assert_eq!(disconnected.status, 502);
+        assert_eq!(
+            disconnected.backend_status, 502,
+            "no backend response was received, so backend_status is the synthesized 502"
+        );
+        assert_eq!(disconnected.error_class, Some(ErrorClass::ProtocolError));
+        assert!(disconnected.request_on_wire);
+
+        let delivered = super::h3_backend_unavailable_stream_result(
+            ErrorClass::ProtocolError,
+            /* request_on_wire = */ false,
+            /* reject_sent = */ true,
+        );
+        assert!(
+            !delivered.client_disconnected,
+            "a delivered 502 reject write is not a client disconnect"
+        );
+        assert!(!delivered.request_on_wire);
     }
 }
 
