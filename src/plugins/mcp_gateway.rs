@@ -32,6 +32,7 @@ const METADATA_REWRITE_PARAM_KEY: &str = "mcp.rewrite.param";
 const METADATA_REWRITE_PUBLIC_VALUE_KEY: &str = "mcp.rewrite.public_value";
 const METADATA_REWRITE_UPSTREAM_VALUE_KEY: &str = "mcp.rewrite.upstream_value";
 const MAX_MCP_PAGINATION_PAGES: usize = 100;
+const MCP_STREAMABLE_HTTP_ACCEPT: &str = "application/json, text/event-stream";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpGatewayMode {
@@ -809,7 +810,7 @@ impl McpGateway {
             return Ok(None);
         }
         let _guard = self.upstream_init_lock.lock().await;
-        if self
+        if let Some(upstream_session_id) = self
             .downstream_session_clone(downstream_session_id)
             .and_then(|session| {
                 session
@@ -818,9 +819,8 @@ impl McpGateway {
                     .filter(|upstream| upstream.initialized)
                     .map(|upstream| upstream.upstream_session_id.clone())
             })
-            .is_some()
         {
-            return Ok(self.upstream_session_id(downstream_session_id, server_id));
+            return Ok(upstream_session_id);
         }
 
         let session = self
@@ -844,7 +844,7 @@ impl McpGateway {
             .get()
             .post(&server.upstream_url)
             .header("content-type", "application/json")
-            .header("accept", "application/json")
+            .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
             .header(
                 "mcp-protocol-version",
                 self.protocol_version_for_session(downstream_session_id),
@@ -948,7 +948,7 @@ impl McpGateway {
             .get()
             .post(&server.upstream_url)
             .header("content-type", "application/json")
-            .header("accept", "application/json")
+            .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
             .header(
                 "mcp-protocol-version",
                 self.protocol_version_for_session(downstream_session_id),
@@ -1069,7 +1069,7 @@ impl McpGateway {
             .get()
             .post(&server.upstream_url)
             .header("content-type", "application/json")
-            .header("accept", "application/json")
+            .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
             .header(
                 "mcp-protocol-version",
                 self.protocol_version_for_session(downstream_session_id),
@@ -1165,7 +1165,6 @@ impl McpGateway {
             cursor = result
                 .get("nextCursor")
                 .and_then(Value::as_str)
-                .filter(|cursor| !cursor.is_empty())
                 .map(ToOwned::to_owned);
             if cursor.is_none() {
                 return Ok(items);
@@ -1865,11 +1864,18 @@ impl McpGateway {
         }
 
         if self.validation.validate_tool_arguments {
-            let arguments = envelope
+            let empty_arguments;
+            let arguments = match envelope
                 .params
                 .as_ref()
                 .and_then(|params| params.get("arguments"))
-                .unwrap_or(&Value::Null);
+            {
+                Some(arguments) => arguments,
+                None => {
+                    empty_arguments = json!({});
+                    &empty_arguments
+                }
+            };
             if self.observability.log_argument_hash {
                 ctx.metadata
                     .insert("mcp.arguments_hash".to_string(), hash_value(arguments));
@@ -2280,6 +2286,28 @@ impl Plugin for McpGateway {
         self.emit_envelope_metadata(ctx, &envelope);
         let protocol_version = self.mark_protocol_version(ctx, headers, Some(&envelope));
         let method = envelope.method.as_deref().unwrap_or_default();
+        if method != "initialize"
+            && let Some(version) = protocol_version.as_deref()
+            && !self
+                .supported_protocol_versions
+                .iter()
+                .any(|supported| supported.as_str() == version)
+        {
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            return json_response(
+                400,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": envelope.id.clone().unwrap_or(Value::Null),
+                    "error": {
+                        "code": -32600,
+                        "message": "Unsupported MCP protocol version"
+                    }
+                }),
+                None,
+            );
+        }
         if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
             if self.mode == McpGatewayMode::AggregateRouter
                 && method != "initialize"
