@@ -1050,6 +1050,7 @@ jobs:
         if: steps.changes.outputs.ebpf_changed == 'true'
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
+          toolchain: nightly
           components: rust-src
 
       - name: Install stable Rust for shared types
@@ -1114,6 +1115,7 @@ jobs:
       - name: Install nightly Rust with rust-src
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
+          toolchain: nightly
           components: rust-src
 
       - uses: ./.github/actions/setup-rust-ci
