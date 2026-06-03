@@ -259,6 +259,12 @@ struct ToolCatalogEntry {
     enabled: bool,
     hidden_by_discovery: bool,
     hidden_from_discovery: bool,
+    // Sticky: once a tool is hidden because its inputSchema drifted under
+    // on_schema_change=hide_until_configured, it stays hidden across refreshes
+    // (the new hash becomes the baseline, so schema_changed is only true once)
+    // until an operator reconfigures/reloads — including explicitly-configured
+    // tools, which the per-refresh schema check would otherwise re-enable.
+    hidden_by_schema_change: bool,
     input_validator: Arc<jsonschema::Validator>,
     #[allow(dead_code)] // Stored for drift/operational metadata extensions.
     discovered_at: DateTime<Utc>,
@@ -662,24 +668,35 @@ impl McpGateway {
         ctx.route_override_authority = Some(server.target.authority.clone());
         headers.insert("host".to_string(), server.target.authority.clone());
         if self.mode == McpGatewayMode::AggregateRouter {
-            // Both session headers are gateway-owned in aggregate mode. Strip any
-            // client-supplied value — the synthetic downstream id and any forged
-            // upstream id (including a differently-cased header key) — before
-            // re-adding only the gateway's mediated upstream session id below. This
-            // stops passthrough / stateless upstreams (no mediated upstream session
-            // id) from binding to or rejecting a client-injected session. Transparent
-            // mode passes the client's session header straight through to its single
-            // upstream.
+            // Session headers and the protocol version are gateway-owned in aggregate
+            // mode. Strip any client-supplied session value — the synthetic downstream
+            // id and any forged upstream id (including a differently-cased header
+            // key) — before re-adding only the gateway's mediated upstream session id.
+            // This stops passthrough / stateless upstreams (no mediated upstream
+            // session id) from binding to or rejecting a client-injected session.
+            // Transparent mode passes the client's session header straight through to
+            // its single upstream.
             remove_header(headers, &self.sessions.downstream_session_header);
             remove_header(headers, &self.sessions.upstream_session_header);
-        }
-        if let Some(downstream_id) = downstream_session_id
-            && let Some(upstream_id) = self.upstream_session_id(downstream_id, &server.server_id)
-        {
-            headers.insert(
-                self.sessions.upstream_session_header.to_ascii_lowercase(),
-                upstream_id,
-            );
+            if let Some(downstream_id) = downstream_session_id {
+                // Forward the version the upstream session negotiated, which can
+                // differ from the downstream-negotiated version when both are
+                // supported. Sending the client's version could be rejected by an
+                // upstream that initialized to a different one.
+                remove_header(headers, "mcp-protocol-version");
+                headers.insert(
+                    "mcp-protocol-version".to_string(),
+                    self.protocol_version_for_upstream(downstream_id, &server.server_id),
+                );
+                if let Some(upstream_id) =
+                    self.upstream_session_id(downstream_id, &server.server_id)
+                {
+                    headers.insert(
+                        self.sessions.upstream_session_header.to_ascii_lowercase(),
+                        upstream_id,
+                    );
+                }
+            }
         }
         if self.observability.emit_metadata {
             ctx.metadata
@@ -1568,12 +1585,25 @@ impl McpGateway {
             .get(&public_name)
             .is_some_and(|old| old.hidden_by_discovery);
         let new_tool = !old_catalog.tools.contains_key(&public_name);
+        // Schema-change hiding must persist across refreshes (the changed schema
+        // becomes the new baseline, so `schema_changed` is only true on the first
+        // refresh after the drift). Carry it forward stickily so the gate is not
+        // lifted on the next refresh. This is what keeps explicitly-configured
+        // tools hidden too: they can only become hidden via schema change (the
+        // new-tool gate below exempts configured tools), so retaining their hidden
+        // state here never traps a freshly-configured tool.
+        let previously_hidden_by_schema_change = old_catalog
+            .tools
+            .get(&public_name)
+            .is_some_and(|old| old.hidden_by_schema_change);
+        let hidden_by_schema_change = previously_hidden_by_schema_change
+            || (schema_changed
+                && self.discovery.on_schema_change == DiscoveryBehavior::HideUntilConfigured);
         let hidden_by_discovery = (previously_hidden_by_discovery && !explicitly_configured)
             || (new_tool
                 && self.discovery.on_new_tool == DiscoveryBehavior::HideUntilConfigured
                 && !explicitly_configured)
-            || (schema_changed
-                && self.discovery.on_schema_change == DiscoveryBehavior::HideUntilConfigured);
+            || hidden_by_schema_change;
         let hidden_from_discovery =
             hidden_by_discovery || policy_action == PolicyAction::HideFromDiscovery;
         let enabled = policy_action == PolicyAction::Allow && !hidden_by_discovery;
@@ -1593,6 +1623,7 @@ impl McpGateway {
             enabled,
             hidden_by_discovery,
             hidden_from_discovery,
+            hidden_by_schema_change,
             input_validator,
             discovered_at,
             schema_hash,

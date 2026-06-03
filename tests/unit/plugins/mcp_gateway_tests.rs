@@ -2293,3 +2293,83 @@ async fn aggregate_tools_list_skips_collision_keeps_other_tools() {
     let names = aggregate_tool_names(&plugin, &session_id, 60).await;
     assert_eq!(names, vec!["a.unique"]);
 }
+
+#[tokio::test]
+async fn aggregate_schema_changed_configured_tool_stays_hidden_until_reconfigured() {
+    let server = start_mcp_schema_change_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["discovery"]["cache_ttl_seconds"] = json!(1);
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["discovery"]["on_schema_change"] = json!("hide_until_configured");
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    // Explicit per-tool allow — the case the prior retention check missed (it only
+    // preserved the hidden state for tools that were NOT explicitly configured).
+    config["policy"] = json!({
+        "default_action": "deny",
+        "tools": { "github.create_pr": { "action": "allow" } }
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 70).await,
+        vec!["github.create_pr"]
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert!(
+        aggregate_tool_names(&plugin, &session_id, 71)
+            .await
+            .is_empty(),
+        "schema change should hide the explicitly-configured tool"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert!(
+        aggregate_tool_names(&plugin, &session_id, 72)
+            .await
+            .is_empty(),
+        "explicitly-configured tool must stay hidden after the schema-changed baseline, not re-enable"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_routed_call_forwards_upstream_negotiated_protocol_version() {
+    let server = start_mcp_negotiated_protocol_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["endpoint"]["protocol_versions"] = json!(["2025-11-25", "2025-06-18"]);
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config["policy"] = json!({"default_action": "allow"});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    // Downstream session negotiates 2025-11-25 (the initialize helper's version).
+    let session_id = initialize(&plugin).await;
+    // Discovery initializes the upstream, which negotiates 2025-06-18.
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 80).await,
+        vec!["github.versioned_tool"]
+    );
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 81,
+        "method": "tools/call",
+        "params": { "name": "github.versioned_tool", "arguments": {} }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    // Client sends the downstream-negotiated version; the gateway must replace it
+    // with the upstream-negotiated one on the routed call.
+    headers.insert("mcp-protocol-version".to_string(), "2025-11-25".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        headers.get("mcp-protocol-version").map(String::as_str),
+        Some("2025-06-18")
+    );
+}
