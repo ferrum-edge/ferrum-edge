@@ -1126,12 +1126,20 @@ async fn functional_mesh_mode_production_binds_mtls_inbound_with_gateway_svid() 
 /// probe's root store, and each leaf carries a `127.0.0.1` SAN so a standard
 /// rustls client can verify the server SVID by address.
 struct MeshPeerSvids {
+    /// The server leaf's SPIFFE ID, pinned client-side during the handshake.
+    server_spiffe: String,
     server_cert_path: String,
     server_key_path: String,
     trust_bundle_path: String,
     ca_pem: String,
     client_cert_pem: String,
     client_key_pem: String,
+    /// A client leaf signed by the **same CA** but bearing a SPIFFE ID in a trust
+    /// domain the server's bundle does not recognize. It chains to the CA, so a
+    /// chain-only verifier would admit it; the SPIFFE trust-domain verifier must
+    /// reject it. This isolates "requires a valid peer SVID" from chain validation.
+    untrusted_td_client_cert_pem: String,
+    untrusted_td_client_key_pem: String,
 }
 
 fn generate_mesh_peer_svids(
@@ -1189,6 +1197,10 @@ fn generate_mesh_peer_svids(
 
     let (server_cert_pem, server_key_pem) = leaf(server_spiffe);
     let (client_cert_pem, client_key_pem) = leaf(client_spiffe);
+    // Same CA, but a trust domain the server bundle does not recognize — admitted
+    // by chain validation, must be rejected by the SPIFFE trust-domain verifier.
+    let (untrusted_td_client_cert_pem, untrusted_td_client_key_pem) =
+        leaf("spiffe://untrusted.example/ns/default/sa/client");
 
     let server_cert_path = dir.join("server-svid.crt");
     let server_key_path = dir.join("server-svid.key");
@@ -1199,12 +1211,15 @@ fn generate_mesh_peer_svids(
 
     let to_str = |p: PathBuf| p.to_str().expect("svid path is UTF-8").to_string();
     MeshPeerSvids {
+        server_spiffe: server_spiffe.to_string(),
         server_cert_path: to_str(server_cert_path),
         server_key_path: to_str(server_key_path),
         trust_bundle_path: to_str(trust_bundle_path),
         ca_pem,
         client_cert_pem,
         client_key_pem,
+        untrusted_td_client_cert_pem,
+        untrusted_td_client_key_pem,
     }
 }
 
@@ -1229,9 +1244,17 @@ fn strict_peer_auth_slice(node_id: &str) -> MeshSlice {
 
 /// Drive a real mTLS connection to the sidecar inbound listener at
 /// `127.0.0.1:port`, verifying the server SVID against `ca_pem` (the leaf carries
-/// a loopback SAN). With `client_identity = Some((cert_pem, key_pem))` the client
-/// presents a client SVID; with `None` it presents none. Returns `Ok(())` only
-/// when the **two-sided handshake completes and the server accepts client-auth**.
+/// a loopback SAN) **and** pinning the server's SPIFFE URI SAN to
+/// `expected_server_spiffe`. With `client_identity = Some((cert_pem, key_pem))`
+/// the client presents a client SVID; with `None` it presents none. Returns
+/// `Ok(())` only when the **two-sided handshake completes, the presented server
+/// leaf carries the expected SPIFFE identity, and the server accepts client-auth**.
+///
+/// Server-identity pin: WebPKI name checking only proves the leaf chains to
+/// `ca_pem` and is valid for `127.0.0.1`, so a same-CA cert with a wrong/missing
+/// SPIFFE URI SAN would still satisfy `connect()`. We therefore re-extract the
+/// peer leaf's SPIFFE ID post-handshake (the same extractor the inbound verifier
+/// uses) and require it to match.
 ///
 /// TLS 1.3 subtlety: the client's `connect()` returns before the server validates
 /// the client certificate, so a STRICT server rejecting a missing/untrusted client
@@ -1241,11 +1264,11 @@ fn strict_peer_auth_slice(node_id: &str) -> MeshSlice {
 /// for the HTTP request (header-read timeout is 10s, so a 3s read blocks → times
 /// out → `Ok`), while a rejected peer's connection is torn down by the alert (read
 /// errors or hits immediate EOF → `Err`). This distinguishes a client-auth failure
-/// from any post-handshake HTTP behavior; a server presenting the wrong identity
-/// instead fails verification up front at `connect()`.
+/// from any post-handshake HTTP behavior.
 async fn mesh_inbound_mtls_connect(
     port: u16,
     ca_pem: &str,
+    expected_server_spiffe: &str,
     client_identity: Option<(&str, &str)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::AsyncReadExt;
@@ -1278,6 +1301,28 @@ async fn mesh_inbound_mtls_connect(
         .await
         .map_err(|_| "tls handshake timed out")??;
 
+    // Pin the server SPIFFE identity from the presented leaf (chaining to the CA
+    // and a loopback SAN is not enough — see the doc comment). Reuses the inbound
+    // verifier's own URI-SAN extractor so this can't drift from production.
+    {
+        let (_io, conn) = tls.get_ref();
+        let server_leaf = conn
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .ok_or("server presented no certificate")?;
+        let server_id =
+            ferrum_edge::identity::spiffe::extract_spiffe_id_from_cert(server_leaf.as_ref())
+                .map_err(|e| format!("server leaf lacks a valid SPIFFE URI SAN: {e}"))?;
+        let expected = SpiffeId::new(expected_server_spiffe)
+            .map_err(|e| format!("invalid expected server SPIFFE ID: {e}"))?;
+        if server_id != expected {
+            return Err(format!(
+                "server SPIFFE ID '{server_id}' does not match expected '{expected}'"
+            )
+            .into());
+        }
+    }
+
     // Send nothing and read once to observe the post-handshake client-auth verdict
     // (see the doc comment): block→timeout = accepted, alert/EOF = rejected.
     let mut buf = [0u8; 1];
@@ -1293,10 +1338,14 @@ async fn mesh_inbound_mtls_connect(
 
 /// Live two-sided mTLS into the sidecar inbound listener (P1 keystone, Increment
 /// A — beyond #1525, which only asserts the listener *binds*). With a STRICT
-/// PeerAuthentication and the gateway SVID backing the inbound server identity:
-/// a real peer presenting a **shared-CA** client SVID completes the inbound mTLS
-/// handshake (and verifies the server SVID against the shared CA) and is accepted,
-/// while a client presenting **no** certificate is rejected by mTLS client-auth.
+/// PeerAuthentication and the gateway SVID backing the inbound server identity,
+/// three real peers probe the listener, each also pinning the **server's** SPIFFE
+/// ID from the presented leaf:
+/// - a **shared-CA** client SVID completes the handshake and is **accepted**;
+/// - a client presenting **no** certificate is **rejected** by mTLS client-auth;
+/// - a client whose SVID chains to the same CA but lives in an **untrusted trust
+///   domain** is **rejected** — proving the SPIFFE trust-domain verifier enforces,
+///   not merely chain validation (the regression Codex flagged).
 /// The request→authz→backend leg (which needs real capture/routing) is covered by
 /// the kind `mesh-e2e-sidecar` workflow (Increment B). The spawn is retried with
 /// fresh ports per the `tests/**` bind-race rule; the mTLS assertions are not.
@@ -1357,13 +1406,27 @@ async fn functional_mesh_mode_strict_inbound_requires_peer_svid() {
         }
 
         // Listener is up — run the real mTLS assertions (these are not retried).
+        // Every probe also pins the server SVID to `peers.server_spiffe`.
         let with_cert = mesh_inbound_mtls_connect(
             inbound_port,
             &peers.ca_pem,
+            &peers.server_spiffe,
             Some((&peers.client_cert_pem, &peers.client_key_pem)),
         )
         .await;
-        let no_cert = mesh_inbound_mtls_connect(inbound_port, &peers.ca_pem, None).await;
+        let no_cert =
+            mesh_inbound_mtls_connect(inbound_port, &peers.ca_pem, &peers.server_spiffe, None)
+                .await;
+        let untrusted_td = mesh_inbound_mtls_connect(
+            inbound_port,
+            &peers.ca_pem,
+            &peers.server_spiffe,
+            Some((
+                &peers.untrusted_td_client_cert_pem,
+                &peers.untrusted_td_client_key_pem,
+            )),
+        )
+        .await;
 
         let output = captured_output(&temp);
         kill_child(&mut child);
@@ -1372,12 +1435,20 @@ async fn functional_mesh_mode_strict_inbound_requires_peer_svid() {
         assert!(
             with_cert.is_ok(),
             "a peer presenting a shared-CA SVID must complete the inbound mTLS handshake \
-             and be accepted by STRICT client-auth: {with_cert:?}\n{output}"
+             and be accepted by STRICT client-auth (server SVID pinned to '{}'): \
+             {with_cert:?}\n{output}",
+            peers.server_spiffe
         );
         assert!(
             no_cert.is_err(),
             "STRICT inbound must reject a peer presenting no client certificate: \
              {no_cert:?}\n{output}"
+        );
+        assert!(
+            untrusted_td.is_err(),
+            "STRICT inbound must reject a client whose SVID chains to the CA but is in an \
+             untrusted trust domain — proves SPIFFE verification, not just chain validation: \
+             {untrusted_td:?}\n{output}"
         );
         return;
     }
