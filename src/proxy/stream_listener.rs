@@ -643,12 +643,10 @@ impl StreamListenerManager {
         passthrough_groups.retain(|_, ids| {
             ids.len() > 1
                 || ids.iter().any(|id| {
-                    epoch
-                        .config
+                    current_config
                         .proxies
                         .iter()
-                        .find(|p| p.id.as_str() == id.as_str())
-                        .is_some_and(|p| !p.hosts.is_empty())
+                        .any(|p| p.id.as_str() == id.as_str() && !p.hosts.is_empty())
                 })
         });
         // Sort IDs for stable comparison on reconcile
