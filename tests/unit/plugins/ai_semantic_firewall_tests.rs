@@ -1421,6 +1421,63 @@ data: [DONE]\n\n";
 }
 
 #[tokio::test]
+async fn streaming_response_buffer_clean_sse_passes_semantic_evaluation() {
+    // The other clean-delivery cases pass via the on_error=warn fallback (dead
+    // provider). This one drives a *successful* embedding evaluation against a
+    // mock provider: the reassembled benign completion is orthogonal to every
+    // response_leakage example, so it is genuinely allowed. `on_error: reject`
+    // ensures a provider miss could not silently mask the result as a clean pass.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(|req: &Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let inputs = body["input"].as_array().unwrap();
+            let data: Vec<Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    let text = input.as_str().unwrap_or("").to_ascii_lowercase();
+                    // Benign completion is orthogonal to the leakage examples.
+                    let embedding = if text.contains("weather") || text.contains("sunny") {
+                        vec![0.0, 1.0]
+                    } else {
+                        vec![1.0, 0.0]
+                    };
+                    json!({"index": index, "embedding": embedding})
+                })
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({"data": data}))
+        })
+        .mount(&server)
+        .await;
+
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "reject",
+        "provider": provider(&format!("{}/v1/embeddings", server.uri())),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather \"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is sunny today.\"}}]}\n\n\
+data: [DONE]\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.decision")
+            .map(String::as_str),
+        Some("allow")
+    );
+}
+
+#[tokio::test]
 async fn buffer_mode_does_not_buffer_unflagged_event_stream() {
     // buffer mode must only pin an event stream onto the buffered path when
     // before_proxy actually flagged a `stream: true` request (the marker). An

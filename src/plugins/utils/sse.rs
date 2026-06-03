@@ -144,10 +144,10 @@ struct ToolCallAccumulator {
 /// (`data: {"choices":[{"delta":{"content":"Hel"}}]}`), so inspecting each frame
 /// in isolation is semantically meaningless — an embedding cannot score a single
 /// token, and a violation phrase split across frames is invisible per-frame.
-/// Feed parsed `data:` frames in arrival order via [`push_frame`] (or a whole
-/// buffered body via [`push_body`]); concatenation is keyed by choice index and
-/// tool-call index so interleaved choices / parallel tool-calls stay separate.
-/// Read the joined result with [`into_texts`].
+/// Feed parsed `data:` frames in arrival order via [`push_frame`](Self::push_frame);
+/// concatenation is keyed by choice index and tool-call index so interleaved
+/// choices / parallel tool-calls stay separate. Read the joined result with
+/// [`into_texts`](Self::into_texts).
 ///
 /// Insertion order is preserved across all accumulators so the output is
 /// deterministic.

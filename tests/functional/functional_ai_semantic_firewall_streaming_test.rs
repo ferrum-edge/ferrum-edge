@@ -58,6 +58,9 @@ fn start_gateway(config_path: &str, proxy_port: u16, admin_port: u16) -> std::pr
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_LOG_LEVEL", "debug")
+        // No backend-hit assertions here, but disable warmup so the startup
+        // HEAD probe doesn't race the single-shot SSE backend.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
