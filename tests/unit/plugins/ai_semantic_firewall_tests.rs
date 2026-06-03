@@ -1597,6 +1597,109 @@ data: [DONE]\n\n";
     );
 }
 
+/// Set the marker `before_proxy` writes when buffer mode flags a `stream: true`
+/// request, without running the full request path.
+fn buffer_marked_event_stream_ctx() -> (RequestContext, HashMap<String, String>) {
+    let mut ctx = create_test_context();
+    ctx.metadata.insert(
+        "ai_semantic_firewall.response_inspection".to_string(),
+        "streaming_buffered".to_string(),
+    );
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    (ctx, headers)
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_rejects_unparseable_stream() {
+    // buffer mode forced this stream onto the buffered path to inspect it, but the
+    // body has only non-JSON `data:` events — uninspectable. on_error=reject must
+    // fail closed rather than deliver it uninspected.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "reject",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, headers) = buffer_marked_event_stream_ctx();
+    let body = b"data: not-json-at-all\n\ndata: <<garbage event>>\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.response_inspection")
+            .map(String::as_str),
+        Some("streaming_uninspectable")
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_rejects_content_less_stream() {
+    // Valid frames, but no extractable assistant content (only role/finish_reason).
+    // buffer mode promised inspection; with on_error=reject, recovering zero
+    // inspectable segments fails closed.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "reject",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, headers) = buffer_marked_event_stream_ctx();
+    let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_uninspectable_honors_on_error_allow() {
+    // The uninspectable disposition is governed by on_error: allow delivers it.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "allow",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, headers) = buffer_marked_event_stream_ctx();
+    let body = b"data: not-json\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn unflagged_uninspectable_sse_is_not_rejected() {
+    // The fail-closed path is scoped to buffer mode: a buffered SSE that buffer
+    // mode did NOT flag (no marker — e.g. pinned by another plugin) keeps the
+    // lenient "nothing to inspect → Continue" behavior, even with on_error=reject.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "reject",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let mut ctx = create_test_context(); // no streaming_buffered marker
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = b"data: not-json\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_continue(result);
+}
+
 #[tokio::test]
 async fn streaming_response_buffer_dry_run_records_would_reject() {
     let config = json!({

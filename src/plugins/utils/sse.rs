@@ -47,21 +47,49 @@ pub fn headers_accept_sse(headers: &HashMap<String, String>) -> bool {
         .is_some_and(|accept| accept_includes_event_stream(accept))
 }
 
+/// Outcome of parsing a buffered SSE body, distinguishing "no data" from "data
+/// we could not parse" so callers that promise inspection (e.g. the AI firewall
+/// `buffer` mode) can fail closed on uninspectable input rather than deliver it.
+pub struct SseParse {
+    /// Successfully parsed JSON `data:` frames, in order.
+    pub frames: Vec<Value>,
+    /// `true` when the body was valid UTF-8 **and** every non-empty, non-`[DONE]`
+    /// `data:` payload parsed as JSON. `false` if the body was not UTF-8 or any
+    /// such payload failed to parse — i.e. it carried data we could not inspect
+    /// (which may hide content a clean-looking frame would not reveal).
+    pub fully_parsed: bool,
+}
+
 /// Parse SSE `data:` frames from a buffered SSE response body into JSON values.
 ///
 /// Iterates lines, strips the `data: ` (or `data:`) prefix, skips empty data,
 /// the `[DONE]` sentinel, and frames that are not valid JSON. Returns the
 /// parsed frames in order. Returns an empty `Vec` if the body is not valid
-/// UTF-8 — callers receive no JSON frames but no error either.
+/// UTF-8 — callers receive no JSON frames but no error either. Use
+/// [`parse_sse_data_frames_checked`] when "had unparseable data" must be
+/// distinguished from "had no data".
 pub fn parse_sse_data_frames(body: &[u8]) -> Vec<Value> {
+    parse_sse_data_frames_checked(body).frames
+}
+
+/// Like [`parse_sse_data_frames`], but also reports whether the entire body was
+/// inspectable (see [`SseParse::fully_parsed`]).
+pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
     let body_str = match std::str::from_utf8(body) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        // Non-UTF-8 body: nothing inspectable, and we cannot rule out hidden data.
+        Err(_) => {
+            return SseParse {
+                frames: Vec::new(),
+                fully_parsed: false,
+            };
+        }
     };
     let mut frames = Vec::new();
+    let mut fully_parsed = true;
     let mut event_data = Vec::new();
 
-    fn flush_event(event_data: &mut Vec<&str>, frames: &mut Vec<Value>) {
+    fn flush_event(event_data: &mut Vec<&str>, frames: &mut Vec<Value>, fully_parsed: &mut bool) {
         if event_data.is_empty() {
             return;
         }
@@ -76,15 +104,17 @@ pub fn parse_sse_data_frames(body: &[u8]) -> Vec<Value> {
         if trimmed.is_empty() || trimmed == "[DONE]" {
             return;
         }
-        if let Ok(json) = serde_json::from_str::<Value>(trimmed) {
-            frames.push(json);
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(json) => frames.push(json),
+            // A `data:` payload that is not JSON is content we cannot inspect.
+            Err(_) => *fully_parsed = false,
         }
     }
 
     for raw_line in body_str.lines() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if line.is_empty() {
-            flush_event(&mut event_data, &mut frames);
+            flush_event(&mut event_data, &mut frames, &mut fully_parsed);
             continue;
         }
 
@@ -97,9 +127,12 @@ pub fn parse_sse_data_frames(body: &[u8]) -> Vec<Value> {
         };
         event_data.push(data);
     }
-    flush_event(&mut event_data, &mut frames);
+    flush_event(&mut event_data, &mut frames, &mut fully_parsed);
 
-    frames
+    SseParse {
+        frames,
+        fully_parsed,
+    }
 }
 
 /// Logical role of a reassembled streaming-SSE text fragment, so callers can map
@@ -478,6 +511,40 @@ mod tests {
     fn parse_sse_frames_invalid_utf8() {
         let body: &[u8] = &[0xff, 0xfe, 0xfd];
         assert!(parse_sse_data_frames(body).is_empty());
+    }
+
+    #[test]
+    fn checked_parse_reports_fully_parsed_for_valid_frames() {
+        let body = b"data: {\"a\":1}\n\ndata: [DONE]\n\n";
+        let parsed = parse_sse_data_frames_checked(body);
+        assert_eq!(parsed.frames.len(), 1);
+        assert!(parsed.fully_parsed);
+    }
+
+    #[test]
+    fn checked_parse_flags_unparseable_data_event() {
+        // A valid frame plus a non-JSON data event: the valid frame is recovered,
+        // but fully_parsed is false because the garbage event is uninspectable.
+        let body = b"data: {\"a\":1}\n\ndata: not-json\n\n";
+        let parsed = parse_sse_data_frames_checked(body);
+        assert_eq!(parsed.frames.len(), 1);
+        assert!(!parsed.fully_parsed);
+    }
+
+    #[test]
+    fn checked_parse_flags_non_utf8_body() {
+        let parsed = parse_sse_data_frames_checked(&[0xff, 0xfe, 0xfd]);
+        assert!(parsed.frames.is_empty());
+        assert!(!parsed.fully_parsed);
+    }
+
+    #[test]
+    fn checked_parse_fully_parsed_for_content_less_stream() {
+        // Comment/keepalive lines and [DONE] only: no frames, nothing unparseable.
+        let body = b": keepalive\n\ndata: [DONE]\n\n";
+        let parsed = parse_sse_data_frames_checked(body);
+        assert!(parsed.frames.is_empty());
+        assert!(parsed.fully_parsed);
     }
 
     fn reassemble(body: &[u8]) -> Vec<SseText> {

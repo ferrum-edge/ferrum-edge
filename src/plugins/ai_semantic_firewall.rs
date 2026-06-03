@@ -16,7 +16,7 @@ use tokio::sync::OnceCell;
 use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
-use super::utils::sse::{SseReassembler, SseText, SseTextKind, parse_sse_data_frames};
+use super::utils::sse::{SseReassembler, SseText, SseTextKind, parse_sse_data_frames_checked};
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
@@ -1278,6 +1278,43 @@ impl AiSemanticFirewall {
             headers: json_headers(),
         }
     }
+
+    /// Disposition for a `buffer`-mode streamed response that yielded no
+    /// inspectable content (uninspectable `data:` events, or no extractable
+    /// content). Buffer mode exists to inspect the stream, so an uninspectable
+    /// body is treated as an inspection failure governed by `on_error`: `reject`
+    /// fails closed (502), `warn`/`allow` (and dry-run) record and deliver.
+    fn handle_uninspectable_buffered_stream(&self, ctx: &mut RequestContext) -> PluginResult {
+        let action = match self.on_error {
+            OnErrorAction::Allow => Action::Allow,
+            OnErrorAction::Warn => Action::Warn,
+            OnErrorAction::Reject => Action::Reject,
+        };
+        let decision = FirewallDecision {
+            action,
+            dry_run: self.mode == EnforcementMode::DryRun,
+            matches: Vec::new(),
+        };
+        self.write_decision_metadata(ctx, &decision, Direction::Response, None);
+        ctx.metadata.insert(
+            RESPONSE_INSPECTION_KEY.to_string(),
+            "streaming_uninspectable".to_string(),
+        );
+
+        if decision.dry_run || action != Action::Reject {
+            return PluginResult::Continue;
+        }
+
+        PluginResult::Reject {
+            status_code: 502,
+            body: rejection_body(
+                "ai_semantic_firewall_response_uninspectable",
+                "AI semantic firewall could not inspect the buffered streaming response.",
+                None,
+            ),
+            headers: json_headers(),
+        }
+    }
 }
 
 #[async_trait]
@@ -1499,7 +1536,18 @@ impl Plugin for AiSemanticFirewall {
             // pinned the stream. SSE deltas arrive as many tiny fragments, so they
             // are reassembled into coherent per-choice / per-tool-call text before
             // inspection rather than scored fragment-by-fragment.
-            reassemble_sse_response_segments(body, &self.extraction)
+            let (segments, fully_parsed) = reassemble_sse_response_segments(body, &self.extraction);
+            // `buffer` mode forced this stream onto the buffered path specifically
+            // to inspect it. If nothing inspectable was recovered — the body had
+            // non-UTF-8 / non-JSON `data:` events, or no extractable content — then
+            // delivering it would be fail-open for an explicit inspection mode, so
+            // treat it as an inspection failure governed by `on_error`. (Other
+            // buffered SSE, e.g. pinned by a different plugin, keeps the lenient
+            // path: no marker means this branch is skipped.)
+            if buffer_streaming_marker_set(ctx) && (!fully_parsed || segments.is_empty()) {
+                return self.handle_uninspectable_buffered_stream(ctx);
+            }
+            segments
         } else if is_json_content_type(content_type) {
             let json: Value = match serde_json::from_slice(body) {
                 Ok(json) => json,
@@ -2146,11 +2194,17 @@ fn extract_response_segments_from_json(
 ///
 /// Only fragments whose canonical JSON path is enabled in `response_json_paths`
 /// are kept, preserving operator extraction overrides.
+///
+/// Returns the segments plus whether the body was **fully inspectable** (valid
+/// UTF-8 and every `data:` payload parsed as JSON). A caller that forced this
+/// stream onto the buffered path (`buffer` mode) uses that flag to fail closed
+/// when part of the body could not be parsed and might hide content.
 fn reassemble_sse_response_segments(
     body: &[u8],
     extraction: &ExtractionConfig,
-) -> Vec<TextSegment> {
-    let frames = parse_sse_data_frames(body);
+) -> (Vec<TextSegment>, bool) {
+    let parsed = parse_sse_data_frames_checked(body);
+    let frames = parsed.frames;
 
     let mut reassembler = SseReassembler::new();
     for frame in &frames {
@@ -2183,7 +2237,7 @@ fn reassemble_sse_response_segments(
         }
     }
 
-    dedupe_segments(segments)
+    (dedupe_segments(segments), parsed.fully_parsed)
 }
 
 /// Whether a response JSON path is a chat-completions streaming `delta.*` path
