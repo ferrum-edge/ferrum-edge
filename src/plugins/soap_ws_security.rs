@@ -2502,7 +2502,7 @@ mod tests {
             "timestamp": { "require": true }
         }))
         .expect("timestamp-only config should construct");
-        let timestamp = r#"<wsu:Timestamp wsu:Id="TS-1"></wsu:Timestamp>"#;
+        let timestamp = r#"<wsu:Timestamp xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" wsu:Id="TS-1"></wsu:Timestamp>"#;
         let digest = digest::digest(&digest::SHA256, timestamp.as_bytes());
         let digest_b64 = BASE64.encode(digest.as_ref());
         let reference = format!(
