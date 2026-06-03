@@ -40,10 +40,12 @@ currently enrolled (machine-gated) set, which is the authoritative answer to
   unless `FERRUM_MESH_ALLOW_NO_CA=true`, and `FERRUM_MESH_PRODUCTION_MODE=true`
   refuses it unconditionally — so the GA path cannot silently degrade to
   unauthenticated plaintext. This is enforced at **both** config-validation time
-  (presence check) and **runtime** (`enforce_mesh_inbound_fail_closed`): the
-  gateway SVID also backs the inbound listener's server cert, and a resolved
-  inbound listener that would still come up plaintext (PeerAuthentication
-  DISABLE, no usable server identity, or an unloadable SVID verifier) is refused.
+  (presence check) and **runtime** (`enforce_mesh_inbound_fail_closed`, at startup
+  and on PeerAuthentication live reload): the gateway SVID also backs the inbound
+  listener's server cert, a resolved inbound listener that would serve plaintext
+  (PeerAuthentication DISABLE, or no usable server identity) is refused in
+  production, and a configured-but-unloadable SVID verifier (TLS without
+  trust-domain verification) is fatal regardless of mode.
 - **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), `Ambient` HBONE, `EastWestGateway`
   SNI passthrough, HTTP-family `EgressGateway`, `ServiceWaypoint` (GAMMA),
   trust-bundle federation.

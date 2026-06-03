@@ -4850,27 +4850,30 @@ fn load_mesh_frontend_tls(
     Ok(Some(tls_config))
 }
 
-/// Posture decision for the mesh inbound fail-closed gate (issue #1523).
+/// Posture decision for a mesh inbound listener that would serve **plaintext**
+/// (issue #1523). Pure so the truth table can be unit-tested without touching the
+/// environment; the env reads + logging live in [`enforce_mesh_inbound_fail_closed`].
 ///
-/// Pure so the truth table can be unit-tested without touching the environment;
-/// the env reads + logging live in [`enforce_mesh_inbound_fail_closed`]. Keyed
-/// on the listener's *actual* resolved posture (would it serve plaintext /
-/// unverified) rather than a config presence check:
-///
-/// | trigger | production | result             |
-/// |---------|------------|--------------------|
-/// | false   | *          | `Ok`               |
-/// | true    | true       | `Refuse`           |
-/// | true    | false      | `AllowWithWarning` |
+/// | trigger (plaintext) | production | result             |
+/// |---------------------|------------|--------------------|
+/// | false               | *          | `Ok`               |
+/// | true                | true       | `Refuse`           |
+/// | true                | false      | `AllowWithWarning` |
 ///
 /// The **production** contract is absolute: a production mesh must serve mTLS on
-/// its inbound listener, so any plaintext/unverified posture is refused. **Dev**
-/// allows it with a loud warning — reaching a plaintext posture in dev is always
-/// *intentional*: the no-identity *silent default* trap is separately
-/// fail-closed at config time by the `FERRUM_MESH_ALLOW_NO_CA` gate
-/// (`EnvConfig::validate`), so the only ways to get here in dev are (a) that
-/// opt-out already acknowledged, or (b) an explicit `PeerAuthentication` DISABLE.
-/// The runtime gate therefore does not re-consult the dev opt-out.
+/// its inbound listener, so a plaintext posture is refused. **Dev** allows it
+/// with a loud warning — reaching plaintext in dev is always *intentional*: the
+/// no-identity *silent default* trap is separately fail-closed at config time by
+/// the `FERRUM_MESH_ALLOW_NO_CA` gate (`EnvConfig::validate`), so the only ways to
+/// get here in dev are (a) that opt-out already acknowledged, or (b) an explicit
+/// `PeerAuthentication` DISABLE. The runtime gate therefore does not re-consult
+/// the dev opt-out.
+///
+/// This governs ONLY the plaintext posture. A *configured-but-unloadable* SVID
+/// verifier (the listener serves TLS but its SPIFFE trust-domain verifier failed
+/// to load) is a genuine misconfiguration, not an intentional dev posture, so
+/// [`enforce_mesh_inbound_fail_closed`] hard-errors that case regardless of
+/// `production` — never routing it through this decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MeshInboundFailClosed {
     /// Listener is mTLS-capable (or there is nothing to enforce); proceed.
@@ -4900,15 +4903,22 @@ fn decide_mesh_inbound_fail_closed(trigger: bool, production: bool) -> MeshInbou
 /// material loads or whether the resolved PeerAuthentication mode would leave
 /// the inbound mTLS/HBONE termination listener serving plaintext. This runs at
 /// the startup TLS-setup path, where the listener's real posture is known, and
-/// closes two distinct escapes:
+/// closes two distinct escapes — with deliberately different severity:
 ///
+///  - **configured-but-unloadable SVID verifier** (gap #2): the listener serves
+///    TLS but gateway SVID material is configured and failed to load, so the
+///    SPIFFE peer-trust-domain verifier is absent (an offered peer cert would not
+///    be trust-domain validated). The operator named all three
+///    `FERRUM_GATEWAY_SVID_*` paths intending verification, so this is a genuine
+///    misconfiguration — **fatal regardless of `production`**, mirroring how
+///    [`load_mesh_frontend_server_identity`] already hard-errors a broken SVID
+///    cert/key. (`ProxyState` construction's `load_gateway_svid_bundle` rejects
+///    the same broken material independently; this is the inbound-local guard.)
 ///  - **would-serve-plaintext**: a termination listener exists but the resolved
 ///    inbound `ServerConfig` is `None` (PeerAuthentication DISABLE, or no usable
 ///    server identity), so the listener would accept unauthenticated plaintext.
-///  - **SVID-verifier-load-failed**: gateway SVID material is configured but
-///    failed to load, so the SPIFFE peer-trust-domain verifier is absent and an
-///    offered peer cert would not be trust-domain validated (gap #2 — load
-///    failures must be fatal in production, not silently swallowed to `None`).
+///    Refused under `production`; in dev allowed with a loud warning (intentional
+///    — see [`decide_mesh_inbound_fail_closed`]).
 ///
 /// Topologies without a TLS-terminating inbound listener (EastWestGateway does
 /// SNI passthrough — encrypted bytes are forwarded, never terminated) have no
@@ -4931,58 +4941,56 @@ fn enforce_mesh_inbound_fail_closed(
         return Ok(());
     }
 
-    let would_serve_plaintext = frontend_tls.is_none();
-    // "Configured" is exact: blank FERRUM_GATEWAY_SVID_* values were normalized
-    // to `None` at parse (#1522), so all-three-`Some` means material was named.
-    // `build_mesh_inbound_spiffe_slot` returning `None` for named material then
-    // means the load failed (it logs the underlying error before returning).
+    // A configured-but-unloadable SVID verifier on a TLS-serving listener is a
+    // genuine fault, not an intentional posture, so it is fatal regardless of
+    // `production` (consistent with the hard error a broken SVID cert/key already
+    // gets in `load_mesh_frontend_server_identity`). "Configured" is exact: blank
+    // FERRUM_GATEWAY_SVID_* values were normalized to `None` at parse (#1522), so
+    // all-three-`Some` means material was named; `build_mesh_inbound_spiffe_slot`
+    // returning `None` for named material then means the load failed (it logs the
+    // underlying error first). This is gated on `frontend_tls.is_some()` so a
+    // resolved-plaintext listener (DISABLE — the verifier is unused) falls to the
+    // plaintext branch below instead.
     let gateway_svid_configured = env_config.gateway_svid_cert_path.is_some()
         && env_config.gateway_svid_key_path.is_some()
         && env_config.gateway_svid_trust_bundle_path.is_some();
-    let svid_verifier_load_failed = gateway_svid_configured && spiffe_bundle_slot.is_none();
-    let trigger = would_serve_plaintext || svid_verifier_load_failed;
-
-    let decision = decide_mesh_inbound_fail_closed(trigger, production);
-    if decision == MeshInboundFailClosed::Ok {
-        return Ok(());
+    if frontend_tls.is_some() && gateway_svid_configured && spiffe_bundle_slot.is_none() {
+        return Err(anyhow::anyhow!(
+            "gateway SVID material is configured (FERRUM_GATEWAY_SVID_*) but failed to load on \
+             {} topology, so the mesh inbound listener would serve TLS WITHOUT SPIFFE \
+             peer-trust-domain verification (an offered peer certificate would not be \
+             trust-domain validated). Fix the SVID cert/key/trust-bundle material, or unset it \
+             to fall back to operator client-CA verification.",
+            runtime.topology.as_str()
+        ));
     }
 
-    // Precise operator diagnosis of why the listener is not mTLS-capable.
-    let reason: &str = if would_serve_plaintext {
-        if mtls_mode == config::MtlsMode::Disable {
-            "PeerAuthentication resolved to DISABLE, so the inbound mTLS/HBONE \
-             termination listener would accept unauthenticated plaintext"
-        } else {
-            "the inbound mTLS/HBONE termination listener resolved to no usable TLS \
-             server identity (set FERRUM_GATEWAY_SVID_CERT_PATH / KEY_PATH / \
-             TRUST_BUNDLE_PATH, or FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH), so it \
-             would accept unauthenticated plaintext"
-        }
+    // Otherwise the only remaining escape is a listener that would serve
+    // plaintext (PeerAuthentication DISABLE, or no usable server identity).
+    let reason: &str = if mtls_mode == config::MtlsMode::Disable {
+        "PeerAuthentication resolved to DISABLE, so the inbound mTLS/HBONE termination \
+         listener would accept unauthenticated plaintext"
     } else {
-        "gateway SVID material is configured but failed to load, so the inbound \
-         SPIFFE peer-trust-domain verifier is absent (an offered peer certificate \
-         would not be trust-domain validated)"
+        "the inbound mTLS/HBONE termination listener resolved to no usable TLS server identity \
+         (set FERRUM_GATEWAY_SVID_CERT_PATH / KEY_PATH / TRUST_BUNDLE_PATH, or \
+         FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH), so it would accept unauthenticated plaintext"
     };
-
-    match decision {
-        // Handled by the early return above; kept for exhaustiveness (no panic
-        // on the startup path).
+    match decide_mesh_inbound_fail_closed(frontend_tls.is_none(), production) {
         MeshInboundFailClosed::Ok => Ok(()),
         MeshInboundFailClosed::AllowWithWarning => {
             warn!(
                 topology = runtime.topology.as_str(),
                 ?mtls_mode,
-                "{reason}. The mesh inbound listener is coming up WITHOUT enforced \
-                 mTLS and may accept unauthenticated plaintext traffic. Dev/test only \
-                 — configure gateway SVID material and set FERRUM_MESH_PRODUCTION_MODE=true \
-                 for production."
+                "{reason}. The mesh inbound listener is coming up WITHOUT enforced mTLS and may \
+                 accept unauthenticated plaintext traffic. Dev/test only — configure gateway \
+                 SVID material and set FERRUM_MESH_PRODUCTION_MODE=true for production."
             );
             Ok(())
         }
         // Refuse only happens under production mode (see decide_*).
         MeshInboundFailClosed::Refuse => Err(anyhow::anyhow!(
-            "FERRUM_MESH_PRODUCTION_MODE=true but {reason} on {} topology. Refusing to \
-             start: a production mesh must serve mTLS on its inbound listener.",
+            "FERRUM_MESH_PRODUCTION_MODE=true but {reason} on {} topology. Refusing to start: a \
+             production mesh must serve mTLS on its inbound listener.",
             runtime.topology.as_str()
         )),
     }
@@ -11329,6 +11337,60 @@ mod tests {
             true,
         )
         .expect("east-west gateway has no termination listener to fail closed on");
+    }
+
+    #[test]
+    fn enforce_mesh_inbound_fail_closed_rejects_configured_but_unloadable_svid_verifier() {
+        ensure_crypto_provider();
+        // gap #2: a TLS-serving inbound listener whose configured gateway SVID
+        // verifier failed to load (slot None while all three FERRUM_GATEWAY_SVID_*
+        // are named) is a genuine misconfiguration — fatal regardless of
+        // FERRUM_MESH_PRODUCTION_MODE, mirroring the hard error a broken SVID
+        // cert/key already gets. It is NOT the intentional plaintext/DISABLE
+        // posture the dev relaxation is for.
+        let runtime = test_mesh_runtime_config(); // Sidecar → has MtlsTermination
+        let env = EnvConfig {
+            // A real frontend identity so the listener serves TLS (frontend_tls Some).
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            // Gateway SVID material is *configured* (all three paths named).
+            gateway_svid_cert_path: Some("tests/certs/server.crt".to_string()),
+            gateway_svid_key_path: Some("tests/certs/server.key".to_string()),
+            gateway_svid_trust_bundle_path: Some("/nonexistent/svid-bundle.pem".to_string()),
+            ..EnvConfig::default()
+        };
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let identity = load_mesh_frontend_server_identity(&env).expect("server identity");
+        let frontend_tls = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Permissive,
+            identity.as_deref(),
+            None,
+            None,
+        )
+        .expect("frontend tls builds")
+        .expect("frontend tls present");
+
+        // The SPIFFE verifier slot failed to load (None) → fatal in BOTH dev and
+        // production.
+        for production in [false, true] {
+            let err = enforce_mesh_inbound_fail_closed(
+                &runtime,
+                &env,
+                config::MtlsMode::Permissive,
+                Some(&frontend_tls),
+                None, // SPIFFE verifier slot failed to load
+                production,
+            )
+            .expect_err("a configured-but-unloadable SVID verifier must be fatal");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SVID material is configured") && msg.contains("WITHOUT SPIFFE"),
+                "unexpected error (production={production}): {msg}"
+            );
+        }
     }
 
     #[test]

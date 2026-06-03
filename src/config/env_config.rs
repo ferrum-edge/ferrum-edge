@@ -3337,14 +3337,15 @@ impl EnvConfig {
                 // those escapes at the mesh TLS-setup path where the listener's
                 // real posture is known, at startup and on PeerAuthentication
                 // live reload (`enforce_mesh_inbound_fail_closed` /
-                // `plan_mesh_inbound_tls_reload` in `src/modes/mesh`): a
-                // configured-but-unloadable SVID, or an inbound termination
-                // listener that would come up plaintext, is fatal in production
-                // (dev allows it with a warning — an explicit DISABLE, or the
-                // no-identity posture this gate already acknowledges, is
-                // intentional). Residual follow-up: wiring FERRUM_MESH_CA_BACKEND
-                // to issue/rotate SVIDs into the data plane (still validated-but-
-                // inert here — only file-based gateway SVID material gives identity).
+                // `plan_mesh_inbound_tls_reload` in `src/modes/mesh`): an inbound
+                // termination listener that would come up plaintext is fatal in
+                // production (dev warns — an explicit DISABLE, or the no-identity
+                // posture this gate already acknowledges, is intentional), while a
+                // configured-but-unloadable SVID verifier is fatal regardless of
+                // mode (a real fault, like a broken cert/key). Residual follow-up:
+                // wiring FERRUM_MESH_CA_BACKEND to issue/rotate SVIDs into the data
+                // plane (still validated-but-inert here — only file-based gateway
+                // SVID material gives identity).
                 if !has_workload_identity {
                     if crate::identity::production_mode() {
                         // Master prod guardrail: like bootstrap_dev_root and
