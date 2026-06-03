@@ -598,25 +598,6 @@ jobs:
               functional_tls_lifecycle_test
               functional_tls_only_test
               functional_client_ip_env_test
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      mongo:
-        image: mongo:7
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd "mongosh --eval 'db.runCommand({ ping: 1 })' --quiet"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -652,6 +633,44 @@ jobs:
         with:
           name: functional-tests-archive-${{ runner.os }}-${{ runner.arch }}
           path: .
+
+      - name: Start data-plane service containers
+        # Only the data-plane shard runs the redis/mongo-backed functional tests
+        # (functional_redis_rate_limiting_test, functional_mongodb_test). These
+        # services were previously declared job-wide, so EVERY shard provisioned
+        # redis + mongo at job startup — a transient Docker Hub pull hiccup then
+        # failed otherwise-unrelated shards (e.g. resilience) before any test ran.
+        # Start them only where they're used to isolate that blast radius. Ports
+        # map to the runner's localhost exactly as the service containers did, so
+        # the tests' localhost:6379 / localhost:27017 connections are unchanged.
+        if: matrix.shard == 'data-plane'
+        run: |
+          docker run -d --name ferrum-ci-redis -p 6379:6379 redis:7-alpine
+          docker run -d --name ferrum-ci-mongo -p 27017:27017 mongo:7
+          # The runner used to gate steps on the services' --health-cmd; reproduce
+          # that readiness wait using the tools shipped inside each image.
+          redis_ok=""
+          for _ in $(seq 1 30); do
+            if docker exec ferrum-ci-redis redis-cli ping 2>/dev/null | grep -q PONG; then
+              redis_ok=1; break
+            fi
+            sleep 2
+          done
+          mongo_ok=""
+          for _ in $(seq 1 30); do
+            if docker exec ferrum-ci-mongo mongosh --quiet \
+                --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)' 2>/dev/null; then
+              mongo_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$redis_ok" ]; then
+            echo "::error::redis did not become ready"; docker logs ferrum-ci-redis; exit 1
+          fi
+          if [ -z "$mongo_ok" ]; then
+            echo "::error::mongo did not become ready"; docker logs ferrum-ci-mongo; exit 1
+          fi
+          echo "data-plane services ready (redis:6379, mongo:27017)"
 
       - name: Run functional test shard
         # ── Single nextest invocation per shard ───────────────────────────
