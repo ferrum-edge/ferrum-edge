@@ -12620,6 +12620,11 @@ components:
           enum: [reject, warn]
           default: reject
           description: Default action for built-in semantic rules.
+        streaming_response:
+          type: string
+          enum: [skip, reject]
+          default: skip
+          description: Behavior for stream:true requests when response-side inspection is active. skip allows the streamed response uninspected (fail-open, recorded in ai_semantic_firewall.response_inspection_skipped); reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response.
         provider:
           type: object
           required: [type, endpoint]
@@ -12797,6 +12802,9 @@ components:
             include_snippet_hash:
               type: boolean
               default: true
+            snippet_hash_salt:
+              type: string
+              description: Optional salt mixed into snippet_hash digests so short/low-entropy matched segments written to logs cannot be reversed by brute force/rainbow tables. Keep consistent across a fleet for correlation and out of the same logs. Unsalted (default) is reversible for short segments.
           description: Raw prompt/response text is not written by default; hashes are for correlation only.
         expose_rule_id_to_client:
           type: boolean

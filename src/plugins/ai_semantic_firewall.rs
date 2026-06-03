@@ -151,6 +151,20 @@ impl EnforcementMode {
     }
 }
 
+/// What to do with `stream: true` requests when response-side inspection is
+/// active. Streamed responses are not buffered, so the response-direction packs
+/// cannot run on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamingResponsePolicy {
+    /// Allow the streamed response uninspected (fail-open). The skip is recorded
+    /// in `ai_semantic_firewall.response_inspection_skipped` for audit.
+    Skip,
+    /// Reject the request (fail-closed) so a client cannot disable response
+    /// inspection by asking for a stream; clients must retry with
+    /// `"stream": false` to receive a buffered, inspectable response.
+    Reject,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Severity {
     Low,
@@ -259,6 +273,11 @@ struct ExtractionConfig {
 #[derive(Debug, Clone)]
 struct PrivacyConfig {
     include_snippet_hash: bool,
+    /// Optional salt mixed into `snippet_hash` so the SHA-256 digests written to
+    /// transaction logs cannot be reversed by brute force / rainbow tables for
+    /// short or low-entropy matched segments. Keep it consistent across a fleet
+    /// for cross-instance correlation; keep it out of the same logs.
+    snippet_hash_salt: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,7 +285,11 @@ struct ProviderConfig {
     endpoint: String,
     redacted_endpoint: String,
     model: Option<String>,
-    api_key: Option<String>,
+    /// Name of the env var holding the provider API key. Resolved lazily at the
+    /// first embedding call rather than in `new()` so config validation (CP
+    /// admin, `ferrum-edge validate`) does not require the live secret to be
+    /// present in a process that never calls the provider.
+    api_key_env: Option<String>,
     request_timeout: Duration,
 }
 
@@ -332,6 +355,7 @@ pub struct AiSemanticFirewall {
     inspect_response: bool,
     mode: EnforcementMode,
     on_error: OnErrorAction,
+    streaming_response: StreamingResponsePolicy,
     provider: Option<ProviderConfig>,
     http_client: PluginHttpClient,
     rules: Vec<SemanticRule>,
@@ -382,6 +406,18 @@ impl AiSemanticFirewall {
             }
         };
 
+        let streaming_response = match optional_string(config, "streaming_response")?
+            .unwrap_or("skip")
+        {
+            "skip" => StreamingResponsePolicy::Skip,
+            "reject" => StreamingResponsePolicy::Reject,
+            other => {
+                return Err(format!(
+                    "ai_semantic_firewall: 'streaming_response' must be one of 'skip' or 'reject', got {other:?}"
+                ));
+            }
+        };
+
         let default_action = match optional_string(config, "default_action")?.unwrap_or("reject") {
             "reject" => Action::Reject,
             "warn" => Action::Warn,
@@ -399,9 +435,17 @@ impl AiSemanticFirewall {
                     .to_string(),
             );
         }
+        let snippet_hash_salt = match privacy_object {
+            Some(obj) => optional_string_from_object(obj, "snippet_hash_salt")?
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.as_bytes().to_vec()),
+            None => None,
+        };
         let privacy = PrivacyConfig {
             include_snippet_hash: optional_bool_in_object(privacy_object, "include_snippet_hash")?
                 .unwrap_or(true),
+            snippet_hash_salt,
         };
 
         let expose_rule_id_to_client =
@@ -437,6 +481,7 @@ impl AiSemanticFirewall {
                 inspect_response,
                 mode,
                 on_error,
+                streaming_response,
                 provider: None,
                 http_client,
                 rules: Vec::new(),
@@ -514,6 +559,7 @@ impl AiSemanticFirewall {
             inspect_response,
             mode,
             on_error,
+            streaming_response,
             provider,
             http_client,
             rules,
@@ -784,7 +830,15 @@ impl AiSemanticFirewall {
             .post(&provider.endpoint)
             .timeout(provider.request_timeout)
             .json(&payload);
-        if let Some(api_key) = &provider.api_key {
+        if let Some(env_name) = &provider.api_key_env {
+            // Resolved lazily here (not in `new()`) so config validation does not
+            // require the secret. A configured-but-missing key is a clear error
+            // rather than a silently unauthenticated request that 401s opaquely.
+            let api_key = std::env::var(env_name).map_err(|_| {
+                format!(
+                    "ai_semantic_firewall: provider.api_key_env {env_name:?} is set but not present in this process"
+                )
+            })?;
             request = request.header("Authorization", format!("Bearer {api_key}"));
         }
 
@@ -935,8 +989,16 @@ impl AiSemanticFirewall {
         if !self.privacy.include_snippet_hash {
             return None;
         }
-        let digest = Sha256::digest(text.as_bytes());
-        Some(hex::encode(digest))
+        let mut hasher = Sha256::new();
+        // A configured salt makes the digest non-reversible by brute force /
+        // rainbow tables for short or low-entropy matched segments that land in
+        // transaction logs. Unsalted (default) stays back-compatible but is
+        // reversible for such segments — documented in docs/plugins.md.
+        if let Some(salt) = &self.privacy.snippet_hash_salt {
+            hasher.update(salt);
+        }
+        hasher.update(text.as_bytes());
+        Some(hex::encode(hasher.finalize()))
     }
 
     fn should_handle_provider_error(
@@ -1203,7 +1265,14 @@ impl Plugin for AiSemanticFirewall {
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.enabled && self.inspect_request && self.has_request_rules
+        self.enabled
+            && ((self.inspect_request && self.has_request_rules)
+                // `streaming_response: reject` must read the request body to
+                // detect `stream: true` and fail closed, even for response-only
+                // policies (which otherwise do not buffer the request body).
+                || (self.streaming_response == StreamingResponsePolicy::Reject
+                    && self.inspect_response
+                    && self.has_response_rules))
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
@@ -1249,6 +1318,28 @@ impl Plugin for AiSemanticFirewall {
             ctx.metadata
                 .insert("ai_request_streaming".to_string(), "true".to_string());
             if self.inspect_response && self.has_response_rules {
+                if self.streaming_response == StreamingResponsePolicy::Reject
+                    && self.mode == EnforcementMode::Enforce
+                {
+                    // Fail closed: a client must not be able to disable response
+                    // inspection just by requesting a stream. Record the reject
+                    // for audit and require a non-streaming (bufferable) retry.
+                    ctx.metadata.insert(
+                        "ai_semantic_firewall.response_inspection_skipped".to_string(),
+                        "streaming_rejected".to_string(),
+                    );
+                    return PluginResult::Reject {
+                        status_code: 400,
+                        body: rejection_body(
+                            "ai_semantic_firewall_streaming_rejected",
+                            "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; retry with \"stream\": false.",
+                            None,
+                        ),
+                        headers: json_headers(),
+                    };
+                }
+                // Skip (or reject in dry-run): the streamed response is not
+                // inspected; record the skip so operators can audit the gap.
                 ctx.metadata.insert(
                     "ai_semantic_firewall.response_inspection_skipped".to_string(),
                     "streaming".to_string(),
@@ -1882,14 +1973,11 @@ fn parse_provider_config(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let api_key = match api_key_env {
-        Some(env_name) => Some(std::env::var(&env_name).map_err(|_| {
-            format!(
-                "ai_semantic_firewall: provider.api_key_env {env_name:?} is set but the environment variable is not present"
-            )
-        })?),
-        None => None,
-    };
+    // Resolve the API key lazily at the first embedding call (see `embed_texts`),
+    // not here: `new()` runs during CP admin validation and `ferrum-edge
+    // validate`, which must not require the live secret in a process that never
+    // calls the provider. Matches how `ai_federation`/`ai_semantic_cache`
+    // validate without the live secret.
     let request_timeout_ms =
         optional_positive_u64_from_object(provider, "request_timeout_ms")?.unwrap_or(5_000);
 
@@ -1897,7 +1985,7 @@ fn parse_provider_config(
         endpoint,
         redacted_endpoint,
         model,
-        api_key,
+        api_key_env,
         request_timeout: Duration::from_millis(request_timeout_ms),
     }))
 }
