@@ -135,6 +135,24 @@ pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
     }
 }
 
+/// Encode an OpenAI-compatible terminal SSE error event for mid-stream
+/// termination: an `event: error` frame carrying `{"error":{"code","message"}}`
+/// followed by the `[DONE]` sentinel. A streaming client surfaces the trailing
+/// `error` data event and sees a clean end-of-stream rather than a silently
+/// truncated body.
+///
+/// `code` and `message` are JSON-escaped via `serde_json`, so embedded quotes or
+/// newlines cannot break out of the frame structure (control characters are
+/// escaped, keeping the payload on a single `data:` line).
+pub fn encode_sse_error_event(code: &str, message: &str) -> bytes::Bytes {
+    let payload = serde_json::json!({
+        "error": { "code": code, "message": message }
+    });
+    // serde_json's `Display` is compact and single-line, so the payload is a
+    // valid one-line SSE `data:` value.
+    bytes::Bytes::from(format!("event: error\ndata: {payload}\n\ndata: [DONE]\n\n"))
+}
+
 /// Logical role of a reassembled streaming-SSE text fragment, so callers can map
 /// it onto their own segment taxonomy without re-deriving the JSON shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,6 +563,31 @@ mod tests {
         let parsed = parse_sse_data_frames_checked(body);
         assert!(parsed.frames.is_empty());
         assert!(parsed.fully_parsed);
+    }
+
+    #[test]
+    fn encodes_terminal_sse_error_event() {
+        let bytes = encode_sse_error_event("ai_semantic_firewall_response_blocked", "blocked");
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(text.starts_with("event: error\ndata: {"));
+        assert!(text.ends_with("\n\ndata: [DONE]\n\n"));
+        // The data payload round-trips through the parser as one JSON frame.
+        let frames = parse_sse_data_frames(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0]["error"]["code"],
+            "ai_semantic_firewall_response_blocked"
+        );
+        assert_eq!(frames[0]["error"]["message"], "blocked");
+    }
+
+    #[test]
+    fn encode_sse_error_event_escapes_payload() {
+        // Embedded quotes / newlines must not break out of the single data line.
+        let bytes = encode_sse_error_event("c", "line1\nline2 \"q\"");
+        let frames = parse_sse_data_frames(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["error"]["message"], "line1\nline2 \"q\"");
     }
 
     fn reassemble(body: &[u8]) -> Vec<SseText> {

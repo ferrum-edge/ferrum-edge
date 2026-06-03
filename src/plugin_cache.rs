@@ -30,8 +30,9 @@ use crate::plugins::{Plugin, PluginHttpClient, ProxyProtocol, create_plugin_with
 // ---------------------------------------------------------------------------
 
 use crate::plugins::{
-    PluginResult, RequestContext, StreamConnectionContext, StreamTransactionSummary,
-    TransactionSummary, UdpDatagramContext, UdpDatagramVerdict, WebSocketFrameDirection,
+    PluginResult, RequestContext, ResponseStreamAction, StreamConnectionContext,
+    StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
+    WebSocketFrameDirection,
 };
 use async_trait::async_trait;
 
@@ -209,6 +210,19 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .on_ws_frame(proxy_id, connection_id, direction, message)
             .await
+    }
+    fn requires_response_stream_hooks(&self) -> bool {
+        self.inner.requires_response_stream_hooks()
+    }
+    async fn on_response_stream_chunk(
+        &self,
+        ctx: &mut RequestContext,
+        chunk: &[u8],
+    ) -> ResponseStreamAction {
+        self.inner.on_response_stream_chunk(ctx, chunk).await
+    }
+    async fn on_response_stream_end(&self, ctx: &mut RequestContext) -> ResponseStreamAction {
+        self.inner.on_response_stream_end(ctx).await
     }
     fn requires_udp_datagram_hooks(&self) -> bool {
         self.inner.requires_udp_datagram_hooks()

@@ -1268,6 +1268,26 @@ pub enum PluginResult {
     },
 }
 
+/// Action returned by a plugin's per-chunk streaming-response hooks
+/// ([`Plugin::on_response_stream_chunk`] / [`Plugin::on_response_stream_end`]),
+/// generalizing the WebSocket [`Plugin::on_ws_frame`] model to streaming HTTP
+/// response bodies (e.g. SSE) that are never buffered.
+///
+/// Headers are already committed by the time a body streams, so enforcement on
+/// a streamed response can only **truncate** — it cannot change the status or
+/// retract bytes already sent downstream.
+#[derive(Debug, Clone)]
+pub enum ResponseStreamAction {
+    /// Release these bytes downstream now. An empty `Bytes` means "hold /
+    /// accumulate": emit nothing for this chunk because the plugin is buffering
+    /// a window it has not yet cleared for release.
+    Forward(bytes::Bytes),
+    /// Stop the response stream: emit the optional final bytes (e.g. an SSE
+    /// terminal error event) and then end the body. Already-sent bytes are
+    /// unrecoverable, so this truncates the response in flight.
+    Terminate(Option<bytes::Bytes>),
+}
+
 /// Mirror response metadata from the `request_mirror` plugin's spawned task.
 ///
 /// Communicated via `tokio::sync::watch` channel from the spawned mirror task
@@ -2258,6 +2278,42 @@ pub trait Plugin: Send + Sync {
         _message: &tokio_tungstenite::tungstenite::Message,
     ) -> Option<tokio_tungstenite::tungstenite::Message> {
         None
+    }
+
+    /// Returns `true` if this plugin needs per-chunk inspection of *streaming*
+    /// (non-buffered) HTTP response bodies — e.g. windowed inspection of an SSE
+    /// LLM completion. Zero overhead when `false` (default): the proxy's
+    /// streaming pipeline skips the hook path entirely, and `PluginCache`
+    /// precomputes an O(1) per-proxy flag from this so unrelated proxies never
+    /// pay. Distinct from response-body buffering — a plugin that inspects a
+    /// stream window-by-window does **not** buffer the whole body.
+    fn requires_response_stream_hooks(&self) -> bool {
+        false
+    }
+
+    /// Called for each decoded chunk of a streaming response body, when at least
+    /// one plugin on the proxy opts in via [`Self::requires_response_stream_hooks`]
+    /// and the response is eligible. Generalizes [`Self::on_ws_frame`] to HTTP
+    /// response streams.
+    ///
+    /// Return [`ResponseStreamAction::Forward`] to release bytes downstream now
+    /// (an empty `Bytes` holds/accumulates), or [`ResponseStreamAction::Terminate`]
+    /// to end the stream after optional final bytes. The plugin owns all window
+    /// / accumulator state (keyed off `ctx`); the proxy only relays the returned
+    /// bytes and must not reinterpret them.
+    async fn on_response_stream_chunk(
+        &self,
+        _ctx: &mut RequestContext,
+        chunk: &[u8],
+    ) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+    }
+
+    /// Called once after the final chunk of a streaming response body (backend
+    /// finished, or the stream ended) for plugins that opted in, so a plugin can
+    /// flush/inspect a trailing partial window. The default forwards nothing.
+    async fn on_response_stream_end(&self, _ctx: &mut RequestContext) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(bytes::Bytes::new())
     }
 
     /// Returns `true` if this plugin needs per-datagram UDP inspection.
