@@ -12651,7 +12651,7 @@ components:
               format: uint
               minimum: 1
               default: 64
-              description: Safety cap on provider inspections per response.
+              description: Safety cap on provider inspections per response. Once reached, further inspectable windows honor on_error (reject cuts/fail-closed; warn/allow forward best-effort).
             on_violation:
               type: string
               enum: [cut_with_error_event, cut_silent]

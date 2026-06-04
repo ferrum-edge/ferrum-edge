@@ -74,6 +74,13 @@ const RESPONSE_INSPECTION_KEY: &str = "ai_semantic_firewall.response_inspection"
 /// `stream: true` request and intends to buffer its SSE response.
 const STREAMING_BUFFERED_MARKER: &str = "streaming_buffered";
 
+/// Value written to [`RESPONSE_INSPECTION_KEY`] when `inspect` mode detects a
+/// `stream: true` request and intends to windowed-inspect its SSE response. The
+/// response-path inspector keys on this so only streams THIS plugin marked are
+/// inspected — an unrelated SSE endpoint (e.g. a `GET` EventSource route) keeps
+/// streaming untouched, mirroring the `buffer`-mode marker gate.
+const STREAMING_WINDOWED_MARKER: &str = "streaming_windowed";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Request,
@@ -1092,12 +1099,14 @@ impl FirewallEngine {
                 || (self.on_error == OnErrorAction::Reject && decision.action != Action::Reject))
     }
 
-    /// Record a streamed `inspect` mode `detect` (release-then-detect) hit. The
-    /// bytes are already on the wire, so this only surfaces what WOULD have been
-    /// blocked — to the structured log, never the client or `/metrics` (security
-    /// detail belongs in logs). No raw response text is logged (privacy); only
-    /// the matched rule ids, the peak severity, and the snippet hashes.
-    fn log_stream_detection(&self, decision: &FirewallDecision) {
+    /// Record a streamed `inspect` mode violation to the structured log — never
+    /// the client or `/metrics` (security detail belongs in logs). The detached
+    /// H1/H2 inspection task cannot write `RequestContext` metadata, so for both
+    /// `block` (cut) and `detect` (release-then-detect) this is the audit trail
+    /// for a streamed decision. No raw response text is logged (privacy); only
+    /// matched rule ids, peak severity, and snippet hashes. `cut` distinguishes a
+    /// `block`-mode cut from a `detect`-mode would-block.
+    fn log_stream_detection(&self, decision: &FirewallDecision, cut: bool) {
         let rule_ids: Vec<&str> = decision
             .matches
             .iter()
@@ -1115,15 +1124,27 @@ impl FirewallEngine {
             .iter()
             .filter_map(|m| m.snippet_hash.as_deref())
             .collect();
-        tracing::warn!(
-            target: "ai_semantic_firewall",
-            direction = "response",
-            enforcement = "detect",
-            peak_severity,
-            rule_ids = ?rule_ids,
-            snippet_hashes = ?snippet_hashes,
-            "streaming detect: response window would be blocked by semantic firewall policy"
-        );
+        if cut {
+            tracing::warn!(
+                target: "ai_semantic_firewall",
+                direction = "response",
+                enforcement = "block",
+                peak_severity,
+                rule_ids = ?rule_ids,
+                snippet_hashes = ?snippet_hashes,
+                "streaming block: response window blocked by semantic firewall policy; stream cut"
+            );
+        } else {
+            tracing::warn!(
+                target: "ai_semantic_firewall",
+                direction = "response",
+                enforcement = "detect",
+                peak_severity,
+                rule_ids = ?rule_ids,
+                snippet_hashes = ?snippet_hashes,
+                "streaming detect: response window would be blocked by semantic firewall policy"
+            );
+        }
     }
 
     fn write_decision_metadata(
@@ -1488,7 +1509,7 @@ impl Plugin for AiSemanticFirewall {
                         .insert("ai_request_streaming".to_string(), "true".to_string());
                     ctx.metadata.insert(
                         RESPONSE_INSPECTION_KEY.to_string(),
-                        "streaming_windowed".to_string(),
+                        STREAMING_WINDOWED_MARKER.to_string(),
                     );
                 }
                 // `reject` (enforce): fail closed so a client cannot disable response
@@ -1613,8 +1634,13 @@ impl Plugin for AiSemanticFirewall {
 
     fn requires_response_stream_hooks(&self) -> bool {
         // Only `inspect` mode drives the per-chunk streaming hook; `streaming_config`
-        // is `Some` exactly for that mode. Zero cost for every other config.
-        self.enabled && self.streaming_config.is_some() && self.has_response_rules
+        // is `Some` exactly for that mode. Honors `inspect.response` so disabling
+        // response inspection also disables the stream hook (matching
+        // `on_response_body`). Zero cost for every other config.
+        self.enabled
+            && self.inspect_response
+            && self.streaming_config.is_some()
+            && self.has_response_rules
     }
 
     fn response_stream_inspector(
@@ -1623,13 +1649,21 @@ impl Plugin for AiSemanticFirewall {
         response_status: u16,
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
-        if !self.enabled || !self.has_response_rules {
+        if !self.enabled || !self.inspect_response || !self.has_response_rules {
             return None;
         }
         // Gate to success responses, mirroring `on_response_body`: an upstream
         // 4xx/5xx `text/event-stream` error body must not be inspected, truncated,
         // or replaced with the firewall terminal event.
         if !(200..300).contains(&response_status) {
+            return None;
+        }
+        // Only windowed-inspect a stream THIS request marked as a detected
+        // `stream: true` AI request (set on the request path). An unrelated SSE
+        // response — a `GET` EventSource route, or a backend that unexpectedly
+        // streams — must keep streaming untouched, never held or cut by AI rules,
+        // mirroring the `buffer`-mode marker gate.
+        if !windowed_streaming_marker_set(ctx) {
             return None;
         }
         let config = self.streaming_config?;
@@ -2810,10 +2844,20 @@ impl StreamInspector {
         }
 
         let segments = self.window_segments();
-        // Nothing inspectable (role-only events flushed), or the per-response
-        // inspection cap reached: release without a provider call.
-        if segments.is_empty() || self.inspections_used >= self.config.max_inspections {
+        // Nothing inspectable (role-only events flushed): release without a call.
+        if segments.is_empty() {
             return ResponseStreamAction::Forward(Bytes::from(self.window.release()));
+        }
+        // Per-response inspection cap reached but content is still arriving: honor
+        // on_error instead of silently forwarding un-inspected windows — reject
+        // fails closed (cut), warn/allow forward best-effort. (Otherwise a
+        // violation placed after the cap would bypass the block-mode contract.)
+        if self.inspections_used >= self.config.max_inspections {
+            return if self.engine.on_error == OnErrorAction::Reject {
+                self.terminate()
+            } else {
+                ResponseStreamAction::Forward(Bytes::from(self.window.release()))
+            };
         }
         self.inspections_used += 1;
 
@@ -2835,8 +2879,11 @@ impl StreamInspector {
             };
         }
 
-        // A confirmed reject cuts the stream; dry-run never cuts.
+        // A confirmed reject cuts the stream; dry-run never cuts. Log the decision
+        // so the cut stream still has an audit trail (rule ids / severity) — the
+        // detached task cannot write `RequestContext` metadata.
         if outcome.decision.action == Action::Reject && !outcome.decision.dry_run {
+            self.engine.log_stream_detection(&outcome.decision, true);
             self.terminate()
         } else {
             ResponseStreamAction::Forward(Bytes::from(self.window.release()))
@@ -2844,27 +2891,31 @@ impl StreamInspector {
     }
 
     /// `detect` mode: the window's bytes were already forwarded, so this only
-    /// inspects to log a detection — it never cuts. The window is then committed
-    /// (advancing the cleared offset and draining inspected prose) regardless of
-    /// the verdict.
-    async fn detect_window(&mut self) {
+    /// inspects to log a detection — it never cuts. Does ONLY cheap synchronous
+    /// bookkeeping (snapshot + advance/drain) and runs the actual evaluation in a
+    /// detached task, so a slow embedding call never stalls the stream — detect is
+    /// release-then-detect and must add no client-visible latency.
+    fn detect_window(&mut self) {
         let segments = self.window_segments();
-        if !segments.is_empty() && self.inspections_used < self.config.max_inspections {
-            self.inspections_used += 1;
-            let outcome = self
-                .engine
-                .evaluate(Direction::Response, &segments, &self.plugin_http_call_ns)
-                .await;
-            let provider_error = self
-                .engine
-                .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref());
-            if !provider_error && outcome.decision.action == Action::Reject {
-                self.engine.log_stream_detection(&outcome.decision);
-            }
-        }
         // Advance + drain; in detect mode `release()` returns no raw bytes (the
         // chunk was already forwarded in `on_chunk`).
         let _ = self.window.release();
+        if segments.is_empty() || self.inspections_used >= self.config.max_inspections {
+            return;
+        }
+        self.inspections_used += 1;
+        let engine = Arc::clone(&self.engine);
+        let plugin_http_call_ns = Arc::clone(&self.plugin_http_call_ns);
+        tokio::spawn(async move {
+            let outcome = engine
+                .evaluate(Direction::Response, &segments, &plugin_http_call_ns)
+                .await;
+            let provider_error = engine
+                .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref());
+            if !provider_error && outcome.decision.action == Action::Reject {
+                engine.log_stream_detection(&outcome.decision, false);
+            }
+        });
     }
 
     fn terminate(&mut self) -> ResponseStreamAction {
@@ -2895,11 +2946,12 @@ impl ResponseStreamInspector for StreamInspector {
                     ResponseStreamAction::Forward(Bytes::new())
                 }
             }
-            // Release immediately; inspect ready windows only to detect/log.
+            // Release immediately; inspect ready windows only to detect/log (the
+            // evaluation is spawned, so the forward is never stalled).
             StreamEnforcement::Detect => {
                 let out = Bytes::copy_from_slice(chunk);
                 if self.window.ingest(chunk) {
-                    self.detect_window().await;
+                    self.detect_window();
                 }
                 ResponseStreamAction::Forward(out)
             }
@@ -2920,7 +2972,7 @@ impl ResponseStreamInspector for StreamInspector {
             }
             StreamEnforcement::Detect => {
                 if self.window.finish() {
-                    self.detect_window().await;
+                    self.detect_window();
                 }
                 ResponseStreamAction::Forward(Bytes::new())
             }
@@ -3814,6 +3866,15 @@ fn buffer_streaming_marker_set(ctx: &RequestContext) -> bool {
         .get(RESPONSE_INSPECTION_KEY)
         .map(String::as_str)
         == Some(STREAMING_BUFFERED_MARKER)
+}
+
+/// Whether `inspect` mode flagged THIS request (a detected `stream: true` JSON
+/// POST) for windowed response inspection — see [`STREAMING_WINDOWED_MARKER`].
+fn windowed_streaming_marker_set(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .get(RESPONSE_INSPECTION_KEY)
+        .map(String::as_str)
+        == Some(STREAMING_WINDOWED_MARKER)
 }
 
 fn is_native_grpc_request(ctx: &RequestContext) -> bool {

@@ -11283,6 +11283,15 @@ async fn handle_proxy_request_inner(
     // failures.
     let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method);
     let stream_request_body = !has_retry && !requires_request_body_buffering;
+    // A response-stream inspector (e.g. ai_semantic_firewall `inspect`) is wired
+    // only on the reqwest streaming path, so when one is configured the backend
+    // must be dispatched via reqwest — otherwise a native-H3 backend would return
+    // `ResponseBody::StreamingH3` and bypass inspection entirely. (Direct-H2/HBONE
+    // are already excluded for these requests because `inspect`/`buffer` force
+    // request-body buffering, which disables those pools; native H3 does not gate
+    // on that, so it is excluded explicitly here.)
+    let requires_response_stream_inspection =
+        plugins.iter().any(|p| p.requires_response_stream_hooks());
     let request_client_ip = ctx.client_ip.clone();
     let retry_config = if has_retry {
         proxy.retry.as_ref()
@@ -11345,8 +11354,8 @@ async fn handle_proxy_request_inner(
             r#"{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}"#,
         ));
     }
-    let mut current_dispatch_h3 =
-        supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
+    let mut current_dispatch_h3 = !requires_response_stream_inspection
+        && supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
     let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
     let mut skip_final_cb_record = false;
@@ -11449,8 +11458,8 @@ async fn handle_proxy_request_inner(
                     // gracefully fall through to reqwest, so an
                     // un-pre-warmed target degrades to the safe path until
                     // the periodic refresh classifies it.
-                    current_dispatch_h3 =
-                        supports_native_http3_backend(&state, &proxy, current_target.as_deref());
+                    current_dispatch_h3 = !requires_response_stream_inspection
+                        && supports_native_http3_backend(&state, &proxy, current_target.as_deref());
                 }
             }
 
