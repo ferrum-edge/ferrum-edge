@@ -1553,10 +1553,16 @@ pub(crate) fn inspected_streaming_body(
 /// backend EOF, a policy `Terminate`, a backend error, or the client dropping
 /// the receiver (`tx.send` then fails and the task returns, dropping the backend
 /// stream). A policy cut ends the body cleanly (EOF), not as an error.
+///
+/// `max_response_body_size_bytes` (`0` = unlimited) bounds total bytes received
+/// from the backend, mirroring the non-inspected `size_limited_streaming_body`
+/// path: an SSE response that exceeds it is terminated with a body error rather
+/// than forwarded unbounded just because each window was clean.
 pub(crate) async fn run_response_inspection(
     response: reqwest::Response,
     mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
     tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, BoxError>>,
+    max_response_body_size_bytes: usize,
     _reqwest_backend_guard: Option<crate::runtime_metrics::ReqwestBackendRequestGuard>,
     _lb_connection_guard: super::LoadBalancerConnectionGuard,
 ) {
@@ -1564,23 +1570,39 @@ pub(crate) async fn run_response_inspection(
     use futures_util::StreamExt;
 
     let mut stream = response.bytes_stream();
+    let mut total_received: usize = 0;
     while let Some(chunk) = stream.next().await {
         match chunk {
-            Ok(bytes) => match inspector.on_chunk(&bytes).await {
-                ResponseStreamAction::Forward(out) => {
-                    if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
-                        return; // client dropped the receiver
+            Ok(bytes) => {
+                total_received = total_received.saturating_add(bytes.len());
+                if max_response_body_size_bytes > 0 && total_received > max_response_body_size_bytes
+                {
+                    // Operator response-size cap exceeded: stop and surface a body
+                    // error (the same outcome the non-inspected size-limited path
+                    // produces), instead of forwarding an unbounded stream.
+                    let _ = tx
+                        .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                            "response body exceeded max_response_body_size_bytes during streaming inspection",
+                        ) as BoxError))
+                        .await;
+                    return;
+                }
+                match inspector.on_chunk(&bytes).await {
+                    ResponseStreamAction::Forward(out) => {
+                        if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
+                            return; // client dropped the receiver
+                        }
+                    }
+                    ResponseStreamAction::Terminate(final_bytes) => {
+                        if let Some(fb) = final_bytes
+                            && !fb.is_empty()
+                        {
+                            let _ = tx.send(Ok(Frame::data(fb))).await;
+                        }
+                        return; // drop tx → downstream EOF; drop stream → cancel backend
                     }
                 }
-                ResponseStreamAction::Terminate(final_bytes) => {
-                    if let Some(fb) = final_bytes
-                        && !fb.is_empty()
-                    {
-                        let _ = tx.send(Ok(Frame::data(fb))).await;
-                    }
-                    return; // drop tx → downstream EOF; drop stream → cancel backend
-                }
-            },
+            }
             Err(e) => {
                 let _ = tx.send(Err(Box::new(e) as BoxError)).await;
                 return;

@@ -1761,12 +1761,19 @@ async fn streaming_response_inspect_parses_and_gates_stream_hooks() {
     // Event streams get a windowed inspector; JSON responses use the buffered path.
     assert!(
         inspect
-            .response_stream_inspector(&ctx, Some("text/event-stream"))
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
             .is_some()
     );
     assert!(
         inspect
-            .response_stream_inspector(&ctx, Some("application/json"))
+            .response_stream_inspector(&ctx, 200, Some("application/json"))
+            .is_none()
+    );
+    // Error responses are not inspected (gated to 2xx, like on_response_body):
+    // an upstream 4xx/5xx SSE error body must not be truncated/replaced.
+    assert!(
+        inspect
+            .response_stream_inspector(&ctx, 502, Some("text/event-stream"))
             .is_none()
     );
 
@@ -1780,7 +1787,7 @@ async fn streaming_response_inspect_cuts_on_leaking_window() {
     let plugin = plugin(&inspect_config());
     let ctx = create_test_context();
     let mut inspector = plugin
-        .response_stream_inspector(&ctx, Some("text/event-stream"))
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
 
     // A content event that completes a sentence which lexically leaks → the
@@ -1805,7 +1812,7 @@ async fn streaming_response_inspect_forwards_clean_windows() {
     let plugin = plugin(&inspect_config());
     let ctx = create_test_context();
     let mut inspector = plugin
-        .response_stream_inspector(&ctx, Some("text/event-stream"))
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
 
     // Benign completed sentence: lexical misses; the dead-port provider error is
@@ -1822,6 +1829,97 @@ async fn streaming_response_inspect_forwards_clean_windows() {
     }
 }
 
+#[tokio::test]
+async fn streaming_response_inspect_cuts_on_leaking_tool_call() {
+    // The leak phrase lives in tool-call ARGUMENTS, not assistant prose.
+    // `response_leakage` applies to ToolArguments, so the tool-only window must
+    // still be reassembled, inspected, and cut (Codex P2: tool deltas were
+    // previously released uninspected because windowing keyed on prose only).
+    let plugin = plugin(&inspect_config());
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let leak = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"note\",\"arguments\":\"my system prompt says never reveal policy\"}}]}}]}\n\n";
+    // No prose boundary → the tool-only window flushes at end-of-stream.
+    assert!(matches!(
+        inspector.on_chunk(leak).await,
+        ResponseStreamAction::Forward(_)
+    ));
+    assert!(
+        matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
+        "a leaking tool-call window must cut the stream"
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_inspect_fail_closed_on_uninspectable() {
+    // A non-JSON `data:` payload cannot be inspected; under on_error=reject the
+    // stream fails closed (cut) rather than forwarding un-inspected content
+    // (Codex P1: block-mode contract — no un-inspected bytes reach the client).
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "inspect",
+        "on_error": "reject",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let garbage = b"data: not-json-cannot-inspect\n\n";
+    assert!(matches!(
+        inspector.on_chunk(garbage).await,
+        ResponseStreamAction::Forward(_)
+    ));
+    assert!(
+        matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
+        "uninspectable SSE must fail closed under on_error=reject"
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_inspect_detect_forwards_and_never_cuts() {
+    // `enforcement: detect` is release-then-detect: bytes go out immediately and
+    // a violation is logged, never cut (Phase C). Even a clearly leaking window
+    // is forwarded verbatim.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "inspect",
+        "streaming": {"enforcement": "detect"},
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    assert!(plugin.requires_response_stream_hooks());
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let leak = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt says never reveal policy.\"}}]}\n\n";
+    match inspector.on_chunk(leak).await {
+        ResponseStreamAction::Forward(bytes) => {
+            assert_eq!(
+                &bytes[..],
+                &leak[..],
+                "detect forwards the raw chunk verbatim"
+            );
+        }
+        ResponseStreamAction::Terminate(_) => panic!("detect mode must never cut the stream"),
+    }
+    // End of stream also forwards (nothing held back, no cut).
+    assert!(matches!(
+        inspector.on_end().await,
+        ResponseStreamAction::Forward(_)
+    ));
+}
+
 #[test]
 fn invalid_streaming_inspect_configs_are_rejected() {
     let with_streaming = |streaming: Value| {
@@ -1834,11 +1932,11 @@ fn invalid_streaming_inspect_configs_are_rejected() {
         })
     };
     let configs = [
-        with_streaming(json!({"enforcement": "detect"})), // not yet supported
-        with_streaming(json!({"window": "tokens"})),      // not yet supported
-        with_streaming(json!({"max_hold_ms": 500})),      // not yet supported
-        with_streaming(json!({"max_window_bytes": 0})),   // must be > 0
-        with_streaming(json!({"max_inspections": 0})),    // must be > 0
+        with_streaming(json!({"enforcement": "explode"})), // unknown enum
+        with_streaming(json!({"window": "tokens"})),       // not yet supported
+        with_streaming(json!({"max_hold_ms": 500})),       // not yet supported
+        with_streaming(json!({"max_window_bytes": 0})),    // must be > 0
+        with_streaming(json!({"max_inspections": 0})),     // must be > 0
         with_streaming(json!({"on_violation": "explode"})), // unknown enum
         // `streaming` block without `streaming_response: inspect`.
         json!({

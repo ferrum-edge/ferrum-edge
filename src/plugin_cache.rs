@@ -217,9 +217,11 @@ impl Plugin for PriorityOverridePlugin {
     fn response_stream_inspector(
         &self,
         ctx: &RequestContext,
+        response_status: u16,
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
-        self.inner.response_stream_inspector(ctx, content_type)
+        self.inner
+            .response_stream_inspector(ctx, response_status, content_type)
     }
     fn requires_udp_datagram_hooks(&self) -> bool {
         self.inner.requires_udp_datagram_hooks()

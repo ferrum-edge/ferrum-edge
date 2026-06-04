@@ -1306,6 +1306,73 @@ pub trait ResponseStreamInspector: Send {
     }
 }
 
+/// Compose the stream inspectors of several plugins into one, so a response with
+/// more than one opted-in plugin (e.g. a global and a proxy-scoped
+/// `ai_semantic_firewall` with different rules) runs them ALL, not just the
+/// first — matching how every other response hook runs for every plugin.
+///
+/// `None` if the list is empty; the single inspector unchanged if there is one;
+/// otherwise a [`ChainedResponseStreamInspector`].
+pub fn chain_response_stream_inspectors(
+    mut inspectors: Vec<Box<dyn ResponseStreamInspector>>,
+) -> Option<Box<dyn ResponseStreamInspector>> {
+    match inspectors.len() {
+        0 => None,
+        1 => inspectors.pop(),
+        _ => Some(Box::new(ChainedResponseStreamInspector { inspectors })),
+    }
+}
+
+/// Pipes each chunk through a chain of [`ResponseStreamInspector`]s: inspector
+/// *i*'s `Forward` output is the input to inspector *i+1*, so each plugin sees
+/// the (frame-aligned) bytes its predecessors released. The first `Terminate`
+/// short-circuits and cuts the stream. Same-call clean releases from an
+/// upstream inspector are dropped on a downstream cut — the stream is ending
+/// anyway, and that preserves the single-`ResponseStreamAction` contract.
+struct ChainedResponseStreamInspector {
+    inspectors: Vec<Box<dyn ResponseStreamInspector>>,
+}
+
+#[async_trait]
+impl ResponseStreamInspector for ChainedResponseStreamInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let mut buf = bytes::Bytes::copy_from_slice(chunk);
+        for inspector in &mut self.inspectors {
+            if buf.is_empty() {
+                // An upstream inspector is holding this window; nothing yet for
+                // the rest of the chain to see.
+                return ResponseStreamAction::Forward(bytes::Bytes::new());
+            }
+            match inspector.on_chunk(&buf).await {
+                ResponseStreamAction::Forward(out) => buf = out,
+                terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+            }
+        }
+        ResponseStreamAction::Forward(buf)
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        // Flush each inspector in order; bytes flushed by inspector *i* are fed to
+        // inspector *i+1* as a final chunk before *i+1* is itself flushed.
+        let mut carry = bytes::Bytes::new();
+        for inspector in &mut self.inspectors {
+            let mut released = bytes::BytesMut::new();
+            if !carry.is_empty() {
+                match inspector.on_chunk(&carry).await {
+                    ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
+                    terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                }
+            }
+            match inspector.on_end().await {
+                ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
+                terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+            }
+            carry = released.freeze();
+        }
+        ResponseStreamAction::Forward(carry)
+    }
+}
+
 /// Mirror response metadata from the `request_mirror` plugin's spawned task.
 ///
 /// Communicated via `tokio::sync::watch` channel from the spawned mirror task
@@ -2311,9 +2378,12 @@ pub trait Plugin: Send + Sync {
 
     /// Create a stateful [`ResponseStreamInspector`] for a streaming (non-buffered)
     /// response body, or `None` to stream it through unchanged. Called once per
-    /// eligible response when at least one plugin on the proxy opts in via
-    /// [`Self::requires_response_stream_hooks`]; the plugin decides applicability
-    /// from `ctx` and the response `content_type` (e.g. only `text/event-stream`).
+    /// eligible response for **every** plugin that opts in via
+    /// [`Self::requires_response_stream_hooks`] (the proxy chains the returned
+    /// inspectors, so multiple stream-inspecting plugins compose); the plugin
+    /// decides applicability from `ctx`, the response `response_status`, and the
+    /// `content_type` (e.g. only inspect a 2xx `text/event-stream`, matching how
+    /// [`Self::on_response_body`] only inspects success responses).
     ///
     /// Returning an inspector is how a plugin generalizes the [`Self::on_ws_frame`]
     /// model to HTTP response streams: the proxy then drives the inspector
@@ -2323,6 +2393,7 @@ pub trait Plugin: Send + Sync {
     fn response_stream_inspector(
         &self,
         _ctx: &RequestContext,
+        _response_status: u16,
         _content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
         None

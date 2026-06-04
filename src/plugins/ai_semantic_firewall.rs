@@ -19,8 +19,7 @@ use url::{Host, Url};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::sse::{
     SseReassembler, SseText, SseTextKind, encode_sse_error_event, floor_char_boundary,
-    last_paragraph_boundary, last_sentence_boundary, parse_sse_data_frames,
-    parse_sse_data_frames_checked,
+    last_paragraph_boundary, last_sentence_boundary, parse_sse_data_frames_checked,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -1093,6 +1092,40 @@ impl FirewallEngine {
                 || (self.on_error == OnErrorAction::Reject && decision.action != Action::Reject))
     }
 
+    /// Record a streamed `inspect` mode `detect` (release-then-detect) hit. The
+    /// bytes are already on the wire, so this only surfaces what WOULD have been
+    /// blocked — to the structured log, never the client or `/metrics` (security
+    /// detail belongs in logs). No raw response text is logged (privacy); only
+    /// the matched rule ids, the peak severity, and the snippet hashes.
+    fn log_stream_detection(&self, decision: &FirewallDecision) {
+        let rule_ids: Vec<&str> = decision
+            .matches
+            .iter()
+            .map(|m| m.rule_id.as_str())
+            .collect();
+        let peak_severity = decision
+            .matches
+            .iter()
+            .map(|m| m.severity)
+            .max_by_key(|s| s.rank())
+            .map(Severity::as_str)
+            .unwrap_or("none");
+        let snippet_hashes: Vec<&str> = decision
+            .matches
+            .iter()
+            .filter_map(|m| m.snippet_hash.as_deref())
+            .collect();
+        tracing::warn!(
+            target: "ai_semantic_firewall",
+            direction = "response",
+            enforcement = "detect",
+            peak_severity,
+            rule_ids = ?rule_ids,
+            snippet_hashes = ?snippet_hashes,
+            "streaming detect: response window would be blocked by semantic firewall policy"
+        );
+    }
+
     fn write_decision_metadata(
         &self,
         ctx: &mut RequestContext,
@@ -1587,9 +1620,16 @@ impl Plugin for AiSemanticFirewall {
     fn response_stream_inspector(
         &self,
         ctx: &RequestContext,
+        response_status: u16,
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
         if !self.enabled || !self.has_response_rules {
+            return None;
+        }
+        // Gate to success responses, mirroring `on_response_body`: an upstream
+        // 4xx/5xx `text/event-stream` error body must not be inspected, truncated,
+        // or replaced with the firewall terminal event.
+        if !(200..300).contains(&response_status) {
             return None;
         }
         let config = self.streaming_config?;
@@ -2358,28 +2398,54 @@ enum StreamWindowKind {
     Bytes,
 }
 
+/// How streamed `inspect` mode reacts to a mid-stream violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnforcement {
+    /// Hold each window's raw bytes until that window is inspected-clean, then
+    /// release them; cut the stream on a violation. No un-inspected bytes ever
+    /// reach the client (block-mode contract). Adds windowing latency.
+    Block,
+    /// Forward bytes immediately (no holding, no added latency) and inspect
+    /// windows only to **detect** — a violation is logged, never cut, because
+    /// the bytes are already on the wire. Observability without enforcement;
+    /// the detection goes to the structured log, not to the client or metrics.
+    Detect,
+}
+
 /// Tunables for streamed `inspect` mode (the `streaming:` config block).
 #[derive(Debug, Clone, Copy)]
 struct StreamingInspectConfig {
     window: StreamWindowKind,
+    /// `block` (hold + cut) or `detect` (release + log).
+    enforcement: StreamEnforcement,
     /// Hard cap on held (un-released) raw bytes — forces a window even mid-sentence,
-    /// bounding both added latency and held memory.
+    /// bounding both added latency and held memory. Also bounds the un-terminated
+    /// `carry`: a single SSE event larger than this is treated as uninspectable.
     max_window_bytes: usize,
     /// Bytes of already-cleared text re-inspected with the next window so a
-    /// violation phrase split across a boundary is still caught.
+    /// violation phrase split across a boundary is still caught. Also the amount
+    /// of reassembled prose retained after a clean release (memory stays bounded
+    /// to roughly one window plus this overlap).
     overlap_bytes: usize,
     /// Safety cap on provider inspections per response.
     max_inspections: u32,
-    /// Emit an OpenAI-compatible terminal error event on a cut (vs. a silent end).
+    /// Emit an OpenAI-compatible terminal error event on a cut (vs. a silent
+    /// end). `block` mode only — `detect` never cuts.
     cut_with_error_event: bool,
 }
 
-/// A complete SSE event held pending release: its raw bytes and the reassembled
-/// assistant-content length after it. The content length lets [`StreamWindowEngine`]
-/// release frame-aligned raw bytes only up to an inspected-clean boundary.
+/// A complete SSE event held pending release: its raw bytes (empty in `detect`
+/// mode, which forwards immediately and never holds), its raw byte length
+/// (tracked even when the bytes are not held, so the window cap still applies),
+/// the reassembled assistant-content length after it (so [`StreamWindowEngine`]
+/// releases frame-aligned raw bytes only up to an inspected-clean boundary), and
+/// whether the event was fully inspectable (valid UTF-8 with JSON `data:`
+/// payloads) so block mode can fail closed on content it could not parse.
 struct HeldEvent {
     raw: Vec<u8>,
+    raw_len: usize,
     content_len_after: usize,
+    inspectable: bool,
 }
 
 /// Pure state machine for windowed streamed inspection.
@@ -2396,12 +2462,18 @@ struct HeldEvent {
 /// inspection lives in the caller; this type is sync and unit-testable.
 struct StreamWindowEngine {
     config: StreamingInspectConfig,
+    /// Whether complete events' raw bytes are retained for release (`block`) or
+    /// dropped because they were already forwarded (`detect`).
+    hold_raw: bool,
     reassembler: SseReassembler,
-    /// Raw bytes received but not yet split into a complete SSE event.
+    /// Raw bytes received but not yet split into a complete SSE event. Bounded
+    /// by `max_window_bytes` so an un-terminated event cannot grow unbounded.
     carry: Vec<u8>,
     /// Complete, reassembled events not yet released — oldest first.
     held: Vec<HeldEvent>,
-    /// Assistant-content length already inspected-clean and released.
+    /// Assistant-content length already inspected-clean and released, in the
+    /// reassembler's CURRENT coordinates (which shrink as cleared prose is
+    /// drained, so this is rebased on every release).
     cleared_len: usize,
     /// Content offset the emitted-but-unverified window will clear to.
     pending_clears_to: Option<usize>,
@@ -2410,6 +2482,7 @@ struct StreamWindowEngine {
 impl StreamWindowEngine {
     fn new(config: StreamingInspectConfig) -> Self {
         Self {
+            hold_raw: config.enforcement == StreamEnforcement::Block,
             config,
             reassembler: SseReassembler::new(),
             carry: Vec::new(),
@@ -2419,53 +2492,67 @@ impl StreamWindowEngine {
         }
     }
 
-    /// Append a raw chunk, reassembling any complete SSE events. Returns the
-    /// window text to inspect when a boundary or the byte cap is reached, else
-    /// `None` (hold). Sets the pending release point.
-    fn ingest(&mut self, chunk: &[u8]) -> Option<String> {
+    /// Reassemble one complete (or force-flushed) SSE event into a held entry,
+    /// recording whether it was fully inspectable.
+    fn absorb_event(&mut self, raw: Vec<u8>) {
+        let parsed = parse_sse_data_frames_checked(&raw);
+        for frame in &parsed.frames {
+            self.reassembler.push_frame(frame);
+        }
+        let content_len_after = self.reassembler.assistant_content_len();
+        let raw_len = raw.len();
+        self.held.push(HeldEvent {
+            raw: if self.hold_raw { raw } else { Vec::new() },
+            raw_len,
+            content_len_after,
+            inspectable: parsed.fully_parsed,
+        });
+    }
+
+    /// Append a raw chunk, reassembling any complete SSE events. Returns `true`
+    /// when a window is ready to inspect (boundary, byte cap, or carry overflow),
+    /// setting the pending release point; `false` means hold.
+    fn ingest(&mut self, chunk: &[u8]) -> bool {
         self.carry.extend_from_slice(chunk);
         while let Some(end) = next_event_end(&self.carry) {
             let raw: Vec<u8> = self.carry.drain(..end).collect();
-            for frame in parse_sse_data_frames(&raw) {
-                self.reassembler.push_frame(&frame);
-            }
-            let content_len_after = self.reassembler.assistant_content().len();
-            self.held.push(HeldEvent {
-                raw,
-                content_len_after,
-            });
+            self.absorb_event(raw);
+        }
+        // Bound carry: an event that never sends a blank-line terminator must not
+        // grow without limit. Once it passes the window cap, force it through as a
+        // (degenerate, almost certainly un-parseable) event so it is inspected or
+        // fails closed instead of buffering unbounded memory.
+        if self.carry.len() > self.config.max_window_bytes {
+            let raw = std::mem::take(&mut self.carry);
+            self.absorb_event(raw);
         }
         self.window_ready(false)
     }
 
-    /// Flush at end of stream: parse any trailing partial event and emit a final
+    /// Flush at end of stream: parse any trailing partial event and signal a final
     /// window covering all remaining content (boundary or not).
-    fn finish(&mut self) -> Option<String> {
+    fn finish(&mut self) -> bool {
         if !self.carry.is_empty() {
             let raw = std::mem::take(&mut self.carry);
-            for frame in parse_sse_data_frames(&raw) {
-                self.reassembler.push_frame(&frame);
-            }
-            let content_len_after = self.reassembler.assistant_content().len();
-            self.held.push(HeldEvent {
-                raw,
-                content_len_after,
-            });
+            self.absorb_event(raw);
         }
         self.window_ready(true)
     }
 
-    fn window_ready(&mut self, at_end: bool) -> Option<String> {
-        let content = self.reassembler.assistant_content();
-        let held_raw: usize = self.held.iter().map(|e| e.raw.len()).sum();
-        let new_content = content.len() > self.cleared_len;
+    fn window_ready(&mut self, at_end: bool) -> bool {
+        let content_len = self.reassembler.assistant_content_len();
+        let held_bytes: usize = self.held.iter().map(|e| e.raw_len).sum();
+        let new_content = content_len > self.cleared_len;
 
         let clears_to = if at_end {
             if !new_content && self.held.is_empty() {
-                return None;
+                return false;
             }
-            content.len()
+            content_len
         } else if new_content {
+            // Allocate the joined prose only when there is new content and a
+            // boundary search is actually needed (not per event).
+            let content = self.reassembler.assistant_content();
             let new = &content[self.cleared_len..];
             let boundary = match self.config.window {
                 StreamWindowKind::Sentence => last_sentence_boundary(new),
@@ -2474,26 +2561,44 @@ impl StreamWindowEngine {
             };
             match boundary {
                 Some(b) => self.cleared_len + b,
-                None if held_raw >= self.config.max_window_bytes => content.len(),
-                None => return None,
+                None if held_bytes >= self.config.max_window_bytes => content_len,
+                None => return false,
             }
-        } else if held_raw >= self.config.max_window_bytes && !self.held.is_empty() {
-            // Non-content events (role-only deltas) piling past the cap: flush.
-            content.len()
+        } else if held_bytes >= self.config.max_window_bytes && !self.held.is_empty() {
+            // Non-prose events (role-only deltas, tool-call frames) piling past the
+            // cap: flush so their content/tool segments get inspected.
+            content_len
         } else {
-            return None;
+            return false;
         };
 
         self.pending_clears_to = Some(clears_to);
-        let start = floor_char_boundary(
-            &content,
-            self.cleared_len.saturating_sub(self.config.overlap_bytes),
-        );
-        Some(content[start..clears_to].to_string())
+        true
     }
 
-    /// Take the raw bytes of the cleared window after a clean verdict: the
-    /// complete events whose content falls within the cleared boundary.
+    /// The reassembled fragments to inspect for the pending window: the full
+    /// currently-retained reassembly (prose plus tool-call names/arguments).
+    /// Retained prose is bounded to roughly one window plus the overlap by
+    /// [`release`](Self::release), so this is not the whole completion.
+    fn snapshot_texts(&self) -> Vec<SseText> {
+        self.reassembler.texts()
+    }
+
+    /// Whether any held event that the pending window would release was not fully
+    /// inspectable (non-UTF-8 or a non-JSON `data:` payload). Block mode uses this
+    /// to fail closed on content it could not parse.
+    fn pending_uninspectable(&self) -> bool {
+        let Some(clears_to) = self.pending_clears_to else {
+            return false;
+        };
+        self.held
+            .iter()
+            .any(|e| !e.inspectable && e.content_len_after <= clears_to)
+    }
+
+    /// Commit the pending window: advance the cleared offset, take the raw bytes
+    /// of the now-cleared events (empty in `detect` mode), and drain inspected
+    /// prose down to the overlap so retained memory stays bounded.
     fn release(&mut self) -> Vec<u8> {
         let Some(clears_to) = self.pending_clears_to.take() else {
             return Vec::new();
@@ -2505,7 +2610,25 @@ impl StreamWindowEngine {
             .first()
             .is_some_and(|e| e.content_len_after <= clears_to)
         {
-            out.extend_from_slice(&self.held.remove(0).raw);
+            let ev = self.held.remove(0);
+            if !ev.raw.is_empty() {
+                out.extend_from_slice(&ev.raw);
+            }
+        }
+
+        // Bound retained prose: drop everything before the re-inspection overlap,
+        // rebasing the offsets that count from the front of the reassembly.
+        let keep_from = self.cleared_len.saturating_sub(self.config.overlap_bytes);
+        if keep_from > 0 {
+            let content = self.reassembler.assistant_content();
+            let drop = floor_char_boundary(&content, keep_from);
+            if drop > 0 {
+                self.reassembler.drain_assistant_prefix(drop);
+                self.cleared_len -= drop;
+                for e in &mut self.held {
+                    e.content_len_after = e.content_len_after.saturating_sub(drop);
+                }
+            }
         }
         out
     }
@@ -2576,20 +2699,15 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
         }
     };
 
-    match streaming_str(streaming, "enforcement")?.unwrap_or("block") {
-        "block" => {}
-        "detect" => {
-            return Err(
-                "ai_semantic_firewall: streaming.enforcement 'detect' (release-then-detect) is not yet supported; only 'block' is available"
-                    .to_string(),
-            );
-        }
+    let enforcement = match streaming_str(streaming, "enforcement")?.unwrap_or("block") {
+        "block" => StreamEnforcement::Block,
+        "detect" => StreamEnforcement::Detect,
         other => {
             return Err(format!(
-                "ai_semantic_firewall: streaming.enforcement must be 'block', got {other:?}"
+                "ai_semantic_firewall: streaming.enforcement must be 'block' or 'detect', got {other:?}"
             ));
         }
-    }
+    };
 
     let cut_with_error_event = match streaming_str(streaming, "on_violation")?
         .unwrap_or("cut_with_error_event")
@@ -2626,6 +2744,7 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
 
     Ok(StreamingInspectConfig {
         window,
+        enforcement,
         max_window_bytes: max_window_bytes as usize,
         overlap_bytes: overlap_bytes as usize,
         max_inspections: u32::try_from(max_inspections).unwrap_or(u32::MAX),
@@ -2665,31 +2784,42 @@ impl StreamInspector {
         }
     }
 
-    /// Inspect a ready window's text and decide whether to release its held raw
-    /// bytes (clean) or cut the stream (violation).
-    async fn act_on_window(&mut self, window_text: String) -> ResponseStreamAction {
-        let trimmed = window_text.trim();
-        // Nothing to inspect (role-only events flushed), or the per-response
-        // inspection cap is reached: release without a provider call.
-        if trimmed.is_empty() || self.inspections_used >= self.config.max_inspections {
+    /// Reassembled response segments for the pending window, mapped to the same
+    /// `TextSegment` kinds the buffered path uses (so chat-completion content,
+    /// Responses-API text, AND tool-call names/arguments are all evaluated against
+    /// the rules that apply to each kind — not just assistant prose). Restricted
+    /// to the enabled extraction paths via [`sse_text_to_segment`].
+    fn window_segments(&self) -> Vec<TextSegment> {
+        self.window
+            .snapshot_texts()
+            .into_iter()
+            .filter_map(|text| sse_text_to_segment(text, &self.engine.extraction))
+            .collect()
+    }
+
+    /// `block` mode: inspect the ready window and decide whether to release its
+    /// held raw bytes (clean) or cut the stream (violation). No un-inspected bytes
+    /// reach the client.
+    async fn act_on_window(&mut self) -> ResponseStreamAction {
+        // Fail closed: a held event about to be released carries a `data:` payload
+        // we could not parse (non-UTF-8 / non-JSON), which may hide content. Honor
+        // on_error — reject cuts; warn/allow forward best-effort — mirroring the
+        // buffered uninspectable path.
+        if self.window.pending_uninspectable() && self.engine.on_error == OnErrorAction::Reject {
+            return self.terminate();
+        }
+
+        let segments = self.window_segments();
+        // Nothing inspectable (role-only events flushed), or the per-response
+        // inspection cap reached: release without a provider call.
+        if segments.is_empty() || self.inspections_used >= self.config.max_inspections {
             return ResponseStreamAction::Forward(Bytes::from(self.window.release()));
         }
         self.inspections_used += 1;
 
-        let segment = TextSegment {
-            direction: Direction::Response,
-            kind: SegmentKind::AssistantMessage,
-            role: Some("assistant".to_string()),
-            json_path: Some("$.choices[*].delta.content".to_string()),
-            text: trimmed.to_string(),
-        };
         let outcome = self
             .engine
-            .evaluate(
-                Direction::Response,
-                std::slice::from_ref(&segment),
-                &self.plugin_http_call_ns,
-            )
+            .evaluate(Direction::Response, &segments, &self.plugin_http_call_ns)
             .await;
 
         // Provider error mid-stream honors on_error: reject fails closed, others
@@ -2713,6 +2843,30 @@ impl StreamInspector {
         }
     }
 
+    /// `detect` mode: the window's bytes were already forwarded, so this only
+    /// inspects to log a detection — it never cuts. The window is then committed
+    /// (advancing the cleared offset and draining inspected prose) regardless of
+    /// the verdict.
+    async fn detect_window(&mut self) {
+        let segments = self.window_segments();
+        if !segments.is_empty() && self.inspections_used < self.config.max_inspections {
+            self.inspections_used += 1;
+            let outcome = self
+                .engine
+                .evaluate(Direction::Response, &segments, &self.plugin_http_call_ns)
+                .await;
+            let provider_error = self
+                .engine
+                .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref());
+            if !provider_error && outcome.decision.action == Action::Reject {
+                self.engine.log_stream_detection(&outcome.decision);
+            }
+        }
+        // Advance + drain; in detect mode `release()` returns no raw bytes (the
+        // chunk was already forwarded in `on_chunk`).
+        let _ = self.window.release();
+    }
+
     fn terminate(&mut self) -> ResponseStreamAction {
         self.terminated = true;
         self.window.discard_pending();
@@ -2732,9 +2886,23 @@ impl ResponseStreamInspector for StreamInspector {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
-        match self.window.ingest(chunk) {
-            Some(text) => self.act_on_window(text).await,
-            None => ResponseStreamAction::Forward(Bytes::new()),
+        match self.config.enforcement {
+            // Hold: emit only what the window engine clears (or cut).
+            StreamEnforcement::Block => {
+                if self.window.ingest(chunk) {
+                    self.act_on_window().await
+                } else {
+                    ResponseStreamAction::Forward(Bytes::new())
+                }
+            }
+            // Release immediately; inspect ready windows only to detect/log.
+            StreamEnforcement::Detect => {
+                let out = Bytes::copy_from_slice(chunk);
+                if self.window.ingest(chunk) {
+                    self.detect_window().await;
+                }
+                ResponseStreamAction::Forward(out)
+            }
         }
     }
 
@@ -2742,9 +2910,20 @@ impl ResponseStreamInspector for StreamInspector {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
-        match self.window.finish() {
-            Some(text) => self.act_on_window(text).await,
-            None => ResponseStreamAction::Forward(Bytes::new()),
+        match self.config.enforcement {
+            StreamEnforcement::Block => {
+                if self.window.finish() {
+                    self.act_on_window().await
+                } else {
+                    ResponseStreamAction::Forward(Bytes::new())
+                }
+            }
+            StreamEnforcement::Detect => {
+                if self.window.finish() {
+                    self.detect_window().await;
+                }
+                ResponseStreamAction::Forward(Bytes::new())
+            }
         }
     }
 }
@@ -4015,8 +4194,23 @@ mod stream_window_tests {
         max_window_bytes: usize,
         overlap_bytes: usize,
     ) -> StreamingInspectConfig {
+        cfg_with(
+            window,
+            max_window_bytes,
+            overlap_bytes,
+            StreamEnforcement::Block,
+        )
+    }
+
+    fn cfg_with(
+        window: StreamWindowKind,
+        max_window_bytes: usize,
+        overlap_bytes: usize,
+        enforcement: StreamEnforcement,
+    ) -> StreamingInspectConfig {
         StreamingInspectConfig {
             window,
+            enforcement,
             max_window_bytes,
             overlap_bytes,
             max_inspections: 64,
@@ -4031,15 +4225,30 @@ mod stream_window_tests {
             .into_bytes()
     }
 
+    /// The reassembled assistant prose the engine would inspect for the pending
+    /// window (chat-completion content + Responses-API text from the snapshot).
+    fn window_prose(eng: &StreamWindowEngine) -> String {
+        eng.snapshot_texts()
+            .into_iter()
+            .filter(|t| {
+                matches!(
+                    t.kind,
+                    SseTextKind::ChatContent | SseTextKind::ResponsesText
+                )
+            })
+            .map(|t| t.text)
+            .collect()
+    }
+
     #[test]
     fn holds_partial_sentence_then_releases_on_boundary() {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
         let f1 = content_event("Hello ");
-        // No terminator yet → hold (emit nothing).
-        assert!(eng.ingest(&f1).is_none());
+        // No terminator/boundary yet → hold (not ready).
+        assert!(!eng.ingest(&f1));
         let f2 = content_event("world.");
-        let window = eng.ingest(&f2).expect("window at sentence boundary");
-        assert_eq!(window, "Hello world.");
+        assert!(eng.ingest(&f2), "window ready at sentence boundary");
+        assert_eq!(window_prose(&eng), "Hello world.");
         // A clean verdict releases the raw bytes of both held events.
         assert_eq!(eng.release(), [f1, f2].concat());
     }
@@ -4047,11 +4256,8 @@ mod stream_window_tests {
     #[test]
     fn partial_event_without_blank_line_is_held() {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
-        // No "\n\n" terminator → nothing reassembled, nothing released.
-        assert!(
-            eng.ingest(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi.\"}}]}")
-                .is_none()
-        );
+        // No "\n\n" terminator and under the cap → nothing reassembled, hold.
+        assert!(!eng.ingest(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi.\"}}]}"));
         assert!(eng.release().is_empty());
     }
 
@@ -4059,8 +4265,8 @@ mod stream_window_tests {
     fn byte_cap_forces_window_without_boundary() {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, 8, 0));
         let f = content_event("abcdefghij");
-        let window = eng.ingest(&f).expect("forced window at byte cap");
-        assert_eq!(window, "abcdefghij");
+        assert!(eng.ingest(&f), "forced window at byte cap");
+        assert_eq!(window_prose(&eng), "abcdefghij");
         assert_eq!(eng.release(), f);
     }
 
@@ -4068,21 +4274,40 @@ mod stream_window_tests {
     fn overlap_reinspects_prior_cleared_text() {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 5));
         let f1 = content_event("First one. ");
-        assert_eq!(eng.ingest(&f1).as_deref(), Some("First one."));
+        assert!(eng.ingest(&f1));
+        assert!(window_prose(&eng).starts_with("First one."));
         eng.release();
         let f2 = content_event("Second.");
-        let window = eng.ingest(&f2).expect("second window");
-        assert!(window.ends_with("Second."));
-        // Overlap pulled cleared text in, so the window is longer than the new text.
-        assert!(window.len() > "Second.".len());
+        assert!(eng.ingest(&f2), "second window");
+        let prose = window_prose(&eng);
+        assert!(prose.ends_with("Second."));
+        // Overlap re-introduced cleared text, so the window exceeds just the new text.
+        assert!(prose.len() > "Second.".len());
+    }
+
+    #[test]
+    fn clean_release_drains_retained_prose() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 4));
+        let f1 = content_event("Aaaaa bbbbb. ");
+        assert!(eng.ingest(&f1));
+        eng.release();
+        // After a clean release the inspected prose is drained down to ~overlap, so
+        // memory does not grow with the whole completion (Codex P2).
+        let retained = window_prose(&eng);
+        assert!(
+            !retained.contains("Aaaaa"),
+            "drained prefix gone: {retained:?}"
+        );
+        assert!(retained.len() < "Aaaaa bbbbb. ".len());
     }
 
     #[test]
     fn finish_flushes_trailing_partial_window() {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
         let f = content_event("no terminator");
-        assert!(eng.ingest(&f).is_none());
-        assert_eq!(eng.finish().as_deref(), Some("no terminator"));
+        assert!(!eng.ingest(&f)); // no sentence boundary yet → hold
+        assert!(eng.finish(), "end-of-stream flushes the held window");
+        assert_eq!(window_prose(&eng), "no terminator");
         assert_eq!(eng.release(), f);
     }
 
@@ -4091,11 +4316,81 @@ mod stream_window_tests {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
         let role =
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n".to_vec();
-        assert!(eng.ingest(&role).is_none()); // no content yet
+        assert!(!eng.ingest(&role)); // no content yet
         let f = content_event("Done.");
-        assert_eq!(eng.ingest(&f).as_deref(), Some("Done."));
+        assert!(eng.ingest(&f));
+        assert_eq!(window_prose(&eng), "Done.");
         // The role-only event is released alongside the content event it preceded.
         assert_eq!(eng.release(), [role, f].concat());
+    }
+
+    #[test]
+    fn tool_call_only_stream_is_inspectable() {
+        // A stream with ONLY tool-call deltas (no assistant prose) still surfaces
+        // segments to inspect at end-of-stream, so tool_abuse rules are not
+        // bypassed (Codex P2).
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        let tool = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\\\"rm -rf /\\\"}\"}}]}}]}\n\n".to_vec();
+        assert!(!eng.ingest(&tool)); // no prose boundary, under cap → hold
+        assert!(eng.finish(), "end-of-stream flushes tool-only events");
+        let texts = eng.snapshot_texts();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.kind == SseTextKind::ChatToolName && t.text == "shell"),
+            "tool-call name must be inspectable: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.kind == SseTextKind::ChatToolArguments && t.text.contains("rm -rf")),
+            "tool-call arguments must be inspectable: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn unterminated_nonjson_event_is_flagged_uninspectable() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        // A complete but non-JSON `data:` payload: parsed-but-uninspectable.
+        assert!(!eng.ingest(b"data: not-json\n\n"));
+        assert!(eng.finish());
+        assert!(
+            eng.pending_uninspectable(),
+            "a non-JSON data: event must fail closed in block mode"
+        );
+    }
+
+    #[test]
+    fn carry_overflow_forces_an_uninspectable_window() {
+        // A single event that never sends a blank-line terminator must not buffer
+        // unbounded memory: once `carry` passes the cap it is force-flushed as a
+        // degenerate (un-parseable) event (Codex P2).
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, 16, 0));
+        assert!(!eng.ingest(b"data: ")); // small, under cap
+        assert!(eng.ingest(&[b'a'; 32]), "carry overflow forces a window");
+        assert!(
+            eng.pending_uninspectable(),
+            "the oversized un-terminated event is uninspectable"
+        );
+        assert!(eng.carry.is_empty(), "carry was drained, not retained");
+    }
+
+    #[test]
+    fn detect_mode_does_not_hold_raw_bytes() {
+        // `detect` forwards bytes immediately, so the window engine retains no raw
+        // bytes to release — `release()` only advances offsets.
+        let mut eng = StreamWindowEngine::new(cfg_with(
+            StreamWindowKind::Sentence,
+            4096,
+            0,
+            StreamEnforcement::Detect,
+        ));
+        let f = content_event("Hi there.");
+        assert!(eng.ingest(&f));
+        assert!(
+            eng.release().is_empty(),
+            "detect mode holds no raw bytes for release"
+        );
     }
 
     #[test]

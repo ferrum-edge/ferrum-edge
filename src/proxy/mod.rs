@@ -11925,9 +11925,13 @@ async fn handle_proxy_request_inner(
         && plugins.iter().any(|p| p.requires_response_stream_hooks())
     {
         let content_type = response_headers.get("content-type").map(String::as_str);
-        plugins
+        // Chain EVERY opted-in plugin (not just the first), gated to the response
+        // status so error bodies are not inspected.
+        let inspectors: Vec<_> = plugins
             .iter()
-            .find_map(|p| p.response_stream_inspector(&ctx, content_type))
+            .filter_map(|p| p.response_stream_inspector(&ctx, response_status, content_type))
+            .collect();
+        crate::plugins::chain_response_stream_inspectors(inspectors)
     } else {
         None
     };
@@ -12035,6 +12039,7 @@ async fn handle_proxy_request_inner(
                     response,
                     inspector,
                     tx,
+                    state.max_response_body_size_bytes,
                     reqwest_backend_guard,
                     lb_connection_guard,
                 ));
