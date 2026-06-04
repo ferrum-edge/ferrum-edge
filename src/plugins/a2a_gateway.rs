@@ -1203,20 +1203,10 @@ fn rewrite_agent_card_urls(
         .get("preferredTransport")
         .or_else(|| object.get("preferred_transport"))
         .and_then(Value::as_str);
-    if should_rewrite_transport(preferred_transport) {
-        if let Some(url) = object.get_mut("url") {
-            changed |= rewrite_url_value(url, public_base, endpoint_path);
-        } else {
-            object.insert(
-                "url".to_string(),
-                Value::String(format!(
-                    "{}{}",
-                    public_base.trim_end_matches('/'),
-                    endpoint_path
-                )),
-            );
-            changed = true;
-        }
+    if should_rewrite_transport(preferred_transport)
+        && let Some(url) = object.get_mut("url")
+    {
+        changed |= rewrite_url_value(url, public_base, endpoint_path);
     }
     for key in [
         "additionalInterfaces",

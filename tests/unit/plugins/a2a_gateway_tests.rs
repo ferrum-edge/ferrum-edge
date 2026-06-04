@@ -292,7 +292,7 @@ async fn jsonrpc_agent_card_response_rewrites_gateway_urls() {
     };
     let body: Value = serde_json::from_str(&body).expect("body should be JSON");
     let result = &body["result"];
-    assert_eq!(result["url"], "https://gateway.example.com/a2a");
+    assert!(result.get("url").is_none());
     assert_eq!(
         result["supported_interfaces"][0]["url"],
         "https://gateway.example.com/a2a"
