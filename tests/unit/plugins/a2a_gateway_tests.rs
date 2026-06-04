@@ -53,7 +53,7 @@ fn grpc_ctx(rpc: &str, content_type: &str) -> (RequestContext, HashMap<String, S
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
-        format!("/a2a.v1.A2AService/{rpc}"),
+        format!("/lf.a2a.v1.A2AService/{rpc}"),
     );
     ctx.headers
         .insert("content-type".to_string(), content_type.to_string());
@@ -127,6 +127,36 @@ async fn jsonrpc_policy_deny_preserves_request_id() {
 }
 
 #[tokio::test]
+async fn jsonrpc_pascalcase_method_is_detected_and_policy_normalized() {
+    let plugin = plugin(json!({
+        "policy": {
+            "methods": {
+                "SendMessage": {"action": "deny"}
+            }
+        }
+    }));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-pascal",
+        "method": "SendMessage",
+        "params": {
+            "id": "task-1"
+        }
+    }));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let PluginResult::Reject { body, .. } = result else {
+        panic!("PascalCase JSON-RPC method should be denied by normalized policy");
+    };
+    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    assert_eq!(body["error"]["data"]["method"], "message/send");
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("message/send")
+    );
+}
+
+#[tokio::test]
 async fn rest_agent_card_response_rewrites_gateway_urls() {
     let plugin = plugin(json!({
         "discovery": {
@@ -187,7 +217,7 @@ async fn grpc_a2a_method_is_detected_without_request_buffering() {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
-        "/a2a.v1.A2AService/SendStreamingMessage".to_string(),
+        "/lf.a2a.v1.A2AService/SendStreamingMessage".to_string(),
     );
     ctx.headers
         .insert("content-type".to_string(), "application/grpc".to_string());
@@ -209,6 +239,69 @@ async fn grpc_a2a_method_is_detected_without_request_buffering() {
         Some("true")
     );
     assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn jsonrpc_agent_card_response_rewrites_gateway_urls() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-card",
+        "method": "GetExtendedAgentCard",
+        "params": {}
+    }));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": "req-card",
+        "result": {
+            "name": "planner",
+            "description": "planning agent",
+            "signatures": [{"protected": "eyJhbGciOiJFUzI1NiJ9", "signature": "stale"}],
+            "supported_interfaces": [
+                {
+                    "protocol_binding": "JSONRPC",
+                    "protocol_version": "0.3",
+                    "url": "https://planner.internal/a2a"
+                },
+                {
+                    "protocol_binding": "GRPC",
+                    "protocol_version": "0.3",
+                    "url": "https://planner.internal/grpc"
+                }
+            ]
+        }
+    })
+    .to_string();
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .await;
+    let PluginResult::Reject { body, .. } = result else {
+        panic!("JSON-RPC agent card rewrite should replace response body");
+    };
+    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    let result = &body["result"];
+    assert_eq!(result["url"], "https://gateway.example.com/a2a");
+    assert_eq!(
+        result["supported_interfaces"][0]["url"],
+        "https://gateway.example.com/a2a"
+    );
+    assert_eq!(
+        result["supported_interfaces"][1]["url"],
+        "https://planner.internal/grpc"
+    );
+    assert!(result.get("signatures").is_none());
 }
 
 #[tokio::test]
@@ -381,7 +474,7 @@ async fn rest_detection_is_scoped_to_configured_endpoint_path() {
     assert!(matches!(result, PluginResult::Continue));
     assert!(!unrelated_ctx.metadata.contains_key("a2a.enabled"));
 
-    let (mut a2a_ctx, mut a2a_headers) = rest_ctx("GET", "/a2a/v1/tasks/task-1");
+    let (mut a2a_ctx, mut a2a_headers) = rest_ctx("GET", "/a2a/tasks/task-1");
     let result = plugin.before_proxy(&mut a2a_ctx, &mut a2a_headers).await;
     assert!(matches!(
         result,
@@ -395,6 +488,22 @@ async fn rest_detection_is_scoped_to_configured_endpoint_path() {
 #[tokio::test]
 async fn rest_operation_table_emits_expected_metadata() {
     let cases = [
+        ("POST", "/a2a/message:send", "message/send", None, "false"),
+        (
+            "POST",
+            "/a2a/acme/message:stream",
+            "message/stream",
+            None,
+            "true",
+        ),
+        ("GET", "/a2a/tasks", "tasks/list", None, "false"),
+        (
+            "GET",
+            "/a2a/acme/tasks/task-1",
+            "tasks/get",
+            Some("task-1"),
+            "false",
+        ),
         (
             "POST",
             "/a2a/v1/message:send",
@@ -495,7 +604,7 @@ async fn rest_operation_table_emits_expected_metadata() {
     }
 
     let plugin = plugin(json!({}));
-    let (mut ctx, mut headers) = rest_ctx("GET", "/a2a/v1/tasks/task-1/child");
+    let (mut ctx, mut headers) = rest_ctx("GET", "/a2a/tasks/task-1/child");
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!ctx.metadata.contains_key("a2a.enabled"));
@@ -514,6 +623,10 @@ async fn grpc_standard_push_rpc_names_are_detected() {
         ),
         (
             "ListTaskPushNotification",
+            "tasks/pushNotificationConfig/list",
+        ),
+        (
+            "ListTaskPushNotificationConfigs",
             "tasks/pushNotificationConfig/list",
         ),
         (
@@ -689,7 +802,7 @@ fn invalid_a2a_gateway_configs_are_rejected() {
             "protocol versions cannot be empty",
         ),
         (
-            json!({"endpoint": {"grpc_services": ["a2a.v1.A2AService", "a2a.v1.A2AService"]}}),
+            json!({"endpoint": {"grpc_services": ["lf.a2a.v1.A2AService", "lf.a2a.v1.A2AService"]}}),
             "duplicate endpoint.grpc_services",
             "duplicate gRPC services should reject",
         ),

@@ -18,7 +18,7 @@ const DEFAULT_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 const DEFAULT_PROTOCOL_VERSION: &str = "0.3.0";
 const DEFAULT_VERSION_HEADER: &str = "A2A-Version";
 const DEFAULT_MAX_DETECTION_BODY_BYTES: u64 = 1024 * 1024;
-const DEFAULT_GRPC_SERVICE: &str = "a2a.v1.A2AService";
+const DEFAULT_GRPC_SERVICE: &str = "lf.a2a.v1.A2AService";
 
 const JSONRPC_METHODS: &[&str] = &[
     "message/send",
@@ -251,20 +251,21 @@ impl A2aGateway {
             return None;
         }
         let method = envelope.method.unwrap_or_else(|| "unknown".to_string());
-        let known = JSONRPC_METHODS.contains(&method.as_str());
+        let canonical_method = canonical_a2a_method(&method);
         let accepted_unknown = self.detection.allow_unknown_methods_with_version_header
             && header_value(headers, &self.detection.version_header).is_some();
-        if !(known || accepted_unknown) {
+        if canonical_method.is_none() && !accepted_unknown {
             return None;
         }
-        let metric_method = if known { method } else { "unknown".to_string() };
+        let metric_method = canonical_method.unwrap_or("unknown").to_string();
+        let is_agent_card = is_agent_card_method(&metric_method);
         Some(A2aDetection {
             binding: A2aBinding::JsonRpc,
             streaming_hint: is_streaming_method(&metric_method),
             method: metric_method,
             jsonrpc_id: envelope.id,
             task_id_hint: extract_task_id_from_request(&value),
-            is_agent_card: false,
+            is_agent_card,
             oversized_body: false,
         })
     }
@@ -389,10 +390,10 @@ impl A2aGateway {
     fn rest_suffix<'a>(&self, path: &'a str) -> Option<&'a str> {
         let endpoint_path = self.endpoint.path.trim_end_matches('/');
         if endpoint_path.is_empty() || endpoint_path == "/" {
-            return path.starts_with("/v1/").then_some(path);
+            return normalized_rest_path(path).is_some().then_some(path);
         }
         path.strip_prefix(endpoint_path)
-            .filter(|suffix| suffix.starts_with("/v1/"))
+            .filter(|suffix| normalized_rest_path(suffix).is_some())
     }
 
     fn should_capture_http_response(&self, ctx: &RequestContext) -> bool {
@@ -586,16 +587,13 @@ impl Plugin for A2aGateway {
         if self.observability.emit_metadata {
             emit_response_metadata(ctx, &value);
         }
-        if !self.discovery.rewrite_agent_card_urls
-            || !ctx.a2a_gateway_is_agent_card
-            || !looks_like_agent_card(&value)
-        {
+        if !self.discovery.rewrite_agent_card_urls || !ctx.a2a_gateway_is_agent_card {
             return PluginResult::Continue;
         }
         let Some(public_base) = self.public_base_url(ctx, response_headers) else {
             return PluginResult::Continue;
         };
-        if !rewrite_agent_card_urls(
+        if !rewrite_agent_card_response(
             &mut value,
             &public_base,
             &self.endpoint.path,
@@ -746,11 +744,8 @@ fn parse_policy(object: &Map<String, Value>) -> Result<A2aPolicyConfig, String> 
             .as_object()
             .ok_or_else(|| "a2a_gateway: 'policy.methods' must be an object".to_string())?;
         for (method, value) in methods_object {
-            if !is_valid_policy_method(method) {
-                return Err(format!(
-                    "a2a_gateway: unsupported policy method name {method:?}"
-                ));
-            }
+            let canonical_method = canonical_policy_method(method)
+                .ok_or_else(|| format!("a2a_gateway: unsupported policy method name {method:?}"))?;
             let object = value.as_object().ok_or_else(|| {
                 format!("a2a_gateway: policy.methods[{method:?}] must be an object")
             })?;
@@ -760,7 +755,14 @@ fn parse_policy(object: &Map<String, Value>) -> Result<A2aPolicyConfig, String> 
                 })?,
                 &format!("policy.methods[{method:?}].action"),
             )?;
-            methods.insert(method.clone(), action);
+            if methods
+                .insert(canonical_method.to_string(), action)
+                .is_some()
+            {
+                return Err(format!(
+                    "a2a_gateway: duplicate policy method name {canonical_method:?}"
+                ));
+            }
         }
     }
     Ok(A2aPolicyConfig {
@@ -843,42 +845,43 @@ fn oversized_jsonrpc_response(detection: &A2aDetection) -> PluginResult {
 }
 
 fn match_rest_operation(method: &str, rest: &str) -> Option<(&'static str, Option<String>, bool)> {
-    if method.eq_ignore_ascii_case("POST") && rest == "/v1/message:send" {
+    let rest = normalized_rest_path(rest)?;
+    if method.eq_ignore_ascii_case("POST") && rest == "message:send" {
         return Some(("message/send", None, false));
     }
-    if method.eq_ignore_ascii_case("POST") && rest == "/v1/message:stream" {
+    if method.eq_ignore_ascii_case("POST") && rest == "message:stream" {
         return Some(("message/stream", None, true));
     }
-    if method.eq_ignore_ascii_case("GET") && rest == "/v1/card" {
+    if method.eq_ignore_ascii_case("GET") && rest == "card" {
         return Some(("agent/getAuthenticatedExtendedCard", None, false));
     }
-    if method.eq_ignore_ascii_case("GET") && rest == "/v1/extendedAgentCard" {
+    if method.eq_ignore_ascii_case("GET") && rest == "extendedAgentCard" {
         return Some(("agent/getExtendedAgentCard", None, false));
     }
     if (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("POST"))
-        && rest == "/v1/tasks"
+        && rest == "tasks"
     {
         return Some(("tasks/list", None, false));
     }
     if let Some(task_id) = rest
-        .strip_prefix("/v1/tasks/")
+        .strip_prefix("tasks/")
         .and_then(|tail| tail.strip_suffix(":cancel"))
         && method.eq_ignore_ascii_case("POST")
-        && !task_id.is_empty()
+        && is_simple_path_id(task_id)
     {
         return Some(("tasks/cancel", Some(task_id.to_string()), false));
     }
     if let Some(task_id) = rest
-        .strip_prefix("/v1/tasks/")
+        .strip_prefix("tasks/")
         .and_then(|tail| tail.strip_suffix(":subscribe"))
         && (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("POST"))
-        && !task_id.is_empty()
+        && is_simple_path_id(task_id)
     {
         return Some(("tasks/resubscribe", Some(task_id.to_string()), true));
     }
     if let Some(parent) = rest.strip_suffix("/pushNotificationConfigs")
-        && let Some(task_id) = parent.strip_prefix("/v1/tasks/")
-        && !task_id.is_empty()
+        && let Some(task_id) = parent.strip_prefix("tasks/")
+        && is_simple_path_id(task_id)
     {
         if method.eq_ignore_ascii_case("GET") {
             return Some((
@@ -895,10 +898,10 @@ fn match_rest_operation(method: &str, rest: &str) -> Option<(&'static str, Optio
             ));
         }
     }
-    if let Some(tail) = rest.strip_prefix("/v1/tasks/")
+    if let Some(tail) = rest.strip_prefix("tasks/")
         && let Some((task_id, rest_tail)) = tail.split_once("/pushNotificationConfigs/")
-        && !task_id.is_empty()
-        && !rest_tail.is_empty()
+        && is_simple_path_id(task_id)
+        && is_simple_path_id(rest_tail)
     {
         if method.eq_ignore_ascii_case("GET") {
             return Some((
@@ -915,10 +918,9 @@ fn match_rest_operation(method: &str, rest: &str) -> Option<(&'static str, Optio
             ));
         }
     }
-    if let Some(task_id) = rest.strip_prefix("/v1/tasks/")
+    if let Some(task_id) = rest.strip_prefix("tasks/")
         && method.eq_ignore_ascii_case("GET")
-        && !task_id.is_empty()
-        && !task_id.contains('/')
+        && is_simple_path_id(task_id)
         && !task_id.ends_with(":cancel")
         && !task_id.ends_with(":subscribe")
     {
@@ -927,29 +929,36 @@ fn match_rest_operation(method: &str, rest: &str) -> Option<(&'static str, Optio
     None
 }
 
+fn normalized_rest_path(rest: &str) -> Option<&str> {
+    let rest = rest.strip_prefix('/')?;
+    let rest = strip_optional_rest_version(rest);
+    if is_a2a_rest_route(rest) {
+        return Some(rest);
+    }
+    let (_tenant, tail) = rest.split_once('/')?;
+    let tail = strip_optional_rest_version(tail);
+    is_a2a_rest_route(tail).then_some(tail)
+}
+
+fn strip_optional_rest_version(rest: &str) -> &str {
+    rest.strip_prefix("v1/").unwrap_or(rest)
+}
+
+fn is_a2a_rest_route(rest: &str) -> bool {
+    matches!(
+        rest,
+        "message:send" | "message:stream" | "card" | "extendedAgentCard" | "tasks"
+    ) || rest.starts_with("tasks/")
+}
+
+fn is_simple_path_id(value: &str) -> bool {
+    !value.is_empty() && !value.contains('/')
+}
+
 fn grpc_operation(method: &str) -> Option<(&'static str, bool)> {
     match method {
-        "SendMessage" => Some(("message/send", false)),
-        "SendStreamingMessage" => Some(("message/stream", true)),
-        "GetTask" => Some(("tasks/get", false)),
-        "ListTasks" => Some(("tasks/list", false)),
-        "CancelTask" => Some(("tasks/cancel", false)),
-        "SubscribeToTask" | "TaskSubscription" => Some(("tasks/resubscribe", true)),
-        "SetTaskPushNotificationConfig"
-        | "CreateTaskPushNotificationConfig"
-        | "CreateTaskPushNotification" => Some(("tasks/pushNotificationConfig/set", false)),
-        "GetTaskPushNotificationConfig" | "GetTaskPushNotification" => {
-            Some(("tasks/pushNotificationConfig/get", false))
-        }
-        "ListTaskPushNotificationConfig" | "ListTaskPushNotification" => {
-            Some(("tasks/pushNotificationConfig/list", false))
-        }
-        "DeleteTaskPushNotificationConfig" | "DeleteTaskPushNotification" => {
-            Some(("tasks/pushNotificationConfig/delete", false))
-        }
-        "GetAgentCard" => Some(("agent/getCard", false)),
-        "GetExtendedAgentCard" => Some(("agent/getExtendedAgentCard", false)),
-        _ => None,
+        "SetTaskPushNotificationConfig" => Some(("tasks/pushNotificationConfig/set", false)),
+        _ => canonical_a2a_method(method).map(|method| (method, is_streaming_method(method))),
     }
 }
 
@@ -957,8 +966,53 @@ fn is_streaming_method(method: &str) -> bool {
     matches!(method, "message/stream" | "tasks/resubscribe")
 }
 
-fn is_valid_policy_method(method: &str) -> bool {
-    JSONRPC_METHODS.contains(&method) || method == "unknown"
+fn is_agent_card_method(method: &str) -> bool {
+    matches!(
+        method,
+        "agent/getCard" | "agent/getExtendedAgentCard" | "agent/getAuthenticatedExtendedCard"
+    )
+}
+
+fn canonical_policy_method(method: &str) -> Option<&'static str> {
+    if method == "unknown" {
+        Some("unknown")
+    } else {
+        canonical_a2a_method(method)
+    }
+}
+
+fn canonical_a2a_method(method: &str) -> Option<&'static str> {
+    if let Some(canonical) = JSONRPC_METHODS
+        .iter()
+        .copied()
+        .find(|canonical| *canonical == method)
+    {
+        return Some(canonical);
+    }
+    match method {
+        "SendMessage" => Some("message/send"),
+        "SendStreamingMessage" => Some("message/stream"),
+        "GetTask" => Some("tasks/get"),
+        "ListTasks" => Some("tasks/list"),
+        "CancelTask" => Some("tasks/cancel"),
+        "SubscribeToTask" | "TaskSubscription" => Some("tasks/resubscribe"),
+        "CreateTaskPushNotificationConfig" | "CreateTaskPushNotification" => {
+            Some("tasks/pushNotificationConfig/set")
+        }
+        "GetTaskPushNotificationConfig" | "GetTaskPushNotification" => {
+            Some("tasks/pushNotificationConfig/get")
+        }
+        "ListTaskPushNotificationConfigs"
+        | "ListTaskPushNotificationConfig"
+        | "ListTaskPushNotification" => Some("tasks/pushNotificationConfig/list"),
+        "DeleteTaskPushNotificationConfig" | "DeleteTaskPushNotification" => {
+            Some("tasks/pushNotificationConfig/delete")
+        }
+        "GetAgentCard" => Some("agent/getCard"),
+        "GetExtendedAgentCard" => Some("agent/getExtendedAgentCard"),
+        "GetAuthenticatedExtendedCard" => Some("agent/getAuthenticatedExtendedCard"),
+        _ => None,
+    }
 }
 
 fn extract_task_id_from_request(value: &Value) -> Option<String> {
@@ -1114,9 +1168,25 @@ fn looks_like_agent_card(value: &Value) -> bool {
         || object.contains_key("additional_interfaces")
         || object.contains_key("supportedInterfaces")
         || object.contains_key("supported_interfaces"))
-        && (object.contains_key("name")
-            || object.contains_key("protocolVersion")
-            || object.contains_key("protocol_version"))
+        && (object.contains_key("name") || object.contains_key("description"))
+}
+
+fn rewrite_agent_card_response(
+    value: &mut Value,
+    public_base: &str,
+    endpoint_path: &str,
+    agent_card_path: &str,
+) -> bool {
+    if looks_like_agent_card(value) {
+        return rewrite_agent_card_urls(value, public_base, endpoint_path, agent_card_path);
+    }
+    let Some(result) = value.get_mut("result") else {
+        return false;
+    };
+    if !looks_like_agent_card(result) {
+        return false;
+    }
+    rewrite_agent_card_urls(result, public_base, endpoint_path, agent_card_path)
 }
 
 fn rewrite_agent_card_urls(

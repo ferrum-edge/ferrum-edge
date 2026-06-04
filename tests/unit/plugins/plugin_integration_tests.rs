@@ -390,7 +390,7 @@ async fn test_plugin_creation_all_plugins() {
                 "endpoint": {
                     "path": "/a2a",
                     "agent_card_path": "/.well-known/agent-card.json",
-                    "grpc_services": ["a2a.v1.A2AService"]
+                    "grpc_services": ["lf.a2a.v1.A2AService"]
                 }
             }),
             "ai_semantic_firewall" => json!({

@@ -3981,7 +3981,7 @@ config:
     path: /a2a
     agent_card_path: /.well-known/agent-card.json
     protocol_versions: ["0.3.0"]
-    grpc_services: ["a2a.v1.A2AService"]
+    grpc_services: ["lf.a2a.v1.A2AService"]
   detection:
     bindings: [jsonrpc, rest, grpc]
     version_header: A2A-Version
@@ -4003,7 +4003,7 @@ config:
         action: deny
 ```
 
-JSON-RPC detection parses `POST endpoint.path` requests with JSON content and recognizes standard A2A methods such as `message/send`, `message/stream`, `tasks/get`, `tasks/list`, `tasks/cancel`, `tasks/resubscribe`, push-notification config methods, and Agent Card methods. When a JSON-RPC request exceeds `detection.max_request_body_size`, the plugin fails closed if `policy.default_action: deny` or any per-method deny rule is configured; otherwise it skips detection for observability-only deployments. REST detection matches standard A2A paths under `endpoint.path`, such as `/a2a/v1/message:send`, `/a2a/v1/message:stream`, `/a2a/v1/tasks/{id}`, `/a2a/v1/tasks/{id}:cancel`, `/a2a/v1/tasks/{id}:subscribe`, `/a2a/v1/tasks`, `/a2a/v1/card`, `/a2a/v1/extendedAgentCard`, plus the configured Agent Card discovery suffix. gRPC detection matches configured services such as `a2a.v1.A2AService` and maps RPC names (`SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`, `TaskSubscription`/`SubscribeToTask`, push-notification config RPCs, `GetAgentCard`) to canonical A2A method names.
+JSON-RPC detection parses `POST endpoint.path` requests with JSON content and recognizes current PascalCase A2A methods such as `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, push-notification config methods, and Agent Card methods. Legacy slash-style method names such as `message/send` are also accepted and normalized to canonical `a2a.method` values for policy and metadata. When a JSON-RPC request exceeds `detection.max_request_body_size`, the plugin fails closed if `policy.default_action: deny` or any per-method deny rule is configured; otherwise it skips detection for observability-only deployments. REST detection matches standard A2A paths under `endpoint.path`, such as `/a2a/message:send`, `/a2a/message:stream`, `/a2a/tasks/{id}`, `/a2a/tasks/{id}:cancel`, `/a2a/tasks/{id}:subscribe`, `/a2a/tasks`, `/a2a/extendedAgentCard`, optional tenant-prefixed forms such as `/a2a/{tenant}/message:send`, the legacy `/a2a/v1/...` form, plus the configured Agent Card discovery suffix. gRPC detection matches configured services such as `lf.a2a.v1.A2AService` and maps RPC names (`SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`, `TaskSubscription`/`SubscribeToTask`, push-notification config RPCs, `GetExtendedAgentCard`) to canonical A2A method names.
 
 Agent Card rewriting applies to buffered HTTP JSON Agent Card responses for detected Agent Card requests. It rewrites JSON-RPC endpoint URLs to the public gateway base and `endpoint.path`, preserves advertised `GRPC`, `HTTP+JSON`, and `REST` interface URLs, and removes existing `signatures` because rewritten fields invalidate card signatures. If `discovery.public_base_url` is omitted, the plugin uses `X-Forwarded-Proto`, `X-Forwarded-Host`, and `Host` only when `trust_forwarded_headers` is explicitly enabled, accepting only `http`/`https` schemes and host-only forwarded values. Configure `discovery.public_base_url` when the gateway is not behind a trusted forwarder. gRPC Agent Card payload rewriting is not implemented in V1 because that would require protobuf response decoding and re-encoding.
 

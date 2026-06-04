@@ -1552,7 +1552,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
             "endpoint": {
                 "path": "/a2a",
                 "agent_card_path": "/.well-known/agent-card.json",
-                "grpc_services": ["a2a.v1.A2AService"]
+                "grpc_services": ["lf.a2a.v1.A2AService"]
             }
         }),
         "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),

@@ -13354,7 +13354,7 @@ components:
               minItems: 1
               items:
                 type: string
-              default: ["a2a.v1.A2AService"]
+              default: ["lf.a2a.v1.A2AService"]
               description: Fully-qualified gRPC service names recognized as A2A services. V1 observes and gates these methods without decoding protobuf payloads.
         detection:
           type: object
