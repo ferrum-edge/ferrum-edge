@@ -12001,79 +12001,106 @@ async fn handle_proxy_request_inner(
             response,
             reqwest_backend_guard,
         } => {
-            let cl = response_headers
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok());
-            // Build the base body from the shared protocol-agnostic builders
-            // first, THEN optionally wrap it in latency tracking via
-            // `into_tracked`. This guarantees the tracked path inherits the
-            // same coalescing / size-limit / fast-path behaviour as the
-            // default streaming path — we have one source of truth for body
-            // construction across the H1/H2-via-reqwest hot paths.
-            //
-            // Fast path: skip coalescing when no plugins need body buffering,
-            // no size limits apply, and response buffer cutoff is disabled.
-            // This eliminates per-frame BytesMut buffering and branch overhead.
-            let base = if state.response_buffer_cutoff_bytes == 0
-                && state.max_response_body_size_bytes == 0
-            {
-                crate::proxy::body::direct_streaming_body(response, cl)
-            } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
-                // No Content-Length — enforce size limit while streaming instead
-                // of buffering the entire body into memory.
-                crate::proxy::body::size_limited_streaming_body(
+            // Windowed streaming inspection (e.g. ai_semantic_firewall `inspect`
+            // mode): if a plugin returns an inspector for this event-stream
+            // response, run the async inspection in a detached task feeding a
+            // passthrough channel body — the poll/async bridge for the poll-based
+            // H1/H2 body. The backend guards move into the task so connection
+            // accounting tracks the real streaming lifetime; a policy cut ends
+            // the body cleanly (EOF, not an error). Gated once per response.
+            let response_inspector = if plugins.iter().any(|p| p.requires_response_stream_hooks()) {
+                let content_type = response_headers.get("content-type").map(String::as_str);
+                plugins
+                    .iter()
+                    .find_map(|p| p.response_stream_inspector(&ctx, content_type))
+            } else {
+                None
+            };
+            if let Some(inspector) = response_inspector {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                tokio::spawn(crate::proxy::body::run_response_inspection(
                     response,
-                    state.max_response_body_size_bytes,
-                    cl,
-                )
+                    inspector,
+                    tx,
+                    reqwest_backend_guard,
+                    lb_connection_guard,
+                ));
+                crate::proxy::body::inspected_streaming_body(rx)
             } else {
-                crate::proxy::body::coalescing_body(response, cl)
-            };
-            let base = if let Some(guard) = reqwest_backend_guard {
-                base.with_reqwest_backend_guard(guard)
-            } else {
-                base
-            };
-            let base = base.with_lb_connection_guard(lb_connection_guard);
+                let cl = response_headers
+                    .get("content-length")
+                    .and_then(|v| v.parse::<u64>().ok());
+                // Build the base body from the shared protocol-agnostic builders
+                // first, THEN optionally wrap it in latency tracking via
+                // `into_tracked`. This guarantees the tracked path inherits the
+                // same coalescing / size-limit / fast-path behaviour as the
+                // default streaming path — we have one source of truth for body
+                // construction across the H1/H2-via-reqwest hot paths.
+                //
+                // Fast path: skip coalescing when no plugins need body buffering,
+                // no size limits apply, and response buffer cutoff is disabled.
+                // This eliminates per-frame BytesMut buffering and branch overhead.
+                let base = if state.response_buffer_cutoff_bytes == 0
+                    && state.max_response_body_size_bytes == 0
+                {
+                    crate::proxy::body::direct_streaming_body(response, cl)
+                } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
+                    // No Content-Length — enforce size limit while streaming instead
+                    // of buffering the entire body into memory.
+                    crate::proxy::body::size_limited_streaming_body(
+                        response,
+                        state.max_response_body_size_bytes,
+                        cl,
+                    )
+                } else {
+                    crate::proxy::body::coalescing_body(response, cl)
+                };
+                let base = if let Some(guard) = reqwest_backend_guard {
+                    base.with_reqwest_backend_guard(guard)
+                } else {
+                    base
+                };
+                let base = base.with_lb_connection_guard(lb_connection_guard);
 
-            if state.env_config.enable_streaming_latency_tracking {
-                let (tracked_body, metrics) = base.into_tracked(backend_start);
+                if state.env_config.enable_streaming_latency_tracking {
+                    let (tracked_body, metrics) = base.into_tracked(backend_start);
 
-                // Spawn a lightweight deferred task to log the final streaming latency.
-                // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
-                // Skipped when read timeout is disabled (0) — no meaningful deadline to check.
-                if proxy.backend_read_timeout_ms > 0 {
-                    let deferred_proxy_id = proxy.id.clone();
-                    let deferred_backend_url = strip_query_params(&backend_url).to_string();
-                    let read_timeout_ms = proxy.backend_read_timeout_ms;
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            read_timeout_ms + 5_000,
-                        ))
-                        .await;
-                        let completed = metrics.completed();
-                        let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
-                        if completed {
-                            debug!(
-                                proxy_id = %deferred_proxy_id,
-                                backend_url = %deferred_backend_url,
-                                backend_total_ms = total_ms,
-                                "Streaming response completed"
-                            );
-                        } else {
-                            warn!(
-                                proxy_id = %deferred_proxy_id,
-                                backend_url = %deferred_backend_url,
-                                backend_last_frame_ms = total_ms,
-                                "Streaming response incomplete (client disconnect or timeout)"
-                            );
-                        }
-                    });
+                    // Spawn a lightweight deferred task to log the final streaming latency.
+                    // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
+                    // Skipped when read timeout is disabled (0) — no meaningful deadline to check.
+                    if proxy.backend_read_timeout_ms > 0 {
+                        let deferred_proxy_id = proxy.id.clone();
+                        let deferred_backend_url = strip_query_params(&backend_url).to_string();
+                        let read_timeout_ms = proxy.backend_read_timeout_ms;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                read_timeout_ms + 5_000,
+                            ))
+                            .await;
+                            let completed = metrics.completed();
+                            let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
+                            if completed {
+                                debug!(
+                                    proxy_id = %deferred_proxy_id,
+                                    backend_url = %deferred_backend_url,
+                                    backend_total_ms = total_ms,
+                                    "Streaming response completed"
+                                );
+                            } else {
+                                warn!(
+                                    proxy_id = %deferred_proxy_id,
+                                    backend_url = %deferred_backend_url,
+                                    backend_last_frame_ms = total_ms,
+                                    "Streaming response incomplete (client disconnect or timeout)"
+                                );
+                            }
+                        });
+                    }
+
+                    tracked_body
+                } else {
+                    base
                 }
-
-                tracked_body
-            } else {
-                base
             }
         }
         ResponseBody::StreamingH2(resp) => {

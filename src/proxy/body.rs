@@ -1522,6 +1522,88 @@ pub(crate) fn coalescing_h2_body(
     ProxyBody::streaming(Box::pin(coalescing))
 }
 
+/// Build a streaming response body fed by [`run_response_inspection`] over an
+/// mpsc channel.
+///
+/// The inspection task drives a plugin's per-chunk [`ResponseStreamInspector`]
+/// and sends the bytes to release; this body passes them through to the client
+/// unmodified — **no coalescing**, because the inspector already releases
+/// coherent windows and `inspect` mode exists to preserve low-latency streaming
+/// (re-coalescing would batch windows and defeat that). It is the poll/async
+/// bridge for H1/H2: the async inspection runs in a detached task while this
+/// poll-based body just drains the channel.
+pub(crate) fn inspected_streaming_body(
+    rx: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, BoxError>>,
+) -> ProxyBody {
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = DirectStreamBody {
+        inner: stream,
+        content_length: None,
+    };
+    ProxyBody::streaming(Box::pin(body))
+}
+
+/// Drive a streaming-response [`crate::plugins::ResponseStreamInspector`] over a
+/// reqwest backend response, forwarding released bytes to `tx` (which backs an
+/// [`inspected_streaming_body`]).
+///
+/// Spawned as a detached task so async inspection (which may call the embedding
+/// provider) runs independently of the poll-based downstream body. Owns the
+/// backend connection guards, so they release exactly when streaming ends —
+/// backend EOF, a policy `Terminate`, a backend error, or the client dropping
+/// the receiver (`tx.send` then fails and the task returns, dropping the backend
+/// stream). A policy cut ends the body cleanly (EOF), not as an error.
+pub(crate) async fn run_response_inspection(
+    response: reqwest::Response,
+    mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
+    tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, BoxError>>,
+    _reqwest_backend_guard: Option<crate::runtime_metrics::ReqwestBackendRequestGuard>,
+    _lb_connection_guard: super::LoadBalancerConnectionGuard,
+) {
+    use crate::plugins::ResponseStreamAction;
+    use futures_util::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => match inspector.on_chunk(&bytes).await {
+                ResponseStreamAction::Forward(out) => {
+                    if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
+                        return; // client dropped the receiver
+                    }
+                }
+                ResponseStreamAction::Terminate(final_bytes) => {
+                    if let Some(fb) = final_bytes
+                        && !fb.is_empty()
+                    {
+                        let _ = tx.send(Ok(Frame::data(fb))).await;
+                    }
+                    return; // drop tx → downstream EOF; drop stream → cancel backend
+                }
+            },
+            Err(e) => {
+                let _ = tx.send(Err(Box::new(e) as BoxError)).await;
+                return;
+            }
+        }
+    }
+    // Backend stream ended cleanly: flush / inspect the trailing partial window.
+    match inspector.on_end().await {
+        ResponseStreamAction::Forward(out) => {
+            if !out.is_empty() {
+                let _ = tx.send(Ok(Frame::data(out))).await;
+            }
+        }
+        ResponseStreamAction::Terminate(final_bytes) => {
+            if let Some(fb) = final_bytes
+                && !fb.is_empty()
+            {
+                let _ = tx.send(Ok(Frame::data(fb))).await;
+            }
+        }
+    }
+}
+
 pub(crate) fn size_limited_streaming_h2_body(
     body: Incoming,
     max_bytes: usize,
