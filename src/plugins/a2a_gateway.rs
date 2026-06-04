@@ -20,6 +20,19 @@ const DEFAULT_VERSION_HEADER: &str = "A2A-Version";
 const DEFAULT_MAX_DETECTION_BODY_BYTES: u64 = 1024 * 1024;
 const DEFAULT_GRPC_SERVICE: &str = "lf.a2a.v1.A2AService";
 
+/// Response headers that describe the backend's original body and become stale
+/// the moment the Agent Card body is re-serialized. Dropped case-insensitively
+/// when the plugin rewrites the card so clients never revalidate or integrity-
+/// check the rewritten body against the backend's original representation.
+const BODY_COUPLED_RESPONSE_HEADERS: &[&str] = &[
+    "content-length",
+    "etag",
+    "last-modified",
+    "content-digest",
+    "digest",
+    "content-md5",
+];
+
 const JSONRPC_METHODS: &[&str] = &[
     "message/send",
     "message/stream",
@@ -604,8 +617,9 @@ impl Plugin for A2aGateway {
         }
         let mut headers = response_headers.clone();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        headers.remove("content-length");
-        headers.remove("Content-Length");
+        for header in BODY_COUPLED_RESPONSE_HEADERS {
+            remove_header(&mut headers, header);
+        }
         PluginResult::Reject {
             status_code: response_status,
             body: value.to_string(),
@@ -1065,7 +1079,7 @@ fn extract_task_id_from_response(binding: Option<&str>, value: &Value) -> Option
     ];
     let rest_id_paths: &[&[&str]] = &[&["taskId"], &["task_id"], &["id"]];
     string_at_any_path(value, common_id_paths)
-        .or_else(|| (binding == Some("rest")).then(|| string_at_any_path(value, rest_id_paths))?)
+        .or_else(|| rest_only(binding, || string_at_any_path(value, rest_id_paths)))
         .or_else(|| {
             task_name_at_any_path(
                 value,
@@ -1076,9 +1090,7 @@ fn extract_task_id_from_response(binding: Option<&str>, value: &Value) -> Option
                 ],
             )
         })
-        .or_else(|| {
-            (binding == Some("rest")).then(|| task_name_at_any_path(value, &[&["name"]]))?
-        })
+        .or_else(|| rest_only(binding, || task_name_at_any_path(value, &[&["name"]])))
 }
 
 fn extract_context_id_from_response(binding: Option<&str>, value: &Value) -> Option<String> {
@@ -1092,7 +1104,15 @@ fn extract_context_id_from_response(binding: Option<&str>, value: &Value) -> Opt
     ];
     let rest_paths: &[&[&str]] = &[&["contextId"], &["context_id"]];
     string_at_any_path(value, common_paths)
-        .or_else(|| (binding == Some("rest")).then(|| string_at_any_path(value, rest_paths))?)
+        .or_else(|| rest_only(binding, || string_at_any_path(value, rest_paths)))
+}
+
+/// Evaluate `lookup` only when the detected binding is REST, flattening the
+/// guard so callers stay in `Option<String>` rather than `Option<Option<_>>`.
+/// REST responses lack the JSON-RPC `result` envelope, so a handful of id/name
+/// fields are read from the top level for that binding alone.
+fn rest_only(binding: Option<&str>, lookup: impl FnOnce() -> Option<String>) -> Option<String> {
+    (binding == Some("rest")).then(lookup).flatten()
 }
 
 fn string_at_any_path(value: &Value, paths: &[&[&str]]) -> Option<String> {

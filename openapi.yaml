@@ -13403,10 +13403,11 @@ components:
             emit_metadata:
               type: boolean
               default: true
+              description: Emit a2a.* request and response metadata for downstream logging, tracing, authz, and chargeback plugins. When true (default), detected non-streaming A2A HTTP responses are buffered so response metadata (a2a.task_id, a2a.context_id, a2a.task_state, a2a.error) can be extracted; SSE and gRPC responses are never buffered. The buffer is bounded by the global FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES limit, not max_payload_size. Set false together with discovery.rewrite_agent_card_urls=false to keep responses fully streaming; request detection and method policy still apply.
             log_payloads:
               type: boolean
               default: false
-              description: Copies bounded A2A response payloads into metadata. Payloads can contain secrets or PII and are copied verbatim into a2a.payload.response rather than field-redacted; enable only for protected logging paths. Request payloads are not logged.
+              description: Copies bounded A2A response payloads into metadata. Payloads can contain secrets or PII and are copied verbatim into a2a.payload.response rather than field-redacted; enable only for protected logging paths. Request payloads are not logged. Requires emit_metadata=true, because payload capture writes the a2a.payload.response metadata key; with emit_metadata=false this option has no effect.
             max_payload_size:
               type: integer
               format: uint64
@@ -13421,6 +13422,16 @@ components:
               default: allow
             methods:
               type: object
+              description: >-
+                Per-method policy overrides. Keys must be a canonical A2A method name —
+                message/send, message/stream, tasks/get, tasks/list, tasks/cancel,
+                tasks/resubscribe, tasks/pushNotificationConfig/set,
+                tasks/pushNotificationConfig/get, tasks/pushNotificationConfig/list,
+                tasks/pushNotificationConfig/delete, agent/getCard,
+                agent/getExtendedAgentCard, agent/getAuthenticatedExtendedCard — or the
+                literal "unknown". PascalCase gRPC/REST aliases such as SendMessage or
+                GetTask are accepted and normalized to these canonical names.
+                Unrecognized keys are rejected at config validation.
               additionalProperties:
                 type: object
                 required: [action]

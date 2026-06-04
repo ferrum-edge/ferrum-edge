@@ -464,6 +464,145 @@ async fn response_host_is_not_used_for_agent_card_public_rewrite() {
 }
 
 #[tokio::test]
+async fn trusted_forwarded_origin_rewrites_agent_card_url() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "trust_forwarded_headers": true
+        }
+    }));
+    let (mut ctx, mut request_headers) =
+        rest_ctx("GET", "/agents/planner/.well-known/agent-card.json");
+    ctx.headers
+        .insert("x-forwarded-proto".to_string(), "https".to_string());
+    ctx.headers.insert(
+        "x-forwarded-host".to_string(),
+        "gateway.example.com".to_string(),
+    );
+
+    let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let body = json!({
+        "protocolVersion": "0.3.0",
+        "name": "planner",
+        "url": "https://planner.internal/a2a"
+    })
+    .to_string();
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .await;
+    let PluginResult::Reject { body, .. } = result else {
+        panic!("trusted forwarded origin should rewrite the agent card");
+    };
+    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    assert_eq!(body["url"], "https://gateway.example.com/a2a");
+}
+
+#[tokio::test]
+async fn trusted_host_header_rewrites_agent_card_url_without_forwarded_host() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "trust_forwarded_headers": true
+        }
+    }));
+    let (mut ctx, mut request_headers) =
+        rest_ctx("GET", "/agents/planner/.well-known/agent-card.json");
+    ctx.headers
+        .insert("x-forwarded-proto".to_string(), "https".to_string());
+    ctx.headers
+        .insert("host".to_string(), "gateway.example.com".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let body = json!({
+        "protocolVersion": "0.3.0",
+        "name": "planner",
+        "url": "https://planner.internal/a2a"
+    })
+    .to_string();
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .await;
+    let PluginResult::Reject { body, .. } = result else {
+        panic!("trusted host header should rewrite the agent card");
+    };
+    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    assert_eq!(body["url"], "https://gateway.example.com/a2a");
+}
+
+#[tokio::test]
+async fn agent_card_rewrite_strips_stale_body_coupled_headers() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let (mut ctx, mut request_headers) =
+        rest_ctx("GET", "/agents/planner/.well-known/agent-card.json");
+
+    let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    // Mixed-case header names exercise the case-insensitive strip.
+    let response_headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("Content-Length".to_string(), "128".to_string()),
+        ("ETag".to_string(), "\"abc123\"".to_string()),
+        (
+            "Last-Modified".to_string(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_string(),
+        ),
+        (
+            "Content-Digest".to_string(),
+            "sha-256=:deadbeef:".to_string(),
+        ),
+        ("Cache-Control".to_string(), "max-age=300".to_string()),
+    ]);
+    let body = json!({
+        "protocolVersion": "0.3.0",
+        "name": "planner",
+        "url": "https://planner.internal/a2a"
+    })
+    .to_string();
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .await;
+    let PluginResult::Reject { headers, body, .. } = result else {
+        panic!("agent card rewrite should replace response body");
+    };
+    let rewritten: Value = serde_json::from_str(&body).expect("body should be JSON");
+    assert_eq!(rewritten["url"], "https://gateway.example.com/a2a");
+
+    // Validators and integrity digests describe the backend body and no longer
+    // match the re-serialized card, so they must be dropped on rewrite.
+    for stale in ["content-length", "etag", "last-modified", "content-digest"] {
+        assert!(
+            !headers.keys().any(|key| key.eq_ignore_ascii_case(stale)),
+            "expected {stale} to be stripped after rewrite, got {headers:?}"
+        );
+    }
+    // Headers unrelated to the body are preserved, and content-type is normalized.
+    assert!(
+        headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("cache-control"))
+    );
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+}
+
+#[tokio::test]
 async fn oversized_jsonrpc_body_fails_closed_when_policy_can_deny() {
     let plugin = plugin(json!({
         "detection": {
