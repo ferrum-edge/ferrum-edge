@@ -424,6 +424,28 @@ fn find_element_by_wsu_id_rejects_prefixed_id_bound_to_non_wsu_namespace() {
 }
 
 #[test]
+fn find_element_by_wsu_id_rejects_prefix_after_namespace_scope_ends() {
+    let xml = r#"
+        <soap:Body>
+            <Scoped xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+                <Signed u:Id="A">signed body bytes</Signed>
+            </Scoped>
+            <Target u:Id="B">unbound prefixed id</Target>
+        </soap:Body>
+    "#;
+
+    assert!(
+        soap_find_element_by_wsu_id_for_test(xml, "B").is_none(),
+        "WSU prefixes must not remain resolvable after their namespace scope closes"
+    );
+    let resolved = soap_find_element_by_wsu_id_for_test(xml, "A")
+        .expect("WSU-bound id inside namespace scope should resolve");
+
+    assert!(resolved.starts_with("<Signed"));
+    assert!(resolved.contains("signed body bytes"));
+}
+
+#[test]
 fn test_valid_username_token_config() {
     let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
     assert_eq!(plugin.name(), "soap_ws_security");
