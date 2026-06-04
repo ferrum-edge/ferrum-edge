@@ -12640,12 +12640,12 @@ components:
               format: uint
               minimum: 1
               default: 4096
-              description: Hard cap on held (un-released) raw bytes; forces a window even mid-sentence, bounding added latency and held memory.
+              description: Hard cap on held (un-released) raw bytes; forces a window even mid-sentence and bounds the un-terminated carry, bounding added latency and held memory. A single SSE event larger than this is treated as uninspectable (fails closed under on_error=reject, forwarded under warn/allow).
             overlap_bytes:
               type: integer
               format: uint
               default: 256
-              description: Bytes of already-cleared text re-inspected with the next window so a violation phrase split across a boundary is still caught.
+              description: Bytes of already-cleared text re-inspected with the next window so a violation phrase split across a boundary is still caught. Also the amount of reassembled prose retained after a clean release, so memory stays bounded to roughly one window plus this overlap.
             max_inspections:
               type: integer
               format: uint
@@ -12656,12 +12656,12 @@ components:
               type: string
               enum: [cut_with_error_event, cut_silent]
               default: cut_with_error_event
-              description: Whether a cut emits an OpenAI-compatible terminal SSE error event or ends the stream silently.
+              description: Whether a cut emits an OpenAI-compatible terminal SSE error event or ends the stream silently. Applies to enforcement=block only (detect never cuts).
             enforcement:
               type: string
-              enum: [block]
+              enum: [block, detect]
               default: block
-              description: Only block (hold each window until it passes, then release) is supported; detect (release-then-detect) is not yet available.
+              description: block holds each window until it passes inspection, then releases it (or cuts the stream on a violation) — no un-inspected bytes reach the client, at the cost of windowing latency. detect is release-then-detect — bytes stream through immediately and a violation is only logged (to the structured log, never the client or metrics), never cut; use it to observe what would be blocked without affecting traffic.
         provider:
           type: object
           required: [type, endpoint]
