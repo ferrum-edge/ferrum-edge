@@ -840,13 +840,11 @@ pub(crate) fn should_stream_response_body(
 /// configured, since a retry may need to replay the response body and a
 /// non-final attempt must stay buffered.
 ///
-/// The decision keys off the *backend's* response `Content-Type`. An
-/// `after_proxy` plugin can still rewrite `content-type` afterward; if it
-/// relabels a non-inspectable type as an inspectable one after a downgrade, the
-/// WAF body scan (which runs only on buffered responses) is skipped. This is an
-/// accepted, narrow trade-off: a fully consistent decision would require
-/// deferring buffer/stream selection until after `after_proxy`, and
-/// body-transforming plugins (which force buffering) are unaffected.
+/// If any plugin can mutate the response `Content-Type` in a later
+/// `after_proxy` hook, the helper keeps the original buffered decision. That
+/// preserves response-body inspection for the final client-visible headers
+/// rather than trusting a backend header value that may be relabeled before
+/// `on_final_response_body` runs.
 pub(crate) fn refine_stream_response_for_content_type(
     stream_response: bool,
     proxy: &Proxy,
@@ -864,6 +862,12 @@ pub(crate) fn refine_stream_response_for_content_type(
     let Some(ctx) = ctx else {
         return false;
     };
+    if plugins
+        .iter()
+        .any(|plugin| plugin.may_modify_response_content_type(ctx))
+    {
+        return false;
+    }
     let content_type = response_headers.get("content-type").map(String::as_str);
     // Keep buffering only while at least one plugin still needs the body for
     // this content-type; otherwise stream it straight through.
@@ -17794,6 +17798,62 @@ mod tests {
             &proxy,
             &plugins,
             Some(&ctx),
+            &binary_headers,
+        ));
+
+        // If a later `after_proxy` hook can relabel Content-Type, keep the
+        // body buffered so WAF-like final-body inspection sees the final
+        // client-visible headers instead of being bypassed by an early
+        // backend-header downgrade.
+        let relabel_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(ContentTypeBufferPlugin {
+                buffer_content_type: "application/json",
+            }),
+            Arc::new(
+                crate::plugins::response_transformer::ResponseTransformer::new(&json!({
+                    "rules": [{
+                        "operation": "update",
+                        "target": "header",
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    }]
+                }))
+                .expect("response transformer config should be valid"),
+            ),
+        ];
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &relabel_plugins,
+            Some(&ctx),
+            &binary_headers,
+        ));
+
+        let mut route_ctx = ctx.clone();
+        route_ctx.route_override_response_transform = Some(Arc::new(vec![
+            crate::plugins::utils::route_header_transform::RouteHeaderTransformRule {
+                operation:
+                    crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Update,
+                key: "content-type".to_string(),
+                value: Some("application/json".to_string()),
+            },
+        ]));
+        let route_relabel_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(ContentTypeBufferPlugin {
+                buffer_content_type: "application/json",
+            }),
+            Arc::new(
+                crate::plugins::response_transformer::ResponseTransformer::new(&json!({
+                    "apply_route_overrides": true
+                }))
+                .expect("route override response transformer config should be valid"),
+            ),
+        ];
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &route_relabel_plugins,
+            Some(&route_ctx),
             &binary_headers,
         ));
 

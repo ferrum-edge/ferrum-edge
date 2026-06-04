@@ -1926,6 +1926,18 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
+    /// Returns `true` when this plugin may change the response `Content-Type`
+    /// in `after_proxy` for the current request.
+    ///
+    /// The proxy uses this as a safety gate before content-type-aware
+    /// buffer-to-stream downgrades. If a later `after_proxy` hook can relabel a
+    /// response from a non-inspectable type to an inspectable one, body
+    /// inspection plugins must keep the buffered path selected by the
+    /// pre-flight decision.
+    fn may_modify_response_content_type(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin should also run its `after_proxy`
     /// header decoration logic for gateway-generated rejection responses.
     ///
