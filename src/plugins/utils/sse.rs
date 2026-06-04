@@ -217,7 +217,7 @@ pub struct SseText {
     pub text: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ToolCallAccumulator {
     name: String,
     arguments: String,
@@ -237,7 +237,7 @@ struct ToolCallAccumulator {
 ///
 /// Insertion order is preserved across all accumulators so the output is
 /// deterministic.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SseReassembler {
     /// `choice_index -> assistant content`.
     content: Vec<(usize, String)>,
@@ -269,6 +269,59 @@ impl SseReassembler {
             combined.push_str(text);
         }
         combined
+    }
+
+    /// Byte length of [`assistant_content`](Self::assistant_content) without
+    /// allocating the joined string. Streamed `inspect` mode queries this per
+    /// event to track window/release offsets, so building the full string each
+    /// time would be O(n²) in the completion length.
+    pub fn assistant_content_len(&self) -> usize {
+        let content: usize = self.content.iter().map(|(_, t)| t.len()).sum();
+        let responses: usize = self.responses_text.iter().map(|(_, t)| t.len()).sum();
+        content + responses
+    }
+
+    /// Reassembled fragments as of now, **without** consuming the accumulator —
+    /// the streamed `inspect` path inspects the current window repeatedly as the
+    /// stream grows, so it cannot move the strings out the way
+    /// [`into_texts`](Self::into_texts) does for the one-shot buffered path.
+    pub fn texts(&self) -> Vec<SseText> {
+        self.clone().into_texts()
+    }
+
+    /// Drop the first `prefix_len` bytes of the logical
+    /// [`assistant_content`](Self::assistant_content) (chat-completion content
+    /// across choices, then Responses-API output text), keeping the tail.
+    ///
+    /// Streamed `inspect` mode calls this after releasing an inspected-clean
+    /// window so retained prose stays bounded to roughly one window plus the
+    /// re-inspection overlap, rather than growing with the whole completion.
+    /// Tool-call accumulators are intentionally left intact — they are bounded
+    /// by the size of the function-call payloads, not the prose length, and have
+    /// no linear release offset. `prefix_len` is snapped down to a char boundary
+    /// per entry, so a value landing mid-character simply retains a few extra
+    /// bytes (always safe — never drops un-inspected content).
+    pub fn drain_assistant_prefix(&mut self, prefix_len: usize) {
+        let mut remaining = prefix_len;
+        let drain_one = |text: &mut String, remaining: &mut usize| {
+            if *remaining == 0 {
+                return;
+            }
+            if *remaining >= text.len() {
+                *remaining -= text.len();
+                text.clear();
+            } else {
+                let cut = floor_char_boundary(text, *remaining);
+                text.drain(..cut);
+                *remaining = 0;
+            }
+        };
+        for (_choice, text) in &mut self.content {
+            drain_one(text, &mut remaining);
+        }
+        for (_key, text) in &mut self.responses_text {
+            drain_one(text, &mut remaining);
+        }
     }
 
     /// Accumulate one already-parsed SSE `data:` frame.
@@ -652,6 +705,45 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
             r.push_frame(&frame);
         }
         assert_eq!(r.assistant_content(), "Hello world.");
+        // The no-alloc length tracks the joined string exactly.
+        assert_eq!(r.assistant_content_len(), "Hello world.".len());
+        // `texts()` is non-consuming and equals the consuming `into_texts()`.
+        assert_eq!(r.texts(), r.clone().into_texts());
+    }
+
+    #[test]
+    fn drain_assistant_prefix_keeps_tail_and_snaps_boundaries() {
+        let mut r = SseReassembler::new();
+        for frame in parse_sse_data_frames(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello world.\"}}]}\n\n",
+        ) {
+            r.push_frame(&frame);
+        }
+        // Drop the first sentence, keep the tail.
+        r.drain_assistant_prefix("Hello ".len());
+        assert_eq!(r.assistant_content(), "world.");
+        assert_eq!(r.assistant_content_len(), "world.".len());
+
+        // A prefix landing mid-multibyte-char snaps down (retains a few extra
+        // bytes) rather than panicking or dropping a partial char.
+        let mut m = SseReassembler::new();
+        for frame in parse_sse_data_frames(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"aé\"}}]}\n\n".as_bytes(),
+        ) {
+            m.push_frame(&frame);
+        }
+        m.drain_assistant_prefix(2); // index 2 is mid-'é' → floors to 1
+        assert_eq!(m.assistant_content(), "é");
+
+        // Tool-call accumulators are NOT drained by a prose-prefix drain.
+        let mut t = SseReassembler::new();
+        for frame in parse_sse_data_frames(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"exec\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        ) {
+            t.push_frame(&frame);
+        }
+        t.drain_assistant_prefix(100);
+        assert!(t.texts().iter().any(|x| x.text == "exec"));
     }
 
     #[test]
