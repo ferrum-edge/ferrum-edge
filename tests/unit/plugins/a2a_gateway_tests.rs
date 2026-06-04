@@ -555,6 +555,7 @@ async fn agent_card_rewrite_strips_stale_body_coupled_headers() {
     let response_headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
         ("Content-Length".to_string(), "128".to_string()),
+        ("Content-Encoding".to_string(), "gzip".to_string()),
         ("ETag".to_string(), "\"abc123\"".to_string()),
         (
             "Last-Modified".to_string(),
@@ -582,9 +583,16 @@ async fn agent_card_rewrite_strips_stale_body_coupled_headers() {
     let rewritten: Value = serde_json::from_str(&body).expect("body should be JSON");
     assert_eq!(rewritten["url"], "https://gateway.example.com/a2a");
 
-    // Validators and integrity digests describe the backend body and no longer
-    // match the re-serialized card, so they must be dropped on rewrite.
-    for stale in ["content-length", "etag", "last-modified", "content-digest"] {
+    // Validators, integrity digests, and the content encoding describe the
+    // backend body and no longer match the re-serialized (uncompressed) card,
+    // so they must be dropped on rewrite.
+    for stale in [
+        "content-length",
+        "content-encoding",
+        "etag",
+        "last-modified",
+        "content-digest",
+    ] {
         assert!(
             !headers.keys().any(|key| key.eq_ignore_ascii_case(stale)),
             "expected {stale} to be stripped after rewrite, got {headers:?}"
@@ -906,6 +914,34 @@ async fn grpc_get_agent_card_maps_to_authenticated_card() {
         "policy": {
             "methods": {
                 "agent/getAuthenticatedExtendedCard": {"action": "deny"}
+            }
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetAgentCard", "application/grpc");
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("agent/getAuthenticatedExtendedCard")
+    );
+}
+
+#[tokio::test]
+async fn grpc_get_agent_card_denied_via_pascalcase_policy_alias() {
+    // The PascalCase `GetAgentCard` policy key must normalize to the same method
+    // the gRPC binding detects (agent/getAuthenticatedExtendedCard); otherwise a
+    // `GetAgentCard: deny` rule silently fails to block the gRPC card RPC.
+    let plugin = plugin(json!({
+        "policy": {
+            "methods": {
+                "GetAgentCard": {"action": "deny"}
             }
         }
     }));

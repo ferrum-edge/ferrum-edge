@@ -21,11 +21,13 @@ const DEFAULT_MAX_DETECTION_BODY_BYTES: u64 = 1024 * 1024;
 const DEFAULT_GRPC_SERVICE: &str = "lf.a2a.v1.A2AService";
 
 /// Response headers that describe the backend's original body and become stale
-/// the moment the Agent Card body is re-serialized. Dropped case-insensitively
-/// when the plugin rewrites the card so clients never revalidate or integrity-
-/// check the rewritten body against the backend's original representation.
+/// the moment the Agent Card body is re-serialized as uncompressed JSON. Dropped
+/// case-insensitively when the plugin rewrites the card so clients never
+/// revalidate, integrity-check, or content-decode the rewritten body against the
+/// backend's original representation.
 const BODY_COUPLED_RESPONSE_HEADERS: &[&str] = &[
     "content-length",
+    "content-encoding",
     "etag",
     "last-modified",
     "content-digest",
@@ -971,7 +973,9 @@ fn is_simple_path_id(value: &str) -> bool {
 fn grpc_operation(method: &str) -> Option<(&'static str, bool)> {
     match method {
         "SetTaskPushNotificationConfig" => Some(("tasks/pushNotificationConfig/set", false)),
-        "GetAgentCard" => Some(("agent/getAuthenticatedExtendedCard", false)),
+        // GetAgentCard resolves through canonical_a2a_method() below so gRPC
+        // detection and policy-key normalization share one mapping and cannot
+        // drift (the gRPC card RPC is the authenticated extended card).
         _ => canonical_a2a_method(method).map(|method| (method, is_streaming_method(method))),
     }
 }
@@ -1022,7 +1026,10 @@ fn canonical_a2a_method(method: &str) -> Option<&'static str> {
         "DeleteTaskPushNotificationConfig" | "DeleteTaskPushNotification" => {
             Some("tasks/pushNotificationConfig/delete")
         }
-        "GetAgentCard" => Some("agent/getCard"),
+        // The gRPC/PascalCase `GetAgentCard` RPC is the authenticated extended
+        // card; keep this aligned with `grpc_operation()` so a `GetAgentCard`
+        // policy key targets the same method the gRPC binding detects.
+        "GetAgentCard" => Some("agent/getAuthenticatedExtendedCard"),
         "GetExtendedAgentCard" => Some("agent/getExtendedAgentCard"),
         "GetAuthenticatedExtendedCard" => Some("agent/getAuthenticatedExtendedCard"),
         _ => None,
