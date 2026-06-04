@@ -1288,6 +1288,24 @@ pub enum ResponseStreamAction {
     Terminate(Option<bytes::Bytes>),
 }
 
+/// A stateful, per-response inspector for a streaming (non-buffered) response
+/// body, created by [`Plugin::response_stream_inspector`]. It **owns** its
+/// window / accumulator state, so the same type works both inside the async H3
+/// streaming loop and inside the detached task that drives the poll-based H1/H2
+/// channel body (which cannot borrow the request `ctx`). The proxy drives it
+/// chunk-by-chunk and relays the returned [`ResponseStreamAction`] bytes.
+#[async_trait]
+pub trait ResponseStreamInspector: Send {
+    /// Inspect the next decoded chunk of the response body.
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction;
+
+    /// Flush / inspect the trailing partial window at end of stream. The default
+    /// forwards nothing.
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(bytes::Bytes::new())
+    }
+}
+
 /// Mirror response metadata from the `request_mirror` plugin's spawned task.
 ///
 /// Communicated via `tokio::sync::watch` channel from the spawned mirror task
@@ -2291,29 +2309,23 @@ pub trait Plugin: Send + Sync {
         false
     }
 
-    /// Called for each decoded chunk of a streaming response body, when at least
-    /// one plugin on the proxy opts in via [`Self::requires_response_stream_hooks`]
-    /// and the response is eligible. Generalizes [`Self::on_ws_frame`] to HTTP
-    /// response streams.
+    /// Create a stateful [`ResponseStreamInspector`] for a streaming (non-buffered)
+    /// response body, or `None` to stream it through unchanged. Called once per
+    /// eligible response when at least one plugin on the proxy opts in via
+    /// [`Self::requires_response_stream_hooks`]; the plugin decides applicability
+    /// from `ctx` and the response `content_type` (e.g. only `text/event-stream`).
     ///
-    /// Return [`ResponseStreamAction::Forward`] to release bytes downstream now
-    /// (an empty `Bytes` holds/accumulates), or [`ResponseStreamAction::Terminate`]
-    /// to end the stream after optional final bytes. The plugin owns all window
-    /// / accumulator state (keyed off `ctx`); the proxy only relays the returned
-    /// bytes and must not reinterpret them.
-    async fn on_response_stream_chunk(
+    /// Returning an inspector is how a plugin generalizes the [`Self::on_ws_frame`]
+    /// model to HTTP response streams: the proxy then drives the inspector
+    /// chunk-by-chunk. The inspector **owns** its window/accumulator state, so it
+    /// works both inside the async H3 loop and inside the detached task that
+    /// drives the poll-based H1/H2 channel body (which cannot borrow `ctx`).
+    fn response_stream_inspector(
         &self,
-        _ctx: &mut RequestContext,
-        chunk: &[u8],
-    ) -> ResponseStreamAction {
-        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
-    }
-
-    /// Called once after the final chunk of a streaming response body (backend
-    /// finished, or the stream ended) for plugins that opted in, so a plugin can
-    /// flush/inspect a trailing partial window. The default forwards nothing.
-    async fn on_response_stream_end(&self, _ctx: &mut RequestContext) -> ResponseStreamAction {
-        ResponseStreamAction::Forward(bytes::Bytes::new())
+        _ctx: &RequestContext,
+        _content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        None
     }
 
     /// Returns `true` if this plugin needs per-datagram UDP inspection.

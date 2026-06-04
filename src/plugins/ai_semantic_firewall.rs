@@ -6,6 +6,7 @@
 //! intent, indirect prompt injection, tool abuse, and business-topic policy.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -16,8 +17,15 @@ use tokio::sync::OnceCell;
 use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
-use super::utils::sse::{SseReassembler, SseText, SseTextKind, parse_sse_data_frames_checked};
-use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::utils::sse::{
+    SseReassembler, SseText, SseTextKind, encode_sse_error_event, floor_char_boundary,
+    last_paragraph_boundary, last_sentence_boundary, parse_sse_data_frames,
+    parse_sse_data_frames_checked,
+};
+use super::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
+    ResponseStreamAction, ResponseStreamInspector,
+};
 
 const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
     "$.messages[*].content",
@@ -192,6 +200,12 @@ enum StreamingResponsePolicy {
     /// time-to-first-byte; an oversized stream fails closed via
     /// `max_response_body_size_bytes`.
     Buffer,
+    /// Inspect the streamed response **progressively in windows**: reassemble to
+    /// a sentence/paragraph (or byte-cap) boundary, inspect that window, release
+    /// it if clean, and cut the stream mid-flight on a violation. Preserves
+    /// streaming UX (low time-to-first-byte) at the cost of windowed granularity
+    /// plus a per-window inspection. Configured by the `streaming` block.
+    Inspect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,6 +426,9 @@ pub struct AiSemanticFirewall {
     streaming_response: StreamingResponsePolicy,
     has_request_rules: bool,
     has_response_rules: bool,
+    /// Windowed-inspection config, `Some` only when `streaming_response: inspect`.
+    /// Drives the per-response [`StreamInspector`].
+    streaming_config: Option<StreamingInspectConfig>,
     engine: Arc<FirewallEngine>,
 }
 
@@ -453,11 +470,24 @@ impl AiSemanticFirewall {
             "skip" => StreamingResponsePolicy::Skip,
             "reject" => StreamingResponsePolicy::Reject,
             "buffer" => StreamingResponsePolicy::Buffer,
+            "inspect" => StreamingResponsePolicy::Inspect,
             other => {
                 return Err(format!(
-                    "ai_semantic_firewall: 'streaming_response' must be one of 'skip', 'reject', or 'buffer', got {other:?}"
+                    "ai_semantic_firewall: 'streaming_response' must be one of 'skip', 'reject', 'buffer', or 'inspect', got {other:?}"
                 ));
             }
+        };
+
+        let streaming_config = if streaming_response == StreamingResponsePolicy::Inspect {
+            Some(parse_streaming_inspect_config(config)?)
+        } else {
+            if config.get("streaming").is_some() {
+                return Err(
+                    "ai_semantic_firewall: 'streaming' block is only valid when 'streaming_response' is 'inspect'"
+                        .to_string(),
+                );
+            }
+            None
         };
 
         let default_action = match optional_string(config, "default_action")?.unwrap_or("reject") {
@@ -524,6 +554,7 @@ impl AiSemanticFirewall {
                 streaming_response,
                 has_request_rules: false,
                 has_response_rules: false,
+                streaming_config,
                 engine: Arc::new(FirewallEngine {
                     enabled,
                     mode,
@@ -605,6 +636,7 @@ impl AiSemanticFirewall {
             streaming_response,
             has_request_rules,
             has_response_rules,
+            streaming_config,
             engine: Arc::new(FirewallEngine {
                 enabled,
                 mode,
@@ -1403,51 +1435,61 @@ impl Plugin for AiSemanticFirewall {
         };
 
         if json.get("stream").and_then(Value::as_bool) == Some(true) {
-            // `buffer` mode forces the streamed response onto the buffered path so
-            // its SSE deltas can be reassembled and inspected. It must NOT set
-            // `ai_request_streaming` — that shared flag suppresses response-body
-            // buffering (`should_buffer_response_body`), which is exactly what we
-            // want to keep enabled here.
-            let buffer_streamed_response = self.streaming_response
-                == StreamingResponsePolicy::Buffer
-                && self.inspect_response
-                && self.has_response_rules;
-
-            if buffer_streamed_response {
-                ctx.metadata.insert(
-                    RESPONSE_INSPECTION_KEY.to_string(),
-                    STREAMING_BUFFERED_MARKER.to_string(),
-                );
-            } else {
-                ctx.metadata
-                    .insert("ai_request_streaming".to_string(), "true".to_string());
-                if self.inspect_response && self.has_response_rules {
-                    if self.streaming_response == StreamingResponsePolicy::Reject
-                        && self.engine.mode == EnforcementMode::Enforce
-                    {
-                        // Fail closed: a client must not be able to disable response
-                        // inspection just by requesting a stream. Record the reject
-                        // for audit and require a non-streaming (bufferable) retry.
-                        ctx.metadata.insert(
-                            "ai_semantic_firewall.response_inspection_skipped".to_string(),
-                            "streaming_rejected".to_string(),
-                        );
-                        return PluginResult::Reject {
-                            status_code: 400,
-                            body: rejection_body(
-                                "ai_semantic_firewall_streaming_rejected",
-                                "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; retry with \"stream\": false.",
-                                None,
-                            ),
-                            headers: json_headers(),
-                        };
-                    }
-                    // Skip (or reject in dry-run): the streamed response is not
-                    // inspected; record the skip so operators can audit the gap.
+            let response_inspectable = self.inspect_response && self.has_response_rules;
+            match self.streaming_response {
+                // `buffer`: force the streamed response onto the buffered path so
+                // its deltas can be reassembled. Do NOT set `ai_request_streaming`
+                // — that shared flag suppresses response buffering, which buffer
+                // mode needs enabled.
+                StreamingResponsePolicy::Buffer if response_inspectable => {
+                    ctx.metadata.insert(
+                        RESPONSE_INSPECTION_KEY.to_string(),
+                        STREAMING_BUFFERED_MARKER.to_string(),
+                    );
+                }
+                // `inspect`: keep streaming (set `ai_request_streaming` so the
+                // response is NOT buffered) and let the per-chunk windowed
+                // inspector run on the response path. Audit marker only.
+                StreamingResponsePolicy::Inspect if response_inspectable => {
+                    ctx.metadata
+                        .insert("ai_request_streaming".to_string(), "true".to_string());
+                    ctx.metadata.insert(
+                        RESPONSE_INSPECTION_KEY.to_string(),
+                        "streaming_windowed".to_string(),
+                    );
+                }
+                // `reject` (enforce): fail closed so a client cannot disable response
+                // inspection by requesting a stream; require a non-streaming retry.
+                StreamingResponsePolicy::Reject
+                    if response_inspectable && self.engine.mode == EnforcementMode::Enforce =>
+                {
+                    ctx.metadata
+                        .insert("ai_request_streaming".to_string(), "true".to_string());
                     ctx.metadata.insert(
                         "ai_semantic_firewall.response_inspection_skipped".to_string(),
-                        "streaming".to_string(),
+                        "streaming_rejected".to_string(),
                     );
+                    return PluginResult::Reject {
+                        status_code: 400,
+                        body: rejection_body(
+                            "ai_semantic_firewall_streaming_rejected",
+                            "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; retry with \"stream\": false.",
+                            None,
+                        ),
+                        headers: json_headers(),
+                    };
+                }
+                // `skip` (default), `reject` in dry-run, or no response rules: the
+                // streamed response is not inspected. Record the skip for audit.
+                _ => {
+                    ctx.metadata
+                        .insert("ai_request_streaming".to_string(), "true".to_string());
+                    if response_inspectable {
+                        ctx.metadata.insert(
+                            "ai_semantic_firewall.response_inspection_skipped".to_string(),
+                            "streaming".to_string(),
+                        );
+                    }
                 }
             }
         }
@@ -1534,6 +1576,33 @@ impl Plugin for AiSemanticFirewall {
         }
 
         is_json_content_type(content_type)
+    }
+
+    fn requires_response_stream_hooks(&self) -> bool {
+        // Only `inspect` mode drives the per-chunk streaming hook; `streaming_config`
+        // is `Some` exactly for that mode. Zero cost for every other config.
+        self.enabled && self.streaming_config.is_some() && self.has_response_rules
+    }
+
+    fn response_stream_inspector(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        if !self.enabled || !self.has_response_rules {
+            return None;
+        }
+        let config = self.streaming_config?;
+        // Only event streams are windowed; a non-stream (JSON) response under
+        // `inspect` mode is buffered and handled by `on_response_body`.
+        if !content_type.is_some_and(is_event_stream_content_type) {
+            return None;
+        }
+        Some(Box::new(StreamInspector::new(
+            Arc::clone(&self.engine),
+            config,
+            Arc::clone(&ctx.plugin_http_call_ns),
+        )))
     }
 
     async fn on_response_body(
@@ -2279,6 +2348,405 @@ fn reassemble_sse_response_segments(
 /// extraction in [`reassemble_sse_response_segments`]).
 fn is_sse_delta_response_path(path: &str) -> bool {
     SSE_DELTA_RESPONSE_PATHS.contains(&path)
+}
+
+/// Where streamed `inspect` mode places window boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamWindowKind {
+    Sentence,
+    Paragraph,
+    Bytes,
+}
+
+/// Tunables for streamed `inspect` mode (the `streaming:` config block).
+#[derive(Debug, Clone, Copy)]
+struct StreamingInspectConfig {
+    window: StreamWindowKind,
+    /// Hard cap on held (un-released) raw bytes — forces a window even mid-sentence,
+    /// bounding both added latency and held memory.
+    max_window_bytes: usize,
+    /// Bytes of already-cleared text re-inspected with the next window so a
+    /// violation phrase split across a boundary is still caught.
+    overlap_bytes: usize,
+    /// Safety cap on provider inspections per response.
+    max_inspections: u32,
+    /// Emit an OpenAI-compatible terminal error event on a cut (vs. a silent end).
+    cut_with_error_event: bool,
+}
+
+/// A complete SSE event held pending release: its raw bytes and the reassembled
+/// assistant-content length after it. The content length lets [`StreamWindowEngine`]
+/// release frame-aligned raw bytes only up to an inspected-clean boundary.
+struct HeldEvent {
+    raw: Vec<u8>,
+    content_len_after: usize,
+}
+
+/// Pure state machine for windowed streamed inspection.
+///
+/// Accumulates raw SSE bytes and the reassembled assistant text in parallel.
+/// [`ingest`](Self::ingest) reassembles complete events and returns a window of
+/// text to inspect when a sentence/paragraph boundary (or the byte cap) is
+/// crossed — with a rolling overlap so a violation split across a boundary is
+/// caught. After a clean verdict the caller takes the released raw bytes via
+/// [`release`](Self::release); on a violation it calls [`discard_pending`](Self::discard_pending).
+///
+/// Block-mode contract: raw bytes are held until the text they produced has been
+/// inspected and cleared, so no un-inspected bytes reach the client. Async
+/// inspection lives in the caller; this type is sync and unit-testable.
+struct StreamWindowEngine {
+    config: StreamingInspectConfig,
+    reassembler: SseReassembler,
+    /// Raw bytes received but not yet split into a complete SSE event.
+    carry: Vec<u8>,
+    /// Complete, reassembled events not yet released — oldest first.
+    held: Vec<HeldEvent>,
+    /// Assistant-content length already inspected-clean and released.
+    cleared_len: usize,
+    /// Content offset the emitted-but-unverified window will clear to.
+    pending_clears_to: Option<usize>,
+}
+
+impl StreamWindowEngine {
+    fn new(config: StreamingInspectConfig) -> Self {
+        Self {
+            config,
+            reassembler: SseReassembler::new(),
+            carry: Vec::new(),
+            held: Vec::new(),
+            cleared_len: 0,
+            pending_clears_to: None,
+        }
+    }
+
+    /// Append a raw chunk, reassembling any complete SSE events. Returns the
+    /// window text to inspect when a boundary or the byte cap is reached, else
+    /// `None` (hold). Sets the pending release point.
+    fn ingest(&mut self, chunk: &[u8]) -> Option<String> {
+        self.carry.extend_from_slice(chunk);
+        while let Some(end) = next_event_end(&self.carry) {
+            let raw: Vec<u8> = self.carry.drain(..end).collect();
+            for frame in parse_sse_data_frames(&raw) {
+                self.reassembler.push_frame(&frame);
+            }
+            let content_len_after = self.reassembler.assistant_content().len();
+            self.held.push(HeldEvent {
+                raw,
+                content_len_after,
+            });
+        }
+        self.window_ready(false)
+    }
+
+    /// Flush at end of stream: parse any trailing partial event and emit a final
+    /// window covering all remaining content (boundary or not).
+    fn finish(&mut self) -> Option<String> {
+        if !self.carry.is_empty() {
+            let raw = std::mem::take(&mut self.carry);
+            for frame in parse_sse_data_frames(&raw) {
+                self.reassembler.push_frame(&frame);
+            }
+            let content_len_after = self.reassembler.assistant_content().len();
+            self.held.push(HeldEvent {
+                raw,
+                content_len_after,
+            });
+        }
+        self.window_ready(true)
+    }
+
+    fn window_ready(&mut self, at_end: bool) -> Option<String> {
+        let content = self.reassembler.assistant_content();
+        let held_raw: usize = self.held.iter().map(|e| e.raw.len()).sum();
+        let new_content = content.len() > self.cleared_len;
+
+        let clears_to = if at_end {
+            if !new_content && self.held.is_empty() {
+                return None;
+            }
+            content.len()
+        } else if new_content {
+            let new = &content[self.cleared_len..];
+            let boundary = match self.config.window {
+                StreamWindowKind::Sentence => last_sentence_boundary(new),
+                StreamWindowKind::Paragraph => last_paragraph_boundary(new),
+                StreamWindowKind::Bytes => None,
+            };
+            match boundary {
+                Some(b) => self.cleared_len + b,
+                None if held_raw >= self.config.max_window_bytes => content.len(),
+                None => return None,
+            }
+        } else if held_raw >= self.config.max_window_bytes && !self.held.is_empty() {
+            // Non-content events (role-only deltas) piling past the cap: flush.
+            content.len()
+        } else {
+            return None;
+        };
+
+        self.pending_clears_to = Some(clears_to);
+        let start = floor_char_boundary(
+            &content,
+            self.cleared_len.saturating_sub(self.config.overlap_bytes),
+        );
+        Some(content[start..clears_to].to_string())
+    }
+
+    /// Take the raw bytes of the cleared window after a clean verdict: the
+    /// complete events whose content falls within the cleared boundary.
+    fn release(&mut self) -> Vec<u8> {
+        let Some(clears_to) = self.pending_clears_to.take() else {
+            return Vec::new();
+        };
+        self.cleared_len = clears_to;
+        let mut out = Vec::new();
+        while self
+            .held
+            .first()
+            .is_some_and(|e| e.content_len_after <= clears_to)
+        {
+            out.extend_from_slice(&self.held.remove(0).raw);
+        }
+        out
+    }
+
+    /// Drop the pending window without releasing it (called on a policy cut).
+    fn discard_pending(&mut self) {
+        self.pending_clears_to = None;
+    }
+}
+
+/// Byte index just past the end of the first complete SSE event in `buf` (the
+/// first blank line — `\n\n` or `\r\n\r\n`), or `None` if no event has fully
+/// arrived yet.
+fn next_event_end(buf: &[u8]) -> Option<usize> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2);
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn streaming_str<'a>(
+    streaming: Option<&'a serde_json::Map<String, Value>>,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
+    match streaming {
+        Some(obj) => optional_string_from_object(obj, field),
+        None => Ok(None),
+    }
+}
+
+fn streaming_u64(
+    streaming: Option<&serde_json::Map<String, Value>>,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    let Some(obj) = streaming else {
+        return Ok(None);
+    };
+    let Some(value) = obj.get(field) else {
+        return Ok(None);
+    };
+    value.as_u64().map(Some).ok_or_else(|| {
+        format!("ai_semantic_firewall: streaming.{field} must be a non-negative integer")
+    })
+}
+
+/// Parse the `streaming:` block for `streaming_response: inspect`. Unsupported
+/// (planned-but-not-yet-implemented) values are rejected with a clear message
+/// rather than silently ignored, so operators are never misled.
+fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConfig, String> {
+    let streaming = optional_object(config, "streaming")?;
+
+    let window = match streaming_str(streaming, "window")?.unwrap_or("sentence") {
+        "sentence" => StreamWindowKind::Sentence,
+        "paragraph" => StreamWindowKind::Paragraph,
+        "bytes" => StreamWindowKind::Bytes,
+        "tokens" => {
+            return Err(
+                "ai_semantic_firewall: streaming.window 'tokens' is not yet supported; use 'sentence', 'paragraph', or 'bytes'"
+                    .to_string(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "ai_semantic_firewall: streaming.window must be one of 'sentence', 'paragraph', or 'bytes', got {other:?}"
+            ));
+        }
+    };
+
+    match streaming_str(streaming, "enforcement")?.unwrap_or("block") {
+        "block" => {}
+        "detect" => {
+            return Err(
+                "ai_semantic_firewall: streaming.enforcement 'detect' (release-then-detect) is not yet supported; only 'block' is available"
+                    .to_string(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "ai_semantic_firewall: streaming.enforcement must be 'block', got {other:?}"
+            ));
+        }
+    }
+
+    let cut_with_error_event = match streaming_str(streaming, "on_violation")?
+        .unwrap_or("cut_with_error_event")
+    {
+        "cut_with_error_event" => true,
+        "cut_silent" => false,
+        other => {
+            return Err(format!(
+                "ai_semantic_firewall: streaming.on_violation must be 'cut_with_error_event' or 'cut_silent', got {other:?}"
+            ));
+        }
+    };
+
+    if streaming.is_some_and(|obj| obj.contains_key("max_hold_ms")) {
+        return Err(
+            "ai_semantic_firewall: streaming.max_hold_ms is not yet supported; windows are bounded by streaming.max_window_bytes"
+                .to_string(),
+        );
+    }
+
+    let max_window_bytes = streaming_u64(streaming, "max_window_bytes")?.unwrap_or(4096);
+    if max_window_bytes == 0 {
+        return Err(
+            "ai_semantic_firewall: streaming.max_window_bytes must be greater than 0".to_string(),
+        );
+    }
+    let overlap_bytes = streaming_u64(streaming, "overlap_bytes")?.unwrap_or(256);
+    let max_inspections = streaming_u64(streaming, "max_inspections")?.unwrap_or(64);
+    if max_inspections == 0 {
+        return Err(
+            "ai_semantic_firewall: streaming.max_inspections must be greater than 0".to_string(),
+        );
+    }
+
+    Ok(StreamingInspectConfig {
+        window,
+        max_window_bytes: max_window_bytes as usize,
+        overlap_bytes: overlap_bytes as usize,
+        max_inspections: u32::try_from(max_inspections).unwrap_or(u32::MAX),
+        cut_with_error_event,
+    })
+}
+
+/// Per-response windowed inspector for `streaming_response: inspect`. Owns its
+/// window state plus a shared [`FirewallEngine`], so it runs the same rules /
+/// embedding index as the buffered paths. Created by
+/// [`AiSemanticFirewall::response_stream_inspector`] and driven chunk-by-chunk
+/// by the proxy.
+struct StreamInspector {
+    engine: Arc<FirewallEngine>,
+    config: StreamingInspectConfig,
+    window: StreamWindowEngine,
+    /// Cloned from `ctx.plugin_http_call_ns` so embedding-call time is attributed
+    /// to the request even when driven from a detached H1/H2 task.
+    plugin_http_call_ns: Arc<AtomicU64>,
+    inspections_used: u32,
+    terminated: bool,
+}
+
+impl StreamInspector {
+    fn new(
+        engine: Arc<FirewallEngine>,
+        config: StreamingInspectConfig,
+        plugin_http_call_ns: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            engine,
+            config,
+            window: StreamWindowEngine::new(config),
+            plugin_http_call_ns,
+            inspections_used: 0,
+            terminated: false,
+        }
+    }
+
+    /// Inspect a ready window's text and decide whether to release its held raw
+    /// bytes (clean) or cut the stream (violation).
+    async fn act_on_window(&mut self, window_text: String) -> ResponseStreamAction {
+        let trimmed = window_text.trim();
+        // Nothing to inspect (role-only events flushed), or the per-response
+        // inspection cap is reached: release without a provider call.
+        if trimmed.is_empty() || self.inspections_used >= self.config.max_inspections {
+            return ResponseStreamAction::Forward(Bytes::from(self.window.release()));
+        }
+        self.inspections_used += 1;
+
+        let segment = TextSegment {
+            direction: Direction::Response,
+            kind: SegmentKind::AssistantMessage,
+            role: Some("assistant".to_string()),
+            json_path: Some("$.choices[*].delta.content".to_string()),
+            text: trimmed.to_string(),
+        };
+        let outcome = self
+            .engine
+            .evaluate(
+                Direction::Response,
+                std::slice::from_ref(&segment),
+                &self.plugin_http_call_ns,
+            )
+            .await;
+
+        // Provider error mid-stream honors on_error: reject fails closed, others
+        // forward best-effort.
+        if self
+            .engine
+            .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref())
+        {
+            return if self.engine.on_error == OnErrorAction::Reject {
+                self.terminate()
+            } else {
+                ResponseStreamAction::Forward(Bytes::from(self.window.release()))
+            };
+        }
+
+        // A confirmed reject cuts the stream; dry-run never cuts.
+        if outcome.decision.action == Action::Reject && !outcome.decision.dry_run {
+            self.terminate()
+        } else {
+            ResponseStreamAction::Forward(Bytes::from(self.window.release()))
+        }
+    }
+
+    fn terminate(&mut self) -> ResponseStreamAction {
+        self.terminated = true;
+        self.window.discard_pending();
+        let final_bytes = self.config.cut_with_error_event.then(|| {
+            encode_sse_error_event(
+                "ai_semantic_firewall_response_blocked",
+                "AI response was blocked by semantic firewall policy.",
+            )
+        });
+        ResponseStreamAction::Terminate(final_bytes)
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for StreamInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        if self.terminated {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        match self.window.ingest(chunk) {
+            Some(text) => self.act_on_window(text).await,
+            None => ResponseStreamAction::Forward(Bytes::new()),
+        }
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        if self.terminated {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        match self.window.finish() {
+            Some(text) => self.act_on_window(text).await,
+            None => ResponseStreamAction::Forward(Bytes::new()),
+        }
+    }
 }
 
 /// Map a reassembled SSE fragment onto a response-direction [`TextSegment`].
@@ -3532,5 +4000,108 @@ fn optional_string_vec_in_object(
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
         Some(_) => Err(format!("ai_semantic_firewall: '{field}' must be an array")),
+    }
+}
+
+#[cfg(test)]
+mod stream_window_tests {
+    //! Pure unit tests for the streamed `inspect` window state machine. The
+    //! engine is private and not externally testable without widening the API;
+    //! the async inspector + config are covered by the external plugin tests.
+    use super::*;
+
+    fn cfg(
+        window: StreamWindowKind,
+        max_window_bytes: usize,
+        overlap_bytes: usize,
+    ) -> StreamingInspectConfig {
+        StreamingInspectConfig {
+            window,
+            max_window_bytes,
+            overlap_bytes,
+            max_inspections: 64,
+            cut_with_error_event: true,
+        }
+    }
+
+    /// Build one SSE chat-completion content-delta event (JSON-escaped).
+    fn content_event(text: &str) -> Vec<u8> {
+        let value = Value::String(text.to_string());
+        format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{value}}}}}]}}\n\n")
+            .into_bytes()
+    }
+
+    #[test]
+    fn holds_partial_sentence_then_releases_on_boundary() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        let f1 = content_event("Hello ");
+        // No terminator yet → hold (emit nothing).
+        assert!(eng.ingest(&f1).is_none());
+        let f2 = content_event("world.");
+        let window = eng.ingest(&f2).expect("window at sentence boundary");
+        assert_eq!(window, "Hello world.");
+        // A clean verdict releases the raw bytes of both held events.
+        assert_eq!(eng.release(), [f1, f2].concat());
+    }
+
+    #[test]
+    fn partial_event_without_blank_line_is_held() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        // No "\n\n" terminator → nothing reassembled, nothing released.
+        assert!(
+            eng.ingest(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi.\"}}]}")
+                .is_none()
+        );
+        assert!(eng.release().is_empty());
+    }
+
+    #[test]
+    fn byte_cap_forces_window_without_boundary() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, 8, 0));
+        let f = content_event("abcdefghij");
+        let window = eng.ingest(&f).expect("forced window at byte cap");
+        assert_eq!(window, "abcdefghij");
+        assert_eq!(eng.release(), f);
+    }
+
+    #[test]
+    fn overlap_reinspects_prior_cleared_text() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 5));
+        let f1 = content_event("First one. ");
+        assert_eq!(eng.ingest(&f1).as_deref(), Some("First one."));
+        eng.release();
+        let f2 = content_event("Second.");
+        let window = eng.ingest(&f2).expect("second window");
+        assert!(window.ends_with("Second."));
+        // Overlap pulled cleared text in, so the window is longer than the new text.
+        assert!(window.len() > "Second.".len());
+    }
+
+    #[test]
+    fn finish_flushes_trailing_partial_window() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        let f = content_event("no terminator");
+        assert!(eng.ingest(&f).is_none());
+        assert_eq!(eng.finish().as_deref(), Some("no terminator"));
+        assert_eq!(eng.release(), f);
+    }
+
+    #[test]
+    fn role_only_events_release_with_the_next_content_window() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        let role =
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n".to_vec();
+        assert!(eng.ingest(&role).is_none()); // no content yet
+        let f = content_event("Done.");
+        assert_eq!(eng.ingest(&f).as_deref(), Some("Done."));
+        // The role-only event is released alongside the content event it preceded.
+        assert_eq!(eng.release(), [role, f].concat());
+    }
+
+    #[test]
+    fn next_event_end_handles_lf_and_crlf() {
+        assert_eq!(next_event_end(b"data: x\n\nrest"), Some(9));
+        assert_eq!(next_event_end(b"data: x\r\n\r\nrest"), Some(11));
+        assert_eq!(next_event_end(b"data: x\n"), None);
     }
 }

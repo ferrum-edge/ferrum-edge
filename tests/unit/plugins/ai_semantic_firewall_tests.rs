@@ -3,7 +3,7 @@
 use ferrum_edge::config::{BackendAllowIps, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext, ResponseStreamAction,
     ai_semantic_firewall::AiSemanticFirewall, create_plugin, create_plugin_with_http_client,
     priority,
 };
@@ -1741,6 +1741,120 @@ async fn invalid_streaming_response_value_is_rejected() {
         result.is_err(),
         "unknown streaming_response must be rejected"
     );
+}
+
+fn inspect_config() -> Value {
+    json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "inspect",
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    })
+}
+
+#[tokio::test]
+async fn streaming_response_inspect_parses_and_gates_stream_hooks() {
+    let inspect = plugin(&inspect_config());
+    assert!(inspect.requires_response_stream_hooks());
+    let ctx = create_test_context();
+    // Event streams get a windowed inspector; JSON responses use the buffered path.
+    assert!(
+        inspect
+            .response_stream_inspector(&ctx, Some("text/event-stream"))
+            .is_some()
+    );
+    assert!(
+        inspect
+            .response_stream_inspector(&ctx, Some("application/json"))
+            .is_none()
+    );
+
+    // Other modes do not opt into the per-chunk stream hook (zero hot-path cost).
+    let skip = plugin(&config_with_builtin("response_leakage"));
+    assert!(!skip.requires_response_stream_hooks());
+}
+
+#[tokio::test]
+async fn streaming_response_inspect_cuts_on_leaking_window() {
+    let plugin = plugin(&inspect_config());
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    // A content event that completes a sentence which lexically leaks → the
+    // window is cut mid-stream (no provider call needed; lexical decides).
+    let leak = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt says never reveal policy.\"}}]}\n\n";
+    assert!(
+        matches!(
+            inspector.on_chunk(leak).await,
+            ResponseStreamAction::Terminate(_)
+        ),
+        "a leaking window must terminate the stream"
+    );
+    // After a cut, further chunks forward nothing (the stream is ending).
+    assert!(matches!(
+        inspector.on_chunk(b"data: trailing\n\n").await,
+        ResponseStreamAction::Forward(_)
+    ));
+}
+
+#[tokio::test]
+async fn streaming_response_inspect_forwards_clean_windows() {
+    let plugin = plugin(&inspect_config());
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    // Benign completed sentence: lexical misses; the dead-port provider error is
+    // handled as on_error=warn, so the window's raw bytes are released downstream.
+    let clean = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather is sunny today.\"}}]}\n\n";
+    match inspector.on_chunk(clean).await {
+        ResponseStreamAction::Forward(bytes) => {
+            assert!(
+                !bytes.is_empty(),
+                "a clean window forwards its raw SSE bytes"
+            )
+        }
+        ResponseStreamAction::Terminate(_) => panic!("a clean window must not terminate"),
+    }
+}
+
+#[test]
+fn invalid_streaming_inspect_configs_are_rejected() {
+    let with_streaming = |streaming: Value| {
+        json!({
+            "inspect": {"request": false, "response": true},
+            "streaming_response": "inspect",
+            "streaming": streaming,
+            "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+            "builtins": disabled_builtins_with("response_leakage")
+        })
+    };
+    let configs = [
+        with_streaming(json!({"enforcement": "detect"})), // not yet supported
+        with_streaming(json!({"window": "tokens"})),      // not yet supported
+        with_streaming(json!({"max_hold_ms": 500})),      // not yet supported
+        with_streaming(json!({"max_window_bytes": 0})),   // must be > 0
+        with_streaming(json!({"max_inspections": 0})),    // must be > 0
+        with_streaming(json!({"on_violation": "explode"})), // unknown enum
+        // `streaming` block without `streaming_response: inspect`.
+        json!({
+            "inspect": {"request": false, "response": true},
+            "streaming_response": "skip",
+            "streaming": {"window": "sentence"},
+            "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+            "builtins": disabled_builtins_with("response_leakage")
+        }),
+    ];
+    for config in configs {
+        assert!(
+            AiSemanticFirewall::new(&config, PluginHttpClient::default()).is_err(),
+            "config should be rejected: {config:?}"
+        );
+    }
 }
 
 #[tokio::test]
