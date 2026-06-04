@@ -541,7 +541,10 @@ async fn inspect_mode_buffers_and_blocks_non_sse_json_leak() {
     // Buffered + inspected → blocked with a proper status (not a truncated 200),
     // and the leak never reaches the client. Codex round-6: this is the scenario
     // where the response was previously streamed past on_response_body.
-    assert_ne!(status, 200, "a buffered JSON leak must be blocked, got 200: {body}");
+    assert_ne!(
+        status, 200,
+        "a buffered JSON leak must be blocked, got 200: {body}"
+    );
     assert!(
         body.contains("ai_semantic_firewall_response_blocked"),
         "a non-SSE JSON leak must be blocked by on_response_body, got: {body}"
