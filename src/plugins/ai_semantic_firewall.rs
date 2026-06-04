@@ -1621,7 +1621,7 @@ impl Plugin for AiSemanticFirewall {
         ctx: &RequestContext,
         content_type: Option<&str>,
     ) -> bool {
-        if !self.should_buffer_response_body(ctx) {
+        if !self.requires_response_body_buffering() || is_native_grpc_request(ctx) {
             return false;
         }
 
@@ -1635,13 +1635,27 @@ impl Plugin for AiSemanticFirewall {
             // POST (the request-path marker). Unrelated SSE — a `GET` EventSource
             // endpoint, or a backend that unexpectedly returns an unbounded
             // stream — must keep streaming; buffering it would collect until
-            // `max_response_body_size_bytes` and 502 instead. (Already-buffered
-            // bodies are still inspected in `on_response_body` regardless.)
+            // `max_response_body_size_bytes` and 502 instead. An `inspect`-marked
+            // event stream stays streaming too (the windowed inspector handles it).
+            // (Already-buffered bodies are still inspected in `on_response_body`.)
             return self.streaming_response == StreamingResponsePolicy::Buffer
                 && buffer_streaming_marker_set(ctx);
         }
 
-        is_json_content_type(content_type)
+        if is_json_content_type(content_type) {
+            // A marked `inspect` request whose backend returned JSON (not the SSE
+            // its `stream: true` implied — e.g. the backend normalized the flag)
+            // MUST be buffered and inspected via `on_response_body`. Otherwise the
+            // `ai_request_streaming` flag keeps it on the streaming path with no
+            // windowed inspector (which only attaches for event streams), so
+            // response rules would be bypassed entirely.
+            if windowed_streaming_marker_set(ctx) {
+                return true;
+            }
+            return self.should_buffer_response_body(ctx);
+        }
+
+        false
     }
 
     fn requires_response_stream_hooks(&self) -> bool {

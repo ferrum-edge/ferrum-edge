@@ -1578,11 +1578,12 @@ pub(crate) async fn run_response_inspection(
                 if max_response_body_size_bytes > 0 && total_received > max_response_body_size_bytes
                 {
                     // Operator response-size cap exceeded: stop and surface a body
-                    // error (the same outcome the non-inspected size-limited path
-                    // produces), instead of forwarding an unbounded stream.
+                    // error, instead of forwarding an unbounded stream. Use the
+                    // SAME message as the non-inspected size-limited path so
+                    // `classify_body_error` tags it `ResponseBodyTooLarge`.
                     let _ = tx
                         .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                            "response body exceeded max_response_body_size_bytes during streaming inspection",
+                            "response body exceeds maximum size",
                         ) as BoxError))
                         .await;
                     return;

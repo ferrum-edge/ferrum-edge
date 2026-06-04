@@ -2080,6 +2080,24 @@ async fn before_proxy_sets_additive_stream_markers() {
 }
 
 #[tokio::test]
+async fn inspect_mode_buffers_non_sse_response_for_inspection() {
+    // Codex round-5: a marked inspect request whose backend returns JSON (not the
+    // SSE its stream:true implied) must be BUFFERED and inspected via
+    // on_response_body — not streamed past all checks with no inspector. The SSE
+    // case keeps streaming (handled by the windowed inspector).
+    let plugin = plugin(&inspect_config());
+    let ctx = inspect_marked_ctx();
+    assert!(
+        plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")),
+        "a JSON response to a marked inspect request must be buffered for inspection"
+    );
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")),
+        "an SSE response to a marked inspect request streams (windowed), not buffered"
+    );
+}
+
+#[tokio::test]
 async fn streaming_response_inspect_cuts_on_non_delta_frame() {
     // Codex round-3: a leak placed in a NON-delta field (message.content) of a
     // valid SSE data event must still be inspected + cut, matching the buffered

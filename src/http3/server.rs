@@ -1906,7 +1906,14 @@ async fn handle_h3_request(
         .await;
     }
 
+    // A request that will be response-stream-inspected (e.g. ai_semantic_firewall
+    // `inspect`, which pre-buffers the `stream: true` request to set its marker)
+    // must dispatch through the cross-protocol/reqwest path, where the inspector
+    // is wired — the native-H3 pool's several send loops are not. Mirrors the
+    // H1/H2 frontend's `forces_reqwest_dispatch` gate; unmarked requests keep
+    // native H3.
     let use_native_h3_pool = http_flavor == HttpFlavor::Plain
+        && !plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx))
         && crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     if !use_native_h3_pool {
         let prebuffered = if needs_request_buffering {

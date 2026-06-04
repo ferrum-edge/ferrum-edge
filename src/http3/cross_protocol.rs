@@ -2495,6 +2495,7 @@ where
                         }
                         if stream.finish().await.is_err() {
                             client_disconnected = true;
+                            body_error_class = Some(ErrorClass::ClientDisconnect);
                         }
                         finished = true;
                         break;
@@ -2527,6 +2528,7 @@ where
                 }
                 if stream.finish().await.is_err() {
                     client_disconnected = true;
+                    body_error_class = Some(ErrorClass::ClientDisconnect);
                 }
                 finished = true;
                 break;
