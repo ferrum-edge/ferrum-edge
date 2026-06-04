@@ -3479,6 +3479,7 @@ paths:
                 - ai_semantic_cache
                 - ai_federation
                 - mcp_gateway
+                - a2a_gateway
                 - ws_message_size_limiting
                 - ws_frame_logging
                 - ws_rate_limiting
@@ -6020,7 +6021,7 @@ components:
             oauth2_introspection, oidc_relying_party, hmac_auth, ldap_auth,
             mtls_auth, access_control,
             tcp_connection_throttle, ip_restriction, waf, security_headers, mesh_authz, opa,
-            mesh_outbound_registry, openapi_validator, ai_semantic_firewall, mcp_gateway) are validation-fatal: invalid config blocks
+            mesh_outbound_registry, openapi_validator, ai_semantic_firewall, mcp_gateway, a2a_gateway) are validation-fatal: invalid config blocks
             gateway startup in file mode, and on DB/CP polling the new config
             snapshot is rejected as a whole (the gateway keeps serving the
             prior good config). Non-security plugins with invalid config are
@@ -13319,6 +13320,113 @@ components:
           type: boolean
           default: true
           description: Trigger fallback when the provider is unreachable (DNS/TCP/TLS failure).
+
+    A2aGatewayConfig:
+      type: object
+      description: "Plugin: a2a_gateway — transparent Agent-to-Agent protocol gateway for HTTP JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs A2A traffic. Detects standard A2A methods, optionally denies methods by gateway policy, rewrites HTTP Agent Card endpoint URLs to the gateway address, preserves SSE/gRPC streaming, and emits a2a.* metadata for existing Ferrum logging, tracing, chargeback, WAF, and alerting plugins. It does not manage A2A task state or aggregate multiple agents in V1."
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        mode:
+          type: string
+          enum: [transparent_proxy]
+          default: transparent_proxy
+        endpoint:
+          type: object
+          properties:
+            path:
+              type: string
+              default: /a2a
+              description: Public JSON-RPC A2A endpoint path.
+            agent_card_path:
+              type: string
+              default: /.well-known/agent-card.json
+              description: Public Agent Card discovery path suffix.
+            protocol_versions:
+              type: array
+              minItems: 1
+              items:
+                type: string
+              default: ["0.3.0"]
+            grpc_services:
+              type: array
+              minItems: 1
+              items:
+                type: string
+              default: ["a2a.v1.A2AService"]
+              description: Fully-qualified gRPC service names recognized as A2A services. V1 observes and gates these methods without decoding protobuf payloads.
+        detection:
+          type: object
+          properties:
+            bindings:
+              type: array
+              minItems: 1
+              items:
+                type: string
+                enum: [jsonrpc, rest, grpc]
+              default: [jsonrpc, rest, grpc]
+            version_header:
+              type: string
+              default: A2A-Version
+              description: Header used to record/accept A2A protocol version hints.
+            max_request_body_size:
+              type: integer
+              format: uint64
+              default: 1048576
+              description: Maximum JSON-RPC request body bytes parsed for A2A detection; 0 means no plugin-level detection limit.
+            allow_unknown_methods_with_version_header:
+              type: boolean
+              default: true
+              description: Treat JSON-RPC requests carrying the version header as A2A even when the method is not in the built-in standard-method table. Metadata records method as unknown to bound cardinality.
+            strip_accept_encoding:
+              type: boolean
+              default: true
+              description: Remove Accept-Encoding on non-streaming A2A HTTP requests whose responses may be parsed or rewritten by the plugin.
+        discovery:
+          type: object
+          properties:
+            rewrite_agent_card_urls:
+              type: boolean
+              default: true
+            public_base_url:
+              type: string
+              format: uri
+              description: Optional explicit public gateway origin, for example https://agents.example.com. When omitted and trust_forwarded_headers is true, X-Forwarded-* and Host are used.
+            trust_forwarded_headers:
+              type: boolean
+              default: true
+        observability:
+          type: object
+          properties:
+            emit_metadata:
+              type: boolean
+              default: true
+            log_payloads:
+              type: boolean
+              default: false
+              description: Copies bounded A2A response payloads into metadata. Payloads can contain secrets or PII; enable only for protected logging paths.
+            max_payload_size:
+              type: integer
+              format: uint64
+              default: 1048576
+              minimum: 1
+        policy:
+          type: object
+          properties:
+            default_action:
+              type: string
+              enum: [allow, deny]
+              default: allow
+            methods:
+              type: object
+              additionalProperties:
+                type: object
+                required: [action]
+                properties:
+                  action:
+                    type: string
+                    enum: [allow, deny]
 
     McpGatewayConfig:
       type: object

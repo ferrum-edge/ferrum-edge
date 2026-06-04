@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 68 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -3958,6 +3958,58 @@ config:
 **Discovery, catalogs, and locking.** Discovery catalogs are cached **per downstream session**, not gateway-wide, because an upstream MCP server may expose different tools/resources/prompts per initialized session (client identity/capabilities); a shared catalog could leak or hide entries across users. Catalog refresh is serialized per session (not globally) and upstream `initialize` is serialized per `(session, server)`, so a slow upstream throttles only the affected session/server rather than blocking discovery or initialization for unrelated clients. A consequence of per-session catalogs is that each new session performs its own upstream discovery. When two upstreams produce the same public tool/prompt/resource name after namespacing, the colliding name is skipped from discovery for **all** colliding upstreams (logged as a warning) so it can never route to the wrong upstream, while the rest of the catalog stays usable.
 
 **V1 limitation — no response-side rewriting.** The gateway rewrites request bodies public→upstream (tool/prompt names, resource URIs) but does **not** reverse-map responses. A `resources/read` response therefore echoes the upstream's native `contents[].uri` rather than the public `mcp://{server}/...` URI the client requested, and resource URIs embedded in tool-call results are not rewritten. Clients that correlate response URIs against the request must tolerate the upstream's native scheme; response-side reverse mapping is deferred to a later version.
+
+---
+
+## A2A / Agent Gateway Plugin
+
+### `a2a_gateway`
+
+Transparent Agent-to-Agent gateway for standardized A2A traffic over HTTP/HTTPS JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs. The plugin detects A2A operations, applies optional method allow/deny policy, rewrites HTTP Agent Card endpoint URLs to the Ferrum gateway, preserves SSE and gRPC streaming pass-through, and emits `a2a.*` metadata for existing Ferrum authz, logging, tracing, chargeback, and alert plugins.
+
+The plugin deliberately does not manage task state, aggregate multiple agents, or implement generic auth, rate limiting, retry, timeout, WAF, tracing, DLP, or semantic safety behavior. Use the existing Ferrum plugins for those concerns.
+
+**Priority:** 2993
+
+```yaml
+plugin_name: a2a_gateway
+scope: proxy
+config:
+  enabled: true
+  mode: transparent_proxy
+  endpoint:
+    path: /a2a
+    agent_card_path: /.well-known/agent-card.json
+    protocol_versions: ["0.3.0"]
+    grpc_services: ["a2a.v1.A2AService"]
+  detection:
+    bindings: [jsonrpc, rest, grpc]
+    version_header: A2A-Version
+    max_request_body_size: 1048576
+    allow_unknown_methods_with_version_header: true
+    strip_accept_encoding: true
+  discovery:
+    rewrite_agent_card_urls: true
+    public_base_url: https://agents.example.com
+    trust_forwarded_headers: true
+  observability:
+    emit_metadata: true
+    log_payloads: false
+    max_payload_size: 1048576
+  policy:
+    default_action: allow
+    methods:
+      tasks/pushNotificationConfig/set:
+        action: deny
+```
+
+JSON-RPC detection parses `POST endpoint.path` requests with JSON content and recognizes standard A2A methods such as `message/send`, `message/stream`, `tasks/get`, `tasks/list`, `tasks/cancel`, `tasks/resubscribe`, push-notification config methods, and Agent Card methods. REST detection matches standard A2A suffixes like `/v1/message:send`, `/v1/message:stream`, `/v1/tasks/{id}`, `/v1/tasks/{id}:cancel`, `/v1/tasks/{id}:subscribe`, `/v1/tasks`, `/v1/card`, `/v1/extendedAgentCard`, and `/.well-known/agent-card.json`, ignoring any proxy route prefix. gRPC detection matches configured services such as `a2a.v1.A2AService` and maps RPC names (`SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`, `TaskSubscription`/`SubscribeToTask`, push-notification config RPCs, `GetAgentCard`) to canonical A2A method names.
+
+Agent Card rewriting applies to buffered HTTP JSON Agent Card responses. It rewrites top-level `url` plus `additionalInterfaces`/`additional_interfaces`/`supportedInterfaces`/`supported_interfaces` URLs to the public gateway base and `endpoint.path`. If `discovery.public_base_url` is omitted, the plugin uses `X-Forwarded-Proto`, `X-Forwarded-Host`, and `Host` when `trust_forwarded_headers` is enabled. gRPC Agent Card payload rewriting is not implemented in V1 because that would require protobuf response decoding and re-encoding.
+
+Metadata keys include `a2a.enabled`, `a2a.mode`, `a2a.binding`, `a2a.method`, `a2a.protocol_version`, `a2a.streaming`, `a2a.policy_decision`, `a2a.task_id`, `a2a.context_id`, `a2a.task_state`, `a2a.error`, `a2a.response_body_size`, and `a2a.ttfb_ms` for streaming responses when headers arrive. `observability.log_payloads` is disabled by default because A2A messages and artifacts can contain secrets or PII.
+
+**V1 limitation — streaming metadata.** SSE and gRPC streaming responses pass through without buffering. The plugin marks them as streaming and records header TTFB, but it does not count SSE events or extract final task state from streaming chunks until Ferrum has a streaming response observer hook that can inspect chunks without delaying clients.
 
 ---
 

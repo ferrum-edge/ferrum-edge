@@ -3,6 +3,7 @@ mod plugin_utils;
 
 mod mesh_route_dispatch_tests;
 
+mod a2a_gateway_tests;
 mod access_control_tests;
 mod ai_federation_tests;
 mod ai_prompt_shield_tests;

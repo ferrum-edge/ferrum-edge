@@ -254,6 +254,7 @@ async fn test_all_plugins_available() {
         "__mesh_bpf_metrics",
         "ai_federation",
         "mcp_gateway",
+        "a2a_gateway",
         "api_chargeback",
         "api_chargeback_sink",
         "fault_injection",
@@ -382,6 +383,14 @@ async fn test_plugin_creation_all_plugins() {
                         "upstream_url": "http://mcp-gateway.example/mcp",
                         "namespace": "tools"
                     }
+                }
+            }),
+            "a2a_gateway" => json!({
+                "mode": "transparent_proxy",
+                "endpoint": {
+                    "path": "/a2a",
+                    "agent_card_path": "/.well-known/agent-card.json",
+                    "grpc_services": ["a2a.v1.A2AService"]
                 }
             }),
             "ai_semantic_firewall" => json!({

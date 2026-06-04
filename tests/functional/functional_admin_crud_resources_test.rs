@@ -78,6 +78,7 @@ const PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
     "ai_semantic_firewall",
     "ai_federation",
     "mcp_gateway",
+    "a2a_gateway",
     "ws_message_size_limiting",
     "ws_frame_logging",
     "ws_rate_limiting",
@@ -1544,6 +1545,14 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
                     "upstream_url": "http://mcp-gateway.example/mcp",
                     "namespace": "tools"
                 }
+            }
+        }),
+        "a2a_gateway" => json!({
+            "mode": "transparent_proxy",
+            "endpoint": {
+                "path": "/a2a",
+                "agent_card_path": "/.well-known/agent-card.json",
+                "grpc_services": ["a2a.v1.A2AService"]
             }
         }),
         "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
