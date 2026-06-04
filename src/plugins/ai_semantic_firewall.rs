@@ -3024,7 +3024,13 @@ impl StreamInspector {
                 .await;
             let provider_error = engine
                 .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref());
-            if !provider_error && outcome.decision.action == Action::Reject {
+            // Log both `reject` and `warn` hits — same action gate as block mode.
+            // A streamed `warn` cannot write the buffered-path metadata, so the log
+            // is its only audit record.
+            if !provider_error
+                && matches!(outcome.decision.action, Action::Reject | Action::Warn)
+                && !outcome.decision.matches.is_empty()
+            {
                 engine.log_stream_detection(&outcome.decision, false);
             }
         });
