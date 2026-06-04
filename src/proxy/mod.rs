@@ -11284,14 +11284,17 @@ async fn handle_proxy_request_inner(
     let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method);
     let stream_request_body = !has_retry && !requires_request_body_buffering;
     // A response-stream inspector (e.g. ai_semantic_firewall `inspect`) is wired
-    // only on the reqwest streaming path, so when one is configured the backend
-    // must be dispatched via reqwest — otherwise a native-H3 backend would return
-    // `ResponseBody::StreamingH3` and bypass inspection entirely. (Direct-H2/HBONE
-    // are already excluded for these requests because `inspect`/`buffer` force
+    // only on the reqwest streaming path, so a request that WILL be inspected must
+    // be dispatched via reqwest — otherwise a native-H3 backend would return
+    // `ResponseBody::StreamingH3` and bypass inspection. This is gated per request
+    // (a plugin returns `true` only for the specific requests it inspects, via
+    // `ctx` markers) so an inspect-mode proxy does NOT push its ordinary,
+    // never-inspected requests off the native-H3 fast path. (Direct-H2/HBONE are
+    // already excluded for these requests because `inspect`/`buffer` force
     // request-body buffering, which disables those pools; native H3 does not gate
     // on that, so it is excluded explicitly here.)
     let requires_response_stream_inspection =
-        plugins.iter().any(|p| p.requires_response_stream_hooks());
+        plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx));
     let request_client_ip = ctx.client_ip.clone();
     let retry_config = if has_retry {
         proxy.retry.as_ref()

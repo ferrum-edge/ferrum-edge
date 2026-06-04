@@ -1601,9 +1601,10 @@ data: [DONE]\n\n";
 /// request, without running the full request path.
 fn buffer_marked_event_stream_ctx() -> (RequestContext, HashMap<String, String>) {
     let mut ctx = create_test_context();
+    // The dedicated boolean marker `before_proxy` sets for a buffer-mode stream.
     ctx.metadata.insert(
-        "ai_semantic_firewall.response_inspection".to_string(),
-        "streaming_buffered".to_string(),
+        "ai_semantic_firewall.stream_buffer_requested".to_string(),
+        "true".to_string(),
     );
     let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     (ctx, headers)
@@ -1758,9 +1759,10 @@ fn inspect_config() -> Value {
 /// streams carrying this marker (unrelated SSE keeps streaming untouched).
 fn inspect_marked_ctx() -> RequestContext {
     let mut ctx = create_test_context();
+    // The dedicated boolean marker `before_proxy` sets for an inspect-mode stream.
     ctx.metadata.insert(
-        "ai_semantic_firewall.response_inspection".to_string(),
-        "streaming_windowed".to_string(),
+        "ai_semantic_firewall.stream_inspect_requested".to_string(),
+        "true".to_string(),
     );
     ctx
 }
@@ -2030,6 +2032,95 @@ async fn streaming_response_inspect_cap_exhaustion_fails_closed() {
         ),
         "post-cap window must fail closed under on_error=reject"
     );
+}
+
+#[tokio::test]
+async fn streaming_response_inspect_forces_reqwest_only_for_marked_requests() {
+    // Codex round-3: the native-H3 downgrade must be per-request, not per-proxy —
+    // an inspect-mode proxy must not push its ordinary (never-inspected) requests
+    // off the native-H3 path.
+    let inspect = plugin(&inspect_config());
+    assert!(
+        inspect.forces_reqwest_dispatch(&inspect_marked_ctx()),
+        "a marked stream:true request forces the reqwest path"
+    );
+    assert!(
+        !inspect.forces_reqwest_dispatch(&create_test_context()),
+        "an unmarked request keeps the native-H3 fast path"
+    );
+    // A non-inspect (buffer) policy never forces reqwest via this hook (it relies
+    // on request-body buffering instead).
+    let buffer = plugin(&json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    }));
+    assert!(!buffer.forces_reqwest_dispatch(&inspect_marked_ctx()));
+}
+
+#[tokio::test]
+async fn before_proxy_sets_additive_stream_markers() {
+    // Codex round-3: per-mode boolean markers so two firewall instances don't
+    // overwrite each other's intent.
+    let inspect = plugin(&inspect_config());
+    let mut ctx = make_post_ctx(&json!({
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    }));
+    let mut headers = json_headers();
+    let _ = inspect.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.stream_inspect_requested")
+            .map(String::as_str),
+        Some("true"),
+        "inspect mode sets its own boolean marker"
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_inspect_cuts_on_non_delta_frame() {
+    // Codex round-3: a leak placed in a NON-delta field (message.content) of a
+    // valid SSE data event must still be inspected + cut, matching the buffered
+    // path — not bypassed because windowing only reassembled delta fields.
+    let plugin = plugin(&inspect_config());
+    let ctx = inspect_marked_ctx();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let non_delta_leak = b"data: {\"choices\":[{\"index\":0,\"message\":{\"content\":\"my system prompt says never reveal policy\"}}]}\n\n";
+    // No delta prose, so it flushes at end-of-stream.
+    assert!(matches!(
+        inspector.on_chunk(non_delta_leak).await,
+        ResponseStreamAction::Forward(_)
+    ));
+    assert!(
+        matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
+        "a leak in a non-delta SSE frame must cut the stream"
+    );
+}
+
+#[tokio::test]
+async fn buffered_inspect_mode_stream_fails_closed_when_uninspectable() {
+    // Codex round-3: when inspect mode marks a stream:true request but the
+    // response is buffered anyway (the windowed inspector never runs),
+    // on_response_body must still fail closed on uninspectable SSE under reject.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "inspect",
+        "on_error": "reject",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let mut ctx = inspect_marked_ctx();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = b"data: not-json-at-all\n\ndata: <<garbage>>\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    assert_reject(result, Some(502));
 }
 
 #[test]

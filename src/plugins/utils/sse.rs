@@ -289,6 +289,34 @@ impl SseReassembler {
         self.clone().into_texts()
     }
 
+    /// Trim each streamed tool-call argument accumulator (and Responses-API
+    /// function-call arguments) to its last `keep_tail` bytes, dropping the
+    /// already-inspected prefix.
+    ///
+    /// Counterpart to [`drain_assistant_prefix`](Self::drain_assistant_prefix)
+    /// for the non-prose accumulators: streamed `inspect` mode inspects tool-call
+    /// arguments alongside prose, so without trimming, a large `tool_calls[].
+    /// arguments` payload would be retained (and re-inspected) in full until EOF.
+    /// The caller trims only AFTER a window inspected those bytes clean, so the
+    /// dropped prefix was already evaluated; the kept tail preserves the
+    /// re-inspection overlap. Tool-call *names* are left intact (bounded by the
+    /// function name length). `keep_tail` is snapped up to a char boundary so the
+    /// retained tail never starts mid-character.
+    pub fn truncate_streamed_tool_args(&mut self, keep_tail: usize) {
+        fn trim(text: &mut String, keep_tail: usize) {
+            if text.len() > keep_tail {
+                let drop = floor_char_boundary(text, text.len() - keep_tail);
+                text.drain(..drop);
+            }
+        }
+        for (_key, accum) in &mut self.tool_calls {
+            trim(&mut accum.arguments, keep_tail);
+        }
+        for (_output, text) in &mut self.responses_args {
+            trim(text, keep_tail);
+        }
+    }
+
     /// Drop the first `prefix_len` bytes of the logical
     /// [`assistant_content`](Self::assistant_content) (chat-completion content
     /// across choices, then Responses-API output text), keeping the tail.
@@ -744,6 +772,34 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         }
         t.drain_assistant_prefix(100);
         assert!(t.texts().iter().any(|x| x.text == "exec"));
+    }
+
+    #[test]
+    fn truncate_streamed_tool_args_bounds_arguments_keeping_tail() {
+        let mut r = SseReassembler::new();
+        // A long tool-call argument stream (well past any small keep_tail).
+        let big = "X".repeat(500);
+        let frame = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"name\":\"run\",\"arguments\":\"{big}\"}}}}]}}}}]}}\n\n"
+        );
+        for f in parse_sse_data_frames(frame.as_bytes()) {
+            r.push_frame(&f);
+        }
+        r.truncate_streamed_tool_args(64);
+        let args = r
+            .texts()
+            .into_iter()
+            .find(|t| t.kind == SseTextKind::ChatToolArguments)
+            .map(|t| t.text)
+            .unwrap_or_default();
+        assert!(
+            args.len() <= 64,
+            "args bounded to ~keep_tail, got {}",
+            args.len()
+        );
+        assert!(args.chars().all(|c| c == 'X'), "kept the argument tail");
+        // The tool NAME is never trimmed.
+        assert!(r.texts().iter().any(|t| t.text == "run"));
     }
 
     #[test]

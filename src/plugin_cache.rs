@@ -214,6 +214,9 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_response_stream_hooks(&self) -> bool {
         self.inner.requires_response_stream_hooks()
     }
+    fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
+        self.inner.forces_reqwest_dispatch(ctx)
+    }
     fn response_stream_inspector(
         &self,
         ctx: &RequestContext,

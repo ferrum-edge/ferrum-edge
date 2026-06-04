@@ -75,11 +75,17 @@ const RESPONSE_INSPECTION_KEY: &str = "ai_semantic_firewall.response_inspection"
 const STREAMING_BUFFERED_MARKER: &str = "streaming_buffered";
 
 /// Value written to [`RESPONSE_INSPECTION_KEY`] when `inspect` mode detects a
-/// `stream: true` request and intends to windowed-inspect its SSE response. The
-/// response-path inspector keys on this so only streams THIS plugin marked are
-/// inspected — an unrelated SSE endpoint (e.g. a `GET` EventSource route) keeps
-/// streaming untouched, mirroring the `buffer`-mode marker gate.
+/// `stream: true` request and intends to windowed-inspect its SSE response.
 const STREAMING_WINDOWED_MARKER: &str = "streaming_windowed";
+
+/// Dedicated boolean request markers (separate from the single-valued audit key
+/// [`RESPONSE_INSPECTION_KEY`]) so that two `ai_semantic_firewall` instances on
+/// one request — e.g. a `buffer` instance and an `inspect` instance — each
+/// record their own intent instead of overwriting a shared value, and neither
+/// instance's response handling is silently skipped. Set additively on the
+/// request path; read on the response path.
+const STREAM_BUFFER_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_buffer_requested";
+const STREAM_INSPECT_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_inspect_requested";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -1496,6 +1502,10 @@ impl Plugin for AiSemanticFirewall {
                 // — that shared flag suppresses response buffering, which buffer
                 // mode needs enabled.
                 StreamingResponsePolicy::Buffer if response_inspectable => {
+                    // Additive boolean marker (survives a second firewall instance)
+                    // plus the single-valued audit marker.
+                    ctx.metadata
+                        .insert(STREAM_BUFFER_REQUESTED_KEY.to_string(), "true".to_string());
                     ctx.metadata.insert(
                         RESPONSE_INSPECTION_KEY.to_string(),
                         STREAMING_BUFFERED_MARKER.to_string(),
@@ -1503,10 +1513,12 @@ impl Plugin for AiSemanticFirewall {
                 }
                 // `inspect`: keep streaming (set `ai_request_streaming` so the
                 // response is NOT buffered) and let the per-chunk windowed
-                // inspector run on the response path. Audit marker only.
+                // inspector run on the response path.
                 StreamingResponsePolicy::Inspect if response_inspectable => {
                     ctx.metadata
                         .insert("ai_request_streaming".to_string(), "true".to_string());
+                    ctx.metadata
+                        .insert(STREAM_INSPECT_REQUESTED_KEY.to_string(), "true".to_string());
                     ctx.metadata.insert(
                         RESPONSE_INSPECTION_KEY.to_string(),
                         STREAMING_WINDOWED_MARKER.to_string(),
@@ -1643,6 +1655,15 @@ impl Plugin for AiSemanticFirewall {
             && self.has_response_rules
     }
 
+    fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
+        // Only when THIS request was marked for windowed inspection — so an
+        // inspect-mode proxy does not push its ordinary (non-streamed, never
+        // inspected) requests off the native-H3 backend path. The windowed
+        // inspector is wired only on the reqwest streaming response path, so a
+        // marked request must dispatch via reqwest to be inspectable.
+        self.enabled && self.streaming_config.is_some() && windowed_streaming_marker_set(ctx)
+    }
+
     fn response_stream_inspector(
         &self,
         ctx: &RequestContext,
@@ -1712,7 +1733,14 @@ impl Plugin for AiSemanticFirewall {
             // treat it as an inspection failure governed by `on_error`. (Other
             // buffered SSE, e.g. pinned by a different plugin, keeps the lenient
             // path: no marker means this branch is skipped.)
-            if buffer_streaming_marker_set(ctx) && (!fully_parsed || segments.is_empty()) {
+            // Fail closed for either marker: `buffer` mode pinned this stream, OR
+            // `inspect` mode marked it but the response was buffered anyway (e.g.
+            // another response-body plugin pinned it, so the windowed inspector
+            // never ran) — both promised inspection, so uninspectable SSE must
+            // honor on_error rather than be delivered.
+            if (buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx))
+                && (!fully_parsed || segments.is_empty())
+            {
                 return self.engine.handle_uninspectable_buffered_stream(ctx);
             }
             segments
@@ -2480,6 +2508,11 @@ struct HeldEvent {
     raw_len: usize,
     content_len_after: usize,
     inspectable: bool,
+    /// Parsed JSON `data:` frames, retained so the inspector can extract
+    /// per-frame NON-delta response paths (e.g. `choices[].message.content`,
+    /// `output_text`) before this event is released — matching the buffered
+    /// path. Dropped when the event is released. Bounded by `held`.
+    frames: Vec<Value>,
 }
 
 /// Pure state machine for windowed streamed inspection.
@@ -2540,7 +2573,14 @@ impl StreamWindowEngine {
             raw_len,
             content_len_after,
             inspectable: parsed.fully_parsed,
+            frames: parsed.frames,
         });
+    }
+
+    /// The parsed JSON frames of all currently-held (un-released) events, for
+    /// per-frame non-delta extraction. Bounded by `held`.
+    fn retained_frames(&self) -> impl Iterator<Item = &Value> {
+        self.held.iter().flat_map(|e| e.frames.iter())
     }
 
     /// Append a raw chunk, reassembling any complete SSE events. Returns `true`
@@ -2664,6 +2704,12 @@ impl StreamWindowEngine {
                 }
             }
         }
+        // Bound retained tool-call arguments the same way: the window just
+        // inspected them clean, so drop all but the overlap tail. (These have no
+        // linear prose offset, so they are trimmed independently of `cleared_len`
+        // — the prose-based raw-frame release above is unaffected.)
+        self.reassembler
+            .truncate_streamed_tool_args(self.config.overlap_bytes);
         out
     }
 
@@ -2798,6 +2844,10 @@ struct StreamInspector {
     /// Cloned from `ctx.plugin_http_call_ns` so embedding-call time is attributed
     /// to the request even when driven from a detached H1/H2 task.
     plugin_http_call_ns: Arc<AtomicU64>,
+    /// Non-delta response extraction paths (e.g. `$.choices[*].message.content`,
+    /// `$.output_text`), precomputed once. `Some` only when the config enables
+    /// such paths, so the common delta-only case pays nothing per window.
+    non_delta_extraction: Option<ExtractionConfig>,
     inspections_used: u32,
     terminated: bool,
 }
@@ -2808,11 +2858,26 @@ impl StreamInspector {
         config: StreamingInspectConfig,
         plugin_http_call_ns: Arc<AtomicU64>,
     ) -> Self {
+        // Pre-split the configured response paths: delta paths are covered by the
+        // reassembler; non-delta paths need per-frame extraction (matching the
+        // buffered path's `reassemble_sse_response_segments`).
+        let non_delta_paths: Vec<String> = engine
+            .extraction
+            .response_json_paths
+            .iter()
+            .filter(|path| !is_sse_delta_response_path(path))
+            .cloned()
+            .collect();
+        let non_delta_extraction = (!non_delta_paths.is_empty()).then(|| ExtractionConfig {
+            request_json_paths: Vec::new(),
+            response_json_paths: non_delta_paths,
+        });
         Self {
             engine,
             config,
             window: StreamWindowEngine::new(config),
             plugin_http_call_ns,
+            non_delta_extraction,
             inspections_used: 0,
             terminated: false,
         }
@@ -2822,13 +2887,28 @@ impl StreamInspector {
     /// `TextSegment` kinds the buffered path uses (so chat-completion content,
     /// Responses-API text, AND tool-call names/arguments are all evaluated against
     /// the rules that apply to each kind — not just assistant prose). Restricted
-    /// to the enabled extraction paths via [`sse_text_to_segment`].
+    /// to the enabled extraction paths via [`sse_text_to_segment`]. Also extracts
+    /// per-frame NON-delta response paths from the retained frames, so a backend
+    /// cannot bypass inspection by placing content in a `message.content` /
+    /// `output_text` field of a streamed event (the buffered path inspects these).
     fn window_segments(&self) -> Vec<TextSegment> {
-        self.window
+        let mut segments: Vec<TextSegment> = self
+            .window
             .snapshot_texts()
             .into_iter()
             .filter_map(|text| sse_text_to_segment(text, &self.engine.extraction))
-            .collect()
+            .collect();
+        if let Some(non_delta_extraction) = &self.non_delta_extraction {
+            for (index, frame) in self.window.retained_frames().enumerate() {
+                extract_response_segments_from_json(
+                    frame,
+                    non_delta_extraction,
+                    Some(format!("sse[{index}]")),
+                    &mut segments,
+                );
+            }
+        }
+        segments
     }
 
     /// `block` mode: inspect the ready window and decide whether to release its
@@ -3863,18 +3943,18 @@ fn max_cosine(
 /// override a shared `ai_request_streaming` flag set by another plugin.
 fn buffer_streaming_marker_set(ctx: &RequestContext) -> bool {
     ctx.metadata
-        .get(RESPONSE_INSPECTION_KEY)
+        .get(STREAM_BUFFER_REQUESTED_KEY)
         .map(String::as_str)
-        == Some(STREAMING_BUFFERED_MARKER)
+        == Some("true")
 }
 
 /// Whether `inspect` mode flagged THIS request (a detected `stream: true` JSON
-/// POST) for windowed response inspection — see [`STREAMING_WINDOWED_MARKER`].
+/// POST) for windowed response inspection — see [`STREAM_INSPECT_REQUESTED_KEY`].
 fn windowed_streaming_marker_set(ctx: &RequestContext) -> bool {
     ctx.metadata
-        .get(RESPONSE_INSPECTION_KEY)
+        .get(STREAM_INSPECT_REQUESTED_KEY)
         .map(String::as_str)
-        == Some(STREAMING_WINDOWED_MARKER)
+        == Some("true")
 }
 
 fn is_native_grpc_request(ctx: &RequestContext) -> bool {

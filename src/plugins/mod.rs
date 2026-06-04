@@ -2399,6 +2399,17 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Returns `true` if THIS request's response must come back on the reqwest
+    /// streaming path rather than a native-H3 (or other advanced) backend
+    /// transport — e.g. because a response-stream inspector will run and is only
+    /// wired on the reqwest path. Evaluated per request just before backend
+    /// dispatch (after `before_proxy`), so a plugin can scope it to the requests
+    /// it actually inspects (via `ctx` markers) instead of forcing every request
+    /// on the proxy off the fast path. Zero overhead when `false` (default).
+    fn forces_reqwest_dispatch(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs per-datagram UDP inspection.
     /// Zero overhead when `false` (default) — the datagram forwarding path skips plugins entirely.
     fn requires_udp_datagram_hooks(&self) -> bool {
