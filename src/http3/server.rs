@@ -2452,6 +2452,13 @@ async fn handle_h3_request(
         } else {
             None
         };
+        // Capture the backend's declared length BEFORE stripping it for the
+        // client — the graceful-close recovery below still needs it to tell a
+        // complete body from a truncated one (an inspected response strips
+        // Content-Length because the inspector transforms the body).
+        let declared_content_length: Option<u64> = response_headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok());
         if response_inspector.is_some() {
             response_headers.remove("content-length");
         }
@@ -2532,8 +2539,11 @@ async fn handle_h3_request(
                                     }
                                     ResponseStreamAction::Terminate(final_bytes) => {
                                         // Policy cut: emit the optional terminal event,
-                                        // end the stream. This is a NORMAL completion
-                                        // (no backend fault, no LB/capability penalty).
+                                        // end the stream. A clean cut is a NORMAL
+                                        // completion (no backend fault, no LB/capability
+                                        // penalty) — but only if the client is still
+                                        // there; a failed send/finish is a disconnect,
+                                        // not a clean completion.
                                         if let Some(fb) = final_bytes
                                             && !fb.is_empty()
                                         {
@@ -2542,8 +2552,13 @@ async fn handle_h3_request(
                                                 bytes_streamed += fb_len;
                                             }
                                         }
-                                        let _ = stream.finish().await;
-                                        body_completed = true;
+                                        if stream.finish().await.is_ok() {
+                                            body_completed = true;
+                                        } else {
+                                            client_disconnected = true;
+                                            body_error_class =
+                                                Some(crate::retry::ErrorClass::ClientDisconnect);
+                                        }
                                         break 'outer;
                                     }
                                 }
@@ -2583,9 +2598,7 @@ async fn handle_h3_request(
                         }
                         Ok(None) => { stream_done = true; }
                         Err(e) => {
-                            let cl: Option<u64> = response_headers
-                                .get("content-length")
-                                .and_then(|v| v.parse().ok());
+                            let cl: Option<u64> = declared_content_length;
                             let received = total_streamed as u64;
                             if crate::http3::client::is_h3_graceful_close(&e)
                                 && crate::http3::client::is_response_body_complete(

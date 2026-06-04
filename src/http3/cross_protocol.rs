@@ -108,7 +108,9 @@ use tracing::{debug, error, warn};
 
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::load_balancer::LoadBalancer;
-use crate::plugins::{Plugin, PluginResult, RequestContext};
+use crate::plugins::{
+    Plugin, PluginResult, RequestContext, ResponseStreamAction, ResponseStreamInspector,
+};
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome;
 use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
@@ -1448,13 +1450,37 @@ where
         });
     }
 
-    // Send response headers, then stream the body with coalescing.
+    // Resolve a response-stream inspector (e.g. ai_semantic_firewall `inspect`)
+    // for this H3-client → non-H3-backend response. Without this, an H3 client
+    // hitting an HTTP/1/2 SSE backend would stream uninspected. Chain every
+    // opted-in plugin, gated to the response status.
+    let response_inspector = if plugins.iter().any(|p| p.requires_response_stream_hooks()) {
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        let inspectors: Vec<_> = plugins
+            .iter()
+            .filter_map(|p| p.response_stream_inspector(&*ctx, status, content_type))
+            .collect();
+        crate::plugins::chain_response_stream_inspectors(inspectors)
+    } else {
+        None
+    };
+    // Strip Content-Length when inspecting — the inspector transforms the body, so
+    // the backend's declared length no longer matches what we send.
+    if response_inspector.is_some() {
+        response_headers.remove("content-length");
+    }
+
+    // Send response headers, then stream the body.
     send_response_headers(stream, status, &response_headers).await?;
 
     let coalesce = CoalesceConfig::from_state(state);
     let max_resp_bytes = state.max_response_body_size_bytes;
     let (bytes_streamed, body_completed, client_disconnected, body_error_class) =
-        stream_reqwest_response(stream, response, coalesce, max_resp_bytes).await;
+        if let Some(inspector) = response_inspector {
+            stream_inspected_reqwest_response(stream, response, inspector, max_resp_bytes).await
+        } else {
+            stream_reqwest_response(stream, response, coalesce, max_resp_bytes).await
+        };
 
     record_backend_outcome(
         state,
@@ -2398,6 +2424,122 @@ where
     }
 
     let body_completed = body_error_class.is_none() && !client_disconnected;
+    (
+        bytes_streamed,
+        body_completed,
+        client_disconnected,
+        body_error_class,
+    )
+}
+
+/// Drive a response-stream [`ResponseStreamInspector`] over a reqwest backend
+/// response, writing released bytes to the H3 client stream. The cross-protocol
+/// (H3 client → HTTP/1/2 backend) counterpart of the native-H3 inspected loop and
+/// the H1/H2 [`crate::proxy::body::run_response_inspection`].
+///
+/// No coalescing — the inspector already releases coherent windows. A policy
+/// `Terminate` ends the stream cleanly (the optional terminal SSE event, then
+/// FIN); `body_completed` is gated on a successful finish, so a client that has
+/// already disconnected is recorded as a disconnect, not a clean completion.
+/// Returns `(bytes_streamed, body_completed, client_disconnected, body_error_class)`.
+async fn stream_inspected_reqwest_response<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    mut response: reqwest::Response,
+    mut inspector: Box<dyn ResponseStreamInspector>,
+    max_response_body_size_bytes: usize,
+) -> (u64, bool, bool, Option<ErrorClass>)
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let mut bytes_streamed: u64 = 0;
+    let mut total_streamed: usize = 0;
+    let mut client_disconnected = false;
+    let mut body_error_class: Option<ErrorClass> = None;
+    let mut finished = false;
+
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if max_response_body_size_bytes > 0 {
+                    total_streamed += chunk.len();
+                    if total_streamed > max_response_body_size_bytes {
+                        warn!(
+                            "Backend response exceeded {} byte limit during inspected cross-protocol H3 stream",
+                            max_response_body_size_bytes
+                        );
+                        let _ = stream.finish().await;
+                        body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+                        break;
+                    }
+                }
+                match inspector.on_chunk(&chunk).await {
+                    ResponseStreamAction::Forward(out) => {
+                        if !out.is_empty() {
+                            let out_len = out.len() as u64;
+                            if stream.send_data(out).await.is_err() {
+                                client_disconnected = true;
+                                body_error_class = Some(ErrorClass::ClientDisconnect);
+                                break;
+                            }
+                            bytes_streamed += out_len;
+                        }
+                    }
+                    ResponseStreamAction::Terminate(final_bytes) => {
+                        if let Some(fb) = final_bytes
+                            && !fb.is_empty()
+                        {
+                            let fb_len = fb.len() as u64;
+                            if stream.send_data(fb).await.is_ok() {
+                                bytes_streamed += fb_len;
+                            }
+                        }
+                        if stream.finish().await.is_err() {
+                            client_disconnected = true;
+                        }
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            Ok(None) => {
+                match inspector.on_end().await {
+                    ResponseStreamAction::Forward(out) => {
+                        if !out.is_empty() {
+                            let out_len = out.len() as u64;
+                            if stream.send_data(out).await.is_err() {
+                                client_disconnected = true;
+                                body_error_class = Some(ErrorClass::ClientDisconnect);
+                                break;
+                            }
+                            bytes_streamed += out_len;
+                        }
+                    }
+                    ResponseStreamAction::Terminate(final_bytes) => {
+                        if let Some(fb) = final_bytes
+                            && !fb.is_empty()
+                        {
+                            let fb_len = fb.len() as u64;
+                            if stream.send_data(fb).await.is_ok() {
+                                bytes_streamed += fb_len;
+                            }
+                        }
+                    }
+                }
+                if stream.finish().await.is_err() {
+                    client_disconnected = true;
+                }
+                finished = true;
+                break;
+            }
+            Err(e) => {
+                body_error_class = Some(crate::retry::classify_reqwest_error(&e));
+                let _ = stream.finish().await;
+                break;
+            }
+        }
+    }
+
+    let body_completed = finished && body_error_class.is_none() && !client_disconnected;
     (
         bytes_streamed,
         body_completed,
