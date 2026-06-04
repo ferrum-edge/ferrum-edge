@@ -1373,6 +1373,100 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
     }
 }
 
+#[cfg(test)]
+mod chained_inspector_tests {
+    //! Focused tests for [`ChainedResponseStreamInspector`]'s threading — the
+    //! struct is private, so these stay inline. The non-trivial part is `on_end`,
+    //! where one inspector's flushed bytes must pass through the next inspector's
+    //! `on_chunk` AND `on_end` before being released.
+    use super::*;
+
+    /// Passes chunks through unchanged; emits `tag` once at end-of-stream.
+    struct TagAtEnd {
+        tag: &'static str,
+    }
+    #[async_trait]
+    impl ResponseStreamInspector for TagAtEnd {
+        async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        }
+        async fn on_end(&mut self) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(self.tag.as_bytes()))
+        }
+    }
+
+    /// Cuts immediately on the first chunk.
+    struct CutNow;
+    #[async_trait]
+    impl ResponseStreamInspector for CutNow {
+        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+            ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(b"CUT")))
+        }
+    }
+
+    /// Holds everything (never releases) — Forward(empty).
+    struct HoldAll;
+    #[async_trait]
+    impl ResponseStreamInspector for HoldAll {
+        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(bytes::Bytes::new())
+        }
+    }
+
+    fn forwarded(action: ResponseStreamAction) -> bytes::Bytes {
+        match action {
+            ResponseStreamAction::Forward(b) => b,
+            ResponseStreamAction::Terminate(_) => panic!("expected Forward, got Terminate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn single_inspector_is_returned_unwrapped() {
+        let chain = chain_response_stream_inspectors(vec![Box::new(TagAtEnd { tag: "A" })]);
+        assert!(chain.is_some());
+        // len 0 -> None
+        assert!(chain_response_stream_inspectors(vec![]).is_none());
+    }
+
+    #[tokio::test]
+    async fn on_chunk_threads_through_all_and_on_end_carries() {
+        let mut chain = chain_response_stream_inspectors(vec![
+            Box::new(TagAtEnd { tag: "A" }),
+            Box::new(TagAtEnd { tag: "B" }),
+        ])
+        .expect("two inspectors chain");
+        // A chunk passes through both unchanged.
+        assert_eq!(&forwarded(chain.on_chunk(b"hi").await)[..], b"hi");
+        // on_end: A flushes "A" -> fed through B.on_chunk ("A") -> then B flushes
+        // "B"; result is "A" ++ "B".
+        assert_eq!(&forwarded(chain.on_end().await)[..], b"AB");
+    }
+
+    #[tokio::test]
+    async fn first_terminate_short_circuits() {
+        let mut chain = chain_response_stream_inspectors(vec![
+            Box::new(CutNow),
+            Box::new(TagAtEnd { tag: "B" }),
+        ])
+        .expect("chain");
+        assert!(matches!(
+            chain.on_chunk(b"x").await,
+            ResponseStreamAction::Terminate(Some(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn upstream_hold_stops_the_chain() {
+        let mut chain = chain_response_stream_inspectors(vec![
+            Box::new(HoldAll),
+            Box::new(TagAtEnd { tag: "B" }),
+        ])
+        .expect("chain");
+        // First inspector holds → nothing reaches the second this chunk.
+        assert!(forwarded(chain.on_chunk(b"x").await).is_empty());
+    }
+}
+
 /// Mirror response metadata from the `request_mirror` plugin's spawned task.
 ///
 /// Communicated via `tokio::sync::watch` channel from the spawned mirror task

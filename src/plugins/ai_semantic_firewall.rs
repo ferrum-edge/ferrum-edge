@@ -2555,6 +2555,10 @@ struct StreamWindowEngine {
     /// Whether complete events' raw bytes are retained for release (`block`) or
     /// dropped because they were already forwarded (`detect`).
     hold_raw: bool,
+    /// Whether parsed JSON frames are retained on each held event for per-frame
+    /// non-delta extraction. `false` (the inspector sets it) when no non-delta
+    /// response paths are configured, so the delta-only case stores no `Value`s.
+    store_frames: bool,
     reassembler: SseReassembler,
     /// Raw bytes received but not yet split into a complete SSE event. Bounded
     /// by `max_window_bytes` so an un-terminated event cannot grow unbounded.
@@ -2573,6 +2577,9 @@ impl StreamWindowEngine {
     fn new(config: StreamingInspectConfig) -> Self {
         Self {
             hold_raw: config.enforcement == StreamEnforcement::Block,
+            // Default to retaining frames; the inspector clears this when no
+            // non-delta extraction is configured.
+            store_frames: true,
             config,
             reassembler: SseReassembler::new(),
             carry: Vec::new(),
@@ -2596,7 +2603,11 @@ impl StreamWindowEngine {
             raw_len,
             content_len_after,
             inspectable: parsed.fully_parsed,
-            frames: parsed.frames,
+            frames: if self.store_frames {
+                parsed.frames
+            } else {
+                Vec::new()
+            },
         });
     }
 
@@ -2701,13 +2712,16 @@ impl StreamWindowEngine {
             return Vec::new();
         };
         self.cleared_len = clears_to;
-        let mut out = Vec::new();
-        while self
+        // `held` is ordered by arrival (content_len_after is monotonic), so the
+        // releasable events are a prefix — drain it once (O(n)) instead of
+        // repeated remove(0) (O(n^2) when a window releases many small events).
+        let release_count = self
             .held
-            .first()
-            .is_some_and(|e| e.content_len_after <= clears_to)
-        {
-            let ev = self.held.remove(0);
+            .iter()
+            .take_while(|e| e.content_len_after <= clears_to)
+            .count();
+        let mut out = Vec::new();
+        for ev in self.held.drain(..release_count) {
             if !ev.raw.is_empty() {
                 out.extend_from_slice(&ev.raw);
             }
@@ -2743,15 +2757,24 @@ impl StreamWindowEngine {
 }
 
 /// Byte index just past the end of the first complete SSE event in `buf` (the
-/// first blank line — `\n\n` or `\r\n\r\n`), or `None` if no event has fully
-/// arrived yet.
+/// first blank line), or `None` if no event has fully arrived yet.
+///
+/// SSE line terminators are `\n` or `\r\n` and may be mixed within one stream, so
+/// a blank line is any of `\n\n`, `\r\n\r\n`, `\n\r\n`, or `\r\n\n`. Scans for the
+/// earliest such boundary: a `\n` immediately followed by another line terminator
+/// (`\n` or `\r\n`).
 fn next_event_end(buf: &[u8]) -> Option<usize> {
-    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2);
-    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
-    match (lf, crlf) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
+    for (i, &b) in buf.iter().enumerate() {
+        if b != b'\n' {
+            continue;
+        }
+        match buf.get(i + 1) {
+            Some(b'\n') => return Some(i + 2),
+            Some(b'\r') if buf.get(i + 2) == Some(&b'\n') => return Some(i + 3),
+            _ => {}
+        }
     }
+    None
 }
 
 fn streaming_str<'a>(
@@ -2855,6 +2878,13 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
     })
 }
 
+/// Max concurrent `detect`-mode inspection round-trips per response. `detect`
+/// spawns each window's evaluation (so the stream is never blocked), so cap how
+/// many run at once — block mode serializes them via `await`, but an unbounded
+/// `detect` could otherwise fire up to `max_inspections` embedding calls at once
+/// on a fast stream.
+const DETECT_MAX_CONCURRENT_INSPECTIONS: usize = 4;
+
 /// Per-response windowed inspector for `streaming_response: inspect`. Owns its
 /// window state plus a shared [`FirewallEngine`], so it runs the same rules /
 /// embedding index as the buffered paths. Created by
@@ -2873,6 +2903,12 @@ struct StreamInspector {
     non_delta_extraction: Option<ExtractionConfig>,
     inspections_used: u32,
     terminated: bool,
+    /// Whether the one-time "forwarded uninspected" audit log has fired for this
+    /// response (so it is not repeated per window).
+    degraded_logged: bool,
+    /// Bounds concurrent `detect`-mode spawned inspections. `Some` only in detect
+    /// mode (block mode serializes via `await`, so it needs no limiter).
+    detect_concurrency: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl StreamInspector {
@@ -2895,15 +2931,44 @@ impl StreamInspector {
             request_json_paths: Vec::new(),
             response_json_paths: non_delta_paths,
         });
+        // Only retain parsed frames when they will actually be consumed (non-delta
+        // extraction); the delta-only case stores no per-event `Value`s.
+        let mut window = StreamWindowEngine::new(config);
+        window.store_frames = non_delta_extraction.is_some();
         Self {
             engine,
             config,
-            window: StreamWindowEngine::new(config),
+            window,
             plugin_http_call_ns,
             non_delta_extraction,
             inspections_used: 0,
             terminated: false,
+            degraded_logged: false,
+            detect_concurrency: (config.enforcement == StreamEnforcement::Detect).then(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    DETECT_MAX_CONCURRENT_INSPECTIONS,
+                ))
+            }),
         }
+    }
+
+    /// Emit a one-time warning that block mode forwarded a window WITHOUT
+    /// inspecting it — the only place the "no un-inspected bytes reach the client"
+    /// contract degrades to pass-through (the per-response `max_inspections` cap is
+    /// hit, or a provider error under `on_error: warn`/`allow`). Logged once per
+    /// response so operators have an audit signal for the degraded window(s).
+    fn log_forward_uninspected_once(&mut self, reason: &str) {
+        if self.degraded_logged {
+            return;
+        }
+        self.degraded_logged = true;
+        tracing::warn!(
+            target: "ai_semantic_firewall",
+            direction = "response",
+            enforcement = "block",
+            reason,
+            "streaming inspect forwarded a response window UNINSPECTED; the block-mode no-un-inspected-bytes guarantee is degraded to pass-through for the remainder of this response"
+        );
     }
 
     /// Reassembled response segments for the pending window, mapped to the same
@@ -2959,6 +3024,7 @@ impl StreamInspector {
             return if self.engine.on_error == OnErrorAction::Reject {
                 self.terminate()
             } else {
+                self.log_forward_uninspected_once("max_inspections_reached");
                 ResponseStreamAction::Forward(Bytes::from(self.window.release()))
             };
         }
@@ -2978,6 +3044,7 @@ impl StreamInspector {
             return if self.engine.on_error == OnErrorAction::Reject {
                 self.terminate()
             } else {
+                self.log_forward_uninspected_once("provider_error");
                 ResponseStreamAction::Forward(Bytes::from(self.window.release()))
             };
         }
@@ -3018,7 +3085,16 @@ impl StreamInspector {
         self.inspections_used += 1;
         let engine = Arc::clone(&self.engine);
         let plugin_http_call_ns = Arc::clone(&self.plugin_http_call_ns);
+        let concurrency = self.detect_concurrency.clone();
         tokio::spawn(async move {
+            // Cap concurrent provider round-trips per response: the permit is held
+            // until the evaluation finishes, so excess windows queue rather than
+            // firing a burst of embedding calls. The stream itself is never blocked
+            // (the bytes were already forwarded in `on_chunk`).
+            let _permit = match concurrency {
+                Some(sem) => sem.acquire_owned().await.ok(),
+                None => None,
+            };
             let outcome = engine
                 .evaluate(Direction::Response, &segments, &plugin_http_call_ns)
                 .await;
@@ -4577,5 +4653,10 @@ mod stream_window_tests {
         assert_eq!(next_event_end(b"data: x\n\nrest"), Some(9));
         assert_eq!(next_event_end(b"data: x\r\n\r\nrest"), Some(11));
         assert_eq!(next_event_end(b"data: x\n"), None);
+        // Mixed blank-line terminators (Codex round-8): \n\r\n and \r\n\n.
+        assert_eq!(next_event_end(b"data: x\n\r\nrest"), Some(10));
+        assert_eq!(next_event_end(b"data: x\r\n\nrest"), Some(10));
+        // A lone CR is not a blank-line terminator here; no false positive.
+        assert_eq!(next_event_end(b"data: x\ny\n"), None);
     }
 }
