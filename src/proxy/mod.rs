@@ -11914,6 +11914,27 @@ async fn handle_proxy_request_inner(
 
     record_request(&state, response_status);
 
+    // Streaming response inspection (e.g. ai_semantic_firewall `inspect` mode):
+    // resolve the per-response inspector BEFORE the headers are applied so we can
+    // strip Content-Length when present — the inspector transforms the body
+    // (releases windows, may cut), so the backend's length no longer matches what
+    // we send, and leaving it would make a mid-stream cut look like a truncated
+    // body to the client. Gated to streaming responses with an opted-in plugin;
+    // the common case skips it. Consumed by the `ResponseBody::Streaming` arm.
+    let response_inspector = if matches!(response_body, ResponseBody::Streaming { .. })
+        && plugins.iter().any(|p| p.requires_response_stream_hooks())
+    {
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        plugins
+            .iter()
+            .find_map(|p| p.response_stream_inspector(&ctx, content_type))
+    } else {
+        None
+    };
+    if response_inspector.is_some() {
+        response_headers.remove("content-length");
+    }
+
     // Build final response
     let mut resp_builder = Response::builder()
         .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY));
@@ -12001,21 +12022,13 @@ async fn handle_proxy_request_inner(
             response,
             reqwest_backend_guard,
         } => {
-            // Windowed streaming inspection (e.g. ai_semantic_firewall `inspect`
-            // mode): if a plugin returns an inspector for this event-stream
-            // response, run the async inspection in a detached task feeding a
-            // passthrough channel body — the poll/async bridge for the poll-based
-            // H1/H2 body. The backend guards move into the task so connection
-            // accounting tracks the real streaming lifetime; a policy cut ends
-            // the body cleanly (EOF, not an error). Gated once per response.
-            let response_inspector = if plugins.iter().any(|p| p.requires_response_stream_hooks()) {
-                let content_type = response_headers.get("content-type").map(String::as_str);
-                plugins
-                    .iter()
-                    .find_map(|p| p.response_stream_inspector(&ctx, content_type))
-            } else {
-                None
-            };
+            // `response_inspector` was resolved above (before headers were applied,
+            // so Content-Length is already stripped on the inspect path). On a hit,
+            // run the async inspection in a detached task feeding a passthrough
+            // channel body — the poll/async bridge for the poll-based H1/H2 body.
+            // The backend guards move into the task so connection accounting tracks
+            // the real streaming lifetime; a policy cut ends the body cleanly (EOF,
+            // not an error).
             if let Some(inspector) = response_inspector {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
                 tokio::spawn(crate::proxy::body::run_response_inspection(

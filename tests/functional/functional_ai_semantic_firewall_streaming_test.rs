@@ -161,6 +161,12 @@ plugin_configs:
     )
 }
 
+/// Same proxy/plugin as [`buffer_mode_config`] but `streaming_response: inspect`
+/// — progressive windowed inspection with mid-stream cut.
+fn inspect_mode_config(backend_port: u16) -> String {
+    buffer_mode_config(backend_port).replace("\"buffer\"", "\"inspect\"")
+}
+
 fn write_config(dir: &TempDir, contents: &str) -> String {
     let config_path = dir.path().join("config.yaml");
     let mut file = std::fs::File::create(&config_path).expect("create config");
@@ -267,5 +273,97 @@ async fn buffer_mode_delivers_clean_streaming_response() {
     assert!(
         body.contains("is sunny today."),
         "delivered body should contain the reassembled completion, got: {body}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn inspect_mode_cuts_leaking_stream_midflight() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let config_path = write_config(&temp_dir, &inspect_mode_config(backend_port));
+
+    let backend = tokio::spawn(start_sse_backend_on(backend_listener, LEAKING_SSE));
+    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/ai/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    // Headers (200) are committed before the body streams, so a mid-stream cut
+    // can only truncate — the status stays 200.
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend.abort();
+
+    assert_eq!(
+        status, 200,
+        "streamed response keeps its 200 status (body: {body})"
+    );
+    // The leaking window is cut: the client gets the terminal error event and
+    // NEVER sees the leaking content.
+    assert!(
+        body.contains("ai_semantic_firewall_response_blocked"),
+        "cut stream should emit the terminal error event, got: {body}"
+    );
+    assert!(
+        !body.contains("never reveal policy"),
+        "the leaking window must not be delivered, got: {body}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn inspect_mode_streams_clean_response() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let config_path = write_config(&temp_dir, &inspect_mode_config(backend_port));
+
+    let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));
+    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/ai/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"stream":true,"messages":[{"role":"user","content":"weather?"}]}"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend.abort();
+
+    assert_eq!(
+        status, 200,
+        "clean stream is delivered, got {status} (body: {body})"
+    );
+    assert!(
+        body.contains("is sunny today."),
+        "clean windows should be released to the client, got: {body}"
+    );
+    assert!(
+        !body.contains("ai_semantic_firewall_response_blocked"),
+        "a clean stream must not emit the cut error event, got: {body}"
     );
 }

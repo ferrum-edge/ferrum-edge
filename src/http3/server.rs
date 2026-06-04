@@ -2433,6 +2433,25 @@ async fn handle_h3_request(
             &mut response_headers,
         );
 
+        // Streaming response inspection (e.g. ai_semantic_firewall `inspect` mode):
+        // if a plugin opts in for this event-stream response it returns a stateful
+        // inspector the loop drives chunk-by-chunk (Forward releases bytes,
+        // Terminate cuts). Computed BEFORE the headers are sent so Content-Length
+        // can be stripped — the inspector transforms the body, so the backend's
+        // length no longer applies and would make a cut look like a truncated body.
+        // Gated once per response; the common case (no opt-in) skips it entirely.
+        let mut response_inspector = if plugins.iter().any(|p| p.requires_response_stream_hooks()) {
+            let content_type = response_headers.get("content-type").map(String::as_str);
+            plugins
+                .iter()
+                .find_map(|p| p.response_stream_inspector(&ctx, content_type))
+        } else {
+            None
+        };
+        if response_inspector.is_some() {
+            response_headers.remove("content-length");
+        }
+
         // Send response headers on the H3 stream
         let status_code = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut resp_builder =
@@ -2447,22 +2466,8 @@ async fn handle_h3_request(
 
         // Stream response body from backend h3 recv_stream to frontend h3 stream.
         // Uses a pinned Sleep that is reset in-place to avoid allocating a new
-        // timer wheel entry on every select! iteration.
-        // Streaming response inspection (e.g. ai_semantic_firewall `inspect` mode):
-        // if a plugin opts in for this event-stream response, it returns a
-        // stateful inspector that the loop drives chunk-by-chunk. The inspector
-        // owns its window state and decides what bytes to release (Forward) or
-        // whether to cut the stream (Terminate). Gated once per response on the
-        // plugin list — the common case (no opt-in) skips this entirely.
-        let mut response_inspector = if plugins.iter().any(|p| p.requires_response_stream_hooks()) {
-            let content_type = response_headers.get("content-type").map(String::as_str);
-            plugins
-                .iter()
-                .find_map(|p| p.response_stream_inspector(&ctx, content_type))
-        } else {
-            None
-        };
-
+        // timer wheel entry on every select! iteration. `response_inspector` was
+        // resolved above (before the headers were sent).
         let coalesce_min_bytes = state.env_config.http3_coalesce_min_bytes;
         let coalesce_max_bytes = state.env_config.http3_coalesce_max_bytes;
         let flush_interval =
