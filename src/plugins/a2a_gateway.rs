@@ -254,7 +254,8 @@ impl A2aGateway {
         let canonical_method = canonical_a2a_method(&method);
         let accepted_unknown = self.detection.allow_unknown_methods_with_version_header
             && header_value(headers, &self.detection.version_header).is_some();
-        if canonical_method.is_none() && !accepted_unknown {
+        let unknown_denied_by_policy = self.policy_action("unknown") == PolicyAction::Deny;
+        if canonical_method.is_none() && !accepted_unknown && !unknown_denied_by_policy {
             return None;
         }
         let metric_method = canonical_method.unwrap_or("unknown").to_string();
@@ -322,7 +323,7 @@ impl A2aGateway {
             jsonrpc_id: None,
             task_id_hint: None,
             streaming_hint: streaming,
-            is_agent_card: operation == "agent/getCard",
+            is_agent_card: is_agent_card_method(operation),
             oversized_body: false,
         })
     }
@@ -406,11 +407,7 @@ impl A2aGateway {
                 || (self.discovery.rewrite_agent_card_urls && ctx.a2a_gateway_is_agent_card))
     }
 
-    fn public_base_url(
-        &self,
-        ctx: &RequestContext,
-        response_headers: &HashMap<String, String>,
-    ) -> Option<String> {
+    fn public_base_url(&self, ctx: &RequestContext) -> Option<String> {
         if let Some(configured) = self.discovery.public_base_url.as_deref() {
             return Some(configured.trim_end_matches('/').to_string());
         }
@@ -425,8 +422,7 @@ impl A2aGateway {
             }
         });
         let host = header_value(&ctx.headers, "x-forwarded-host")
-            .or_else(|| header_value(&ctx.headers, "host"))
-            .or_else(|| header_value(response_headers, "host"))?;
+            .or_else(|| header_value(&ctx.headers, "host"))?;
         forwarded_public_base_url(proto, host)
     }
 }
@@ -590,7 +586,7 @@ impl Plugin for A2aGateway {
         if !self.discovery.rewrite_agent_card_urls || !ctx.a2a_gateway_is_agent_card {
             return PluginResult::Continue;
         }
-        let Some(public_base) = self.public_base_url(ctx, response_headers) else {
+        let Some(public_base) = self.public_base_url(ctx) else {
             return PluginResult::Continue;
         };
         let agent_card_path = if ctx.path.ends_with(&self.endpoint.agent_card_path) {
@@ -863,9 +859,7 @@ fn match_rest_operation(method: &str, rest: &str) -> Option<(&'static str, Optio
     if method.eq_ignore_ascii_case("GET") && rest == "extendedAgentCard" {
         return Some(("agent/getExtendedAgentCard", None, false));
     }
-    if (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("POST"))
-        && rest == "tasks"
-    {
+    if method.eq_ignore_ascii_case("GET") && rest == "tasks" {
         return Some(("tasks/list", None, false));
     }
     if let Some(task_id) = rest
@@ -963,6 +957,7 @@ fn is_simple_path_id(value: &str) -> bool {
 fn grpc_operation(method: &str) -> Option<(&'static str, bool)> {
     match method {
         "SetTaskPushNotificationConfig" => Some(("tasks/pushNotificationConfig/set", false)),
+        "GetAgentCard" => Some(("agent/getAuthenticatedExtendedCard", false)),
         _ => canonical_a2a_method(method).map(|method| (method, is_streaming_method(method))),
     }
 }

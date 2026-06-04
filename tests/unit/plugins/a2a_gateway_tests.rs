@@ -434,6 +434,36 @@ async fn invalid_forwarded_origin_does_not_rewrite_agent_card() {
 }
 
 #[tokio::test]
+async fn response_host_is_not_used_for_agent_card_public_rewrite() {
+    let plugin = plugin(json!({
+        "discovery": {
+            "trust_forwarded_headers": true
+        }
+    }));
+    let (mut ctx, mut request_headers) =
+        rest_ctx("GET", "/agents/planner/.well-known/agent-card.json");
+
+    let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let response_headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("host".to_string(), "backend.example.com".to_string()),
+    ]);
+    let body = json!({
+        "protocolVersion": "0.3.0",
+        "name": "planner",
+        "url": "https://planner.internal/a2a"
+    })
+    .to_string();
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
 async fn oversized_jsonrpc_body_fails_closed_when_policy_can_deny() {
     let plugin = plugin(json!({
         "detection": {
@@ -492,6 +522,45 @@ async fn oversized_jsonrpc_body_continues_when_policy_cannot_deny() {
 }
 
 #[tokio::test]
+async fn unknown_jsonrpc_method_is_denied_when_unknown_policy_denies() {
+    let cases = [
+        (
+            json!({"policy": {"default_action": "deny"}}),
+            "default deny should reject unknown JSON-RPC methods",
+        ),
+        (
+            json!({"policy": {"methods": {"unknown": {"action": "deny"}}}}),
+            "explicit unknown deny should reject unknown JSON-RPC methods",
+        ),
+    ];
+
+    for (config, label) in cases {
+        let plugin = plugin(config);
+        let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+            "jsonrpc": "2.0",
+            "id": "req-custom-method",
+            "method": "FutureCustomMethod"
+        }));
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let PluginResult::Reject {
+            status_code, body, ..
+        } = result
+        else {
+            panic!("{label}");
+        };
+        assert_eq!(status_code, 200, "{label}");
+        let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+        assert_eq!(body["error"]["data"]["method"], "unknown", "{label}");
+        assert_eq!(
+            ctx.metadata.get("a2a.policy_decision").map(String::as_str),
+            Some("deny"),
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn rest_detection_is_scoped_to_configured_endpoint_path() {
     let plugin = plugin(json!({
         "policy": {
@@ -514,6 +583,20 @@ async fn rest_detection_is_scoped_to_configured_endpoint_path() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn rest_post_tasks_is_not_classified_as_list_tasks() {
+    let plugin = plugin(json!({
+        "policy": {
+            "default_action": "deny"
+        }
+    }));
+    let (mut ctx, mut headers) = rest_ctx("POST", "/a2a/v1/tasks");
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("a2a.enabled"));
 }
 
 #[tokio::test]
@@ -550,7 +633,6 @@ async fn rest_operation_table_emits_expected_metadata() {
             "true",
         ),
         ("GET", "/a2a/v1/tasks", "tasks/list", None, "false"),
-        ("POST", "/a2a/v1/tasks", "tasks/list", None, "false"),
         (
             "GET",
             "/a2a/v1/tasks/task-1",
@@ -677,6 +759,31 @@ async fn grpc_standard_push_rpc_names_are_detected() {
             "{rpc}"
         );
     }
+}
+
+#[tokio::test]
+async fn grpc_get_agent_card_maps_to_authenticated_card() {
+    let plugin = plugin(json!({
+        "policy": {
+            "methods": {
+                "agent/getAuthenticatedExtendedCard": {"action": "deny"}
+            }
+        }
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetAgentCard", "application/grpc");
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("agent/getAuthenticatedExtendedCard")
+    );
 }
 
 #[tokio::test]
