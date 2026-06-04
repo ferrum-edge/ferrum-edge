@@ -143,6 +143,7 @@ struct A2aDetection {
     task_id_hint: Option<String>,
     streaming_hint: bool,
     is_agent_card: bool,
+    oversized_body: bool,
 }
 
 pub struct A2aGateway {
@@ -231,6 +232,17 @@ impl A2aGateway {
                 max_request_body_size = self.detection.max_request_body_size,
                 "Skipping A2A JSON-RPC detection because request body exceeds plugin detection limit"
             );
+            if self.policy_requires_inspection() {
+                return Some(A2aDetection {
+                    binding: A2aBinding::JsonRpc,
+                    method: "unknown".to_string(),
+                    jsonrpc_id: None,
+                    task_id_hint: None,
+                    streaming_hint: false,
+                    is_agent_card: false,
+                    oversized_body: true,
+                });
+            }
             return None;
         }
         let value: Value = serde_json::from_slice(body).ok()?;
@@ -253,6 +265,7 @@ impl A2aGateway {
             jsonrpc_id: envelope.id,
             task_id_hint: extract_task_id_from_request(&value),
             is_agent_card: false,
+            oversized_body: false,
         })
     }
 
@@ -267,9 +280,10 @@ impl A2aGateway {
                 task_id_hint: None,
                 streaming_hint: false,
                 is_agent_card: true,
+                oversized_body: false,
             });
         }
-        let rest = rest_suffix(path)?;
+        let rest = self.rest_suffix(path)?;
         let (operation, task_id, streaming) = match_rest_operation(method, rest)?;
         Some(A2aDetection {
             binding: A2aBinding::Rest,
@@ -283,6 +297,7 @@ impl A2aGateway {
                     | "agent/getExtendedAgentCard"
                     | "agent/getAuthenticatedExtendedCard"
             ),
+            oversized_body: false,
         })
     }
 
@@ -307,6 +322,7 @@ impl A2aGateway {
             task_id_hint: None,
             streaming_hint: streaming,
             is_agent_card: operation == "agent/getCard",
+            oversized_body: false,
         })
     }
 
@@ -316,6 +332,11 @@ impl A2aGateway {
         headers: &HashMap<String, String>,
         detection: &A2aDetection,
     ) {
+        ctx.a2a_gateway_detected = true;
+        ctx.a2a_gateway_binding = Some(detection.binding.as_str());
+        ctx.a2a_gateway_is_agent_card = detection.is_agent_card;
+        ctx.a2a_gateway_streaming = detection.streaming_hint;
+
         if !self.observability.emit_metadata {
             return;
         }
@@ -356,12 +377,32 @@ impl A2aGateway {
             .unwrap_or(self.policy.default_action)
     }
 
+    fn policy_requires_inspection(&self) -> bool {
+        self.policy.default_action == PolicyAction::Deny
+            || self
+                .policy
+                .methods
+                .values()
+                .any(|action| *action == PolicyAction::Deny)
+    }
+
+    fn rest_suffix<'a>(&self, path: &'a str) -> Option<&'a str> {
+        let endpoint_path = self.endpoint.path.trim_end_matches('/');
+        if endpoint_path.is_empty() || endpoint_path == "/" {
+            return path.starts_with("/v1/").then_some(path);
+        }
+        path.strip_prefix(endpoint_path)
+            .filter(|suffix| suffix.starts_with("/v1/"))
+    }
+
     fn should_capture_http_response(&self, ctx: &RequestContext) -> bool {
         if is_grpc_request(&ctx.headers) {
             return false;
         }
-        ctx.metadata.get("a2a.enabled").map(String::as_str) == Some("true")
-            && ctx.metadata.get("a2a.streaming").map(String::as_str) != Some("true")
+        ctx.a2a_gateway_detected
+            && !ctx.a2a_gateway_streaming
+            && (self.observability.emit_metadata
+                || (self.discovery.rewrite_agent_card_urls && ctx.a2a_gateway_is_agent_card))
     }
 
     fn public_base_url(
@@ -385,11 +426,7 @@ impl A2aGateway {
         let host = header_value(&ctx.headers, "x-forwarded-host")
             .or_else(|| header_value(&ctx.headers, "host"))
             .or_else(|| header_value(response_headers, "host"))?;
-        let mut base = String::with_capacity(proto.len() + host.len() + 3);
-        base.push_str(proto.trim_end_matches(':'));
-        base.push_str("://");
-        base.push_str(host.trim_end_matches('/'));
-        Some(base)
+        forwarded_public_base_url(proto, host)
     }
 }
 
@@ -458,6 +495,17 @@ impl Plugin for A2aGateway {
             return PluginResult::Continue;
         };
         self.emit_base_metadata(ctx, headers, &detection);
+        if detection.oversized_body && self.policy_requires_inspection() {
+            if self.observability.emit_metadata {
+                ctx.metadata
+                    .insert("a2a.policy_decision".to_string(), "deny".to_string());
+                ctx.metadata.insert(
+                    "a2a.error".to_string(),
+                    "request_body_too_large".to_string(),
+                );
+            }
+            return oversized_jsonrpc_response(&detection);
+        }
         let action = self.policy_action(&detection.method);
         if self.observability.emit_metadata {
             ctx.metadata.insert(
@@ -483,24 +531,24 @@ impl Plugin for A2aGateway {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.enabled || !self.observability.emit_metadata {
-            return PluginResult::Continue;
-        }
-        if ctx.metadata.get("a2a.enabled").map(String::as_str) != Some("true") {
+        if !self.enabled || !ctx.a2a_gateway_detected {
             return PluginResult::Continue;
         }
         if response_headers
             .get("content-type")
             .is_some_and(|value| is_event_stream_content_type(value))
         {
-            ctx.metadata
-                .insert("a2a.streaming".to_string(), "true".to_string());
-            let latency = Utc::now()
-                .signed_duration_since(ctx.timestamp_received)
-                .num_milliseconds()
-                .max(0);
-            ctx.metadata
-                .insert("a2a.ttfb_ms".to_string(), latency.to_string());
+            ctx.a2a_gateway_streaming = true;
+            if self.observability.emit_metadata {
+                ctx.metadata
+                    .insert("a2a.streaming".to_string(), "true".to_string());
+                let latency = Utc::now()
+                    .signed_duration_since(ctx.timestamp_received)
+                    .num_milliseconds()
+                    .max(0);
+                ctx.metadata
+                    .insert("a2a.ttfb_ms".to_string(), latency.to_string());
+            }
         }
         PluginResult::Continue
     }
@@ -512,7 +560,7 @@ impl Plugin for A2aGateway {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.enabled || ctx.metadata.get("a2a.enabled").map(String::as_str) != Some("true") {
+        if !self.enabled || !ctx.a2a_gateway_detected {
             return PluginResult::Continue;
         }
         if self.observability.emit_metadata {
@@ -538,7 +586,10 @@ impl Plugin for A2aGateway {
         if self.observability.emit_metadata {
             emit_response_metadata(ctx, &value);
         }
-        if !self.discovery.rewrite_agent_card_urls || !looks_like_agent_card(&value) {
+        if !self.discovery.rewrite_agent_card_urls
+            || !ctx.a2a_gateway_is_agent_card
+            || !looks_like_agent_card(&value)
+        {
             return PluginResult::Continue;
         }
         let Some(public_base) = self.public_base_url(ctx, response_headers) else {
@@ -653,7 +704,7 @@ fn parse_discovery(object: &Map<String, Value>) -> Result<A2aDiscoveryConfig, St
             .unwrap_or(true),
         public_base_url,
         trust_forwarded_headers: optional_bool_from_object(discovery, "trust_forwarded_headers")?
-            .unwrap_or(true),
+            .unwrap_or(false),
     })
 }
 
@@ -771,6 +822,26 @@ fn deny_response(detection: &A2aDetection) -> PluginResult {
     }
 }
 
+fn oversized_jsonrpc_response(detection: &A2aDetection) -> PluginResult {
+    PluginResult::Reject {
+        status_code: 413,
+        body: json!({
+            "jsonrpc": "2.0",
+            "id": detection.jsonrpc_id.clone().unwrap_or(Value::Null),
+            "error": {
+                "code": -32013,
+                "message": "A2A request body exceeds gateway detection limit",
+                "data": {
+                    "gateway": "a2a_gateway",
+                    "method": detection.method
+                }
+            }
+        })
+        .to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    }
+}
+
 fn match_rest_operation(method: &str, rest: &str) -> Option<(&'static str, Option<String>, bool)> {
     if method.eq_ignore_ascii_case("POST") && rest == "/v1/message:send" {
         return Some(("message/send", None, false));
@@ -864,20 +935,22 @@ fn grpc_operation(method: &str) -> Option<(&'static str, bool)> {
         "ListTasks" => Some(("tasks/list", false)),
         "CancelTask" => Some(("tasks/cancel", false)),
         "SubscribeToTask" | "TaskSubscription" => Some(("tasks/resubscribe", true)),
-        "SetTaskPushNotificationConfig" | "CreateTaskPushNotificationConfig" => {
-            Some(("tasks/pushNotificationConfig/set", false))
+        "SetTaskPushNotificationConfig"
+        | "CreateTaskPushNotificationConfig"
+        | "CreateTaskPushNotification" => Some(("tasks/pushNotificationConfig/set", false)),
+        "GetTaskPushNotificationConfig" | "GetTaskPushNotification" => {
+            Some(("tasks/pushNotificationConfig/get", false))
         }
-        "GetTaskPushNotificationConfig" => Some(("tasks/pushNotificationConfig/get", false)),
-        "ListTaskPushNotificationConfig" => Some(("tasks/pushNotificationConfig/list", false)),
-        "DeleteTaskPushNotificationConfig" => Some(("tasks/pushNotificationConfig/delete", false)),
+        "ListTaskPushNotificationConfig" | "ListTaskPushNotification" => {
+            Some(("tasks/pushNotificationConfig/list", false))
+        }
+        "DeleteTaskPushNotificationConfig" | "DeleteTaskPushNotification" => {
+            Some(("tasks/pushNotificationConfig/delete", false))
+        }
         "GetAgentCard" => Some(("agent/getCard", false)),
         "GetExtendedAgentCard" => Some(("agent/getExtendedAgentCard", false)),
         _ => None,
     }
-}
-
-fn rest_suffix(path: &str) -> Option<&str> {
-    path.find("/v1/").map(|idx| &path[idx..])
 }
 
 fn is_streaming_method(method: &str) -> bool {
@@ -889,9 +962,16 @@ fn is_valid_policy_method(method: &str) -> bool {
 }
 
 fn extract_task_id_from_request(value: &Value) -> Option<String> {
-    let params = value.get("params")?;
-    find_string_field(params, &["taskId", "task_id", "id", "name"])
-        .and_then(|value| task_id_from_name(&value).or(Some(value)))
+    string_at_any_path(
+        value,
+        &[
+            &["params", "taskId"],
+            &["params", "task_id"],
+            &["params", "id"],
+            &["params", "task", "id"],
+        ],
+    )
+    .or_else(|| task_name_at_any_path(value, &[&["params", "name"], &["params", "task", "name"]]))
 }
 
 fn emit_response_metadata(ctx: &mut RequestContext, value: &Value) {
@@ -907,18 +987,73 @@ fn emit_response_metadata(ctx: &mut RequestContext, value: &Value) {
                 .insert("a2a.error".to_string(), message.to_string());
         }
     }
-    if let Some(task_id) = find_string_field(value, &["taskId", "task_id", "id"])
-        .and_then(|value| task_id_from_name(&value).or(Some(value)))
-    {
+    if let Some(task_id) = extract_task_id_from_response(ctx.a2a_gateway_binding, value) {
         ctx.metadata.insert("a2a.task_id".to_string(), task_id);
     }
-    if let Some(context_id) = find_string_field(value, &["contextId", "context_id"]) {
+    if let Some(context_id) = extract_context_id_from_response(ctx.a2a_gateway_binding, value) {
         ctx.metadata
             .insert("a2a.context_id".to_string(), context_id);
     }
     if let Some(state) = find_task_state(value) {
         ctx.metadata.insert("a2a.task_state".to_string(), state);
     }
+}
+
+fn extract_task_id_from_response(binding: Option<&str>, value: &Value) -> Option<String> {
+    let common_id_paths: &[&[&str]] = &[
+        &["result", "taskId"],
+        &["result", "task_id"],
+        &["result", "id"],
+        &["result", "task", "id"],
+        &["task", "id"],
+    ];
+    let rest_id_paths: &[&[&str]] = &[&["taskId"], &["task_id"], &["id"]];
+    string_at_any_path(value, common_id_paths)
+        .or_else(|| (binding == Some("rest")).then(|| string_at_any_path(value, rest_id_paths))?)
+        .or_else(|| {
+            task_name_at_any_path(
+                value,
+                &[
+                    &["result", "name"],
+                    &["result", "task", "name"],
+                    &["task", "name"],
+                ],
+            )
+        })
+        .or_else(|| {
+            (binding == Some("rest")).then(|| task_name_at_any_path(value, &[&["name"]]))?
+        })
+}
+
+fn extract_context_id_from_response(binding: Option<&str>, value: &Value) -> Option<String> {
+    let common_paths: &[&[&str]] = &[
+        &["result", "contextId"],
+        &["result", "context_id"],
+        &["result", "task", "contextId"],
+        &["result", "task", "context_id"],
+        &["task", "contextId"],
+        &["task", "context_id"],
+    ];
+    let rest_paths: &[&[&str]] = &[&["contextId"], &["context_id"]];
+    string_at_any_path(value, common_paths)
+        .or_else(|| (binding == Some("rest")).then(|| string_at_any_path(value, rest_paths))?)
+}
+
+fn string_at_any_path(value: &Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        get_path(value, path)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn task_name_at_any_path(value: &Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        get_path(value, path)
+            .and_then(Value::as_str)
+            .and_then(task_id_from_name)
+    })
 }
 
 fn find_task_state(value: &Value) -> Option<String> {
@@ -938,26 +1073,6 @@ fn find_task_state(value: &Value) -> Option<String> {
         }
     }
     None
-}
-
-fn find_string_field(value: &Value, keys: &[&str]) -> Option<String> {
-    match value {
-        Value::Object(object) => {
-            for key in keys {
-                if let Some(value) = object.get(*key).and_then(Value::as_str) {
-                    return Some(value.to_string());
-                }
-            }
-            for child in object.values() {
-                if let Some(value) = find_string_field(child, keys) {
-                    return Some(value);
-                }
-            }
-            None
-        }
-        Value::Array(items) => items.iter().find_map(|item| find_string_field(item, keys)),
-        _ => None,
-    }
 }
 
 fn get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -1014,8 +1129,24 @@ fn rewrite_agent_card_urls(
         return false;
     };
     let mut changed = false;
-    if let Some(url) = object.get_mut("url") {
-        changed |= rewrite_url_value(url, public_base, endpoint_path);
+    let preferred_transport = object
+        .get("preferredTransport")
+        .or_else(|| object.get("preferred_transport"))
+        .and_then(Value::as_str);
+    if should_rewrite_transport(preferred_transport) {
+        if let Some(url) = object.get_mut("url") {
+            changed |= rewrite_url_value(url, public_base, endpoint_path);
+        } else {
+            object.insert(
+                "url".to_string(),
+                Value::String(format!(
+                    "{}{}",
+                    public_base.trim_end_matches('/'),
+                    endpoint_path
+                )),
+            );
+            changed = true;
+        }
     }
     for key in [
         "additionalInterfaces",
@@ -1025,26 +1156,17 @@ fn rewrite_agent_card_urls(
     ] {
         if let Some(Value::Array(interfaces)) = object.get_mut(key) {
             for interface in interfaces {
-                if let Some(url) = interface.get_mut("url") {
+                let Some(interface_object) = interface.as_object_mut() else {
+                    continue;
+                };
+                if !should_rewrite_transport(interface_transport(interface_object)) {
+                    continue;
+                }
+                if let Some(url) = interface_object.get_mut("url") {
                     changed |= rewrite_url_value(url, public_base, endpoint_path);
                 }
             }
         }
-    }
-    if object
-        .get("url")
-        .and_then(Value::as_str)
-        .is_none_or(|url| url.is_empty())
-    {
-        object.insert(
-            "url".to_string(),
-            Value::String(format!(
-                "{}{}",
-                public_base.trim_end_matches('/'),
-                endpoint_path
-            )),
-        );
-        changed = true;
     }
     if object.get("agentCardUrl").is_some() {
         object.insert(
@@ -1057,7 +1179,30 @@ fn rewrite_agent_card_urls(
         );
         changed = true;
     }
+    if changed {
+        object.remove("signatures");
+    }
     changed
+}
+
+fn interface_transport(interface: &Map<String, Value>) -> Option<&str> {
+    interface
+        .get("transport")
+        .or_else(|| interface.get("protocolBinding"))
+        .or_else(|| interface.get("protocol_binding"))
+        .and_then(Value::as_str)
+}
+
+fn should_rewrite_transport(transport: Option<&str>) -> bool {
+    let Some(transport) = transport else {
+        return true;
+    };
+    let normalized: String = transport
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    normalized == "jsonrpc"
 }
 
 fn rewrite_url_value(value: &mut Value, public_base: &str, path: &str) -> bool {
@@ -1070,6 +1215,44 @@ fn rewrite_url_value(value: &mut Value, public_base: &str, path: &str) -> bool {
     }
     *value = Value::String(new_url);
     true
+}
+
+fn forwarded_public_base_url(proto: &str, host: &str) -> Option<String> {
+    let scheme = normalized_public_scheme(first_header_token(proto))?;
+    let host = first_header_token(host);
+    if host.is_empty()
+        || host
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\' | b'@'))
+    {
+        return None;
+    }
+    let candidate = format!("{scheme}://{host}");
+    let parsed = Url::parse(&candidate).ok()?;
+    if parsed.scheme() != scheme
+        || parsed.host_str().is_none()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn first_header_token(value: &str) -> &str {
+    value.split(',').next().unwrap_or(value).trim()
+}
+
+fn normalized_public_scheme(value: &str) -> Option<&'static str> {
+    let scheme = value.trim_end_matches(':');
+    if scheme.eq_ignore_ascii_case("http") {
+        Some("http")
+    } else if scheme.eq_ignore_ascii_case("https") {
+        Some("https")
+    } else {
+        None
+    }
 }
 
 fn content_type_is_json(headers: &HashMap<String, String>) -> bool {
@@ -1094,13 +1277,7 @@ fn is_event_stream_content_type(value: &str) -> bool {
 
 fn is_grpc_request(headers: &HashMap<String, String>) -> bool {
     header_value(headers, "content-type").is_some_and(|value| {
-        value
-            .split(';')
-            .next()
-            .unwrap_or(value)
-            .trim()
-            .to_ascii_lowercase()
-            .starts_with("application/grpc")
+        crate::proxy::backend_dispatch::is_native_grpc_content_type(value.as_bytes())
     })
 }
 

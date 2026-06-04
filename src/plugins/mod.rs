@@ -433,6 +433,13 @@ pub struct RequestContext {
     /// final body hooks. Kept out of public metadata so per-instance state does
     /// not leak into transaction logs.
     pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
+    /// A2A gateway detection state staged between request and response hooks.
+    /// Kept out of public metadata so Agent Card rewriting can work even when
+    /// `observability.emit_metadata` is disabled.
+    pub(crate) a2a_gateway_detected: bool,
+    pub(crate) a2a_gateway_binding: Option<&'static str>,
+    pub(crate) a2a_gateway_is_agent_card: bool,
+    pub(crate) a2a_gateway_streaming: bool,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -639,6 +646,10 @@ impl RequestContext {
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
+            a2a_gateway_detected: false,
+            a2a_gateway_binding: None,
+            a2a_gateway_is_agent_card: false,
+            a2a_gateway_streaming: false,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_score: 0,
@@ -698,6 +709,10 @@ impl RequestContext {
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
+            a2a_gateway_detected: self.a2a_gateway_detected,
+            a2a_gateway_binding: self.a2a_gateway_binding,
+            a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
+            a2a_gateway_streaming: self.a2a_gateway_streaming,
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_score: self.waf_score,

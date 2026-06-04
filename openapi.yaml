@@ -13374,7 +13374,7 @@ components:
               type: integer
               format: uint64
               default: 1048576
-              description: Maximum JSON-RPC request body bytes parsed for A2A detection; 0 means no plugin-level detection limit.
+              description: Maximum JSON-RPC request body bytes parsed for A2A detection; 0 means no plugin-level detection limit. Oversized JSON-RPC candidates fail closed when default_action is deny or any per-method deny rule is configured.
             allow_unknown_methods_with_version_header:
               type: boolean
               default: true
@@ -13382,20 +13382,21 @@ components:
             strip_accept_encoding:
               type: boolean
               default: true
-              description: Remove Accept-Encoding on non-streaming A2A HTTP requests whose responses may be parsed or rewritten by the plugin.
+              description: Remove Accept-Encoding on non-streaming A2A HTTP requests whose responses may be parsed or rewritten by the plugin. Enabling this plugin with the default true value marks request headers mutable for all traffic on the proxy.
         discovery:
           type: object
           properties:
             rewrite_agent_card_urls:
               type: boolean
               default: true
+              description: Rewrite HTTP JSON Agent Card URLs for detected card requests. V1 rewrites JSON-RPC endpoint URLs, preserves non-JSONRPC interface URLs such as GRPC and HTTP+JSON, and removes stale signatures after mutation.
             public_base_url:
               type: string
               format: uri
-              description: Optional explicit public gateway origin, for example https://agents.example.com. When omitted and trust_forwarded_headers is true, X-Forwarded-* and Host are used.
+              description: Optional explicit public gateway origin, for example https://agents.example.com. When omitted and trust_forwarded_headers is true, X-Forwarded-* and Host are used after validating http/https scheme and host-only values.
             trust_forwarded_headers:
               type: boolean
-              default: true
+              default: false
         observability:
           type: object
           properties:
@@ -13405,7 +13406,7 @@ components:
             log_payloads:
               type: boolean
               default: false
-              description: Copies bounded A2A response payloads into metadata. Payloads can contain secrets or PII; enable only for protected logging paths.
+              description: Copies bounded A2A response payloads into metadata. Payloads can contain secrets or PII and are copied verbatim into a2a.payload.response rather than field-redacted; enable only for protected logging paths. Request payloads are not logged.
             max_payload_size:
               type: integer
               format: uint64
