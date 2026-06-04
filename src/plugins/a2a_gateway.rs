@@ -593,11 +593,16 @@ impl Plugin for A2aGateway {
         let Some(public_base) = self.public_base_url(ctx, response_headers) else {
             return PluginResult::Continue;
         };
+        let agent_card_path = if ctx.path.ends_with(&self.endpoint.agent_card_path) {
+            ctx.path.as_str()
+        } else {
+            self.endpoint.agent_card_path.as_str()
+        };
         if !rewrite_agent_card_response(
             &mut value,
             &public_base,
             &self.endpoint.path,
-            &self.endpoint.agent_card_path,
+            agent_card_path,
         ) {
             return PluginResult::Continue;
         }
@@ -1023,6 +1028,8 @@ fn extract_task_id_from_request(value: &Value) -> Option<String> {
             &["params", "task_id"],
             &["params", "id"],
             &["params", "task", "id"],
+            &["params", "message", "taskId"],
+            &["params", "message", "task_id"],
         ],
     )
     .or_else(|| task_name_at_any_path(value, &[&["params", "name"], &["params", "task", "name"]]))
@@ -1323,7 +1330,9 @@ fn content_type_value_is_json(value: &str) -> bool {
     let media_type = value.split(';').next().unwrap_or(value).trim();
     media_type.eq_ignore_ascii_case("application/json")
         || media_type.eq_ignore_ascii_case("application/json-rpc")
-        || media_type.ends_with("+json")
+        || media_type
+            .rsplit_once('+')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json"))
 }
 
 fn is_event_stream_content_type(value: &str) -> bool {
@@ -1481,6 +1490,11 @@ fn validate_public_base_url(value: &str) -> Result<(), String> {
     }
     if parsed.host_str().is_none() {
         return Err("a2a_gateway: discovery.public_base_url missing host".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "a2a_gateway: discovery.public_base_url must not contain credentials".to_string(),
+        );
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(

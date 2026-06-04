@@ -157,6 +157,32 @@ async fn jsonrpc_pascalcase_method_is_detected_and_policy_normalized() {
 }
 
 #[tokio::test]
+async fn jsonrpc_detection_accepts_case_insensitive_json_suffix() {
+    let plugin = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-json-suffix",
+        "method": "SendMessage"
+    }));
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/A2A+JSON".to_string(),
+    );
+    headers.insert(
+        "content-type".to_string(),
+        "application/A2A+JSON".to_string(),
+    );
+
+    assert!(plugin.should_buffer_request_body(&ctx));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("message/send")
+    );
+}
+
+#[tokio::test]
 async fn rest_agent_card_response_rewrites_gateway_urls() {
     let plugin = plugin(json!({
         "discovery": {
@@ -180,6 +206,7 @@ async fn rest_agent_card_response_rewrites_gateway_urls() {
         "description": "planning agent",
         "preferredTransport": "GRPC",
         "url": "https://planner.internal/grpc",
+        "agentCardUrl": "https://planner.internal/.well-known/agent-card.json",
         "signatures": [{"protected": "eyJhbGciOiJFUzI1NiJ9", "signature": "stale"}],
         "additionalInterfaces": [
             {"transport": "JSONRPC", "url": "https://planner.internal/a2a"},
@@ -207,6 +234,10 @@ async fn rest_agent_card_response_rewrites_gateway_urls() {
     assert_eq!(
         body["additionalInterfaces"][1]["url"],
         "https://planner.internal/grpc"
+    );
+    assert_eq!(
+        body["agentCardUrl"],
+        "https://gateway.example.com/agents/planner/.well-known/agent-card.json"
     );
     assert!(body.get("signatures").is_none());
 }
@@ -717,6 +748,31 @@ async fn task_id_metadata_uses_known_a2a_locations_only() {
 }
 
 #[tokio::test]
+async fn task_id_metadata_uses_nested_message_task_id() {
+    let plugin = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-nested-task",
+        "method": "message/send",
+        "params": {
+            "message": {
+                "taskId": "task-1",
+                "parts": [
+                    {"id": "part-id"}
+                ]
+            }
+        }
+    }));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("a2a.task_id").map(String::as_str),
+        Some("task-1")
+    );
+}
+
+#[tokio::test]
 async fn response_metadata_normalizes_task_state() {
     let plugin = plugin(json!({}));
     let (mut ctx, mut headers) = jsonrpc_ctx(json!({
@@ -825,6 +881,11 @@ fn invalid_a2a_gateway_configs_are_rejected() {
             json!({"discovery": {"public_base_url": "https://agents.example.com?a=b"}}),
             "discovery.public_base_url must not contain query",
             "public base cannot carry query",
+        ),
+        (
+            json!({"discovery": {"public_base_url": "https://user:pass@agents.example.com"}}),
+            "discovery.public_base_url must not contain credentials",
+            "public base cannot carry credentials",
         ),
         (
             json!({"observability": {"max_payload_size": 0}}),
