@@ -26,7 +26,9 @@ use super::config::Http3ServerConfig;
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
-use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
+use crate::plugins::{
+    Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction, TransactionSummary,
+};
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
     parse_connection_listed_from_str_map,
@@ -2446,6 +2448,21 @@ async fn handle_h3_request(
         // Stream response body from backend h3 recv_stream to frontend h3 stream.
         // Uses a pinned Sleep that is reset in-place to avoid allocating a new
         // timer wheel entry on every select! iteration.
+        // Streaming response inspection (e.g. ai_semantic_firewall `inspect` mode):
+        // if a plugin opts in for this event-stream response, it returns a
+        // stateful inspector that the loop drives chunk-by-chunk. The inspector
+        // owns its window state and decides what bytes to release (Forward) or
+        // whether to cut the stream (Terminate). Gated once per response on the
+        // plugin list — the common case (no opt-in) skips this entirely.
+        let mut response_inspector = if plugins.iter().any(|p| p.requires_response_stream_hooks()) {
+            let content_type = response_headers.get("content-type").map(String::as_str);
+            plugins
+                .iter()
+                .find_map(|p| p.response_stream_inspector(&ctx, content_type))
+        } else {
+            None
+        };
+
         let coalesce_min_bytes = state.env_config.http3_coalesce_min_bytes;
         let coalesce_max_bytes = state.env_config.http3_coalesce_max_bytes;
         let flush_interval =
@@ -2481,6 +2498,47 @@ async fn handle_h3_request(
                                 let _ = stream.finish().await;
                                 body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                                 break 'outer;
+                            }
+                            // Windowed inspection (bypasses coalescing): the
+                            // inspector holds raw bytes until a window is cleared,
+                            // then releases them verbatim, or cuts the stream.
+                            if let Some(inspector) = response_inspector.as_mut() {
+                                let chunk_bytes =
+                                    crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                                match inspector.on_chunk(&chunk_bytes).await {
+                                    ResponseStreamAction::Forward(out) => {
+                                        if !out.is_empty() {
+                                            let out_len = out.len() as u64;
+                                            if stream.send_data(out).await.is_err() {
+                                                client_disconnected = true;
+                                                body_error_class =
+                                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                                                break 'outer;
+                                            }
+                                            bytes_streamed += out_len;
+                                            flush_timer.as_mut().reset(
+                                                tokio::time::Instant::now() + flush_interval,
+                                            );
+                                        }
+                                    }
+                                    ResponseStreamAction::Terminate(final_bytes) => {
+                                        // Policy cut: emit the optional terminal event,
+                                        // end the stream. This is a NORMAL completion
+                                        // (no backend fault, no LB/capability penalty).
+                                        if let Some(fb) = final_bytes
+                                            && !fb.is_empty()
+                                        {
+                                            let fb_len = fb.len() as u64;
+                                            if stream.send_data(fb).await.is_ok() {
+                                                bytes_streamed += fb_len;
+                                            }
+                                        }
+                                        let _ = stream.finish().await;
+                                        body_completed = true;
+                                        break 'outer;
+                                    }
+                                }
+                                continue;
                             }
                             if crate::http3::config::should_direct_send_response_chunk(
                                 coalesce_buf.len(),
@@ -2559,7 +2617,29 @@ async fn handle_h3_request(
                 }
             }
             if stream_done {
-                if !coalesce_buf.is_empty() {
+                if let Some(inspector) = response_inspector.as_mut() {
+                    // Flush / inspect the trailing partial window at end of stream.
+                    match inspector.on_end().await {
+                        ResponseStreamAction::Forward(out) => {
+                            if !out.is_empty() {
+                                let out_len = out.len() as u64;
+                                if stream.send_data(out).await.is_ok() {
+                                    bytes_streamed += out_len;
+                                }
+                            }
+                        }
+                        ResponseStreamAction::Terminate(final_bytes) => {
+                            if let Some(fb) = final_bytes
+                                && !fb.is_empty()
+                            {
+                                let fb_len = fb.len() as u64;
+                                if stream.send_data(fb).await.is_ok() {
+                                    bytes_streamed += fb_len;
+                                }
+                            }
+                        }
+                    }
+                } else if !coalesce_buf.is_empty() {
                     let data = coalesce_buf.split().freeze();
                     let data_len = data.len() as u64;
                     if stream.send_data(data).await.is_err() {
