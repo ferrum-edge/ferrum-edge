@@ -1571,7 +1571,19 @@ pub(crate) async fn run_response_inspection(
 
     let mut stream = response.bytes_stream();
     let mut total_received: usize = 0;
-    while let Some(chunk) = stream.next().await {
+    loop {
+        // Watch for client disconnect WHILE awaiting the next backend chunk: an
+        // idle long-lived SSE stream may not produce another chunk for a long
+        // time (or ever), and without this the backend connection + LB guard would
+        // stay open until a chunk or read timeout arrives. `tx.closed()` resolves
+        // as soon as the downstream body drops the receiver; returning here drops
+        // `stream` (cancelling the backend request) and the guards.
+        let chunk = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            next = stream.next() => next,
+        };
+        let Some(chunk) = chunk else { break };
         match chunk {
             Ok(bytes) => {
                 total_received = total_received.saturating_add(bytes.len());

@@ -2087,6 +2087,14 @@ async fn inspect_mode_buffers_non_sse_response_for_inspection() {
     // case keeps streaming (handled by the windowed inspector).
     let plugin = plugin(&inspect_config());
     let ctx = inspect_marked_ctx();
+    // Codex round-6: the pre-header decision must BUFFER by default for a marked
+    // inspect request (so `refine_stream_response_for_content_type` can later
+    // downgrade only an SSE response to the windowed path). Without this, the
+    // content-type hook below is never consulted and JSON streams uninspected.
+    assert!(
+        plugin.should_buffer_response_body(&ctx),
+        "a marked inspect request buffers by default (refine downgrades SSE)"
+    );
     assert!(
         plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")),
         "a JSON response to a marked inspect request must be buffered for inspection"

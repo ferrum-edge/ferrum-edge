@@ -1610,7 +1610,16 @@ impl Plugin for AiSemanticFirewall {
         // — set on the request path only for a detected `stream: true` — takes
         // precedence so the two plugins compose instead of silently disabling
         // response inspection.
-        if buffer_streaming_marker_set(ctx) {
+        //
+        // `inspect` mode also buffers by default (its windowed marker): the
+        // pre-header decision cannot see the content-type, so it must buffer so
+        // that `refine_stream_response_for_content_type` can later DOWNGRADE only an
+        // `text/event-stream` response to the windowed streaming path (see
+        // `should_buffer_response_body_for_content_type`). A non-SSE (JSON)
+        // response then stays buffered and is inspected by `on_response_body`
+        // instead of streaming past every check. (Setting `ai_request_streaming`
+        // alone is NOT enough — `refine` never upgrades stream→buffer.)
+        if buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx) {
             return true;
         }
         ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
@@ -2980,6 +2989,15 @@ impl StreamInspector {
             self.engine.log_stream_detection(&outcome.decision, true);
             self.terminate()
         } else {
+            // A NON-cutting policy hit (a `warn` action, or a dry-run `would_reject`)
+            // is still forwarded — but log it, because the streaming path cannot
+            // write the `would_*`/`warn` transaction metadata the buffered path
+            // does, and logs are this path's only audit trail.
+            if matches!(outcome.decision.action, Action::Reject | Action::Warn)
+                && !outcome.decision.matches.is_empty()
+            {
+                self.engine.log_stream_detection(&outcome.decision, false);
+            }
             ResponseStreamAction::Forward(Bytes::from(self.window.release()))
         }
     }

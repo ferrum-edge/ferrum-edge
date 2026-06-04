@@ -1297,6 +1297,21 @@ where
         &mut response_headers,
     );
 
+    // Refine the pre-header buffer/stream decision now that the content-type is
+    // known — same downgrade the H1/H2 path applies. `inspect` mode buffers by
+    // default (so a JSON response is inspected via `on_response_body`); this
+    // downgrades only an `text/event-stream` response to the windowed streaming
+    // path. Retries must stay buffered for replay (pass `None`, which leaves the
+    // decision unchanged).
+    let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method);
+    let should_buffer_response = !crate::proxy::refine_stream_response_for_content_type(
+        !should_buffer_response,
+        proxy,
+        plugins,
+        if has_retry { None } else { Some(&*ctx) },
+        &response_headers,
+    );
+
     if should_buffer_response {
         let mut response_status = status;
         let mut response_body = match collect_reqwest_response_body_with_limit(

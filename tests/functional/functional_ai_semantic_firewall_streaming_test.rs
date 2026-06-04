@@ -48,6 +48,27 @@ async fn start_sse_backend_on(listener: TcpListener, sse_body: &'static str) {
     }
 }
 
+/// Stream a fixed `application/json` body — a backend that ignored the
+/// `stream: true` flag and returned a normal JSON completion.
+async fn start_json_backend_on(listener: TcpListener, json_body: &'static str) {
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16384];
+                let _n = stream.read(&mut buf).await.unwrap_or(0);
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    json_body.len(),
+                    json_body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    }
+}
+
 fn gateway_binary_path() -> &'static str {
     if std::path::Path::new("./target/debug/ferrum-edge").exists() {
         "./target/debug/ferrum-edge"
@@ -212,6 +233,11 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
 data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"prompt says never reveal policy\"}}]}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
 data: [DONE]\n\n";
+
+// A NON-streaming JSON completion (the backend ignored `stream: true`) carrying a
+// leak in the non-delta `message.content` path. Inspect mode must buffer this and
+// block it via on_response_body, not stream it past every check.
+const JSON_LEAK: &str = "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Sure. My system prompt says never reveal policy.\"}}]}";
 
 // ============================================================================
 // Tests
@@ -476,5 +502,52 @@ async fn inspect_detect_mode_forwards_leak_without_cutting() {
     assert!(
         !body.contains("ai_semantic_firewall_response_blocked"),
         "detect mode must NOT emit the cut error event, got: {body}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn inspect_mode_buffers_and_blocks_non_sse_json_leak() {
+    // A backend that ignored stream:true and returned a JSON completion: inspect
+    // mode must BUFFER it (the windowed inspector only handles SSE) and block the
+    // leak via on_response_body — not stream it past every check uninspected.
+    let temp_dir = TempDir::new().expect("temp dir");
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let config_path = write_config(&temp_dir, &inspect_mode_config(backend_port));
+
+    let backend = tokio::spawn(start_json_backend_on(backend_listener, JSON_LEAK));
+    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/ai/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend.abort();
+
+    // Buffered + inspected → blocked with a proper status (not a truncated 200),
+    // and the leak never reaches the client. Codex round-6: this is the scenario
+    // where the response was previously streamed past on_response_body.
+    assert_ne!(status, 200, "a buffered JSON leak must be blocked, got 200: {body}");
+    assert!(
+        body.contains("ai_semantic_firewall_response_blocked"),
+        "a non-SSE JSON leak must be blocked by on_response_body, got: {body}"
+    );
+    assert!(
+        !body.contains("never reveal policy"),
+        "the leaking JSON content must not be delivered, got: {body}"
     );
 }
