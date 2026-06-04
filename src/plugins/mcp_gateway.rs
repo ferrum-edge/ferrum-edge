@@ -33,6 +33,9 @@ const METADATA_REWRITE_PARAM_KEY: &str = "mcp.rewrite.param";
 const METADATA_REWRITE_PUBLIC_VALUE_KEY: &str = "mcp.rewrite.public_value";
 const METADATA_REWRITE_UPSTREAM_VALUE_KEY: &str = "mcp.rewrite.upstream_value";
 const MAX_MCP_PAGINATION_PAGES: usize = 100;
+const MAX_MCP_CATALOG_ITEMS_PER_LIST: usize = 10_000;
+const MAX_MCP_CATALOG_BYTES_PER_LIST: usize = 8 * 1024 * 1024;
+const MAX_UPSTREAM_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MCP_STREAMABLE_HTTP_ACCEPT: &str = "application/json, text/event-stream";
 
@@ -1287,6 +1290,7 @@ impl McpGateway {
         result_key: &str,
     ) -> Result<Vec<Value>, String> {
         let mut items = Vec::new();
+        let mut total_item_bytes = 0usize;
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_MCP_PAGINATION_PAGES {
             let params = match cursor.as_deref() {
@@ -1306,7 +1310,43 @@ impl McpGateway {
                 .ok_or_else(|| {
                     format!("upstream MCP {method} response missing result.{result_key}")
                 })?;
-            items.extend(page_items.iter().cloned());
+            for item in page_items {
+                if items.len() >= MAX_MCP_CATALOG_ITEMS_PER_LIST {
+                    warn!(
+                        server_id = %server.server_id,
+                        method,
+                        max_items = MAX_MCP_CATALOG_ITEMS_PER_LIST,
+                        "MCP upstream catalog item count exceeded limit"
+                    );
+                    return Err(format!(
+                        "upstream MCP {method} catalog exceeded {MAX_MCP_CATALOG_ITEMS_PER_LIST} items"
+                    ));
+                }
+                let item_bytes = serde_json::to_vec(item).map_err(|error| {
+                    warn!(
+                        server_id = %server.server_id,
+                        method,
+                        error = %error,
+                        "MCP upstream catalog item could not be measured"
+                    );
+                    format!("upstream MCP {method} catalog item could not be measured: {error}")
+                })?;
+                if total_item_bytes.saturating_add(item_bytes.len())
+                    > MAX_MCP_CATALOG_BYTES_PER_LIST
+                {
+                    warn!(
+                        server_id = %server.server_id,
+                        method,
+                        max_bytes = MAX_MCP_CATALOG_BYTES_PER_LIST,
+                        "MCP upstream catalog item bytes exceeded limit"
+                    );
+                    return Err(format!(
+                        "upstream MCP {method} catalog exceeded {MAX_MCP_CATALOG_BYTES_PER_LIST} bytes"
+                    ));
+                }
+                total_item_bytes += item_bytes.len();
+                items.push(item.clone());
+            }
             cursor = result
                 .get("nextCursor")
                 .and_then(Value::as_str)
@@ -2825,15 +2865,7 @@ async fn upstream_response_json(
         return upstream_sse_json_rpc_response(response, server_id, method).await;
     }
 
-    let body = response.text().await.map_err(|error| {
-        warn!(
-            server_id,
-            method,
-            error = %error,
-            "MCP upstream response body could not be read"
-        );
-        format!("upstream MCP response body could not be read: {error}")
-    })?;
+    let body = bounded_upstream_response_text(response, server_id, method).await?;
 
     serde_json::from_str::<Value>(&body)
         .or_else(|error| parse_sse_json_rpc_response(&body).ok_or(error))
@@ -2846,6 +2878,63 @@ async fn upstream_response_json(
             );
             format!("upstream MCP response was neither JSON nor SSE JSON-RPC: {error}")
         })
+}
+
+async fn bounded_upstream_response_text(
+    response: reqwest::Response,
+    server_id: &str,
+    method: &str,
+) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_UPSTREAM_JSON_RESPONSE_BYTES as u64)
+    {
+        warn!(
+            server_id,
+            method,
+            max_bytes = MAX_UPSTREAM_JSON_RESPONSE_BYTES,
+            "MCP upstream JSON response exceeded size limit"
+        );
+        return Err(format!(
+            "upstream MCP response exceeded {MAX_UPSTREAM_JSON_RESPONSE_BYTES} bytes"
+        ));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            warn!(
+                server_id,
+                method,
+                error = %error,
+                "MCP upstream response body could not be read"
+            );
+            format!("upstream MCP response body could not be read: {error}")
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_UPSTREAM_JSON_RESPONSE_BYTES {
+            warn!(
+                server_id,
+                method,
+                max_bytes = MAX_UPSTREAM_JSON_RESPONSE_BYTES,
+                "MCP upstream JSON response exceeded size limit"
+            );
+            return Err(format!(
+                "upstream MCP response exceeded {MAX_UPSTREAM_JSON_RESPONSE_BYTES} bytes"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|error| {
+        warn!(
+            server_id,
+            method,
+            error = %error,
+            "MCP upstream response body was not UTF-8"
+        );
+        format!("upstream MCP response body was not UTF-8: {error}")
+    })
 }
 
 async fn upstream_sse_json_rpc_response(
