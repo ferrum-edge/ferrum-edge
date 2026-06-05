@@ -2589,10 +2589,17 @@ impl StreamWindowEngine {
         }
     }
 
-    /// Reassemble one complete (or force-flushed) SSE event into a held entry,
-    /// recording whether it was fully inspectable.
-    fn absorb_event(&mut self, raw: Vec<u8>) {
-        let parsed = parse_sse_data_frames_checked(&raw);
+    /// Reassemble one complete SSE event into a held entry, recording whether it
+    /// was fully inspectable. Forced carry overflows are partial events and must
+    /// be marked uninspectable even if their individual fragment parses cleanly:
+    /// parsing them independently could split a `data:` field name across the
+    /// force-flush boundary and otherwise release bytes the client reassembles
+    /// into valid, uninspected SSE data.
+    fn absorb_event(&mut self, raw: Vec<u8>, force_uninspectable: bool) {
+        let mut parsed = parse_sse_data_frames_checked(&raw);
+        if force_uninspectable {
+            parsed.fully_parsed = false;
+        }
         for frame in &parsed.frames {
             self.reassembler.push_frame(frame);
         }
@@ -2624,7 +2631,7 @@ impl StreamWindowEngine {
         self.carry.extend_from_slice(chunk);
         while let Some(end) = next_event_end(&self.carry) {
             let raw: Vec<u8> = self.carry.drain(..end).collect();
-            self.absorb_event(raw);
+            self.absorb_event(raw, false);
         }
         // Bound carry: an event that never sends a blank-line terminator must not
         // grow without limit. Once it passes the window cap, force it through as a
@@ -2632,7 +2639,7 @@ impl StreamWindowEngine {
         // fails closed instead of buffering unbounded memory.
         if self.carry.len() > self.config.max_window_bytes {
             let raw = std::mem::take(&mut self.carry);
-            self.absorb_event(raw);
+            self.absorb_event(raw, true);
         }
         self.window_ready(false)
     }
@@ -2642,7 +2649,7 @@ impl StreamWindowEngine {
     fn finish(&mut self) -> bool {
         if !self.carry.is_empty() {
             let raw = std::mem::take(&mut self.carry);
-            self.absorb_event(raw);
+            self.absorb_event(raw, false);
         }
         self.window_ready(true)
     }
@@ -4628,6 +4635,25 @@ mod stream_window_tests {
             "the oversized un-terminated event is uninspectable"
         );
         assert!(eng.carry.is_empty(), "carry was drained, not retained");
+    }
+
+    #[test]
+    fn carry_overflow_split_data_field_is_uninspectable() {
+        // A force-flushed fragment may end in the middle of the `data:` field
+        // name. Parsed by itself it contains only ignored non-data lines, but
+        // the client will concatenate it with the next bytes into a valid event.
+        // Treat every forced partial event as uninspectable so block/on_error=reject
+        // fails closed rather than releasing an uninspected SSE payload.
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, 16, 0));
+        assert!(
+            eng.ingest(b"event: message\nda"),
+            "carry overflow forces a window"
+        );
+        assert!(
+            eng.pending_uninspectable(),
+            "a split data: field prefix must fail closed"
+        );
+        assert_eq!(eng.release(), b"event: message\nda");
     }
 
     #[test]
