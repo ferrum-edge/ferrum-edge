@@ -159,6 +159,7 @@ struct A2aDetection {
     streaming_hint: bool,
     is_agent_card: bool,
     oversized_body: bool,
+    inspection_failed: bool,
 }
 
 pub struct A2aGateway {
@@ -256,12 +257,47 @@ impl A2aGateway {
                     streaming_hint: false,
                     is_agent_card: false,
                     oversized_body: true,
+                    inspection_failed: false,
                 });
             }
             return None;
         }
         let value: Value = serde_json::from_slice(body).ok()?;
-        let envelope = parse_jsonrpc_envelope(&value).ok()?;
+        if let Some(batch) = value.as_array() {
+            return self.detect_jsonrpc_batch(batch, headers);
+        }
+        self.detect_jsonrpc_value(&value, headers)
+    }
+
+    fn detect_jsonrpc_batch(
+        &self,
+        batch: &[Value],
+        headers: &HashMap<String, String>,
+    ) -> Option<A2aDetection> {
+        if batch.is_empty() {
+            return self.jsonrpc_inspection_failed_detection();
+        }
+        let mut first_detection = None;
+        for item in batch {
+            let Some(detection) = self.detect_jsonrpc_value(item, headers) else {
+                return self.jsonrpc_inspection_failed_detection();
+            };
+            if self.policy_action(&detection.method) == PolicyAction::Deny {
+                return Some(detection);
+            }
+            if first_detection.is_none() {
+                first_detection = Some(detection);
+            }
+        }
+        first_detection
+    }
+
+    fn detect_jsonrpc_value(
+        &self,
+        value: &Value,
+        headers: &HashMap<String, String>,
+    ) -> Option<A2aDetection> {
+        let envelope = parse_jsonrpc_envelope(value).ok()?;
         if envelope.jsonrpc.as_deref() != Some("2.0") || !envelope.is_request {
             return None;
         }
@@ -280,9 +316,23 @@ impl A2aGateway {
             streaming_hint: is_streaming_method(&metric_method),
             method: metric_method,
             jsonrpc_id: envelope.id,
-            task_id_hint: extract_task_id_from_request(&value),
+            task_id_hint: extract_task_id_from_request(value),
             is_agent_card,
             oversized_body: false,
+            inspection_failed: false,
+        })
+    }
+
+    fn jsonrpc_inspection_failed_detection(&self) -> Option<A2aDetection> {
+        self.policy_requires_inspection().then(|| A2aDetection {
+            binding: A2aBinding::JsonRpc,
+            method: "unknown".to_string(),
+            jsonrpc_id: None,
+            task_id_hint: None,
+            streaming_hint: false,
+            is_agent_card: false,
+            oversized_body: false,
+            inspection_failed: true,
         })
     }
 
@@ -298,6 +348,7 @@ impl A2aGateway {
                 streaming_hint: false,
                 is_agent_card: true,
                 oversized_body: false,
+                inspection_failed: false,
             });
         }
         let rest = self.rest_suffix(path)?;
@@ -315,6 +366,7 @@ impl A2aGateway {
                     | "agent/getAuthenticatedExtendedCard"
             ),
             oversized_body: false,
+            inspection_failed: false,
         })
     }
 
@@ -340,6 +392,7 @@ impl A2aGateway {
             streaming_hint: streaming,
             is_agent_card: is_agent_card_method(operation),
             oversized_body: false,
+            inspection_failed: false,
         })
     }
 
@@ -517,6 +570,17 @@ impl Plugin for A2aGateway {
                 );
             }
             return oversized_jsonrpc_response(&detection);
+        }
+        if detection.inspection_failed && self.policy_requires_inspection() {
+            if self.observability.emit_metadata {
+                ctx.metadata
+                    .insert("a2a.policy_decision".to_string(), "deny".to_string());
+                ctx.metadata.insert(
+                    "a2a.error".to_string(),
+                    "request_body_uninspectable".to_string(),
+                );
+            }
+            return deny_response(&detection);
         }
         let action = self.policy_action(&detection.method);
         if self.observability.emit_metadata {

@@ -127,6 +127,80 @@ async fn jsonrpc_policy_deny_preserves_request_id() {
 }
 
 #[tokio::test]
+async fn jsonrpc_batch_policy_deny_rejects_denied_member() {
+    let plugin = plugin(json!({
+        "policy": {
+            "methods": {
+                "message/send": {"action": "deny"}
+            }
+        }
+    }));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!([
+        {
+            "jsonrpc": "2.0",
+            "id": "req-allowed",
+            "method": "tasks/get"
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "req-denied",
+            "method": "message/send"
+        }
+    ]));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = result
+    else {
+        panic!("batch containing a denied JSON-RPC method should reject");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    assert_eq!(body["id"], "req-denied");
+    assert_eq!(body["error"]["data"]["method"], "message/send");
+    assert_eq!(
+        ctx.metadata.get("a2a.policy_decision").map(String::as_str),
+        Some("deny")
+    );
+}
+
+#[tokio::test]
+async fn jsonrpc_batch_policy_deny_rejects_uninspectable_member() {
+    let plugin = plugin(json!({
+        "policy": {
+            "methods": {
+                "message/send": {"action": "deny"}
+            }
+        }
+    }));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!([
+        {
+            "jsonrpc": "2.0",
+            "id": "req-allowed",
+            "method": "tasks/get"
+        },
+        "not-an-envelope"
+    ]));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = result
+    else {
+        panic!("uninspectable batch with method policy should reject");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    assert!(body["id"].is_null());
+    assert_eq!(body["error"]["data"]["method"], "unknown");
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("request_body_uninspectable")
+    );
+}
+
+#[tokio::test]
 async fn jsonrpc_pascalcase_method_is_detected_and_policy_normalized() {
     let plugin = plugin(json!({
         "policy": {
