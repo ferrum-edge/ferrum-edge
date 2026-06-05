@@ -157,8 +157,12 @@ async fn jsonrpc_batch_policy_deny_rejects_denied_member() {
     };
     assert_eq!(status_code, 200);
     let body: Value = serde_json::from_str(&body).expect("body should be JSON");
-    assert_eq!(body["id"], "req-denied");
-    assert_eq!(body["error"]["data"]["method"], "message/send");
+    let response = body
+        .as_array()
+        .and_then(|responses| responses.first())
+        .expect("batch denial should be wrapped in a JSON-RPC batch response");
+    assert_eq!(response["id"], "req-denied");
+    assert_eq!(response["error"]["data"]["method"], "message/send");
     assert_eq!(
         ctx.metadata.get("a2a.policy_decision").map(String::as_str),
         Some("deny")
@@ -192,8 +196,12 @@ async fn jsonrpc_batch_policy_deny_rejects_uninspectable_member() {
     };
     assert_eq!(status_code, 200);
     let body: Value = serde_json::from_str(&body).expect("body should be JSON");
-    assert!(body["id"].is_null());
-    assert_eq!(body["error"]["data"]["method"], "unknown");
+    let response = body
+        .as_array()
+        .and_then(|responses| responses.first())
+        .expect("uninspectable batch should be wrapped in a JSON-RPC batch response");
+    assert!(response["id"].is_null());
+    assert_eq!(response["error"]["data"]["method"], "unknown");
     assert_eq!(
         ctx.metadata.get("a2a.error").map(String::as_str),
         Some("request_body_uninspectable")
