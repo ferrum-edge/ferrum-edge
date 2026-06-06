@@ -1180,19 +1180,18 @@ fn build_east_west_service_proxies_and_upstreams(
     (proxies, upstreams)
 }
 
-/// Build upstream targets from workloads that belong to the given service.
-///
-/// Matches workloads by SPIFFE ID against the service's `WorkloadRef` list.
-/// Each workload address + first port produces one `UpstreamTarget`. When a
-/// workload has no addresses, it is skipped (pod IP not yet assigned).
-fn build_east_west_service_targets(
+/// Match a service's `WorkloadRef`s to slice `Workload`s one-to-one by index (so
+/// replicas sharing a SPIFFE id yield distinct workloads), then drop
+/// remote-cluster endpoints. Shared scaffold for the east-west and Ambient
+/// outbound target builders, which differ only in per-target port/tag policy. A
+/// remote-cluster match still consumes its index (mirroring the original inline
+/// loops) so a local replica isn't pulled into a remote ref's slot.
+fn matched_local_service_workloads<'a>(
     service: &crate::modes::mesh::config::MeshService,
-    workloads: &[crate::modes::mesh::config::Workload],
+    workloads: &'a [crate::modes::mesh::config::Workload],
     local_cluster: Option<&str>,
-) -> Vec<UpstreamTarget> {
-    let mut targets = Vec::new();
-    // WorkloadRefs are intentionally matched one-to-one by workload index:
-    // replicated pods can share a SPIFFE ID and still produce distinct targets.
+) -> Vec<&'a crate::modes::mesh::config::Workload> {
+    let mut matched = Vec::new();
     let mut used_workload_indices = std::collections::HashSet::new();
 
     for workload_ref in &service.workloads {
@@ -1220,7 +1219,24 @@ fn build_east_west_service_targets(
         }) {
             continue;
         }
+        matched.push(workload);
+    }
 
+    matched
+}
+
+/// Build upstream targets from workloads that belong to the given service.
+///
+/// Matches workloads by SPIFFE ID against the service's `WorkloadRef` list.
+/// Each workload address + first port produces one `UpstreamTarget`. When a
+/// workload has no addresses, it is skipped (pod IP not yet assigned).
+fn build_east_west_service_targets(
+    service: &crate::modes::mesh::config::MeshService,
+    workloads: &[crate::modes::mesh::config::Workload],
+    local_cluster: Option<&str>,
+) -> Vec<UpstreamTarget> {
+    let mut targets = Vec::new();
+    for workload in matched_local_service_workloads(service, workloads, local_cluster) {
         // Backend (container) port for this workload address: honor the first
         // service port's `targetPort` (Kubernetes' authoritative
         // service-port→container-port binding). A DECLARED targetPort is
@@ -1394,9 +1410,9 @@ pub(crate) fn is_mesh_outbound_route_id(id: &str) -> bool {
 /// inbound listener (the two capture listeners share one route table).
 ///
 /// Only ever called on **proxy (route) ids** — request path, operator-yield,
-/// authz — never on upstream ids. Note that `mesh_outbound_upstream_id` shares
-/// the `__mesh-outbound-` prefix, so passing an upstream id here would
-/// misclassify it as an Outbound route; do not.
+/// authz — never on upstream ids. `mesh_outbound_upstream_id` deliberately uses a
+/// non-overlapping `__mesh-out-upstream-` prefix (not `__mesh-outbound-`) so an
+/// upstream id can never be misclassified as an Outbound route here.
 pub(crate) fn mesh_route_direction(id: &str) -> Option<MeshTrafficDirection> {
     if is_mesh_inbound_route_id(id) {
         Some(MeshTrafficDirection::Inbound)
@@ -1411,8 +1427,14 @@ fn mesh_outbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_OUTBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
+/// Upstream id for a materialized Ambient outbound HBONE route. Deliberately
+/// does NOT start with [`MESH_OUTBOUND_PROXY_ID_PREFIX`] (`__mesh-outbound-`) so
+/// it is never misclassified as a direction-scoped *route* by
+/// [`mesh_route_direction`] / [`is_mesh_outbound_route_id`] — those predicates
+/// run on proxy ids, and a shared prefix would be a latent footgun if one were
+/// ever handed an upstream id. Parallels the east-west `__mesh-ew-upstream-` id.
 fn mesh_outbound_upstream_id(namespace: &str, name: &str) -> String {
-    format!("__mesh-outbound-upstream-{namespace}-{name}").replace(['/', '.'], "-")
+    format!("__mesh-out-upstream-{namespace}-{name}").replace(['/', '.'], "-")
 }
 
 /// Materialize inbound routes for the sidecar's **local** workload so that
@@ -1861,10 +1883,9 @@ fn materialize_mesh_outbound_proxies(
         // DestinationRule keyed on the service host matches it
         // (`destination_rule_matches_upstream` matches by target host / upstream
         // NAME / id, and the targets are pod IPs) — otherwise no DR traffic policy
-        // (top-level connectTimeout / LB / outlier) would apply to outbound HBONE
-        // routes. (Per-port `portLevelSettings` reach this static upstream only
-        // when the dial port equals the service port — see the upstream builder's
-        // note for the `targetPort != port` gap.)
+        // would apply to outbound HBONE routes (top-level connectTimeout / LB /
+        // outlier, plus per-port `portLevelSettings`, which `apply_destination_rules`
+        // re-keys onto the dial port via `mesh_outbound_upstream_port_remap`).
         let service_fqdn = format!(
             "{}.{}.svc.{}",
             service.name,
@@ -1914,34 +1935,7 @@ fn build_outbound_hbone_targets(
     local_cluster: Option<&str>,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
-    let mut used_workload_indices = std::collections::HashSet::new();
-
-    for workload_ref in &service.workloads {
-        let has_matching_service_metadata = workloads.iter().any(|workload| {
-            workload.spiffe_id == workload_ref.spiffe_id
-                && workload.namespace == service.namespace
-                && workload.service_name == service.name
-        });
-        let Some((workload_index, workload)) =
-            workloads.iter().enumerate().find(|(idx, workload)| {
-                !used_workload_indices.contains(idx)
-                    && workload.spiffe_id == workload_ref.spiffe_id
-                    && workload.namespace == service.namespace
-                    && (workload.service_name == service.name || !has_matching_service_metadata)
-            })
-        else {
-            continue;
-        };
-        used_workload_indices.insert(workload_index);
-        if local_cluster.is_some_and(|local_cluster| {
-            workload
-                .cluster
-                .as_deref()
-                .is_some_and(|cluster| cluster != local_cluster)
-        }) {
-            continue;
-        }
-
+    for workload in matched_local_service_workloads(service, workloads, local_cluster) {
         // App (container) port the HBONE CONNECT tunnels to. A DECLARED
         // `targetPort` is authoritative: resolve it, or SKIP this target (fail
         // closed) rather than fall back to the service port — an unresolved named
@@ -2055,13 +2049,12 @@ fn mesh_outbound_hbone_proxy(
 /// The upstream backing a materialized outbound HBONE proxy: the service's
 /// HBONE-tagged workload targets with passive health and round-robin LB. Mirrors
 /// the east-west service upstream. Top-level DR traffic policy applies (the
-/// upstream is FQDN-named so DestinationRules match it), but per-port
-/// `portLevelSettings` reach this STATIC upstream only when the dial port equals
-/// the service port: `apply_destination_rules` re-keys service-port→dial-port
-/// only for service-discovery-backed upstreams, so a `targetPort != port`
-/// service drops its per-port settings here (a known gap, same as east-west
-/// static upstreams, pending the service-discovery-backed-upstream rework — see
-/// docs/mesh.md).
+/// upstream is FQDN-named so DestinationRules match it), and per-port
+/// `portLevelSettings` authored on the service port are re-keyed onto the dial
+/// port by [`mesh_outbound_upstream_port_remap`] in `apply_destination_rules`, so
+/// a numeric `targetPort != port` service keeps its per-port settings. A *named*
+/// `targetPort` stays under the service port — a residual matching the
+/// service-discovery / egress-ServiceEntry paths.
 fn mesh_outbound_hbone_upstream(
     upstream_id: &str,
     namespace: &str,
@@ -2131,6 +2124,42 @@ fn mesh_upstream_service<'a>(
         .services
         .iter()
         .find(|s| s.name == mesh_sd.service_name && s.namespace == namespace)
+}
+
+/// Resolve in-mesh Service service-port→dial-port remaps for a materialized
+/// Ambient outbound HBONE upstream (`__mesh-out-upstream-*`).
+///
+/// Like an egress ServiceEntry upstream, this upstream is static-target: its
+/// targets dial the resolved numeric `targetPort` while a DestinationRule
+/// `portLevelSettings` entry is authored on the Service port. Dispatch keys port
+/// overrides by the dial port, so a P entry must be re-keyed to T or per-port
+/// policy (connect timeout / LB / outlier / per-port TLS / maxConnections) is
+/// dropped as a phantom port. Only ports whose numeric `targetPort` is an actual
+/// dialed target are remapped, so `portLevelSettings` on a non-materialized (e.g.
+/// non-HTTP) service port still fails closed as a phantom rather than bloating
+/// `port_overrides`. Named `targetPort`s stay under the Service port (a residual
+/// matching the service-discovery / egress paths). Empty for any other upstream.
+fn mesh_outbound_upstream_port_remap(
+    upstream: &Upstream,
+    mesh_slice: &MeshSlice,
+) -> std::collections::HashMap<u16, u16> {
+    let target_ports: std::collections::HashSet<u16> =
+        upstream.targets.iter().map(|t| t.port).collect();
+    mesh_slice
+        .services
+        .iter()
+        .filter(|svc| upstream.id == mesh_outbound_upstream_id(&svc.namespace, &svc.name))
+        .flat_map(|svc| {
+            svc.ports.iter().filter_map(|sp| match sp.target_port {
+                Some(ServiceTargetPort::Number(t))
+                    if t != 0 && t != sp.port && target_ports.contains(&t) =>
+                {
+                    Some((sp.port, t))
+                }
+                _ => None,
+            })
+        })
+        .collect()
 }
 
 fn apply_destination_rules(
@@ -2209,6 +2238,14 @@ fn apply_destination_rules(
             } else {
                 std::collections::HashMap::new()
             };
+            // Materialized Ambient outbound HBONE upstreams (`__mesh-out-upstream-*`)
+            // are static-target: their targets dial the resolved numeric
+            // `targetPort` while a DR `portLevelSettings` entry is keyed on the
+            // Service port, so re-key P→T here too or the per-port policy is dropped
+            // as a phantom port. Rebound (not folded into the if/else above) so it
+            // composes with any service-port→dial-port remap derived there.
+            let mut mesh_port_remap = mesh_port_remap;
+            mesh_port_remap.extend(mesh_outbound_upstream_port_remap(upstream, mesh_slice));
 
             // Top-level `connectionPool.tcp.{maxConnections,tcpKeepalive}` fan
             // out to every port served by this upstream. Per-port
@@ -7697,7 +7734,7 @@ mod tests {
         assert_eq!(proxy.backend_scheme, Some(BackendScheme::Http));
         assert_eq!(
             proxy.upstream_id.as_deref(),
-            Some("__mesh-outbound-upstream-default-reviews")
+            Some("__mesh-out-upstream-default-reviews")
         );
         assert!(
             proxy.retry.is_none(),
@@ -7713,7 +7750,7 @@ mod tests {
         let upstream = config
             .upstreams
             .iter()
-            .find(|u| u.id == "__mesh-outbound-upstream-default-reviews")
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews")
             .expect("ambient outbound upstream materialized");
         let target = &upstream.targets[0];
         assert_eq!(target.host, "10.0.0.1");
@@ -7773,11 +7810,66 @@ mod tests {
         let upstream = config
             .upstreams
             .iter()
-            .find(|u| u.id == "__mesh-outbound-upstream-default-reviews")
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews")
             .expect("upstream");
         assert_eq!(
             upstream.targets[0].port, 8080,
             "the HBONE CONNECT dials the resolved targetPort"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_rekeys_port_policy_to_target_port() {
+        // A DestinationRule portLevelSettings entry is keyed on the SERVICE port
+        // (80), but the materialized outbound HBONE upstream's target dials the
+        // numeric targetPort (8080). The per-port policy must be re-keyed onto the
+        // dial port so dispatch applies it — otherwise it is dropped as a phantom
+        // port (the egress-ServiceEntry bug class fixed in #1548, here for outbound
+        // HBONE upstreams).
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut svc = http_mesh_service("reviews", 80, spiffe);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("reviews", "reviews", "10.0.0.1")],
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([(
+                    80u16,
+                    MeshTrafficPolicy {
+                        connect_timeout_ms: Some(1234),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews")
+            .expect("outbound upstream materialized");
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&8080)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(1234),
+            "service-port portLevelSettings must be re-keyed onto the dial port 8080"
+        );
+        assert!(
+            !upstream.port_overrides.contains_key(&80),
+            "per-port policy must not remain under the service port 80"
         );
     }
 
@@ -7806,7 +7898,7 @@ mod tests {
             !config
                 .upstreams
                 .iter()
-                .any(|u| u.id.starts_with("__mesh-outbound-")),
+                .any(|u| u.id.starts_with("__mesh-out-upstream-")),
             "an unresolved named targetPort must drop the target (fail closed), leaving no upstream"
         );
     }
