@@ -1392,6 +1392,11 @@ pub(crate) fn is_mesh_outbound_route_id(id: &str) -> bool {
 /// does not name a direction-scoped mesh route. The request path uses this to
 /// keep inbound routes off the outbound listener and outbound routes off the
 /// inbound listener (the two capture listeners share one route table).
+///
+/// Only ever called on **proxy (route) ids** — request path, operator-yield,
+/// authz — never on upstream ids. Note that `mesh_outbound_upstream_id` shares
+/// the `__mesh-outbound-` prefix, so passing an upstream id here would
+/// misclassify it as an Outbound route; do not.
 pub(crate) fn mesh_route_direction(id: &str) -> Option<MeshTrafficDirection> {
     if is_mesh_inbound_route_id(id) {
         Some(MeshTrafficDirection::Inbound)
@@ -1856,8 +1861,10 @@ fn materialize_mesh_outbound_proxies(
         // DestinationRule keyed on the service host matches it
         // (`destination_rule_matches_upstream` matches by target host / upstream
         // NAME / id, and the targets are pod IPs) — otherwise no DR traffic policy
-        // (timeouts, LB, outlier, per-port settings) would apply to outbound
-        // HBONE routes.
+        // (top-level connectTimeout / LB / outlier) would apply to outbound HBONE
+        // routes. (Per-port `portLevelSettings` reach this static upstream only
+        // when the dial port equals the service port — see the upstream builder's
+        // note for the `targetPort != port` gap.)
         let service_fqdn = format!(
             "{}.{}.svc.{}",
             service.name,
@@ -2047,8 +2054,14 @@ fn mesh_outbound_hbone_proxy(
 
 /// The upstream backing a materialized outbound HBONE proxy: the service's
 /// HBONE-tagged workload targets with passive health and round-robin LB. Mirrors
-/// the east-west service upstream; `port_overrides` are populated later by
-/// `apply_destination_rules` (re-keyed to the resolved dial port).
+/// the east-west service upstream. Top-level DR traffic policy applies (the
+/// upstream is FQDN-named so DestinationRules match it), but per-port
+/// `portLevelSettings` reach this STATIC upstream only when the dial port equals
+/// the service port: `apply_destination_rules` re-keys service-port→dial-port
+/// only for service-discovery-backed upstreams, so a `targetPort != port`
+/// service drops its per-port settings here (a known gap, same as east-west
+/// static upstreams, pending the service-discovery-backed-upstream rework — see
+/// docs/mesh.md).
 fn mesh_outbound_hbone_upstream(
     upstream_id: &str,
     namespace: &str,
