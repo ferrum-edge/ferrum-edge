@@ -489,14 +489,15 @@ pub(crate) fn run_backend_admission_plugins(
 /// health and least-latency reporting attribute to the upstream that was
 /// actually dispatched to.
 ///
-/// `error_class == Some(ErrorClass::ClientDisconnect)` is handled centrally: a
-/// client-caused disconnect carries no signal about backend health, so it routes
-/// the circuit breaker to `record_neutral` AND skips the least-latency sample and
-/// passive-health report entirely. Callers that detect a client disconnect can
-/// therefore set `connection_error` to whatever is most accurate for their path
-/// without worrying about poisoning backend health — the `ClientDisconnect` arm
-/// suppresses latency/passive regardless, and is evaluated before
-/// `connection_error` for the breaker.
+/// Client-side outcomes that never reached a backend (client disconnects and
+/// gateway request-body-limit rejects) are handled centrally: they carry no
+/// signal about backend health, so they route the circuit breaker to
+/// `record_neutral` AND skip the least-latency sample and passive-health report
+/// entirely. Callers that detect these outcomes can therefore set
+/// `connection_error` to whatever is most accurate for their path without
+/// worrying about poisoning backend health — the neutral arm suppresses
+/// latency/passive regardless, and is evaluated before `connection_error` for
+/// the breaker.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_backend_outcome(
     state: &ProxyState,
@@ -570,6 +571,14 @@ pub(crate) fn record_backend_outcome_no_conn_end(
     );
 }
 
+#[inline]
+fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
+    matches!(
+        error_class,
+        Some(ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge)
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_backend_outcome_inner(
     state: &ProxyState,
@@ -603,7 +612,9 @@ fn record_backend_outcome_inner(
     //   4. No active health checks configured for this upstream — when active probes
     //      exist, they provide consistent, controlled RTT measurements and take
     //      precedence over passive TTFB which includes variable application processing time
-    if error_class != Some(ErrorClass::ClientDisconnect)
+    let client_side_no_backend_signal = client_side_no_backend_signal(error_class);
+
+    if !client_side_no_backend_signal
         && !connection_error
         && response_status < 500
         && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
@@ -628,7 +639,7 @@ fn record_backend_outcome_inner(
             state
                 .circuit_breaker_cache
                 .get_or_create(&proxy.id, final_cb_target_key, cb_config);
-        if error_class == Some(ErrorClass::ClientDisconnect) {
+        if client_side_no_backend_signal {
             cb.record_neutral(is_half_open_probe);
         } else if connection_error {
             // Always route connection errors through record_failure().
@@ -652,7 +663,7 @@ fn record_backend_outcome_inner(
     // failure when that status happens to be in `unhealthy_status_codes`. The
     // sibling H3 oversized/abort paths rely on this so their "must not poison
     // backend passive health" comments hold.
-    if error_class != Some(ErrorClass::ClientDisconnect)
+    if !client_side_no_backend_signal
         && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
         && let Some(upstream) = LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id)
     {
@@ -1217,6 +1228,98 @@ mod tests {
             active(),
             0,
             "record_backend_outcome must end the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_body_too_large_outcome_releases_half_open_probe_neutrally() {
+        // HBONE/native-H3 can detect an oversized Content-Length after
+        // check_circuit_breaker() has reserved a HALF_OPEN probe but before any
+        // backend connection is attempted. That synthetic 413 is a client-side
+        // gateway rejection, not backend recovery, so it must release the probe
+        // slot without counting as a successful recovery probe.
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "cb-body-limit-proxy",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "backend.local",
+                    "backend_port": 8080,
+                    "circuit_breaker": {
+                        "failure_threshold": 1,
+                        "success_threshold": 1,
+                        "timeout_seconds": 0,
+                        "failure_status_codes": [500, 502, 503, 504],
+                        "half_open_max_requests": 1,
+                        "trip_on_connection_errors": true
+                    }
+                }],
+                "upstreams": []
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let cb_config = proxy
+            .circuit_breaker
+            .as_ref()
+            .expect("proxy should have circuit breaker config");
+        let cb_target_key = circuit_breaker_target_key(proxy, None);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.id,
+            cb_target_key.as_deref(),
+            cb_config,
+        );
+
+        cb.record_failure(500, false, false);
+        assert_eq!(cb.state_name(), "open");
+
+        let (final_cb_target_key, is_half_open_probe) =
+            check_circuit_breaker(proxy, &state, None).expect("timeout=0 admits a probe");
+        assert!(
+            is_half_open_probe,
+            "the request must own a HALF_OPEN probe slot"
+        );
+        assert_eq!(cb.state_name(), "half_open");
+        assert_eq!(cb.half_open_in_flight(), 1);
+
+        record_backend_outcome_no_conn_end(
+            &state,
+            proxy,
+            &epoch.load_balancer,
+            None,
+            None,
+            final_cb_target_key.as_deref(),
+            413,
+            false,
+            Some(ErrorClass::RequestBodyTooLarge),
+            is_half_open_probe,
+            false,
+            std::time::Duration::ZERO,
+        );
+
+        assert_eq!(
+            cb.state_name(),
+            "half_open",
+            "synthetic oversized-request 413 must not close the breaker as a successful backend probe"
+        );
+        assert_eq!(
+            cb.success_count(),
+            0,
+            "request-body-limit rejects carry no backend recovery signal"
+        );
+        assert_eq!(
+            cb.half_open_in_flight(),
+            0,
+            "neutral recording must release the reserved probe slot"
         );
     }
 
