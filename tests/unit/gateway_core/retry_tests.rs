@@ -35,6 +35,17 @@ fn connection_failure() -> BackendResponse {
     }
 }
 
+fn post_header_body_read_failure() -> BackendResponse {
+    BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(Vec::new()),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: None,
+        error_class: Some(ErrorClass::ConnectionReset),
+    }
+}
+
 fn dispatch_policy_rejection() -> BackendResponse {
     BackendResponse {
         status_code: 502,
@@ -216,6 +227,24 @@ fn test_connection_failure_ignores_method_filter() {
     let config = default_config();
     assert!(should_retry(&config, "POST", &connection_failure(), 0));
     assert!(should_retry(&config, "PATCH", &connection_failure(), 0));
+}
+
+#[test]
+fn test_post_header_body_read_failure_respects_method_filter() {
+    // Once response headers have arrived, a response-body read failure is
+    // post-wire: the backend may already have committed side effects. It must
+    // not be marked as a connection failure, because that path intentionally
+    // bypasses retryable_methods for pre-wire failures only.
+    let config = RetryConfig {
+        max_retries: 3,
+        retry_on_connect_failure: true,
+        retryable_status_codes: vec![502],
+        ..default_config()
+    };
+    let response = post_header_body_read_failure();
+
+    assert!(!should_retry(&config, "POST", &response, 0));
+    assert!(should_retry(&config, "GET", &response, 0));
 }
 
 #[test]

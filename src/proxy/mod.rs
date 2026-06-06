@@ -13519,8 +13519,10 @@ fn record_h2_pool_admission_failure(
 /// Build a buffered `BackendResponse` from a reqwest body-read result. A read
 /// failure AFTER the response headers arrived (backend reset/closed/timed out
 /// mid-body) is a backend fault, so it must surface as a 502 with
-/// `connection_error` and an error class — NOT the backend's original status with
-/// a silently-emptied body. Otherwise the non-streaming adaptive-concurrency
+/// an error class — NOT the backend's original status with a silently-emptied
+/// body. It is not a connection error because response headers already arrived,
+/// so retry policy must treat it as a post-wire/status failure and preserve
+/// method/idempotency checks. Otherwise the non-streaming adaptive-concurrency
 /// admission (and passive health) record a mid-body backend failure as a healthy
 /// success and can grow the limit. Mirrors the size-limited buffered read paths
 /// that already classify this.
@@ -13547,7 +13549,7 @@ fn buffered_backend_response_from_body_read(
                     r#"{"error":"Backend response body read failed"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
-                connection_error: true,
+                connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ConnectionReset),
             }
