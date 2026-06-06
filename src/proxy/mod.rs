@@ -10395,6 +10395,9 @@ async fn handle_proxy_request_inner(
                         cb_target_key.as_deref(),
                         grpc_cb_probe_slot,
                     );
+                    // The explicit release above consumed the initial HALF_OPEN probe
+                    // slot; disarm the RAII guard so Drop cannot release it again.
+                    grpc_probe_guard.disarm();
                     return Ok(handle_backend_admission_rejection(
                         rejection,
                         &plugins,
@@ -10537,6 +10540,9 @@ async fn handle_proxy_request_inner(
                             cb_target_key.as_deref(),
                             grpc_cb_probe_slot,
                         );
+                        // The explicit release above consumed the initial HALF_OPEN probe
+                        // slot; disarm the RAII guard so Drop cannot release it again.
+                        grpc_probe_guard.disarm();
                         return Ok(handle_backend_admission_rejection(
                             rejection,
                             &plugins,
@@ -10595,6 +10601,9 @@ async fn handle_proxy_request_inner(
                                         cb_target_key.as_deref(),
                                         grpc_cb_probe_slot,
                                     );
+                                    // The explicit release above consumed the initial HALF_OPEN probe
+                                    // slot; disarm the RAII guard so Drop cannot release it again.
+                                    grpc_probe_guard.disarm();
                                     return Ok(handle_backend_admission_rejection(
                                         rejection,
                                         &plugins,
