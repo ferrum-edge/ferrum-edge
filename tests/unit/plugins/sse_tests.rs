@@ -476,17 +476,28 @@ async fn test_retry_ms_not_set_without_config() {
 fn may_modify_response_content_type_reflects_force_sse_content_type() {
     let ctx = make_sse_ctx();
 
-    // force_sse_content_type rewrites a non-SSE backend content-type to
-    // text/event-stream in after_proxy, so the proxy must keep the
-    // buffer/stream decision tied to the final client-visible type.
     let forcing = make_plugin(json!({"force_sse_content_type": true}));
-    assert!(forcing.may_modify_response_content_type(&ctx));
+    // A non-SSE backend type WILL be relabeled to text/event-stream in
+    // after_proxy, so keep the body buffered for final-response inspection.
+    assert!(forcing.may_modify_response_content_type(&ctx, Some("application/json")));
+    // A missing backend Content-Type is also the relabel path (after_proxy
+    // treats a missing/non-SSE type as "force it"), so keep buffering.
+    assert!(forcing.may_modify_response_content_type(&ctx, None));
+    // A genuine text/event-stream response is NOT relabeled by after_proxy, so
+    // it must NOT be pinned to the buffered path — an unbounded stream would
+    // otherwise be collected until the max-response-body 502. Allow the
+    // SSE→stream downgrade (including with a charset parameter).
+    assert!(!forcing.may_modify_response_content_type(&ctx, Some("text/event-stream")));
+    assert!(
+        !forcing.may_modify_response_content_type(&ctx, Some("text/event-stream; charset=utf-8"))
+    );
 
     // Without forcing, the plugin never changes the response content-type
     // (it only adds SSE responses' cache/streaming headers), so the proxy can
     // still downgrade buffering for non-inspectable types.
     let passive = make_plugin(json!({}));
-    assert!(!passive.may_modify_response_content_type(&ctx));
+    assert!(!passive.may_modify_response_content_type(&ctx, Some("application/json")));
+    assert!(!passive.may_modify_response_content_type(&ctx, Some("text/event-stream")));
 }
 
 #[tokio::test]

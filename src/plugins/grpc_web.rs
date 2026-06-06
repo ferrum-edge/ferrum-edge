@@ -453,10 +453,17 @@ impl Plugin for GrpcWebPlugin {
         PluginResult::Continue
     }
 
-    fn may_modify_response_content_type(&self, ctx: &RequestContext) -> bool {
+    fn may_modify_response_content_type(
+        &self,
+        ctx: &RequestContext,
+        _response_content_type: Option<&str>,
+    ) -> bool {
         // `after_proxy` relabels the response `Content-Type` to the gRPC-Web
         // variant exactly when `on_request_received` recorded the original
-        // gRPC-Web content-type. Signal that so the proxy keeps the body
+        // gRPC-Web content-type — independent of the backend response type, so
+        // the request marker alone is the precise signal. (gRPC-Web responses
+        // are already unconditionally buffered to embed trailers, so this never
+        // newly pins a streaming body.) Signal that so the proxy keeps the body
         // buffered for final-response inspection instead of trusting the
         // backend's `application/grpc` header for the buffer/stream decision.
         ctx.metadata.contains_key(META_GRPC_WEB_ORIGINAL_CT)

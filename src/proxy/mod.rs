@@ -863,13 +863,13 @@ pub(crate) fn refine_stream_response_for_content_type(
     let Some(ctx) = ctx else {
         return false;
     };
+    let content_type = response_headers.get("content-type").map(String::as_str);
     if plugins
         .iter()
-        .any(|plugin| plugin.may_modify_response_content_type(ctx))
+        .any(|plugin| plugin.may_modify_response_content_type(ctx, content_type))
     {
         return false;
     }
-    let content_type = response_headers.get("content-type").map(String::as_str);
     // Keep buffering only while at least one plugin still needs the body for
     // this content-type; otherwise stream it straight through.
     !plugins

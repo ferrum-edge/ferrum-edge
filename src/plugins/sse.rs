@@ -276,12 +276,23 @@ impl super::Plugin for SsePlugin {
 
     // ── Phase 3: Set SSE response headers ────────────────────────────────
 
-    fn may_modify_response_content_type(&self, _ctx: &RequestContext) -> bool {
-        // With `force_sse_content_type`, `after_proxy` rewrites a non-SSE
-        // backend `Content-Type` to `text/event-stream`. Signal that so the
-        // proxy's buffer/stream downgrade keys off the final client-visible
-        // type rather than the backend header it is about to overwrite.
-        self.force_sse_content_type
+    fn may_modify_response_content_type(
+        &self,
+        _ctx: &RequestContext,
+        response_content_type: Option<&str>,
+    ) -> bool {
+        // `after_proxy` rewrites the response `Content-Type` to
+        // `text/event-stream` only when `force_sse_content_type` is set AND the
+        // backend did not already send an SSE type. Mirror that exact condition
+        // so the proxy's buffer/stream downgrade keys off the final
+        // client-visible type rather than the backend header it is about to
+        // overwrite — while still letting a genuine `text/event-stream`
+        // response take the SSE→stream downgrade. Returning `true`
+        // unconditionally on `force_sse_content_type` would pin an unbounded SSE
+        // stream onto the buffered path and collect it until the
+        // max-response-body limit 502s it, defeating the SSE-never-buffer
+        // protection every response-buffering plugin already implements.
+        self.force_sse_content_type && !response_content_type.is_some_and(Self::is_sse_content_type)
     }
 
     async fn after_proxy(

@@ -2295,12 +2295,24 @@ pub trait Plugin: Send + Sync {
     /// Returns `true` when this plugin may change the response `Content-Type`
     /// in `after_proxy` for the current request.
     ///
+    /// `response_content_type` is the backend's `Content-Type` — the value the
+    /// downgrade would otherwise key off. Plugins that relabel only *some*
+    /// backend types should consult it so the gate matches their `after_proxy`
+    /// exactly: a plugin that rewrites a non-SSE type to `text/event-stream`
+    /// must return `false` when the backend already sent `text/event-stream`,
+    /// otherwise an unbounded stream is pinned to the buffered path and
+    /// collected until the max-response-body limit 502s it.
+    ///
     /// The proxy uses this as a safety gate before content-type-aware
     /// buffer-to-stream downgrades. If a later `after_proxy` hook can relabel a
     /// response from a non-inspectable type to an inspectable one, body
     /// inspection plugins must keep the buffered path selected by the
     /// pre-flight decision.
-    fn may_modify_response_content_type(&self, _ctx: &RequestContext) -> bool {
+    fn may_modify_response_content_type(
+        &self,
+        _ctx: &RequestContext,
+        _response_content_type: Option<&str>,
+    ) -> bool {
         false
     }
 
