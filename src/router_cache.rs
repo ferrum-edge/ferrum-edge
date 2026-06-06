@@ -29,6 +29,22 @@ thread_local! {
     static CACHE_KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(128));
 }
 
+/// How [`RouterCache::search_route_table`] treats direction-scoped materialized
+/// mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`). The inbound and
+/// outbound capture listeners share one route table, so the slow path filters by
+/// the request's listener direction.
+#[derive(Clone, Copy)]
+enum MeshRouteDirectionFilter {
+    /// Admit all routes regardless of direction — the cached fast path. The
+    /// request handler re-resolves with `MatchingDirection` only if the cached
+    /// winner turns out to be a wrong-direction mesh route.
+    Unfiltered,
+    /// Admit non-mesh routes plus mesh routes whose direction equals this
+    /// request's listener direction (`None` ⇒ a non-mesh listener, which admits
+    /// no direction-scoped mesh route).
+    MatchingDirection(Option<crate::modes::mesh::MeshTrafficDirection>),
+}
+
 /// Result of a route match, containing the matched proxy and any extracted path parameters.
 #[derive(Clone, Debug)]
 pub struct RouteMatch {
@@ -491,9 +507,11 @@ impl RouterCache {
         }
 
         // Slow path: search the host route table (cache miss). The normal lookup
-        // never excludes inbound routes; direction scoping is handled by the
-        // request handlers via `resolve_route_excluding_mesh_inbound`.
-        let result = Self::search_route_table(table, host, path, false);
+        // never filters by direction; direction scoping is handled by the request
+        // handlers via `resolve_route_excluding_wrong_direction` when the cached
+        // winner turns out to be a wrong-direction mesh route.
+        let result =
+            Self::search_route_table(table, host, path, MeshRouteDirectionFilter::Unfiltered);
 
         // Allocate the cache key String only on the cold path (cache miss + insert).
         let cache_key = make_cache_key(host, path);
@@ -570,15 +588,23 @@ impl RouterCache {
         table: &HostRouteTable,
         host: Option<&str>,
         path: &str,
-        exclude_mesh_inbound: bool,
+        direction_filter: MeshRouteDirectionFilter,
     ) -> Option<RouteMatch> {
-        // Admit a tier's match unless it is a materialized sidecar inbound route
-        // (`__mesh-inbound-*`) that this lookup is excluding. Dropping the match
-        // here lets the tiered search fall through to a lower-priority valid
-        // route instead of returning that inbound-only route. A no-op (and
-        // zero-cost via short-circuit) on the normal lookup path.
-        let admit = |rm: &RouteMatch| {
-            !(exclude_mesh_inbound && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id))
+        // Admit a tier's match unless it is a direction-scoped materialized mesh
+        // route (`__mesh-inbound-*` / `__mesh-outbound-*`) excluded by this lookup
+        // because the request's listener direction does not match the route's
+        // direction. Dropping the match here lets the tiered search fall through
+        // to a lower-priority valid route instead of returning a wrong-direction
+        // route. A no-op (and zero-cost via short-circuit) on the normal
+        // `Unfiltered` lookup path.
+        let admit = |rm: &RouteMatch| match direction_filter {
+            MeshRouteDirectionFilter::Unfiltered => true,
+            MeshRouteDirectionFilter::MatchingDirection(req_dir) => {
+                match crate::modes::mesh::mesh_route_direction(&rm.proxy.id) {
+                    None => true,
+                    Some(route_dir) => req_dir == Some(route_dir),
+                }
+            }
         };
         if let Some(host) = host {
             // 1. Exact host match — exact path, prefix, regex, then host-only
@@ -678,19 +704,30 @@ impl RouterCache {
         None
     }
 
-    /// Resolve a route while **excluding** materialized sidecar inbound
-    /// (`__mesh-inbound-*`) routes. Uncached slow-path lookup used by the request
-    /// handlers only when a non-inbound (e.g. outbound capture) request happens
-    /// to match an inbound-only route — it re-resolves so a valid lower-priority
-    /// route is found instead of serving the inbound loopback route or 404ing.
-    pub(crate) fn resolve_route_excluding_mesh_inbound(
+    /// Resolve a route while keeping only mesh routes whose direction matches the
+    /// request's listener direction (`req_direction`); non-mesh routes are always
+    /// admitted. Uncached slow-path lookup used by the request handlers only when
+    /// the cached winner is a direction-scoped mesh route (`__mesh-inbound-*` /
+    /// `__mesh-outbound-*`) that does NOT match the current listener direction:
+    /// it re-resolves so a valid lower-priority route is found instead of serving
+    /// a wrong-direction route or 404ing. The inbound and outbound capture
+    /// listeners share one route table, so this keeps each listener serving only
+    /// its own direction's materialized routes. `req_direction == None` (a
+    /// non-mesh listener) excludes every direction-scoped mesh route.
+    pub(crate) fn resolve_route_excluding_wrong_direction(
         &self,
         table: &HostRouteTable,
         host: Option<&str>,
         path: &str,
+        req_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     ) -> Option<RouteMatch> {
         let normalized = normalize_encoded_slashes(path);
-        Self::search_route_table(table, host, &normalized, true)
+        Self::search_route_table(
+            table,
+            host,
+            &normalized,
+            MeshRouteDirectionFilter::MatchingDirection(req_direction),
+        )
     }
 
     /// Cache statistics for metrics: (prefix_entries, regex_entries, prefix_evictions, regex_evictions, max_entries).
@@ -1650,6 +1687,89 @@ mod tests {
             proxies,
             ..GatewayConfig::default()
         }
+    }
+
+    #[test]
+    fn resolve_route_excluding_wrong_direction_scopes_mesh_routes_by_listener() {
+        use crate::modes::mesh::MeshTrafficDirection;
+        // A materialized mesh route is served ONLY on its own direction's
+        // listener. The inbound and outbound capture listeners share one route
+        // table; the slow-path resolver drops a route whose direction does not
+        // match the request's listener direction (and a non-mesh `None` listener
+        // — e.g. the H3 frontend — drops every direction-scoped mesh route),
+        // falling through to whatever lower-priority route remains (here, none).
+        let mut outbound = minimal_proxy_for_routing("__mesh-outbound-default-ratings-8080", "/");
+        outbound.hosts = vec!["ratings".to_string()];
+        let config = GatewayConfig {
+            proxies: vec![outbound],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        // Outbound listener: the outbound route is served.
+        let outb = cache
+            .resolve_route_excluding_wrong_direction(
+                &table,
+                Some("ratings"),
+                "/",
+                Some(MeshTrafficDirection::Outbound),
+            )
+            .expect("outbound listener serves the outbound route");
+        assert_eq!(outb.proxy.id, "__mesh-outbound-default-ratings-8080");
+        // Inbound listener and non-mesh (H3) listener: wrong direction → dropped.
+        assert!(
+            cache
+                .resolve_route_excluding_wrong_direction(
+                    &table,
+                    Some("ratings"),
+                    "/",
+                    Some(MeshTrafficDirection::Inbound),
+                )
+                .is_none(),
+            "an outbound route must not serve on the inbound listener"
+        );
+        assert!(
+            cache
+                .resolve_route_excluding_wrong_direction(&table, Some("ratings"), "/", None)
+                .is_none(),
+            "a non-mesh listener serves no direction-scoped mesh route"
+        );
+
+        // The inbound prefix is the mirror image: served on the inbound listener,
+        // dropped on the outbound listener.
+        let mut inbound = minimal_proxy_for_routing("__mesh-inbound-default-reviews-8080", "/");
+        inbound.hosts = vec!["reviews".to_string()];
+        let config = GatewayConfig {
+            proxies: vec![inbound],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+        assert_eq!(
+            cache
+                .resolve_route_excluding_wrong_direction(
+                    &table,
+                    Some("reviews"),
+                    "/",
+                    Some(MeshTrafficDirection::Inbound),
+                )
+                .expect("inbound listener serves the inbound route")
+                .proxy
+                .id,
+            "__mesh-inbound-default-reviews-8080"
+        );
+        assert!(
+            cache
+                .resolve_route_excluding_wrong_direction(
+                    &table,
+                    Some("reviews"),
+                    "/",
+                    Some(MeshTrafficDirection::Outbound),
+                )
+                .is_none(),
+            "an inbound route must not serve on the outbound listener"
+        );
     }
 
     #[test]

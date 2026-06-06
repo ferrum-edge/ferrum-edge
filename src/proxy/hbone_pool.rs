@@ -593,7 +593,10 @@ impl HboneConnectionPool {
             set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
         }
 
-        let tls_config = build_spiffe_outbound_config(self.gateway_svid.clone(), None)?;
+        // HBONE is HTTP/2 CONNECT over mTLS — advertise h2 only so a sidecar can
+        // reject non-HBONE clients at ALPN.
+        let tls_config =
+            build_spiffe_outbound_config(self.gateway_svid.clone(), None, vec![b"h2".to_vec()])?;
         let connector = TlsConnector::from(tls_config);
         let server_name = rustls::pki_types::ServerName::try_from(target_host.to_string())
             .map_err(|e| HbonePoolError::InvalidServerName {

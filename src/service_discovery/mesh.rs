@@ -167,32 +167,12 @@ impl MeshServiceDiscoverer {
         workload: &Workload,
         selected_port: &SelectedPort,
     ) -> HashMap<String, String> {
-        let mut tags = HashMap::new();
-        tags.insert("mesh.hbone".to_string(), "true".to_string());
-        tags.insert("mesh.namespace".to_string(), workload.namespace.clone());
-        tags.insert("mesh.service".to_string(), service.name.clone());
-        tags.insert(
-            "mesh.spiffe_id".to_string(),
-            workload.spiffe_id.as_str().to_string(),
-        );
-        tags.insert(
-            "mesh.trust_domain".to_string(),
-            workload.trust_domain.as_str().to_string(),
-        );
-        tags.insert(
-            "mesh.protocol".to_string(),
-            protocol_tag(selected_port.protocol).to_string(),
-        );
-        if let Some(port_name) = &selected_port.name {
-            tags.insert("mesh.port_name".to_string(), port_name.clone());
-        }
-        if let Some(network) = &workload.network {
-            tags.insert("mesh.network".to_string(), network.clone());
-        }
-        if let Some(cluster) = &workload.cluster {
-            tags.insert("mesh.cluster".to_string(), cluster.clone());
-        }
-        tags
+        mesh_hbone_target_tags(
+            service,
+            workload,
+            selected_port.protocol,
+            selected_port.name.as_deref(),
+        )
     }
 }
 
@@ -295,6 +275,49 @@ fn protocol_tag(protocol: AppProtocol) -> &'static str {
         AppProtocol::Postgres => "postgres",
         AppProtocol::Unknown => "unknown",
     }
+}
+
+/// Build the `mesh.*` UpstreamTarget tags that mark a target for HBONE dispatch
+/// (HTTP/2 CONNECT over auto-originated SVID mTLS) and carry the peer identity
+/// the mTLS handshake verifies (`mesh.spiffe_id` / `mesh.trust_domain`).
+///
+/// Shared by runtime mesh service discovery
+/// ([`MeshServiceDiscoverer::tags_for_target`]) and by Ambient outbound route
+/// materialization (`modes::mesh::build_outbound_hbone_targets`) so the two paths
+/// cannot drift on the tag contract that `proxy::hbone_pool` and
+/// `supports_hbone_backend` consume.
+pub(crate) fn mesh_hbone_target_tags(
+    service: &MeshService,
+    workload: &Workload,
+    protocol: AppProtocol,
+    port_name: Option<&str>,
+) -> HashMap<String, String> {
+    let mut tags = HashMap::new();
+    tags.insert("mesh.hbone".to_string(), "true".to_string());
+    tags.insert("mesh.namespace".to_string(), workload.namespace.clone());
+    tags.insert("mesh.service".to_string(), service.name.clone());
+    tags.insert(
+        "mesh.spiffe_id".to_string(),
+        workload.spiffe_id.as_str().to_string(),
+    );
+    tags.insert(
+        "mesh.trust_domain".to_string(),
+        workload.trust_domain.as_str().to_string(),
+    );
+    tags.insert(
+        "mesh.protocol".to_string(),
+        protocol_tag(protocol).to_string(),
+    );
+    if let Some(port_name) = port_name {
+        tags.insert("mesh.port_name".to_string(), port_name.to_string());
+    }
+    if let Some(network) = &workload.network {
+        tags.insert("mesh.network".to_string(), network.clone());
+    }
+    if let Some(cluster) = &workload.cluster {
+        tags.insert("mesh.cluster".to_string(), cluster.clone());
+    }
+    tags
 }
 
 #[cfg(test)]

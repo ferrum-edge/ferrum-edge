@@ -138,9 +138,17 @@ pub fn build_spiffe_client_cert_verifier(
 /// - Presents the SVID currently in `bundle_slot`.
 /// - Validates the server's SVID against the trust bundle.
 /// - Optionally pins the peer SPIFFE ID (`expected_peer`).
+/// - Advertises the given `alpn_protocols`.
+///
+/// HBONE callers pass `["h2"]` (HTTP/2 CONNECT over mTLS). Sidecar outbound
+/// SVID-mTLS-HTTP origination (to a peer's `:15006`, which negotiates
+/// `["h2","http/1.1"]`) passes the protocol(s) the backend client speaks. The
+/// verifier and client-cert resolver are transport-agnostic — only the ALPN and
+/// the post-TLS framing differ between HBONE and plain mesh HTTP.
 pub fn build_spiffe_outbound_config(
     bundle_slot: SharedBundleSlot,
     expected_peer: Option<SpiffeId>,
+    alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<Arc<ClientConfig>, SpiffeTlsError> {
     if bundle_slot.load_full().is_none() {
         return Err(SpiffeTlsError::NoSvid);
@@ -157,10 +165,7 @@ pub fn build_spiffe_outbound_config(
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_client_cert_resolver(Arc::new(resolver));
-    // SPIFFE outbound is used for HBONE, which is HTTP/2 CONNECT over mTLS.
-    // Advertising h2 here lets sidecars reject non-HBONE clients at ALPN and
-    // keeps callers from having to clone/mutate rustls configs per tunnel.
-    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    cfg.alpn_protocols = alpn_protocols;
     Ok(Arc::new(cfg))
 }
 

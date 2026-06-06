@@ -1092,19 +1092,21 @@ async fn handle_h3_request(
         &path,
     );
 
-    // Materialized sidecar inbound routes (`__mesh-inbound-*`) are direction-
-    // scoped: the H3 frontend is never the mesh inbound mTLS listener, so if a
-    // request matched one, re-resolve excluding inbound routes (mirrors the
-    // H1/H2 handler) so it is not shortcut to the local loopback backend.
+    // Materialized mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`) are
+    // direction-scoped (see the H1/H2 handler). The H3 frontend is never a mesh
+    // capture listener, so `ctx.mesh_direction` is `None` here and any matched
+    // mesh route is wrong-direction: re-resolve keeping only matching-direction
+    // routes so an H3 request is never shortcut to a loopback/HBONE mesh route.
     let route_match = match route_match {
         Some(rm)
-            if ctx.mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
-                && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id) =>
+            if crate::modes::mesh::mesh_route_direction(&rm.proxy.id)
+                .is_some_and(|route_dir| Some(route_dir) != ctx.mesh_direction) =>
         {
-            state.router_cache.resolve_route_excluding_mesh_inbound(
+            state.router_cache.resolve_route_excluding_wrong_direction(
                 &epoch.route_table,
                 request_host.as_deref(),
                 &path,
+                ctx.mesh_direction,
             )
         }
         other => other,

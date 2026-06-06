@@ -9301,20 +9301,24 @@ async fn handle_proxy_request_inner(
         &path,
     );
 
-    // Materialized sidecar inbound routes (`__mesh-inbound-*`) are direction-
-    // scoped: only the inbound listener may serve them. If a non-inbound request
-    // matched one, re-resolve excluding inbound routes so a valid lower-priority
-    // route is found instead of shortcutting the app's own-service traffic to
-    // loopback (or 404ing past a real outbound route).
+    // Materialized mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`) are
+    // direction-scoped: the inbound and outbound capture listeners share one
+    // route table, so each may serve only its own direction's routes. If the
+    // cached winner is a mesh route whose direction does not match this request's
+    // listener direction, re-resolve keeping only matching-direction routes — so
+    // a peer's inbound request is not re-tunnelled out an outbound HBONE route,
+    // and an app's outbound request is not shortcut to the local inbound loopback
+    // (and neither 404s past a valid lower-priority route).
     let route_match = match route_match {
         Some(rm)
-            if ctx.mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
-                && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id) =>
+            if crate::modes::mesh::mesh_route_direction(&rm.proxy.id)
+                .is_some_and(|route_dir| Some(route_dir) != ctx.mesh_direction) =>
         {
-            state.router_cache.resolve_route_excluding_mesh_inbound(
+            state.router_cache.resolve_route_excluding_wrong_direction(
                 &epoch.route_table,
                 request_host.as_deref(),
                 &path,
+                ctx.mesh_direction,
             )
         }
         other => other,
