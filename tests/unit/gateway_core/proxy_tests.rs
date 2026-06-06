@@ -259,9 +259,9 @@ fn test_no_match() {
 
 use async_trait::async_trait;
 use ferrum_edge::_test_support::{
-    apply_request_body_plugins, can_use_direct_http2_pool, extract_grpc_reject_message,
-    insert_grpc_error_metadata, map_http_reject_status_to_grpc_status, normalize_reject_response,
-    request_may_have_body,
+    apply_request_body_plugins, can_dispatch_direct_http2_pool, can_use_direct_http2_pool,
+    extract_grpc_reject_message, insert_grpc_error_metadata, map_http_reject_status_to_grpc_status,
+    normalize_reject_response, request_may_have_body,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
@@ -641,6 +641,14 @@ fn test_direct_http2_pool_requires_http2_without_retries_or_request_buffering() 
     assert!(!can_use_direct_http2_pool(false, false, false));
     assert!(!can_use_direct_http2_pool(true, true, false));
     assert!(!can_use_direct_http2_pool(true, false, true));
+}
+
+#[test]
+fn test_direct_http2_pool_dispatch_disabled_by_body_limits() {
+    assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 0));
+    assert!(!can_dispatch_direct_http2_pool(true, false, false, 1, 0));
+    assert!(!can_dispatch_direct_http2_pool(true, false, false, 0, 1));
+    assert!(!can_dispatch_direct_http2_pool(true, true, false, 0, 0));
 }
 
 #[test]

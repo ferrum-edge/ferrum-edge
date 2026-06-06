@@ -453,6 +453,22 @@ pub mod _test_support {
         )
     }
 
+    pub fn can_dispatch_direct_http2_pool(
+        enable_http2: bool,
+        retain_request_body: bool,
+        requires_request_body_buffering: bool,
+        max_request_body_size_bytes: usize,
+        max_response_body_size_bytes: usize,
+    ) -> bool {
+        crate::proxy::can_dispatch_direct_http2_pool(
+            enable_http2,
+            retain_request_body,
+            requires_request_body_buffering,
+            max_request_body_size_bytes,
+            max_response_body_size_bytes,
+        )
+    }
+
     pub fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
         crate::proxy::request_may_have_body(method, headers)
     }

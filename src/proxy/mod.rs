@@ -1090,6 +1090,27 @@ pub(crate) fn can_use_direct_http2_pool(
     enable_http2 && !retain_request_body && !requires_request_body_buffering
 }
 
+/// Whether HTTPS requests may dispatch over the direct hyper HTTP/2 backend pool.
+///
+/// `get_sender()` may dial or probe the backend, so callers must use this
+/// stricter predicate before opening an H2 sender. When body-size limits are
+/// enabled, the request must stay on the reqwest path so local request-size
+/// checks and deferred backend admission run before any backend interaction.
+pub(crate) fn can_dispatch_direct_http2_pool(
+    enable_http2: bool,
+    retain_request_body: bool,
+    requires_request_body_buffering: bool,
+    max_request_body_size_bytes: usize,
+    max_response_body_size_bytes: usize,
+) -> bool {
+    can_use_direct_http2_pool(
+        enable_http2,
+        retain_request_body,
+        requires_request_body_buffering,
+    ) && max_request_body_size_bytes == 0
+        && max_response_body_size_bytes == 0
+}
+
 pub(crate) fn supports_native_http3_backend(
     state: &ProxyState,
     proxy: &Proxy,
@@ -13837,6 +13858,13 @@ async fn proxy_to_backend(
             retain_request_body,
             requires_request_body_buffering,
         );
+        let direct_h2_can_dispatch = can_dispatch_direct_http2_pool(
+            pool_config.enable_http2,
+            retain_request_body,
+            requires_request_body_buffering,
+            state.max_request_body_size_bytes,
+            state.max_response_body_size_bytes,
+        );
         if requires_direct_h2_for_sni && direct_h2_known_unsupported {
             debug!(
                 proxy_id = %proxy.id,
@@ -13849,39 +13877,25 @@ async fn proxy_to_backend(
                 None,
             );
         }
-        if direct_h2_compatible && (direct_h2_supports || requires_direct_h2_for_sni) {
-            // Gate adaptive-concurrency admission BEFORE opening the H2 sender,
-            // but ONLY when this request can actually dispatch over direct H2 —
-            // i.e. body-size limits are disabled. `get_sender()` can dial the
-            // backend, so for the dispatching case admitting afterward would let
-            // a capacity-rejected request still create a connection and would
-            // hide get_sender connect failures from the limiter. When body-size
-            // limits are enabled this branch always falls through to the reqwest
-            // path, so admission must be deferred there (run after the reqwest
-            // request-size checks) — otherwise a capacity rejection here returns
-            // a 503 and an oversized upload that should be a local 413 is masked
-            // as upstream concurrency pressure. On any fall-through,
-            // `h2_admission_permits` drops, releasing the in-flight slot so the
-            // reqwest path re-admits.
-            let h2_can_dispatch =
-                state.max_request_body_size_bytes == 0 && state.max_response_body_size_bytes == 0;
-            let mut h2_admission_permits = if h2_can_dispatch {
-                match backend_dispatch::run_backend_admission_plugins(
-                    backend_admission_plugins,
-                    request_ctx,
-                    proxy,
-                    upstream_target,
-                    ProxyProtocol::Http,
-                ) {
-                    Ok(permits) => permits,
-                    Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
-                }
-            } else {
-                None
+        if direct_h2_can_dispatch && (direct_h2_supports || requires_direct_h2_for_sni) {
+            // Gate adaptive-concurrency admission BEFORE opening the H2 sender.
+            // `get_sender()` can dial the backend, so admitting afterward would
+            // let a capacity-rejected request still create a connection and
+            // would hide get_sender connect failures from the limiter. Body-size
+            // limited requests intentionally do not enter this block: they must
+            // stay on the reqwest path so local 413 checks and deferred backend
+            // admission happen before any backend interaction.
+            let mut h2_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                backend_admission_plugins,
+                request_ctx,
+                proxy,
+                upstream_target,
+                ProxyProtocol::Http,
+            ) {
+                Ok(permits) => permits,
+                Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
             };
-            if h2_can_dispatch {
-                *backend_admission_started_at = Instant::now();
-            }
+            *backend_admission_started_at = Instant::now();
             let direct_h2_sender = match state.http2_pool.get_sender(direct_h2_proxy).await {
                 Ok(sender) => Some(sender),
                 Err(e) => {
@@ -13951,64 +13965,66 @@ async fn proxy_to_backend(
                 }
             };
             if let Some(sender) = direct_h2_sender {
-                if h2_can_dispatch {
-                    let request = match client_request_body {
-                        ClientRequestBody::Streaming(request) => *request,
-                        ClientRequestBody::Buffered(_) => {
-                            debug_assert!(
-                                false,
-                                "direct HTTP/2 pool should not be used when request body is pre-buffered"
-                            );
-                            return backend_dispatch_response(
-                                retry::BackendResponse {
-                                    status_code: 500,
-                                    body: ResponseBody::Buffered(
-                                        r#"{"error":"Request buffering invariant violated"}"#
-                                            .as_bytes()
-                                            .to_vec(),
-                                    ),
-                                    headers: HashMap::new(),
-                                    connection_error: false,
-                                    backend_resolved_ip: resolved_ip,
-                                    error_class: None,
-                                },
-                                None,
-                                None,
-                            );
-                        }
-                    };
-                    return backend_dispatch_response(
-                        proxy_to_backend_http2(
-                            state,
-                            direct_h2_proxy,
-                            sender,
-                            backend_url,
-                            method,
-                            headers,
-                            request,
-                            plugins,
-                            response_decision_ctx,
-                            stream_response,
-                            client_ip,
-                            is_tls,
-                            resolved_ip,
-                            ctx_bytes_sent_observed,
-                        )
-                        .await,
-                        None,
-                        h2_admission_permits.take(),
-                    );
-                }
-                debug!(
-                    proxy_id = %proxy.id,
-                    max_request_body_size_bytes = state.max_request_body_size_bytes,
-                    max_response_body_size_bytes = state.max_response_body_size_bytes,
-                    "H2 pool bypassed because body-size limits are enabled — using reqwest path"
+                let request = match client_request_body {
+                    ClientRequestBody::Streaming(request) => *request,
+                    ClientRequestBody::Buffered(_) => {
+                        debug_assert!(
+                            false,
+                            "direct HTTP/2 pool should not be used when request body is pre-buffered"
+                        );
+                        return backend_dispatch_response(
+                            retry::BackendResponse {
+                                status_code: 500,
+                                body: ResponseBody::Buffered(
+                                    r#"{"error":"Request buffering invariant violated"}"#
+                                        .as_bytes()
+                                        .to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: false,
+                                backend_resolved_ip: resolved_ip,
+                                error_class: None,
+                            },
+                            None,
+                            None,
+                        );
+                    }
+                };
+                return backend_dispatch_response(
+                    proxy_to_backend_http2(
+                        state,
+                        direct_h2_proxy,
+                        sender,
+                        backend_url,
+                        method,
+                        headers,
+                        request,
+                        plugins,
+                        response_decision_ctx,
+                        stream_response,
+                        client_ip,
+                        is_tls,
+                        resolved_ip,
+                        ctx_bytes_sent_observed,
+                    )
+                    .await,
+                    None,
+                    h2_admission_permits.take(),
                 );
             }
             // Fall through to the reqwest path: `h2_admission_permits` drops here,
             // releasing the in-flight slot so the reqwest path below re-admits
             // after its own request-body collection / final-body hooks.
+        } else if direct_h2_compatible
+            && !direct_h2_can_dispatch
+            && (direct_h2_supports || requires_direct_h2_for_sni)
+        {
+            debug!(
+                proxy_id = %proxy.id,
+                max_request_body_size_bytes = state.max_request_body_size_bytes,
+                max_response_body_size_bytes = state.max_response_body_size_bytes,
+                "H2 pool bypassed because body-size limits are enabled"
+            );
         }
         if requires_direct_h2_for_sni {
             warn!(
