@@ -453,6 +453,15 @@ impl Plugin for GrpcWebPlugin {
         PluginResult::Continue
     }
 
+    fn may_modify_response_content_type(&self, ctx: &RequestContext) -> bool {
+        // `after_proxy` relabels the response `Content-Type` to the gRPC-Web
+        // variant exactly when `on_request_received` recorded the original
+        // gRPC-Web content-type. Signal that so the proxy keeps the body
+        // buffered for final-response inspection instead of trusting the
+        // backend's `application/grpc` header for the buffer/stream decision.
+        ctx.metadata.contains_key(META_GRPC_WEB_ORIGINAL_CT)
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,

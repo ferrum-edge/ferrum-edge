@@ -276,6 +276,14 @@ impl super::Plugin for SsePlugin {
 
     // ── Phase 3: Set SSE response headers ────────────────────────────────
 
+    fn may_modify_response_content_type(&self, _ctx: &RequestContext) -> bool {
+        // With `force_sse_content_type`, `after_proxy` rewrites a non-SSE
+        // backend `Content-Type` to `text/event-stream`. Signal that so the
+        // proxy's buffer/stream downgrade keys off the final client-visible
+        // type rather than the backend header it is about to overwrite.
+        self.force_sse_content_type
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,

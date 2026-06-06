@@ -472,6 +472,23 @@ async fn test_retry_ms_not_set_without_config() {
 
 // ── after_proxy: force_sse_content_type ───────────────────────────────────────
 
+#[test]
+fn may_modify_response_content_type_reflects_force_sse_content_type() {
+    let ctx = make_sse_ctx();
+
+    // force_sse_content_type rewrites a non-SSE backend content-type to
+    // text/event-stream in after_proxy, so the proxy must keep the
+    // buffer/stream decision tied to the final client-visible type.
+    let forcing = make_plugin(json!({"force_sse_content_type": true}));
+    assert!(forcing.may_modify_response_content_type(&ctx));
+
+    // Without forcing, the plugin never changes the response content-type
+    // (it only adds SSE responses' cache/streaming headers), so the proxy can
+    // still downgrade buffering for non-inspectable types.
+    let passive = make_plugin(json!({}));
+    assert!(!passive.may_modify_response_content_type(&ctx));
+}
+
 #[tokio::test]
 async fn test_force_sse_content_type_on_json_response() {
     let plugin = make_plugin(json!({"force_sse_content_type": true}));
