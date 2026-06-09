@@ -10,12 +10,13 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 2. **`authenticate`** — Identifies the consumer (mTLS, JWKS, JWT, API Key, LDAP, Basic Auth, HMAC)
 3. **`authorize`** — Checks consumer permissions and policy decisions (Access Control, OPA, consumer-mode rate limiting)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
-5. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
-6. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
-7. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
-8. **`on_final_response_body`** — Validates or stores the final client-visible buffered body (Body Validator, Response Size Limiting, Response Caching)
-9. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
-10. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
+5. **`backend_admission`** — Decides whether the selected backend target can accept one more in-flight request after load balancing
+6. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
+7. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
+8. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
+9. **`on_final_response_body`** — Validates or stores the final client-visible buffered body (Body Validator, Response Size Limiting, Response Caching)
+10. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
+11. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
 
 ## Custom Plugins
 
@@ -1947,6 +1948,50 @@ Limits concurrent TCP connections per observed client identity on a per-proxy ba
 The proxy ID is included so the same identity can hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners.
 
 This makes plaintext TCP listeners IP-scoped, while TCP+TLS and UDP+DTLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP/UDP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
+
+### `adaptive_concurrency`
+
+Protects upstreams by admitting backend dispatch only when the selected target is healthy enough to accept one more in-flight request. It shrinks a per-target concurrency limit when backend latency rises above the learned baseline, when backend responses are 5xx, when a backend response exceeds the configured maximum body size, or when connection errors occur; it cautiously increases the limit when the target is saturated and healthy. Client-side outcomes — a client disconnect, or an oversized client upload the gateway rejects with 413 — release the permit without feeding any latency, growth, or shrink signal, so aborted or abusive requests cannot train the limiter for an otherwise healthy backend.
+
+**Priority:** 2090
+**Phase:** `backend_admission`
+**Supported protocols:** HTTP, gRPC, WebSocket
+
+For HTTP and gRPC, admission runs after load balancing selects the backend target and after request-body buffering/final-body hooks complete, immediately before the gateway opens/sends each backend attempt; the latency sample is measured from that dispatch point so slow client uploads and body-plugin time are never attributed to the backend. HTTP/3 frontends run the same target-aware admission for both native QUIC backend dispatch and the fallback H3-to-H1/H2 bridge. For WebSocket, admission runs once during the upgrade handshake and the permit is held for the full upgraded session, including HTTP/3 WebSocket. Because that permit stays held for the session, a successful handshake records its backend-connect latency but does **not** grow the limit — otherwise every concurrent session would ratchet it upward and defeat the in-flight session cap; latency and failure signals can still shrink it.
+
+**Behavior notes:**
+
+- **Streaming responses** record their latency sample at TTFB (response-header arrival) while the in-flight slot is held for the full body. Unlike a WebSocket session this slot is still transient (it frees when the body completes), so streaming keeps the normal growth behavior rather than the handshake-style suppression above. For very long-lived streaming/SSE backends this means the limit can grow on fast TTFB while slots stay tied up for the stream duration.
+- **`target_latency_multiplier`** is relative to the *minimum* observed backend latency, which is tracked as a monotonically-decreasing baseline that does not decay back up. A single unusually-fast response (a tiny `200`, a `304`, a cache hit) permanently lowers the baseline and tightens the target, which can keep the limit pinned low. Prefer a multiplier with headroom (the `1.5` default is conservative) for backends whose latency varies widely.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `key_by` | String | `proxy_target` | Limit scope: `proxy_target` keys by proxy plus selected backend, `upstream_target` keys by upstream plus selected backend when the proxy uses an upstream, and `backend_target` shares one limit per backend endpoint across every proxy using this plugin instance. |
+| `max_tracked_keys` | u64 | `10000` | Maximum number of distinct target keys this plugin instance tracks, bounding memory under high-cardinality (e.g. wildcard upstream) traffic. The cap bounds the limiter's own memory only: a target beyond it **fails open** — admitted without adaptive limiting rather than rejected — so a new target is never black-holed and `shadow_mode` never rejects. Tracked targets continue to be admitted subject to their adaptive limit. |
+| `min_limit` | u64 | `1` | Lower bound for the adaptive in-flight request limit. Must be greater than zero. |
+| `initial_limit` | u64 | `32` | Starting in-flight request limit for a new target key. Must be between `min_limit` and `max_limit`. |
+| `max_limit` | u64 | `1024` | Upper bound for the adaptive in-flight request limit. Must be at least `min_limit`. |
+| `min_samples` | u64 | `20` | Successful backend samples required before latency-based growth/shrink decisions are applied. |
+| `target_latency_multiplier` | f64 | `1.5` | Target latency threshold as a multiple of the learned minimum observed backend latency. Must be finite and greater than `1.0`. |
+| `decrease_ratio` | f64 | `0.8` | Multiplicative decrease applied after a failure signal or high latency. Must be greater than `0` and less than `1`. |
+| `increase_step` | u64 | `1` | Additive increase applied when the target is saturated and latency remains within the target. |
+| `shadow_mode` | bool | `false` | Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. |
+| `expose_headers` | bool | `false` | Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on rejection responses. |
+
+```yaml
+plugin_name: adaptive_concurrency
+config:
+  key_by: upstream_target
+  max_tracked_keys: 10000
+  initial_limit: 32
+  min_limit: 2
+  max_limit: 512
+  min_samples: 20
+  target_latency_multiplier: 1.5
+  decrease_ratio: 0.8
+  increase_step: 1
+  shadow_mode: false
+```
 
 ### `ip_restriction`
 

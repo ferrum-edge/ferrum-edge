@@ -127,6 +127,146 @@ async fn jsonrpc_policy_deny_preserves_request_id() {
 }
 
 #[tokio::test]
+async fn jsonrpc_batch_policy_deny_rejects_denied_member() {
+    let plugin = plugin(json!({
+        "policy": {
+            "methods": {
+                "message/send": {"action": "deny"}
+            }
+        }
+    }));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!([
+        {
+            "jsonrpc": "2.0",
+            "id": "req-allowed",
+            "method": "tasks/get"
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "req-denied",
+            "method": "message/send"
+        }
+    ]));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = result
+    else {
+        panic!("batch containing a denied JSON-RPC method should reject");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    let response = body
+        .as_array()
+        .and_then(|responses| responses.first())
+        .expect("batch denial should be wrapped in a JSON-RPC batch response");
+    assert_eq!(response["id"], "req-denied");
+    assert_eq!(response["error"]["data"]["method"], "message/send");
+    assert_eq!(
+        ctx.metadata.get("a2a.policy_decision").map(String::as_str),
+        Some("deny")
+    );
+}
+
+#[tokio::test]
+async fn jsonrpc_batch_policy_deny_rejects_uninspectable_member() {
+    let plugin = plugin(json!({
+        "policy": {
+            "methods": {
+                "message/send": {"action": "deny"}
+            }
+        }
+    }));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!([
+        {
+            "jsonrpc": "2.0",
+            "id": "req-allowed",
+            "method": "tasks/get"
+        },
+        "not-an-envelope"
+    ]));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = result
+    else {
+        panic!("uninspectable batch with method policy should reject");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    let response = body
+        .as_array()
+        .and_then(|responses| responses.first())
+        .expect("uninspectable batch should be wrapped in a JSON-RPC batch response");
+    assert!(response["id"].is_null());
+    assert_eq!(response["error"]["data"]["method"], "unknown");
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("request_body_uninspectable")
+    );
+}
+
+#[tokio::test]
+async fn jsonrpc_single_method_without_version_fails_closed_when_policy_denies() {
+    // A single (non-batch) body that carries a JSON-RPC `method` but omits a
+    // valid `jsonrpc: "2.0"` envelope must not slip past a deny policy by being
+    // treated as "not A2A". It fails closed exactly as a batch member would.
+    let plugin = plugin(json!({
+        "policy": {
+            "methods": {
+                "message/send": {"action": "deny"}
+            }
+        }
+    }));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "id": "req-malformed",
+        "method": "message/send"
+    }));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = result
+    else {
+        panic!(
+            "single method-bearing body with a malformed envelope should reject under a deny policy"
+        );
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    // A single (non-batch) denial is a bare object, not a batch array.
+    assert!(!body.is_array());
+    assert_eq!(body["error"]["data"]["method"], "unknown");
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("request_body_uninspectable")
+    );
+}
+
+#[tokio::test]
+async fn jsonrpc_single_body_without_method_passes_through_under_deny_policy() {
+    // A body with no JSON-RPC `method` is not a method call; it must keep
+    // passing through even when a deny policy exists, so the single-object
+    // fail-closed path does not over-block non-A2A JSON.
+    let plugin = plugin(json!({
+        "policy": {
+            "methods": {
+                "message/send": {"action": "deny"}
+            }
+        }
+    }));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({ "foo": "bar" }));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a method-less body must not be denied by the single-object fail-closed path"
+    );
+}
+
+#[tokio::test]
 async fn jsonrpc_pascalcase_method_is_detected_and_policy_normalized() {
     let plugin = plugin(json!({
         "policy": {

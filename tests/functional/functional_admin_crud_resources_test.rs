@@ -46,6 +46,7 @@ const PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
     "security_headers",
     "access_control",
     "tcp_connection_throttle",
+    "adaptive_concurrency",
     "ip_restriction",
     "bot_detection",
     "correlation_id",
@@ -1477,6 +1478,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         "response_transformer" => {
             json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
         }
+        "adaptive_concurrency" => json!({}),
         "mesh_route_dispatch" => json!({
             "rules": [{
                 "match": {"methods": ["GET"]},

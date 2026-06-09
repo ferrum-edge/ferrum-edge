@@ -17,6 +17,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use crate::plugins::BackendAdmissionOutcome;
+use crate::retry::ErrorClass;
+
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
 pub(crate) type BoxError = ProxyBodyError;
@@ -49,6 +52,10 @@ pub struct ProxyBody {
     /// (EOF, error, or client disconnect), ensuring least-connections
     /// accounting decrements when the backend stream actually ends.
     _lb_connection_guard: Option<super::LoadBalancerConnectionGuard>,
+    /// Dropped when the client-visible response body finishes, releasing
+    /// backend-admission slots such as adaptive concurrency permits.
+    _backend_admission_permits: Option<crate::plugins::BackendAdmissionPermitSet>,
+    backend_admission_outcome: Option<DeferredBackendAdmissionOutcome>,
     /// Deferred logger that fires after body completion, allowing
     /// `TransactionSummary.body_completed` / `body_error_class` /
     /// `client_disconnected` / `bytes_streamed` to reflect the
@@ -80,6 +87,26 @@ pub struct ProxyBody {
     /// will complete successfully on the next wake. Cheap — one atomic RMW
     /// on the first poll per body, zero cost thereafter.
     polled: AtomicBool,
+}
+
+#[derive(Clone)]
+struct DeferredBackendAdmissionOutcome {
+    response_status: u16,
+    backend_elapsed: Duration,
+    /// Set on the gRPC fully-streaming path: a late client-upload overflow
+    /// (`> max_grpc_recv_size_bytes`) RSTs the backend response stream after
+    /// headers, surfacing as a body error. That is a client/gateway-side size
+    /// violation, not a backend fault, so when this flag has tripped the limiter
+    /// outcome is forced to `RequestBodyTooLarge` (which the limiter ignores)
+    /// rather than letting the body error shrink the limit.
+    request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// gRPC streaming responses finish HTTP 200 and carry the real outcome in a
+    /// `grpc-status` trailer. When set, `poll_frame` inspects forwarded trailer
+    /// frames and records the HTTP-mapped status of a non-OK gRPC status into
+    /// `grpc_trailer_http_status`, so a backend gRPC failure (e.g. 14 -> 503)
+    /// shrinks the limit instead of recording a healthy success at EOF.
+    classify_grpc_trailer: bool,
+    grpc_trailer_http_status: Option<u16>,
 }
 
 /// Inner body variant — buffered, streaming, or tracked-streaming.
@@ -217,6 +244,8 @@ impl ProxyBody {
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
             _lb_connection_guard: None,
+            _backend_admission_permits: None,
+            backend_admission_outcome: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),
@@ -236,6 +265,8 @@ impl ProxyBody {
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
             _lb_connection_guard: None,
+            _backend_admission_permits: None,
+            backend_admission_outcome: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),
@@ -267,6 +298,60 @@ impl ProxyBody {
         guard: super::LoadBalancerConnectionGuard,
     ) -> Self {
         self._lb_connection_guard = Some(guard);
+        self
+    }
+
+    /// Hold the backend-admission permit for the lifetime of a streamed response
+    /// body and record its outcome when the body reaches a terminal state.
+    ///
+    /// `backend_elapsed` is TTFB (captured at header arrival), so the adaptive
+    /// limiter's latency signal is TTFB even though the in-flight slot is held
+    /// for the full body. Unlike a WebSocket session this slot is still
+    /// transient (it frees at body completion), so this deliberately uses the
+    /// growth-allowing `record_backend_outcome`, not the holding variant — see
+    /// `AdaptiveConcurrencyPermit::record_success_latency`.
+    pub(crate) fn with_deferred_backend_admission_outcome(
+        mut self,
+        permits: crate::plugins::BackendAdmissionPermitSet,
+        response_status: u16,
+        backend_elapsed: Duration,
+    ) -> Self {
+        self._backend_admission_permits = Some(permits);
+        self.backend_admission_outcome = Some(DeferredBackendAdmissionOutcome {
+            response_status,
+            backend_elapsed,
+            request_body_exceeded: None,
+            classify_grpc_trailer: false,
+            grpc_trailer_http_status: None,
+        });
+        self
+    }
+
+    /// Enable gRPC trailer classification for the deferred admission outcome:
+    /// `poll_frame` will read the `grpc-status` from forwarded trailer frames and
+    /// (for a non-OK status) record the HTTP-mapped status so a backend gRPC
+    /// failure on a streaming response shrinks the limit instead of recording a
+    /// healthy success at EOF. No-op when no deferred admission outcome is set.
+    pub(crate) fn with_grpc_trailer_admission_classification(mut self) -> Self {
+        if let Some(outcome) = self.backend_admission_outcome.as_mut() {
+            outcome.classify_grpc_trailer = true;
+        }
+        self
+    }
+
+    /// Attach the gRPC streaming request-body-overflow flag to an already-set
+    /// deferred backend-admission outcome. When the flag has tripped by the time
+    /// the body terminates, the recorded outcome is forced to `RequestBodyTooLarge`
+    /// so a client-upload overflow that RSTs the response stream is ignored by the
+    /// adaptive limiter instead of being counted as a backend fault. No-op when no
+    /// deferred admission outcome is attached or the flag is `None`.
+    pub(crate) fn with_deferred_admission_request_body_exceeded_flag(
+        mut self,
+        flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
+        if let Some(outcome) = self.backend_admission_outcome.as_mut() {
+            outcome.request_body_exceeded = flag;
+        }
         self
     }
 
@@ -312,6 +397,8 @@ impl ProxyBody {
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
             _lb_connection_guard: None,
+            _backend_admission_permits: None,
+            backend_admission_outcome: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),
@@ -367,6 +454,48 @@ impl ProxyBody {
         };
         (self, metrics)
     }
+
+    fn record_deferred_backend_admission(
+        &mut self,
+        error_class: Option<ErrorClass>,
+        client_disconnected: bool,
+    ) {
+        let Some(permits) = self._backend_admission_permits.take() else {
+            return;
+        };
+        let Some(outcome) = self.backend_admission_outcome.take() else {
+            return;
+        };
+        let error_class = if outcome
+            .request_body_exceeded
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            // Late gRPC client-upload overflow RST the backend response stream:
+            // a client/gateway-side size violation, not a backend fault. Force
+            // RequestBodyTooLarge so the limiter ignores it (no shrink), matching
+            // how the circuit breaker neutralizes the same overflow.
+            Some(ErrorClass::RequestBodyTooLarge)
+        } else if client_disconnected {
+            Some(ErrorClass::ClientDisconnect)
+        } else {
+            error_class
+        };
+        let connection_error =
+            error_class.is_some_and(|class| class != ErrorClass::ClientDisconnect);
+        // Prefer the gRPC trailer's mapped status (a non-OK grpc-status finishes
+        // HTTP 200) so a backend gRPC failure shrinks the limit; falls back to the
+        // header status for non-gRPC streams or an OK/absent trailer.
+        let response_status = outcome
+            .grpc_trailer_http_status
+            .unwrap_or(outcome.response_status);
+        permits.record_backend_outcome(BackendAdmissionOutcome {
+            response_status,
+            connection_error,
+            error_class,
+            backend_elapsed: outcome.backend_elapsed,
+        });
+    }
 }
 
 impl http_body::Body for ProxyBody {
@@ -410,24 +539,42 @@ impl http_body::Body for ProxyBody {
                     this.bytes_streamed
                         .fetch_add(data.len() as u64, Ordering::Relaxed);
                 }
+                // gRPC streaming admission: the response finished HTTP 200 and the
+                // real outcome rides in the grpc-status trailer, so capture a non-OK
+                // status here (it arrives just before EOF) and map it to HTTP, so the
+                // deferred admission below records a backend gRPC failure as a fault.
+                if let Some(outcome) = this.backend_admission_outcome.as_mut()
+                    && outcome.classify_grpc_trailer
+                    && let Some(trailers) = frame.trailers_ref()
+                    && let Some(code) = trailers
+                        .get("grpc-status")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                    && code != 0
+                {
+                    outcome.grpc_trailer_http_status =
+                        Some(crate::proxy::grpc_proxy::grpc_status_to_http_status(code));
+                }
             }
             Poll::Ready(Some(Err(e))) => {
+                let (class, disconnected) =
+                    crate::retry::classify_body_error(&**e as &dyn std::error::Error);
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
-                    let (class, disconnected) =
-                        crate::retry::classify_body_error(&**e as &dyn std::error::Error);
                     logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
                         class,
                         bytes,
                         disconnected,
                     ));
                 }
+                this.record_deferred_backend_admission(Some(class), disconnected);
             }
             Poll::Ready(None) => {
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
                     logger.fire(crate::proxy::deferred_log::BodyOutcome::success(bytes));
                 }
+                this.record_deferred_backend_admission(None, false);
             }
             Poll::Pending => {}
         }
@@ -454,6 +601,8 @@ impl http_body::Body for ProxyBody {
 
 impl Drop for ProxyBody {
     fn drop(&mut self) {
+        let mut deferred_admission_error_class = None;
+        let mut deferred_admission_client_disconnected = false;
         if let Some(logger) = self.logger.take() {
             let bytes = self.bytes_streamed.load(Ordering::Relaxed);
 
@@ -511,8 +660,41 @@ impl Drop for ProxyBody {
                     }
                 }
             };
+            if !outcome.body_completed {
+                deferred_admission_error_class = outcome.body_error_class;
+                deferred_admission_client_disconnected = outcome.client_disconnected;
+            }
             logger.fire(outcome);
+        } else if self._backend_admission_permits.is_some()
+            && self.backend_admission_outcome.is_some()
+            && self.polled.load(Ordering::Relaxed)
+        {
+            deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
+            deferred_admission_client_disconnected = true;
         }
+        // A never-polled *streaming* body is ambiguous between a legitimate empty
+        // response (HEAD / 204 / zero-length, which the logger above optimistically
+        // counts as success) and a client that dropped immediately after headers
+        // before hyper polled a single frame. The adaptive limiter must not train
+        // on that ambiguity as healthy backend latency — and so grow the limit —
+        // so when the outcome would otherwise be recorded as success, ignore it
+        // like a client disconnect. A `Full` body that already holds the complete
+        // response is a real success and is intentionally left untouched.
+        if deferred_admission_error_class.is_none()
+            && !deferred_admission_client_disconnected
+            && !self.polled.load(Ordering::Relaxed)
+            && matches!(
+                self.kind,
+                ProxyBodyKind::Stream(_) | ProxyBodyKind::Tracked(_)
+            )
+        {
+            deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
+            deferred_admission_client_disconnected = true;
+        }
+        self.record_deferred_backend_admission(
+            deferred_admission_error_class,
+            deferred_admission_client_disconnected,
+        );
     }
 }
 

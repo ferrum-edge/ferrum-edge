@@ -1750,12 +1750,16 @@ pub(crate) fn find_element_by_wsu_id_in_range(
         return None;
     }
 
+    let (mut namespaces, mut stack) = namespace_state_before_tag(xml, range_start)?;
     let mut search_from = range_start;
     while let Some(rel) = xml.get(search_from..range_end)?.find('<') {
         let tag_start = search_from + rel;
         let after_lt = xml.as_bytes().get(tag_start + 1)?;
         if *after_lt == b'/' {
-            search_from = tag_start + 1;
+            let tag_end_rel = find_start_tag_end(xml, tag_start)?;
+            let tag = xml.get(tag_start + 2..tag_start + tag_end_rel)?.trim();
+            revert_namespace_bindings_until(&mut stack, &mut namespaces, tag);
+            search_from = tag_start + tag_end_rel + 1;
             continue;
         }
         if *after_lt == b'!' {
@@ -1769,13 +1773,26 @@ pub(crate) fn find_element_by_wsu_id_in_range(
 
         let tag_end_rel = find_start_tag_end(xml, tag_start)?;
         let tag = &xml[tag_start + 1..tag_start + tag_end_rel];
-        let namespaces = namespace_bindings_for_tag(xml, tag_start)?;
-        if !tag_has_resolvable_wsu_id(tag, id, &namespaces) {
+        let element_name = extract_full_tag_name_from_tag(tag)?.to_string();
+        let previous_bindings = apply_namespace_declarations_with_history(tag, &mut namespaces);
+        let is_self_closing = tag.trim_end().ends_with('/');
+        let has_matching_id = tag_has_resolvable_wsu_id(tag, id, &namespaces);
+
+        if !is_self_closing {
+            stack.push(NamespaceFrame {
+                element_name,
+                previous_bindings,
+            });
+        } else if !previous_bindings.is_empty() {
+            revert_namespace_bindings(previous_bindings, &mut namespaces);
+        }
+
+        if !has_matching_id {
             search_from = tag_start + tag_end_rel + 1;
             continue;
         }
 
-        if tag.trim_end().ends_with('/') {
+        if is_self_closing {
             let tag_end = tag_start + tag_end_rel + 1;
             if tag_end <= range_end {
                 return Some(xml[tag_start..tag_end].to_string());
@@ -1864,17 +1881,17 @@ fn namespace_bindings_for_tag(
     xml: &str,
     target_tag_start: usize,
 ) -> Option<HashMap<String, String>> {
-    let mut namespaces = namespace_bindings_before_tag(xml, target_tag_start)?;
+    let (mut namespaces, _) = namespace_state_before_tag(xml, target_tag_start)?;
     let tag_end_rel = find_start_tag_end(xml, target_tag_start)?;
     let tag = xml.get(target_tag_start + 1..target_tag_start + tag_end_rel)?;
     apply_namespace_declarations(tag, &mut namespaces);
     Some(namespaces)
 }
 
-fn namespace_bindings_before_tag(
+fn namespace_state_before_tag(
     xml: &str,
     target_tag_start: usize,
-) -> Option<HashMap<String, String>> {
+) -> Option<(HashMap<String, String>, Vec<NamespaceFrame>)> {
     let mut namespaces = HashMap::new();
     let mut stack: Vec<NamespaceFrame> = Vec::new();
     let mut search_from = 0usize;
@@ -1916,7 +1933,7 @@ fn namespace_bindings_before_tag(
         search_from = tag_start + tag_end_rel + 1;
     }
 
-    Some(namespaces)
+    Some((namespaces, stack))
 }
 
 fn extract_full_tag_name_from_tag(tag: &str) -> Option<&str> {
@@ -1966,15 +1983,22 @@ fn revert_namespace_bindings_until(
                 .element_name
                 .rsplit_once(':')
                 .is_some_and(|(_, local_name)| local_name == closing_tag_name);
-        for (prefix, previous) in frame.previous_bindings.into_iter().rev() {
-            if let Some(uri) = previous {
-                namespaces.insert(prefix, uri);
-            } else {
-                namespaces.remove(&prefix);
-            }
-        }
+        revert_namespace_bindings(frame.previous_bindings, namespaces);
         if matched {
             break;
+        }
+    }
+}
+
+fn revert_namespace_bindings(
+    previous_bindings: Vec<(String, Option<String>)>,
+    namespaces: &mut HashMap<String, String>,
+) {
+    for (prefix, previous) in previous_bindings.into_iter().rev() {
+        if let Some(uri) = previous {
+            namespaces.insert(prefix, uri);
+        } else {
+            namespaces.remove(&prefix);
         }
     }
 }

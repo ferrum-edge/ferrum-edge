@@ -92,6 +92,16 @@ impl Plugin for PriorityOverridePlugin {
     ) -> PluginResult {
         self.inner.before_proxy(ctx, headers).await
     }
+    fn is_backend_admission_plugin(&self) -> bool {
+        self.inner.is_backend_admission_plugin()
+    }
+    fn try_backend_admission(
+        &self,
+        ctx: &RequestContext,
+        admission: &crate::plugins::BackendAdmissionContext<'_>,
+    ) -> crate::plugins::BackendAdmissionDecision {
+        self.inner.try_backend_admission(ctx, admission)
+    }
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         self.inner.should_buffer_request_body(ctx)
     }
@@ -388,6 +398,8 @@ pub struct PluginPhaseData {
     pub auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Authorization plugins only (pre-filtered from the protocol plugin list).
     pub authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Backend-admission plugins only (pre-filtered from the protocol plugin list).
+    pub backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
 }
@@ -397,6 +409,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut caps = 0u8;
     let mut auth = Vec::new();
     let mut authorize = Vec::new();
+    let mut backend_admission = Vec::new();
     for p in plugins {
         if p.is_auth_plugin() {
             caps |= PluginCapabilities::HAS_AUTH_PLUGINS;
@@ -404,6 +417,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.is_authorize_plugin() {
             authorize.push(Arc::clone(p));
+        }
+        if p.is_backend_admission_plugin() {
+            backend_admission.push(Arc::clone(p));
         }
         if p.modifies_request_headers() {
             caps |= PluginCapabilities::MODIFIES_REQUEST_HEADERS;
@@ -430,6 +446,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     PluginPhaseData {
         auth_plugins: Arc::new(auth),
         authorize_plugins: Arc::new(authorize),
+        backend_admission_plugins: Arc::new(backend_admission),
         capabilities: PluginCapabilities(caps),
     }
 }
@@ -630,6 +647,16 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    pub(crate) fn get_backend_admission_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.backend_admission_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub(crate) fn get_capabilities(
         &self,
         proxy_id: &str,
@@ -670,6 +697,7 @@ impl PluginCacheInner {
             plugins: self.get_plugins_for_protocol(proxy_id, protocol),
             auth_plugins: self.get_auth_plugins(proxy_id, protocol),
             authorize_plugins: self.get_authorize_plugins(proxy_id, protocol),
+            backend_admission_plugins: self.get_backend_admission_plugins(proxy_id, protocol),
             capabilities: self.get_capabilities(proxy_id, protocol),
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
@@ -688,6 +716,7 @@ pub struct PluginCacheRequestView {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
@@ -708,6 +737,11 @@ impl PluginCacheRequestView {
     /// Get pre-computed authorization plugins from this request view.
     pub fn authorize_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.authorize_plugins)
+    }
+
+    /// Get pre-computed backend admission plugins from this request view.
+    pub fn backend_admission_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
+        Arc::clone(&self.backend_admission_plugins)
     }
 
     /// Get pre-computed capability bitset from this request view.

@@ -3,8 +3,13 @@
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
 //! `before_proxy` → `transform_request_body` → `on_final_request_body` →
-//! `after_proxy` → `on_response_body` → `transform_response_body` →
+//! `backend_admission` → `after_proxy` → `on_response_body` → `transform_response_body` →
 //! `on_final_response_body` → `log` → `on_ws_frame`.
+//!
+//! `backend_admission` runs last on the request side — after request-body
+//! transforms and `on_final_request_body`, immediately before the backend
+//! dispatch — so a rejected admission still skips the actual upstream call but
+//! not the body hooks that precede it.
 //!
 //! Each plugin declares which protocols it supports via `supported_protocols()`.
 //! The `PluginCache` pre-filters plugins per protocol at config reload time
@@ -17,6 +22,7 @@
 
 pub mod a2a_gateway;
 pub mod access_control;
+pub mod adaptive_concurrency;
 pub mod ai_federation;
 pub mod ai_prompt_shield;
 pub mod ai_rate_limiter;
@@ -100,10 +106,11 @@ use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, Consumer, DispatchKind, Proxy, ResolvedPortOverride,
-    RetryConfig, Upstream,
+    RetryConfig, Upstream, UpstreamTarget,
 };
 use crate::consumer_index::ConsumerIndex;
 use crate::modes::mesh::MeshTrafficDirection;
@@ -1942,7 +1949,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_federation (2985), mcp_gateway (2992), a2a_gateway (2993) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_federation (2985), mcp_gateway (2992), a2a_gateway (2993) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365) |
@@ -1980,6 +1987,7 @@ pub mod priority {
     pub const TCP_CONNECTION_THROTTLE: u16 = 2050;
     pub const MESH_AUTHZ: u16 = 2075;
     pub const OPA: u16 = 2080;
+    pub const ADAPTIVE_CONCURRENCY: u16 = 2090;
     pub const REQUEST_DEDUPLICATION: u16 = 2750;
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
     pub const GRAPHQL: u16 = 2850;
@@ -2054,6 +2062,87 @@ pub mod priority {
     pub const UDP_RATE_LIMITING: u16 = 2915;
     /// Default priority for unknown/custom plugins — runs after transforms, before logging.
     pub const DEFAULT: u16 = 5000;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BackendAdmissionOutcome {
+    pub response_status: u16,
+    pub connection_error: bool,
+    pub error_class: Option<crate::retry::ErrorClass>,
+    pub backend_elapsed: Duration,
+}
+
+pub trait BackendAdmissionPermit: Send + Sync {
+    fn record_backend_outcome(&self, outcome: BackendAdmissionOutcome);
+
+    /// Record an outcome for an admission whose in-flight slot is still held
+    /// after this call returns — long-lived sessions such as WebSocket, where
+    /// the permit lives for the entire session rather than a single
+    /// request/response. Feeds the same latency/failure signals as
+    /// [`Self::record_backend_outcome`] but must never grow the limit: with the
+    /// slot still occupied, every concurrent handshake observes the limiter at
+    /// capacity, so growing here would ratchet the limit upward and defeat the
+    /// in-flight session cap. Defaults to `record_backend_outcome` for permits
+    /// that do not distinguish the two.
+    fn record_backend_outcome_holding(&self, outcome: BackendAdmissionOutcome) {
+        self.record_backend_outcome(outcome);
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct BackendAdmissionPermitSet {
+    permits: Vec<Arc<dyn BackendAdmissionPermit>>,
+}
+
+impl BackendAdmissionPermitSet {
+    pub fn new(permits: Vec<Arc<dyn BackendAdmissionPermit>>) -> Option<Self> {
+        (!permits.is_empty()).then_some(Self { permits })
+    }
+
+    pub fn record_backend_outcome(&self, outcome: BackendAdmissionOutcome) {
+        for permit in &self.permits {
+            permit.record_backend_outcome(outcome);
+        }
+    }
+
+    /// Record an outcome while the in-flight slot stays held (long-lived
+    /// sessions such as WebSocket). See
+    /// [`BackendAdmissionPermit::record_backend_outcome_holding`].
+    pub fn record_backend_outcome_holding(&self, outcome: BackendAdmissionOutcome) {
+        for permit in &self.permits {
+            permit.record_backend_outcome_holding(outcome);
+        }
+    }
+}
+
+pub struct BackendAdmissionContext<'a> {
+    pub proxy: &'a Proxy,
+    pub upstream_target: Option<&'a UpstreamTarget>,
+    pub protocol: ProxyProtocol,
+}
+
+impl<'a> BackendAdmissionContext<'a> {
+    pub fn backend_host(&self) -> &'a str {
+        self.upstream_target
+            .map(|target| target.host.as_str())
+            .unwrap_or(self.proxy.backend_host.as_str())
+    }
+
+    pub fn backend_port(&self) -> u16 {
+        self.upstream_target
+            .map(|target| target.port)
+            .unwrap_or(self.proxy.backend_port)
+    }
+}
+
+pub enum BackendAdmissionDecision {
+    Continue,
+    Admit(Arc<dyn BackendAdmissionPermit>),
+    Reject {
+        status_code: u16,
+        body: Vec<u8>,
+        headers: HashMap<String, String>,
+    },
 }
 
 /// Plugin lifecycle hooks.
@@ -2166,6 +2255,23 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
+    /// Returns `true` if this plugin participates in target-aware backend
+    /// admission after load balancing and before backend dispatch.
+    fn is_backend_admission_plugin(&self) -> bool {
+        false
+    }
+
+    /// Called after the gateway has selected the backend target but before it
+    /// dials or sends the request. Returning a permit keeps backend admission
+    /// state alive for the response or upgraded-session lifetime.
+    fn try_backend_admission(
+        &self,
+        _ctx: &RequestContext,
+        _admission: &BackendAdmissionContext<'_>,
+    ) -> BackendAdmissionDecision {
+        BackendAdmissionDecision::Continue
+    }
+
     /// Returns `true` when the current request should buffer the request body
     /// for this plugin.
     ///
@@ -2184,6 +2290,30 @@ pub trait Plugin: Send + Sync {
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin may change the response `Content-Type`
+    /// in `after_proxy` for the current request.
+    ///
+    /// `response_content_type` is the backend's `Content-Type` — the value the
+    /// downgrade would otherwise key off. Plugins that relabel only *some*
+    /// backend types should consult it so the gate matches their `after_proxy`
+    /// exactly: a plugin that rewrites a non-SSE type to `text/event-stream`
+    /// must return `false` when the backend already sent `text/event-stream`,
+    /// otherwise an unbounded stream is pinned to the buffered path and
+    /// collected until the max-response-body limit 502s it.
+    ///
+    /// The proxy uses this as a safety gate before content-type-aware
+    /// buffer-to-stream downgrades. If a later `after_proxy` hook can relabel a
+    /// response from a non-inspectable type to an inspectable one, body
+    /// inspection plugins must keep the buffered path selected by the
+    /// pre-flight decision.
+    fn may_modify_response_content_type(
+        &self,
+        _ctx: &RequestContext,
+        _response_content_type: Option<&str>,
+    ) -> bool {
+        false
     }
 
     /// Returns `true` if this plugin should also run its `after_proxy`
@@ -2714,6 +2844,9 @@ pub fn create_plugin_with_http_client(
         "tcp_connection_throttle" => Ok(Some(Arc::new(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
         ))),
+        "adaptive_concurrency" => Ok(Some(Arc::new(
+            adaptive_concurrency::AdaptiveConcurrency::new(config, http_client.clone())?,
+        ))),
         "mesh_authz" => Ok(Some(Arc::new(mesh::authz::MeshAuthz::new(config)?))),
         "opa" => Ok(Some(Arc::new(opa::Opa::new(config, http_client.clone())?))),
         "mesh_outbound_registry" => Ok(Some(Arc::new(
@@ -2922,6 +3055,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "mesh_outbound_registry"
             | "access_control"
             | "tcp_connection_throttle"
+            | "adaptive_concurrency"
             | "rate_limiting"
             | "ip_restriction"
             | "waf"
@@ -2970,6 +3104,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "security_headers",
         "access_control",
         "tcp_connection_throttle",
+        "adaptive_concurrency",
         "ip_restriction",
         "bot_detection",
         "correlation_id",

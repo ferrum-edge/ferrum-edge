@@ -109,7 +109,8 @@ use tracing::{debug, error, warn};
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::load_balancer::LoadBalancer;
 use crate::plugins::{
-    Plugin, PluginResult, RequestContext, ResponseStreamAction, ResponseStreamInspector,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
+    RequestContext, ResponseStreamAction, ResponseStreamInspector,
 };
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome;
@@ -181,6 +182,7 @@ where
     pub client_ip: &'a str,
     pub ctx: &'a mut RequestContext,
     pub plugins: &'a [Arc<dyn Plugin>],
+    pub backend_admission_plugins: &'a [Arc<dyn Plugin>],
     pub requires_response_body_buffering: bool,
     pub sticky_cookie_needed: bool,
 }
@@ -191,6 +193,116 @@ fn record_cross_protocol_connection_start(
 ) {
     if let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
         balancer.record_connection_start(target);
+    }
+}
+
+fn cross_protocol_proxy_protocol(flavor: HttpFlavor) -> ProxyProtocol {
+    match flavor {
+        HttpFlavor::Plain => ProxyProtocol::Http,
+        HttpFlavor::Grpc => ProxyProtocol::Grpc,
+        HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
+    }
+}
+
+fn record_cross_protocol_backend_admission_outcome(
+    permits: &mut Option<BackendAdmissionPermitSet>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    backend_elapsed: Duration,
+) {
+    if let Some(permits) = permits.take() {
+        permits.record_backend_outcome(BackendAdmissionOutcome {
+            response_status,
+            connection_error,
+            error_class,
+            backend_elapsed,
+        });
+    }
+}
+
+fn release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+    state: &ProxyState,
+    proxy: &Proxy,
+    target_key: Option<&str>,
+    is_half_open_probe: bool,
+) {
+    if !is_half_open_probe {
+        return;
+    }
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb = state
+            .circuit_breaker_cache
+            .get_or_create(&proxy.id, target_key, cb_config);
+        cb.record_neutral(true);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_cross_protocol_backend_admission_or_reject<S>(
+    backend_admission_plugins: &[Arc<dyn Plugin>],
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    flavor: HttpFlavor,
+    stream: &mut RequestStream<S, Bytes>,
+    backend_start: Instant,
+    bytes_sent: u64,
+    state: &ProxyState,
+    cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+) -> Result<Result<Option<BackendAdmissionPermitSet>, CrossProtocolOutcome>, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    match crate::proxy::backend_dispatch::run_backend_admission_plugins(
+        backend_admission_plugins,
+        ctx,
+        proxy,
+        upstream_target,
+        cross_protocol_proxy_protocol(flavor),
+    ) {
+        Ok(permits) => Ok(Ok(permits)),
+        Err(rejection) => {
+            // Release any reserved CB HALF_OPEN probe BEFORE writing the reject:
+            // the writes below use `await?`, so an H3 client closing mid-write
+            // returns early. The callers release only on the `Err(outcome)` arm,
+            // so releasing here guarantees the slot is freed even on write error.
+            release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                state,
+                proxy,
+                cb_target_key,
+                cb_is_half_open_probe,
+            );
+            let mut headers = rejection.headers;
+            crate::proxy::apply_after_proxy_hooks_to_rejection(
+                plugins,
+                ctx,
+                rejection.status_code,
+                &mut headers,
+            )
+            .await;
+            let http_status = StatusCode::from_u16(rejection.status_code)
+                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            let mut outcome = if matches!(flavor, HttpFlavor::Grpc) {
+                let normalized = normalize_h3_grpc_reject(http_status, &rejection.body, &headers);
+                apply_h3_grpc_reject_metadata(ctx, &normalized);
+                write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await?
+            } else {
+                write_reject_with_headers(
+                    stream,
+                    http_status,
+                    &rejection.body,
+                    &headers,
+                    backend_start,
+                    bytes_sent,
+                )
+                .await?
+            };
+            outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
+            Ok(Err(outcome))
+        }
     }
 }
 
@@ -322,6 +434,7 @@ where
         client_ip,
         ctx,
         plugins,
+        backend_admission_plugins,
         requires_response_body_buffering,
         sticky_cookie_needed,
     } = request;
@@ -393,6 +506,7 @@ where
                 backend_start,
                 ctx,
                 plugins,
+                backend_admission_plugins,
                 requires_response_body_buffering,
                 sticky_cookie_needed,
             )
@@ -420,6 +534,7 @@ where
                 backend_start,
                 ctx,
                 plugins,
+                backend_admission_plugins,
                 requires_response_body_buffering,
                 sticky_cookie_needed,
             )
@@ -615,6 +730,7 @@ async fn dispatch_plain<S>(
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
+    backend_admission_plugins: &[Arc<dyn Plugin>],
     requires_response_body_buffering: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -724,165 +840,587 @@ where
             requires_response_body_buffering,
         );
 
-    let (response, bytes_sent) = match prebuffered_body {
-        Some(buffered_body) => {
-            let bytes_sent = raw_prebuffered_body_bytes;
-            let mut attempt = 0u32;
+    let (response, bytes_sent, mut backend_admission_permits, backend_admission_elapsed) =
+        match prebuffered_body {
+            Some(buffered_body) => {
+                let bytes_sent = raw_prebuffered_body_bytes;
+                let mut attempt = 0u32;
+                let final_backend_admission_permits: Option<BackendAdmissionPermitSet>;
+                let final_backend_admission_elapsed: Duration;
 
-            record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
-
-            let response = loop {
-                let effective_host = current_target
-                    .as_deref()
-                    .map(|t| t.host.as_str())
-                    .unwrap_or(proxy.backend_host.as_str());
-                let send_result = build_plain_request_builder(
-                    &client,
-                    state,
-                    proxy,
-                    req_method.clone(),
-                    proxy_headers,
-                    &current_url,
-                    effective_host,
-                    client_ip,
-                    ctx.is_early_data,
-                )
-                .body(buffered_body.clone())
-                .send()
-                .await;
-
-                match send_result {
-                    Ok(response) => {
-                        let attempt_result = crate::retry::BackendResponse {
-                            status_code: response.status().as_u16(),
-                            body: crate::retry::ResponseBody::Buffered(Vec::new()),
-                            headers: HashMap::new(),
-                            connection_error: false,
-                            backend_resolved_ip: None,
-                            error_class: None,
-                        };
-                        if let Some(retry_config) = retry_config
-                            && crate::retry::should_retry(
-                                retry_config,
-                                method,
-                                &attempt_result,
-                                attempt,
-                            )
+                let response = loop {
+                    let backend_admission_start = Instant::now();
+                    let mut backend_admission_permits =
+                        match run_cross_protocol_backend_admission_or_reject(
+                            backend_admission_plugins,
+                            plugins,
+                            ctx,
+                            proxy,
+                            current_target.as_deref(),
+                            HttpFlavor::Plain,
+                            stream,
+                            backend_start,
+                            bytes_sent,
+                            state,
+                            current_cb_target_key.as_deref(),
+                            cb_retry_probe_slot_available,
+                        )
+                        .await?
                         {
-                            record_cross_protocol_retry_failure(
-                                state,
-                                proxy,
-                                upstream_balancer,
-                                current_target.as_deref(),
-                                current_cb_target_key.as_deref(),
-                                attempt_result.status_code,
-                                false,
-                                cb_retry_probe_slot_available,
-                            );
-                            cb_retry_probe_slot_available = false;
-                            let delay = crate::retry::retry_delay(retry_config, attempt);
-                            tokio::time::sleep(delay).await;
-                            attempt += 1;
-                            if let Some((next_target, next_cb_target_key, next_url)) =
-                                select_next_cross_protocol_retry_target(
-                                    state,
-                                    epoch,
-                                    proxy,
-                                    lb_hash_key,
-                                    current_target.as_ref(),
-                                    path,
-                                    query_string,
-                                    client_ip,
-                                    proxy_headers,
+                            Ok(permits) => permits,
+                            // Probe release happens inside the helper, before the reject write.
+                            Err(outcome) => return Ok(outcome),
+                        };
+                    record_cross_protocol_connection_start(
+                        upstream_balancer,
+                        current_target.as_deref(),
+                    );
+
+                    let effective_host = current_target
+                        .as_deref()
+                        .map(|t| t.host.as_str())
+                        .unwrap_or(proxy.backend_host.as_str());
+                    let send_result = build_plain_request_builder(
+                        &client,
+                        state,
+                        proxy,
+                        req_method.clone(),
+                        proxy_headers,
+                        &current_url,
+                        effective_host,
+                        client_ip,
+                        ctx.is_early_data,
+                    )
+                    .body(buffered_body.clone())
+                    .send()
+                    .await;
+
+                    match send_result {
+                        Ok(response) => {
+                            let attempt_result = crate::retry::BackendResponse {
+                                status_code: response.status().as_u16(),
+                                body: crate::retry::ResponseBody::Buffered(Vec::new()),
+                                headers: HashMap::new(),
+                                connection_error: false,
+                                backend_resolved_ip: None,
+                                error_class: None,
+                            };
+                            if let Some(retry_config) = retry_config
+                                && crate::retry::should_retry(
+                                    retry_config,
+                                    method,
+                                    &attempt_result,
+                                    attempt,
                                 )
                             {
-                                current_target = Some(next_target);
-                                current_cb_target_key = Some(next_cb_target_key);
-                                current_url = next_url;
+                                record_cross_protocol_backend_admission_outcome(
+                                    &mut backend_admission_permits,
+                                    attempt_result.status_code,
+                                    false,
+                                    None,
+                                    backend_admission_start.elapsed(),
+                                );
+                                record_cross_protocol_retry_failure(
+                                    state,
+                                    proxy,
+                                    upstream_balancer,
+                                    current_target.as_deref(),
+                                    current_cb_target_key.as_deref(),
+                                    attempt_result.status_code,
+                                    false,
+                                    cb_retry_probe_slot_available,
+                                );
+                                cb_retry_probe_slot_available = false;
+                                let delay = crate::retry::retry_delay(retry_config, attempt);
+                                tokio::time::sleep(delay).await;
+                                attempt += 1;
+                                if let Some((next_target, next_cb_target_key, next_url)) =
+                                    select_next_cross_protocol_retry_target(
+                                        state,
+                                        epoch,
+                                        proxy,
+                                        lb_hash_key,
+                                        current_target.as_ref(),
+                                        path,
+                                        query_string,
+                                        client_ip,
+                                        proxy_headers,
+                                    )
+                                {
+                                    current_target = Some(next_target);
+                                    current_cb_target_key = Some(next_cb_target_key);
+                                    current_url = next_url;
+                                }
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    attempt = attempt,
+                                    max_retries = retry_config.max_retries,
+                                    connection_error = false,
+                                    "Retrying cross-protocol H3→HTTP backend request"
+                                );
+                                continue;
                             }
+                            final_backend_admission_elapsed = backend_admission_start.elapsed();
+                            final_backend_admission_permits = backend_admission_permits;
+                            break response;
+                        }
+                        Err(e) => {
+                            let attempt_result =
+                                reqwest_error_response_for_cross_protocol(state, &e, None);
                             warn!(
                                 proxy_id = %proxy.id,
-                                attempt = attempt,
-                                max_retries = retry_config.max_retries,
-                                connection_error = false,
-                                "Retrying cross-protocol H3→HTTP backend request"
+                                error = %e,
+                                class = ?attempt_result.error_class,
+                                "cross-protocol H3→HTTP: backend request failed"
                             );
-                            record_cross_protocol_connection_start(
-                                upstream_balancer,
-                                current_target.as_deref(),
-                            );
-                            continue;
-                        }
-                        break response;
-                    }
-                    Err(e) => {
-                        let attempt_result =
-                            reqwest_error_response_for_cross_protocol(state, &e, None);
-                        warn!(
-                            proxy_id = %proxy.id,
-                            error = %e,
-                            class = ?attempt_result.error_class,
-                            "cross-protocol H3→HTTP: backend request failed"
-                        );
-                        if let Some(retry_config) = retry_config
-                            && crate::retry::should_retry(
-                                retry_config,
-                                method,
-                                &attempt_result,
-                                attempt,
-                            )
-                        {
-                            record_cross_protocol_retry_failure(
+                            if let Some(retry_config) = retry_config
+                                && crate::retry::should_retry(
+                                    retry_config,
+                                    method,
+                                    &attempt_result,
+                                    attempt,
+                                )
+                            {
+                                record_cross_protocol_backend_admission_outcome(
+                                    &mut backend_admission_permits,
+                                    attempt_result.status_code,
+                                    attempt_result.connection_error,
+                                    attempt_result.error_class,
+                                    backend_admission_start.elapsed(),
+                                );
+                                record_cross_protocol_retry_failure(
+                                    state,
+                                    proxy,
+                                    upstream_balancer,
+                                    current_target.as_deref(),
+                                    current_cb_target_key.as_deref(),
+                                    attempt_result.status_code,
+                                    attempt_result.connection_error,
+                                    cb_retry_probe_slot_available,
+                                );
+                                cb_retry_probe_slot_available = false;
+                                let delay = crate::retry::retry_delay(retry_config, attempt);
+                                tokio::time::sleep(delay).await;
+                                attempt += 1;
+                                if let Some((next_target, next_cb_target_key, next_url)) =
+                                    select_next_cross_protocol_retry_target(
+                                        state,
+                                        epoch,
+                                        proxy,
+                                        lb_hash_key,
+                                        current_target.as_ref(),
+                                        path,
+                                        query_string,
+                                        client_ip,
+                                        proxy_headers,
+                                    )
+                                {
+                                    current_target = Some(next_target);
+                                    current_cb_target_key = Some(next_cb_target_key);
+                                    current_url = next_url;
+                                }
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    attempt = attempt,
+                                    max_retries = retry_config.max_retries,
+                                    connection_error = attempt_result.connection_error,
+                                    "Retrying cross-protocol H3→HTTP backend request"
+                                );
+                                continue;
+                            }
+
+                            let final_backend_resolved_ip = resolve_cross_protocol_backend_ip(
                                 state,
                                 proxy,
+                                current_target.as_deref(),
+                            )
+                            .await;
+                            record_cross_protocol_backend_admission_outcome(
+                                &mut backend_admission_permits,
+                                attempt_result.status_code,
+                                attempt_result.connection_error,
+                                attempt_result.error_class,
+                                backend_admission_start.elapsed(),
+                            );
+                            record_backend_outcome(
+                                state,
+                                proxy,
+                                &epoch.load_balancer,
                                 upstream_balancer,
                                 current_target.as_deref(),
                                 current_cb_target_key.as_deref(),
                                 attempt_result.status_code,
                                 attempt_result.connection_error,
+                                attempt_result.error_class,
                                 cb_retry_probe_slot_available,
+                                false,
+                                backend_start.elapsed(),
                             );
-                            cb_retry_probe_slot_available = false;
-                            let delay = crate::retry::retry_delay(retry_config, attempt);
-                            tokio::time::sleep(delay).await;
-                            attempt += 1;
-                            if let Some((next_target, next_cb_target_key, next_url)) =
-                                select_next_cross_protocol_retry_target(
-                                    state,
-                                    epoch,
-                                    proxy,
-                                    lb_hash_key,
-                                    current_target.as_ref(),
-                                    path,
-                                    query_string,
-                                    client_ip,
-                                    proxy_headers,
-                                )
-                            {
-                                current_target = Some(next_target);
-                                current_cb_target_key = Some(next_cb_target_key);
-                                current_url = next_url;
-                            }
-                            warn!(
-                                proxy_id = %proxy.id,
-                                attempt = attempt,
-                                max_retries = retry_config.max_retries,
-                                connection_error = attempt_result.connection_error,
-                                "Retrying cross-protocol H3→HTTP backend request"
-                            );
-                            record_cross_protocol_connection_start(
-                                upstream_balancer,
-                                current_target.as_deref(),
-                            );
-                            continue;
+                            let mut outcome = write_error(
+                                stream,
+                                StatusCode::BAD_GATEWAY,
+                                r#"{"error":"Bad Gateway"}"#,
+                                backend_start,
+                                bytes_sent,
+                            )
+                            .await?;
+                            outcome.backend_target =
+                                Some(strip_query_from_backend_url(&current_url));
+                            outcome.connection_error = attempt_result.connection_error;
+                            outcome.error_class = attempt_result.error_class;
+                            outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                            return Ok(outcome);
                         }
+                    }
+                };
+                (
+                    response,
+                    bytes_sent,
+                    final_backend_admission_permits,
+                    final_backend_admission_elapsed,
+                )
+            }
+            None => {
+                // 413 on an oversized declared Content-Length BEFORE admission, so a
+                // saturated limiter cannot mask the size violation as a 503. The
+                // streaming reader below enforces the limit mid-body (recording the
+                // admission outcome as a client-side overflow there), but admission
+                // runs before the first read — mirror the reqwest/direct-H2/H3/HBONE
+                // ordering so an oversized H3 upload still gets the local 413. No
+                // admission permits exist yet, but the initial circuit-breaker check
+                // may have reserved a HALF_OPEN probe, so neutralize it here (the
+                // reader-loop 413 below does the same) or one oversized body wedges
+                // the breaker's half-open slot.
+                if state.max_request_body_size_bytes > 0
+                    && let Some(content_length) = proxy_headers.get("content-length")
+                    && let Ok(len) = content_length.parse::<usize>()
+                    && len > state.max_request_body_size_bytes
+                {
+                    release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                        state,
+                        proxy,
+                        current_cb_target_key.as_deref(),
+                        cb_retry_probe_slot_available,
+                    );
+                    return write_error(
+                        stream,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                        backend_start,
+                        0,
+                    )
+                    .await;
+                }
+                let backend_admission_start = Instant::now();
+                let mut backend_admission_permits =
+                    match run_cross_protocol_backend_admission_or_reject(
+                        backend_admission_plugins,
+                        plugins,
+                        ctx,
+                        proxy,
+                        current_target.as_deref(),
+                        HttpFlavor::Plain,
+                        stream,
+                        backend_start,
+                        0,
+                        state,
+                        current_cb_target_key.as_deref(),
+                        cb_retry_probe_slot_available,
+                    )
+                    .await?
+                    {
+                        Ok(permits) => permits,
+                        // Probe release happens inside the helper, before the reject write.
+                        Err(outcome) => return Ok(outcome),
+                    };
+                record_cross_protocol_connection_start(
+                    upstream_balancer,
+                    current_target.as_deref(),
+                );
 
+                let effective_host = current_target
+                    .as_deref()
+                    .map(|t| t.host.as_str())
+                    .unwrap_or(proxy.backend_host.as_str());
+                let req_builder = build_plain_request_builder(
+                    &client,
+                    state,
+                    proxy,
+                    req_method,
+                    proxy_headers,
+                    &current_url,
+                    effective_host,
+                    client_ip,
+                    ctx.is_early_data,
+                );
+
+                let max_req_bytes = state.max_request_body_size_bytes;
+                let capacity = state.env_config.http3_request_body_channel_capacity;
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(capacity);
+                // `tx` is borrowed by `reader_future` below, so the receiver cannot
+                // rely on sender drop to observe EOF. Signal completion explicitly
+                // once H3 DATA is drained so reqwest emits the final chunk marker.
+                let reader_finished = Arc::new(AtomicBool::new(false));
+                let reader_done_notify = Arc::new(tokio::sync::Notify::new());
+                let body_stream_reader_finished = Arc::clone(&reader_finished);
+                let body_stream_reader_done_notify = Arc::clone(&reader_done_notify);
+                let body_stream = futures_util::stream::unfold(
+                    (
+                        rx,
+                        body_stream_reader_finished,
+                        body_stream_reader_done_notify,
+                    ),
+                    |(mut rx, reader_finished, reader_done_notify)| async move {
+                        loop {
+                            if reader_finished.load(Ordering::Acquire) && rx.is_empty() {
+                                return None;
+                            }
+                            tokio::select! {
+                                item = rx.recv() => {
+                                    return item.map(|item| (item, (rx, reader_finished, reader_done_notify)));
+                                }
+                                _ = reader_done_notify.notified() => {}
+                            }
+                        }
+                    },
+                );
+                let req_body = reqwest::Body::wrap_stream(body_stream);
+                let send_future = req_builder.body(req_body).send();
+
+                let bytes_read = Arc::new(AtomicU64::new(0));
+                let reader_bytes = Arc::clone(&bytes_read);
+                let oversized = Arc::new(AtomicBool::new(false));
+                let reader_oversized = Arc::clone(&oversized);
+                // When the backend resolves first, the outer `select!`
+                // notifies the reader, which halts the recv half
+                // (STOP_SENDING + H3_NO_ERROR) and exits. Without this,
+                // dropping `reader_future` would close the mpsc sender
+                // mid-stream — reqwest surfaces it as a connection error
+                // AND the H3 recv half is left dangling, which the peer
+                // observes as RESET_STREAM(0x0).
+                let halt_notify = Arc::new(tokio::sync::Notify::new());
+                let reader_halt = Arc::clone(&halt_notify);
+                // The reader_future loops on (halt | recv_data). After it
+                // receives a chunk it has to push it through the bounded mpsc
+                // — and that `tx.send().await` is its own await point that
+                // does NOT observe `halt_notify`. If the backend wins the
+                // race while the channel is full (reqwest already saw the
+                // response and stopped draining), the reader stays parked in
+                // tx.send(); the outer drain + halt timeouts elapse without
+                // progress and `reader_future` is dropped. To make sure the
+                // halt is observable in that backpressure window, every
+                // tx.send() is wrapped in its own select against
+                // `reader_halt.notified()`. The unconditional
+                // `halt_request_body` call after the bridge (below) is the
+                // final safety net for any await that remains uncancellable.
+                let reader_finished_for_reader = Arc::clone(&reader_finished);
+                let reader_done_notify_for_reader = Arc::clone(&reader_done_notify);
+                let reader_future = async {
+                    let finish_reader = || {
+                        reader_finished_for_reader.store(true, Ordering::Release);
+                        reader_done_notify_for_reader.notify_waiters();
+                    };
+                    let mut total: usize = 0;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = reader_halt.notified() => {
+                                crate::http3::stream_util::halt_request_body(stream);
+                                finish_reader();
+                                return;
+                            }
+                            chunk = stream.recv_data() => {
+                                match chunk {
+                                    Ok(Some(mut chunk)) => {
+                                        let len = chunk.remaining();
+                                        if max_req_bytes > 0 && total + len > max_req_bytes {
+                                            reader_oversized.store(true, Ordering::Relaxed);
+                                            crate::http3::stream_util::halt_request_body(stream);
+                                            tokio::select! {
+                                                biased;
+                                                _ = reader_halt.notified() => {}
+                                                _ = tx.send(Err(std::io::Error::new(
+                                                    std::io::ErrorKind::InvalidData,
+                                                    "request body exceeds max_request_body_size_bytes",
+                                                ))) => {}
+                                            }
+                                            finish_reader();
+                                            return;
+                                        }
+                                        total += len;
+                                        reader_bytes.store(total as u64, Ordering::Relaxed);
+                                        // `Buf::copy_to_bytes` is zero-copy when the
+                                        // underlying buffer is already `bytes::Bytes`
+                                        // (always true with h3-quinn). Mirrors the
+                                        // pattern used by the native H3 backend pool
+                                        // in `src/http3/client.rs`.
+                                        let body_bytes = chunk.copy_to_bytes(len);
+                                        let send_outcome = tokio::select! {
+                                            biased;
+                                            _ = reader_halt.notified() => {
+                                                crate::http3::stream_util::halt_request_body(stream);
+                                                finish_reader();
+                                                return;
+                                            }
+                                            res = tx.send(Ok(body_bytes)) => res,
+                                        };
+                                        if send_outcome.is_err() {
+                                            finish_reader();
+                                            return;
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        finish_reader();
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        tokio::select! {
+                                            biased;
+                                            _ = reader_halt.notified() => {}
+                                            _ = tx.send(Err(std::io::Error::other(format!(
+                                                "H3 recv_data failed: {}",
+                                                e
+                                            )))) => {}
+                                        }
+                                        finish_reader();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+
+                // Race resolution: the reader_future MUST stay polled until
+                // it exits cleanly, otherwise dropping it closes the mpsc
+                // sender mid-stream and reqwest surfaces the aborted body as
+                // a connection error — AND the H3 recv half is left
+                // dangling, which the peer observes as RESET_STREAM(0x0).
+                // When the backend resolves first (common for early errors
+                // and small 2xx responses while the client is still
+                // uploading) we notify the reader so it halts the recv
+                // half itself and exits naturally. A short grace deadline
+                // caps the time we wait for the reader after the backend
+                // has already answered.
+                //
+                // The drain budget only applies on backend success — error
+                // responses (Bad Gateway, transport failure) halt
+                // immediately, matching the explicit ferrum.conf promise
+                // for FERRUM_H3_REQUEST_BODY_DRAIN_MS.
+                let drain_ms = state.env_config.h3_request_body_drain_ms;
+                let send_result = {
+                    tokio::pin!(send_future);
+                    tokio::pin!(reader_future);
+                    let mut reader_done = false;
+                    loop {
+                        tokio::select! {
+                            result = &mut send_future => {
+                                if !reader_done {
+                                    let backend_succeeded = result.is_ok();
+                                    if backend_succeeded && drain_ms > 0 {
+                                        let drain_deadline = Duration::from_millis(drain_ms);
+                                        if let Ok(()) =
+                                            tokio::time::timeout(drain_deadline, &mut reader_future)
+                                                .await
+                                        {
+                                            reader_done = true;
+                                        }
+                                    }
+                                    if !reader_done {
+                                        halt_notify.notify_one();
+                                        let halt_deadline = Duration::from_millis(100);
+                                        let _ = tokio::time::timeout(halt_deadline, &mut reader_future)
+                                            .await;
+                                    }
+                                }
+                                break result;
+                            }
+                            _ = &mut reader_future, if !reader_done => {
+                                reader_done = true;
+                            }
+                        }
+                    }
+                };
+                // Final safety net: regardless of how the reader exited
+                // (notified, naturally, oversized, recv error, or dropped
+                // because the halt_notify never reached an uncancellable
+                // await), call STOP_SENDING on the recv half before any
+                // success path proceeds to write the response. Without
+                // this, a reader parked in `tx.send()` under backpressure
+                // would have its future dropped after the halt deadline
+                // and the recv half would surface as RESET_STREAM(0x0) on
+                // the wire — the exact failure mode this PR removes from
+                // the early-response paths. STOP_SENDING is idempotent in
+                // h3-quinn (subsequent calls return ClosedStream which is
+                // ignored), so any inner halts already issued by the
+                // reader cost only one extra frame.
+                crate::http3::stream_util::halt_request_body(stream);
+                let bytes_sent = bytes_read.load(Ordering::Relaxed);
+                if oversized.load(Ordering::Relaxed) {
+                    record_cross_protocol_backend_admission_outcome(
+                        &mut backend_admission_permits,
+                        413,
+                        false,
+                        Some(ErrorClass::ClientDisconnect),
+                        backend_admission_start.elapsed(),
+                    );
+                    record_backend_outcome(
+                        state,
+                        proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer,
+                        current_target.as_deref(),
+                        current_cb_target_key.as_deref(),
+                        413,
+                        false,
+                        None,
+                        cb_retry_probe_slot_available,
+                        false,
+                        backend_start.elapsed(),
+                    );
+                    return write_error(
+                        stream,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                        backend_start,
+                        bytes_sent,
+                    )
+                    .await;
+                }
+
+                match send_result {
+                    Ok(response) => (
+                        response,
+                        bytes_sent,
+                        backend_admission_permits,
+                        backend_admission_start.elapsed(),
+                    ),
+                    Err(e) => {
                         let final_backend_resolved_ip = resolve_cross_protocol_backend_ip(
                             state,
                             proxy,
                             current_target.as_deref(),
                         )
                         .await;
+                        let attempt_result = reqwest_error_response_for_cross_protocol(
+                            state,
+                            &e,
+                            final_backend_resolved_ip.clone(),
+                        );
+                        record_cross_protocol_backend_admission_outcome(
+                            &mut backend_admission_permits,
+                            attempt_result.status_code,
+                            attempt_result.connection_error,
+                            attempt_result.error_class,
+                            backend_admission_start.elapsed(),
+                        );
+                        warn!(
+                            proxy_id = %proxy.id,
+                            error = %e,
+                            class = ?attempt_result.error_class,
+                            "cross-protocol H3→HTTP: backend request failed"
+                        );
                         record_backend_outcome(
                             state,
                             proxy,
@@ -912,303 +1450,8 @@ where
                         return Ok(outcome);
                     }
                 }
-            };
-            (response, bytes_sent)
-        }
-        None => {
-            record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
-
-            let effective_host = current_target
-                .as_deref()
-                .map(|t| t.host.as_str())
-                .unwrap_or(proxy.backend_host.as_str());
-            let req_builder = build_plain_request_builder(
-                &client,
-                state,
-                proxy,
-                req_method,
-                proxy_headers,
-                &current_url,
-                effective_host,
-                client_ip,
-                ctx.is_early_data,
-            );
-
-            let max_req_bytes = state.max_request_body_size_bytes;
-            let capacity = state.env_config.http3_request_body_channel_capacity;
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(capacity);
-            // `tx` is borrowed by `reader_future` below, so the receiver cannot
-            // rely on sender drop to observe EOF. Signal completion explicitly
-            // once H3 DATA is drained so reqwest emits the final chunk marker.
-            let reader_finished = Arc::new(AtomicBool::new(false));
-            let reader_done_notify = Arc::new(tokio::sync::Notify::new());
-            let body_stream_reader_finished = Arc::clone(&reader_finished);
-            let body_stream_reader_done_notify = Arc::clone(&reader_done_notify);
-            let body_stream = futures_util::stream::unfold(
-                (
-                    rx,
-                    body_stream_reader_finished,
-                    body_stream_reader_done_notify,
-                ),
-                |(mut rx, reader_finished, reader_done_notify)| async move {
-                    loop {
-                        if reader_finished.load(Ordering::Acquire) && rx.is_empty() {
-                            return None;
-                        }
-                        tokio::select! {
-                            item = rx.recv() => {
-                                return item.map(|item| (item, (rx, reader_finished, reader_done_notify)));
-                            }
-                            _ = reader_done_notify.notified() => {}
-                        }
-                    }
-                },
-            );
-            let req_body = reqwest::Body::wrap_stream(body_stream);
-            let send_future = req_builder.body(req_body).send();
-
-            let bytes_read = Arc::new(AtomicU64::new(0));
-            let reader_bytes = Arc::clone(&bytes_read);
-            let oversized = Arc::new(AtomicBool::new(false));
-            let reader_oversized = Arc::clone(&oversized);
-            // When the backend resolves first, the outer `select!`
-            // notifies the reader, which halts the recv half
-            // (STOP_SENDING + H3_NO_ERROR) and exits. Without this,
-            // dropping `reader_future` would close the mpsc sender
-            // mid-stream — reqwest surfaces it as a connection error
-            // AND the H3 recv half is left dangling, which the peer
-            // observes as RESET_STREAM(0x0).
-            let halt_notify = Arc::new(tokio::sync::Notify::new());
-            let reader_halt = Arc::clone(&halt_notify);
-            // The reader_future loops on (halt | recv_data). After it
-            // receives a chunk it has to push it through the bounded mpsc
-            // — and that `tx.send().await` is its own await point that
-            // does NOT observe `halt_notify`. If the backend wins the
-            // race while the channel is full (reqwest already saw the
-            // response and stopped draining), the reader stays parked in
-            // tx.send(); the outer drain + halt timeouts elapse without
-            // progress and `reader_future` is dropped. To make sure the
-            // halt is observable in that backpressure window, every
-            // tx.send() is wrapped in its own select against
-            // `reader_halt.notified()`. The unconditional
-            // `halt_request_body` call after the bridge (below) is the
-            // final safety net for any await that remains uncancellable.
-            let reader_finished_for_reader = Arc::clone(&reader_finished);
-            let reader_done_notify_for_reader = Arc::clone(&reader_done_notify);
-            let reader_future = async {
-                let finish_reader = || {
-                    reader_finished_for_reader.store(true, Ordering::Release);
-                    reader_done_notify_for_reader.notify_waiters();
-                };
-                let mut total: usize = 0;
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = reader_halt.notified() => {
-                            crate::http3::stream_util::halt_request_body(stream);
-                            finish_reader();
-                            return;
-                        }
-                        chunk = stream.recv_data() => {
-                            match chunk {
-                                Ok(Some(mut chunk)) => {
-                                    let len = chunk.remaining();
-                                    if max_req_bytes > 0 && total + len > max_req_bytes {
-                                        reader_oversized.store(true, Ordering::Relaxed);
-                                        crate::http3::stream_util::halt_request_body(stream);
-                                        tokio::select! {
-                                            biased;
-                                            _ = reader_halt.notified() => {}
-                                            _ = tx.send(Err(std::io::Error::new(
-                                                std::io::ErrorKind::InvalidData,
-                                                "request body exceeds max_request_body_size_bytes",
-                                            ))) => {}
-                                        }
-                                        finish_reader();
-                                        return;
-                                    }
-                                    total += len;
-                                    reader_bytes.store(total as u64, Ordering::Relaxed);
-                                    // `Buf::copy_to_bytes` is zero-copy when the
-                                    // underlying buffer is already `bytes::Bytes`
-                                    // (always true with h3-quinn). Mirrors the
-                                    // pattern used by the native H3 backend pool
-                                    // in `src/http3/client.rs`.
-                                    let body_bytes = chunk.copy_to_bytes(len);
-                                    let send_outcome = tokio::select! {
-                                        biased;
-                                        _ = reader_halt.notified() => {
-                                            crate::http3::stream_util::halt_request_body(stream);
-                                            finish_reader();
-                                            return;
-                                        }
-                                        res = tx.send(Ok(body_bytes)) => res,
-                                    };
-                                    if send_outcome.is_err() {
-                                        finish_reader();
-                                        return;
-                                    }
-                                }
-                                Ok(None) => {
-                                    finish_reader();
-                                    return;
-                                }
-                                Err(e) => {
-                                    tokio::select! {
-                                        biased;
-                                        _ = reader_halt.notified() => {}
-                                        _ = tx.send(Err(std::io::Error::other(format!(
-                                            "H3 recv_data failed: {}",
-                                            e
-                                        )))) => {}
-                                    }
-                                    finish_reader();
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-
-            // Race resolution: the reader_future MUST stay polled until
-            // it exits cleanly, otherwise dropping it closes the mpsc
-            // sender mid-stream and reqwest surfaces the aborted body as
-            // a connection error — AND the H3 recv half is left
-            // dangling, which the peer observes as RESET_STREAM(0x0).
-            // When the backend resolves first (common for early errors
-            // and small 2xx responses while the client is still
-            // uploading) we notify the reader so it halts the recv
-            // half itself and exits naturally. A short grace deadline
-            // caps the time we wait for the reader after the backend
-            // has already answered.
-            //
-            // The drain budget only applies on backend success — error
-            // responses (Bad Gateway, transport failure) halt
-            // immediately, matching the explicit ferrum.conf promise
-            // for FERRUM_H3_REQUEST_BODY_DRAIN_MS.
-            let drain_ms = state.env_config.h3_request_body_drain_ms;
-            let send_result = {
-                tokio::pin!(send_future);
-                tokio::pin!(reader_future);
-                let mut reader_done = false;
-                loop {
-                    tokio::select! {
-                        result = &mut send_future => {
-                            if !reader_done {
-                                let backend_succeeded = result.is_ok();
-                                if backend_succeeded && drain_ms > 0 {
-                                    let drain_deadline = Duration::from_millis(drain_ms);
-                                    if let Ok(()) =
-                                        tokio::time::timeout(drain_deadline, &mut reader_future)
-                                            .await
-                                    {
-                                        reader_done = true;
-                                    }
-                                }
-                                if !reader_done {
-                                    halt_notify.notify_one();
-                                    let halt_deadline = Duration::from_millis(100);
-                                    let _ = tokio::time::timeout(halt_deadline, &mut reader_future)
-                                        .await;
-                                }
-                            }
-                            break result;
-                        }
-                        _ = &mut reader_future, if !reader_done => {
-                            reader_done = true;
-                        }
-                    }
-                }
-            };
-            // Final safety net: regardless of how the reader exited
-            // (notified, naturally, oversized, recv error, or dropped
-            // because the halt_notify never reached an uncancellable
-            // await), call STOP_SENDING on the recv half before any
-            // success path proceeds to write the response. Without
-            // this, a reader parked in `tx.send()` under backpressure
-            // would have its future dropped after the halt deadline
-            // and the recv half would surface as RESET_STREAM(0x0) on
-            // the wire — the exact failure mode this PR removes from
-            // the early-response paths. STOP_SENDING is idempotent in
-            // h3-quinn (subsequent calls return ClosedStream which is
-            // ignored), so any inner halts already issued by the
-            // reader cost only one extra frame.
-            crate::http3::stream_util::halt_request_body(stream);
-            let bytes_sent = bytes_read.load(Ordering::Relaxed);
-            if oversized.load(Ordering::Relaxed) {
-                record_backend_outcome(
-                    state,
-                    proxy,
-                    &epoch.load_balancer,
-                    upstream_balancer,
-                    current_target.as_deref(),
-                    current_cb_target_key.as_deref(),
-                    413,
-                    false,
-                    None,
-                    cb_retry_probe_slot_available,
-                    false,
-                    backend_start.elapsed(),
-                );
-                return write_error(
-                    stream,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    r#"{"error":"Request body exceeds maximum size"}"#,
-                    backend_start,
-                    bytes_sent,
-                )
-                .await;
             }
-
-            match send_result {
-                Ok(response) => (response, bytes_sent),
-                Err(e) => {
-                    let final_backend_resolved_ip =
-                        resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref())
-                            .await;
-                    let attempt_result = reqwest_error_response_for_cross_protocol(
-                        state,
-                        &e,
-                        final_backend_resolved_ip.clone(),
-                    );
-                    warn!(
-                        proxy_id = %proxy.id,
-                        error = %e,
-                        class = ?attempt_result.error_class,
-                        "cross-protocol H3→HTTP: backend request failed"
-                    );
-                    record_backend_outcome(
-                        state,
-                        proxy,
-                        &epoch.load_balancer,
-                        upstream_balancer,
-                        current_target.as_deref(),
-                        current_cb_target_key.as_deref(),
-                        attempt_result.status_code,
-                        attempt_result.connection_error,
-                        attempt_result.error_class,
-                        cb_retry_probe_slot_available,
-                        false,
-                        backend_start.elapsed(),
-                    );
-                    let mut outcome = write_error(
-                        stream,
-                        StatusCode::BAD_GATEWAY,
-                        r#"{"error":"Bad Gateway"}"#,
-                        backend_start,
-                        bytes_sent,
-                    )
-                    .await?;
-                    outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
-                    outcome.connection_error = attempt_result.connection_error;
-                    outcome.error_class = attempt_result.error_class;
-                    outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
-                    return Ok(outcome);
-                }
-            }
-        }
-    };
+        };
 
     let status = response.status().as_u16();
     let mut response_headers = collect_reqwest_response_headers(&response);
@@ -1235,6 +1478,13 @@ where
             cb_retry_probe_slot_available,
             false,
             backend_start.elapsed(),
+        );
+        record_cross_protocol_backend_admission_outcome(
+            &mut backend_admission_permits,
+            502,
+            false,
+            Some(ErrorClass::ResponseBodyTooLarge),
+            backend_admission_elapsed,
         );
         let mut outcome = write_error(
             stream,
@@ -1266,12 +1516,19 @@ where
             upstream_balancer,
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
-            reject.status_code,
+            status,
             false,
             None,
             cb_retry_probe_slot_available,
             false,
             backend_start.elapsed(),
+        );
+        record_cross_protocol_backend_admission_outcome(
+            &mut backend_admission_permits,
+            status,
+            false,
+            None,
+            backend_admission_elapsed,
         );
         let mut outcome = write_reject_with_headers(
             stream,
@@ -1335,6 +1592,13 @@ where
                     cb_retry_probe_slot_available,
                     false,
                     backend_start.elapsed(),
+                );
+                record_cross_protocol_backend_admission_outcome(
+                    &mut backend_admission_permits,
+                    502,
+                    error_class.is_some_and(|class| class != ErrorClass::ClientDisconnect),
+                    error_class,
+                    backend_admission_elapsed,
                 );
                 let empty_headers = HashMap::new();
                 let mut outcome = write_reject_with_headers(
@@ -1445,6 +1709,24 @@ where
             false,
             backend_start.elapsed(),
         );
+        // Feed the limiter the ORIGINAL backend `status`, not `response_status`:
+        // response-body/final-body plugin rejects above may have rewritten
+        // `response_status` to a gateway policy code (e.g. a 503/4xx reject of a
+        // healthy backend 200). Recording the policy status would make the
+        // adaptive limiter shrink/grow on a signal that does not reflect backend
+        // health. Matches the streaming path below and the H1/H2 path, which
+        // capture the backend status before response-body hooks run.
+        record_cross_protocol_backend_admission_outcome(
+            &mut backend_admission_permits,
+            status,
+            false,
+            if body_completed {
+                None
+            } else {
+                Some(ErrorClass::ClientDisconnect)
+            },
+            backend_admission_elapsed,
+        );
 
         return Ok(CrossProtocolOutcome {
             response_status,
@@ -1511,6 +1793,18 @@ where
         false,
         backend_start.elapsed(),
     );
+    let backend_admission_connection_error = match body_error_class {
+        Some(ErrorClass::ClientDisconnect) => false,
+        Some(_) => true,
+        None => false,
+    };
+    record_cross_protocol_backend_admission_outcome(
+        &mut backend_admission_permits,
+        status,
+        backend_admission_connection_error,
+        body_error_class,
+        backend_admission_elapsed,
+    );
 
     Ok(CrossProtocolOutcome {
         response_status: status,
@@ -1553,6 +1847,7 @@ async fn dispatch_grpc<S>(
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
+    backend_admission_plugins: &[Arc<dyn Plugin>],
     requires_response_body_buffering: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -1575,6 +1870,7 @@ where
     let mut current_target = upstream_target.cloned().map(Arc::new);
     let mut current_cb_target_key = cb_target_key.map(str::to_owned);
     let mut current_url = backend_url.to_string();
+    let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
 
     // gRPC request body: the pool API takes `Bytes` for retry-safe framing
     // and trailer handling. Buffer the H3 recv half here (unary gRPC bodies
@@ -1710,6 +2006,27 @@ where
         requires_response_body_buffering,
     );
     let body_bytes = Bytes::from(body);
+    let mut backend_admission_start = Instant::now();
+    let mut backend_admission_permits = match run_cross_protocol_backend_admission_or_reject(
+        backend_admission_plugins,
+        plugins,
+        ctx,
+        proxy,
+        current_target.as_deref(),
+        HttpFlavor::Grpc,
+        stream,
+        backend_start,
+        bytes_sent,
+        state,
+        current_cb_target_key.as_deref(),
+        cb_retry_probe_slot_available,
+    )
+    .await?
+    {
+        Ok(permits) => permits,
+        // Probe release happens inside the helper, before the reject write.
+        Err(outcome) => return Ok(outcome),
+    };
     record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
     // `hmap` already contains the complete backend-bound header set
     // (plugin-transformed end-to-end headers + canonical forwarding
@@ -1769,6 +2086,17 @@ where
                 break;
             }
 
+            let retry_error_class = result
+                .as_ref()
+                .err()
+                .map(crate::retry::classify_grpc_proxy_error);
+            record_cross_protocol_backend_admission_outcome(
+                &mut backend_admission_permits,
+                502,
+                true,
+                retry_error_class,
+                backend_admission_start.elapsed(),
+            );
             record_cross_protocol_retry_failure(
                 state,
                 proxy,
@@ -1777,8 +2105,9 @@ where
                 current_cb_target_key.as_deref(),
                 502,
                 true,
-                cb_is_half_open_probe,
+                cb_retry_probe_slot_available,
             );
+            cb_retry_probe_slot_available = false;
 
             let delay = crate::retry::retry_delay(retry_config, attempt);
             tokio::time::sleep(delay).await;
@@ -1808,6 +2137,27 @@ where
                 max_retries = retry_config.max_retries,
                 "Retrying cross-protocol H3→gRPC backend request"
             );
+            backend_admission_start = Instant::now();
+            backend_admission_permits = match run_cross_protocol_backend_admission_or_reject(
+                backend_admission_plugins,
+                plugins,
+                ctx,
+                proxy,
+                current_target.as_deref(),
+                HttpFlavor::Grpc,
+                stream,
+                backend_start,
+                bytes_sent,
+                state,
+                current_cb_target_key.as_deref(),
+                cb_retry_probe_slot_available,
+            )
+            .await?
+            {
+                Ok(permits) => permits,
+                // Probe release happens inside the helper, before the reject write.
+                Err(outcome) => return Ok(outcome),
+            };
             record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
 
             // Stream the retry response under the same conditions as the
@@ -1876,9 +2226,22 @@ where
                     outcome.response_status,
                     false,
                     None,
-                    cb_is_half_open_probe,
+                    cb_retry_probe_slot_available,
                     false,
                     backend_start.elapsed(),
+                );
+                // Feed the limiter the BACKEND status, not the gateway policy reject
+                // in `outcome.response_status`: the backend responded fine and an
+                // after_proxy hook rejected it locally, so training on the policy
+                // status would wrongly shrink a healthy backend limit. gRPC errors
+                // ride on HTTP 200, and a rejected response is never forwarded, so use
+                // the backend `resp.status` directly (matching the plain buffered path).
+                record_cross_protocol_backend_admission_outcome(
+                    &mut backend_admission_permits,
+                    resp.status,
+                    false,
+                    None,
+                    backend_admission_start.elapsed(),
                 );
                 outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
                 outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
@@ -2024,9 +2387,33 @@ where
                 response_status,
                 false,
                 None,
-                cb_is_half_open_probe,
+                cb_retry_probe_slot_available,
                 false,
                 backend_start.elapsed(),
+            );
+            // A completed buffered gRPC response carries its backend outcome in the
+            // grpc-status trailer (HTTP 200), so map it for the admission sample —
+            // an UNAVAILABLE/INTERNAL backend must shrink, not look healthy. An
+            // incomplete stream stays a client disconnect (ignored), matching H1/H2.
+            let admission_status = if body_completed {
+                crate::proxy::grpc_proxy::grpc_admission_status_from_maps(
+                    &response_trailers,
+                    &response_headers,
+                    response_status,
+                )
+            } else {
+                response_status
+            };
+            record_cross_protocol_backend_admission_outcome(
+                &mut backend_admission_permits,
+                admission_status,
+                false,
+                if body_completed {
+                    None
+                } else {
+                    Some(ErrorClass::ClientDisconnect)
+                },
+                backend_admission_start.elapsed(),
             );
             Ok(CrossProtocolOutcome {
                 response_status,
@@ -2086,9 +2473,19 @@ where
                     outcome.response_status,
                     false,
                     None,
-                    cb_is_half_open_probe,
+                    cb_retry_probe_slot_available,
                     false,
                     backend_start.elapsed(),
+                );
+                // Backend status, not the gateway policy reject (see the buffered
+                // reject path above): a locally-rejected response must not train the
+                // limiter as a backend failure.
+                record_cross_protocol_backend_admission_outcome(
+                    &mut backend_admission_permits,
+                    streaming.status,
+                    false,
+                    None,
+                    backend_admission_start.elapsed(),
                 );
                 outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
                 outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
@@ -2110,7 +2507,15 @@ where
 
             let mut final_body_completed = body_completed;
             let mut final_client_disconnected = client_disconnected;
+            // Capture the backend gRPC outcome from the trailers before they are
+            // stripped/forwarded, so the admission sample below reflects a backend
+            // gRPC failure (e.g. 14 -> 503) instead of the HTTP 200 status line.
+            let mut grpc_trailer_status: Option<u32> = None;
             if body_completed && let Some(mut trailers) = trailers {
+                grpc_trailer_status = trailers
+                    .get("grpc-status")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u32>().ok());
                 // Strip RFC 9110 §7.6.1 response-direction hop-by-hop names from
                 // the backend gRPC trailers before forwarding to the H3 client,
                 // via the shared helper so this site, the buffered path
@@ -2154,9 +2559,30 @@ where
                 streaming.status,
                 false,
                 None,
-                cb_is_half_open_probe,
+                cb_retry_probe_slot_available,
                 false,
                 backend_start.elapsed(),
+            );
+            let backend_admission_connection_error = match body_error_class {
+                Some(ErrorClass::ClientDisconnect) => false,
+                Some(_) => true,
+                None => false,
+            };
+            // On a clean completion the backend health rides in the grpc-status
+            // trailer (HTTP 200) — map a non-OK status to 5xx so the limiter shrinks;
+            // a mid-stream body error already drives `connection_error`/error_class.
+            let admission_status = match grpc_trailer_status {
+                Some(code) if code != 0 => {
+                    crate::proxy::grpc_proxy::grpc_status_to_http_status(code)
+                }
+                _ => streaming.status,
+            };
+            record_cross_protocol_backend_admission_outcome(
+                &mut backend_admission_permits,
+                admission_status,
+                backend_admission_connection_error,
+                body_error_class,
+                backend_admission_start.elapsed(),
             );
             Ok(CrossProtocolOutcome {
                 response_status: streaming.status,
@@ -2227,9 +2653,16 @@ where
                 502,
                 connection_error,
                 Some(error_class),
-                cb_is_half_open_probe,
+                cb_retry_probe_slot_available,
                 false,
                 backend_start.elapsed(),
+            );
+            record_cross_protocol_backend_admission_outcome(
+                &mut backend_admission_permits,
+                502,
+                connection_error,
+                Some(error_class),
+                backend_admission_start.elapsed(),
             );
             let mut outcome = write_grpc_error(
                 stream,

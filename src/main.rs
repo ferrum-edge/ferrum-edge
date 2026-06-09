@@ -7,6 +7,7 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod adaptive_buffer;
+mod adaptive_concurrency;
 mod admin;
 mod backend_conn_limit;
 mod capture;

@@ -241,12 +241,20 @@ struct ToolCallAccumulator {
 pub struct SseReassembler {
     /// `choice_index -> assistant content`.
     content: Vec<(usize, String)>,
+    /// Lookup table for `content`, avoiding linear scans over untrusted indexes.
+    content_positions: HashMap<usize, usize>,
     /// `(choice_index, tool_call_index) -> accumulated name + arguments`.
     tool_calls: Vec<((usize, usize), ToolCallAccumulator)>,
+    /// Lookup table for `tool_calls`, avoiding linear scans over untrusted indexes.
+    tool_call_positions: HashMap<(usize, usize), usize>,
     /// Responses-API output text keyed by `(output_index, content_index)`.
     responses_text: Vec<((usize, usize), String)>,
+    /// Lookup table for `responses_text`, avoiding linear scans over untrusted indexes.
+    responses_text_positions: HashMap<(usize, usize), usize>,
     /// Responses-API function-call arguments keyed by `output_index`.
     responses_args: Vec<(usize, String)>,
+    /// Lookup table for `responses_args`, avoiding linear scans over untrusted indexes.
+    responses_args_positions: HashMap<usize, usize>,
 }
 
 impl SseReassembler {
@@ -473,11 +481,13 @@ impl SseReassembler {
     }
 
     fn content_mut(&mut self, choice: usize) -> &mut String {
-        let pos = match self.content.iter().position(|(c, _)| *c == choice) {
+        let pos = match self.content_positions.get(&choice).copied() {
             Some(pos) => pos,
             None => {
+                let pos = self.content.len();
                 self.content.push((choice, String::new()));
-                self.content.len() - 1
+                self.content_positions.insert(choice, pos);
+                pos
             }
         };
         &mut self.content[pos].1
@@ -485,11 +495,13 @@ impl SseReassembler {
 
     fn tool_call_mut(&mut self, choice: usize, tool: usize) -> &mut ToolCallAccumulator {
         let key = (choice, tool);
-        let pos = match self.tool_calls.iter().position(|(k, _)| *k == key) {
+        let pos = match self.tool_call_positions.get(&key).copied() {
             Some(pos) => pos,
             None => {
+                let pos = self.tool_calls.len();
                 self.tool_calls.push((key, ToolCallAccumulator::default()));
-                self.tool_calls.len() - 1
+                self.tool_call_positions.insert(key, pos);
+                pos
             }
         };
         &mut self.tool_calls[pos].1
@@ -497,22 +509,26 @@ impl SseReassembler {
 
     fn responses_text_mut(&mut self, output: usize, content: usize) -> &mut String {
         let key = (output, content);
-        let pos = match self.responses_text.iter().position(|(k, _)| *k == key) {
+        let pos = match self.responses_text_positions.get(&key).copied() {
             Some(pos) => pos,
             None => {
+                let pos = self.responses_text.len();
                 self.responses_text.push((key, String::new()));
-                self.responses_text.len() - 1
+                self.responses_text_positions.insert(key, pos);
+                pos
             }
         };
         &mut self.responses_text[pos].1
     }
 
     fn responses_args_mut(&mut self, output: usize) -> &mut String {
-        let pos = match self.responses_args.iter().position(|(o, _)| *o == output) {
+        let pos = match self.responses_args_positions.get(&output).copied() {
             Some(pos) => pos,
             None => {
+                let pos = self.responses_args.len();
                 self.responses_args.push((output, String::new()));
-                self.responses_args.len() - 1
+                self.responses_args_positions.insert(output, pos);
+                pos
             }
         };
         &mut self.responses_args[pos].1
@@ -864,6 +880,24 @@ data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"baz\"}}]}\n\n";
         assert_eq!(texts[0].json_path, "$.choices[0].delta.content");
         assert_eq!(texts[1].text, "barbaz");
         assert_eq!(texts[1].json_path, "$.choices[1].delta.content");
+    }
+
+    #[test]
+    fn reassembles_many_distinct_untrusted_indexes_without_linear_scans() {
+        let mut reassembler = SseReassembler::new();
+        for index in 0..4096 {
+            reassembler.push_frame(&serde_json::json!({
+                "choices": [{
+                    "index": index,
+                    "delta": { "content": "x" }
+                }]
+            }));
+        }
+
+        let texts = reassembler.into_texts();
+        assert_eq!(texts.len(), 4096);
+        assert_eq!(texts[0].json_path, "$.choices[0].delta.content");
+        assert_eq!(texts[4095].json_path, "$.choices[4095].delta.content");
     }
 
     #[test]

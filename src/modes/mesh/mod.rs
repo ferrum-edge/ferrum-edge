@@ -2162,6 +2162,46 @@ fn mesh_outbound_upstream_port_remap(
         .collect()
 }
 
+/// Resolve ServiceEntry service-port→dial-port remaps for an egress upstream.
+///
+/// Egress upstream IDs intentionally stay keyed on the ServiceEntry service port
+/// while their targets may dial a numeric `targetPort`. Istio
+/// DestinationRule `portLevelSettings[].port.number` is service-port-scoped,
+/// but dispatch looks up Ferrum port overrides by the selected
+/// `UpstreamTarget.port` dial port. Re-key matching ServiceEntry ports here so
+/// per-port TLS/mTLS and pool policy cannot be dropped as a phantom port after
+/// targetPort materialization.
+fn egress_service_entry_port_remap(
+    upstream: &Upstream,
+    mesh_slice: &MeshSlice,
+) -> std::collections::HashMap<u16, u16> {
+    mesh_slice
+        .service_entries
+        .iter()
+        .filter(|entry| entry.location == ServiceEntryLocation::MeshExternal)
+        .flat_map(|entry| {
+            entry.hosts.iter().flat_map(move |host| {
+                entry.ports.iter().filter_map(move |port| {
+                    let upstream_id =
+                        mesh_egress_upstream_id(&entry.namespace, &entry.name, host, port.port);
+                    if upstream.id != upstream_id
+                        && upstream.name.as_deref() != Some(upstream_id.as_str())
+                    {
+                        return None;
+                    }
+
+                    match resolve_target_port(port.target_port.as_ref(), &[]) {
+                        Some(target_port) if target_port != port.port => {
+                            Some((port.port, target_port))
+                        }
+                        _ => None,
+                    }
+                })
+            })
+        })
+        .collect()
+}
+
 fn apply_destination_rules(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -2212,15 +2252,13 @@ fn apply_destination_rules(
                 upstream.targets.iter().map(|t| t.port).collect();
             let has_service_discovery = upstream.service_discovery.is_some();
 
-            // Round-12 F2: a mesh service-discovery upstream whose Service
-            // declares a numeric `targetPort` dials the container port (T) at
-            // runtime, not the Service port (P); dispatch keys port overrides by
-            // the dial port, so a DR `portLevelSettings` entry keyed on P must be
-            // re-keyed to T or it never matches the resolved target. Map P→T for
-            // numeric targetPorts. (Targets resolve at runtime, so a static
-            // target-port check isn't possible — and isn't needed, since a numeric
-            // targetPort is authoritative. A named targetPort resolves per-workload
-            // and is left under the Service port: a documented residual.)
+            // A mesh upstream can dial a numeric targetPort (T) while policy is
+            // still authored against the Service/ServiceEntry port (P). Dispatch
+            // keys port overrides by the dial port, so a DR `portLevelSettings`
+            // entry keyed on P must be re-keyed to T or it never matches the
+            // selected target. Map P→T for service-discovery MeshServices and
+            // materialized egress ServiceEntries with numeric targetPorts. Named
+            // targetPorts are workload/endpoint-specific and stay under P.
             let mesh_port_remap: std::collections::HashMap<u16, u16> = if has_service_discovery {
                 mesh_upstream_service(upstream, mesh_slice)
                     .map(|svc| {
@@ -2236,7 +2274,7 @@ fn apply_destination_rules(
                     })
                     .unwrap_or_default()
             } else {
-                std::collections::HashMap::new()
+                egress_service_entry_port_remap(upstream, mesh_slice)
             };
             // Materialized Ambient outbound HBONE upstreams (`__mesh-out-upstream-*`)
             // are static-target: their targets dial the resolved numeric
@@ -14648,6 +14686,81 @@ mod tests {
             upstreams[0].targets[0].port, 8443,
             "egress must dial the ServiceEntry targetPort, not the service port"
         );
+    }
+
+    #[test]
+    fn destination_rule_egress_service_entry_rekeys_port_policy_to_target_port() {
+        // Istio DestinationRule portLevelSettings are keyed by the ServiceEntry
+        // service port (443), while the egress upstream target dials the numeric
+        // targetPort (8443). The port-level TLS policy must be stored under the
+        // dial port so dispatch applies it to the selected target.
+        let mut entry = test_external_service_entry(
+            "dns-svc",
+            vec!["primary.external.com".to_string()],
+            443,
+            AppProtocol::Tls,
+        );
+        entry.ports[0].target_port = Some(ServiceTargetPort::Number(8443));
+
+        let (_, upstreams) = build_egress_proxies_and_upstreams(
+            &[entry.clone()],
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+        );
+        let mut config = GatewayConfig {
+            upstreams,
+            ..GatewayConfig::default()
+        };
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            service_entries: vec![entry],
+            destination_rules: vec![MeshDestinationRule {
+                name: "dns-svc".to_string(),
+                namespace: "default".to_string(),
+                host: "primary.external.com".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([(
+                    443u16,
+                    MeshTrafficPolicy {
+                        tls: Some(MeshTrafficPolicyTls {
+                            mode: MtlsMode::Simple,
+                            ca_certificates: Some("/etc/certs/primary-ca.pem".to_string()),
+                            sni: Some("primary.external.com".to_string()),
+                            ..MeshTrafficPolicyTls::default()
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = &config.upstreams[0];
+        assert!(
+            upstream.port_overrides.contains_key(&8443),
+            "service-port policy must be re-keyed onto targetPort 8443, got {:?}",
+            upstream.port_overrides.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !upstream.port_overrides.contains_key(&443),
+            "policy must not remain under service port 443"
+        );
+        let tls = upstream
+            .port_overrides
+            .get(&8443)
+            .and_then(|slot| slot.tls.as_ref())
+            .expect("targetPort override carries resolved TLS policy");
+        assert_eq!(
+            tls.server_ca_cert_path.as_deref(),
+            Some("/etc/certs/primary-ca.pem")
+        );
+        assert_eq!(tls.sni.as_deref(), Some("primary.external.com"));
     }
 
     #[test]

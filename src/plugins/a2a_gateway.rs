@@ -155,10 +155,12 @@ struct A2aDetection {
     binding: A2aBinding,
     method: String,
     jsonrpc_id: Option<Value>,
+    jsonrpc_batch_response: bool,
     task_id_hint: Option<String>,
     streaming_hint: bool,
     is_agent_card: bool,
     oversized_body: bool,
+    inspection_failed: bool,
 }
 
 pub struct A2aGateway {
@@ -252,16 +254,64 @@ impl A2aGateway {
                     binding: A2aBinding::JsonRpc,
                     method: "unknown".to_string(),
                     jsonrpc_id: None,
+                    jsonrpc_batch_response: false,
                     task_id_hint: None,
                     streaming_hint: false,
                     is_agent_card: false,
                     oversized_body: true,
+                    inspection_failed: false,
                 });
             }
             return None;
         }
         let value: Value = serde_json::from_slice(body).ok()?;
-        let envelope = parse_jsonrpc_envelope(&value).ok()?;
+        if let Some(batch) = value.as_array() {
+            return self.detect_jsonrpc_batch(batch, headers);
+        }
+        match self.detect_jsonrpc_value(&value, headers) {
+            Some(detection) => Some(detection),
+            // A body that carries a JSON-RPC `method` but is not a well-formed
+            // 2.0 request (wrong/absent `jsonrpc`, etc.) must not slip past a
+            // deny policy via a malformed envelope. Fail closed here exactly as
+            // batch members do below. Bodies with no `method` are not method
+            // calls, so they pass through unchanged (no over-blocking).
+            None if value.get("method").is_some() => {
+                self.jsonrpc_inspection_failed_detection(false)
+            }
+            None => None,
+        }
+    }
+
+    fn detect_jsonrpc_batch(
+        &self,
+        batch: &[Value],
+        headers: &HashMap<String, String>,
+    ) -> Option<A2aDetection> {
+        if batch.is_empty() {
+            return self.jsonrpc_inspection_failed_detection(false);
+        }
+        let mut first_detection = None;
+        for item in batch {
+            let Some(mut detection) = self.detect_jsonrpc_value(item, headers) else {
+                return self.jsonrpc_inspection_failed_detection(true);
+            };
+            detection.jsonrpc_batch_response = true;
+            if self.policy_action(&detection.method) == PolicyAction::Deny {
+                return Some(detection);
+            }
+            if first_detection.is_none() {
+                first_detection = Some(detection);
+            }
+        }
+        first_detection
+    }
+
+    fn detect_jsonrpc_value(
+        &self,
+        value: &Value,
+        headers: &HashMap<String, String>,
+    ) -> Option<A2aDetection> {
+        let envelope = parse_jsonrpc_envelope(value).ok()?;
         if envelope.jsonrpc.as_deref() != Some("2.0") || !envelope.is_request {
             return None;
         }
@@ -280,9 +330,28 @@ impl A2aGateway {
             streaming_hint: is_streaming_method(&metric_method),
             method: metric_method,
             jsonrpc_id: envelope.id,
-            task_id_hint: extract_task_id_from_request(&value),
+            jsonrpc_batch_response: false,
+            task_id_hint: extract_task_id_from_request(value),
             is_agent_card,
             oversized_body: false,
+            inspection_failed: false,
+        })
+    }
+
+    fn jsonrpc_inspection_failed_detection(
+        &self,
+        jsonrpc_batch_response: bool,
+    ) -> Option<A2aDetection> {
+        self.policy_requires_inspection().then(|| A2aDetection {
+            binding: A2aBinding::JsonRpc,
+            method: "unknown".to_string(),
+            jsonrpc_id: None,
+            jsonrpc_batch_response,
+            task_id_hint: None,
+            streaming_hint: false,
+            is_agent_card: false,
+            oversized_body: false,
+            inspection_failed: true,
         })
     }
 
@@ -294,10 +363,12 @@ impl A2aGateway {
                 binding: A2aBinding::Rest,
                 method: "agent/getCard".to_string(),
                 jsonrpc_id: None,
+                jsonrpc_batch_response: false,
                 task_id_hint: None,
                 streaming_hint: false,
                 is_agent_card: true,
                 oversized_body: false,
+                inspection_failed: false,
             });
         }
         let rest = self.rest_suffix(path)?;
@@ -306,6 +377,7 @@ impl A2aGateway {
             binding: A2aBinding::Rest,
             method: operation.to_string(),
             jsonrpc_id: None,
+            jsonrpc_batch_response: false,
             task_id_hint: task_id,
             streaming_hint: streaming,
             is_agent_card: matches!(
@@ -315,6 +387,7 @@ impl A2aGateway {
                     | "agent/getAuthenticatedExtendedCard"
             ),
             oversized_body: false,
+            inspection_failed: false,
         })
     }
 
@@ -336,10 +409,12 @@ impl A2aGateway {
             binding: A2aBinding::Grpc,
             method: operation.to_string(),
             jsonrpc_id: None,
+            jsonrpc_batch_response: false,
             task_id_hint: None,
             streaming_hint: streaming,
             is_agent_card: is_agent_card_method(operation),
             oversized_body: false,
+            inspection_failed: false,
         })
     }
 
@@ -517,6 +592,17 @@ impl Plugin for A2aGateway {
                 );
             }
             return oversized_jsonrpc_response(&detection);
+        }
+        if detection.inspection_failed && self.policy_requires_inspection() {
+            if self.observability.emit_metadata {
+                ctx.metadata
+                    .insert("a2a.policy_decision".to_string(), "deny".to_string());
+                ctx.metadata.insert(
+                    "a2a.error".to_string(),
+                    "request_body_uninspectable".to_string(),
+                );
+            }
+            return deny_response(&detection);
         }
         let action = self.policy_action(&detection.method);
         if self.observability.emit_metadata {
@@ -809,18 +895,11 @@ fn deny_response(detection: &A2aDetection) -> PluginResult {
     match detection.binding {
         A2aBinding::JsonRpc => PluginResult::Reject {
             status_code: 200,
-            body: json!({
-                "jsonrpc": "2.0",
-                "id": detection.jsonrpc_id.clone().unwrap_or(Value::Null),
-                "error": {
-                    "code": -32001,
-                    "message": "A2A method denied by gateway policy",
-                    "data": {
-                        "gateway": "a2a_gateway",
-                        "method": detection.method
-                    }
-                }
-            })
+            body: jsonrpc_error_response_body(
+                detection,
+                -32001,
+                "A2A method denied by gateway policy",
+            )
             .to_string(),
             headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         },
@@ -841,21 +920,34 @@ fn deny_response(detection: &A2aDetection) -> PluginResult {
     }
 }
 
+fn jsonrpc_error_response_body(detection: &A2aDetection, code: i64, message: &str) -> Value {
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": detection.jsonrpc_id.clone().unwrap_or(Value::Null),
+        "error": {
+            "code": code,
+            "message": message,
+            "data": {
+                "gateway": "a2a_gateway",
+                "method": detection.method
+            }
+        }
+    });
+    if detection.jsonrpc_batch_response {
+        Value::Array(vec![response])
+    } else {
+        response
+    }
+}
+
 fn oversized_jsonrpc_response(detection: &A2aDetection) -> PluginResult {
     PluginResult::Reject {
         status_code: 413,
-        body: json!({
-            "jsonrpc": "2.0",
-            "id": detection.jsonrpc_id.clone().unwrap_or(Value::Null),
-            "error": {
-                "code": -32013,
-                "message": "A2A request body exceeds gateway detection limit",
-                "data": {
-                    "gateway": "a2a_gateway",
-                    "method": detection.method
-                }
-            }
-        })
+        body: jsonrpc_error_response_body(
+            detection,
+            -32013,
+            "A2A request body exceeds gateway detection limit",
+        )
         .to_string(),
         headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
     }

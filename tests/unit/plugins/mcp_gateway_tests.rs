@@ -283,6 +283,34 @@ async fn start_mcp_empty_cursor_tools_server() -> MockServer {
     server
 }
 
+async fn start_mcp_oversized_json_tools_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "upstream-init",
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "oversized", "version": "1"}
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"jsonrpc":"2.0","id":"oversized","result":{{"tools":[{{"name":"huge_tool","description":"{}","inputSchema":{{"type":"object"}}}}]}}}}"#,
+            "x".repeat(4 * 1024 * 1024)
+        )))
+        .mount(&server)
+        .await;
+    server
+}
+
 async fn start_mcp_stateless_tools_server() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -805,6 +833,43 @@ fn invalid_config_shapes_are_rejected() {
     }
 }
 
+#[test]
+fn validation_upstream_and_catalog_limits_parse() {
+    let mut config = transparent_config("http://127.0.0.1:9/mcp");
+    config["validation"] = json!({
+        "max_upstream_response_bytes": 1024,
+        "max_catalog_items_per_list": 5,
+        "max_catalog_bytes_per_list": 2048
+    });
+    assert!(
+        create_plugin("mcp_gateway", &config).is_ok(),
+        "positive upstream/catalog limit overrides should be accepted"
+    );
+}
+
+#[test]
+fn validation_zero_limits_are_rejected() {
+    // Zero would disable a DoS backstop, so each limit must reject 0.
+    for field in [
+        "max_upstream_response_bytes",
+        "max_catalog_items_per_list",
+        "max_catalog_bytes_per_list",
+    ] {
+        let mut config = transparent_config("http://127.0.0.1:9/mcp");
+        let mut validation = serde_json::Map::new();
+        validation.insert(field.to_string(), json!(0));
+        config["validation"] = Value::Object(validation);
+
+        let err = create_plugin("mcp_gateway", &config)
+            .err()
+            .unwrap_or_else(|| panic!("{field} = 0 must be rejected"));
+        assert!(
+            err.contains(field),
+            "rejection should name {field}, got: {err}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn transparent_post_sets_direct_route_override_and_metadata() {
     let plugin = create_plugin(
@@ -1167,6 +1232,34 @@ async fn aggregate_tools_list_follows_upstream_pagination() {
         .collect();
     tool_names.sort_unstable();
     assert_eq!(tool_names, vec!["github.create_pr", "github.second_tool"]);
+}
+
+#[tokio::test]
+async fn aggregate_tools_list_rejects_oversized_upstream_json() {
+    let server = start_mcp_oversized_json_tools_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config["policy"] = json!({"default_action": "allow"});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 24,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32006);
+    assert_eq!(body["error"]["message"], "MCP catalog unavailable");
 }
 
 #[tokio::test]

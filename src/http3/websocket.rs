@@ -130,7 +130,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::load_balancer::LoadBalancer;
-use crate::plugins::{Plugin, RequestContext, TransactionSummary};
+use crate::plugins::{
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, ProxyProtocol, RequestContext,
+    TransactionSummary,
+};
 use crate::proxy::{ProxyState, WsSessionMeta};
 use crate::request_epoch::RequestEpoch;
 use crate::retry;
@@ -294,6 +297,100 @@ async fn send_h3_error_body<S>(
     crate::http3::stream_util::halt_request_body(stream);
 }
 
+async fn send_h3_reject_body<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) where
+    S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
+{
+    let mut builder = Response::builder().status(status);
+    if !headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("content-type"))
+    {
+        builder = builder.header("content-type", "application/json");
+    }
+    for (name, value) in headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    let resp = match builder.body(()) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("H3 WS: failed to build reject response: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = stream.send_response(resp).await {
+        debug!("H3 WS: failed to send reject response: {}", e);
+        return;
+    }
+    if !body.is_empty()
+        && let Err(e) = stream.send_data(Bytes::copy_from_slice(body)).await
+    {
+        debug!("H3 WS: failed to send reject body: {}", e);
+    }
+    if let Err(e) = stream.finish().await {
+        debug!("H3 WS: failed to finish stream after reject: {}", e);
+    }
+    crate::http3::stream_util::halt_request_body(stream);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_h3_backend_admission_rejection<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    rejection: crate::proxy::backend_dispatch::BackendAdmissionRejection,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    state: &ProxyState,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    original_request_path: &str,
+) where
+    S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
+{
+    let mut headers = rejection.headers;
+    crate::proxy::apply_after_proxy_hooks_to_rejection(
+        plugins,
+        ctx,
+        rejection.status_code,
+        &mut headers,
+    )
+    .await;
+    let status =
+        StatusCode::from_u16(rejection.status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    crate::proxy::log_rejected_request_with_path(
+        plugins,
+        ctx,
+        status.as_u16(),
+        start_time,
+        &rejection.plugin_name,
+        plugin_execution_ns,
+        Some(original_request_path),
+    )
+    .await;
+    crate::proxy::record_request(state, status.as_u16());
+    send_h3_reject_body(stream, status, &rejection.body, &headers).await;
+}
+
+fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
+    state: &ProxyState,
+    proxy: &Proxy,
+    target_key: Option<&str>,
+    is_half_open_probe: bool,
+) {
+    if !is_half_open_probe {
+        return;
+    }
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb = state
+            .circuit_breaker_cache
+            .get_or_create(&proxy.id, target_key, cb_config);
+        cb.record_neutral(true);
+    }
+}
+
 /// H3 WebSocket entry point. Called from `handle_h3_request` when
 /// `HttpFlavor::WebSocket` is detected on an HTTP/3 request and
 /// `FERRUM_HTTP3_WEBSOCKET_ENABLED` is true.
@@ -315,6 +412,7 @@ pub(crate) async fn handle_h3_websocket(
     proxy: Arc<Proxy>,
     ctx: RequestContext,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
     upstream_target: Option<Arc<UpstreamTarget>>,
     upstream_balancer: Option<Arc<LoadBalancer>>,
@@ -357,6 +455,7 @@ pub(crate) async fn handle_h3_websocket(
         client_ip = %ctx.client_ip,
         "H3 WebSocket (RFC 9220) upgrade request received"
     );
+    let mut ctx = ctx;
 
     // ── Connection admission ─────────────────────────────────────────
     let ws_connection_permit = match crate::proxy::try_acquire_websocket_connection_permit(
@@ -427,6 +526,9 @@ pub(crate) async fn handle_h3_websocket(
     let mut current_backend_url = backend_url;
     let mut current_target = upstream_target;
     let mut current_cb_target_key = cb_target_key;
+    let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
+    let mut backend_admission_start: Instant;
+    let mut ws_cb_probe_slot_available = cb_is_half_open_probe;
     let mut ws_attempt = 0u32;
 
     // The backend WebSocket connection acquired below is held for the full
@@ -483,6 +585,40 @@ pub(crate) async fn handle_h3_websocket(
             }
         };
 
+        backend_admission_start = Instant::now();
+        backend_admission_permits =
+            match crate::proxy::backend_dispatch::run_backend_admission_plugins(
+                backend_admission_plugins.as_ref(),
+                &ctx,
+                &proxy,
+                current_target.as_deref(),
+                ProxyProtocol::WebSocket,
+            ) {
+                Ok(permits) => permits,
+                Err(rejection) => {
+                    drop(conn_slot);
+                    release_h3_ws_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        current_cb_target_key.as_deref(),
+                        ws_cb_probe_slot_available,
+                    );
+                    send_h3_backend_admission_rejection(
+                        &mut stream,
+                        rejection,
+                        &plugins,
+                        &mut ctx,
+                        &state,
+                        start_time,
+                        plugin_execution_ns,
+                        &original_request_path,
+                    )
+                    .await;
+                    drop(ws_connection_permit);
+                    return Ok(());
+                }
+            };
+
         match crate::proxy::connect_websocket_backend(
             &current_backend_url,
             &proxy,
@@ -521,13 +657,22 @@ pub(crate) async fn handle_h3_websocket(
                 });
 
                 if let Some(delay) = retry_delay {
+                    if let Some(permits) = backend_admission_permits.take() {
+                        permits.record_backend_outcome(BackendAdmissionOutcome {
+                            response_status: 502,
+                            connection_error: ws_is_pre_wire,
+                            error_class: Some(ws_error_class),
+                            backend_elapsed: backend_admission_start.elapsed(),
+                        });
+                    }
                     if let Some(cb_config) = &proxy.circuit_breaker {
                         let cb = state.circuit_breaker_cache.get_or_create(
                             &proxy.id,
                             current_cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, ws_is_pre_wire, cb_is_half_open_probe);
+                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                        ws_cb_probe_slot_available = false;
                     }
 
                     tokio::time::sleep(delay).await;
@@ -577,6 +722,14 @@ pub(crate) async fn handle_h3_websocket(
                     error = %e,
                     "H3 WebSocket backend connection failed"
                 );
+                if let Some(permits) = backend_admission_permits.take() {
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status: 502,
+                        connection_error: ws_is_pre_wire,
+                        error_class: Some(ws_error_class),
+                        backend_elapsed: backend_admission_start.elapsed(),
+                    });
+                }
 
                 if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
@@ -584,7 +737,7 @@ pub(crate) async fn handle_h3_websocket(
                         current_cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, ws_is_pre_wire, cb_is_half_open_probe);
+                    cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
                 }
 
                 crate::proxy::record_request(&state, 502);
@@ -628,7 +781,7 @@ pub(crate) async fn handle_h3_websocket(
             current_cb_target_key.as_deref(),
             cb_config,
         );
-        cb.record_success(cb_is_half_open_probe);
+        cb.record_success(ws_cb_probe_slot_available);
     }
 
     // Capture the LB connection guard NOW — before the 200 is sent — so
@@ -638,6 +791,19 @@ pub(crate) async fn handle_h3_websocket(
         current_target.clone(),
         upstream_balancer.clone(),
     );
+    if let Some(permits) = backend_admission_permits.as_ref() {
+        // The permit is held for the full session (moved into the task below),
+        // so record the handshake latency without growing the limit — matching
+        // the H1/H2 WebSocket path. Growing here would ratchet the limit up on
+        // every concurrent session and defeat the in-flight session cap.
+        permits.record_backend_outcome_holding(BackendAdmissionOutcome {
+            response_status: 200,
+            connection_error: false,
+            error_class: None,
+            backend_elapsed: backend_admission_start.elapsed(),
+        });
+    }
+    let _backend_admission_permits = backend_admission_permits;
 
     // ── Send 200 OK response on the H3 stream (RFC 9220 §4) ─────────
     //

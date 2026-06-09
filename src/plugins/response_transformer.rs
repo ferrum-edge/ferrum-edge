@@ -88,6 +88,21 @@ impl ResponseTransformer {
             .gate(scope)
             .unwrap_or(self.default_enabled)
     }
+
+    fn static_rules_may_modify_content_type(&self) -> bool {
+        self.header_rules.iter().any(|rule| match rule.operation {
+            HeaderOp::Add | HeaderOp::Update | HeaderOp::Remove => rule.key == "content-type",
+            HeaderOp::Rename => {
+                rule.key == "content-type" || rule.new_key.as_deref() == Some("content-type")
+            }
+        })
+    }
+
+    fn route_rules_may_modify_content_type(ctx: &RequestContext) -> bool {
+        ctx.route_override_response_transform
+            .as_ref()
+            .is_some_and(|rules| rules.iter().any(|rule| rule.key == "content-type"))
+    }
 }
 
 fn parse_op(op: &str) -> Option<HeaderOp> {
@@ -333,6 +348,18 @@ impl Plugin for ResponseTransformer {
 
     fn requires_response_body_buffering(&self) -> bool {
         !self.body_rules.is_empty()
+    }
+
+    fn may_modify_response_content_type(
+        &self,
+        ctx: &RequestContext,
+        _response_content_type: Option<&str>,
+    ) -> bool {
+        // Whether a rule fires is decided by config/route state, not the
+        // backend response type, so the backend `Content-Type` is not consulted.
+        self.rules_enabled()
+            && (self.static_rules_may_modify_content_type()
+                || Self::route_rules_may_modify_content_type(ctx))
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {

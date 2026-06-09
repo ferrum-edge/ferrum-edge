@@ -27,7 +27,8 @@ use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{
-    Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction, TransactionSummary,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
+    RequestContext, ResponseStreamAction, TransactionSummary,
 };
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
@@ -1762,6 +1763,19 @@ async fn handle_h3_request(
         request_host.as_deref(),
     );
     let upstream_balancer = selection.balancer;
+    // A request that will be response-stream-inspected (e.g. ai_semantic_firewall
+    // `inspect`, which pre-buffers the `stream: true` request in `before_proxy` to
+    // set its marker) must dispatch through the cross-protocol/reqwest path, where
+    // the inspector is wired — the native-H3 pool's several send loops are not.
+    // Mirrors the H1/H2 frontend's `forces_reqwest_dispatch` gate; unmarked
+    // requests keep native H3. The marker is already set here because `before_proxy`
+    // ran above.
+    let use_native_h3_pool = http_flavor == HttpFlavor::Plain
+        && !plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx))
+        && crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
+    let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
+    let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
+    let mut backend_admission_start: std::time::Instant;
 
     let (cb_target_key, cb_is_half_open_probe) =
         match crate::proxy::backend_dispatch::check_circuit_breaker(
@@ -1907,6 +1921,7 @@ async fn handle_h3_request(
             proxy,
             ctx,
             plugins,
+            backend_admission_plugins,
             plugin_execution_ns,
             upstream_target,
             upstream_balancer,
@@ -1926,15 +1941,6 @@ async fn handle_h3_request(
         .await;
     }
 
-    // A request that will be response-stream-inspected (e.g. ai_semantic_firewall
-    // `inspect`, which pre-buffers the `stream: true` request to set its marker)
-    // must dispatch through the cross-protocol/reqwest path, where the inspector
-    // is wired — the native-H3 pool's several send loops are not. Mirrors the
-    // H1/H2 frontend's `forces_reqwest_dispatch` gate; unmarked requests keep
-    // native H3.
-    let use_native_h3_pool = http_flavor == HttpFlavor::Plain
-        && !plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx))
-        && crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     if !use_native_h3_pool {
         let prebuffered = if needs_request_buffering {
             let body_was_prebuffered = prebuffered_body_data.is_some();
@@ -2031,6 +2037,7 @@ async fn handle_h3_request(
                 client_ip: &client_ip_owned,
                 ctx: &mut ctx,
                 plugins: &plugins,
+                backend_admission_plugins: backend_admission_plugins.as_ref(),
                 requires_response_body_buffering: maybe_requires_response_body_buffering,
                 sticky_cookie_needed,
             })
@@ -2096,6 +2103,28 @@ async fn handle_h3_request(
         // ===== STREAMING REQUEST + RESPONSE PATH =====
         // Stream both the request body (frontend → backend) and response body
         // (backend → frontend) without buffering either into memory.
+
+        backend_admission_start = std::time::Instant::now();
+        backend_admission_permits = match run_h3_backend_admission_or_send_reject(
+            backend_admission_plugins.as_ref(),
+            &plugins,
+            &mut ctx,
+            &proxy,
+            upstream_target.as_deref(),
+            http_flavor,
+            &mut stream,
+            &state,
+            start_time,
+            plugin_execution_ns,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        )
+        .await?
+        {
+            Ok(permits) => permits,
+            // Probe release happens inside the helper, before the reject write.
+            Err(()) => return Ok(()),
+        };
 
         // Track connection for least-connections LB (after all pre-dispatch rejects)
         if let (Some(_upstream_id), Some(target), Some(balancer)) = (
@@ -2205,6 +2234,13 @@ async fn handle_h3_request(
                         false,
                         backend_start.elapsed(),
                     );
+                    record_h3_backend_admission_outcome(
+                        &mut backend_admission_permits,
+                        413,
+                        false,
+                        Some(crate::retry::ErrorClass::ClientDisconnect),
+                        backend_admission_start.elapsed(),
+                    );
                     return Ok(());
                 }
                 error!("Backend request failed (HTTP/3 streaming body): {}", e);
@@ -2260,6 +2296,13 @@ async fn handle_h3_request(
                     false,
                     backend_start.elapsed(),
                 );
+                record_h3_backend_admission_outcome(
+                    &mut backend_admission_permits,
+                    502,
+                    outcome_connection_error,
+                    outcome_error_class,
+                    backend_admission_start.elapsed(),
+                );
 
                 let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -2311,6 +2354,7 @@ async fn handle_h3_request(
             }
         };
 
+        let backend_admission_response_elapsed = backend_admission_start.elapsed();
         let response_status = h3_resp.status;
         let mut response_headers = h3_resp.headers;
 
@@ -2353,6 +2397,19 @@ async fn handle_h3_request(
                 cb_is_half_open_probe,
                 false,
                 backend_start.elapsed(),
+            );
+            // Unlike the circuit-breaker/passive-health record above (which sees
+            // the real backend status), the adaptive-concurrency sample must
+            // treat an oversized backend response as a failure: the gateway
+            // sends a 502 and the low-latency 2xx/4xx status would otherwise be
+            // counted as a fast success and grow the limit. Mirrors the reqwest
+            // path, which tags the admission outcome `ResponseBodyTooLarge`.
+            record_h3_backend_admission_outcome(
+                &mut backend_admission_permits,
+                response_status,
+                false,
+                Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+                backend_admission_response_elapsed,
             );
             record_request(&state, 502);
             return Ok(());
@@ -2397,6 +2454,13 @@ async fn handle_h3_request(
                 cb_is_half_open_probe,
                 false,
                 backend_start.elapsed(),
+            );
+            record_h3_backend_admission_outcome(
+                &mut backend_admission_permits,
+                response_status,
+                false,
+                None,
+                backend_admission_response_elapsed,
             );
 
             let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -2724,6 +2788,18 @@ async fn handle_h3_request(
             false,
             backend_start.elapsed(),
         );
+        let backend_admission_connection_error = match body_error_class {
+            Some(crate::retry::ErrorClass::ClientDisconnect) => false,
+            Some(_) => true,
+            None => false,
+        };
+        record_h3_backend_admission_outcome(
+            &mut backend_admission_permits,
+            response_status,
+            backend_admission_connection_error,
+            body_error_class,
+            backend_admission_response_elapsed,
+        );
 
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
         let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -2901,6 +2977,28 @@ async fn handle_h3_request(
         }
     }
 
+    backend_admission_start = std::time::Instant::now();
+    backend_admission_permits = match run_h3_backend_admission_or_send_reject(
+        backend_admission_plugins.as_ref(),
+        &plugins,
+        &mut ctx,
+        &proxy,
+        upstream_target.as_deref(),
+        http_flavor,
+        &mut stream,
+        &state,
+        start_time,
+        plugin_execution_ns,
+        cb_target_key.as_deref(),
+        cb_is_half_open_probe,
+    )
+    .await?
+    {
+        Ok(permits) => permits,
+        // Probe release happens inside the helper, before the reject write.
+        Err(()) => return Ok(()),
+    };
+
     // Track connection for least-connections LB (after all pre-dispatch rejects).
     // Placed here so the streaming-request path above handles its own tracking,
     // and early returns from body collection/plugin rejects don't leak counts.
@@ -2939,6 +3037,7 @@ async fn handle_h3_request(
             &mut ctx,
             &mut plugin_execution_ns,
             is_early_data,
+            backend_admission_start,
         )
         .await?
         {
@@ -2982,6 +3081,7 @@ async fn handle_h3_request(
                 &plugins,
                 &mut ctx,
                 &mut plugin_execution_ns,
+                backend_admission_start,
             )
             .await;
 
@@ -3071,6 +3171,14 @@ async fn handle_h3_request(
             cb_is_half_open_probe,
             false,
             backend_start.elapsed(),
+        );
+        let backend_admission_error_class = h3_stream_result.body_error_class.or(h3_error_class);
+        record_h3_backend_admission_outcome(
+            &mut backend_admission_permits,
+            backend_status,
+            connection_error,
+            backend_admission_error_class,
+            h3_stream_result.backend_admission_elapsed,
         );
 
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -3192,6 +3300,13 @@ async fn handle_h3_request(
                 },
                 attempt,
             ) {
+                record_h3_backend_admission_outcome(
+                    &mut backend_admission_permits,
+                    result.status,
+                    !result.request_on_wire,
+                    result.error_class,
+                    backend_admission_start.elapsed(),
+                );
                 // Record failure against current target's circuit breaker.
                 // Same typed signal as the retry decision: a graceful close
                 // (or any other post-`send_request` fault) does not count
@@ -3241,6 +3356,28 @@ async fn handle_h3_request(
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     current_target = Some(next);
                 }
+
+                backend_admission_start = std::time::Instant::now();
+                backend_admission_permits = match run_h3_backend_admission_or_send_reject(
+                    backend_admission_plugins.as_ref(),
+                    &plugins,
+                    &mut ctx,
+                    &proxy,
+                    current_target.as_deref(),
+                    http_flavor,
+                    &mut stream,
+                    &state,
+                    start_time,
+                    plugin_execution_ns,
+                    current_cb_target_key.as_deref(),
+                    cb_retry_probe_slot_available,
+                )
+                .await?
+                {
+                    Ok(permits) => permits,
+                    // Probe release happens inside the helper, before the reject write.
+                    Err(()) => return Ok(()),
+                };
 
                 warn!(
                     proxy_id = %proxy.id,
@@ -3317,6 +3454,13 @@ async fn handle_h3_request(
             cb_retry_probe_slot_available,
             false,
             backend_start.elapsed(),
+        );
+        record_h3_backend_admission_outcome(
+            &mut backend_admission_permits,
+            response_status,
+            !h3_request_on_wire,
+            h3_error_class,
+            backend_admission_start.elapsed(),
         );
 
         let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -3540,6 +3684,104 @@ fn h3_plugin_protocol_for_flavor(flavor: HttpFlavor) -> ProxyProtocol {
         HttpFlavor::Plain => ProxyProtocol::Http,
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
         HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_h3_backend_admission_or_send_reject(
+    backend_admission_plugins: &[Arc<dyn Plugin>],
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    flavor: HttpFlavor,
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &ProxyState,
+    start_time: std::time::Instant,
+    plugin_execution_ns: u64,
+    cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+) -> Result<Result<Option<BackendAdmissionPermitSet>, ()>, anyhow::Error> {
+    match crate::proxy::backend_dispatch::run_backend_admission_plugins(
+        backend_admission_plugins,
+        ctx,
+        proxy,
+        upstream_target,
+        h3_plugin_protocol_for_flavor(flavor),
+    ) {
+        Ok(permits) => Ok(Ok(permits)),
+        Err(rejection) => {
+            // Release any reserved circuit-breaker HALF_OPEN probe BEFORE writing
+            // the reject body: the write below propagates errors with `?`, so if
+            // the H3 client resets mid-write this returns early. The caller frees
+            // the probe only on the `Ok(Err(()))` arm, so releasing here guarantees
+            // the slot is freed even when the reject write fails.
+            release_h3_circuit_breaker_probe_on_admission_reject(
+                state,
+                proxy,
+                cb_target_key,
+                cb_is_half_open_probe,
+            );
+            let mut headers = rejection.headers;
+            apply_after_proxy_hooks_to_rejection(plugins, ctx, rejection.status_code, &mut headers)
+                .await;
+            let http_status = StatusCode::from_u16(rejection.status_code)
+                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            let log_status_code = h3_reject_log_status_and_metadata(
+                ctx,
+                flavor,
+                http_status,
+                &rejection.body,
+                &headers,
+            );
+            record_request(state, log_status_code);
+            log_rejected_request(
+                plugins,
+                ctx,
+                log_status_code,
+                start_time,
+                &rejection.plugin_name,
+                plugin_execution_ns,
+            )
+            .await;
+            send_h3_reject_flavor_aware(stream, flavor, http_status, &rejection.body, &headers)
+                .await?;
+            Ok(Err(()))
+        }
+    }
+}
+
+fn release_h3_circuit_breaker_probe_on_admission_reject(
+    state: &ProxyState,
+    proxy: &Proxy,
+    target_key: Option<&str>,
+    is_half_open_probe: bool,
+) {
+    if !is_half_open_probe {
+        return;
+    }
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb = state
+            .circuit_breaker_cache
+            .get_or_create(&proxy.id, target_key, cb_config);
+        cb.record_neutral(true);
+    }
+}
+
+fn record_h3_backend_admission_outcome(
+    permits: &mut Option<BackendAdmissionPermitSet>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<crate::retry::ErrorClass>,
+    backend_elapsed: Duration,
+) {
+    if let Some(permits) = permits.take() {
+        permits.record_backend_outcome(BackendAdmissionOutcome {
+            response_status,
+            connection_error,
+            error_class,
+            backend_elapsed,
+        });
     }
 }
 
@@ -3866,6 +4108,11 @@ struct H3StreamResult {
     /// reset can string-classify as `ConnectionReset` even though no
     /// request reached the backend).
     request_on_wire: bool,
+    /// Elapsed time from backend-admission acquisition until the backend
+    /// produced response headers or a pre-headers dispatch error. Streaming
+    /// callers reuse this after downstream body relay completes so adaptive
+    /// concurrency samples backend health rather than client backpressure.
+    backend_admission_elapsed: std::time::Duration,
 }
 
 enum H3RefinedResponse {
@@ -3888,6 +4135,7 @@ fn h3_backend_unavailable_stream_result(
     error_class: crate::retry::ErrorClass,
     request_on_wire: bool,
     reject_sent: bool,
+    backend_admission_elapsed: std::time::Duration,
 ) -> H3StreamResult {
     H3StreamResult {
         status: 502,
@@ -3898,6 +4146,7 @@ fn h3_backend_unavailable_stream_result(
         client_disconnected: !reject_sent,
         body_error_class: None,
         request_on_wire,
+        backend_admission_elapsed,
     }
 }
 
@@ -3931,6 +4180,7 @@ async fn proxy_to_backend_h3_refined_response(
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
     is_early_data: bool,
+    backend_admission_start: std::time::Instant,
 ) -> Result<H3RefinedResponse, anyhow::Error> {
     let h3_headers = build_h3_backend_headers(
         proxy,
@@ -3992,11 +4242,17 @@ async fn proxy_to_backend_h3_refined_response(
             .await
             .is_ok();
             return Ok(H3RefinedResponse::Streamed(
-                h3_backend_unavailable_stream_result(h3_error_class, request_on_wire, reject_sent),
+                h3_backend_unavailable_stream_result(
+                    h3_error_class,
+                    request_on_wire,
+                    reject_sent,
+                    backend_admission_start.elapsed(),
+                ),
             ));
         }
     };
 
+    let backend_admission_elapsed = backend_admission_start.elapsed();
     let response_status = h3_resp.status;
     let mut response_headers = h3_resp.headers;
     response_headers.retain(|name, _| !is_backend_response_strip_header(name));
@@ -4022,6 +4278,7 @@ async fn proxy_to_backend_h3_refined_response(
             plugins,
             ctx,
             plugin_execution_ns,
+            backend_admission_elapsed,
         )
         .await?;
         return Ok(H3RefinedResponse::Streamed(result));
@@ -4143,6 +4400,7 @@ async fn stream_h3_open_response_to_client(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
+    backend_admission_elapsed: std::time::Duration,
 ) -> Result<H3StreamResult, anyhow::Error> {
     if state.max_response_body_size_bytes > 0
         && let Some(len) = response_headers
@@ -4166,6 +4424,7 @@ async fn stream_h3_open_response_to_client(
             client_disconnected: !size_reject_sent,
             body_error_class: None,
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4201,6 +4460,7 @@ async fn stream_h3_open_response_to_client(
                 Some(crate::retry::ErrorClass::ClientDisconnect)
             },
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4231,6 +4491,7 @@ async fn stream_h3_open_response_to_client(
             client_disconnected: true,
             body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4372,6 +4633,7 @@ async fn stream_h3_open_response_to_client(
         client_disconnected,
         body_error_class,
         request_on_wire: true,
+        backend_admission_elapsed,
     })
 }
 
@@ -4399,6 +4661,7 @@ async fn proxy_to_backend_h3_streaming(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
+    backend_admission_start: std::time::Instant,
 ) -> Result<H3StreamResult, anyhow::Error> {
     let h3_headers = build_h3_backend_headers(
         proxy,
@@ -4473,10 +4736,12 @@ async fn proxy_to_backend_h3_streaming(
                 h3_error_class,
                 request_on_wire,
                 reject_sent,
+                backend_admission_start.elapsed(),
             ));
         }
     };
 
+    let backend_admission_elapsed = backend_admission_start.elapsed();
     let response_status = h3_resp.status;
     let mut response_headers = h3_resp.headers;
 
@@ -4523,6 +4788,7 @@ async fn proxy_to_backend_h3_streaming(
             // reached the wire. The 502 we synthesize is a gateway-side
             // policy rejection, not a transport failure.
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4570,6 +4836,7 @@ async fn proxy_to_backend_h3_streaming(
                 Some(crate::retry::ErrorClass::ClientDisconnect)
             },
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4606,6 +4873,7 @@ async fn proxy_to_backend_h3_streaming(
             // Headers came back from the backend; the request reached
             // the wire. The client gave up on us between then and now.
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4769,6 +5037,7 @@ async fn proxy_to_backend_h3_streaming(
         // produced response headers. Mid-stream aborts are post-wire
         // by construction — we already have headers from the backend.
         request_on_wire: true,
+        backend_admission_elapsed,
     })
 }
 
@@ -5726,6 +5995,7 @@ mod h3_streaming_outcome_tests {
             ErrorClass::ProtocolError,
             /* request_on_wire = */ true,
             /* reject_sent = */ false,
+            std::time::Duration::from_millis(7),
         );
         assert!(
             disconnected.client_disconnected,
@@ -5738,17 +6008,26 @@ mod h3_streaming_outcome_tests {
         );
         assert_eq!(disconnected.error_class, Some(ErrorClass::ProtocolError));
         assert!(disconnected.request_on_wire);
+        assert_eq!(
+            disconnected.backend_admission_elapsed,
+            std::time::Duration::from_millis(7)
+        );
 
         let delivered = super::h3_backend_unavailable_stream_result(
             ErrorClass::ProtocolError,
             /* request_on_wire = */ false,
             /* reject_sent = */ true,
+            std::time::Duration::from_millis(11),
         );
         assert!(
             !delivered.client_disconnected,
             "a delivered 502 reject write is not a client disconnect"
         );
         assert!(!delivered.request_on_wire);
+        assert_eq!(
+            delivered.backend_admission_elapsed,
+            std::time::Duration::from_millis(11)
+        );
     }
 }
 

@@ -17,6 +17,10 @@ use crate::config::types::{HttpFlavor, PassiveHealthCheck, Proxy, Upstream, Upst
 use crate::load_balancer::{
     HashOnStrategy, HealthContext, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
 };
+use crate::plugins::{
+    BackendAdmissionContext, BackendAdmissionDecision, BackendAdmissionPermit,
+    BackendAdmissionPermitSet, Plugin, ProxyProtocol, RequestContext,
+};
 use crate::proxy::ProxyState;
 use crate::proxy::is_valid_websocket_key;
 use crate::request_epoch::RequestEpoch;
@@ -427,6 +431,52 @@ fn circuit_breaker_target_key(
                     crate::circuit_breaker::target_key(&proxy.backend_host, proxy.backend_port)
                 })
         })
+}
+
+pub(crate) struct BackendAdmissionRejection {
+    pub(crate) plugin_name: String,
+    pub(crate) status_code: u16,
+    pub(crate) body: Vec<u8>,
+    pub(crate) headers: HashMap<String, String>,
+}
+
+pub(crate) fn run_backend_admission_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    protocol: ProxyProtocol,
+) -> Result<Option<BackendAdmissionPermitSet>, BackendAdmissionRejection> {
+    if plugins.is_empty() {
+        return Ok(None);
+    }
+
+    let admission = BackendAdmissionContext {
+        proxy,
+        upstream_target,
+        protocol,
+    };
+    let mut permits: Vec<Arc<dyn BackendAdmissionPermit>> = Vec::new();
+    for plugin in plugins {
+        match plugin.try_backend_admission(ctx, &admission) {
+            BackendAdmissionDecision::Continue => {}
+            BackendAdmissionDecision::Admit(permit) => permits.push(permit),
+            BackendAdmissionDecision::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                return Err(BackendAdmissionRejection {
+                    plugin_name: plugin.name().to_string(),
+                    status_code,
+                    body,
+                    headers,
+                });
+            }
+        }
+    }
+
+    Ok(BackendAdmissionPermitSet::new(permits))
 }
 
 /// Record the outcome of a backend request across all observability systems:

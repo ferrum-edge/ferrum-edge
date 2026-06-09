@@ -3447,6 +3447,7 @@ paths:
                 - security_headers
                 - access_control
                 - tcp_connection_throttle
+                - adaptive_concurrency
                 - ip_restriction
                 - bot_detection
                 - correlation_id
@@ -6020,7 +6021,7 @@ components:
             Security plugins (key_auth, basic_auth, jwt_auth, jwks_auth,
             oauth2_introspection, oidc_relying_party, hmac_auth, ldap_auth,
             mtls_auth, access_control,
-            tcp_connection_throttle, ip_restriction, waf, security_headers, mesh_authz, opa,
+            tcp_connection_throttle, adaptive_concurrency, ip_restriction, waf, security_headers, mesh_authz, opa,
             mesh_outbound_registry, openapi_validator, ai_semantic_firewall, mcp_gateway, a2a_gateway) are validation-fatal: invalid config blocks
             gateway startup in file mode, and on DB/CP polling the new config
             snapshot is rejected as a whole (the gateway keeps serving the
@@ -10695,6 +10696,83 @@ components:
           minimum: 0
           description: Interval in seconds between background sweeps that remove zero-count entries from the per-key connection counter map. `0` disables the sweep (entries remain in memory until process restart).
 
+    AdaptiveConcurrencyConfig:
+      type: object
+      description: >-
+        Plugin: adaptive_concurrency — Target-aware backend admission for
+        upstream survival. Runs after load balancing for HTTP, gRPC, native
+        HTTP/3 backend dispatch, HTTP/3 fallback bridge dispatch, and
+        WebSocket upgrade admission with the permit held for the full session
+        lifetime.
+      properties:
+        key_by:
+          type: string
+          enum: [proxy_target, upstream_target, backend_target]
+          default: proxy_target
+          description: >-
+            Limit key scope. `proxy_target` keys by proxy plus selected
+            backend. `upstream_target` keys by upstream plus selected backend
+            when the proxy uses an upstream, and falls back to proxy-target
+            scoping for direct backends. `backend_target` shares one limit per
+            backend endpoint across every proxy using this plugin instance.
+        max_tracked_keys:
+          type: integer
+          format: uint64
+          default: 10000
+          minimum: 1
+          description: Maximum number of distinct target keys this plugin instance will track, bounding limiter memory for high-cardinality wildcard upstreams. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503), running unlimited until key churn or a config reload frees a tracked slot. Existing keys continue to be admitted subject to their adaptive limit.
+        min_limit:
+          type: integer
+          format: uint64
+          default: 1
+          minimum: 1
+          description: Lower bound for the adaptive in-flight request limit.
+        initial_limit:
+          type: integer
+          format: uint64
+          default: 32
+          minimum: 1
+          description: Starting in-flight request limit for a new target key. Must be between `min_limit` and `max_limit`.
+        max_limit:
+          type: integer
+          format: uint64
+          default: 1024
+          minimum: 1
+          description: Upper bound for the adaptive in-flight request limit. Must be greater than or equal to `min_limit`.
+        min_samples:
+          type: integer
+          format: uint64
+          default: 20
+          minimum: 1
+          description: Successful backend samples required before latency-based limit changes are applied.
+        target_latency_multiplier:
+          type: number
+          format: double
+          default: 1.5
+          exclusiveMinimum: 1
+          description: Target latency threshold as a multiple of the learned minimum observed backend latency.
+        decrease_ratio:
+          type: number
+          format: double
+          default: 0.8
+          exclusiveMinimum: 0
+          exclusiveMaximum: 1
+          description: Multiplicative decrease applied after backend 5xx responses, connection errors, or high latency.
+        increase_step:
+          type: integer
+          format: uint64
+          default: 1
+          minimum: 1
+          description: Additive increase applied when the target is saturated and latency remains within the target.
+        shadow_mode:
+          type: boolean
+          default: false
+          description: Learn and expose state without rejecting requests when the current in-flight count is at or above the limit.
+        expose_headers:
+          type: boolean
+          default: false
+          description: Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on rejection responses.
+
     IpRestrictionConfig:
       type: object
       description: >-
@@ -13648,6 +13726,24 @@ components:
               default: false
               enum: [false]
               description: Reserved; tool result validation is not implemented yet, so true is rejected at config validation.
+            max_upstream_response_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 4194304
+              description: "Maximum bytes read from a single non-SSE upstream application/json response before the read is aborted (DoS backstop). Must be greater than 0."
+            max_catalog_items_per_list:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 10000
+              description: "Maximum items accumulated across paginated catalog list pages (tools/resources/prompts) before the aggregation is rejected. Must be greater than 0."
+            max_catalog_bytes_per_list:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 8388608
+              description: "Maximum total serialized bytes accumulated across paginated catalog list pages before the aggregation is rejected. Must be greater than 0."
         observability:
           type: object
           properties:

@@ -33,6 +33,9 @@ const METADATA_REWRITE_PARAM_KEY: &str = "mcp.rewrite.param";
 const METADATA_REWRITE_PUBLIC_VALUE_KEY: &str = "mcp.rewrite.public_value";
 const METADATA_REWRITE_UPSTREAM_VALUE_KEY: &str = "mcp.rewrite.upstream_value";
 const MAX_MCP_PAGINATION_PAGES: usize = 100;
+const DEFAULT_MAX_MCP_CATALOG_ITEMS_PER_LIST: usize = 10_000;
+const DEFAULT_MAX_MCP_CATALOG_BYTES_PER_LIST: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MCP_STREAMABLE_HTTP_ACCEPT: &str = "application/json, text/event-stream";
 
@@ -178,6 +181,13 @@ impl McpPolicy {
 #[derive(Debug, Clone)]
 struct McpValidationConfig {
     validate_tool_arguments: bool,
+    /// Max bytes read from a single non-SSE upstream `application/json`
+    /// response before the read is aborted (DoS backstop).
+    max_upstream_response_bytes: usize,
+    /// Max items accumulated across paginated catalog list pages.
+    max_catalog_items_per_list: usize,
+    /// Max total serialized bytes accumulated across paginated catalog pages.
+    max_catalog_bytes_per_list: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -984,8 +994,13 @@ impl McpGateway {
             .get(&self.sessions.upstream_session_header)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
-        let response_body =
-            upstream_response_json(response, &server.server_id, "initialize").await?;
+        let response_body = upstream_response_json(
+            response,
+            &server.server_id,
+            "initialize",
+            self.validation.max_upstream_response_bytes,
+        )
+        .await?;
         if let Some(error) = response_body.get("error") {
             let error_code = error.get("code").and_then(Value::as_i64);
             let error_message = error
@@ -1259,7 +1274,13 @@ impl McpGateway {
                 response.status()
             ));
         }
-        let response_body = upstream_response_json(response, &server.server_id, method).await?;
+        let response_body = upstream_response_json(
+            response,
+            &server.server_id,
+            method,
+            self.validation.max_upstream_response_bytes,
+        )
+        .await?;
         if let Some(error) = response_body.get("error") {
             let error_code = error.get("code").and_then(Value::as_i64);
             let error_message = error
@@ -1287,6 +1308,9 @@ impl McpGateway {
         result_key: &str,
     ) -> Result<Vec<Value>, String> {
         let mut items = Vec::new();
+        let mut total_item_bytes = 0usize;
+        let max_items = self.validation.max_catalog_items_per_list;
+        let max_bytes = self.validation.max_catalog_bytes_per_list;
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_MCP_PAGINATION_PAGES {
             let params = match cursor.as_deref() {
@@ -1306,7 +1330,41 @@ impl McpGateway {
                 .ok_or_else(|| {
                     format!("upstream MCP {method} response missing result.{result_key}")
                 })?;
-            items.extend(page_items.iter().cloned());
+            for item in page_items {
+                if items.len() >= max_items {
+                    warn!(
+                        server_id = %server.server_id,
+                        method,
+                        max_items,
+                        "MCP upstream catalog item count exceeded limit"
+                    );
+                    return Err(format!(
+                        "upstream MCP {method} catalog exceeded {max_items} items"
+                    ));
+                }
+                let item_bytes = serde_json::to_vec(item).map_err(|error| {
+                    warn!(
+                        server_id = %server.server_id,
+                        method,
+                        error = %error,
+                        "MCP upstream catalog item could not be measured"
+                    );
+                    format!("upstream MCP {method} catalog item could not be measured: {error}")
+                })?;
+                if total_item_bytes.saturating_add(item_bytes.len()) > max_bytes {
+                    warn!(
+                        server_id = %server.server_id,
+                        method,
+                        max_bytes,
+                        "MCP upstream catalog item bytes exceeded limit"
+                    );
+                    return Err(format!(
+                        "upstream MCP {method} catalog exceeded {max_bytes} bytes"
+                    ));
+                }
+                total_item_bytes += item_bytes.len();
+                items.push(item.clone());
+            }
             cursor = result
                 .get("nextCursor")
                 .and_then(Value::as_str)
@@ -2810,6 +2868,7 @@ async fn upstream_response_json(
     response: reqwest::Response,
     server_id: &str,
     method: &str,
+    max_response_bytes: usize,
 ) -> Result<Value, String> {
     let is_sse = response
         .headers()
@@ -2825,15 +2884,8 @@ async fn upstream_response_json(
         return upstream_sse_json_rpc_response(response, server_id, method).await;
     }
 
-    let body = response.text().await.map_err(|error| {
-        warn!(
-            server_id,
-            method,
-            error = %error,
-            "MCP upstream response body could not be read"
-        );
-        format!("upstream MCP response body could not be read: {error}")
-    })?;
+    let body =
+        bounded_upstream_response_text(response, server_id, method, max_response_bytes).await?;
 
     serde_json::from_str::<Value>(&body)
         .or_else(|error| parse_sse_json_rpc_response(&body).ok_or(error))
@@ -2846,6 +2898,64 @@ async fn upstream_response_json(
             );
             format!("upstream MCP response was neither JSON nor SSE JSON-RPC: {error}")
         })
+}
+
+async fn bounded_upstream_response_text(
+    response: reqwest::Response,
+    server_id: &str,
+    method: &str,
+    max_response_bytes: usize,
+) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_response_bytes as u64)
+    {
+        warn!(
+            server_id,
+            method,
+            max_bytes = max_response_bytes,
+            "MCP upstream JSON response exceeded size limit"
+        );
+        return Err(format!(
+            "upstream MCP response exceeded {max_response_bytes} bytes"
+        ));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            warn!(
+                server_id,
+                method,
+                error = %error,
+                "MCP upstream response body could not be read"
+            );
+            format!("upstream MCP response body could not be read: {error}")
+        })?;
+        if body.len().saturating_add(chunk.len()) > max_response_bytes {
+            warn!(
+                server_id,
+                method,
+                max_bytes = max_response_bytes,
+                "MCP upstream JSON response exceeded size limit"
+            );
+            return Err(format!(
+                "upstream MCP response exceeded {max_response_bytes} bytes"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|error| {
+        warn!(
+            server_id,
+            method,
+            error = %error,
+            "MCP upstream response body was not UTF-8"
+        );
+        format!("upstream MCP response body was not UTF-8: {error}")
+    })
 }
 
 async fn upstream_sse_json_rpc_response(
@@ -3560,9 +3670,42 @@ fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, 
                 .to_string(),
         );
     }
+    let max_upstream_response_bytes =
+        optional_u64_from_object(validation, "max_upstream_response_bytes")?
+            .map(|value| value as usize)
+            .unwrap_or(DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES);
+    if max_upstream_response_bytes == 0 {
+        return Err(
+            "mcp_gateway: 'validation.max_upstream_response_bytes' must be greater than 0"
+                .to_string(),
+        );
+    }
+    let max_catalog_items_per_list =
+        optional_u64_from_object(validation, "max_catalog_items_per_list")?
+            .map(|value| value as usize)
+            .unwrap_or(DEFAULT_MAX_MCP_CATALOG_ITEMS_PER_LIST);
+    if max_catalog_items_per_list == 0 {
+        return Err(
+            "mcp_gateway: 'validation.max_catalog_items_per_list' must be greater than 0"
+                .to_string(),
+        );
+    }
+    let max_catalog_bytes_per_list =
+        optional_u64_from_object(validation, "max_catalog_bytes_per_list")?
+            .map(|value| value as usize)
+            .unwrap_or(DEFAULT_MAX_MCP_CATALOG_BYTES_PER_LIST);
+    if max_catalog_bytes_per_list == 0 {
+        return Err(
+            "mcp_gateway: 'validation.max_catalog_bytes_per_list' must be greater than 0"
+                .to_string(),
+        );
+    }
     Ok(McpValidationConfig {
         validate_tool_arguments: optional_bool_from_object(validation, "validate_tool_arguments")?
             .unwrap_or(true),
+        max_upstream_response_bytes,
+        max_catalog_items_per_list,
+        max_catalog_bytes_per_list,
     })
 }
 

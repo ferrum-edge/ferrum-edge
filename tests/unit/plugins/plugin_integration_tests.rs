@@ -202,6 +202,7 @@ async fn test_all_plugins_available() {
         "cors",
         "access_control",
         "tcp_connection_throttle",
+        "adaptive_concurrency",
         "ip_restriction",
         "bot_detection",
         "correlation_id",
@@ -347,6 +348,7 @@ async fn test_plugin_creation_all_plugins() {
             "response_transformer" => {
                 json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
             }
+            "adaptive_concurrency" => json!({}),
             "request_size_limiting" => json!({"max_bytes": 1048576}),
             "response_size_limiting" => json!({"max_bytes": 1048576}),
             "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
