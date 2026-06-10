@@ -170,6 +170,7 @@ pub(crate) const H3_BODY_PREALLOC_CAP_BYTES: u64 = 1024 * 1024;
 pub(crate) enum H3BodyDrainError {
     Stream(h3::error::StreamError),
     ResponseTooLarge { limit: usize },
+    ReadTimeout { timeout_ms: u64 },
 }
 
 impl std::fmt::Display for H3BodyDrainError {
@@ -182,6 +183,9 @@ impl std::fmt::Display for H3BodyDrainError {
                     "Backend response body exceeds maximum size of {limit} bytes"
                 )
             }
+            Self::ReadTimeout { timeout_ms } => {
+                write!(f, "Backend response read timeout after {timeout_ms}ms")
+            }
         }
     }
 }
@@ -190,7 +194,7 @@ impl std::error::Error for H3BodyDrainError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Stream(err) => Some(err),
-            Self::ResponseTooLarge { .. } => None,
+            Self::ResponseTooLarge { .. } | Self::ReadTimeout { .. } => None,
         }
     }
 }
@@ -220,6 +224,7 @@ pub(crate) async fn drain_h3_response_body(
     status: u16,
     content_length: Option<u64>,
     max_response_body_size_bytes: usize,
+    backend_read_timeout_ms: u64,
 ) -> Result<Vec<u8>, H3BodyDrainError> {
     if max_response_body_size_bytes > 0
         && content_length.is_some_and(|len| len > max_response_body_size_bytes as u64)
@@ -234,7 +239,24 @@ pub(crate) async fn drain_h3_response_body(
         None => Vec::new(),
     };
     loop {
-        match stream.recv_data().await {
+        let recv_result = if backend_read_timeout_ms > 0 {
+            match tokio::time::timeout(
+                Duration::from_millis(backend_read_timeout_ms),
+                stream.recv_data(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(H3BodyDrainError::ReadTimeout {
+                        timeout_ms: backend_read_timeout_ms,
+                    });
+                }
+            }
+        } else {
+            stream.recv_data().await
+        };
+        match recv_result {
             Ok(Some(chunk)) => {
                 let chunk = chunk.chunk();
                 if max_response_body_size_bytes > 0
@@ -262,6 +284,27 @@ pub(crate) async fn drain_h3_response_body(
         }
     }
     Ok(body)
+}
+
+async fn recv_h3_response_with_timeout(
+    stream: &mut H3RequestStream,
+    backend_read_timeout_ms: u64,
+) -> H3PoolResult<http::Response<()>> {
+    let recv = stream.recv_response();
+    let result = if backend_read_timeout_ms > 0 {
+        match tokio::time::timeout(Duration::from_millis(backend_read_timeout_ms), recv).await {
+            Ok(result) => result,
+            Err(_) => {
+                return Err(H3PoolError::post_wire(anyhow::anyhow!(
+                    "recv_response read timeout after {}ms",
+                    backend_read_timeout_ms
+                )));
+            }
+        }
+    } else {
+        recv.await
+    };
+    result.map_err(recv_response_err)
 }
 
 #[inline]
@@ -1658,7 +1701,8 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = stream.recv_response().await.map_err(recv_response_err)?;
+        let response =
+            recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -1699,6 +1743,7 @@ impl Http3ConnectionPool {
             status,
             content_length,
             max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
         )
         .await
         .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_data failed: {}", e)))?;
@@ -1759,7 +1804,8 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = stream.recv_response().await.map_err(recv_response_err)?;
+        let response =
+            recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -1887,10 +1933,9 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = backend_stream
-            .recv_response()
-            .await
-            .map_err(recv_response_err)?;
+        let response =
+            recv_h3_response_with_timeout(&mut backend_stream, proxy.backend_read_timeout_ms)
+                .await?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -2006,10 +2051,9 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = backend_stream
-            .recv_response()
-            .await
-            .map_err(recv_response_err)?;
+        let response =
+            recv_h3_response_with_timeout(&mut backend_stream, proxy.backend_read_timeout_ms)
+                .await?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -2778,7 +2822,7 @@ impl Http3Client {
             .and_then(|v| v.parse().ok());
 
         let response_body =
-            drain_h3_response_body(&mut stream, method, status, content_length, 0).await?;
+            drain_h3_response_body(&mut stream, method, status, content_length, 0, 0).await?;
 
         Ok((status, response_body, response_headers))
     }
