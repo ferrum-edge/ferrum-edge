@@ -673,10 +673,25 @@ fn collect_reqwest_warmup_candidates_for_proxy(
         && let Some(upstream) = upstream_map.get(upstream_id.as_str())
     {
         for target in &upstream.targets {
+            // Mesh-transport-tagged targets are NOT plaintext reqwest backends.
+            // HBONE targets warm via their own capability probe; SVID-mTLS
+            // targets dial a peer's mTLS listener — a plaintext reqwest HEAD to
+            // the app port would fail (or, worse, dial the app outside the mesh
+            // transport). Leave both to their transport-specific paths.
+            if hbone_pool::target_hbone_enabled(target)
+                || mesh_mtls_pool::target_mesh_mtls_enabled(target)
+            {
+                continue;
+            }
             targets.push((target.host.clone(), target.port));
         }
     }
-    if targets.is_empty() {
+    // Fall back to the proxy's own backend only when it has one. A mesh egress
+    // proxy carries `upstream_id` + an empty `backend_host`, so once its
+    // mesh-tagged targets are filtered out above, `targets` is empty and there
+    // is nothing to warm — do NOT synthesize a `:0` candidate from the empty
+    // backend.
+    if targets.is_empty() && !proxy.backend_host.is_empty() {
         targets.push((proxy.backend_host.clone(), proxy.backend_port));
     }
 
@@ -1002,6 +1017,61 @@ pub fn is_h2_websocket_connect<B>(req: &Request<B>) -> bool {
 /// (for example `connect-udp`) on the existing fail-closed path.
 pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> bool {
     hbone_proxy::is_connect_request(req, env_config)
+}
+
+/// Whether an authenticated inbound HBONE CONNECT to `host:port` may be
+/// transparently relayed. SAFE local targets only: a loopback address (the
+/// co-located app — Ferrum's per-workload Ambient/Sidecar model puts the app on
+/// loopback) or an in-mesh workload address+port the slice already declares.
+/// This bounds the terminator to mesh-known destinations, so an authenticated
+/// peer can never use the HBONE listener as an open proxy to arbitrary internal
+/// hosts. (`handle_hbone_request` separately requires the peer to be an
+/// authenticated, trust-domain-verified mesh identity before dialing.)
+fn inbound_hbone_relay_destination_allowed(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && ip.is_loopback()
+    {
+        return true;
+    }
+    // Otherwise the destination must be an in-mesh workload address+port the
+    // slice declares — never an arbitrary host. A workload that declares no
+    // ports admits any port for its address (the slice does not constrain it).
+    mesh.is_some_and(|mesh| {
+        mesh.workloads.iter().any(|workload| {
+            workload.addresses.iter().any(|addr| addr == host)
+                && (workload.ports.is_empty() || workload.ports.iter().any(|wp| wp.port == port))
+        })
+    })
+}
+
+/// Build a transparent inbound HBONE relay proxy that dials the CONNECT
+/// `:authority` of an authenticated mesh peer, for an Ambient/Waypoint
+/// terminator where no inbound route is materialized. Returns `None` (caller
+/// 404s) when the authority is missing/portless or is not a safe local relay
+/// target per [`inbound_hbone_relay_destination_allowed`].
+fn build_inbound_hbone_relay_proxy(
+    authority: Option<&http::uri::Authority>,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> Option<Arc<Proxy>> {
+    let authority = authority?;
+    let host = authority.host();
+    let port = authority.port_u16()?;
+    if host.is_empty() || port == 0 {
+        return None;
+    }
+    if !inbound_hbone_relay_destination_allowed(host, port, mesh) {
+        return None;
+    }
+    Some(Arc::new(
+        crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
+    ))
 }
 
 #[allow(dead_code)]
@@ -9541,16 +9611,42 @@ async fn handle_proxy_request_inner(
             (rm.proxy, rm.matched_prefix_len)
         }
         None => {
-            debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
-            state.request_count.fetch_add(1, Ordering::Relaxed);
-            let reject = normalize_reject_response(
-                StatusCode::NOT_FOUND,
-                br#"{"error":"Not Found"}"#,
-                &EMPTY_HEADERS,
-                request_uses_grpc_content_type,
-            );
-            record_status(&state, reject.http_status.as_u16());
-            return Ok(build_response_from_normalized_reject(reject));
+            // Ambient / Waypoint inbound HBONE terminators materialize NO
+            // inbound routes — the relay is transparent: it dials the CONNECT
+            // `:authority`, the original destination the mesh peer asked for.
+            // An authenticated CONNECT to a safe local target therefore relays
+            // through a synthesized proxy instead of 404ing. The synthesized
+            // proxy is built only on the inbound listener (`mesh_direction ==
+            // Inbound`) and only for a loopback / slice-known workload
+            // destination; `handle_hbone_request` re-checks the
+            // authenticated-peer gate before dialing.
+            let hbone_relay = if is_hbone_connect
+                && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+            {
+                build_inbound_hbone_relay_proxy(req.uri().authority(), epoch.config.mesh.as_deref())
+            } else {
+                None
+            };
+            match hbone_relay {
+                Some(relay_proxy) => {
+                    // Plugins (incl. the mesh global chain / `mesh_authz`) read
+                    // `ctx.headers`, so materialize them before the chain runs.
+                    ctx.materialize_headers();
+                    (relay_proxy, 0)
+                }
+                None => {
+                    debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
+                    state.request_count.fetch_add(1, Ordering::Relaxed);
+                    let reject = normalize_reject_response(
+                        StatusCode::NOT_FOUND,
+                        br#"{"error":"Not Found"}"#,
+                        &EMPTY_HEADERS,
+                        request_uses_grpc_content_type,
+                    );
+                    record_status(&state, reject.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(reject));
+                }
+            }
         }
     };
 
@@ -21045,6 +21141,71 @@ mod tests {
 
         assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
         assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
+    #[test]
+    fn inbound_hbone_relay_guard_allows_only_local_destinations() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadPort, WorkloadSelector};
+
+        // Loopback is always a safe relay target (the co-located app), even
+        // with no slice context.
+        assert!(inbound_hbone_relay_destination_allowed(
+            "127.0.0.1",
+            8080,
+            None
+        ));
+        assert!(inbound_hbone_relay_destination_allowed("::1", 8080, None));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "localhost",
+            8080,
+            None
+        ));
+
+        // A non-loopback host is REFUSED when it is not a slice-known workload —
+        // an authenticated peer must not be able to relay to arbitrary hosts.
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "10.1.2.3", 8080, None
+        ));
+
+        let mut mesh = MeshConfig::default();
+        mesh.workloads.push(Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
+            selector: WorkloadSelector::default(),
+            service_name: "app".to_string(),
+            addresses: vec!["10.1.2.3".to_string()],
+            ports: vec![WorkloadPort {
+                port: 8080,
+                protocol: crate::modes::mesh::config::AppProtocol::Http,
+                name: None,
+            }],
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+        });
+        // Now the workload's exact address+port is allowed...
+        assert!(inbound_hbone_relay_destination_allowed(
+            "10.1.2.3",
+            8080,
+            Some(&mesh)
+        ));
+        // ...but a port the workload does not expose is refused...
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "10.1.2.3",
+            9999,
+            Some(&mesh)
+        ));
+        // ...and an address the slice does not declare is refused.
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "10.9.9.9",
+            8080,
+            Some(&mesh)
+        ));
     }
 
     #[test]

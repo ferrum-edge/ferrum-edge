@@ -1766,6 +1766,83 @@ fn mesh_inbound_loopback_proxy(
     }
 }
 
+/// Reserved id for a synthesized transparent INBOUND HBONE relay proxy.
+/// Ambient / Waypoint terminators materialize NO inbound routes (the relay is
+/// transparent — it dials the CONNECT `:authority`, the original destination
+/// the mesh peer asked for), so an authenticated HBONE CONNECT that matches no
+/// route is relayed through a proxy built on the fly with this id. Carries the
+/// `MESH_INBOUND_PROXY_ID_PREFIX` so `mesh_authz`'s `mesh_inbound_app_port`
+/// reads the relay's `backend_port` (the destination app port) when evaluating
+/// port-scoped policy, exactly as for a materialized sidecar inbound route.
+pub(crate) const MESH_INBOUND_HBONE_RELAY_PROXY_ID: &str = "__mesh-inbound-hbone-relay";
+
+/// Build the transparent inbound HBONE relay proxy that dials `host:port` — the
+/// CONNECT `:authority` of an authenticated mesh peer. The caller
+/// (`proxy::mod`) gates this on the destination being a safe local target
+/// (loopback or a slice-known in-mesh workload address), so the terminator can
+/// never be used as an open proxy to arbitrary hosts. No upstreams / circuit
+/// breaker / retry: it is a transparent TCP tunnel, and the mesh global plugin
+/// chain (incl. `mesh_authz`) still runs on the outer CONNECT before the relay.
+pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
+    let now = chrono::Utc::now();
+    Proxy {
+        id: MESH_INBOUND_HBONE_RELAY_PROXY_ID.to_string(),
+        name: Some("mesh inbound hbone relay".to_string()),
+        namespace: String::new(),
+        hosts: Vec::new(),
+        listen_path: Some("/".to_string()),
+        backend_scheme: Some(BackendScheme::Http),
+        dispatch_kind: Default::default(),
+        backend_host: host.to_string(),
+        backend_port: port,
+        backend_path: None,
+        strip_listen_path: false,
+        preserve_host_header: true,
+        backend_connect_timeout_ms: 5_000,
+        backend_read_timeout_ms: 30_000,
+        backend_write_timeout_ms: 30_000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: false,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: BackendTlsConfig::default(),
+        dispatch_port_overrides: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: Default::default(),
+        plugins: Vec::<PluginAssociation>::new(),
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
+        upstream_id: None,
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: ResponseBodyMode::Stream,
+        listen_port: None,
+        frontend_tls: false,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        udp_max_response_amplification_factor: None,
+        tcp_idle_timeout_seconds: Some(300),
+        allowed_methods: None,
+        allowed_ws_origins: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 /// Which egress transport an outbound-materialized target dispatches over.
 /// Mesh transports are PER-TOPOLOGY (see `.claude/rules/mesh.md` "Datapath
 /// Layering"): Ambient/Waypoint speak HBONE on `:15008`; Sidecar speaks plain
