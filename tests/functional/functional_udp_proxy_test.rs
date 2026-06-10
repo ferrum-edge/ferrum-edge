@@ -19,7 +19,7 @@ use crate::common::{
     configure_coverage_gateway_command, explicit_test_binary, shutdown_gateway_child,
 };
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::net::UdpSocket;
 use tokio::time::sleep;
@@ -57,6 +57,33 @@ async fn start_udp_fixed_response_server(
         let mut buf = vec![0u8; 65535];
         while let Ok((_len, src)) = socket.recv_from(&mut buf).await {
             let _ = socket.send_to(&response, src).await;
+        }
+    });
+    sleep(Duration::from_millis(200)).await;
+    handle
+}
+
+/// Start a UDP backend that sends periodic responses after the first datagram
+/// from each client. Used to verify backend-side activity keeps DTLS frontend
+/// sessions alive even when the client is idle.
+async fn start_udp_push_server(port: u16) -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async move {
+        let socket = std::sync::Arc::new(
+            UdpSocket::bind(format!("127.0.0.1:{}", port))
+                .await
+                .unwrap_or_else(|_| panic!("Failed to bind UDP push server on port {}", port)),
+        );
+
+        let mut buf = vec![0u8; 65535];
+        while let Ok((_len, src)) = socket.recv_from(&mut buf).await {
+            let socket = std::sync::Arc::clone(&socket);
+            tokio::spawn(async move {
+                for i in 0..8u8 {
+                    let payload = format!("push-{i}");
+                    let _ = socket.send_to(payload.as_bytes(), src).await;
+                    sleep(Duration::from_millis(500)).await;
+                }
+            });
         }
     });
     sleep(Duration::from_millis(200)).await;
@@ -227,6 +254,74 @@ plugin_configs: []
     echo_server.abort();
 }
 
+/// Regression: a zero-length UDP datagram is valid payload, not EOF. The proxy
+/// must relay it in both directions and keep the session usable afterwards.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_zero_length_datagram_forwarding() {
+    let backend_port = 19830u16;
+    let proxy_port = 19831u16;
+    let gateway_http_port = 18220u16;
+
+    let echo_server = start_udp_echo_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-empty-datagram"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_idle_timeout_seconds: 30
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway =
+        start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+
+    client
+        .send(&[])
+        .await
+        .expect("Failed to send empty datagram");
+    let mut buf = vec![0u8; 1024];
+    let empty_len = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+        .await
+        .expect("empty datagram echo timed out")
+        .expect("empty datagram recv error");
+    assert_eq!(empty_len, 0, "empty datagram echo should have length 0");
+
+    let followup = b"after-empty";
+    client
+        .send(followup)
+        .await
+        .expect("Failed to send follow-up datagram");
+    let followup_len = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+        .await
+        .expect("follow-up echo timed out")
+        .expect("follow-up recv error");
+    assert_eq!(&buf[..followup_len], followup);
+
+    shutdown_gateway(&mut gateway);
+    echo_server.abort();
+}
+
 /// Test 2: Multiple concurrent UDP clients — verify session isolation.
 /// Each client should get back only its own data.
 #[ignore]
@@ -295,6 +390,88 @@ plugin_configs: []
     assert_eq!(completed.len(), num_clients, "All clients should complete");
 
     // Cleanup
+    shutdown_gateway(&mut gateway);
+    echo_server.abort();
+}
+
+/// Regression: new-source session setup must not block the single UDP recv loop
+/// while an established session is exchanging traffic.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_new_source_flood_does_not_stall_established_session() {
+    let backend_port = 19832u16;
+    let proxy_port = 19833u16;
+    let gateway_http_port = 18221u16;
+
+    let echo_server = start_udp_echo_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-setup-flood"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_idle_timeout_seconds: 30
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway =
+        start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+    let established = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    established.connect(&proxy_addr).await.unwrap();
+    established.send(b"warmup").await.unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), established.recv(&mut buf))
+        .await
+        .expect("warmup timed out")
+        .expect("warmup recv error");
+    assert_eq!(&buf[..n], b"warmup");
+
+    let flood_addr = proxy_addr.clone();
+    let flood = tokio::spawn(async move {
+        let mut handles = Vec::new();
+        for i in 0..128usize {
+            let addr = flood_addr.clone();
+            handles.push(tokio::spawn(async move {
+                let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                client.connect(&addr).await.unwrap();
+                let payload = format!("new-source-{i}");
+                let _ = client.send(payload.as_bytes()).await;
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    });
+
+    for i in 0..10usize {
+        let payload = format!("steady-{i}");
+        established
+            .send(payload.as_bytes())
+            .await
+            .expect("steady send failed");
+        let n = tokio::time::timeout(Duration::from_secs(2), established.recv(&mut buf))
+            .await
+            .expect("established session stalled during new-source flood")
+            .expect("steady recv error");
+        assert_eq!(&buf[..n], payload.as_bytes());
+    }
+    flood.await.unwrap();
+
     shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
@@ -829,6 +1006,85 @@ plugin_configs: []
     echo_server.abort();
 }
 
+/// Regression: DTLS frontend idle timeout is session-wide, not per direction.
+/// Backend-only push traffic must keep the session alive past the configured
+/// idle threshold even when the client sends no more datagrams.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_frontend_dtls_backend_push_keeps_session_alive() {
+    let backend_port = 19834u16;
+    let proxy_port = 19835u16;
+    let gateway_http_port = 18222u16;
+
+    let push_server = start_udp_push_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let (cert_path, key_path) = generate_test_dtls_cert(&temp_dir);
+
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "frontend-dtls-backend-push"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    frontend_tls: true
+    udp_idle_timeout_seconds: 2
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let dtls_env = GatewayDtlsEnv {
+        cert_path: cert_path.clone(),
+        key_path: key_path.clone(),
+    };
+    let mut gateway = start_gateway_with_dtls(
+        config_path.to_str().unwrap(),
+        gateway_http_port,
+        Some(&dtls_env),
+    )
+    .expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let dtls_client = connect_dtls_client_with_retry(proxy_port, 5).await;
+    dtls_client
+        .send(b"start-push")
+        .await
+        .expect("Failed to start backend push stream");
+
+    let started = Instant::now();
+    let mut late_reply = None;
+    while started.elapsed() < Duration::from_secs(5) {
+        match tokio::time::timeout(Duration::from_secs(1), dtls_client.recv()).await {
+            Ok(Ok(reply)) => {
+                if started.elapsed() > Duration::from_secs(3) {
+                    late_reply = Some(reply);
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("DTLS session closed before late backend push: {e}"),
+            Err(_) => {}
+        }
+    }
+
+    assert!(
+        late_reply.is_some(),
+        "backend push traffic should keep the DTLS frontend session alive beyond udp_idle_timeout_seconds"
+    );
+
+    dtls_client.close().await;
+    shutdown_gateway(&mut gateway);
+    push_server.abort();
+}
+
 /// Test 9: Full DTLS e2e — DTLS client → gateway (DTLS termination + DTLS origination) → DTLS echo server.
 ///
 /// Both sides encrypted: the gateway terminates DTLS from the client and opens a new
@@ -991,14 +1247,9 @@ async fn start_dtls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
         // Accept and echo
         while let Ok((conn, _remote_addr)) = server.accept().await {
             tokio::spawn(async move {
-                loop {
-                    match conn.recv().await {
-                        Ok(data) if !data.is_empty() => {
-                            if conn.send(&data).await.is_err() {
-                                break;
-                            }
-                        }
-                        _ => break,
+                while let Ok(data) = conn.recv().await {
+                    if conn.send(&data).await.is_err() {
+                        break;
                     }
                 }
             });

@@ -63,7 +63,7 @@ struct UdpSession {
     /// Set to `true` by the idle-cleanup task immediately before the
     /// session is removed from the session map. The recv-loop
     /// `last_client` fast path checks this flag and falls through to
-    /// `lookup_or_create_session` when it sees an expired session, so
+    /// session creation when it sees an expired session, so
     /// a cached `Arc<UdpSession>` that survived the map removal can't
     /// keep routing traffic through an orphaned backend leg. Without
     /// this gate the fast path serves stale sessions for as long as
@@ -128,6 +128,60 @@ struct UdpSession {
 /// SocketAddr keys are kernel-provided (not attacker-controlled), so cryptographic
 /// hashing is unnecessary — speed wins here.
 type SessionMap = Arc<DashMap<SocketAddr, Arc<UdpSession>, ahash::RandomState>>;
+type PendingSessionMap = Arc<DashMap<SocketAddr, (), ahash::RandomState>>;
+
+#[derive(Debug)]
+struct UdpDtlsIdleTimeout;
+
+impl std::fmt::Display for UdpDtlsIdleTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UDP DTLS idle timeout")
+    }
+}
+
+impl std::error::Error for UdpDtlsIdleTimeout {}
+
+fn is_udp_dtls_idle_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<UdpDtlsIdleTimeout>().is_some()
+}
+
+struct UdpSessionSlotReservation {
+    metrics: Arc<UdpProxyMetrics>,
+    active: bool,
+}
+
+impl UdpSessionSlotReservation {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for UdpSessionSlotReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn reserve_udp_session_slot(
+    metrics: &Arc<UdpProxyMetrics>,
+    max_sessions: usize,
+) -> Result<UdpSessionSlotReservation, anyhow::Error> {
+    let prev = metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
+    if prev >= max_sessions as u64 {
+        metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        return Err(anyhow::anyhow!(
+            "UDP session limit reached ({}), dropping datagram",
+            max_sessions
+        ));
+    }
+
+    Ok(UdpSessionSlotReservation {
+        metrics: Arc::clone(metrics),
+        active: true,
+    })
+}
 
 struct UdpSessionEpochView {
     proxy: Proxy,
@@ -686,6 +740,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     info!(proxy_id = %proxy_id, "UDP proxy listener started on {}", addr);
 
     let sessions: SessionMap = Arc::new(DashMap::with_hasher(ahash::RandomState::default()));
+    let pending_sessions: PendingSessionMap =
+        Arc::new(DashMap::with_hasher(ahash::RandomState::default()));
 
     // Spawn session cleanup task
     spawn_session_cleanup(
@@ -782,6 +838,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &dns_cache,
                                                     &frontend_socket,
                                                     &sessions,
+                                                    &pending_sessions,
                                                     &metrics,
                                                     tls_no_verify,
                                                     tls_ca_bundle_path.as_deref(),
@@ -823,6 +880,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &dns_cache,
                                         &frontend_socket,
                                         &sessions,
+                                        &pending_sessions,
                                         &metrics,
                                         tls_no_verify,
                                         tls_ca_bundle_path.as_deref(),
@@ -901,6 +959,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &dns_cache,
                     &frontend_socket,
                     &sessions,
+                    &pending_sessions,
                     &metrics,
                     tls_no_verify,
                     tls_ca_bundle_path.as_deref(),
@@ -978,6 +1037,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &dns_cache,
                                                     &frontend_socket,
                                                     &sessions,
+                                                    &pending_sessions,
                                                     &metrics,
                                                     tls_no_verify,
                                                     tls_ca_bundle_path.as_deref(),
@@ -1019,6 +1079,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &dns_cache,
                                         &frontend_socket,
                                         &sessions,
+                                        &pending_sessions,
                                         &metrics,
                                         tls_no_verify,
                                         tls_ca_bundle_path.as_deref(),
@@ -1074,6 +1135,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     &dns_cache,
                                     &frontend_socket,
                                     &sessions,
+                                    &pending_sessions,
                                     &metrics,
                                     tls_no_verify,
                                     tls_ca_bundle_path.as_deref(),
@@ -1138,10 +1200,11 @@ async fn process_datagram(
     data: &[u8],
     client_addr: SocketAddr,
     proxy_id: &str,
-    request_epoch: &RequestEpochStore,
+    request_epoch: &Arc<RequestEpochStore>,
     dns_cache: &DnsCache,
     frontend_socket: &Arc<UdpSocket>,
     sessions: &SessionMap,
+    pending_sessions: &PendingSessionMap,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
     tls_ca_bundle_path: Option<&str>,
@@ -1150,7 +1213,7 @@ async fn process_datagram(
     batch_dgrams_out: &mut u64,
     batch_bytes_out: &mut u64,
     listen_port: u16,
-    circuit_breaker_cache: &CircuitBreakerCache,
+    circuit_breaker_cache: &Arc<CircuitBreakerCache>,
     crls: &crate::tls::CrlList,
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
@@ -1162,6 +1225,10 @@ async fn process_datagram(
     mesh_outbound_enforcement:
         &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 ) -> Result<(), anyhow::Error> {
+    if pending_sessions.contains_key(&client_addr) {
+        return Ok(());
+    }
+
     // Fast path: check last-client cache before hitting DashMap.
     // Skip the cache when the cached session has been flagged expired
     // by the idle-cleanup task — that path removes the session from
@@ -1182,150 +1249,54 @@ async fn process_datagram(
             .map(|entry| entry.value().clone())
     };
 
-    let session = if let Some(session) = existing_session {
-        if !udp_datagram_allowed(
-            &session.datagram_plugins,
-            client_addr,
-            &session.proxy_id,
-            session.proxy_name.as_deref(),
-            session.listen_port,
-            data,
-            session.datagram_payload_kind,
-            UdpDatagramDirection::ClientToBackend,
-            Some(UdpMetadataSink::new(&session.metadata)),
-        )
-        .await
-        {
+    let Some(session) = existing_session else {
+        let reservation = reserve_udp_session_slot(metrics, max_sessions)?;
+        if pending_sessions.insert(client_addr, ()).is_some() {
             return Ok(());
         }
-        session
-    } else {
-        let epoch = request_epoch.load();
-        let view =
-            resolve_udp_session_epoch_view(proxy_id, &epoch, data, sni_proxy_ids, listen_port)?;
-        // The opening datagram is inspected before the session exists, so capture
-        // any WAF metadata it records into a local map and seed it onto the new
-        // session below — otherwise a monitor-mode hit on the very first datagram
-        // (the one that creates the session) would never reach the transaction
-        // summary.
-        let first_datagram_metadata =
-            std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
-        if !udp_datagram_allowed(
-            &view.datagram_plugins,
+        spawn_new_session_datagram(
+            data.to_vec(),
             client_addr,
-            &view.proxy.id,
-            view.proxy.name.as_deref(),
-            listen_port,
-            data,
-            if view.proxy.passthrough {
-                StreamBytesKind::EncryptedWire
-            } else {
-                StreamBytesKind::PlaintextWire
-            },
-            UdpDatagramDirection::ClientToBackend,
-            Some(UdpMetadataSink::new(&first_datagram_metadata)),
-        )
-        .await
-        {
-            // Blocked before any session exists. We intentionally do NOT emit a
-            // one-shot stream summary here. A sessionless UDP datagram has a
-            // trivially spoofable source, so a default-on (`log_to_metadata`)
-            // summary per blocked opening datagram would be a log-flood amplifier
-            // — unlike TCP, whose per-connection block summaries are bounded by a
-            // completed handshake, and unlike in-session UDP blocks, which ride
-            // the bounded per-session summary. The hit is still surfaced on the
-            // opt-in `log_to_stdout` channel via `warn_stream_hits`.
-            return Ok(());
-        }
-        // Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement (T5-B).
-        // Resolved here BEFORE `lookup_or_create_session` so an unadmitted
-        // destination never spawns a backend socket, never advances the
-        // session-limit counter, never opens a DTLS handshake, and never
-        // trips a circuit breaker. UDP has no RST analogue, so the
-        // enforcement is a silent drop with a structured warn! the first
-        // time the (client, backend) pair is rejected within a tight loop.
-        // Per-session caching is unnecessary because we only land here on
-        // the new-session branch — subsequent datagrams hit the
-        // `existing_session` fast path above and skip enforcement.
-        let mesh_enforcement_snapshot = mesh_outbound_enforcement.load_full();
-        if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
-            use crate::modes::mesh::outbound_enforcement::{
-                Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS,
-            };
-            // For UDP we have to peek at the resolved backend target — the
-            // proxy could be using an upstream LB, which already picked a
-            // target in `resolve_backend_target`. We mirror that resolution
-            // here against the same load_balancer snapshot so admit/deny
-            // decisions stay consistent with what the create_session path
-            // would actually dial.
-            let (backend_host, backend_port) =
-                resolve_backend_target(&view.proxy, &epoch.load_balancer)?;
-            let protocol_label = if matches!(view.proxy.effective_scheme(), BackendScheme::Dtls) {
-                PROTOCOL_UDP_DTLS
-            } else {
-                PROTOCOL_UDP
-            };
-            match enforcement.check_destination(listen_port, &backend_host, backend_port) {
-                Decision::Admit => {
-                    enforcement.record_stream_decision(protocol_label, Decision::Admit);
-                }
-                Decision::Deny => {
-                    enforcement.record_stream_decision(protocol_label, Decision::Deny);
-                    // Deny is cold path; the formatting cost here is dwarfed
-                    // by the structured log emission itself. Keep the host
-                    // and port distinct so log queries can filter on either.
-                    warn!(
-                        proxy_id = %view.proxy.id,
-                        client = %client_addr.ip(),
-                        listen_port = listen_port,
-                        backend_host = %backend_host,
-                        backend_port = backend_port,
-                        protocol = protocol_label,
-                        "Mesh REGISTRY_ONLY: dropping UDP datagram to unadmitted destination"
-                    );
-                    return Ok(());
-                }
-                Decision::Skip => {}
-            }
-        }
-        let session = lookup_or_create_session(
-            client_addr,
-            &epoch,
-            view,
-            dns_cache,
-            frontend_socket,
-            sessions,
-            metrics,
+            proxy_id.to_string(),
+            Arc::clone(request_epoch),
+            dns_cache.clone(),
+            Arc::clone(frontend_socket),
+            Arc::clone(sessions),
+            Arc::clone(pending_sessions),
+            Arc::clone(metrics),
             tls_no_verify,
-            tls_ca_bundle_path,
-            max_sessions,
+            tls_ca_bundle_path.map(str::to_owned),
             listen_port,
-            circuit_breaker_cache,
-            crls,
-            data,
-            adaptive_buffer,
+            Arc::clone(circuit_breaker_cache),
+            Arc::clone(crls),
+            sni_proxy_ids.map(|ids| ids.to_vec()),
+            Arc::clone(adaptive_buffer),
             udp_gso_enabled,
-            listener_shutdown,
-            global_shutdown,
-            overload,
-        )
-        .await?;
-        // Seed the opening datagram's WAF metadata onto the session without
-        // clobbering anything `on_stream_connect` recorded during creation.
-        let seed = first_datagram_metadata
-            .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !seed.is_empty() {
-            let mut session_meta = session
-                .metadata
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for (key, value) in seed {
-                session_meta.entry(key).or_insert(value);
-            }
-        }
-        session
+            local_addr,
+            listener_shutdown.clone(),
+            global_shutdown.cloned(),
+            Arc::clone(overload),
+            Arc::clone(mesh_outbound_enforcement),
+            reservation,
+        );
+        return Ok(());
     };
+
+    if !udp_datagram_allowed(
+        &session.datagram_plugins,
+        client_addr,
+        &session.proxy_id,
+        session.proxy_name.as_deref(),
+        session.listen_port,
+        data,
+        session.datagram_payload_kind,
+        UdpDatagramDirection::ClientToBackend,
+        Some(UdpMetadataSink::new(&session.metadata)),
+    )
+    .await
+    {
+        return Ok(());
+    }
 
     // Record the per-datagram local (destination) address on the session the
     // first time the kernel exposes one. `OnceLock::set` is a no-op if already
@@ -1337,7 +1308,209 @@ async fn process_datagram(
     // Update cache for next datagram.
     *last_client = Some((client_addr, session.clone()));
 
-    // Forward to backend.
+    forward_client_datagram_to_backend(&session, data).await?;
+    *batch_dgrams_out += 1;
+    *batch_bytes_out += data.len() as u64;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_new_session_datagram(
+    data: Vec<u8>,
+    client_addr: SocketAddr,
+    proxy_id: String,
+    request_epoch: Arc<RequestEpochStore>,
+    dns_cache: DnsCache,
+    frontend_socket: Arc<UdpSocket>,
+    sessions: SessionMap,
+    pending_sessions: PendingSessionMap,
+    metrics: Arc<UdpProxyMetrics>,
+    tls_no_verify: bool,
+    tls_ca_bundle_path: Option<String>,
+    listen_port: u16,
+    circuit_breaker_cache: Arc<CircuitBreakerCache>,
+    crls: crate::tls::CrlList,
+    sni_proxy_ids: Option<Vec<String>>,
+    adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+    udp_gso_enabled: bool,
+    local_addr: Option<crate::socket_opts::PktinfoLocal>,
+    listener_shutdown: watch::Receiver<bool>,
+    global_shutdown: Option<watch::Receiver<bool>>,
+    overload: Arc<crate::overload::OverloadState>,
+    mesh_outbound_enforcement:
+        crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    reservation: UdpSessionSlotReservation,
+) {
+    tokio::spawn(async move {
+        let result = process_new_session_datagram(
+            data,
+            client_addr,
+            &proxy_id,
+            &request_epoch,
+            &dns_cache,
+            &frontend_socket,
+            &sessions,
+            &metrics,
+            tls_no_verify,
+            tls_ca_bundle_path.as_deref(),
+            listen_port,
+            &circuit_breaker_cache,
+            &crls,
+            sni_proxy_ids.as_deref(),
+            &adaptive_buffer,
+            udp_gso_enabled,
+            local_addr,
+            &listener_shutdown,
+            global_shutdown.as_ref(),
+            &overload,
+            &mesh_outbound_enforcement,
+            reservation,
+        )
+        .await;
+        pending_sessions.remove(&client_addr);
+        if let Err(e) = result {
+            debug!(proxy_id = %proxy_id, client = %client_addr, "UDP session setup/initial forward error: {}", e);
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_new_session_datagram(
+    data: Vec<u8>,
+    client_addr: SocketAddr,
+    proxy_id: &str,
+    request_epoch: &RequestEpochStore,
+    dns_cache: &DnsCache,
+    frontend_socket: &Arc<UdpSocket>,
+    sessions: &SessionMap,
+    metrics: &Arc<UdpProxyMetrics>,
+    tls_no_verify: bool,
+    tls_ca_bundle_path: Option<&str>,
+    listen_port: u16,
+    circuit_breaker_cache: &CircuitBreakerCache,
+    crls: &crate::tls::CrlList,
+    sni_proxy_ids: Option<&[String]>,
+    adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+    udp_gso_enabled: bool,
+    local_addr: Option<crate::socket_opts::PktinfoLocal>,
+    listener_shutdown: &watch::Receiver<bool>,
+    global_shutdown: Option<&watch::Receiver<bool>>,
+    overload: &Arc<crate::overload::OverloadState>,
+    mesh_outbound_enforcement:
+        &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    mut reservation: UdpSessionSlotReservation,
+) -> Result<(), anyhow::Error> {
+    if sessions.contains_key(&client_addr) {
+        return Ok(());
+    }
+
+    let epoch = request_epoch.load();
+    let view = resolve_udp_session_epoch_view(proxy_id, &epoch, &data, sni_proxy_ids, listen_port)?;
+    let first_datagram_metadata =
+        std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
+    if !udp_datagram_allowed(
+        &view.datagram_plugins,
+        client_addr,
+        &view.proxy.id,
+        view.proxy.name.as_deref(),
+        listen_port,
+        &data,
+        if view.proxy.passthrough {
+            StreamBytesKind::EncryptedWire
+        } else {
+            StreamBytesKind::PlaintextWire
+        },
+        UdpDatagramDirection::ClientToBackend,
+        Some(UdpMetadataSink::new(&first_datagram_metadata)),
+    )
+    .await
+    {
+        return Ok(());
+    }
+
+    let mesh_enforcement_snapshot = mesh_outbound_enforcement.load_full();
+    if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
+        use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
+        let (backend_host, backend_port) =
+            resolve_backend_target(&view.proxy, &epoch.load_balancer)?;
+        let protocol_label = if matches!(view.proxy.effective_scheme(), BackendScheme::Dtls) {
+            PROTOCOL_UDP_DTLS
+        } else {
+            PROTOCOL_UDP
+        };
+        match enforcement.check_destination(listen_port, &backend_host, backend_port) {
+            Decision::Admit => {
+                enforcement.record_stream_decision(protocol_label, Decision::Admit);
+            }
+            Decision::Deny => {
+                enforcement.record_stream_decision(protocol_label, Decision::Deny);
+                warn!(
+                    proxy_id = %view.proxy.id,
+                    client = %client_addr.ip(),
+                    listen_port = listen_port,
+                    backend_host = %backend_host,
+                    backend_port = backend_port,
+                    protocol = protocol_label,
+                    "Mesh REGISTRY_ONLY: dropping UDP datagram to unadmitted destination"
+                );
+                return Ok(());
+            }
+            Decision::Skip => {}
+        }
+    }
+
+    let session = create_session(
+        &epoch,
+        view,
+        dns_cache,
+        frontend_socket,
+        client_addr,
+        sessions,
+        metrics,
+        tls_no_verify,
+        tls_ca_bundle_path,
+        listen_port,
+        circuit_breaker_cache,
+        crls,
+        &data,
+        adaptive_buffer,
+        udp_gso_enabled,
+        listener_shutdown,
+        global_shutdown,
+        overload,
+    )
+    .await?;
+    reservation.disarm();
+
+    let seed = first_datagram_metadata
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !seed.is_empty() {
+        let mut session_meta = session
+            .metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (key, value) in seed {
+            session_meta.entry(key).or_insert(value);
+        }
+    }
+
+    if let Some(la) = local_addr {
+        let _ = session.local_addr.set(la);
+    }
+
+    forward_client_datagram_to_backend(&session, &data).await?;
+    metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
+    metrics
+        .bytes_out
+        .fetch_add(data.len() as u64, Ordering::Relaxed);
+    Ok(())
+}
+
+async fn forward_client_datagram_to_backend(
+    session: &Arc<UdpSession>,
+    data: &[u8],
+) -> Result<(), anyhow::Error> {
     session
         .last_activity
         .store(coarse_epoch_millis(), Ordering::Relaxed);
@@ -1360,81 +1533,9 @@ async fn process_datagram(
             session
                 .last_request_size
                 .store(data.len() as u64, Ordering::Relaxed);
-            *batch_dgrams_out += 1;
-            *batch_bytes_out += data.len() as u64;
             Ok(())
         }
         Err(e) => Err(anyhow::anyhow!("send to backend failed: {}", e)),
-    }
-}
-
-/// Look up an existing session or create a new one.
-#[allow(clippy::too_many_arguments)]
-async fn lookup_or_create_session(
-    client_addr: SocketAddr,
-    epoch: &RequestEpoch,
-    view: UdpSessionEpochView,
-    dns_cache: &DnsCache,
-    frontend_socket: &Arc<UdpSocket>,
-    sessions: &SessionMap,
-    metrics: &Arc<UdpProxyMetrics>,
-    tls_no_verify: bool,
-    tls_ca_bundle_path: Option<&str>,
-    max_sessions: usize,
-    listen_port: u16,
-    circuit_breaker_cache: &CircuitBreakerCache,
-    crls: &crate::tls::CrlList,
-    initial_data: &[u8],
-    adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
-    udp_gso_enabled: bool,
-    listener_shutdown: &watch::Receiver<bool>,
-    global_shutdown: Option<&watch::Receiver<bool>>,
-    overload: &Arc<crate::overload::OverloadState>,
-) -> Result<Arc<UdpSession>, anyhow::Error> {
-    if let Some(existing) = sessions.get(&client_addr) {
-        return Ok(existing.value().clone());
-    }
-
-    // Atomically reserve a slot: increment active_sessions first, then check the limit.
-    // If we exceed the limit, undo the increment and reject. This prevents the TOCTOU
-    // race where multiple concurrent connections all pass a len() check before any insert.
-    let prev = metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
-    if prev >= max_sessions as u64 {
-        metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
-        return Err(anyhow::anyhow!(
-            "UDP session limit reached ({}), dropping datagram",
-            max_sessions
-        ));
-    }
-
-    match create_session(
-        epoch,
-        view,
-        dns_cache,
-        frontend_socket,
-        client_addr,
-        sessions,
-        metrics,
-        tls_no_verify,
-        tls_ca_bundle_path,
-        listen_port,
-        circuit_breaker_cache,
-        crls,
-        initial_data,
-        adaptive_buffer,
-        udp_gso_enabled,
-        listener_shutdown,
-        global_shutdown,
-        overload,
-    )
-    .await
-    {
-        Ok(session) => Ok(session),
-        Err(e) => {
-            // Session creation failed — release the reserved slot.
-            metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
-            Err(e)
-        }
     }
 }
 
@@ -1792,7 +1893,11 @@ async fn start_dtls_frontend_listener(
                                     e
                                 );
                                 let error_message = e.to_string();
-                                let err_class = crate::retry::classify_boxed_error(e.as_ref());
+                                let err_class = if is_udp_dtls_idle_timeout(e) {
+                                    crate::retry::ErrorClass::ReadWriteTimeout
+                                } else {
+                                    crate::retry::classify_boxed_error(e.as_ref())
+                                };
                                 // handle_dtls_client_inner can fail on
                                 // backend-side setup (DNS, backend UDP bind,
                                 // backend DTLS handshake) as well as
@@ -1991,6 +2096,10 @@ fn dtls_disconnect_cause(
     use crate::plugins::DisconnectCause;
     use crate::retry::ErrorClass;
 
+    if is_udp_dtls_idle_timeout(error) {
+        return DisconnectCause::IdleTimeout;
+    }
+
     if let Some(setup_err) = find_stream_setup_error(error) {
         return if setup_err.kind.is_client_side() {
             DisconnectCause::RecvError
@@ -2025,6 +2134,9 @@ fn dtls_disconnect_cause(
 /// the backend tore down the session.
 fn dtls_disconnect_direction(error: &anyhow::Error, class: &crate::retry::ErrorClass) -> Direction {
     use crate::retry::ErrorClass;
+    if is_udp_dtls_idle_timeout(error) {
+        return Direction::Unknown;
+    }
     if let Some(setup_err) = find_stream_setup_error(error) {
         return setup_err.kind.direction();
     }
@@ -2041,6 +2153,23 @@ fn dtls_disconnect_direction(error: &anyhow::Error, class: &crate::retry::ErrorC
             Direction::ClientToBackend
         }
         _ => Direction::Unknown,
+    }
+}
+
+async fn dtls_shared_idle_watchdog(
+    last_activity_ms: Arc<AtomicU64>,
+    idle_timeout: Duration,
+) -> Result<(), anyhow::Error> {
+    let idle_timeout_ms = idle_timeout.as_millis().min(u64::MAX as u128) as u64;
+    let poll_ms = (idle_timeout_ms / 4).clamp(100, 1_000);
+    let mut interval = tokio::time::interval(Duration::from_millis(poll_ms));
+    loop {
+        interval.tick().await;
+        let now = coarse_epoch_millis();
+        let last = last_activity_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) > idle_timeout_ms {
+            return Err(UdpDtlsIdleTimeout.into());
+        }
     }
 }
 
@@ -2296,17 +2425,18 @@ async fn handle_dtls_client_inner(
     // feed the same session map drained into the disconnect summary.
     let dgram_metadata_fwd = Arc::clone(&datagram_metadata);
     let dgram_metadata_rev = Arc::clone(&datagram_metadata);
+    let shared_activity_ms = Arc::new(AtomicU64::new(coarse_epoch_millis()));
 
     // Client → Backend
+    let activity_fwd = Arc::clone(&shared_activity_ms);
     let client_to_backend = tokio::spawn(async move {
         loop {
-            let data = match tokio::time::timeout(idle_timeout, client_conn.recv()).await {
-                Ok(Ok(d)) if d.is_empty() => break,
-                Ok(Ok(d)) => d,
-                Ok(Err(_)) => break,
+            let data = match client_conn.recv().await {
+                Ok(d) => d,
                 Err(_) => break,
             };
             let len = data.len();
+            activity_fwd.store(coarse_epoch_millis(), Ordering::Relaxed);
 
             metrics_fwd.datagrams_in.fetch_add(1, Ordering::Relaxed);
             metrics_fwd
@@ -2364,6 +2494,7 @@ async fn handle_dtls_client_inner(
                 .fetch_add(len as u64, Ordering::Relaxed);
             bytes_sent_fwd.fetch_add(len as u64, Ordering::Relaxed);
             last_request_size_fwd.store(len as u64, Ordering::Relaxed);
+            activity_fwd.store(coarse_epoch_millis(), Ordering::Relaxed);
         }
     });
 
@@ -2375,27 +2506,25 @@ async fn handle_dtls_client_inner(
     let amplification_factor_rev = proxy.udp_max_response_amplification_factor;
     let last_request_size_rev = Arc::clone(&last_request_size);
 
+    let activity_rev = Arc::clone(&shared_activity_ms);
     let backend_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         loop {
             let data = if let Some(ref dtls) = backend_dtls {
-                match tokio::time::timeout(idle_timeout, dtls.recv()).await {
-                    Ok(Ok(d)) if d.is_empty() => break,
-                    Ok(Ok(d)) => d,
-                    Ok(Err(_)) => break,
+                match dtls.recv().await {
+                    Ok(d) => d,
                     Err(_) => break,
                 }
             } else if let Some(ref sock) = backend_udp {
-                match tokio::time::timeout(idle_timeout, sock.recv(&mut buf)).await {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => buf[..n].to_vec(),
-                    Ok(Err(_)) => break,
+                match sock.recv(&mut buf).await {
+                    Ok(n) => buf[..n].to_vec(),
                     Err(_) => break,
                 }
             } else {
                 break;
             };
             let len = data.len();
+            activity_rev.store(coarse_epoch_millis(), Ordering::Relaxed);
 
             metrics_rev.datagrams_in.fetch_add(1, Ordering::Relaxed);
             metrics_rev
@@ -2452,21 +2581,27 @@ async fn handle_dtls_client_inner(
                 .bytes_out
                 .fetch_add(len as u64, Ordering::Relaxed);
             bytes_received_rev.fetch_add(len as u64, Ordering::Relaxed);
+            activity_rev.store(coarse_epoch_millis(), Ordering::Relaxed);
         }
     });
 
-    // Wait for either direction to finish, then clean up
-    tokio::select! {
-        _ = client_to_backend => {}
-        _ = backend_to_client => {}
-    }
+    let mut client_to_backend = client_to_backend;
+    let mut backend_to_client = backend_to_client;
+    let mut idle_watchdog = Box::pin(dtls_shared_idle_watchdog(shared_activity_ms, idle_timeout));
+    let outcome = tokio::select! {
+        _ = &mut client_to_backend => Ok(()),
+        _ = &mut backend_to_client => Ok(()),
+        result = &mut idle_watchdog => result,
+    };
+    client_to_backend.abort();
+    backend_to_client.abort();
 
     client_close.close().await;
     if let Some(ref dtls) = backend_dtls_cleanup {
         dtls.close().await;
     }
 
-    Ok(())
+    outcome
 }
 
 /// Create a new UDP session for a client (plain UDP frontend path).
@@ -2769,8 +2904,8 @@ async fn create_session(
     });
 
     sessions.insert(client_addr, session.clone());
-    // Note: active_sessions is incremented by the caller (lookup_or_create_session)
-    // before create_session is called, to avoid TOCTOU race conditions.
+    // Note: active_sessions is reserved by the receive loop before the
+    // background setup task calls create_session, avoiding TOCTOU races.
     metrics.total_sessions.fetch_add(1, Ordering::Relaxed);
 
     debug!(
@@ -2862,7 +2997,6 @@ async fn create_session(
                 };
                 match recv_result {
                     None => break,
-                    Some(Ok(d)) if d.is_empty() => break,
                     Some(Ok(d)) => {
                         len = d.len();
                         data_vec = Some(d);
@@ -2901,7 +3035,6 @@ async fn create_session(
                 };
                 match recv_result {
                     None => break,
-                    Some(Ok(0)) => break,
                     Some(Ok(n)) => {
                         len = n;
                         data_vec = None;
@@ -3424,7 +3557,7 @@ mod tests {
     use super::{
         DtlsDisconnectContext, STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext,
         UdpSession, build_dtls_stream_summary, build_udp_stream_summary, dtls_disconnect_cause,
-        dtls_disconnect_direction, emit_udp_stream_disconnect,
+        dtls_disconnect_direction, emit_udp_stream_disconnect, reserve_udp_session_slot,
     };
     use crate::config::types::BackendScheme;
     use crate::plugins::{Plugin, StreamTransactionSummary};
@@ -3704,6 +3837,53 @@ mod tests {
             dtls_disconnect_direction(&e, &ErrorClass::ConnectionReset),
             Direction::ClientToBackend
         );
+    }
+
+    #[test]
+    fn udp_dtls_idle_timeout_maps_to_idle_cause() {
+        use crate::plugins::{Direction, DisconnectCause};
+        use crate::retry::ErrorClass;
+
+        let e: anyhow::Error = super::UdpDtlsIdleTimeout.into();
+        assert_eq!(
+            dtls_disconnect_cause(&e, &ErrorClass::ReadWriteTimeout),
+            DisconnectCause::IdleTimeout
+        );
+        assert_eq!(
+            dtls_disconnect_direction(&e, &ErrorClass::ReadWriteTimeout),
+            Direction::Unknown
+        );
+    }
+
+    #[test]
+    fn udp_session_slot_reservation_releases_unclaimed_slot_on_drop() {
+        let metrics = Arc::new(super::UdpProxyMetrics::default());
+
+        {
+            let _reservation = reserve_udp_session_slot(&metrics, 1).unwrap();
+            assert_eq!(metrics.active_sessions.load(Ordering::Relaxed), 1);
+        }
+
+        assert_eq!(
+            metrics.active_sessions.load(Ordering::Relaxed),
+            0,
+            "dropping an unclaimed UDP session reservation must release the active slot"
+        );
+    }
+
+    #[test]
+    fn udp_session_slot_reservation_disarm_transfers_slot_to_session() {
+        let metrics = Arc::new(super::UdpProxyMetrics::default());
+        let mut reservation = reserve_udp_session_slot(&metrics, 1).unwrap();
+        reservation.disarm();
+        drop(reservation);
+
+        assert_eq!(
+            metrics.active_sessions.load(Ordering::Relaxed),
+            1,
+            "disarmed reservations are owned by the created session lifecycle"
+        );
+        metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
     }
 
     // --- OverloadState.active_connections parity (UDP <-> TCP/H3) ---
