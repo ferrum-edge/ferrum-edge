@@ -113,7 +113,7 @@ use crate::plugins::{
     RequestContext, ResponseStreamAction, ResponseStreamInspector,
 };
 use crate::proxy::ProxyState;
-use crate::proxy::backend_dispatch::record_backend_outcome;
+use crate::proxy::backend_dispatch::{record_backend_outcome, record_backend_outcome_no_conn_end};
 use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
 use crate::proxy::headers::{
     is_backend_response_strip_header, parse_connection_listed_headers,
@@ -218,6 +218,66 @@ fn record_cross_protocol_backend_admission_outcome(
             error_class,
             backend_elapsed,
         });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_cross_protocol_header_write_disconnect(
+    state: &ProxyState,
+    proxy: &Proxy,
+    epoch: &RequestEpoch,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&Arc<UpstreamTarget>>,
+    cb_target_key: Option<&str>,
+    backend_outcome_status: u16,
+    admission_status: u16,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+) {
+    record_backend_outcome(
+        state,
+        proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
+        current_target.map(|target| target.as_ref()),
+        cb_target_key,
+        backend_outcome_status,
+        false,
+        Some(ErrorClass::ClientDisconnect),
+        cb_is_half_open_probe,
+        false,
+        backend_start.elapsed(),
+    );
+    record_cross_protocol_backend_admission_outcome(
+        backend_admission_permits,
+        admission_status,
+        false,
+        Some(ErrorClass::ClientDisconnect),
+        backend_admission_elapsed,
+    );
+}
+
+fn cross_protocol_header_write_disconnect_outcome(
+    response_status: u16,
+    bytes_sent: u64,
+    backend_start: Instant,
+    backend_target: Option<String>,
+    backend_resolved_ip: Option<String>,
+) -> CrossProtocolOutcome {
+    CrossProtocolOutcome {
+        response_status,
+        bytes_streamed: 0,
+        bytes_sent,
+        backend_target,
+        backend_resolved_ip,
+        body_completed: false,
+        client_disconnected: true,
+        connection_error: false,
+        error_class: None,
+        body_error_class: Some(ErrorClass::ClientDisconnect),
+        backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
     }
 }
 
@@ -744,7 +804,7 @@ where
             reason = crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
             "cross-protocol H3→HTTP bridge cannot honor backend TLS SNI override; returning 502"
         );
-        record_backend_outcome(
+        record_backend_outcome_no_conn_end(
             state,
             proxy,
             &epoch.load_balancer,
@@ -782,7 +842,7 @@ where
                 proxy_id = %proxy.id,
                 "cross-protocol H3→HTTP: failed to get client from pool: {}", e
             );
-            record_backend_outcome(
+            record_backend_outcome_no_conn_end(
                 state,
                 proxy,
                 &epoch.load_balancer,
@@ -1678,7 +1738,31 @@ where
             }
         }
 
-        send_response_headers(stream, response_status, &response_headers).await?;
+        if let Err(error) = send_response_headers(stream, response_status, &response_headers).await
+        {
+            debug!("cross-protocol H3 buffered response header write failed: {error}");
+            record_cross_protocol_header_write_disconnect(
+                state,
+                proxy,
+                epoch,
+                upstream_balancer,
+                current_target.as_ref(),
+                current_cb_target_key.as_deref(),
+                response_status,
+                status,
+                cb_retry_probe_slot_available,
+                backend_start,
+                &mut backend_admission_permits,
+                backend_admission_elapsed,
+            );
+            return Ok(cross_protocol_header_write_disconnect_outcome(
+                response_status,
+                bytes_sent,
+                backend_start,
+                Some(strip_query_from_backend_url(&current_url)),
+                final_backend_resolved_ip.clone(),
+            ));
+        }
         let bytes_streamed = response_body.len() as u64;
         let mut body_completed = true;
         let mut client_disconnected = false;
@@ -1768,7 +1852,30 @@ where
     }
 
     // Send response headers, then stream the body.
-    send_response_headers(stream, status, &response_headers).await?;
+    if let Err(error) = send_response_headers(stream, status, &response_headers).await {
+        debug!("cross-protocol H3 streaming response header write failed: {error}");
+        record_cross_protocol_header_write_disconnect(
+            state,
+            proxy,
+            epoch,
+            upstream_balancer,
+            current_target.as_ref(),
+            current_cb_target_key.as_deref(),
+            status,
+            status,
+            cb_retry_probe_slot_available,
+            backend_start,
+            &mut backend_admission_permits,
+            backend_admission_elapsed,
+        );
+        return Ok(cross_protocol_header_write_disconnect_outcome(
+            status,
+            bytes_sent,
+            backend_start,
+            Some(strip_query_from_backend_url(&current_url)),
+            final_backend_resolved_ip.clone(),
+        ));
+    }
 
     let coalesce = CoalesceConfig::from_state(state);
     let max_resp_bytes = state.max_response_body_size_bytes;
@@ -2006,6 +2113,16 @@ where
         requires_response_body_buffering,
     );
     let body_bytes = Bytes::from(body);
+    let (initial_hmap, initial_body, retry_hmap, retry_body) = if grpc_has_retry {
+        (
+            hmap.clone(),
+            body_bytes.clone(),
+            Some(hmap),
+            Some(body_bytes),
+        )
+    } else {
+        (hmap, body_bytes, None, None)
+    };
     let mut backend_admission_start = Instant::now();
     let mut backend_admission_permits = match run_cross_protocol_backend_admission_or_reject(
         backend_admission_plugins,
@@ -2036,8 +2153,8 @@ where
     let empty_proxy_headers: HashMap<String, String> = HashMap::new();
     let mut result = proxy_grpc_request_from_bytes(
         hyper_method.clone(),
-        hmap.clone(),
-        body_bytes.clone(),
+        initial_hmap,
+        initial_body,
         proxy,
         &current_url,
         &state.grpc_pool,
@@ -2049,6 +2166,8 @@ where
     .await;
 
     if grpc_has_retry && let Some(retry_config) = &proxy.retry {
+        let hmap = retry_hmap.expect("retry hmap must exist when grpc retry is enabled");
+        let body_bytes = retry_body.expect("retry body must exist when grpc retry is enabled");
         let mut attempt = 0u32;
         loop {
             // Pre-wire predicate for the H3→gRPC retry loop, derived from
@@ -2202,7 +2321,8 @@ where
                 )
                 .await
             {
-                let mut outcome = write_final_body_reject(
+                let reject_status = reject.status_code;
+                let mut outcome = match write_final_body_reject(
                     stream,
                     HttpFlavor::Grpc,
                     plugins,
@@ -2215,7 +2335,36 @@ where
                     backend_start,
                     bytes_sent,
                 )
-                .await?;
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        debug!(
+                            "cross-protocol H3 gRPC buffered after_proxy reject header write failed: {error}"
+                        );
+                        record_cross_protocol_header_write_disconnect(
+                            state,
+                            proxy,
+                            epoch,
+                            upstream_balancer,
+                            current_target.as_ref(),
+                            current_cb_target_key.as_deref(),
+                            reject_status,
+                            resp.status,
+                            cb_retry_probe_slot_available,
+                            backend_start,
+                            &mut backend_admission_permits,
+                            backend_admission_start.elapsed(),
+                        );
+                        return Ok(cross_protocol_header_write_disconnect_outcome(
+                            reject_status,
+                            bytes_sent,
+                            backend_start,
+                            Some(strip_query_from_backend_url(&current_url)),
+                            final_backend_resolved_ip.clone(),
+                        ));
+                    }
+                };
                 record_backend_outcome(
                     state,
                     proxy,
@@ -2354,7 +2503,32 @@ where
                 }
             }
 
-            send_response_headers(stream, response_status, &response_headers).await?;
+            if let Err(error) =
+                send_response_headers(stream, response_status, &response_headers).await
+            {
+                debug!("cross-protocol H3 gRPC buffered response header write failed: {error}");
+                record_cross_protocol_header_write_disconnect(
+                    state,
+                    proxy,
+                    epoch,
+                    upstream_balancer,
+                    current_target.as_ref(),
+                    current_cb_target_key.as_deref(),
+                    response_status,
+                    response_status,
+                    cb_retry_probe_slot_available,
+                    backend_start,
+                    &mut backend_admission_permits,
+                    backend_admission_start.elapsed(),
+                );
+                return Ok(cross_protocol_header_write_disconnect_outcome(
+                    response_status,
+                    bytes_sent,
+                    backend_start,
+                    Some(strip_query_from_backend_url(&current_url)),
+                    final_backend_resolved_ip.clone(),
+                ));
+            }
             let bytes_total = response_body.len() as u64;
             let mut body_completed = true;
             let mut client_disconnected = false;
@@ -2449,7 +2623,8 @@ where
                 )
                 .await
             {
-                let mut outcome = write_final_body_reject(
+                let reject_status = reject.status_code;
+                let mut outcome = match write_final_body_reject(
                     stream,
                     HttpFlavor::Grpc,
                     plugins,
@@ -2462,7 +2637,36 @@ where
                     backend_start,
                     bytes_sent,
                 )
-                .await?;
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        debug!(
+                            "cross-protocol H3 gRPC streaming after_proxy reject header write failed: {error}"
+                        );
+                        record_cross_protocol_header_write_disconnect(
+                            state,
+                            proxy,
+                            epoch,
+                            upstream_balancer,
+                            current_target.as_ref(),
+                            current_cb_target_key.as_deref(),
+                            reject_status,
+                            streaming.status,
+                            cb_retry_probe_slot_available,
+                            backend_start,
+                            &mut backend_admission_permits,
+                            backend_admission_start.elapsed(),
+                        );
+                        return Ok(cross_protocol_header_write_disconnect_outcome(
+                            reject_status,
+                            bytes_sent,
+                            backend_start,
+                            Some(strip_query_from_backend_url(&current_url)),
+                            final_backend_resolved_ip.clone(),
+                        ));
+                    }
+                };
                 record_backend_outcome(
                     state,
                     proxy,
@@ -2499,7 +2703,32 @@ where
                 &mut streaming.headers,
             );
 
-            send_response_headers(stream, streaming.status, &streaming.headers).await?;
+            if let Err(error) =
+                send_response_headers(stream, streaming.status, &streaming.headers).await
+            {
+                debug!("cross-protocol H3 gRPC streaming response header write failed: {error}");
+                record_cross_protocol_header_write_disconnect(
+                    state,
+                    proxy,
+                    epoch,
+                    upstream_balancer,
+                    current_target.as_ref(),
+                    current_cb_target_key.as_deref(),
+                    streaming.status,
+                    streaming.status,
+                    cb_retry_probe_slot_available,
+                    backend_start,
+                    &mut backend_admission_permits,
+                    backend_admission_start.elapsed(),
+                );
+                return Ok(cross_protocol_header_write_disconnect_outcome(
+                    streaming.status,
+                    bytes_sent,
+                    backend_start,
+                    Some(strip_query_from_backend_url(&current_url)),
+                    final_backend_resolved_ip.clone(),
+                ));
+            }
             let coalesce = CoalesceConfig::from_state(state);
             let max_resp_bytes = state.max_response_body_size_bytes;
             let (bytes_streamed, body_completed, client_disconnected, body_error_class, trailers) =
@@ -3669,10 +3898,12 @@ fn should_skip_cross_protocol_backend_header(name: &str) -> bool {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Instant;
 
     use super::{
         apply_buffered_grpc_plugin_reject, apply_buffered_plain_plugin_reject,
-        apply_h3_grpc_reject_metadata, build_plain_request_builder, normalize_h3_grpc_reject,
+        apply_h3_grpc_reject_metadata, build_plain_request_builder,
+        cross_protocol_header_write_disconnect_outcome, normalize_h3_grpc_reject,
         reject_body_as_h3_grpc_message, sanitize_h3_grpc_message_for_header,
         should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
     };
@@ -3681,7 +3912,33 @@ mod tests {
     use crate::dns::{DnsCache, DnsConfig};
     use crate::plugins::{Plugin, PluginResult, RequestContext, security_headers::SecurityHeaders};
     use crate::proxy::ProxyState;
+    use crate::retry::ErrorClass;
     use hyper::{HeaderMap, StatusCode};
+
+    #[test]
+    fn header_write_disconnect_outcome_marks_client_disconnect_without_backend_error() {
+        let outcome = cross_protocol_header_write_disconnect_outcome(
+            200,
+            42,
+            Instant::now(),
+            Some("https://backend.example/path".to_string()),
+            Some("192.0.2.10".to_string()),
+        );
+
+        assert_eq!(outcome.response_status, 200);
+        assert_eq!(outcome.bytes_streamed, 0);
+        assert_eq!(outcome.bytes_sent, 42);
+        assert_eq!(
+            outcome.backend_target.as_deref(),
+            Some("https://backend.example/path")
+        );
+        assert_eq!(outcome.backend_resolved_ip.as_deref(), Some("192.0.2.10"));
+        assert!(!outcome.body_completed);
+        assert!(outcome.client_disconnected);
+        assert!(!outcome.connection_error);
+        assert_eq!(outcome.error_class, None);
+        assert_eq!(outcome.body_error_class, Some(ErrorClass::ClientDisconnect));
+    }
 
     #[test]
     fn cross_protocol_backend_header_filter_strips_hop_by_hop_and_forwarding_headers() {
@@ -4502,6 +4759,26 @@ mod tests {
             0,
             "client-supplied Early-Data must be stripped, and no value \
              injected when is_early_data == false"
+        );
+    }
+
+    #[test]
+    fn h3_cross_protocol_grpc_initial_dispatch_does_not_clone_without_retry() {
+        let src = include_str!("cross_protocol.rs");
+        assert!(
+            src.contains(
+                "let (initial_hmap, initial_body, retry_hmap, retry_body) = if grpc_has_retry"
+            ),
+            "retry replay buffers must be split from the initial dispatch inputs"
+        );
+        assert!(
+            src.contains(
+                "proxy_grpc_request_from_bytes(\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20hyper_method.clone(),\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20initial_hmap,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20initial_body,"
+            ),
+            "initial gRPC dispatch must move the prepared headers/body instead of cloning them"
         );
     }
 }
