@@ -51,7 +51,7 @@ pub mod udp_proxy;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -6375,11 +6375,13 @@ async fn handle_websocket_request_authenticated(
     // Measure total latency using monotonic Instant (NTP-safe).
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
-    // Resolve backend IP from DNS cache for WebSocket tx log
+    // Resolve backend IP from DNS cache for WebSocket tx log. Use the
+    // effective LB target when present, not the proxy's static backend_host.
+    let ws_resolve_host = websocket_dns_resolution_host(&proxy, current_target.as_deref());
     let ws_resolved_ip = state
         .dns_cache
         .resolve(
-            &proxy.backend_host,
+            ws_resolve_host,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
         )
@@ -6516,6 +6518,7 @@ async fn handle_websocket_request_authenticated(
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
+    let ws_idle_timeout_seconds = state.env_config.websocket_idle_timeout_seconds;
     let adaptive_buf = state.adaptive_buffer.clone();
     // Track the upgraded WebSocket session in `OverloadState.active_connections`
     // so graceful drain waits for in-flight WS sessions before exiting.
@@ -6602,6 +6605,7 @@ async fn handle_websocket_request_authenticated(
                     // `src/http3/websocket.rs` passes `true` for
                     // RFC 9220 §5 compliance.
                     false,
+                    ws_idle_timeout_seconds,
                     &adaptive_buf,
                 )
                 .await
@@ -6876,6 +6880,19 @@ fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Host used for WebSocket transaction-log DNS resolution. Load-balanced
+/// WebSocket sessions dial the selected target host, not the proxy's static
+/// `backend_host`, so `backend_resolved_ip` must follow the same effective
+/// destination as `backend_target`.
+pub(crate) fn websocket_dns_resolution_host<'a>(
+    proxy: &'a Proxy,
+    target: Option<&'a UpstreamTarget>,
+) -> &'a str {
+    target
+        .map(|target| target.host.as_str())
+        .unwrap_or(proxy.backend_host.as_str())
+}
+
 /// Build a WebSocket backend URL using a specific target host/port,
 /// respecting strip_listen_path, backend_path, and query string.
 ///
@@ -7061,6 +7078,8 @@ pub(crate) async fn connect_websocket_backend(
             }
         };
 
+    set_tcp_keepalive(backend_ws_stream.get_ref().get_ref());
+
     debug!("Connected to backend WebSocket server: {}", backend_url);
     debug!("Backend response status: {}", backend_response.status());
 
@@ -7216,6 +7235,25 @@ fn guard_ws_control_transform(
     }
 }
 
+enum WsNextMessage {
+    Item(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
+    IdleTimeout,
+}
+
+async fn next_websocket_message<S>(stream: &mut S, idle_timeout: Option<Duration>) -> WsNextMessage
+where
+    S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    if let Some(timeout) = idle_timeout.filter(|timeout| !timeout.is_zero()) {
+        match tokio::time::timeout(timeout, stream.next()).await {
+            Ok(item) => WsNextMessage::Item(item),
+            Err(_) => WsNextMessage::IdleTimeout,
+        }
+    } else {
+        WsNextMessage::Item(stream.next().await)
+    }
+}
+
 /// Generic over the client transport type `C`. The H1/H2 frontend passes
 /// `TokioIo::new(upgraded)` (hyper's `Upgraded` adapted to tokio AsyncRead+AsyncWrite);
 /// the H3 frontend (RFC 9220 Extended CONNECT) passes a `tokio::io::DuplexStream`
@@ -7254,6 +7292,7 @@ pub(crate) async fn run_websocket_proxy<C>(
     websocket_write_buffer_size: usize,
     websocket_tunnel_mode: bool,
     accept_unmasked_client_frames: bool,
+    websocket_idle_timeout_seconds: u64,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -7273,6 +7312,11 @@ where
         "run_websocket_proxy: tunnel mode is incompatible with unmasked client \
          frames (H3 caller must pass websocket_tunnel_mode=false)"
     );
+    let websocket_idle_timeout = if websocket_idle_timeout_seconds == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(websocket_idle_timeout_seconds))
+    };
 
     // When tunnel mode is enabled and no plugins need frame-level hooks, bypass
     // WebSocket frame parsing entirely and do raw TCP bidirectional copy. This
@@ -7302,35 +7346,40 @@ where
         // and `into_inner()` will drop them. Deployments where the backend
         // sends immediately after upgrade should use frame-parsing mode (set
         // a frame-level plugin or disable `FERRUM_WEBSOCKET_TUNNEL_MODE`).
-        let mut backend = backend_ws_stream.into_inner();
-        let mut client_io = client_io;
+        let backend = backend_ws_stream.into_inner();
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
-        let result = tokio::io::copy_bidirectional_with_sizes(
-            &mut client_io,
-            &mut backend,
-            buf_size,
+        let copy_result = tcp_proxy::bidirectional_copy_for_relay(
+            client_io,
+            backend,
+            websocket_idle_timeout,
+            None,
+            None,
+            None,
             buf_size,
         )
         .await;
-        let tunnel_failure = match &result {
-            Ok((c2b, b2c)) => {
-                adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
-                None
-            }
-            Err(e) => {
-                // `copy_bidirectional` doesn't report which half failed, so fall
-                // back to `Direction::Unknown`. Observers that rely on direction
-                // attribution should enable frame-level plugins instead of tunnel
-                // mode.
-                let anyhow_err: anyhow::Error =
-                    anyhow::anyhow!("WebSocket tunnel copy error: {}", e);
-                Some((
-                    crate::plugins::Direction::Unknown,
-                    crate::retry::classify_boxed_error(anyhow_err.as_ref()),
-                    None,
-                ))
-            }
-        };
+        adaptive_buffer.record_connection(
+            proxy_id,
+            copy_result
+                .bytes_client_to_backend
+                .saturating_add(copy_result.bytes_backend_to_client),
+        );
+        let tunnel_failure =
+            copy_result
+                .first_failure
+                .as_ref()
+                .map(|(direction, class, side, message)| {
+                    debug!(
+                        proxy_id = %proxy_id,
+                        connection_id,
+                        direction = ?direction,
+                        error_class = %class,
+                        io_side = ?side,
+                        error = %message,
+                        "WebSocket tunnel relay ended with failure"
+                    );
+                    (*direction, *class, *side)
+                });
         // Fire on_ws_disconnect so plugins that opted into disconnect hooks see
         // the tunnel-mode session teardown. Frame counts are 0 because tunnel
         // mode does raw TCP bidirectional copy — no frames are parsed.
@@ -7398,6 +7447,8 @@ where
     > = Arc::new(std::sync::OnceLock::new());
     let first_failure_ctb = first_failure.clone();
     let first_failure_btc = first_failure.clone();
+    let websocket_idle_timeout_ctb = websocket_idle_timeout;
+    let websocket_idle_timeout_btc = websocket_idle_timeout;
 
     // Cancellation token for clean bidirectional close when a plugin triggers Close.
     // Each direction checks this token to know if the other side initiated a close.
@@ -7428,8 +7479,27 @@ where
                     .await;
                     break;
                 }
-                msg = ws_stream.next() => {
-                    let Some(msg) = msg else { break };
+                msg = next_websocket_message(&mut ws_stream, websocket_idle_timeout_ctb) => {
+                    let msg = match msg {
+                        WsNextMessage::Item(Some(msg)) => msg,
+                        WsNextMessage::Item(None) => break,
+                        WsNextMessage::IdleTimeout => {
+                            debug!(
+                                proxy_id = %proxy_id_ctb,
+                                connection_id,
+                                idle_timeout_seconds = websocket_idle_timeout_ctb
+                                    .map(|timeout| timeout.as_secs())
+                                    .unwrap_or_default(),
+                                "WebSocket client->backend relay idle timeout"
+                            );
+                            let _ = first_failure_ctb.set((
+                                crate::plugins::Direction::ClientToBackend,
+                                retry::ErrorClass::ReadWriteTimeout,
+                                Some(tcp_proxy::StreamIoSide::Read),
+                            ));
+                            break;
+                        }
+                    };
                     match msg {
                         Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
@@ -7585,8 +7655,27 @@ where
                     .await;
                     break;
                 }
-                msg = backend_stream.next() => {
-                    let Some(msg) = msg else { break };
+                msg = next_websocket_message(&mut backend_stream, websocket_idle_timeout_btc) => {
+                    let msg = match msg {
+                        WsNextMessage::Item(Some(msg)) => msg,
+                        WsNextMessage::Item(None) => break,
+                        WsNextMessage::IdleTimeout => {
+                            debug!(
+                                proxy_id = %proxy_id_btc,
+                                connection_id,
+                                idle_timeout_seconds = websocket_idle_timeout_btc
+                                    .map(|timeout| timeout.as_secs())
+                                    .unwrap_or_default(),
+                                "WebSocket backend->client relay idle timeout"
+                            );
+                            let _ = first_failure_btc.set((
+                                crate::plugins::Direction::BackendToClient,
+                                retry::ErrorClass::ReadWriteTimeout,
+                                Some(tcp_proxy::StreamIoSide::Read),
+                            ));
+                            break;
+                        }
+                    };
                     match msg {
                         Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
@@ -18109,6 +18198,43 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    #[test]
+    fn websocket_dns_resolution_host_prefers_selected_upstream_target() {
+        let proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "static.example.com",
+            "backend_port": 443,
+        }))
+        .expect("test proxy should deserialize");
+        let target = UpstreamTarget {
+            host: "selected.example.com".to_string(),
+            port: 8443,
+            weight: 1,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        };
+
+        assert_eq!(
+            websocket_dns_resolution_host(&proxy, Some(&target)),
+            "selected.example.com"
+        );
+        assert_eq!(
+            websocket_dns_resolution_host(&proxy, None),
+            "static.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_websocket_message_times_out_when_idle_bound_elapsed() {
+        let mut stream = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+
+        let item = next_websocket_message(&mut stream, Some(Duration::from_millis(5))).await;
+
+        assert!(matches!(item, WsNextMessage::IdleTimeout));
     }
 
     #[tokio::test]

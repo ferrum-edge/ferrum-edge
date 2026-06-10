@@ -988,6 +988,10 @@ pub struct EnvConfig {
     ///
     /// Default: false (safe, frame-parsed path for all connections)
     pub websocket_tunnel_mode: bool,
+    /// WebSocket relay idle timeout in seconds. When non-zero, an upgraded
+    /// session is closed if neither side produces data for this duration.
+    /// 0 = disabled. Default: 0.
+    pub websocket_idle_timeout_seconds: u64,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
     /// HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks
@@ -1741,6 +1745,7 @@ impl Default for EnvConfig {
             max_websocket_frame_size_bytes: 16_777_216,
             websocket_write_buffer_size: 131_072, // 128 KB
             websocket_tunnel_mode: false,
+            websocket_idle_timeout_seconds: 0,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
             frontend_tls_handshake_timeout_seconds: 10,
@@ -2103,6 +2108,7 @@ impl EnvConfig {
             max_websocket_frame_size_bytes: usize = "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES" => 16_777_216usize;
             websocket_write_buffer_size: usize = "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE" => 131_072usize;
             websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
+            websocket_idle_timeout_seconds: u64 = "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS" => 0u64;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
             frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
@@ -2675,6 +2681,7 @@ impl EnvConfig {
             max_websocket_frame_size_bytes,
             websocket_write_buffer_size,
             websocket_tunnel_mode,
+            websocket_idle_timeout_seconds,
             max_credentials_per_type,
             http_header_read_timeout_seconds,
             frontend_tls_handshake_timeout_seconds,
