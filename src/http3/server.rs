@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
+use h3::quic::SendStream;
 use h3::server::RequestStream;
 use http::{Response, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
@@ -32,7 +33,7 @@ use crate::plugins::{
 };
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
-    parse_connection_listed_from_str_map,
+    parse_connection_listed_from_str_map, strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_after_proxy_hooks_to_rejection, apply_plugin_rejection_response,
@@ -243,6 +244,33 @@ fn build_h3_quinn_server_config(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
     server_config.transport_config(Arc::new(transport_config));
     Ok(server_config)
+}
+
+async fn finish_h3_response_with_backend_trailers<S>(
+    h3_stream: &mut RequestStream<S, Bytes>,
+    recv_stream: &mut crate::http3::client::H3RequestStream,
+) -> Result<(), h3::error::StreamError>
+where
+    S: SendStream<Bytes>,
+{
+    let trailers = match recv_stream.recv_trailers().await {
+        Ok(trailers) => trailers,
+        Err(err) if crate::http3::client::is_h3_graceful_close(&err) => None,
+        Err(err) => return Err(err),
+    };
+
+    match trailers {
+        Some(mut trailers) => {
+            strip_response_hop_by_hop_trailers(&mut trailers);
+            if trailers.is_empty() {
+                h3_stream.finish().await
+            } else {
+                h3_stream.send_trailers(trailers).await?;
+                h3_stream.finish().await
+            }
+        }
+        None => h3_stream.finish().await,
+    }
 }
 
 /// Start the HTTP/3 listener and optionally emit a startup signal after bind.
@@ -2627,7 +2655,7 @@ async fn handle_h3_request(
                                     "Backend response exceeded {} byte limit during streaming",
                                     state.max_response_body_size_bytes
                                 );
-                                let _ = stream.finish().await;
+                                crate::http3::stream_util::abort_response_stream(&mut stream);
                                 body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                                 break 'outer;
                             }
@@ -2728,14 +2756,8 @@ async fn handle_h3_request(
                                 stream_done = true;
                             } else {
                                 error!("Error reading backend h3 response during streaming: {}", e);
-                                if !coalesce_buf.is_empty() {
-                                    let data = coalesce_buf.split().freeze();
-                                    let data_len = data.len() as u64;
-                                    if stream.send_data(data).await.is_ok() {
-                                        bytes_streamed += data_len;
-                                    }
-                                }
-                                let _ = stream.finish().await;
+                                coalesce_buf.clear();
+                                crate::http3::stream_util::abort_response_stream(&mut stream);
                                 body_error_class = Some(crate::http3::client::classify_http3_error(&e));
                                 break 'outer;
                             }
@@ -2787,7 +2809,13 @@ async fn handle_h3_request(
                     }
                     bytes_streamed += data_len;
                 }
-                match stream.finish().await {
+                let finish_result = if response_inspector.is_some() {
+                    stream.finish().await
+                } else {
+                    finish_h3_response_with_backend_trailers(&mut stream, &mut h3_resp.recv_stream)
+                        .await
+                };
+                match finish_result {
                     Ok(_) => body_completed = true,
                     Err(_) => {
                         client_disconnected = true;
@@ -3948,7 +3976,7 @@ fn build_h3_backend_headers(
     // X-Forwarded-Proto
     h3_headers.push((
         http::header::HeaderName::from_static("x-forwarded-proto"),
-        http::header::HeaderValue::from_static("h3"),
+        http::header::HeaderValue::from_static("https"),
     ));
 
     // X-Forwarded-Host
@@ -3974,7 +4002,7 @@ fn build_h3_backend_headers(
             .get("host")
             .or_else(|| headers.get(":authority"))
             .map(|s| s.as_str());
-        let fwd = crate::proxy::build_forwarded_value(client_ip, "h3", host);
+        let fwd = crate::proxy::build_forwarded_value(client_ip, "https", host);
         if let Ok(val) = http::header::HeaderValue::from_str(&fwd) {
             h3_headers.push((http::header::HeaderName::from_static("forwarded"), val));
         }
@@ -4545,7 +4573,7 @@ async fn stream_h3_open_response_to_client(
                         if state.max_response_body_size_bytes > 0
                             && total_streamed > state.max_response_body_size_bytes
                         {
-                            let _ = h3_stream.finish().await;
+                            crate::http3::stream_util::abort_response_stream(h3_stream);
                             terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                             body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                             break 'outer;
@@ -4599,14 +4627,8 @@ async fn stream_h3_open_response_to_client(
                             stream_done = true;
                         } else {
                             error!("Error reading backend h3 response during refined streaming: {}", error);
-                            if !coalesce_buf.is_empty() {
-                                let data = coalesce_buf.split().freeze();
-                                let data_len = data.len() as u64;
-                                if h3_stream.send_data(data).await.is_ok() {
-                                    bytes_streamed += data_len;
-                                }
-                            }
-                            let _ = h3_stream.finish().await;
+                            coalesce_buf.clear();
+                            crate::http3::stream_util::abort_response_stream(h3_stream);
                             let class = crate::http3::client::classify_http3_error(&error);
                             terminal_error_class = Some(class);
                             body_error_class = Some(class);
@@ -4638,7 +4660,7 @@ async fn stream_h3_open_response_to_client(
                 }
                 bytes_streamed += data_len;
             }
-            match h3_stream.finish().await {
+            match finish_h3_response_with_backend_trailers(h3_stream, &mut recv_stream).await {
                 Ok(_) => body_completed = true,
                 Err(_) => {
                     client_disconnected = true;
@@ -4938,7 +4960,7 @@ async fn proxy_to_backend_h3_streaming(
                                 "Backend response exceeded {} byte limit during streaming",
                                 state.max_response_body_size_bytes
                             );
-                            let _ = h3_stream.finish().await;
+                            crate::http3::stream_util::abort_response_stream(h3_stream);
                             terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                             body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                             break 'outer;
@@ -4997,14 +5019,8 @@ async fn proxy_to_backend_h3_streaming(
                             stream_done = true;
                         } else {
                             error!("Error reading backend h3 response during streaming: {}", e);
-                            if !coalesce_buf.is_empty() {
-                                let data = coalesce_buf.split().freeze();
-                                let data_len = data.len() as u64;
-                                if h3_stream.send_data(data).await.is_ok() {
-                                    bytes_streamed += data_len;
-                                }
-                            }
-                            let _ = h3_stream.finish().await;
+                            coalesce_buf.clear();
+                            crate::http3::stream_util::abort_response_stream(h3_stream);
                             let class = crate::http3::client::classify_http3_error(&e);
                             terminal_error_class = Some(class);
                             body_error_class = Some(class);
@@ -5038,7 +5054,9 @@ async fn proxy_to_backend_h3_streaming(
                 }
                 bytes_streamed += data_len;
             }
-            match h3_stream.finish().await {
+            match finish_h3_response_with_backend_trailers(h3_stream, &mut h3_resp.recv_stream)
+                .await
+            {
                 Ok(_) => body_completed = true,
                 Err(_) => {
                     client_disconnected = true;
@@ -6350,6 +6368,53 @@ mod build_h3_backend_headers_tests {
             .iter()
             .find(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
             .map(|(_, v)| v)
+    }
+
+    #[tokio::test]
+    async fn native_h3_forwarded_proto_uses_uri_scheme_not_alpn_token() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "api.example".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ false,
+        );
+
+        assert_eq!(
+            header_value(&out, "x-forwarded-proto").map(|v| v.as_bytes()),
+            Some(&b"https"[..]),
+            "X-Forwarded-Proto must carry the URI scheme, not the H3 ALPN token"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_h3_forwarded_header_uses_https_scheme() {
+        let mut state = minimal_proxy_state();
+        state.add_forwarded_header = true;
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "api.example".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ false,
+        );
+
+        assert_eq!(
+            header_value(&out, "forwarded").and_then(|v| v.to_str().ok()),
+            Some("for=203.0.113.1;proto=https;host=api.example"),
+            "Forwarded proto must be the URI scheme, not the H3 ALPN token"
+        );
     }
 
     #[tokio::test]

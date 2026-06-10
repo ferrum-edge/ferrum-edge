@@ -12,7 +12,7 @@
 
 use bytes::Bytes;
 use h3::error::Code;
-use h3::quic::RecvStream;
+use h3::quic::{RecvStream, SendStream};
 use h3::server::RequestStream;
 
 /// Signal the peer that we are done with the receive side of the
@@ -38,6 +38,20 @@ where
     stream.stop_sending(Code::H3_NO_ERROR);
 }
 
+/// Abort the response send half for a gateway-originated streaming failure.
+///
+/// Use this when we have already sent response headers but cannot complete the
+/// backend body honestly (backend read error, response-size overflow, etc.).
+/// A graceful `finish()` would make unknown-length responses look complete; a
+/// reset lets H3 clients distinguish truncation from EOF.
+#[inline]
+pub(crate) fn abort_response_stream<S>(stream: &mut RequestStream<S, Bytes>)
+where
+    S: SendStream<Bytes>,
+{
+    stream.stop_stream(Code::H3_INTERNAL_ERROR);
+}
+
 #[cfg(test)]
 mod tests {
     use super::Code;
@@ -49,5 +63,10 @@ mod tests {
     #[test]
     fn halt_code_matches_rfc9114_h3_no_error() {
         assert_eq!(Code::H3_NO_ERROR.value(), 0x100);
+    }
+
+    #[test]
+    fn response_abort_code_matches_rfc9114_h3_internal_error() {
+        assert_eq!(Code::H3_INTERNAL_ERROR.value(), 0x102);
     }
 }
