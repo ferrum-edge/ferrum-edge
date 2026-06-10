@@ -99,6 +99,10 @@ pub struct BackendCapabilityProbeTarget {
     pub hbone_hint: bool,
     /// Sidecar HBONE listener port for this target. Defaults to Istio 15008.
     pub hbone_port: u16,
+    /// Destination identity the HBONE probe handshake must pin
+    /// (`mesh.spiffe_id` tag), mirroring the request path so a probe cannot
+    /// classify a peer Supported under weaker verification than dispatch uses.
+    pub hbone_expected_peer: Option<crate::identity::SpiffeId>,
 }
 
 impl BackendCapabilityProbeTarget {
@@ -106,11 +110,26 @@ impl BackendCapabilityProbeTarget {
         let mut probe_proxy = proxy.clone();
         let mut hbone_hint = false;
         let mut hbone_port = crate::modes::mesh::hbone::ISTIO_HBONE_PORT;
+        let mut hbone_expected_peer = None;
         if let Some(target) = target {
             probe_proxy.backend_host = target.host.clone();
             probe_proxy.backend_port = target.port;
             hbone_hint = crate::proxy::hbone_pool::target_hbone_enabled(target);
             hbone_port = crate::proxy::hbone_pool::target_hbone_port(target);
+            match crate::proxy::hbone_pool::target_expected_peer_spiffe(target) {
+                Ok(peer) => hbone_expected_peer = peer,
+                Err(err) => {
+                    // A corrupt pinned identity must not be probed UNPINNED —
+                    // skip HBONE probing entirely; dispatch fails the same tag
+                    // closed per request.
+                    tracing::debug!(
+                        target_host = %target.host,
+                        error = %err,
+                        "Skipping HBONE capability probe: invalid mesh.spiffe_id tag"
+                    );
+                    hbone_hint = false;
+                }
+            }
         }
         let key = match target {
             Some(_) => capability_key_for_proxy_target(proxy, target),
@@ -121,6 +140,7 @@ impl BackendCapabilityProbeTarget {
             proxy: probe_proxy,
             hbone_hint,
             hbone_port,
+            hbone_expected_peer,
         }
     }
 

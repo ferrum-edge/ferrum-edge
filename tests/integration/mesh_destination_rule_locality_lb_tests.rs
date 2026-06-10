@@ -57,6 +57,8 @@ fn runtime() -> MeshRuntimeConfig {
         outbound_listen_addr: "127.0.0.1:0".parse().expect("addr"),
         hbone_listen_addr: "127.0.0.1:0".parse().expect("addr"),
         east_west_listen_port: 15443,
+        egress_hbone_port: 15008,
+        egress_mtls_port: 15006,
         egress_listen_addr: "0.0.0.0:15090".parse().expect("addr"),
         workload_spiffe_id: None,
         waypoint_name: None,

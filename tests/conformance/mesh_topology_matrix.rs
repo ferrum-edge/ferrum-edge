@@ -30,6 +30,8 @@ fn runtime_for(topology: MeshTopology) -> MeshRuntimeConfig {
         outbound_listen_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         hbone_listen_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         east_west_listen_port: 15443,
+        egress_hbone_port: 15008,
+        egress_mtls_port: 15006,
         egress_listen_addr: "127.0.0.1:15090".parse::<SocketAddr>().unwrap(),
         workload_spiffe_id: None,
         waypoint_name: match topology {

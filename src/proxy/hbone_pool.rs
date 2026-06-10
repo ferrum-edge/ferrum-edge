@@ -34,6 +34,12 @@ use crate::tls::spiffe::{SpiffeTlsError, build_spiffe_outbound_config};
 
 pub const HBONE_TARGET_TAG: &str = "mesh.hbone";
 pub const HBONE_PORT_TAG: &str = "mesh.hbone_port";
+/// Tag carrying the destination workload's SPIFFE id. When present on a mesh
+/// target it is the identity the outbound SVID-mTLS handshake must PIN: the
+/// peer's server SVID URI SAN has to equal it exactly, not merely share a trust
+/// domain. Stamped by `service_discovery::mesh` tag builders for both HBONE and
+/// Sidecar-mTLS targets.
+pub const MESH_SPIFFE_ID_TAG: &str = "mesh.spiffe_id";
 const MAX_HBONE_WRITE_CHUNK: usize = 16 * 1024;
 const ADAPTIVE_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 const ADAPTIVE_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
@@ -76,6 +82,8 @@ pub enum HbonePoolError {
     },
     #[error("invalid HBONE server name {host}: {message}")]
     InvalidServerName { host: String, message: String },
+    #[error("invalid {MESH_SPIFFE_ID_TAG} tag '{value}' on mesh target: {message}")]
+    InvalidPeerSpiffeTag { value: String, message: String },
     #[error("SPIFFE TLS config failed: {0}")]
     TlsConfig(#[from] SpiffeTlsError),
     #[error("TLS handshake failed for {host}: {message}")]
@@ -93,7 +101,10 @@ pub enum HbonePoolError {
 impl HbonePoolError {
     pub fn error_class(&self) -> ErrorClass {
         match self {
-            Self::NoSvid | Self::NoLeafCert | Self::TlsConfig(_) => ErrorClass::ConnectionPoolError,
+            Self::NoSvid
+            | Self::NoLeafCert
+            | Self::TlsConfig(_)
+            | Self::InvalidPeerSpiffeTag { .. } => ErrorClass::ConnectionPoolError,
             Self::DnsLookup { .. } | Self::InvalidServerName { .. } => ErrorClass::DnsLookupError,
             Self::ConnectTimeout { .. } => ErrorClass::ConnectionTimeout,
             Self::Connect { source, .. } => {
@@ -165,6 +176,7 @@ impl HboneConnectionPool {
         target_host: &str,
         target_port: u16,
         hbone_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<(), HbonePoolError> {
         let (source_identity, fingerprint) = current_svid_identity(&self.gateway_svid)?;
         let pool_config = self.pool_config.for_proxy(proxy);
@@ -175,6 +187,7 @@ impl HboneConnectionPool {
             hbone_port,
             proxy.dns_override.as_deref(),
             &fingerprint,
+            expected_peer,
             &pool_config,
             |key| self.try_cached_sender_read(key),
         );
@@ -188,6 +201,7 @@ impl HboneConnectionPool {
                 hbone_port,
                 proxy.dns_override.as_deref(),
                 &fingerprint,
+                expected_peer,
                 &pool_config,
                 |key| key.to_string(),
             );
@@ -196,6 +210,7 @@ impl HboneConnectionPool {
                 target_host,
                 target_port,
                 hbone_port,
+                expected_peer,
                 &key,
                 &pool_config,
             )
@@ -226,6 +241,7 @@ impl HboneConnectionPool {
         target_host: &str,
         target_port: u16,
         hbone_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<HboneTunnel, HbonePoolError> {
         let (source_identity, fingerprint) = current_svid_identity(&self.gateway_svid)?;
         let pool_config = self.pool_config.for_proxy(proxy);
@@ -236,6 +252,7 @@ impl HboneConnectionPool {
             hbone_port,
             proxy.dns_override.as_deref(),
             &fingerprint,
+            expected_peer,
             &pool_config,
             |key| self.try_cached_sender_read(key),
         );
@@ -249,6 +266,7 @@ impl HboneConnectionPool {
                 hbone_port,
                 proxy.dns_override.as_deref(),
                 &fingerprint,
+                expected_peer,
                 &pool_config,
                 |key| key.to_string(),
             );
@@ -257,6 +275,7 @@ impl HboneConnectionPool {
                 target_host,
                 target_port,
                 hbone_port,
+                expected_peer,
                 &key,
                 &pool_config,
             )
@@ -276,12 +295,14 @@ impl HboneConnectionPool {
         })?
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn get_or_create_sender(
         &self,
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
         hbone_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
         key: &str,
         pool_config: &PoolConfig,
     ) -> Result<SendRequest<Bytes>, HbonePoolError> {
@@ -398,7 +419,7 @@ impl HboneConnectionPool {
         };
         let sender = match tokio::time::timeout(
             remaining,
-            self.create_sender(proxy, target_host, hbone_port, pool_config),
+            self.create_sender(proxy, target_host, hbone_port, expected_peer, pool_config),
         )
         .await
         {
@@ -556,6 +577,7 @@ impl HboneConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         hbone_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
         pool_config: &PoolConfig,
     ) -> Result<SendRequest<Bytes>, HbonePoolError> {
         let resolved_ip = self
@@ -594,9 +616,16 @@ impl HboneConnectionPool {
         }
 
         // HBONE is HTTP/2 CONNECT over mTLS — advertise h2 only so a sidecar can
-        // reject non-HBONE clients at ALPN.
-        let tls_config =
-            build_spiffe_outbound_config(self.gateway_svid.clone(), None, vec![b"h2".to_vec()])?;
+        // reject non-HBONE clients at ALPN. When the target declared its
+        // workload identity (`mesh.spiffe_id` tag), PIN it: the peer must
+        // present exactly that SVID, not merely one from an allowed trust
+        // domain — a same-trust-domain workload at a reused pod IP must not be
+        // able to impersonate the destination.
+        let tls_config = build_spiffe_outbound_config(
+            self.gateway_svid.clone(),
+            expected_peer.cloned(),
+            vec![b"h2".to_vec()],
+        )?;
         let connector = TlsConnector::from(tls_config);
         let server_name = rustls::pki_types::ServerName::try_from(target_host.to_string())
             .map_err(|e| HbonePoolError::InvalidServerName {
@@ -878,6 +907,26 @@ pub fn target_hbone_port(target: &UpstreamTarget) -> u16 {
         .unwrap_or(ISTIO_HBONE_PORT)
 }
 
+/// The destination identity an outbound mesh dial must PIN, read from the
+/// target's [`MESH_SPIFFE_ID_TAG`]. `Ok(None)` when the tag is absent —
+/// operator-supplied targets without a declared peer identity keep
+/// trust-domain-only verification. A PRESENT but unparseable tag is an error so
+/// a corrupted identity fails the dial closed instead of silently downgrading
+/// to unpinned verification.
+pub fn target_expected_peer_spiffe(
+    target: &UpstreamTarget,
+) -> Result<Option<crate::identity::SpiffeId>, HbonePoolError> {
+    match target.tags.get(MESH_SPIFFE_ID_TAG) {
+        None => Ok(None),
+        Some(value) => crate::identity::SpiffeId::new(value)
+            .map(Some)
+            .map_err(|e| HbonePoolError::InvalidPeerSpiffeTag {
+                value: value.clone(),
+                message: e.to_string(),
+            }),
+    }
+}
+
 pub(crate) fn authority_for_host_port(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
@@ -917,7 +966,7 @@ pub fn svid_fingerprint(bundle: &SvidBundle) -> Result<String, HbonePoolError> {
     Ok(out)
 }
 
-fn current_svid_identity(
+pub(crate) fn current_svid_identity(
     gateway_svid: &SharedSvidBundle,
 ) -> Result<(crate::identity::SpiffeId, String), HbonePoolError> {
     let snapshot = gateway_svid.load_full();
@@ -954,30 +1003,36 @@ fn record_hbone_evictions(count: usize) {
 // migration to a monotonic clock (this pool's prune scheduler + `GenericPool`
 // together) is the right place to remove that residual, not a piecemeal switch
 // of this one field that would desync it from the rest of the pool's timing.
-fn entry_idle_expired(last_used_secs: u64, idle_timeout_seconds: u64, now_secs: u64) -> bool {
+pub(crate) fn entry_idle_expired(
+    last_used_secs: u64,
+    idle_timeout_seconds: u64,
+    now_secs: u64,
+) -> bool {
     idle_timeout_seconds > 0 && now_secs.saturating_sub(last_used_secs) > idle_timeout_seconds
 }
 
-fn unix_secs() -> u64 {
+pub(crate) fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
 }
 
-fn matches_boolish_true(value: &str) -> bool {
+pub(crate) fn matches_boolish_true(value: &str) -> bool {
     value.eq_ignore_ascii_case("true")
         || value.eq_ignore_ascii_case("yes")
         || value.eq_ignore_ascii_case("on")
         || value == "1"
 }
 
+#[allow(clippy::too_many_arguments)]
 fn with_hbone_pool_key<R>(
     host: &str,
     target_port: u16,
     hbone_port: u16,
     dns_override: Option<&str>,
     svid_fingerprint: &str,
+    expected_peer: Option<&crate::identity::SpiffeId>,
     pool_config: &PoolConfig,
     f: impl FnOnce(&str) -> R,
 ) -> R {
@@ -990,6 +1045,7 @@ fn with_hbone_pool_key<R>(
             hbone_port,
             dns_override,
             svid_fingerprint,
+            expected_peer,
             pool_config,
         );
         f(&buf)
@@ -1003,6 +1059,7 @@ fn pool_key_owned(
     hbone_port: u16,
     dns_override: Option<&str>,
     svid_fingerprint: &str,
+    expected_peer: Option<&crate::identity::SpiffeId>,
     pool_config: &PoolConfig,
 ) -> String {
     with_hbone_pool_key(
@@ -1011,11 +1068,13 @@ fn pool_key_owned(
         hbone_port,
         dns_override,
         svid_fingerprint,
+        expected_peer,
         pool_config,
         |key| key.to_string(),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_hbone_pool_key(
     buf: &mut String,
     host: &str,
@@ -1023,18 +1082,23 @@ fn write_hbone_pool_key(
     hbone_port: u16,
     dns_override: Option<&str>,
     svid_fingerprint: &str,
+    expected_peer: Option<&crate::identity::SpiffeId>,
     pool_config: &PoolConfig,
 ) {
     buf.clear();
+    // The pinned peer identity is connection identity, not policy: a pooled
+    // mTLS connection verified against one expected SVID must never be reused
+    // for a target that pins a different (or no) identity.
     let _ = write!(
         buf,
-        "hbone|{host}|{target_port}|{hbone_port}|{}|{svid_fingerprint}",
-        dns_override.unwrap_or_default()
+        "hbone|{host}|{target_port}|{hbone_port}|{}|{svid_fingerprint}|{}",
+        dns_override.unwrap_or_default(),
+        expected_peer.map(|peer| peer.as_str()).unwrap_or_default()
     );
     write_pool_config_key(buf, pool_config);
 }
 
-fn write_pool_config_key(buf: &mut String, pool_config: &PoolConfig) {
+pub(crate) fn write_pool_config_key(buf: &mut String, pool_config: &PoolConfig) {
     // Pool-MANAGEMENT policy is intentionally excluded from the key: it does
     // not change the h2-over-mTLS connection's identity or wire behavior, and
     // including it fragmented the pool (two proxies targeting the same sidecar
@@ -1293,17 +1357,35 @@ mod tests {
             http2_max_concurrent_streams: None,
             ..PoolConfig::default()
         };
+        let pinned_peer =
+            crate::identity::SpiffeId::new("spiffe://cluster.local/ns/default/sa/orders")
+                .expect("valid spiffe id");
         let key = pool_key_owned(
             "orders.default.svc.cluster.local",
             8080,
             15008,
             Some("10.0.0.2"),
             "0123456789abcdef",
+            Some(&pinned_peer),
             &pool_config,
         );
         assert_eq!(
             key,
-            "hbone|orders.default.svc.cluster.local|8080|15008|10.0.0.2|0123456789abcdef|pool=0,1,22,33,44,65535,131072,0,16384,none"
+            "hbone|orders.default.svc.cluster.local|8080|15008|10.0.0.2|0123456789abcdef|spiffe://cluster.local/ns/default/sa/orders|pool=0,1,22,33,44,65535,131072,0,16384,none"
+        );
+        // An unpinned dial must not share a connection with a pinned one.
+        let unpinned_key = pool_key_owned(
+            "orders.default.svc.cluster.local",
+            8080,
+            15008,
+            Some("10.0.0.2"),
+            "0123456789abcdef",
+            None,
+            &pool_config,
+        );
+        assert_ne!(
+            key, unpinned_key,
+            "pinned-peer identity is connection identity and must partition the pool"
         );
     }
 
@@ -1323,6 +1405,7 @@ mod tests {
             15008,
             None,
             "fingerprint",
+            None,
             &base_config,
         );
         let overridden_key = pool_key_owned(
@@ -1331,6 +1414,7 @@ mod tests {
             15008,
             None,
             "fingerprint",
+            None,
             &overridden_config,
         );
 
@@ -1358,6 +1442,7 @@ mod tests {
             15008,
             None,
             "fingerprint",
+            None,
             &base_config,
         );
         let policy_only_key = pool_key_owned(
@@ -1366,6 +1451,7 @@ mod tests {
             15008,
             None,
             "fingerprint",
+            None,
             &policy_only_config,
         );
         assert_eq!(
@@ -1457,6 +1543,7 @@ mod tests {
             ISTIO_HBONE_PORT,
             None,
             "fingerprint",
+            None,
             &pool_config,
         );
         let creation_lock = Arc::new(Mutex::new(()));
@@ -1471,6 +1558,7 @@ mod tests {
                 "orders.default.svc.cluster.local",
                 8080,
                 ISTIO_HBONE_PORT,
+                None,
                 &key,
                 &pool_config,
             )
@@ -1565,9 +1653,9 @@ mod tests {
     #[test]
     fn with_hbone_pool_key_matches_pool_key_owned() {
         let pool_config = PoolConfig::default();
-        let owned = pool_key_owned("host", 8080, 15008, None, "fp", &pool_config);
+        let owned = pool_key_owned("host", 8080, 15008, None, "fp", None, &pool_config);
         let via_callback =
-            with_hbone_pool_key("host", 8080, 15008, None, "fp", &pool_config, |key| {
+            with_hbone_pool_key("host", 8080, 15008, None, "fp", None, &pool_config, |key| {
                 key.to_string()
             });
         assert_eq!(owned, via_callback);

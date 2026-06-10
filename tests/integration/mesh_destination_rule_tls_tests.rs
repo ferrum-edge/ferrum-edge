@@ -72,6 +72,8 @@ fn test_runtime() -> MeshRuntimeConfig {
         outbound_listen_addr: test_addr("127.0.0.1:15001"),
         hbone_listen_addr: test_addr("127.0.0.1:15008"),
         east_west_listen_port: 15443,
+        egress_hbone_port: 15008,
+        egress_mtls_port: 15006,
         egress_listen_addr: test_addr("0.0.0.0:15090"),
         workload_spiffe_id: None,
         waypoint_name: None,
