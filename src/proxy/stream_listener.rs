@@ -136,6 +136,8 @@ pub struct StreamListenerManager {
     adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     /// Number of datagrams per `recvmmsg` syscall on Linux.
     udp_recvmmsg_batch_size: usize,
+    /// Normalized shard count for hot UDP session maps.
+    pool_shard_amount: usize,
     /// Whether TCP Fast Open is enabled for TCP stream proxy sockets.
     tcp_fastopen_enabled: bool,
     /// Listen backlog for TCP stream proxy sockets.
@@ -324,6 +326,7 @@ impl StreamListenerManager {
             udp_gro_enabled,
             udp_gso_enabled,
             udp_pktinfo_enabled,
+            0,
             crate::modes::mesh::outbound_enforcement::empty_slot(),
         )
     }
@@ -359,6 +362,7 @@ impl StreamListenerManager {
         udp_gro_enabled: bool,
         udp_gso_enabled: bool,
         udp_pktinfo_enabled: bool,
+        pool_shard_amount: usize,
         mesh_outbound_enforcement:
             crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
     ) -> Self {
@@ -384,6 +388,7 @@ impl StreamListenerManager {
             crls,
             adaptive_buffer,
             udp_recvmmsg_batch_size,
+            pool_shard_amount: crate::util::sharding::pool_shard_amount(pool_shard_amount),
             tcp_fastopen_enabled,
             tcp_listen_backlog,
             accept_threads,
@@ -879,6 +884,7 @@ impl StreamListenerManager {
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
                 let recvmmsg_batch = self.udp_recvmmsg_batch_size;
+                let session_shards = self.pool_shard_amount;
                 let overload = self.overload.clone();
                 let so_busy_poll_us = self.so_busy_poll_us;
                 let udp_gro_enabled = self.udp_gro_enabled;
@@ -920,6 +926,7 @@ impl StreamListenerManager {
                         sni_proxy_ids: sni_ids,
                         adaptive_buffer: adaptive_buf,
                         recvmmsg_batch_size: recvmmsg_batch,
+                        session_shard_amount: session_shards,
                         overload,
                         so_busy_poll_us,
                         udp_gro_enabled,

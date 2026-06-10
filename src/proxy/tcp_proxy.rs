@@ -10,12 +10,16 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+#[cfg(target_os = "linux")]
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::backend_conn_limit::{
@@ -1782,7 +1786,7 @@ async fn handle_tcp_connection_inner(
         let sni = super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
         stream_ctx.sni_hostname = sni.clone();
 
-        let matched = super::sni::resolve_proxy_by_sni(sni.as_deref(), sni_ids, &epoch.config)
+        let matched = super::sni::resolve_proxy_by_sni_in_epoch(sni.as_deref(), sni_ids, epoch)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "No matching passthrough proxy for SNI {:?} on port {}",
@@ -1793,12 +1797,7 @@ async fn handle_tcp_connection_inner(
         _resolved_proxy_id = Some(matched.to_string());
         // Update stream_ctx to reflect the resolved proxy
         stream_ctx.proxy_id = matched.to_string();
-        stream_ctx.proxy_name = epoch
-            .config
-            .proxies
-            .iter()
-            .find(|p| p.id == matched)
-            .and_then(|p| p.name.clone());
+        stream_ctx.proxy_name = epoch.proxy_by_id(matched).and_then(|p| p.name.clone());
         _resolved_proxy_id.as_deref().unwrap_or(proxy_id)
     } else {
         _resolved_proxy_id = None;
@@ -1808,10 +1807,7 @@ async fn handle_tcp_connection_inner(
     // Look up the proxy config and extract only the fields we need.
     let (params, cb_info) = {
         let proxy = epoch
-            .config
-            .proxies
-            .iter()
-            .find(|p| p.id == proxy_id)
+            .proxy_by_id(proxy_id)
             .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?;
 
         stream_ctx.proxy_id = proxy.id.clone();
@@ -2111,7 +2107,7 @@ async fn handle_tcp_connection_inner(
         // watermarks inside their loops, so we no longer fall back to bidirectional_copy.
         #[cfg(target_os = "linux")]
         let copy_result = if io_uring_splice_enabled {
-            bidirectional_splice_io_uring(
+            bidirectional_splice_io_uring_bounded_or_async(
                 client_stream,
                 backend_stream,
                 idle_timeout,
@@ -2787,7 +2783,7 @@ async fn handle_tcp_connection_inner(
                     {
                         used_splice = true;
                         if io_uring_splice_enabled {
-                            bidirectional_splice_io_uring(
+                            bidirectional_splice_io_uring_bounded_or_async(
                                 client_stream,
                                 bs,
                                 idle_timeout,
@@ -4740,6 +4736,88 @@ fn classify_splice_worker_failure(
     }
 }
 
+#[cfg(target_os = "linux")]
+const IO_URING_SPLICE_MAX_CONCURRENT: usize = 128;
+
+#[cfg(target_os = "linux")]
+static IO_URING_SPLICE_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn io_uring_splice_limit() -> Arc<Semaphore> {
+    IO_URING_SPLICE_LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(IO_URING_SPLICE_MAX_CONCURRENT)))
+        .clone()
+}
+
+#[cfg(target_os = "linux")]
+fn try_acquire_io_uring_splice_permit(limit: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    limit.clone().try_acquire_owned().ok()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod io_uring_splice_limit_tests {
+    use super::*;
+
+    #[test]
+    fn permit_gate_returns_none_when_limit_is_exhausted() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit =
+            try_acquire_io_uring_splice_permit(&limit).expect("first permit should be available");
+
+        assert!(
+            try_acquire_io_uring_splice_permit(&limit).is_none(),
+            "saturated io_uring splice limit should decline another relay"
+        );
+
+        drop(permit);
+        assert!(
+            try_acquire_io_uring_splice_permit(&limit).is_some(),
+            "released permit should make the relay slot available again"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn bidirectional_splice_io_uring_bounded_or_async(
+    client: TcpStream,
+    backend: TcpStream,
+    idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
+    backend_read_timeout: Option<Duration>,
+    backend_write_timeout: Option<Duration>,
+    pipe_size: usize,
+) -> StreamCopyResult {
+    let limit = io_uring_splice_limit();
+    if let Some(_permit) = try_acquire_io_uring_splice_permit(&limit) {
+        bidirectional_splice_io_uring(
+            client,
+            backend,
+            idle_timeout,
+            half_close_cap,
+            backend_read_timeout,
+            backend_write_timeout,
+            pipe_size,
+        )
+        .await
+    } else {
+        debug!(
+            max_concurrent = IO_URING_SPLICE_MAX_CONCURRENT,
+            "io_uring splice concurrency limit reached; falling back to async splice"
+        );
+        bidirectional_splice(
+            client,
+            backend,
+            idle_timeout,
+            half_close_cap,
+            backend_read_timeout,
+            backend_write_timeout,
+            pipe_size,
+        )
+        .await
+    }
+}
+
 /// Bidirectional zero-copy relay using io_uring `IORING_OP_SPLICE`.
 ///
 /// Each direction gets its own io_uring ring (8 entries) and runs on a
@@ -4769,8 +4847,6 @@ async fn bidirectional_splice_io_uring(
     // unwind instead of pinning under a stalled peer when
     // `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0`.
     use std::os::unix::io::AsRawFd;
-    use std::sync::OnceLock;
-
     let client_fd = client.as_raw_fd();
     let backend_fd = backend.as_raw_fd();
 

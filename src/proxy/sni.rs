@@ -358,16 +358,35 @@ fn u24_to_usize(data: &[u8]) -> usize {
 /// 2. Wildcard host match (e.g., `*.example.com` matches `foo.example.com`)
 /// 3. Fallback: first proxy with empty `hosts` (catch-all/default)
 /// 4. If no match and no fallback: `None`
+#[allow(dead_code)] // Public test/library helper; runtime uses the RequestEpoch-indexed variant.
 pub fn resolve_proxy_by_sni<'a>(
     sni: Option<&str>,
     proxy_ids: &'a [String],
     config: &crate::config::types::GatewayConfig,
 ) -> Option<&'a str> {
+    resolve_proxy_by_sni_with_lookup(sni, proxy_ids, |proxy_id| {
+        config.proxies.iter().find(|p| p.id == proxy_id)
+    })
+}
+
+pub fn resolve_proxy_by_sni_in_epoch<'a>(
+    sni: Option<&str>,
+    proxy_ids: &'a [String],
+    epoch: &crate::request_epoch::RequestEpoch,
+) -> Option<&'a str> {
+    resolve_proxy_by_sni_with_lookup(sni, proxy_ids, |proxy_id| epoch.proxy_by_id(proxy_id))
+}
+
+fn resolve_proxy_by_sni_with_lookup<'a, 'p>(
+    sni: Option<&str>,
+    proxy_ids: &'a [String],
+    mut find_proxy: impl FnMut(&str) -> Option<&'p crate::config::types::Proxy>,
+) -> Option<&'a str> {
     let mut fallback: Option<&'a str> = None;
     let mut wildcard_match: Option<&'a str> = None;
 
     for proxy_id in proxy_ids {
-        let Some(proxy) = config.proxies.iter().find(|p| p.id == *proxy_id) else {
+        let Some(proxy) = find_proxy(proxy_id) else {
             continue;
         };
 

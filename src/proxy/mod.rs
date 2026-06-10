@@ -3388,6 +3388,7 @@ impl ProxyState {
         let load_balancer_cache = Arc::new(LoadBalancerCache::new(&config));
         let request_epoch = Arc::new(RequestEpochStore::new(RequestEpoch {
             config: Arc::new(config.clone()),
+            proxy_index_by_id: crate::request_epoch::build_proxy_index_by_id(&config),
             route_table: RouterCache::build_route_table_snapshot(&config),
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),
@@ -3596,6 +3597,7 @@ impl ProxyState {
                     }
                     v
                 },
+                env_config_arc.pool_shard_amount,
                 mesh_outbound_enforcement.clone(),
             ),
         );
@@ -5666,7 +5668,7 @@ async fn run_per_ip_cleanup_loop(
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     frontend_listen_port: Option<u16>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
@@ -5717,7 +5719,7 @@ async fn handle_connection(
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
     let svc = service_fn(move |req: Request<Incoming>| {
-        let state = state.clone();
+        let state = Arc::clone(&state);
         let addr = remote_addr;
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
@@ -5820,7 +5822,7 @@ pub fn try_acquire_websocket_connection_permit(
 #[allow(clippy::too_many_arguments)]
 async fn handle_websocket_request_authenticated(
     req: Request<Incoming>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     proxy: Arc<Proxy>,
     ctx: RequestContext,
@@ -7836,6 +7838,7 @@ pub async fn start_proxy_listener_with_bound_listener(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
+    let state = Arc::new(state);
     // Optional connection limit, mirroring the bound-port path. The semaphore
     // is sized from `max_connections` and shared with the connection guard.
     let conn_semaphore: Option<Arc<tokio::sync::Semaphore>> =
@@ -8195,6 +8198,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         } else {
             None
         };
+    let state = Arc::new(state);
 
     if accept_threads > 1 {
         // Multi-listener mode: spawn N-1 additional accept loops, each with its
@@ -8205,7 +8209,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
             let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
-            let state = state.clone();
+            let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
             let shutdown_rx = shutdown.clone();
@@ -8296,7 +8300,7 @@ impl SourceIpOverride {
 #[allow(clippy::too_many_arguments)]
 async fn run_accept_loop(
     listener: TcpListener,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     tls_source: ListenerTlsSource,
     conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -8358,7 +8362,7 @@ async fn run_accept_loop(
                             None
                         };
 
-                        let state = state.clone();
+                        let state = Arc::clone(&state);
                         let node_waypoint_identity =
                             if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
                                 match resolver.resolve_stream(&stream) {
@@ -8491,7 +8495,7 @@ async fn run_accept_loop(
 async fn handle_tls_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     tls_config: Arc<rustls::ServerConfig>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     tls_connection_metadata: TlsConnectionMetadata,
@@ -8572,7 +8576,7 @@ async fn handle_tls_connection(
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-        let state = state.clone();
+        let state = Arc::clone(&state);
         let addr = remote_addr;
         let cert = client_cert_der.clone();
         let chain = client_cert_chain_der.clone();
@@ -9195,7 +9199,7 @@ pub async fn handle_proxy_request(
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     handle_proxy_request_on_frontend_port(
         req,
-        state,
+        Arc::new(state),
         remote_addr,
         is_tls,
         tls_client_cert_der,
@@ -9207,7 +9211,7 @@ pub async fn handle_proxy_request(
 
 async fn handle_proxy_request_on_frontend_port(
     req: Request<Incoming>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -9280,7 +9284,7 @@ async fn handle_proxy_request_on_frontend_port(
 /// function can attach the [`RequestGuard`] to the response body.
 async fn handle_proxy_request_inner(
     req: Request<Incoming>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
