@@ -86,7 +86,9 @@ use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::identity::{SharedSvidBundle, SvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
-use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
+use crate::load_balancer::{
+    HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
+};
 use crate::modes::mesh::node_waypoint::{
     NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver,
 };
@@ -1553,6 +1555,35 @@ fn record_grpc_backend_status_outcome(
     } else {
         cb.record_success(is_half_open_probe);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_grpc_backend_dispatch_outcome(
+    state: &ProxyState,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
+    upstream_target: Option<&Arc<UpstreamTarget>>,
+    final_cb_target_key: Option<&str>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<retry::ErrorClass>,
+    backend_elapsed: Duration,
+) {
+    backend_dispatch::record_backend_outcome_no_conn_end(
+        state,
+        proxy,
+        lb_snapshot,
+        selected_balancer,
+        upstream_target.map(Arc::as_ref),
+        final_cb_target_key,
+        response_status,
+        connection_error,
+        error_class,
+        false,
+        true,
+        backend_elapsed,
+    );
 }
 
 /// Load a gRPC streaming late client-upload overflow flag with `Acquire`
@@ -10463,6 +10494,8 @@ async fn handle_proxy_request_inner(
         // `backend_admission_started_at`. `backend_start` itself stays the
         // origin for full backend-latency metrics (`backend_total_ms`).
         let mut grpc_backend_admission_started_at = backend_start;
+        let mut grpc_final_upstream_target = upstream_target.clone();
+        let mut grpc_lb_connection_guard: Option<LoadBalancerConnectionGuard> = None;
 
         // Streaming-response safety:
         //   * Retries are triggered by CONNECTION errors (BackendUnavailable,
@@ -10650,6 +10683,10 @@ async fn handle_proxy_request_inner(
                     .await);
                 }
             };
+            grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                upstream_target.clone(),
+                upstream_balancer.clone(),
+            ));
             grpc_backend_admission_started_at = Instant::now();
             let result = grpc_proxy::proxy_grpc_request_core(
                 grpc_method,
@@ -10794,6 +10831,10 @@ async fn handle_proxy_request_inner(
                         .await);
                     }
                 };
+                grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                    upstream_target.clone(),
+                    upstream_balancer.clone(),
+                ));
                 grpc_backend_admission_started_at = Instant::now();
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
@@ -10855,6 +10896,10 @@ async fn handle_proxy_request_inner(
                                     .await);
                                 }
                             };
+                        grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                            upstream_target.clone(),
+                            upstream_balancer.clone(),
+                        ));
                         grpc_backend_admission_started_at = Instant::now();
                         let result = grpc_proxy::proxy_grpc_request_core(
                             grpc_method,
@@ -10936,6 +10981,23 @@ async fn handle_proxy_request_inner(
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                let grpc_retry_error_class = match &grpc_result {
+                    Err(error) => Some(retry::classify_grpc_proxy_error(error)),
+                    Ok(_) => None,
+                };
+                record_grpc_backend_dispatch_outcome(
+                    &state,
+                    &proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer.as_ref(),
+                    grpc_current_target.as_ref(),
+                    grpc_current_cb_key.as_deref(),
+                    502,
+                    true,
+                    grpc_retry_error_class,
+                    grpc_backend_admission_started_at.elapsed(),
+                );
+                drop(grpc_lb_connection_guard.take());
 
                 // Record circuit breaker failure for current target
                 if let Some(cb_config) = &proxy.circuit_breaker {
@@ -10966,6 +11028,7 @@ async fn handle_proxy_request_inner(
                 // stays attributed to the target that produced it. Mirrors the
                 // HTTP retry path.
                 let grpc_pre_rotation_cb_key = grpc_current_cb_key.clone();
+                let grpc_pre_rotation_target = grpc_current_target.clone();
 
                 // Try a different target on retry if load balancing is configured
                 if let (Some(_upstream_id), Some(prev_target)) =
@@ -11020,6 +11083,7 @@ async fn handle_proxy_request_inner(
                             // post-dispatch record so we neither double-record
                             // nor attribute to the never-dispatched target.
                             grpc_final_cb_key = grpc_pre_rotation_cb_key;
+                            grpc_final_upstream_target = grpc_pre_rotation_target;
                             grpc_skip_final_cb_record = true;
                             break;
                         }
@@ -11081,6 +11145,11 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     grpc_current_target.as_deref(),
                 );
+                grpc_final_upstream_target = grpc_current_target.clone();
+                grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                    grpc_current_target.clone(),
+                    upstream_balancer.clone(),
+                ));
                 grpc_backend_admission_started_at = Instant::now();
                 grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
                     grpc_method.clone(),
@@ -11199,6 +11268,11 @@ async fn handle_proxy_request_inner(
 
                 // after_proxy plugins run on headers only (body is not yet in memory).
                 let mut response_headers: HashMap<String, String> = grpc_streaming.headers;
+                let grpc_backend_dispatch_status = grpc_proxy::grpc_admission_status_from_maps(
+                    &EMPTY_HEADERS,
+                    &response_headers,
+                    grpc_streaming.status,
+                );
                 {
                     let phase_start = Instant::now();
                     if let Some(reject) = run_after_proxy_hooks(
@@ -11226,6 +11300,19 @@ async fn handle_proxy_request_inner(
                                 backend_elapsed: grpc_backend_admission_elapsed,
                             });
                         }
+                        record_grpc_backend_dispatch_outcome(
+                            &state,
+                            &proxy,
+                            &epoch.load_balancer,
+                            upstream_balancer.as_ref(),
+                            grpc_final_upstream_target.as_ref(),
+                            grpc_final_cb_key.as_deref(),
+                            grpc_backend_dispatch_status,
+                            false,
+                            None,
+                            grpc_backend_admission_elapsed,
+                        );
+                        drop(grpc_lb_connection_guard.take());
                         // Use `original_request_path` so the log records the
                         // path the client actually requested, not the
                         // VirtualService-rewritten backend path in `ctx.path`.
@@ -11364,6 +11451,7 @@ async fn handle_proxy_request_inner(
 
                 if body_exceeded {
                     drop(backend_admission_permits.take());
+                    drop(grpc_lb_connection_guard.take());
                     record_request(&state, 200);
                     return Ok(grpc_proxy::build_grpc_error_response(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -11445,6 +11533,28 @@ async fn handle_proxy_request_inner(
                 if let Some(guard) = per_ip_guard {
                     body = body.with_per_ip_request_guard(guard);
                 }
+                if let Some(guard) = grpc_lb_connection_guard.take() {
+                    body = body.with_lb_connection_guard(guard);
+                }
+                body = body
+                    .with_deferred_backend_dispatch_outcome(
+                        Arc::new(state.clone()),
+                        Arc::clone(&proxy),
+                        Arc::clone(&epoch.load_balancer),
+                        upstream_balancer.clone(),
+                        grpc_final_upstream_target.clone(),
+                        grpc_final_cb_key.clone(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                        false,
+                        true,
+                        grpc_backend_admission_elapsed,
+                    )
+                    .with_grpc_trailer_backend_dispatch_classification()
+                    .with_deferred_dispatch_request_body_exceeded_flag(
+                        grpc_streaming.request_body_exceeded.clone(),
+                    );
                 if let Some(permits) = backend_admission_permits.take() {
                     body = body
                         .with_deferred_backend_admission_outcome(
@@ -11507,6 +11617,11 @@ async fn handle_proxy_request_inner(
                 let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_body = grpc_resp.body;
+                let grpc_backend_dispatch_status = grpc_proxy::grpc_admission_status_from_maps(
+                    &grpc_resp.trailers,
+                    &response_headers,
+                    response_status,
+                );
                 if let Some(permits) = backend_admission_permits.take() {
                     // gRPC application failures ride in the `grpc-status` trailer
                     // (or header, for trailers-only) under HTTP 200, so the HTTP
@@ -11516,18 +11631,28 @@ async fn handle_proxy_request_inner(
                     // while client-side statuses stay <500 (healthy). `grpc_resp`
                     // trailers are still intact here — drained into `response_headers`
                     // below.
-                    let admission_status = grpc_proxy::grpc_admission_status_from_maps(
-                        &grpc_resp.trailers,
-                        &response_headers,
-                        response_status,
-                    );
                     permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status: admission_status,
+                        response_status: grpc_backend_dispatch_status,
                         connection_error: false,
                         error_class: None,
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                if !grpc_skip_final_cb_record {
+                    record_grpc_backend_dispatch_outcome(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        grpc_final_upstream_target.as_ref(),
+                        grpc_final_cb_key.as_deref(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                        grpc_backend_admission_started_at.elapsed(),
+                    );
+                }
+                drop(grpc_lb_connection_guard.take());
 
                 // Forward trailers as response headers (gRPC Trailers-Only encoding).
                 // Drain instead of clone to avoid per-trailer String allocations.
@@ -11778,28 +11903,48 @@ async fn handle_proxy_request_inner(
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
+                let grpc_backend_connection_error = matches!(
+                    &e,
+                    GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
+                ) || matches!(
+                    &e,
+                    GrpcProxyError::BackendTimeout {
+                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                        ..
+                    }
+                );
                 if !matches!(
                     &e,
                     GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
                 ) && let Some(permits) = backend_admission_permits.take()
                 {
-                    let connection_error = matches!(
-                        &e,
-                        GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
-                    ) || matches!(
-                        &e,
-                        GrpcProxyError::BackendTimeout {
-                            kind: grpc_proxy::GrpcTimeoutKind::Connect,
-                            ..
-                        }
-                    );
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: 502,
-                        connection_error,
+                        connection_error: grpc_backend_connection_error,
                         error_class: Some(grpc_error_class),
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                if !grpc_skip_final_cb_record
+                    && !matches!(
+                        &e,
+                        GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
+                    )
+                {
+                    record_grpc_backend_dispatch_outcome(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        grpc_final_upstream_target.as_ref(),
+                        grpc_final_cb_key.as_deref(),
+                        502,
+                        grpc_backend_connection_error,
+                        Some(grpc_error_class),
+                        grpc_backend_admission_started_at.elapsed(),
+                    );
+                }
+                drop(grpc_lb_connection_guard.take());
                 if grpc_error_class == retry::ErrorClass::PortExhaustion {
                     state.overload.record_port_exhaustion();
                 }
