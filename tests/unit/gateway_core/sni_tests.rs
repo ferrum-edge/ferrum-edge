@@ -598,6 +598,37 @@ async fn test_extract_sni_from_tcp_stream_succeeds_within_timeout() {
     assert_eq!(result, Some("inside.example.com".to_string()));
 }
 
+/// A peer that writes one non-TLS byte and stalls must be rejected as soon as
+/// that prefix is visible, not kept around until the full handshake timeout.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_rejects_non_tls_prefix_immediately() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        let started = std::time::Instant::now();
+        let result =
+            extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_secs(1)))
+                .await;
+        (result, started.elapsed())
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(b"G").await.expect("write prefix");
+    client.flush().await.expect("flush prefix");
+
+    let (result, elapsed) = accept_task.await.expect("accept_task");
+    assert_eq!(result, None, "non-TLS prefix must not produce SNI");
+    assert!(
+        elapsed < std::time::Duration::from_millis(300),
+        "non-TLS prefix waited for the handshake timeout: {elapsed:?}"
+    );
+}
+
 /// A ClientHello that arrives split across multiple TCP segments must still
 /// have its SNI extracted: `peek()` returns as soon as ≥1 byte is buffered, so
 /// a single peek sees a truncated record (routine for ~1.7 KB post-quantum

@@ -71,13 +71,19 @@ pub async fn extract_sni_from_tcp_stream(
                 return extract_sni_from_client_hello(&buf[..have]);
             }
         }
+        // Reject non-TLS prefixes as soon as the first byte is visible. Waiting
+        // for the full record header would let one malformed byte park this
+        // task until the handshake timeout.
+        if have >= 1 && buf[0] != 0x16 {
+            return None;
+        }
+
         // Need the 5-byte record header to know the full record length.
         if have >= 5 {
             let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
             let want = (5 + record_len).min(MAX_CLIENT_HELLO_LEN);
-            if have >= want || buf[0] != 0x16 {
-                // Full first record buffered (or not a TLS handshake record at
-                // all — parse fails fast without waiting out the deadline).
+            if have >= want {
+                // Full first record buffered.
                 return extract_sni_from_client_hello(&buf[..have]);
             }
         }

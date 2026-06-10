@@ -5738,6 +5738,7 @@ async fn handle_websocket_request_authenticated(
         remote_addr.ip()
     );
     let mut ctx = ctx;
+    let mut current_cb_target_key = cb_target_key;
 
     // Build backend URL using upstream target if available
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
@@ -5770,7 +5771,7 @@ async fn handle_websocket_request_authenticated(
             release_circuit_breaker_probe_on_admission_reject(
                 &state,
                 &proxy,
-                cb_target_key.as_deref(),
+                current_cb_target_key.as_deref(),
                 cb_is_half_open_probe,
             );
             return Ok(build_response(
@@ -5811,7 +5812,7 @@ async fn handle_websocket_request_authenticated(
                 release_circuit_breaker_probe_on_admission_reject(
                     &state,
                     &proxy,
-                    cb_target_key.as_deref(),
+                    current_cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                 );
                 return Ok(build_response(
@@ -5905,7 +5906,7 @@ async fn handle_websocket_request_authenticated(
                 release_circuit_breaker_probe_on_admission_reject(
                     &state,
                     &proxy,
-                    cb_target_key.as_deref(),
+                    current_cb_target_key.as_deref(),
                     ws_cb_probe_slot_available,
                 );
                 return Ok(build_response(
@@ -5929,7 +5930,7 @@ async fn handle_websocket_request_authenticated(
                 release_circuit_breaker_probe_on_admission_reject(
                     &state,
                     &proxy,
-                    cb_target_key.as_deref(),
+                    current_cb_target_key.as_deref(),
                     ws_cb_probe_slot_available,
                 );
                 return Ok(handle_backend_admission_rejection(
@@ -5998,6 +5999,9 @@ async fn handle_websocket_request_authenticated(
                     false
                 };
 
+                let mut cb_failure_already_recorded = false;
+                let mut backend_outcome_already_recorded = false;
+
                 if should_retry_ws {
                     if let Some(permits) = backend_admission_permits.take() {
                         permits.record_backend_outcome(BackendAdmissionOutcome {
@@ -6006,6 +6010,7 @@ async fn handle_websocket_request_authenticated(
                             error_class: Some(ws_error_class),
                             backend_elapsed: backend_admission_start.elapsed(),
                         });
+                        backend_outcome_already_recorded = true;
                     }
                     // Safety: should_retry_ws is only true when proxy.retry.is_some()
                     // (see condition above). Fall through to 502 if the invariant
@@ -6029,22 +6034,23 @@ async fn handle_websocket_request_authenticated(
                     // value keeps the invariant readable and survives a
                     // future refactor that moves this block.)
                     if let Some(cb_config) = &proxy.circuit_breaker {
-                        let current_cb_key = current_target
-                            .as_ref()
-                            .map(|t| crate::circuit_breaker::target_key(&t.host, t.port))
-                            .or_else(|| cb_target_key.clone());
                         let cb = state.circuit_breaker_cache.get_or_create(
                             &proxy.id,
-                            current_cb_key.as_deref(),
+                            current_cb_target_key.as_deref(),
                             cb_config,
                         );
                         cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
                         ws_cb_probe_slot_available = false;
+                        cb_failure_already_recorded = true;
                     }
 
                     let delay = retry::retry_delay(retry_config, ws_attempt);
                     tokio::time::sleep(delay).await;
                     ws_attempt += 1;
+
+                    let mut retry_backend_url = current_backend_url.clone();
+                    let mut retry_target = current_target.clone();
+                    let mut retry_cb_target_key = current_cb_target_key.clone();
 
                     // Try a different target on retry if load balancing is configured
                     if let (Some(_upstream_id), Some(prev_target)) =
@@ -6060,7 +6066,7 @@ async fn handle_websocket_request_authenticated(
                             &ctx.headers,
                         )
                     {
-                        current_backend_url = build_websocket_backend_url_with_target(
+                        retry_backend_url = build_websocket_backend_url_with_target(
                             &proxy,
                             &ctx.path,
                             &query_string,
@@ -6069,17 +6075,46 @@ async fn handle_websocket_request_authenticated(
                             strip_len,
                             next.path.as_deref(),
                         );
-                        current_target = Some(next);
+                        retry_cb_target_key =
+                            Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                        retry_target = Some(next);
                     }
 
-                    warn!(
-                        proxy_id = %proxy.id,
-                        attempt = ws_attempt,
-                        max_retries = retry_config.max_retries,
-                        error_class = %ws_error_class,
-                        "Retrying WebSocket backend connection"
-                    );
-                    continue;
+                    let mut retry_admitted_by_cb = true;
+                    if let Some(cb_config) = &proxy.circuit_breaker {
+                        match state.circuit_breaker_cache.can_execute(
+                            &proxy.id,
+                            retry_cb_target_key.as_deref(),
+                            cb_config,
+                        ) {
+                            Ok((_cb, is_half_open_probe)) => {
+                                ws_cb_probe_slot_available = is_half_open_probe;
+                            }
+                            Err(_) => {
+                                retry_admitted_by_cb = false;
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    attempt = ws_attempt,
+                                    "WebSocket retry target rejected by circuit breaker"
+                                );
+                            }
+                        }
+                    }
+
+                    if retry_admitted_by_cb {
+                        current_backend_url = retry_backend_url;
+                        current_target = retry_target;
+                        current_cb_target_key = retry_cb_target_key;
+
+                        warn!(
+                            proxy_id = %proxy.id,
+                            attempt = ws_attempt,
+                            max_retries = retry_config.max_retries,
+                            error_class = %ws_error_class,
+                            "Retrying WebSocket backend connection"
+                        );
+                        continue;
+                    }
                 }
 
                 // No retry — return error. Use the unified
@@ -6103,19 +6138,17 @@ async fn handle_websocket_request_authenticated(
                 // (the default), WS backend connect failures never fed the
                 // breaker at all on H1/H2, and an admitted probe slot leaked
                 // permanently.
-                if let Some(cb_config) = &proxy.circuit_breaker {
-                    let current_cb_key = current_target
-                        .as_ref()
-                        .map(|t| crate::circuit_breaker::target_key(&t.host, t.port))
-                        .or_else(|| cb_target_key.clone());
+                if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
                         &proxy.id,
-                        current_cb_key.as_deref(),
+                        current_cb_target_key.as_deref(),
                         cb_config,
                     );
                     cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
                 }
-                if let Some(permits) = backend_admission_permits.take() {
+                if !backend_outcome_already_recorded
+                    && let Some(permits) = backend_admission_permits.take()
+                {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: 502,
                         connection_error: ws_is_pre_wire,
@@ -6195,13 +6228,9 @@ async fn handle_websocket_request_authenticated(
     // upgrades the breaker wedged in HALF_OPEN, 503ing ALL traffic to the
     // target. Mirrors the H3 WS path (`src/http3/websocket.rs`).
     if let Some(cb_config) = &proxy.circuit_breaker {
-        let current_cb_key = current_target
-            .as_ref()
-            .map(|t| crate::circuit_breaker::target_key(&t.host, t.port))
-            .or_else(|| cb_target_key.clone());
         let cb = state.circuit_breaker_cache.get_or_create(
             &proxy.id,
-            current_cb_key.as_deref(),
+            current_cb_target_key.as_deref(),
             cb_config,
         );
         cb.record_success(ws_cb_probe_slot_available);

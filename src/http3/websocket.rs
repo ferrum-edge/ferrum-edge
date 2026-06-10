@@ -680,6 +680,9 @@ pub(crate) async fn handle_h3_websocket(
                         .then(|| retry::retry_delay(retry_config, ws_attempt))
                 });
 
+                let mut cb_failure_already_recorded = false;
+                let mut backend_outcome_already_recorded = false;
+
                 if let Some(delay) = retry_delay {
                     if let Some(permits) = backend_admission_permits.take() {
                         permits.record_backend_outcome(BackendAdmissionOutcome {
@@ -688,6 +691,7 @@ pub(crate) async fn handle_h3_websocket(
                             error_class: Some(ws_error_class),
                             backend_elapsed: backend_admission_start.elapsed(),
                         });
+                        backend_outcome_already_recorded = true;
                     }
                     if let Some(cb_config) = &proxy.circuit_breaker {
                         let cb = state.circuit_breaker_cache.get_or_create(
@@ -697,10 +701,15 @@ pub(crate) async fn handle_h3_websocket(
                         );
                         cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
                         ws_cb_probe_slot_available = false;
+                        cb_failure_already_recorded = true;
                     }
 
                     tokio::time::sleep(delay).await;
                     ws_attempt += 1;
+
+                    let mut retry_backend_url = current_backend_url.clone();
+                    let mut retry_target = current_target.clone();
+                    let mut retry_cb_target_key = current_cb_target_key.clone();
 
                     if let (Some(_upstream_id), Some(prev_target), Some(hash_key)) =
                         (&proxy.upstream_id, &current_target, lb_hash_key.as_deref())
@@ -714,7 +723,7 @@ pub(crate) async fn handle_h3_websocket(
                             &proxy_headers,
                         )
                     {
-                        current_backend_url = crate::proxy::build_websocket_backend_url_with_target(
+                        retry_backend_url = crate::proxy::build_websocket_backend_url_with_target(
                             &proxy,
                             &ctx.path,
                             &query_string,
@@ -723,19 +732,46 @@ pub(crate) async fn handle_h3_websocket(
                             strip_len,
                             next.path.as_deref(),
                         );
-                        current_cb_target_key =
+                        retry_cb_target_key =
                             Some(crate::circuit_breaker::target_key(&next.host, next.port));
-                        current_target = Some(next);
+                        retry_target = Some(next);
                     }
 
-                    warn!(
-                        proxy_id = %proxy.id,
-                        attempt = ws_attempt,
-                        max_retries = proxy.retry.as_ref().map(|r| r.max_retries).unwrap_or(0),
-                        error_class = %ws_error_class,
-                        "Retrying H3 WebSocket backend connection"
-                    );
-                    continue;
+                    let mut retry_admitted_by_cb = true;
+                    if let Some(cb_config) = &proxy.circuit_breaker {
+                        match state.circuit_breaker_cache.can_execute(
+                            &proxy.id,
+                            retry_cb_target_key.as_deref(),
+                            cb_config,
+                        ) {
+                            Ok((_cb, is_half_open_probe)) => {
+                                ws_cb_probe_slot_available = is_half_open_probe;
+                            }
+                            Err(_) => {
+                                retry_admitted_by_cb = false;
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    attempt = ws_attempt,
+                                    "H3 WebSocket retry target rejected by circuit breaker"
+                                );
+                            }
+                        }
+                    }
+
+                    if retry_admitted_by_cb {
+                        current_backend_url = retry_backend_url;
+                        current_target = retry_target;
+                        current_cb_target_key = retry_cb_target_key;
+
+                        warn!(
+                            proxy_id = %proxy.id,
+                            attempt = ws_attempt,
+                            max_retries = proxy.retry.as_ref().map(|r| r.max_retries).unwrap_or(0),
+                            error_class = %ws_error_class,
+                            "Retrying H3 WebSocket backend connection"
+                        );
+                        continue;
+                    }
                 }
 
                 error!(
@@ -746,7 +782,9 @@ pub(crate) async fn handle_h3_websocket(
                     error = %e,
                     "H3 WebSocket backend connection failed"
                 );
-                if let Some(permits) = backend_admission_permits.take() {
+                if !backend_outcome_already_recorded
+                    && let Some(permits) = backend_admission_permits.take()
+                {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: 502,
                         connection_error: ws_is_pre_wire,
@@ -755,7 +793,7 @@ pub(crate) async fn handle_h3_websocket(
                     });
                 }
 
-                if let Some(cb_config) = &proxy.circuit_breaker {
+                if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
                         &proxy.id,
                         current_cb_target_key.as_deref(),
