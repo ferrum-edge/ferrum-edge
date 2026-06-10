@@ -5,7 +5,9 @@
 
 use arc_swap::ArcSwap;
 use ferrum_edge::circuit_breaker::CircuitBreakerCache;
-use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig, Proxy};
+use ferrum_edge::config::types::{
+    BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, Proxy,
+};
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::load_balancer::LoadBalancerCache;
@@ -21,7 +23,7 @@ use std::time::Duration;
 // ============================================================================
 
 fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
-    Proxy {
+    let mut proxy = Proxy {
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -77,7 +79,9 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         udp_max_response_amplification_factor: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-    }
+    };
+    proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+    proxy
 }
 
 /// Allocate an ephemeral port by binding and immediately dropping.
@@ -90,12 +94,19 @@ async fn ephemeral_port() -> u16 {
 
 fn create_manager(config: GatewayConfig) -> StreamListenerManager {
     let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    create_manager_with_config_arc(config_arc, &config)
+}
+
+fn create_manager_with_config_arc(
+    config_arc: Arc<ArcSwap<GatewayConfig>>,
+    config: &GatewayConfig,
+) -> StreamListenerManager {
     let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    let lb_cache = Arc::new(LoadBalancerCache::new(config));
     let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
+    let plugin_cache = Arc::new(PluginCache::new(config).expect("PluginCache::new failed"));
     let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
-        config.clone(),
+        (*config).clone(),
         &plugin_cache,
         &consumer_index,
         &lb_cache,
@@ -290,6 +301,95 @@ async fn test_reconcile_detects_port_conflict() {
 
     // Keep blocker alive until end of test
     drop(blocker);
+}
+
+#[tokio::test]
+async fn test_reconcile_restarts_changed_tcp_listener_without_bind_failure() {
+    let port = ephemeral_port().await;
+    let proxy = create_stream_proxy("tcp-restart", BackendScheme::Tcp, port);
+    let config = GatewayConfig {
+        proxies: vec![proxy.clone()],
+        ..empty_config()
+    };
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial TCP listener should start without failures: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial TCP listener should bind");
+
+    let mut restarted_proxy = proxy;
+    restarted_proxy.backend_scheme = Some(BackendScheme::Tcps);
+    restarted_proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcps);
+    restarted_proxy.backend_tls_verify_server_cert = false;
+    let restarted_config = GatewayConfig {
+        proxies: vec![restarted_proxy],
+        ..empty_config()
+    };
+    config_arc.store(Arc::new(restarted_config));
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "same-port listener restart should wait for the old socket before probing: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("restarted TCP TLS listener should bind");
+
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn test_reconcile_skips_tcp_tls_listener_when_backend_tls_material_unreadable() {
+    let port = ephemeral_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing_ca_path = dir.path().join("missing-ca.pem");
+    let mut proxy = create_stream_proxy("tcp-tls-bad-ca", BackendScheme::Tcps, port);
+    proxy.backend_tls_verify_server_cert = true;
+    proxy.backend_tls_server_ca_cert_path = Some(
+        missing_ca_path
+            .to_str()
+            .expect("test temp path must be utf-8 for proxy config")
+            .to_string(),
+    );
+    proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let manager = create_manager(config);
+
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "bad backend TLS material should fail only that stream listener: {:?}",
+        failures
+    );
+    assert_eq!(failures[0].0, "tcp-tls-bad-ca");
+    assert_eq!(failures[0].1, port);
+    assert!(
+        failures[0].2.contains("Backend TLS config failed"),
+        "error should identify backend TLS validation: {}",
+        failures[0].2
+    );
+
+    let probe = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await;
+    assert!(
+        probe.is_ok(),
+        "failed backend TLS validation must not leave a dead listener occupying port {}",
+        port
+    );
 }
 
 // ============================================================================

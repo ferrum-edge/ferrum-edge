@@ -631,7 +631,7 @@ pub(crate) async fn bidirectional_splice_io_uring_for_test_with_timeouts(
 
 /// Cached backend TLS configuration to avoid reading certificate files from
 /// disk on every connection. Built once per listener lifecycle and reused.
-struct CachedBackendTlsConfig {
+pub(crate) struct CachedBackendTlsConfig {
     config: Arc<rustls::ClientConfig>,
 }
 
@@ -661,6 +661,22 @@ impl CachedBackendTlsConfig {
             config: Arc::new(tls_config),
         })
     }
+}
+
+pub(crate) fn build_cached_backend_tls_config(
+    proxy: &Proxy,
+    tls_no_verify: bool,
+    global_tls_ca_bundle_path: Option<&str>,
+    tls_policy: Option<&TlsPolicy>,
+    crls: &crate::tls::CrlList,
+) -> Result<CachedBackendTlsConfig, anyhow::Error> {
+    CachedBackendTlsConfig::build(
+        proxy,
+        tls_no_verify,
+        global_tls_ca_bundle_path,
+        tls_policy,
+        crls,
+    )
 }
 
 /// Metrics for a single TCP proxy listener.
@@ -898,28 +914,17 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
             .find(|p| *p.id == *proxy_id)
             .filter(|p| p.dispatch_kind == crate::config::types::DispatchKind::TcpTls)
             .map(|proxy| {
-                CachedBackendTlsConfig::build(
+                build_cached_backend_tls_config(
                     proxy,
                     tls_no_verify,
                     tls_ca_bundle_path.as_deref(),
                     tls_policy.as_deref(),
                     &crls,
                 )
-                    .map(Arc::new)
-                    .unwrap_or_else(|e| {
-                        warn!(proxy_id = %proxy_id, "Failed to pre-build backend TLS config: {}, will retry per-connection", e);
-                        // Return a dummy config that will be rebuilt per-connection
-                        let dummy_builder = crate::tls::backend_client_config_builder(tls_policy.as_deref())
-                            .unwrap_or_else(|_| rustls::ClientConfig::builder());
-                        Arc::new(CachedBackendTlsConfig {
-                            config: Arc::new(
-                                dummy_builder
-                                    .with_root_certificates(rustls::RootCertStore::empty())
-                                    .with_no_client_auth()
-                            ),
-                        })
-                    })
+                .map(Arc::new)
             })
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Failed to pre-build backend TLS config: {}", e))?
     };
 
     let loop_state = TcpAcceptLoopState {
