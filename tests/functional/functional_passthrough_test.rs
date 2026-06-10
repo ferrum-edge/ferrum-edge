@@ -256,6 +256,84 @@ upstreams: []
 
 #[tokio::test]
 #[ignore]
+async fn test_tcp_passthrough_circuit_breaker_rejects_without_backend_dial() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // Reserve a backend port, then drop the listener so the first gateway
+    // connection gets ECONNREFUSED and trips the passthrough breaker.
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+
+    let (mut gateway, proxy_listen_port, _http_port, _admin_port, _dir) =
+        start_gateway_with_retry(|stream_port, _dir_path| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "tcp-passthrough-cb"
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    listen_port: {stream_port}
+    passthrough: true
+    backend_connect_timeout_ms: 200
+    circuit_breaker:
+      failure_threshold: 1
+      success_threshold: 1
+      timeout_seconds: 60
+      failure_status_codes: [500, 502, 503]
+      half_open_max_requests: 1
+      trip_on_connection_errors: true
+
+consumers: []
+plugin_configs: []
+upstreams: []
+"#,
+            )
+        })
+        .await;
+
+    let mut first = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_listen_port))
+        .await
+        .expect("connect to passthrough proxy");
+    first.write_all(b"trip breaker").await.ok();
+    let mut buf = [0u8; 1];
+    let _ = tokio::time::timeout(Duration::from_secs(5), first.read(&mut buf)).await;
+
+    // Bring up a backend on the same port after the breaker is open. If the
+    // passthrough path skips can_execute, the next client will be accepted here.
+    let backend_listener = TcpListener::bind(format!("127.0.0.1:{backend_port}"))
+        .await
+        .expect("bind backend after breaker trip");
+    let accepts = Arc::new(AtomicU32::new(0));
+    let accepts_for_task = accepts.clone();
+    tokio::spawn(async move {
+        while let Ok((_stream, _)) = backend_listener.accept().await {
+            accepts_for_task.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let mut second = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_listen_port))
+        .await
+        .expect("connect to passthrough proxy while breaker is open");
+    second.write_all(b"must not reach backend").await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), second.read(&mut buf)).await;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        0,
+        "open passthrough circuit breaker must reject before backend dial"
+    );
+
+    gateway.kill().ok();
+    gateway.wait().ok();
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_tcp_tls_passthrough_forwards_encrypted_data() {
     let (cert_pem, key_pem) = generate_self_signed_cert();
 
