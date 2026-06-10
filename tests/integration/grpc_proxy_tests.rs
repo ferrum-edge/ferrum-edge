@@ -21,7 +21,9 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
-use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, ResponseBodyMode,
+};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::ProxyState;
 
@@ -823,6 +825,68 @@ async fn start_streaming_grpc_backend(
 
     tokio::time::sleep(Duration::from_millis(20)).await;
     (addr, handle)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_buffered_non_empty_response_sends_status_as_trailer() {
+    let (backend_addr, _backend_handle) = start_streaming_grpc_backend(1, 32, Duration::ZERO).await;
+
+    let mut proxy = create_grpc_proxy("grpc-buffered-trailers", "/grpc", backend_addr.port());
+    proxy.response_body_mode = ResponseBodyMode::Buffer;
+    let state = create_test_proxy_state(vec![proxy]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/grpc/my.Service/Unary")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let response = sender.send_request(req).await.expect("request send failed");
+    assert_eq!(response.status(), 200);
+    assert!(
+        response.headers().get("grpc-status").is_none(),
+        "non-empty buffered gRPC responses must not send grpc-status as initial metadata"
+    );
+
+    let mut saw_data = false;
+    let mut grpc_status = None;
+    let mut grpc_message = None;
+    let mut body = response.into_body();
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.expect("response frame");
+        if let Some(data) = frame.data_ref()
+            && !data.is_empty()
+        {
+            saw_data = true;
+        }
+        if let Some(trailers) = frame.trailers_ref() {
+            grpc_status = trailers
+                .get("grpc-status")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            grpc_message = trailers
+                .get("grpc-message")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+        }
+    }
+
+    assert!(saw_data, "backend DATA frame was not forwarded");
+    assert_eq!(grpc_status.as_deref(), Some("0"));
+    assert_eq!(grpc_message.as_deref(), Some("OK"));
 }
 
 /// Fix 4: with retry configured, a gRPC server-streaming response with

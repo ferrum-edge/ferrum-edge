@@ -11404,6 +11404,7 @@ async fn handle_proxy_request_inner(
             Ok(GrpcResponseKind::Buffered(grpc_resp)) => {
                 let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
+                let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
                 let mut response_body = grpc_resp.body;
                 if let Some(permits) = backend_admission_permits.take() {
                     // gRPC application failures ride in the `grpc-status` trailer
@@ -11415,7 +11416,7 @@ async fn handle_proxy_request_inner(
                     // trailers are still intact here — drained into `response_headers`
                     // below.
                     let admission_status = grpc_proxy::grpc_admission_status_from_maps(
-                        &grpc_resp.trailers,
+                        &response_trailers,
                         &response_headers,
                         response_status,
                     );
@@ -11427,10 +11428,16 @@ async fn handle_proxy_request_inner(
                     });
                 }
 
-                // Forward trailers as response headers (gRPC Trailers-Only encoding).
-                // Drain instead of clone to avoid per-trailer String allocations.
-                for (k, v) in grpc_resp.trailers {
-                    response_headers.insert(k, v);
+                // Plugins historically saw a merged header+trailer map on the
+                // buffered gRPC path because trailers were inserted into
+                // response headers before hooks ran. Keep that compatibility
+                // view, but split the wire response back into HEADERS + DATA +
+                // TRAILERS when the final body is non-empty.
+                let mut plugin_response_headers = response_headers.clone();
+                for (k, v) in &response_trailers {
+                    plugin_response_headers
+                        .entry(k.clone())
+                        .or_insert_with(|| v.clone());
                 }
 
                 // after_proxy hooks
@@ -11441,7 +11448,7 @@ async fn handle_proxy_request_inner(
                         &plugins,
                         &mut ctx,
                         response_status,
-                        &mut response_headers,
+                        &mut plugin_response_headers,
                     )
                     .await
                     {
@@ -11455,6 +11462,8 @@ async fn handle_proxy_request_inner(
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
                         response_status = normalized.http_status.as_u16();
                         response_headers = normalized.headers;
+                        plugin_response_headers = response_headers.clone();
+                        response_trailers.clear();
                         response_body = normalized.body;
                         after_proxy_rejected = true;
                     }
@@ -11468,7 +11477,7 @@ async fn handle_proxy_request_inner(
                             .on_response_body(
                                 &mut ctx,
                                 response_status,
-                                &response_headers,
+                                &plugin_response_headers,
                                 &response_body,
                             )
                             .await;
@@ -11490,6 +11499,8 @@ async fn handle_proxy_request_inner(
                                     .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
+                                plugin_response_headers = response_headers.clone();
+                                response_trailers.clear();
                                 response_body = normalized.body;
                                 break;
                             }
@@ -11500,14 +11511,18 @@ async fn handle_proxy_request_inner(
 
                 if !after_proxy_rejected {
                     let phase_start = Instant::now();
-                    let content_type = response_headers.get("content-type").cloned();
+                    let content_type = plugin_response_headers.get("content-type").cloned();
                     let ct_ref = content_type.as_deref();
                     for plugin in plugins.iter() {
                         if let Some(transformed) = plugin
-                            .transform_response_body(&response_body, ct_ref, &response_headers)
+                            .transform_response_body(
+                                &response_body,
+                                ct_ref,
+                                &plugin_response_headers,
+                            )
                             .await
                         {
-                            response_headers.insert(
+                            plugin_response_headers.insert(
                                 "content-length".to_string(),
                                 transformed.len().to_string(),
                             );
@@ -11524,7 +11539,7 @@ async fn handle_proxy_request_inner(
                             .on_final_response_body(
                                 &mut ctx,
                                 response_status,
-                                &response_headers,
+                                &plugin_response_headers,
                                 &response_body,
                             )
                             .await;
@@ -11546,6 +11561,8 @@ async fn handle_proxy_request_inner(
                                     .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
+                                plugin_response_headers = response_headers.clone();
+                                response_trailers.clear();
                                 response_body = normalized.body;
                                 break;
                             }
@@ -11612,6 +11629,31 @@ async fn handle_proxy_request_inner(
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
+                if !after_proxy_rejected {
+                    response_headers = plugin_response_headers.clone();
+                }
+                if response_body.is_empty() {
+                    // True Trailers-Only encoding: no DATA frame, grpc-status
+                    // and friends stay in the initial HEADERS with END_STREAM.
+                    for (k, v) in &response_trailers {
+                        response_headers
+                            .entry(k.clone())
+                            .or_insert_with(|| v.clone());
+                    }
+                    response_trailers.clear();
+                } else {
+                    // Non-empty gRPC responses must carry grpc-status in a
+                    // terminal trailers frame. Preserve plugin mutations to
+                    // existing trailer keys, then strip those keys from the
+                    // initial headers.
+                    for (k, v) in &mut response_trailers {
+                        if let Some(plugin_value) = plugin_response_headers.get(k) {
+                            *v = plugin_value.clone();
+                        }
+                        response_headers.remove(k);
+                    }
+                }
+
                 // Inject sticky session cookie for gRPC responses
                 if sticky_cookie_needed
                     && let (Some(upstream_id), Some(target)) =
@@ -11665,14 +11707,28 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                 );
 
-                return Ok(resp_builder
-                    .body(ProxyBody::full(Bytes::from(response_body)))
-                    .unwrap_or_else(|_| {
-                        grpc_proxy::build_grpc_error_response(
-                            grpc_proxy::grpc_status::UNAVAILABLE,
-                            "Internal gateway error",
-                        )
-                    }));
+                let response_body = Bytes::from(response_body);
+                let body = if !response_body.is_empty() && !response_trailers.is_empty() {
+                    let mut trailers = hyper::HeaderMap::new();
+                    for (k, v) in &response_trailers {
+                        if let (Ok(name), Ok(value)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            hyper::header::HeaderValue::from_str(v),
+                        ) {
+                            trailers.append(name, value);
+                        }
+                    }
+                    ProxyBody::buffered_grpc_with_trailers(response_body, trailers)
+                } else {
+                    ProxyBody::full(response_body)
+                };
+
+                return Ok(resp_builder.body(body).unwrap_or_else(|_| {
+                    grpc_proxy::build_grpc_error_response(
+                        grpc_proxy::grpc_status::UNAVAILABLE,
+                        "Internal gateway error",
+                    )
+                }));
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);

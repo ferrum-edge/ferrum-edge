@@ -1950,8 +1950,9 @@ pub(crate) async fn proxy_grpc_request_core(
 /// RFC 9110 §7.6.1 response-direction hop-by-hop names.
 ///
 /// gRPC carries `grpc-status` / `grpc-message` / `grpc-status-details-bin` in
-/// trailers, and at the forward boundary in `mod.rs` they are merged into
-/// the response header map (gRPC trailers-only encoding). A misbehaving or
+/// trailers, and the forward boundary in `mod.rs` emits them as true trailers
+/// when a buffered response has a non-empty body. Empty-body responses still
+/// use gRPC trailers-only encoding in initial headers. A misbehaving or
 /// malicious backend that puts hop-by-hop directives like `connection:
 /// close`, `proxy-authenticate`, `keep-alive`, `transfer-encoding`, or
 /// `upgrade` in the trailer map would otherwise leak past the proxy

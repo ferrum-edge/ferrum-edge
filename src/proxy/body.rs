@@ -6,6 +6,7 @@
 //! concrete stream type.
 
 use bytes::{Bytes, BytesMut};
+use http::HeaderMap;
 use http_body::Frame;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -235,6 +236,59 @@ impl http_body::Body for TrackedBody {
     }
 }
 
+/// Buffered gRPC response body that preserves wire trailers.
+///
+/// The proxy may need the full gRPC response body in memory for body plugins or
+/// `response_body_mode = Buffer`, but a non-empty gRPC response must still end
+/// with an HTTP/2 trailers frame carrying `grpc-status`. `Full<Bytes>` cannot
+/// emit that terminal frame, so this tiny body yields the buffered DATA once,
+/// then the sanitized trailers collected from the backend.
+struct BufferedGrpcBody {
+    data: Option<Bytes>,
+    trailers: Option<HeaderMap>,
+}
+
+impl BufferedGrpcBody {
+    fn new(data: Bytes, trailers: HeaderMap) -> Self {
+        Self {
+            data: Some(data),
+            trailers: Some(trailers),
+        }
+    }
+}
+
+impl http_body::Body for BufferedGrpcBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if let Some(data) = this.data.take()
+            && !data.is_empty()
+        {
+            return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        if let Some(trailers) = this.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+        Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_none() && self.trailers.is_none()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        let mut hint = http_body::SizeHint::new();
+        let len = self.data.as_ref().map_or(0, Bytes::len) as u64;
+        hint.set_exact(len);
+        hint
+    }
+}
+
 impl ProxyBody {
     /// Create a buffered body from bytes.
     pub fn full(data: impl Into<Bytes>) -> Self {
@@ -271,6 +325,13 @@ impl ProxyBody {
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),
         }
+    }
+
+    /// Create a buffered gRPC response body that emits DATA followed by
+    /// trailers. Callers should use trailers-only headers instead when `data`
+    /// is empty.
+    pub(crate) fn buffered_grpc_with_trailers(data: impl Into<Bytes>, trailers: HeaderMap) -> Self {
+        Self::streaming(Box::pin(BufferedGrpcBody::new(data.into(), trailers)))
     }
 
     /// Attach a [`RequestGuard`] to this body so the `active_requests`
