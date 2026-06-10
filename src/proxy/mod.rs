@@ -6578,12 +6578,12 @@ fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(
 /// Collect backend WebSocket headers while preserving repeated client-provided
 /// values when the sanitized proxy header map still represents the full raw set.
 ///
-/// `RequestContext::headers` is a `HashMap`, so repeated fields are necessarily
-/// collapsed or comma-folded after materialization. The raw `HeaderMap` is
-/// still available from the upgrade request; use it to retain handshake-
-/// equivalent repeated headers such as multiple `Sec-WebSocket-Protocol`
-/// values, while still honoring plugin-driven strips and rewrites reflected in
-/// `proxy_headers`.
+/// `RequestContext::headers` is a `HashMap`, so repeated fields are folded
+/// after materialization (`; ` for cookie crumbs, `, ` otherwise). The raw
+/// `HeaderMap` is still available from the upgrade request; use it to retain
+/// handshake-equivalent repeated headers such as multiple
+/// `Sec-WebSocket-Protocol` values, while still honoring plugin-driven strips
+/// and rewrites reflected in `proxy_headers`.
 fn collect_forwardable_websocket_headers(
     raw_headers: &hyper::HeaderMap,
     proxy_headers: &HashMap<String, String>,
@@ -6619,7 +6619,7 @@ fn collect_forwardable_websocket_headers(
             .iter()
             .filter_map(|value| value.to_str().ok())
             .collect();
-        if sanitized_value_preserves_raw_values(&raw_values, sanitized_value)
+        if sanitized_value_preserves_raw_values(name.as_str(), &raw_values, sanitized_value)
             || sanitized_value == &materialized_raw_header_value(name.as_str(), &raw_values)
         {
             preserved_raw_names.insert(lower_name);
@@ -6654,15 +6654,25 @@ fn collect_forwardable_websocket_headers(
     forwarded
 }
 
-fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &str) -> bool {
+fn sanitized_value_preserves_raw_values(
+    name: &str,
+    raw_values: &[&str],
+    sanitized_value: &str,
+) -> bool {
     match raw_values {
         [] => false,
         [only] => *only == sanitized_value,
         _ => {
             // This exact fast-path only applies to list-style values where
-            // individual raw values do not contain literal commas. If that is
-            // not true, callers fall back to the shared materialized form.
-            let mut sanitized_values = sanitized_value.split(',').map(str::trim);
+            // individual raw values do not contain the fold delimiter. If
+            // that is not true, callers fall back to the shared materialized
+            // form.
+            let delimiter = if name.eq_ignore_ascii_case("cookie") {
+                ';'
+            } else {
+                ','
+            };
+            let mut sanitized_values = sanitized_value.split(delimiter).map(str::trim);
             raw_values
                 .iter()
                 .map(|value| value.trim())
@@ -6673,11 +6683,7 @@ fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &s
 }
 
 fn materialized_raw_header_value(name: &str, raw_values: &[&str]) -> String {
-    if crate::plugins::is_comma_folded_list_header(name) {
-        raw_values.join(",")
-    } else {
-        raw_values.last().copied().unwrap_or_default().to_string()
-    }
+    raw_values.join(crate::plugins::repeated_request_header_separator(name))
 }
 
 fn proxy_header_entry_case_insensitive<'a>(
