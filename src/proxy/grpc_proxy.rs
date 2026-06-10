@@ -1892,8 +1892,19 @@ pub(crate) async fn proxy_grpc_request_core(
                     }
                 }
                 Err(e) => {
+                    // Propagate instead of break: swallowing a mid-body frame
+                    // error (backend RST_STREAM / GOAWAY / connection reset)
+                    // would forward a silently truncated body as HTTP 200 with
+                    // no grpc-status anywhere, and the caller would record a
+                    // circuit-breaker/admission SUCCESS for a failed exchange.
+                    // h2 trailers are the final frame, so an error here always
+                    // means the response never completed.
                     warn!("gRPC: error reading backend response frame: {}", e);
-                    break;
+                    return Err(GrpcProxyError::backend_unavailable_with_source(
+                        GrpcBackendUnavailableKind::BackendRequest,
+                        format!("Error reading backend response body: {}", e),
+                        e,
+                    ));
                 }
             }
         }

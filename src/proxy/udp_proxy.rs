@@ -3150,6 +3150,17 @@ async fn create_session(
                                 if let Some(ref dtls) = reply_dtls {
                                     dtls.close().await;
                                 }
+                                // Mark expired BEFORE removal so the recv-loop's
+                                // `last_client` fast-path cache (which checks only
+                                // this flag) stops forwarding through the dead
+                                // session and re-creates one — otherwise a
+                                // single-client listener is blackholed: datagrams
+                                // keep flowing into a session whose reply task is
+                                // gone and which the idle cleaner can no longer
+                                // see (it is out of the map).
+                                reply_session
+                                    .expired
+                                    .store(true, std::sync::atomic::Ordering::Release);
                                 if reply_sessions
                                     .remove_if(&client_addr, |_, v| Arc::ptr_eq(v, &reply_session))
                                     .is_some()
@@ -3280,6 +3291,14 @@ async fn create_session(
         if let Some(ref dtls) = reply_dtls {
             dtls.close().await;
         }
+        // Mark expired BEFORE removal so the recv-loop's `last_client`
+        // fast-path cache (which checks only this flag) stops forwarding
+        // through the dead session and re-creates one. The flag is on THIS
+        // generation's Arc, so a newer session re-created at the same client
+        // address is unaffected.
+        reply_session
+            .expired
+            .store(true, std::sync::atomic::Ordering::Release);
         // Only decrement active_sessions if we actually removed THIS session
         // (the cleanup task may have already removed and decremented it, or a
         // newer session may have been re-created at the same client address —

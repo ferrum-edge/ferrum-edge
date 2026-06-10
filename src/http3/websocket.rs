@@ -374,7 +374,7 @@ async fn send_h3_backend_admission_rejection<S>(
     send_h3_reject_body(stream, status, &rejection.body, &headers).await;
 }
 
-fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
+pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
     state: &ProxyState,
     proxy: &Proxy,
     target_key: Option<&str>,
@@ -447,6 +447,14 @@ pub(crate) async fn handle_h3_websocket(
         )
         .await;
         crate::proxy::record_request(&state, 501);
+        // Gateway-side reject after the caller's CB check — release a claimed
+        // HALF_OPEN probe slot so the breaker doesn't wedge.
+        release_h3_ws_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
         return Ok(());
     }
 
@@ -492,6 +500,14 @@ pub(crate) async fn handle_h3_websocket(
                 r#"{"error":"WebSocket connection limit exceeded"}"#,
             )
             .await;
+            // Gateway-side reject after the caller's CB check — release a
+            // claimed HALF_OPEN probe slot so the breaker doesn't wedge.
+            release_h3_ws_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
             return Ok(());
         }
     };
@@ -580,6 +596,14 @@ pub(crate) async fn handle_h3_websocket(
                     r#"{"error":"Backend connection limit exceeded"}"#,
                 )
                 .await;
+                // Gateway-side reject after the CB check — release a claimed
+                // HALF_OPEN probe slot so the breaker doesn't wedge.
+                release_h3_ws_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    current_cb_target_key.as_deref(),
+                    ws_cb_probe_slot_available,
+                );
                 drop(ws_connection_permit);
                 return Ok(());
             }

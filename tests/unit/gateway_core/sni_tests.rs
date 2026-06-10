@@ -597,3 +597,72 @@ async fn test_extract_sni_from_tcp_stream_succeeds_within_timeout() {
     let result = accept_task.await.expect("accept_task");
     assert_eq!(result, Some("inside.example.com".to_string()));
 }
+
+/// A ClientHello that arrives split across multiple TCP segments must still
+/// have its SNI extracted: `peek()` returns as soon as ≥1 byte is buffered, so
+/// a single peek sees a truncated record (routine for ~1.7 KB post-quantum
+/// ClientHellos). The bounded peek loop must wait for the full first record.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_handles_split_clienthello() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let hello = build_tls_client_hello("split.example.com");
+    // Split inside the random bytes — well before the SNI extension — so a
+    // single-peek parse of the first fragment cannot find the hostname.
+    let split_at = 20.min(hello.len() - 1);
+    let (first, rest) = hello.split_at(split_at);
+    let (first, rest) = (first.to_vec(), rest.to_vec());
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_secs(5))).await
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&first).await.expect("write first");
+    client.flush().await.expect("flush first");
+    // Let the server's first peek observe only the truncated prefix.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    client.write_all(&rest).await.expect("write rest");
+    client.flush().await.expect("flush rest");
+
+    let result = accept_task.await.expect("accept_task");
+    assert_eq!(result, Some("split.example.com".to_string()));
+}
+
+/// Exact host matches must beat wildcard matches regardless of the order the
+/// candidate proxies appear in `proxy_ids` (routing tier order: exact,
+/// wildcard, catch-all). A wildcard proxy listed first must not steal traffic
+/// from an exact-host proxy listed later.
+#[test]
+fn test_resolve_proxy_exact_beats_wildcard_listed_first() {
+    let config = make_test_config(vec![
+        make_proxy("wild", vec!["*.example.com"]),
+        make_proxy("exact", vec!["foo.example.com"]),
+        make_proxy("fallback", vec![]),
+    ]);
+    let ids = vec![
+        "wild".to_string(),
+        "exact".to_string(),
+        "fallback".to_string(),
+    ];
+    assert_eq!(
+        resolve_proxy_by_sni(Some("foo.example.com"), &ids, &config),
+        Some("exact"),
+        "exact host must win over an earlier-listed wildcard"
+    );
+    // Wildcard still matches other subdomains.
+    assert_eq!(
+        resolve_proxy_by_sni(Some("bar.example.com"), &ids, &config),
+        Some("wild")
+    );
+    // Catch-all still picks up non-matching SNI.
+    assert_eq!(
+        resolve_proxy_by_sni(Some("other.org"), &ids, &config),
+        Some("fallback")
+    );
+}

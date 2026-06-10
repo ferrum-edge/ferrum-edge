@@ -5764,6 +5764,15 @@ async fn handle_websocket_request_authenticated(
         Some(on_upgrade) => on_upgrade,
         None => {
             error!("Failed to extract OnUpgrade extension from WebSocket request");
+            // The caller's CB check may have claimed a HALF_OPEN probe slot —
+            // release it (gateway-side reject, not a backend outcome) so the
+            // breaker can admit the next probe instead of wedging.
+            release_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
             return Ok(build_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 r#"{"error":"Internal server error during WebSocket upgrade"}"#,
@@ -5797,6 +5806,14 @@ async fn handle_websocket_request_authenticated(
                 )
                 .await;
                 record_request(&state, 503);
+                // Gateway-side reject after the CB check — release a claimed
+                // HALF_OPEN probe slot so the breaker doesn't wedge.
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
                 return Ok(build_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"WebSocket connection limit exceeded"}"#,
@@ -5883,6 +5900,14 @@ async fn handle_websocket_request_authenticated(
                 )
                 .await;
                 record_request(&state, 503);
+                // Gateway-side reject after the CB check — release a claimed
+                // HALF_OPEN probe slot so the breaker doesn't wedge.
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    ws_cb_probe_slot_available,
+                );
                 return Ok(build_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"Backend connection limit exceeded"}"#,
@@ -6072,6 +6097,24 @@ async fn handle_websocket_request_authenticated(
                     error = %e,
                     "WebSocket backend connection failed"
                 );
+                // Record the failure so the breaker / passive health see it
+                // and a claimed HALF_OPEN probe slot is released. Previously
+                // only the retry branch recorded — with retries unconfigured
+                // (the default), WS backend connect failures never fed the
+                // breaker at all on H1/H2, and an admitted probe slot leaked
+                // permanently.
+                if let Some(cb_config) = &proxy.circuit_breaker {
+                    let current_cb_key = current_target
+                        .as_ref()
+                        .map(|t| crate::circuit_breaker::target_key(&t.host, t.port))
+                        .or_else(|| cb_target_key.clone());
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        current_cb_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                }
                 if let Some(permits) = backend_admission_permits.take() {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: 502,
@@ -6143,6 +6186,26 @@ async fn handle_websocket_request_authenticated(
             }
         }
     };
+
+    // Backend handshake succeeded — record the success so the breaker sees a
+    // healthy outcome and, when this request was admitted as a HALF_OPEN
+    // probe, the probe slot is released and the breaker can close. Without
+    // this, every successful WS upgrade admitted as a probe permanently
+    // consumed a `half_open_in_flight` slot, and after `half_open_max_requests`
+    // upgrades the breaker wedged in HALF_OPEN, 503ing ALL traffic to the
+    // target. Mirrors the H3 WS path (`src/http3/websocket.rs`).
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        let current_cb_key = current_target
+            .as_ref()
+            .map(|t| crate::circuit_breaker::target_key(&t.host, t.port))
+            .or_else(|| cb_target_key.clone());
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.id,
+            current_cb_key.as_deref(),
+            cb_config,
+        );
+        cb.record_success(ws_cb_probe_slot_available);
+    }
 
     let ws_lb_guard =
         LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
@@ -10389,6 +10452,11 @@ async fn handle_proxy_request_inner(
                     // HALF_OPEN probe; an adaptive-concurrency reject here must
                     // release that probe slot so the breaker can admit the next
                     // probe (the retry path and HTTP/WS/H3 paths do the same).
+                    // Disarm the RAII guard FIRST — its Drop would otherwise
+                    // fire a second `record_neutral(true)` on the same breaker,
+                    // and the spurious extra decrement can free a DIFFERENT
+                    // in-flight probe's slot, over-admitting probes.
+                    grpc_probe_guard.disarm();
                     release_circuit_breaker_probe_on_admission_reject(
                         &state,
                         &proxy,
@@ -10531,6 +10599,8 @@ async fn handle_proxy_request_inner(
                     Err(rejection) => {
                         // Release the CB HALF_OPEN probe slot before rejecting, as on
                         // the other admission paths (see the split-path branch above).
+                        // Disarm the RAII guard first so its Drop doesn't double-release.
+                        grpc_probe_guard.disarm();
                         release_circuit_breaker_probe_on_admission_reject(
                             &state,
                             &proxy,
@@ -10589,6 +10659,9 @@ async fn handle_proxy_request_inner(
                                 Err(rejection) => {
                                     // Release the CB HALF_OPEN probe slot before
                                     // rejecting, as on the other admission paths.
+                                    // Disarm the RAII guard first so its Drop
+                                    // doesn't double-release.
+                                    grpc_probe_guard.disarm();
                                     release_circuit_breaker_probe_on_admission_reject(
                                         &state,
                                         &proxy,

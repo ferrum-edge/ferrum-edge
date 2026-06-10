@@ -1888,6 +1888,14 @@ async fn handle_h3_request(
                     origin, proxy.id
                 );
                 record_request(&state, 403);
+                // Gateway-side reject after the CB check above — release a
+                // claimed HALF_OPEN probe slot so the breaker doesn't wedge.
+                crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
                 send_h3_error_flavor_aware(
                     &mut stream,
                     http_flavor,
@@ -2562,7 +2570,23 @@ async fn handle_h3_request(
         let resp = resp_builder
             .body(())
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
-        stream.send_response(resp).await?;
+        // Do NOT `?`-propagate a send_response failure: `record_connection_start`
+        // already ran above, so bailing out here would leak the least-connections
+        // count, a CB HALF_OPEN probe slot, the admission outcome, and the
+        // transaction summary (the same client-disconnect case the sibling
+        // relays in `proxy_to_backend_h3_streaming` /
+        // `stream_h3_open_response_to_client` handle explicitly). Fall through
+        // to the outcome-recording block below instead.
+        let mut client_disconnected = false;
+        let mut body_error_class: Option<crate::retry::ErrorClass> = None;
+        if let Err(e) = stream.send_response(resp).await {
+            debug!(
+                "HTTP/3 client disconnected before streaming response headers: {}",
+                e
+            );
+            client_disconnected = true;
+            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+        }
 
         // Stream response body from backend h3 recv_stream to frontend h3 stream.
         // Uses a pinned Sleep that is reset in-place to avoid allocating a new
@@ -2578,11 +2602,12 @@ async fn handle_h3_request(
         tokio::pin!(flush_timer);
         let mut stream_done = false;
         let mut bytes_streamed: u64 = 0;
-        let mut client_disconnected = false;
         let mut body_completed = false;
-        let mut body_error_class: Option<crate::retry::ErrorClass> = None;
 
-        'outer: loop {
+        // Skipped entirely when send_response already failed above — the
+        // relay loop would only rediscover the dead stream on its first
+        // send_data and there is no backend data worth pulling for it.
+        'outer: while !client_disconnected {
             tokio::select! {
                 chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
                     match chunk_result {

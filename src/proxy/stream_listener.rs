@@ -36,6 +36,13 @@ struct ListenerHandle {
     frontend_tls: bool,
     passthrough: bool,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
+    /// Sorted SNI-group member proxy IDs for shared `__sni_{port}` passthrough
+    /// listeners (`None` for individual listeners). Part of the restart key:
+    /// the accept loop captures the candidate-ID list at spawn, so a
+    /// membership change (proxy added to / removed from a shared passthrough
+    /// port) must restart the listener or new connections keep routing
+    /// against the stale set.
+    sni_ids: Option<Vec<String>>,
     started: Arc<AtomicBool>,
     tcp_metrics: Option<Arc<TcpProxyMetrics>>,
     udp_metrics: Option<Arc<UdpProxyMetrics>>,
@@ -719,12 +726,25 @@ impl StreamListenerManager {
                 None => {
                     to_remove.push(key.clone());
                 }
-                Some((port, scheme, frontend_tls, passthrough, backend_tls_reload_key, _)) => {
+                Some((
+                    port,
+                    scheme,
+                    frontend_tls,
+                    passthrough,
+                    backend_tls_reload_key,
+                    sni_ids,
+                )) => {
                     if handle.listen_port != *port
                         || handle.scheme != *scheme
                         || handle.frontend_tls != *frontend_tls
                         || handle.passthrough != *passthrough
                         || handle.backend_tls_reload_key != *backend_tls_reload_key
+                        // SNI-group membership change on a shared passthrough
+                        // port: the running listener captured the old candidate
+                        // ID list at spawn, so it must be restarted. IDs are
+                        // sorted at group construction, making this a stable
+                        // comparison.
+                        || handle.sni_ids != *sni_ids
                     {
                         to_remove.push(key.clone());
                     }
@@ -1049,6 +1069,7 @@ impl StreamListenerManager {
                     frontend_tls: *frontend_tls,
                     passthrough: *passthrough,
                     backend_tls_reload_key: backend_tls_reload_key.clone(),
+                    sni_ids: sni_ids.clone(),
                     started,
                     tcp_metrics,
                     udp_metrics,

@@ -785,7 +785,31 @@ impl DtlsServer {
         loop {
             let (len, peer_addr) = tokio::select! {
                 result = self.socket.recv_from(&mut buf) => {
-                    result.map_err(|e| anyhow::anyhow!("DTLS server recv error: {}", e))?
+                    match result {
+                        Ok(v) => v,
+                        // Transient, per-peer recv errors must not kill the
+                        // single demux loop for every session on the listener.
+                        // Notably, on Windows `recvfrom` on an unconnected UDP
+                        // socket fails with WSAECONNRESET whenever a prior
+                        // `send_to` elicited an ICMP port-unreachable — i.e.,
+                        // any DTLS client that disappears abruptly would
+                        // permanently brick the listener (the caller only logs
+                        // a warn and never restarts this loop).
+                        Err(e) if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                        ) => {
+                            trace!("DTLS server transient recv error (ignored): {}", e);
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("DTLS server recv error: {}", e));
+                        }
+                    }
                 }
                 _ = shutdown_rx.changed() => {
                     return Ok(());
@@ -797,26 +821,51 @@ impl DtlsServer {
 
             let data = buf[..len].to_vec();
 
-            // Clone the sender out of the DashMap guard before awaiting.
+            // Clone the sender out of the DashMap guard before sending.
             // The `Ref` from `sessions.get()` holds a read lock on the shard;
-            // holding it across `.send().await` would deadlock if the channel
-            // is full and a `SessionGuard::Drop` on the same shard needs a
-            // write lock to call `sessions.remove()`.
+            // holding it while a `SessionGuard::Drop` on the same shard needs
+            // a write lock to call `sessions.remove()` would deadlock.
             let incoming_tx = self.sessions.get(&peer_addr).map(|s| s.incoming_tx.clone());
             if let Some(tx) = incoming_tx {
-                // Existing session — forward packet to its driver
-                if tx.send(data).await.is_err() {
-                    // Driver task exited — remove stale session
-                    remove_session(
-                        &self.sessions,
-                        &self.active_sessions,
-                        self.limits.active_session_mirror.as_deref(),
-                        &peer_addr,
-                    );
+                // Existing session — forward packet to its driver. Never
+                // `.send().await`: one session whose driver has stalled (its
+                // proxy-side consumer stopped draining `app_out`) would fill
+                // its bounded channel and park this single shared recv loop,
+                // freezing demux — handshakes, retransmits, everything — for
+                // EVERY peer on the listener. Dropping the datagram is correct
+                // UDP semantics; DTLS retransmission recovers the loss.
+                match tx.try_send(data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        trace!(
+                            client = %peer_addr,
+                            "DTLS session channel full; dropping datagram"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // Driver task exited — remove stale session
+                        remove_session(
+                            &self.sessions,
+                            &self.active_sessions,
+                            self.limits.active_session_mirror.as_deref(),
+                            &peer_addr,
+                        );
+                    }
                 }
-            } else {
-                // New client — spawn a session driver
+            } else if len >= 13 && data[0] == 0x16 {
+                // New client — spawn a session driver. Only for datagrams that
+                // plausibly start a DTLS handshake (content-type 0x16 with a
+                // full 13-byte record header): spawning reserves a
+                // `max_sessions` slot, allocates four channels, and holds the
+                // slot for the handshake timeout, so arbitrary garbage from
+                // scanners or spoofed floods must not reach it.
                 self.spawn_session(peer_addr, data);
+            } else {
+                trace!(
+                    client = %peer_addr,
+                    len,
+                    "DTLS: dropping non-handshake datagram from unknown source"
+                );
             }
         }
     }
