@@ -14,6 +14,7 @@
 //! Decrypted datagrams are forwarded to the backend (plain UDP or DTLS).
 
 use dashmap::DashMap;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -128,6 +129,92 @@ struct UdpSession {
 /// SocketAddr keys are kernel-provided (not attacker-controlled), so cryptographic
 /// hashing is unnecessary — speed wins here.
 type SessionMap = Arc<DashMap<SocketAddr, Arc<UdpSession>, ahash::RandomState>>;
+type BackendDtlsConfigCache =
+    Arc<DashMap<BackendDtlsConfigCacheKey, Arc<crate::dtls::BackendDtlsParams>>>;
+
+#[derive(Clone, Eq, PartialEq)]
+struct BackendDtlsConfigCacheKey {
+    proxy_id: String,
+    backend_host: String,
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
+    server_ca_cert_path: Option<String>,
+    verify_server_cert: bool,
+    tls_no_verify: bool,
+    global_ca_bundle_path: Option<String>,
+    san_allow_list: Vec<String>,
+    connect_timeout_ms: u64,
+    crls_ptr: usize,
+}
+
+impl Hash for BackendDtlsConfigCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.proxy_id.hash(state);
+        self.backend_host.hash(state);
+        self.client_cert_path.hash(state);
+        self.client_key_path.hash(state);
+        self.server_ca_cert_path.hash(state);
+        self.verify_server_cert.hash(state);
+        self.tls_no_verify.hash(state);
+        self.global_ca_bundle_path.hash(state);
+        self.san_allow_list.hash(state);
+        self.connect_timeout_ms.hash(state);
+        self.crls_ptr.hash(state);
+    }
+}
+
+fn backend_dtls_config_cache_key(
+    proxy: &Proxy,
+    backend_host: &str,
+    tls_no_verify: bool,
+    global_ca_bundle_path: Option<&str>,
+    crls: &crate::tls::CrlList,
+) -> BackendDtlsConfigCacheKey {
+    BackendDtlsConfigCacheKey {
+        proxy_id: proxy.id.clone(),
+        backend_host: backend_host.to_string(),
+        client_cert_path: proxy.resolved_tls.client_cert_path.clone(),
+        client_key_path: proxy.resolved_tls.client_key_path.clone(),
+        server_ca_cert_path: proxy.resolved_tls.server_ca_cert_path.clone(),
+        verify_server_cert: proxy.resolved_tls.verify_server_cert,
+        tls_no_verify,
+        global_ca_bundle_path: global_ca_bundle_path.map(str::to_string),
+        san_allow_list: proxy.resolved_tls.san_allow_list.clone(),
+        connect_timeout_ms: proxy.backend_connect_timeout_ms,
+        crls_ptr: Arc::as_ptr(crls) as usize,
+    }
+}
+
+fn cached_backend_dtls_config(
+    cache: &BackendDtlsConfigCache,
+    proxy: &Proxy,
+    backend_host: &str,
+    tls_no_verify: bool,
+    crls: &crate::tls::CrlList,
+    global_ca_bundle_path: Option<&str>,
+) -> Result<crate::dtls::BackendDtlsParams, anyhow::Error> {
+    let key = backend_dtls_config_cache_key(
+        proxy,
+        backend_host,
+        tls_no_verify,
+        global_ca_bundle_path,
+        crls,
+    );
+    if let Some(entry) = cache.get(&key) {
+        return Ok(entry.value().as_ref().clone());
+    }
+
+    let params = crate::dtls::build_backend_dtls_config(
+        proxy,
+        backend_host,
+        tls_no_verify,
+        crls,
+        global_ca_bundle_path,
+    )?;
+    let cached = Arc::new(params);
+    let entry = cache.entry(key).or_insert_with(|| cached.clone());
+    Ok(entry.value().as_ref().clone())
+}
 
 struct UdpSessionEpochView {
     proxy: Proxy,
@@ -606,6 +693,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             crls,
             started,
             overload,
+            Arc::new(DashMap::new()),
         )
         .await;
     }
@@ -686,6 +774,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     info!(proxy_id = %proxy_id, "UDP proxy listener started on {}", addr);
 
     let sessions: SessionMap = Arc::new(DashMap::with_hasher(ahash::RandomState::default()));
+    let backend_dtls_config_cache: BackendDtlsConfigCache = Arc::new(DashMap::new());
 
     // Spawn session cleanup task
     spawn_session_cleanup(
@@ -785,6 +874,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &metrics,
                                                     tls_no_verify,
                                                     tls_ca_bundle_path.as_deref(),
+                                                    &backend_dtls_config_cache,
                                                     max_sessions,
                                                     &mut last_client,
                                                     &mut batch_dgrams_out,
@@ -826,6 +916,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &metrics,
                                         tls_no_verify,
                                         tls_ca_bundle_path.as_deref(),
+                                        &backend_dtls_config_cache,
                                         max_sessions,
                                         &mut last_client,
                                         &mut batch_dgrams_out,
@@ -904,6 +995,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &metrics,
                     tls_no_verify,
                     tls_ca_bundle_path.as_deref(),
+                    &backend_dtls_config_cache,
                     max_sessions,
                     &mut last_client,
                     &mut batch_dgrams_out,
@@ -981,6 +1073,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &metrics,
                                                     tls_no_verify,
                                                     tls_ca_bundle_path.as_deref(),
+                                                    &backend_dtls_config_cache,
                                                     max_sessions,
                                                     &mut last_client,
                                                     &mut batch_dgrams_out,
@@ -1022,6 +1115,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &metrics,
                                         tls_no_verify,
                                         tls_ca_bundle_path.as_deref(),
+                                        &backend_dtls_config_cache,
                                         max_sessions,
                                         &mut last_client,
                                         &mut batch_dgrams_out,
@@ -1077,6 +1171,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     &metrics,
                                     tls_no_verify,
                                     tls_ca_bundle_path.as_deref(),
+                                    &backend_dtls_config_cache,
                                     max_sessions,
                                     &mut last_client,
                                     &mut batch_dgrams_out,
@@ -1145,6 +1240,7 @@ async fn process_datagram(
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
     tls_ca_bundle_path: Option<&str>,
+    backend_dtls_config_cache: &BackendDtlsConfigCache,
     max_sessions: usize,
     last_client: &mut Option<(SocketAddr, Arc<UdpSession>)>,
     batch_dgrams_out: &mut u64,
@@ -1298,6 +1394,7 @@ async fn process_datagram(
             metrics,
             tls_no_verify,
             tls_ca_bundle_path,
+            backend_dtls_config_cache,
             max_sessions,
             listen_port,
             circuit_breaker_cache,
@@ -1380,6 +1477,7 @@ async fn lookup_or_create_session(
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
     tls_ca_bundle_path: Option<&str>,
+    backend_dtls_config_cache: &BackendDtlsConfigCache,
     max_sessions: usize,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
@@ -1417,6 +1515,7 @@ async fn lookup_or_create_session(
         metrics,
         tls_no_verify,
         tls_ca_bundle_path,
+        backend_dtls_config_cache,
         listen_port,
         circuit_breaker_cache,
         crls,
@@ -1556,6 +1655,7 @@ async fn start_dtls_frontend_listener(
     crls: crate::tls::CrlList,
     started: Arc<AtomicBool>,
     overload: Arc<crate::overload::OverloadState>,
+    backend_dtls_config_cache: BackendDtlsConfigCache,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
     let admission_overload = overload.clone();
@@ -1756,6 +1856,7 @@ async fn start_dtls_frontend_listener(
 
                 let handler_crls = crls.clone();
                 let handler_ca_bundle = tls_ca_bundle_path.clone();
+                let handler_dtls_cache = backend_dtls_config_cache.clone();
                 tokio::spawn(async move {
                     // Hold the guard for the lifetime of the handler task. Drop
                     // at task exit decrements `OverloadState.active_connections`.
@@ -1774,6 +1875,7 @@ async fn start_dtls_frontend_listener(
                         handler_proxy_name.as_deref(),
                         port,
                         &handler_crls,
+                        &handler_dtls_cache,
                     )
                     .await;
                     let (err_msg, error_class, disconnect_cause, disconnect_direction) =
@@ -1918,6 +2020,7 @@ async fn handle_dtls_client(
     proxy_name: Option<&str>,
     listen_port: u16,
     crls: &crate::tls::CrlList,
+    backend_dtls_config_cache: &BackendDtlsConfigCache,
 ) -> DtlsHandlerResult {
     let mut backend_info = DtlsBackendInfo {
         backend_target: String::new(),
@@ -1949,6 +2052,7 @@ async fn handle_dtls_client(
         proxy_name,
         listen_port,
         crls,
+        backend_dtls_config_cache,
     )
     .await;
     DtlsHandlerResult {
@@ -2064,6 +2168,7 @@ async fn handle_dtls_client_inner(
     proxy_name: Option<&str>,
     listen_port: u16,
     crls: &crate::tls::CrlList,
+    backend_dtls_config_cache: &BackendDtlsConfigCache,
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let proxy = epoch
@@ -2179,7 +2284,8 @@ async fn handle_dtls_client_inner(
                 e
             ));
         }
-        let dtls_params = crate::dtls::build_backend_dtls_config(
+        let dtls_params = cached_backend_dtls_config(
+            backend_dtls_config_cache,
             &proxy,
             &backend_host,
             tls_no_verify,
@@ -2481,6 +2587,7 @@ async fn create_session(
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
     tls_ca_bundle_path: Option<&str>,
+    backend_dtls_config_cache: &BackendDtlsConfigCache,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
     crls: &crate::tls::CrlList,
@@ -2649,7 +2756,8 @@ async fn create_session(
                 ));
             }
 
-            let dtls_params = crate::dtls::build_backend_dtls_config(
+            let dtls_params = cached_backend_dtls_config(
+                backend_dtls_config_cache,
                 &proxy,
                 &backend_host,
                 tls_no_verify,
@@ -3422,13 +3530,15 @@ fn epoch_millis_precise() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DtlsDisconnectContext, STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext,
-        UdpSession, build_dtls_stream_summary, build_udp_stream_summary, dtls_disconnect_cause,
-        dtls_disconnect_direction, emit_udp_stream_disconnect,
+        BackendDtlsConfigCache, DtlsDisconnectContext, STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED,
+        UdpDisconnectContext, UdpSession, build_dtls_stream_summary, build_udp_stream_summary,
+        cached_backend_dtls_config, dtls_disconnect_cause, dtls_disconnect_direction,
+        emit_udp_stream_disconnect,
     };
-    use crate::config::types::BackendScheme;
+    use crate::config::types::{BackendScheme, BackendTlsConfig, Proxy};
     use crate::plugins::{Plugin, StreamTransactionSummary};
     use async_trait::async_trait;
+    use dashmap::DashMap;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -3473,6 +3583,39 @@ mod tests {
             // emission only.
             _overload_guard: None,
         }
+    }
+
+    #[test]
+    fn backend_dtls_config_cache_reuses_ephemeral_certificate() {
+        let mut proxy: Proxy = serde_yaml::from_str(
+            r#"
+id: dtls-proxy
+backend_scheme: dtls
+backend_host: localhost
+backend_port: 8443
+listen_port: 9443
+backend_tls_verify_server_cert: false
+"#,
+        )
+        .unwrap();
+        proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+        let cache: BackendDtlsConfigCache = Arc::new(DashMap::new());
+        let crls = Arc::new(Vec::new());
+
+        let first =
+            cached_backend_dtls_config(&cache, &proxy, "localhost", true, &crls, None).unwrap();
+        let second =
+            cached_backend_dtls_config(&cache, &proxy, "localhost", true, &crls, None).unwrap();
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            first.certificate.certificate, second.certificate.certificate,
+            "cached DTLS params should reuse the generated ephemeral certificate"
+        );
+        assert_eq!(
+            first.certificate.private_key, second.certificate.private_key,
+            "cached DTLS params should reuse the generated ephemeral key"
+        );
     }
 
     #[test]

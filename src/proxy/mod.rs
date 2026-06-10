@@ -2664,6 +2664,7 @@ struct BackendPoolFamily {
     http2_pool: Arc<Http2ConnectionPool>,
     grpc_pool: Arc<GrpcConnectionPool>,
     h3_pool: Arc<Http3ConnectionPool>,
+    hbone_pool: Arc<HboneConnectionPool>,
 }
 
 impl BackendPoolFamily {
@@ -2687,6 +2688,7 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_svid_generation(generation);
         self.grpc_pool.force_drain_svid_generation(generation);
         self.h3_pool.force_drain_svid_generation(generation);
+        self.hbone_pool.force_drain_svid_generation(generation);
     }
 
     fn force_drain_all(&self) {
@@ -2694,6 +2696,7 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_all();
         self.grpc_pool.force_drain_all();
         self.h3_pool.force_drain_all();
+        self.hbone_pool.force_drain_all();
     }
 }
 
@@ -3021,6 +3024,7 @@ impl ProxyState {
             http2_pool: self.http2_pool.clone(),
             grpc_pool: self.grpc_pool.clone(),
             h3_pool: self.h3_pool.clone(),
+            hbone_pool: self.hbone_pool.clone(),
         };
         pools.clear_tls_config_caches();
         pools.force_drain_all();
@@ -3446,6 +3450,7 @@ impl ProxyState {
                     http2_pool: http2_pool.clone(),
                     grpc_pool: grpc_pool.clone(),
                     h3_pool: h3_pool.clone(),
+                    hbone_pool: hbone_pool.clone(),
                 },
                 health_checker: health_checker.clone(),
                 config: config_arc.clone(),

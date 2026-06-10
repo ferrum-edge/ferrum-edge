@@ -31,6 +31,7 @@ use crate::identity::{SharedSvidBundle, SvidBundle};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, ISTIO_HBONE_PORT, baggage_header_for_source};
 use crate::retry::ErrorClass;
 use crate::tls::spiffe::{SpiffeTlsError, build_spiffe_outbound_config};
+use arc_swap::ArcSwap;
 
 pub const HBONE_TARGET_TAG: &str = "mesh.hbone";
 pub const HBONE_PORT_TAG: &str = "mesh.hbone_port";
@@ -148,9 +149,16 @@ pub struct HboneConnectionPool {
     entries: DashMap<String, Vec<HbonePoolEntry>>,
     creation_locks: DashMap<String, Arc<Mutex<()>>>,
     gateway_svid: SharedSvidBundle,
+    svid_identity_cache: ArcSwap<Option<HboneSvidIdentityCache>>,
     dns_cache: DnsCache,
     pool_config: PoolConfig,
     last_idle_prune_unix_secs: AtomicU64,
+}
+
+struct HboneSvidIdentityCache {
+    source: Arc<Option<SvidBundle>>,
+    identity: crate::identity::SpiffeId,
+    fingerprint: Arc<str>,
 }
 
 impl HboneConnectionPool {
@@ -164,6 +172,7 @@ impl HboneConnectionPool {
             entries: DashMap::with_shard_amount(shard_amount),
             creation_locks: DashMap::with_shard_amount(shard_amount),
             gateway_svid,
+            svid_identity_cache: ArcSwap::new(Arc::new(None)),
             dns_cache,
             pool_config,
             last_idle_prune_unix_secs: AtomicU64::new(0),
@@ -178,7 +187,7 @@ impl HboneConnectionPool {
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<(), HbonePoolError> {
-        let (source_identity, fingerprint) = current_svid_identity(&self.gateway_svid)?;
+        let (source_identity, fingerprint) = self.current_svid_identity_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
 
         let fast_sender = with_hbone_pool_key(
@@ -186,7 +195,7 @@ impl HboneConnectionPool {
             target_port,
             hbone_port,
             proxy.dns_override.as_deref(),
-            &fingerprint,
+            fingerprint.as_ref(),
             expected_peer,
             &pool_config,
             |key| self.try_cached_sender_read(key),
@@ -200,7 +209,7 @@ impl HboneConnectionPool {
                 target_port,
                 hbone_port,
                 proxy.dns_override.as_deref(),
-                &fingerprint,
+                fingerprint.as_ref(),
                 expected_peer,
                 &pool_config,
                 |key| key.to_string(),
@@ -235,6 +244,62 @@ impl HboneConnectionPool {
         self.entries.iter().map(|entry| entry.value().len()).sum()
     }
 
+    fn current_svid_identity_cached(
+        &self,
+    ) -> Result<(crate::identity::SpiffeId, Arc<str>), HbonePoolError> {
+        let snapshot = self.gateway_svid.load_full();
+        let cached = self.svid_identity_cache.load_full();
+        if let Some(cache) = cached.as_ref()
+            && Arc::ptr_eq(&cache.source, &snapshot)
+        {
+            return Ok((cache.identity.clone(), cache.fingerprint.clone()));
+        }
+
+        let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
+        let identity = bundle.spiffe_id.clone();
+        let fingerprint: Arc<str> = Arc::from(svid_fingerprint(bundle)?);
+        self.svid_identity_cache
+            .store(Arc::new(Some(HboneSvidIdentityCache {
+                source: snapshot,
+                identity: identity.clone(),
+                fingerprint: fingerprint.clone(),
+            })));
+        Ok((identity, fingerprint))
+    }
+
+    pub fn force_drain_svid_generation(&self, _generation: u64) {
+        let current_fingerprint = self
+            .current_svid_identity_cached()
+            .map(|(_, fingerprint)| fingerprint)
+            .ok();
+        let Some(current_fingerprint) = current_fingerprint else {
+            self.force_drain_all();
+            return;
+        };
+
+        let mut evicted = 0usize;
+        self.entries.retain(|key, entries| {
+            let keep = hbone_key_svid_fingerprint(key)
+                .is_some_and(|fingerprint| fingerprint == current_fingerprint.as_ref());
+            if !keep {
+                evicted = evicted.saturating_add(entries.len());
+            }
+            keep
+        });
+        self.creation_locks.retain(|key, _| {
+            hbone_key_svid_fingerprint(key)
+                .is_some_and(|fingerprint| fingerprint == current_fingerprint.as_ref())
+        });
+        record_hbone_evictions(evicted);
+    }
+
+    pub fn force_drain_all(&self) {
+        let evicted = self.pool_size();
+        self.entries.clear();
+        self.creation_locks.clear();
+        record_hbone_evictions(evicted);
+    }
+
     pub async fn get_tunnel(
         &self,
         proxy: &Proxy,
@@ -243,7 +308,7 @@ impl HboneConnectionPool {
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<HboneTunnel, HbonePoolError> {
-        let (source_identity, fingerprint) = current_svid_identity(&self.gateway_svid)?;
+        let (source_identity, fingerprint) = self.current_svid_identity_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
 
         let fast_sender = with_hbone_pool_key(
@@ -251,7 +316,7 @@ impl HboneConnectionPool {
             target_port,
             hbone_port,
             proxy.dns_override.as_deref(),
-            &fingerprint,
+            fingerprint.as_ref(),
             expected_peer,
             &pool_config,
             |key| self.try_cached_sender_read(key),
@@ -265,7 +330,7 @@ impl HboneConnectionPool {
                 target_port,
                 hbone_port,
                 proxy.dns_override.as_deref(),
-                &fingerprint,
+                fingerprint.as_ref(),
                 expected_peer,
                 &pool_config,
                 |key| key.to_string(),
@@ -974,10 +1039,18 @@ pub(crate) fn current_svid_identity(
     Ok((bundle.spiffe_id.clone(), svid_fingerprint(bundle)?))
 }
 
+fn hbone_key_svid_fingerprint(key: &str) -> Option<&str> {
+    key.split('|').nth(5)
+}
+
 fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
     let before = entries.len();
     let now = unix_secs();
     entries.retain(|entry| {
+        let sender = entry.sender.clone();
+        if matches!(sender.ready().now_or_never(), Some(Err(_))) {
+            return false;
+        }
         !entry_idle_expired(
             entry.last_used_at.load(Ordering::Relaxed),
             entry.idle_timeout_seconds,
@@ -1390,6 +1463,22 @@ mod tests {
     }
 
     #[test]
+    fn hbone_key_svid_fingerprint_reads_fingerprint_field() {
+        let key = pool_key_owned(
+            "orders.default.svc.cluster.local",
+            8080,
+            15008,
+            Some("10.0.0.2"),
+            "0123456789abcdef",
+            None,
+            &PoolConfig::default(),
+        );
+
+        assert_eq!(hbone_key_svid_fingerprint(&key), Some("0123456789abcdef"));
+        assert_eq!(hbone_key_svid_fingerprint("not-a-pool-key"), None);
+    }
+
+    #[test]
     fn pool_key_changes_when_per_proxy_pool_overrides_change() {
         let base_config = PoolConfig::default();
         let overridden_config = PoolConfig {
@@ -1522,6 +1611,62 @@ mod tests {
         pool.maybe_prune_idle_entries();
 
         assert!(!pool.creation_locks.contains_key(&active_key));
+    }
+
+    #[test]
+    fn force_drain_svid_generation_removes_non_current_fingerprints() {
+        let td = TrustDomain::new("cluster.local").unwrap();
+        let bundle = SvidBundle {
+            spiffe_id: SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap(),
+            cert_chain_der: vec![b"current-leaf".to_vec()],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td,
+                x509_authorities: vec![],
+                jwt_authorities: vec![],
+                refresh_hint_seconds: None,
+            }),
+        };
+        let current_fingerprint = svid_fingerprint(&bundle).unwrap();
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle))));
+        let pool = HboneConnectionPool::new(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid,
+            4,
+        );
+        let stale_key = pool_key_owned(
+            "stale.default.svc.cluster.local",
+            8080,
+            ISTIO_HBONE_PORT,
+            None,
+            "oldfingerprint",
+            None,
+            &PoolConfig::default(),
+        );
+        let current_key = pool_key_owned(
+            "current.default.svc.cluster.local",
+            8080,
+            ISTIO_HBONE_PORT,
+            None,
+            &current_fingerprint,
+            None,
+            &PoolConfig::default(),
+        );
+
+        pool.entries.insert(stale_key.clone(), Vec::new());
+        pool.entries.insert(current_key.clone(), Vec::new());
+        pool.creation_locks
+            .insert(stale_key.clone(), Arc::new(Mutex::new(())));
+        pool.creation_locks
+            .insert(current_key.clone(), Arc::new(Mutex::new(())));
+
+        pool.force_drain_svid_generation(7);
+
+        assert!(!pool.entries.contains_key(&stale_key));
+        assert!(pool.entries.contains_key(&current_key));
+        assert!(!pool.creation_locks.contains_key(&stale_key));
+        assert!(pool.creation_locks.contains_key(&current_key));
     }
 
     #[tokio::test]
