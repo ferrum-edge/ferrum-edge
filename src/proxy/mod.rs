@@ -1442,18 +1442,18 @@ fn parse_hyper_method(method: &str) -> Result<hyper::Method, ()> {
     }
 }
 
-/// Build X-Forwarded-For header value by appending the client IP to the existing value.
+/// Build X-Forwarded-For header value by appending the immediate peer IP to the existing value.
 /// Uses pre-allocated buffer instead of `format!()` to avoid format machinery overhead.
-pub(crate) fn build_xff_value(existing_xff: Option<&str>, client_ip: &str) -> String {
+pub(crate) fn build_xff_value(existing_xff: Option<&str>, append_ip: &str) -> String {
     match existing_xff {
         Some(xff) => {
-            let mut val = String::with_capacity(xff.len() + 2 + client_ip.len());
+            let mut val = String::with_capacity(xff.len() + 2 + append_ip.len());
             val.push_str(xff);
             val.push_str(", ");
-            val.push_str(client_ip);
+            val.push_str(append_ip);
             val
         }
-        None => client_ip.to_string(),
+        None => append_ip.to_string(),
     }
 }
 
@@ -11949,6 +11949,7 @@ async fn handle_proxy_request_inner(
     let requires_response_stream_inspection =
         plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx));
     let request_client_ip = ctx.client_ip.clone();
+    let request_xff_append_ip = socket_ip.clone();
     let retry_config = if has_retry {
         proxy.retry.as_ref()
     } else {
@@ -12070,6 +12071,7 @@ async fn handle_proxy_request_inner(
             stream_request_body,
             has_retry,
             &request_client_ip,
+            &request_xff_append_ip,
             is_tls,
             false,
             false,
@@ -12261,6 +12263,8 @@ async fn handle_proxy_request_inner(
             // the body was never sent, so replaying is correct and safe.
             // The final retry attempt uses streaming if configured.
             let is_last_attempt = attempt >= retry_config.max_retries;
+            let h3_retry_stream_response =
+                should_stream_h3_retry_response(should_stream, attempt, retry_config.max_retries);
             // `current_dispatch_h3` was either kept from the prior attempt
             // (same target → same protocol) or recomputed above for the
             // new target (rotation → match the new target's capability).
@@ -12273,7 +12277,9 @@ async fn handle_proxy_request_inner(
                     proxy_headers,
                     current_target.as_deref(),
                     retained_body.as_deref(),
+                    h3_retry_stream_response,
                     &ctx.client_ip,
+                    &request_xff_append_ip,
                     is_tls,
                     inbound_version,
                 )
@@ -12289,6 +12295,7 @@ async fn handle_proxy_request_inner(
                     retained_body.as_deref(),
                     should_stream && is_last_attempt,
                     &ctx.client_ip,
+                    &request_xff_append_ip,
                     is_tls,
                     inbound_version,
                 )
@@ -12331,6 +12338,7 @@ async fn handle_proxy_request_inner(
             stream_request_body,
             false, // no retry — don't retain body
             &request_client_ip,
+            &request_xff_append_ip,
             is_tls,
             current_dispatch_hbone,
             current_dispatch_mesh_mtls,
@@ -13014,12 +13022,15 @@ async fn handle_proxy_request_inner(
             let body = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
             {
-                crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
+                crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
+                    resp.into_body(),
+                    cl,
+                )
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce response-size limits while
                 // streaming H2 bodies, including HBONE tunnel responses,
                 // without buffering the whole backend response into memory.
-                crate::proxy::body::size_limited_streaming_h2_body(
+                crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     state.max_response_body_size_bytes,
                     cl,
@@ -13031,9 +13042,12 @@ async fn handle_proxy_request_inner(
                 // `BytesMut::extend_from_slice` copy that CoalescingH2Body
                 // would do on every data frame before the large-frame
                 // bypass kicks in at body.rs:~1184.
-                crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
+                crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
+                    resp.into_body(),
+                    cl,
+                )
             } else {
-                crate::proxy::body::coalescing_h2_body(
+                crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     cl,
                     state.h2_coalesce_target_bytes,
@@ -13446,6 +13460,7 @@ pub(crate) async fn proxy_to_backend_retry(
     request_body: Option<&[u8]>,
     stream_response: bool,
     client_ip: &str,
+    xff_append_ip: &str,
     is_tls: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
@@ -13565,10 +13580,10 @@ pub(crate) async fn proxy_to_backend_retry(
         }
     }
 
-    // Add proxy headers with real client IP
+    // Add proxy-managed forwarding metadata.
     let xff_val = build_xff_value(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
-        client_ip,
+        xff_append_ip,
     );
     let proto_str = if is_tls { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
@@ -13897,6 +13912,7 @@ async fn proxy_to_backend(
     stream_request_body: bool,
     retain_request_body: bool,
     client_ip: &str,
+    xff_append_ip: &str,
     is_tls: bool,
     dispatch_hbone: bool,
     dispatch_mesh_mtls: bool,
@@ -14003,6 +14019,7 @@ async fn proxy_to_backend(
             response_decision_ctx,
             stream_response,
             client_ip,
+            xff_append_ip,
             is_tls,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
@@ -14042,6 +14059,7 @@ async fn proxy_to_backend(
             response_decision_ctx,
             stream_response,
             client_ip,
+            xff_append_ip,
             is_tls,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
@@ -14103,6 +14121,7 @@ async fn proxy_to_backend(
             ctx,
             upstream_target,
             client_ip,
+            xff_append_ip,
             is_tls,
             inbound_version,
             stream_request_body,
@@ -14312,6 +14331,7 @@ async fn proxy_to_backend(
                             response_decision_ctx,
                             stream_response,
                             client_ip,
+                            xff_append_ip,
                             is_tls,
                             resolved_ip,
                             ctx_bytes_sent_observed,
@@ -14450,10 +14470,10 @@ async fn proxy_to_backend(
         }
     }
 
-    // Add proxy headers
+    // Add proxy-managed forwarding metadata.
     let xff_val = build_xff_value(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
-        client_ip,
+        xff_append_ip,
     );
     let proto_str = if is_tls { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
@@ -15705,6 +15725,7 @@ async fn proxy_to_backend_hbone(
     ctx: Option<&RequestContext>,
     stream_response: bool,
     client_ip: &str,
+    xff_append_ip: &str,
     is_tls: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
@@ -15933,7 +15954,7 @@ async fn proxy_to_backend_hbone(
 
     let xff_val = build_xff_value(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
-        client_ip,
+        xff_append_ip,
     );
     if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
         parts.headers.insert("x-forwarded-for", val);
@@ -16138,6 +16159,7 @@ async fn proxy_to_backend_mesh_mtls(
     ctx: Option<&RequestContext>,
     stream_response: bool,
     client_ip: &str,
+    xff_append_ip: &str,
     is_tls: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
@@ -16400,7 +16422,7 @@ async fn proxy_to_backend_mesh_mtls(
 
     let xff_val = build_xff_value(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
-        client_ip,
+        xff_append_ip,
     );
     if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
         parts.headers.insert("x-forwarded-for", val);
@@ -16596,6 +16618,7 @@ async fn proxy_to_backend_http2(
     ctx: Option<&RequestContext>,
     stream_response: bool,
     client_ip: &str,
+    xff_append_ip: &str,
     is_tls: bool,
     resolved_ip: Option<String>,
     // Shared counter for request body bytes. The H2 direct pool forwards
@@ -16698,10 +16721,10 @@ async fn proxy_to_backend_http2(
         }
     }
 
-    // Add proxy headers
+    // Add proxy-managed forwarding metadata.
     let xff_val = build_xff_value(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
-        client_ip,
+        xff_append_ip,
     );
     if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
         parts.headers.insert("x-forwarded-for", val);
@@ -16835,6 +16858,7 @@ async fn proxy_to_backend_http2(
 
 struct Http3BackendHeaderContext<'a> {
     client_ip: &'a str,
+    xff_append_ip: &'a str,
     effective_host: &'a str,
     is_tls: bool,
     inbound_version: hyper::Version,
@@ -16900,11 +16924,11 @@ fn build_http3_backend_headers(
         http3_headers.push((hyper::header::CONTENT_LENGTH, content_length));
     }
 
-    if let Some(xff) = headers.get("x-forwarded-for") {
-        if let Ok(v) = format!("{}, {}", xff, ctx.client_ip).parse() {
-            http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
-        }
-    } else if let Ok(v) = ctx.client_ip.parse() {
+    let xff = build_xff_value(
+        headers.get("x-forwarded-for").map(String::as_str),
+        ctx.xff_append_ip,
+    );
+    if let Ok(v) = xff.parse() {
         http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
     }
     let proto = if ctx.is_tls { "https" } else { "http" };
@@ -16954,6 +16978,7 @@ async fn proxy_to_backend_http3(
     mut ctx: Option<&mut RequestContext>,
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
+    xff_append_ip: &str,
     is_tls: bool,
     inbound_version: hyper::Version,
     stream_request_body: bool,
@@ -17015,6 +17040,7 @@ async fn proxy_to_backend_http3(
                     headers,
                     Http3BackendHeaderContext {
                         client_ip,
+                        xff_append_ip,
                         effective_host,
                         is_tls,
                         inbound_version,
@@ -17377,6 +17403,7 @@ async fn proxy_to_backend_http3(
         headers,
         Http3BackendHeaderContext {
             client_ip,
+            xff_append_ip,
             effective_host,
             is_tls,
             inbound_version,
@@ -17637,6 +17664,10 @@ fn classify_h3_pool_error(
     classify_h3_error(e.as_ref())
 }
 
+fn should_stream_h3_retry_response(stream_response: bool, attempt: u32, max_retries: u32) -> bool {
+    stream_response && attempt >= max_retries
+}
+
 /// Replay a saved HTTP/3 request to an explicit target (used during retries).
 ///
 /// Accepts pre-collected body bytes, method, URI, and headers so the original
@@ -17651,7 +17682,9 @@ async fn proxy_to_backend_http3_retry(
     headers: &HashMap<String, String>,
     upstream_target: Option<&UpstreamTarget>,
     request_body: Option<&[u8]>,
+    stream_response: bool,
     client_ip: &str,
+    xff_append_ip: &str,
     is_tls: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
@@ -17686,6 +17719,7 @@ async fn proxy_to_backend_http3_retry(
         headers,
         Http3BackendHeaderContext {
             client_ip,
+            xff_append_ip,
             effective_host,
             is_tls,
             inbound_version,
@@ -17694,6 +17728,82 @@ async fn proxy_to_backend_http3_retry(
     );
 
     let body_bytes = bytes::Bytes::copy_from_slice(request_body.unwrap_or(&[]));
+
+    if stream_response {
+        let connection_pool = state.connection_pool.clone();
+        let proxy_clone = proxy.clone();
+        let h3_result = if let Some(target) = upstream_target {
+            let target_host = target.host.clone();
+            let target_port = target.port;
+            state
+                .h3_pool
+                .request_with_target_streaming(
+                    proxy,
+                    &target_host,
+                    target_port,
+                    method,
+                    backend_url,
+                    &http3_headers,
+                    body_bytes,
+                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                )
+                .await
+        } else {
+            state
+                .h3_pool
+                .request_streaming(
+                    proxy,
+                    method,
+                    backend_url,
+                    &http3_headers,
+                    body_bytes,
+                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                )
+                .await
+        };
+
+        return match h3_result {
+            Ok(mut response) => {
+                debug!(
+                    proxy_id = %proxy.id,
+                    status = response.status,
+                    "HTTP/3 backend streaming retry request successful"
+                );
+                let headers = std::mem::take(&mut response.headers);
+                retry::BackendResponse {
+                    status_code: response.status,
+                    body: ResponseBody::StreamingH3(Box::new(response)),
+                    headers,
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                }
+            }
+            Err(e) => {
+                let is_conn_error = !e.request_on_wire();
+                let (error_kind, error_class) = classify_h3_pool_error(&e);
+                record_port_exhaustion_if_class(&state.overload, error_class);
+                error!(
+                    proxy_id = %proxy.id,
+                    backend_url = %strip_query_params(backend_url),
+                    target = %format!("{}:{}", effective_host, effective_port),
+                    error_kind = error_kind,
+                    error = %e,
+                    "HTTP/3 backend streaming retry request failed"
+                );
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: is_conn_error,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(error_class),
+                }
+            }
+        };
+    }
 
     let connection_pool = state.connection_pool.clone();
     let proxy_clone = proxy.clone();
@@ -18489,6 +18599,7 @@ mod tests {
             None,
             true,
             "127.0.0.1",
+            "127.0.0.1",
             true,
             hyper::Version::HTTP_2,
         )
@@ -18540,6 +18651,7 @@ mod tests {
                 false, // requires_request_body_buffering
                 true,  // stream_request_body
                 false, // retain_request_body (non-retry -> downgrade active)
+                "127.0.0.1",
                 "127.0.0.1",
                 false, // is_tls
                 false, // dispatch_hbone
@@ -18639,7 +18751,8 @@ mod tests {
             &proxy,
             &headers,
             Http3BackendHeaderContext {
-                client_ip: "127.0.0.1",
+                client_ip: "203.0.113.44",
+                xff_append_ip: "127.0.0.1",
                 effective_host: "backend.internal",
                 is_tls: false,
                 inbound_version: hyper::Version::HTTP_11,
@@ -18658,7 +18771,7 @@ mod tests {
         assert_eq!(header_value(&out, "via"), Some("1.1 ferrum-edge"));
         assert_eq!(
             header_value(&out, "forwarded"),
-            Some("for=127.0.0.1;proto=http;host=edge.example")
+            Some("for=203.0.113.44;proto=http;host=edge.example")
         );
         assert!(
             header_value(&out, "x-strip").is_none(),
@@ -18684,6 +18797,7 @@ mod tests {
             &headers,
             Http3BackendHeaderContext {
                 client_ip: "203.0.113.9",
+                xff_append_ip: "10.0.0.7",
                 effective_host: "h3-backend.example",
                 is_tls: true,
                 inbound_version: hyper::Version::HTTP_2,
@@ -18692,6 +18806,7 @@ mod tests {
         );
 
         assert_eq!(header_value(&out, "x-forwarded-proto"), Some("https"));
+        assert_eq!(header_value(&out, "x-forwarded-for"), Some("10.0.0.7"));
         assert_eq!(header_value(&out, "via"), Some("2.0 ferrum-edge"));
         assert_eq!(
             header_value(&out, "forwarded"),
@@ -20040,6 +20155,22 @@ mod tests {
             Some(1024 * 1024),
             1024 * 1024,
         ));
+    }
+
+    #[test]
+    fn h3_retry_streams_only_the_final_attempt_when_requested() {
+        assert!(
+            !super::should_stream_h3_retry_response(true, 0, 2),
+            "non-final H3 retries must stay buffered so another retry can replay"
+        );
+        assert!(
+            !super::should_stream_h3_retry_response(false, 2, 2),
+            "a buffered-response request must stay buffered even on the final retry"
+        );
+        assert!(
+            super::should_stream_h3_retry_response(true, 2, 2),
+            "the final H3 retry must preserve the original streaming response decision"
+        );
     }
 
     /// Regression guard: the gRPC request-body-hook branch must always
