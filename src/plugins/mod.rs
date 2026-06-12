@@ -1089,20 +1089,14 @@ impl RequestContext {
                     if matches!(key, "x-consumer-username" | "x-consumer-custom-id") {
                         continue;
                     }
-                    if is_comma_folded_list_header(key) {
-                        // These are list headers, so multiple field lines are
-                        // equivalent to one comma-separated value. Preserve that
-                        // before raw headers are consumed by materialization.
-                        self.headers
-                            .entry(key.to_owned())
-                            .and_modify(|existing| {
-                                existing.push(',');
-                                existing.push_str(v);
-                            })
-                            .or_insert_with(|| v.to_owned());
-                    } else {
-                        self.headers.insert(key.to_owned(), v.to_owned());
-                    }
+                    let separator = repeated_request_header_separator(key);
+                    self.headers
+                        .entry(key.to_owned())
+                        .and_modify(|existing| {
+                            existing.push_str(separator);
+                            existing.push_str(v);
+                        })
+                        .or_insert_with(|| v.to_owned());
                 }
             }
         }
@@ -1232,13 +1226,18 @@ impl RequestContext {
     }
 }
 
-/// Headers that are materialized by comma-folding repeated request values.
+/// Separator used when materializing repeated request header field lines.
 ///
-/// This is used both when `RequestContext` is built and when the WebSocket
-/// proxy path reconstructs the materialized form to decide whether raw
-/// repeated headers can be preserved for the backend handshake.
-pub(crate) fn is_comma_folded_list_header(name: &str) -> bool {
-    matches!(name, "baggage" | "sec-websocket-protocol")
+/// RFC 9113 §8.2.3 requires H2/H3 cookie crumbs to be reassembled with
+/// `"; "`. Other repeated request fields use the standard comma-list form so
+/// materialized plugin headers, backend forwarding, and `Connection`-listed
+/// stripping all see the complete value set.
+pub(crate) fn repeated_request_header_separator(name: &str) -> &'static str {
+    if name.eq_ignore_ascii_case("cookie") {
+        "; "
+    } else {
+        ", "
+    }
 }
 
 fn dispatch_port_overrides_from_upstream(

@@ -70,6 +70,7 @@ Ferrum's mesh subsystem is in active build-out. The paths below ship in one bina
 |---|---|---|
 | Native `MeshSubscribe` (Ferrum CP → Ferrum DP) | **Stable** | Default protocol. Full slice (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, telemetry, multi-cluster) is pushed directly. The most mature and recommended config path. |
 | xDS ADS (Ferrum CP → Ferrum DP) | **Beta** | Functionally equivalent to native via Ferrum-specific ECDS carriers (`ferrum.config.extension.v3.*`). **NOT stock-Envoy / third-party-Istio interop** — a non-Ferrum CP emits only name-only CDS/EDS/LDS/RDS and no carriers, so it cannot drive a protected Ferrum mesh and may be NACKed. `ProxyConfig` is native-only. RTDS layers are authored by the operator's CP (Ferrum's xDS server does not originate Runtime resources). |
+| Localized file source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) | **Beta** | No control plane: the DP builds its slice locally from `FERRUM_MESH_FILE_CONFIG_PATH` through the same materialization path as native/xDS, so enforcement parity is structural. Fail-closed initial load; SIGHUP reload (Unix) keeps the last good slice on error. Sharp edges: reload is signal-driven only (no file watching), and there is no CP heartbeat — `/mesh/config-drift` staleness reflects the last SIGHUP, not a sync failure. |
 | Stock Envoy / third-party Istio xDS interop | **Not supported** | See [Limitations](#limitations-and-not-supported). Use native or a Ferrum CP. |
 
 ### Topology maturity
@@ -214,7 +215,7 @@ The inbound listener terminates mTLS from peer sidecars and forwards plaintext t
 
 **Implementation status — transport vs. materialization, per topology.** Transport (how a peer is reached on the wire) and materialization (turning the slice into routable proxies) are separate layers, and **the transport differs by topology**: **Ambient / Waypoint** speak HBONE (HTTP/2 CONNECT over mTLS, `:15008`); **Sidecar** speaks plain SVID-mTLS HTTP (`:15006`, no `:15008` listener). HBONE is *not* Sidecar's transport.
 
-- **Ingress is handled for both.** Sidecar inbound builds materialized loopback routes (`:15006` → `127.0.0.1:<appPort>`). Ambient/Waypoint inbound is **transparent** — an authenticated HBONE CONNECT that matches no route is relayed directly to its `:authority` (the original destination), so no route materialization is needed. The relay is guarded: the destination must be a local target — a loopback address (the co-located app) or an in-mesh workload address+port the slice declares — so an authenticated peer can never use the HBONE terminator as an open proxy to arbitrary hosts, and a peerless CONNECT is rejected (403) before any dial.
+- **Ingress is handled for both.** Sidecar inbound builds materialized loopback routes (`:15006` → `127.0.0.1:<appPort>`). Ambient/Waypoint inbound is **transparent** — an authenticated HBONE CONNECT that matches no route is relayed directly to its `:authority` (the original destination), so no route materialization is needed. The relay is guarded: the destination must be a local target — a loopback address on an application port declared by the slice, or an in-mesh workload address+port the slice declares — so an authenticated peer can never use the HBONE terminator as an open proxy to arbitrary hosts or undeclared localhost listeners, and a peerless CONNECT is rejected (403) before any dial.
 - **Egress is materialized for both**, per transport: **Ambient outbound** builds per-service HBONE routes (a host-routed `/` proxy per in-mesh Service → `mesh.hbone`-tagged upstreams dialing the destination's `:15008`); **Sidecar outbound** builds per-service SVID-mTLS routes (`mesh.mtls`-tagged upstreams dialing the destination sidecar's inbound `:15006` with plain HTTP/2 over mutual TLS — never HBONE). Either way the upstream targets carry the destination workload's SPIFFE id (`mesh.spiffe_id`), which the outbound handshake **pins**: the peer must present exactly that SVID, not merely one from an allowed trust domain. Sidecar egress yields to the local workload's own inbound loopback route (the route table holds one proxy per host+path), so a service's own-sidecar traffic stays local. Non-convention transport ports are configured with `FERRUM_MESH_EGRESS_HBONE_PORT` / `FERRUM_MESH_EGRESS_MTLS_PORT`. Original-destination routing for multi-port / TCP egress (and lifting the single-HTTP-port fail-closed guard) is a later stage.
   - Per-port `DestinationRule.trafficPolicy.portLevelSettings` authored on the service port are re-keyed onto the actual dial port for these static-target upstreams, so a service whose numeric `targetPort` differs from its `port` keeps its *per-port* DR settings (mirroring the egress ServiceEntry path). A *named* `targetPort` remains a residual — its per-port settings stay under the service port — pending the move to service-discovery-backed outbound upstreams.
 
@@ -301,7 +302,7 @@ Sidecars route external traffic to the egress gateway over mTLS. The gateway ter
 
 ## Configuration Consumption
 
-Mesh mode consumes configuration from a Control Plane via one of two protocols, selected by `FERRUM_MESH_CONFIG_PROTOCOL`.
+Mesh mode consumes configuration via one of three sources, selected by `FERRUM_MESH_CONFIG_PROTOCOL`: two Control-Plane protocols (`native`, `xds`) and a localized file source (`file`).
 
 ### Native MeshSubscribe (default)
 
@@ -453,11 +454,21 @@ The DP recovers this back into a `MeshDestinationRule` with `traffic_policy.load
 - Configuration: no `FERRUM_MESH_*` env var gates the carrier path. The DP recognizes the marker whenever `FERRUM_MESH_CONFIG_PROTOCOL=xds`; turning the path on is a CP-authoring decision.
 - Test pin: `ecds_dr_carrier_payload_recovers_destination_rule()` in `src/modes/mesh/config_consumer/xds_client.rs` round-trips the envelope and asserts that `traffic_policy.load_balancer` survives — i.e. fields baked out by a CDS-only path are recovered.
 
+### Localized file source (no control plane)
+
+`FERRUM_MESH_CONFIG_PROTOCOL=file` runs a mesh data plane with **no control plane at all** — the slice is built locally from a YAML/JSON document at `FERRUM_MESH_FILE_CONFIG_PATH`. This mirrors the gateway's database-vs-file duality for the mesh (cf. Kuma's universal mode): the same `MeshSlice::from_gateway_config` materialization the CP runs is executed DP-side, so authz / PeerAuthentication / JWT / ServiceEntry / DestinationRule / trust-bundle semantics are structurally identical to a CP-delivered slice.
+
+- **Document shape**: an optional `version` stamp (must equal the current config schema version when present) plus the `mesh` section only — `workloads`, `services`, `mesh_policies`, `peer_authentications`, `service_entries`, `request_authentications`, `telemetry_resources`, `destination_rules`, `proxy_configs`, `sidecars`, `trust_bundles`, `multi_cluster`, `outbound_traffic_policy`. Gateway resources (`proxies:`, `upstreams:`, `consumers:`, `plugin_configs:`) are **rejected** at parse — mesh mode materializes its routes from the slice; plain gateway routes belong to `FERRUM_MODE=file`.
+- **Startup is fail-closed**: a missing, unparsable, or mesh-invalid document refuses startup, matching file-mode validation semantics.
+- **Reload**: SIGHUP (Unix; `ferrum-edge reload`). A failed reload logs a warning and keeps the last good slice — identical to how the CP consumers retain the last accepted slice. Reload is signal-driven only; there is no file watcher or poll timer. Non-Unix platforms load once and require a restart.
+- **Not required / not consumed**: `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_SECRET`, DP gRPC TLS vars. Everything else (topology, SVID material, PeerAuthentication posture, plugin injection, slice scoping via `FERRUM_MESH_WORKLOAD_SPIFFE_ID` / `FERRUM_MESH_WORKLOAD_LABELS` / Sidecar egress enforcement) behaves exactly as under native/xDS.
+- **Observability caveat**: there is no CP heartbeat, so `/mesh/config-drift` slice staleness reflects time since the last SIGHUP reload rather than a sync failure.
+
 ### Bootstrap Behavior
 
-Both protocols share the same startup contract:
+All three config sources share the same startup contract:
 
-1. The mesh data plane waits for an initial valid slice before serving traffic.
+1. The mesh data plane waits for an initial valid slice before serving traffic (the file source loads it synchronously and refuses startup on error).
 2. Valid updates are applied atomically via `ArcSwap`.
 3. Invalid updates are logged and ignored; the last accepted configuration continues serving.
 4. On config source unavailability, the gateway keeps serving cached configuration (resilience principle).

@@ -56,6 +56,7 @@ pub fn default_mesh_runtime() -> MeshRuntimeConfig {
         namespace: DEFAULT_NAMESPACE.to_string(),
         cp_urls: vec!["http://127.0.0.1:1".to_string()],
         config_protocol: MeshConfigProtocol::Native,
+        file_config_path: None,
         topology: MeshTopology::Sidecar,
         inbound_listen_addr: "127.0.0.1:0".parse().expect("addr"),
         outbound_listen_addr: "127.0.0.1:0".parse().expect("addr"),

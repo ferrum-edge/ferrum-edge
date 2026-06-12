@@ -171,6 +171,14 @@ pub struct StreamListenerManager {
     /// inside `ProxyState::new()` (synchronous) but the watch channel is
     /// created in `main.rs` and threaded into each mode separately.
     global_shutdown_rx: arc_swap::ArcSwap<Option<watch::Receiver<bool>>>,
+    /// Backend TLS reload epoch shared with every spawned UDP/DTLS listener.
+    /// `reload_backend_tls_material` bumps it (via
+    /// [`Self::bump_backend_tls_reload_epoch`]) after backend cert/key/CA
+    /// bytes change in place, so listener-local backend DTLS config caches —
+    /// keyed by paths/options, which cannot observe content rotation — drop
+    /// entries built from the pre-rotation material. TCP listeners use the
+    /// config-path-based `BackendTlsReloadKey` restart instead.
+    backend_tls_reload_epoch: Arc<AtomicU64>,
     /// Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement slot shared
     /// with `ProxyState`. Each spawned TCP / UDP listener gets the same
     /// `Arc<ArcSwap<...>>` so slice updates that swap the contents are
@@ -402,6 +410,7 @@ impl StreamListenerManager {
             udp_gso_enabled,
             udp_pktinfo_enabled,
             global_shutdown_rx: arc_swap::ArcSwap::new(Arc::new(None)),
+            backend_tls_reload_epoch: Arc::new(AtomicU64::new(0)),
             mesh_outbound_enforcement,
             node_waypoint_identity_resolver: arc_swap::ArcSwap::new(Arc::new(None)),
         }
@@ -418,6 +427,16 @@ impl StreamListenerManager {
     /// the `ArcSwap` load.
     pub fn set_global_shutdown_rx(&self, rx: watch::Receiver<bool>) {
         self.global_shutdown_rx.store(Arc::new(Some(rx)));
+    }
+
+    /// Bump the backend TLS reload epoch shared with UDP/DTLS listeners.
+    ///
+    /// Called by `reload_backend_tls_material` after backend cert/key/CA
+    /// bytes were validated and swapped, so listener-local backend DTLS
+    /// config caches rebuild from the rotated material on the next session
+    /// instead of serving stale params until restart.
+    pub fn bump_backend_tls_reload_epoch(&self) {
+        self.backend_tls_reload_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Inject the node-waypoint identity resolver shared with `ProxyState`.
@@ -880,6 +899,7 @@ impl StreamListenerManager {
                 let frontend_tls_handshake_timeout = self.frontend_tls_handshake_timeout_seconds;
                 let udp_cleanup_interval = self.udp_cleanup_interval_seconds;
                 let crls = self.crls.clone();
+                let backend_tls_reload_epoch = self.backend_tls_reload_epoch.clone();
                 let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
@@ -922,6 +942,7 @@ impl StreamListenerManager {
                         cleanup_interval_seconds: udp_cleanup_interval,
                         circuit_breaker_cache: cb_cache,
                         crls,
+                        backend_tls_reload_epoch,
                         started: started_for_listener,
                         sni_proxy_ids: sni_ids,
                         adaptive_buffer: adaptive_buf,
