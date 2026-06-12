@@ -568,6 +568,7 @@ async fn try_spawn_udp_listener(
         max_sessions: 1024,
         frontend_tls_handshake_timeout_seconds: 10,
         cleanup_interval_seconds: 10,
+        session_shard_amount: 0,
         circuit_breaker_cache,
         crls: Arc::new(Vec::new()),
         started: listener_started,
