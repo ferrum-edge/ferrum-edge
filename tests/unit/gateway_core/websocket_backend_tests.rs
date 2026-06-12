@@ -31,7 +31,8 @@ async fn connect_websocket_backend_sets_tcp_nodelay() {
         .expect("backend connect succeeds");
 
     match ws_stream.get_ref() {
-        tokio_tungstenite::MaybeTlsStream::Plain(tcp) => {
+        tokio_tungstenite::MaybeTlsStream::Plain(io) => {
+            let tcp = io.get_ref();
             assert!(
                 tcp.nodelay().expect("nodelay getsockopt"),
                 "backend WS TcpStream must have TCP_NODELAY set"

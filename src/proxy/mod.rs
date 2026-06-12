@@ -64,13 +64,14 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{
-    WebSocketStream, connect_async_tls_with_config, tungstenite::handshake::derive_accept_key,
+    WebSocketStream, client_async_tls_with_config, tungstenite::handshake::derive_accept_key,
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -6028,6 +6029,13 @@ async fn handle_websocket_request_authenticated(
     let mut ws_cb_probe_slot_available = cb_is_half_open_probe;
     let mut ws_attempt = 0u32;
 
+    // Connection-wide idle tracker created BEFORE the backend dial so the
+    // byte-level activity adapter can be installed under the backend framer
+    // inside `connect_websocket_backend`; the same tracker is later wired
+    // under the client framer by `run_websocket_proxy`. `None` disables the
+    // idle bound entirely.
+    let ws_idle_tracker =
+        WsIdleTracker::from_timeout_seconds(state.env_config.websocket_idle_timeout_seconds);
     // The backend WebSocket connection acquired below is held for the full
     // session lifetime (moved into the spawned task), so this guard's slot is
     // released exactly when the dedicated backend connection closes. Captured
@@ -6126,6 +6134,7 @@ async fn handle_websocket_request_authenticated(
             &state.crls,
             state.max_websocket_frame_size_bytes,
             state.websocket_write_buffer_size,
+            ws_idle_tracker.clone(),
         )
         .await
         {
@@ -6573,7 +6582,6 @@ async fn handle_websocket_request_authenticated(
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
-    let ws_idle_timeout_seconds = state.env_config.websocket_idle_timeout_seconds;
     let adaptive_buf = state.adaptive_buffer.clone();
     // Track the upgraded WebSocket session in `OverloadState.active_connections`
     // so graceful drain waits for in-flight WS sessions before exiting.
@@ -6660,7 +6668,7 @@ async fn handle_websocket_request_authenticated(
                     // `src/http3/websocket.rs` passes `true` for
                     // RFC 9220 §5 compliance.
                     false,
-                    ws_idle_timeout_seconds,
+                    ws_idle_tracker,
                     &adaptive_buf,
                 )
                 .await
@@ -7080,8 +7088,16 @@ fn build_websocket_tls_connector(
 /// `Sec-WebSocket-Extensions` is intentionally NOT forwarded: the bridge
 /// doesn't speak `permessage-deflate` end-to-end, so signalling a negotiated
 /// extension would lead the client to decode raw frames as compressed.
+/// Backend WebSocket transport: TLS (or plain) over the byte-level idle
+/// activity adapter over TCP. The `WsActivityIo` layer sits UNDER the
+/// framer so fragmented-message read progress refreshes the shared idle
+/// watermark (see `WsActivityIo`); with no tracker configured it is a pure
+/// passthrough.
+pub type BackendWsStream =
+    WebSocketStream<tokio_tungstenite::MaybeTlsStream<WsActivityIo<tokio::net::TcpStream>>>;
+
 pub(crate) struct BackendWsHandshake {
-    pub stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    pub stream: BackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
 }
 
@@ -7098,6 +7114,7 @@ pub(crate) async fn connect_websocket_backend(
     crls: &crate::tls::CrlList,
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
+    idle_tracker: Option<Arc<WsIdleTracker>>,
 ) -> Result<BackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
@@ -7116,9 +7133,42 @@ pub(crate) async fn connect_websocket_backend(
 
     let connector = build_websocket_tls_connector(proxy, env_config, tls_policy, crls)?;
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
-    // Without this, 70 KB WS messages hit Nagle + delayed-ACK (~40 ms/msg).
-    let connect_future =
-        connect_async_tls_with_config(ws_request, Some(ws_config), true, connector);
+    // Dial the TCP stream ourselves (instead of `connect_async_tls_with_config`)
+    // so the byte-level `WsActivityIo` idle adapter can be installed UNDER the
+    // TLS layer and WebSocket framer — read progress on a fragmented or large
+    // backend message then refreshes the shared idle watermark even before
+    // tungstenite yields a complete `Message`. Host/port resolution matches
+    // what tungstenite's own dialer would use (request URI + scheme default).
+    let uri = ws_request.uri();
+    let dial_host = uri
+        .host()
+        .ok_or("WebSocket backend URL is missing a host")?
+        // `TcpStream::connect` expects bare IPv6 addresses, not URI-bracketed.
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let dial_port = uri.port_u16().unwrap_or_else(|| {
+        if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        }
+    });
+    let connect_future = async {
+        let tcp = tokio::net::TcpStream::connect((dial_host.as_str(), dial_port)).await?;
+        // Without nodelay, 70 KB WS messages hit Nagle + delayed-ACK
+        // (~40 ms/msg); keepalive bounds dead-peer detection on idle
+        // long-lived sessions.
+        set_tcp_keepalive(&tcp);
+        client_async_tls_with_config(
+            ws_request,
+            WsActivityIo::new(tcp, idle_tracker),
+            Some(ws_config),
+            connector,
+        )
+        .await
+        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+    };
 
     let (backend_ws_stream, backend_response) =
         match tokio::time::timeout(connect_timeout, connect_future).await {
@@ -7138,8 +7188,6 @@ pub(crate) async fn connect_websocket_backend(
                 .into());
             }
         };
-
-    set_tcp_keepalive(backend_ws_stream.get_ref().get_ref());
 
     debug!("Connected to backend WebSocket server: {}", backend_url);
     debug!("Backend response status: {}", backend_response.status());
@@ -7312,14 +7360,14 @@ enum WsNextMessage {
 /// TCP relay: asymmetric sessions (quiet client, chatty backend pushing
 /// notifications/pings) stay open, and the session is torn down only when the
 /// connection as a whole is idle.
-struct WsIdleTracker {
+pub struct WsIdleTracker {
     timeout: Duration,
     epoch: Instant,
     last_activity_ms: AtomicU64,
 }
 
 impl WsIdleTracker {
-    fn new(timeout: Duration) -> Self {
+    pub(crate) fn new(timeout: Duration) -> Self {
         Self {
             timeout,
             epoch: Instant::now(),
@@ -7327,11 +7375,17 @@ impl WsIdleTracker {
         }
     }
 
+    /// Build the shared tracker from the configured timeout seconds;
+    /// `None` (idle timeout disabled) when the value is `0`.
+    pub(crate) fn from_timeout_seconds(seconds: u64) -> Option<Arc<Self>> {
+        (seconds > 0).then(|| Arc::new(Self::new(Duration::from_secs(seconds))))
+    }
+
     fn now_ms(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Record activity: a frame received from either direction.
+    /// Record activity: bytes or a frame received from either direction.
     fn touch(&self) {
         self.last_activity_ms
             .store(self.now_ms(), Ordering::Relaxed);
@@ -7345,6 +7399,94 @@ impl WsIdleTracker {
         self.timeout
             .checked_sub(Duration::from_millis(idle_ms))
             .filter(|remaining| !remaining.is_zero())
+    }
+}
+
+/// Byte-level activity adapter feeding [`WsIdleTracker`].
+///
+/// Wraps the raw transport UNDER the WebSocket framer (client: the upgraded
+/// H1/H2 stream or the H3 duplex bridge; backend: the TCP stream beneath
+/// `MaybeTlsStream`) and refreshes the shared idle watermark whenever read
+/// progress is made. Tracking at the byte level — rather than only when
+/// tungstenite yields a complete `Message` — keeps a slowly arriving large or
+/// fragmented WebSocket message alive: continuation frames refresh the
+/// watermark as their bytes land even though no complete message has been
+/// assembled yet. This matches the byte-level shared idle timer used by the
+/// tunnel-mode raw copy, so frame-parsed and tunnel sessions expire under the
+/// same "no bytes in either direction" rule.
+///
+/// Writes don't touch the watermark: every byte written to one side was just
+/// read from the other, so read-side tracking already covers both directions.
+/// With `tracker == None` (idle timeout disabled) the adapter is a pure
+/// passthrough.
+pub struct WsActivityIo<S> {
+    inner: S,
+    tracker: Option<Arc<WsIdleTracker>>,
+}
+
+impl<S> WsActivityIo<S> {
+    pub(crate) fn new(inner: S, tracker: Option<Arc<WsIdleTracker>>) -> Self {
+        Self { inner, tracker }
+    }
+
+    /// Access the wrapped transport (socket-option tweaks, tests).
+    #[allow(dead_code)] // Used by library consumers and external unit tests; the binary tree has no caller.
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WsActivityIo<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result
+            && buf.filled().len() > before
+            && let Some(tracker) = &self.tracker
+        {
+            tracker.touch();
+        }
+        result
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WsActivityIo<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 }
 
@@ -7401,7 +7543,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C>(
     client_io: C,
-    backend_ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    backend_ws_stream: BackendWsStream,
     proxy_id: &str,
     connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
@@ -7412,7 +7554,7 @@ pub(crate) async fn run_websocket_proxy<C>(
     websocket_write_buffer_size: usize,
     websocket_tunnel_mode: bool,
     accept_unmasked_client_frames: bool,
-    websocket_idle_timeout_seconds: u64,
+    ws_idle_tracker: Option<Arc<WsIdleTracker>>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -7432,11 +7574,7 @@ where
         "run_websocket_proxy: tunnel mode is incompatible with unmasked client \
          frames (H3 caller must pass websocket_tunnel_mode=false)"
     );
-    let websocket_idle_timeout = if websocket_idle_timeout_seconds == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(websocket_idle_timeout_seconds))
-    };
+    let websocket_idle_timeout = ws_idle_tracker.as_ref().map(|tracker| tracker.timeout);
 
     // When tunnel mode is enabled and no plugins need frame-level hooks, bypass
     // WebSocket frame parsing entirely and do raw TCP bidirectional copy. This
@@ -7522,8 +7660,12 @@ where
     // H3 callers pass `true`.
     ws_config.accept_unmasked_frames = accept_unmasked_client_frames;
 
+    // Byte-level idle activity adapter under the client-side framer, matching
+    // the wrap applied beneath the backend stream at connect time: read
+    // progress on a partially received (fragmented/large) client message
+    // refreshes the shared watermark before a complete `Message` is yielded.
     let ws_stream = WebSocketStream::from_raw_socket(
-        client_io,
+        WsActivityIo::new(client_io, ws_idle_tracker.clone()),
         tokio_tungstenite::tungstenite::protocol::Role::Server,
         Some(ws_config),
     )
@@ -7569,9 +7711,9 @@ where
     let first_failure_btc = first_failure.clone();
     // Connection-wide idle tracker shared by both relay halves (see
     // `WsIdleTracker`). `None` when the timeout is disabled — the relay then
-    // awaits `stream.next()` directly with zero added overhead.
-    let ws_idle_tracker =
-        websocket_idle_timeout.map(|timeout| Arc::new(WsIdleTracker::new(timeout)));
+    // awaits `stream.next()` directly with zero added overhead. The same
+    // tracker is wired into the byte-level `WsActivityIo` adapters under both
+    // framers, so mid-message read progress also refreshes the watermark.
     let ws_idle_tracker_ctb = ws_idle_tracker.clone();
     let ws_idle_tracker_btc = ws_idle_tracker;
 
@@ -18940,6 +19082,55 @@ mod tests {
         toucher.abort();
         let item = next_websocket_message(&mut stream, Some(idle.as_ref())).await;
         assert!(matches!(item, WsNextMessage::IdleTimeout));
+    }
+
+    /// Byte-level activity through the `WsActivityIo` adapter must refresh
+    /// the shared idle watermark even though no complete WebSocket `Message`
+    /// is ever yielded — this is what keeps a slowly arriving large or
+    /// fragmented message alive past the idle window.
+    #[tokio::test]
+    async fn ws_activity_io_read_progress_refreshes_idle_watermark() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let idle = Arc::new(WsIdleTracker::new(Duration::from_millis(200)));
+        let (client, server) = tokio::io::duplex(64);
+        let mut tracked = WsActivityIo::new(server, Some(idle.clone()));
+
+        // Writer drips raw bytes (mid-message continuation data) every 50ms,
+        // never completing a frame.
+        let writer = tokio::spawn(async move {
+            let mut client = client;
+            for _ in 0..8u8 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = client.write_all(b"x").await;
+            }
+        });
+
+        // Read through the adapter for 400ms — twice the idle window. Each
+        // read with progress must touch the tracker, so `remaining()` never
+        // hits zero while bytes keep arriving.
+        let mut buf = [0u8; 8];
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, tracked.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(_)) => {
+                    assert!(
+                        idle.remaining().is_some(),
+                        "mid-message byte progress must keep the idle window open"
+                    );
+                }
+                Ok(Err(e)) => panic!("duplex read failed: {e}"),
+            }
+        }
+        writer.abort();
+
+        // With the byte drip stopped, the window finally elapses.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            idle.remaining().is_none(),
+            "idle window must expire once byte progress stops"
+        );
     }
 
     #[tokio::test]

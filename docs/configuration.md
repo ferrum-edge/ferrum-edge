@@ -410,7 +410,7 @@ Injected sidecars run as the configured mesh proxy UID with `runAsNonRoot=true`,
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | No | `16777216` | Maximum WebSocket frame size in bytes; max message size = 4x frame size |
 | `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | No | `131072` | WebSocket write buffer size (128 KB). Increase for large WS frames (1 MB+). Only applies when frame-level plugins are active |
 | `FERRUM_WEBSOCKET_TUNNEL_MODE` | No | `false` | When true and no frame-level plugins are configured, bypass WebSocket frame parsing and use raw TCP bidirectional copy. Significantly improves throughput for large payloads (9 MB: 25→110 RPS). Trade-off: `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` is not enforced (no DoS risk — data streams through fixed-size copy buffer) |
-| `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` | No | `0` | Connection-wide WebSocket idle timeout in seconds for frame-parsed and tunnel-mode sessions. The session closes only when neither direction (data or control frames) produces traffic within the window; activity from either side keeps it open. `0` disables |
+| `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` | No | `0` | Connection-wide WebSocket idle timeout in seconds for frame-parsed and tunnel-mode sessions. The session closes only when neither direction produces traffic within the window; activity from either side keeps it open. Tracked at the transport byte level in both modes, so a partially received large/fragmented message counts as activity while its bytes are still arriving. `0` disables |
 | `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | No | `10` | HTTP/1.1 header read timeout; `0` disables |
 
 See [size_limits.md](size_limits.md) for detailed sizing guidance.

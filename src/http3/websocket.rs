@@ -564,6 +564,14 @@ pub(crate) async fn handle_h3_websocket(
     let mut ws_cb_probe_slot_available = cb_is_half_open_probe;
     let mut ws_attempt = 0u32;
 
+    // Connection-wide idle tracker created BEFORE the backend dial so the
+    // byte-level activity adapter can be installed under the backend framer
+    // inside `connect_websocket_backend`; the same tracker is later wired
+    // under the client framer by `run_websocket_proxy`. `None` disables the
+    // idle bound entirely.
+    let ws_idle_tracker = crate::proxy::WsIdleTracker::from_timeout_seconds(
+        state.env_config.websocket_idle_timeout_seconds,
+    );
     // The backend WebSocket connection acquired below is held for the full
     // session lifetime (the inline relay below, until this function returns),
     // so this guard's slot releases exactly when the dedicated backend
@@ -669,6 +677,7 @@ pub(crate) async fn handle_h3_websocket(
             &state.crls,
             state.max_websocket_frame_size_bytes,
             state.websocket_write_buffer_size,
+            ws_idle_tracker.clone(),
         )
         .await
         {
@@ -1100,7 +1109,6 @@ pub(crate) async fn handle_h3_websocket(
     let ws_conn_id = state.ws_connection_counter.fetch_add(1, Ordering::Relaxed);
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
-    let ws_idle_timeout_seconds = state.env_config.websocket_idle_timeout_seconds;
     let adaptive_buf = state.adaptive_buffer.clone();
 
     // ── Run the shared frame-relay code (same as H1/H2) ─────────────
@@ -1126,7 +1134,7 @@ pub(crate) async fn handle_h3_websocket(
         // gap because tungstenite only exposes a permissive
         // accept-unmasked mode. See docs/http3.md#frame-masking--rfc-9220-5-vs-rfc-6455.
         true,
-        ws_idle_timeout_seconds,
+        ws_idle_tracker,
         &adaptive_buf,
     )
     .await;
