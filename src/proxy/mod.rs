@@ -60,7 +60,7 @@ use hyper_util::rt::TokioIo;
 use percent_encoding::percent_decode_str;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1473,6 +1473,7 @@ fn parse_hyper_method(method: &str) -> Result<hyper::Method, ()> {
 /// | no proxy in front                  | none        | equal          | `peer`                |
 /// | trusted LB sending XFF             | `…, client` | differ         | `…, client, peer`     |
 /// | trusted LB sending real-IP header  | none        | differ         | `client, peer`        |
+/// | real-IP header + passthrough XFF   | `…` (no client) | differ     | `…, client, peer`     |
 /// | untrusted peer (spoofed XFF)       | dropped     | equal          | `peer`                |
 ///
 /// When inbound XFF exists the resolved client is already in the chain, so
@@ -1499,9 +1500,23 @@ pub(crate) fn build_xff_value(
     });
     match existing_xff {
         Some(xff) => {
-            let mut val = String::with_capacity(xff.len() + 2 + peer_ip.len());
+            // Real-IP-header deployments: a trusted proxy can resolve the
+            // client via `FERRUM_REAL_IP_HEADER` while ALSO forwarding an XFF
+            // chain that does not contain that client (e.g. a client-supplied
+            // chain it passed through verbatim). Resolution ignored the chain
+            // in favor of the real-IP header, so the authenticated client
+            // must be seeded before the peer or backends consuming XFF lose
+            // it entirely. When resolution walked the chain itself the client
+            // is already present and only the peer is appended.
+            let seed_client = client_ip != peer_ip && !xff_chain_contains(xff, client_ip);
+            let mut val =
+                String::with_capacity(xff.len() + 2 + client_ip.len() + 2 + peer_ip.len());
             val.push_str(xff);
             val.push_str(", ");
+            if seed_client {
+                val.push_str(client_ip);
+                val.push_str(", ");
+            }
             val.push_str(peer_ip);
             val
         }
@@ -1514,6 +1529,17 @@ pub(crate) fn build_xff_value(
         }
         None => peer_ip.to_string(),
     }
+}
+
+/// True when `chain` (a comma-separated XFF value) already lists `client_ip`.
+/// Compares both textually and by parsed `IpAddr` so canonicalization
+/// differences (case, IPv6 zero-compression) don't produce duplicates.
+fn xff_chain_contains(chain: &str, client_ip: &str) -> bool {
+    let client_addr: Option<IpAddr> = client_ip.parse().ok();
+    chain.split(',').any(|entry| {
+        let entry = entry.trim();
+        entry == client_ip || (client_addr.is_some() && entry.parse::<IpAddr>().ok() == client_addr)
+    })
 }
 
 /// RAII guard that decrements the per-IP concurrent request counter on drop.
@@ -21006,6 +21032,31 @@ mod tests {
         assert_eq!(
             build_xff_value(Some("198.51.100.7"), "192.0.2.6", "192.0.2.6", &no_policy),
             "198.51.100.7, 192.0.2.6"
+        );
+
+        // Trusted LB resolving via FERRUM_REAL_IP_HEADER while passing an
+        // XFF chain through verbatim: the resolved client is not in the
+        // chain, so it must be seeded before the peer — backends consuming
+        // XFF must still see the authenticated client.
+        assert_eq!(
+            build_xff_value(Some("198.51.100.7"), "203.0.113.9", "10.0.0.7", &lb_trusted),
+            "198.51.100.7, 203.0.113.9, 10.0.0.7"
+        );
+        // ...but when the resolved client already appears in the chain
+        // (canonicalization differences included), nothing is duplicated.
+        assert_eq!(
+            build_xff_value(
+                Some("198.51.100.7, 203.0.113.9"),
+                "203.0.113.9",
+                "10.0.0.7",
+                &lb_trusted
+            ),
+            "198.51.100.7, 203.0.113.9, 10.0.0.7"
+        );
+        assert_eq!(
+            build_xff_value(Some("2001:DB8::1"), "2001:db8::1", "10.0.0.7", &lb_trusted),
+            "2001:DB8::1, 10.0.0.7",
+            "IPv6 case differences must not duplicate the client in the chain"
         );
     }
 
