@@ -2647,23 +2647,25 @@ async fn run_gateway_svid_file_rotation_loop(
     }
 }
 
-/// Bundle of the four backend pools whose entries are partitioned by SVID
+/// Bundle of the backend pools whose entries are partitioned by SVID
 /// generation. Grouping them keeps the rotation-task signature manageable and
 /// makes "another pool joined the family" a one-line edit.
 ///
 /// NOTE on the asymmetric drain calls: only `connection_pool`, `http2_pool`,
 /// and `grpc_pool` get a `drain_backend_tls_config_cache_svid_generation()`
 /// call on rotation — the H3 pool's TLS config cache is co-located on
-/// `connection_pool.backend_h3_tls_configs`, so it is drained transitively.
-/// All four pools get a `force_drain_svid_generation()` call when the
-/// operator-configured drain window elapses, because each pool keeps its own
-/// `DashMap` of live connections.
+/// `connection_pool.backend_h3_tls_configs`, so it is drained transitively,
+/// and the mesh mTLS pool builds its SPIFFE client config per connect (no
+/// cache to drain). All pools get a `force_drain_svid_generation()` call when
+/// the operator-configured drain window elapses, because each pool keeps its
+/// own `DashMap` of live connections.
 #[derive(Clone)]
 struct BackendPoolFamily {
     connection_pool: Arc<ConnectionPool>,
     http2_pool: Arc<Http2ConnectionPool>,
     grpc_pool: Arc<GrpcConnectionPool>,
     h3_pool: Arc<Http3ConnectionPool>,
+    mesh_mtls_pool: Arc<mesh_mtls_pool::MeshMtlsConnectionPool>,
 }
 
 impl BackendPoolFamily {
@@ -2687,6 +2689,7 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_svid_generation(generation);
         self.grpc_pool.force_drain_svid_generation(generation);
         self.h3_pool.force_drain_svid_generation(generation);
+        self.mesh_mtls_pool.force_drain_svid_generation(generation);
     }
 
     fn force_drain_all(&self) {
@@ -2694,6 +2697,7 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_all();
         self.grpc_pool.force_drain_all();
         self.h3_pool.force_drain_all();
+        self.mesh_mtls_pool.force_drain_all();
     }
 }
 
@@ -2729,8 +2733,8 @@ fn spawn_backend_svid_rotation_task(
         // on graceful shutdown; otherwise each runs to completion independently
         // so the operator's `drain_seconds` window is honoured per-generation
         // even under rotation storms (e.g. a misbehaving CA issuing 30s certs).
-        // Each task only retains four `Arc` pool handles and ends with a
-        // single `invalidate_matching` pass per pool, so memory + CPU cost
+        // Each task only retains the family's `Arc` pool handles and ends with
+        // a single `invalidate_matching` pass per pool, so memory + CPU cost
         // remains O(rotations within drain_seconds) which is bounded by the
         // operator-chosen window.
         let mut pending_force_drains: std::collections::VecDeque<tokio::task::JoinHandle<()>> =
@@ -3021,6 +3025,7 @@ impl ProxyState {
             http2_pool: self.http2_pool.clone(),
             grpc_pool: self.grpc_pool.clone(),
             h3_pool: self.h3_pool.clone(),
+            mesh_mtls_pool: self.mesh_mtls_pool.clone(),
         };
         pools.clear_tls_config_caches();
         pools.force_drain_all();
@@ -3316,12 +3321,15 @@ impl ProxyState {
             gateway_svid_bundle.clone(),
             pool_shard_amount,
         ));
-        let mesh_mtls_pool = Arc::new(mesh_mtls_pool::MeshMtlsConnectionPool::new(
-            global_pool_config.clone(),
-            dns_cache.clone(),
-            gateway_svid_bundle.clone(),
-            pool_shard_amount,
-        ));
+        let mesh_mtls_pool = Arc::new(
+            mesh_mtls_pool::MeshMtlsConnectionPool::new_with_svid_generation(
+                global_pool_config.clone(),
+                dns_cache.clone(),
+                gateway_svid_bundle.clone(),
+                pool_shard_amount,
+                backend_svid_generation.clone(),
+            ),
+        );
         let h3_pool = Arc::new(Http3ConnectionPool::new_with_svid_generation(
             env_config_arc.clone(),
             dns_cache.clone(),
@@ -3446,6 +3454,7 @@ impl ProxyState {
                     http2_pool: http2_pool.clone(),
                     grpc_pool: grpc_pool.clone(),
                     h3_pool: h3_pool.clone(),
+                    mesh_mtls_pool: mesh_mtls_pool.clone(),
                 },
                 health_checker: health_checker.clone(),
                 config: config_arc.clone(),
