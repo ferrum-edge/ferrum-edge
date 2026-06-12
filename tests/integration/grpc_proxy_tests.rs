@@ -934,8 +934,12 @@ async fn grpc_buffered_non_empty_response_sends_status_as_trailer() {
 
 /// Mock gRPC backend that sends a non-empty DATA frame plus a fixed trailer
 /// fixture, with `x-dup-key` present in BOTH the initial headers
-/// (`header-value`) and the trailers (`trailer-value`), and an extra
-/// `x-removed-trailer` trailer for a response hook to strip.
+/// (`header-value`) and the trailers (`trailer-value`), an extra
+/// `x-removed-trailer` trailer for a response hook to strip, an
+/// `x-shadowed-removed` key duplicated across initial headers AND trailers
+/// for a hook to strip from both, and malformed duplicate `grpc-status` /
+/// `grpc-message` initial headers (a non-Trailers-Only response must carry
+/// terminal status only in the trailers).
 async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use http_body::Frame;
     use http_body_util::StreamBody;
@@ -981,6 +985,10 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
                             hyper::header::HeaderName::from_static("x-removed-trailer"),
                             hyper::header::HeaderValue::from_static("should-not-reach-client"),
                         );
+                        trailers.insert(
+                            hyper::header::HeaderName::from_static("x-shadowed-removed"),
+                            hyper::header::HeaderValue::from_static("trailer-secret"),
+                        );
                         let _ = tx.send(Ok(Frame::trailers(trailers))).await;
                     });
 
@@ -991,6 +999,11 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
                         .status(200)
                         .header("content-type", "application/grpc")
                         .header("x-dup-key", "header-value")
+                        .header("x-shadowed-removed", "header-secret")
+                        // Malformed duplicates: terminal status must only ride
+                        // in the trailers for a non-empty response.
+                        .header("grpc-status", "13")
+                        .header("grpc-message", "bogus-initial-header-status")
                         .body(body)
                         .unwrap();
 
@@ -1013,7 +1026,12 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
 ///   must NOT be forwarded in the wire trailers;
 /// - a key the backend sent in BOTH initial headers and trailers must keep the
 ///   backend's true trailer value in the wire TRAILERS frame while the initial
-///   header stays an initial header (H3 bridge wire shape).
+///   header stays an initial header (H3 bridge wire shape);
+/// - a header-shadowed key removed by a hook must be suppressed in BOTH the
+///   initial headers and the wire trailers (no hidden trailer leak);
+/// - malformed duplicate `grpc-status`/`grpc-message` initial headers are
+///   stripped on the non-empty path: terminal status appears ONLY in the
+///   trailers, with the backend's true trailing value.
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys() {
     let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
@@ -1030,7 +1048,8 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
         enabled: true,
         config: serde_json::json!({
             "rules": [
-                { "target": "header", "operation": "remove", "key": "x-removed-trailer" }
+                { "target": "header", "operation": "remove", "key": "x-removed-trailer" },
+                { "target": "header", "operation": "remove", "key": "x-shadowed-removed" }
             ]
         }),
         scope: PluginScope::Proxy,
@@ -1065,7 +1084,12 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
     assert_eq!(response.status(), 200);
     assert!(
         response.headers().get("grpc-status").is_none(),
-        "grpc-status must not appear as initial metadata for non-empty responses"
+        "grpc-status must not appear as initial metadata for non-empty responses, \
+         even when a malformed backend duplicated it into the initial headers"
+    );
+    assert!(
+        response.headers().get("grpc-message").is_none(),
+        "grpc-message must not appear as initial metadata for non-empty responses"
     );
     assert_eq!(
         response
@@ -1078,6 +1102,10 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
     assert!(
         response.headers().get("x-removed-trailer").is_none(),
         "hook-removed key must not appear as an initial header"
+    );
+    assert!(
+        response.headers().get("x-shadowed-removed").is_none(),
+        "hook-removed shadowed key must not appear as an initial header"
     );
 
     let mut saw_data = false;
@@ -1099,7 +1127,14 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
     let trailers = wire_trailers.expect("wire TRAILERS frame missing");
     assert_eq!(
         trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
-        Some("0")
+        Some("0"),
+        "wire trailer must carry the backend's true trailing grpc-status, \
+         not the malformed initial-header duplicate"
+    );
+    assert_eq!(
+        trailers.get("grpc-message").and_then(|v| v.to_str().ok()),
+        Some("OK"),
+        "wire trailer must carry the backend's true trailing grpc-message"
     );
     assert_eq!(
         trailers.get("x-dup-key").and_then(|v| v.to_str().ok()),
@@ -1109,6 +1144,106 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
     assert!(
         trailers.get("x-removed-trailer").is_none(),
         "trailer removed by a response hook must not be forwarded to the client"
+    );
+    assert!(
+        trailers.get("x-shadowed-removed").is_none(),
+        "hook removal of a header-shadowed key must suppress the hidden trailer copy too"
+    );
+}
+
+/// gRPC-Web transformed responses must NOT carry native H2 trailers: the
+/// `grpc_web` plugin re-encodes terminal status as a gRPC-Web trailer frame
+/// appended to the body and relabels the content-type, so also emitting the
+/// reconciled native TRAILERS frame would double-signal terminal status.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_transformed_response_suppresses_native_trailers() {
+    let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
+
+    let mut proxy = create_grpc_proxy("grpc-web-no-native-trailers", "/grpc", backend_addr.port());
+    proxy.response_body_mode = ResponseBodyMode::Buffer;
+    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: "grpc-web-bridge".to_string(),
+    }];
+    let plugin = PluginConfig {
+        id: "grpc-web-bridge".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "grpc_web".to_string(),
+        enabled: true,
+        config: serde_json::json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("grpc-web-no-native-trailers".to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Binary-mode gRPC-Web request: a single empty gRPC DATA frame
+    // (flag 0x00 + 4-byte zero length) so framing is valid end-to-end.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/grpc/my.Service/Unary")
+        .header("content-type", "application/grpc-web+proto")
+        .body(Full::new(Bytes::from_static(&[0u8, 0, 0, 0, 0])))
+        .unwrap();
+
+    let response = sender.send_request(req).await.expect("request send failed");
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/grpc-web+proto"),
+        "response content-type must be rewritten to the gRPC-Web variant"
+    );
+    assert!(
+        response.headers().get("grpc-status").is_none(),
+        "terminal status must ride in the gRPC-Web body trailer frame, \
+         not the initial headers"
+    );
+
+    let mut body_bytes: Vec<u8> = Vec::new();
+    let mut saw_native_trailers = false;
+    let mut body = response.into_body();
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.expect("response frame");
+        if let Some(data) = frame.data_ref() {
+            body_bytes.extend_from_slice(data);
+        }
+        if frame.is_trailers() {
+            saw_native_trailers = true;
+        }
+    }
+
+    assert!(
+        !saw_native_trailers,
+        "gRPC-Web transformed responses must not emit native H2 trailers \
+         (status is already embedded as a gRPC-Web trailer frame in the body)"
+    );
+    assert!(
+        body_bytes
+            .windows(b"grpc-status: 0".len())
+            .any(|w| w == b"grpc-status: 0"),
+        "gRPC-Web body must embed the backend's true trailing grpc-status \
+         in the appended trailer frame"
+    );
+    // The appended gRPC-Web trailer frame is flagged 0x80.
+    assert!(
+        body_bytes.iter().any(|&b| b == 0x80),
+        "gRPC-Web body must contain a trailer frame (flag 0x80)"
     );
 }
 

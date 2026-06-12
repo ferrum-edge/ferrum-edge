@@ -11683,10 +11683,20 @@ async fn handle_proxy_request_inner(
                 // are tracked so the post-hook writeback never copies the
                 // header's value into the wire trailer (the view value for
                 // those keys belongs to the header, not the trailer).
+                //
+                // Exception: the reserved gRPC terminal-status keys
+                // (grpc-status / grpc-message / grpc-status-details-bin) are
+                // trailer-authoritative and never shadowed — a malformed
+                // backend that duplicates them into the initial headers must
+                // not feed plugins (or the wire) the bogus header copy, so
+                // the trailing value wins in the view and the header copy is
+                // stripped on the non-empty wire path below.
                 let mut plugin_response_headers = response_headers.clone();
                 let mut header_shadowed_trailer_keys: HashSet<String> = HashSet::new();
                 for (k, v) in &response_trailers {
-                    if response_headers.contains_key(k) {
+                    if response_headers.contains_key(k)
+                        && !grpc_proxy::is_reserved_grpc_terminal_metadata(k)
+                    {
                         header_shadowed_trailer_keys.insert(k.clone());
                     } else {
                         plugin_response_headers.insert(k.clone(), v.clone());
@@ -11889,11 +11899,15 @@ async fn handle_proxy_request_inner(
                     // matching the pre-split behavior where trailers lived in
                     // the headers map plugins mutated); a changed value is a
                     // hook edit. Keys shadowed by a real backend header were
-                    // never plugin-visible as trailers, so they keep the
-                    // backend's true trailer value.
+                    // never plugin-visible as trailers, so while the key is
+                    // still in the view they keep the backend's true trailer
+                    // value — but a hook that removed the key from the view
+                    // suppresses the hidden trailer too (a security plugin
+                    // stripping a sensitive key must not leak its trailer
+                    // copy on the wire).
                     response_trailers.retain(|k, v| {
                         if header_shadowed_trailer_keys.contains(k) {
-                            return true;
+                            return plugin_response_headers.contains_key(k);
                         }
                         match plugin_response_headers.get(k) {
                             Some(plugin_value) => {
@@ -11921,11 +11935,38 @@ async fn handle_proxy_request_inner(
                     // copies from the initial headers; keys the backend also
                     // sent as real initial headers stay headers — the wire
                     // trailer carries the backend's true trailer value (same
-                    // wire shape as the H3 bridge).
+                    // wire shape as the H3 bridge). Reserved terminal-status
+                    // keys are never shadowed, so a malformed duplicate
+                    // grpc-status initial header is always stripped here:
+                    // status must only appear in the trailers.
                     for k in response_trailers.keys() {
                         if !header_shadowed_trailer_keys.contains(k) {
                             response_headers.remove(k);
                         }
+                    }
+                }
+
+                // A response transform that re-encodes the gRPC terminal
+                // status into the body (e.g. `grpc_web` appends a gRPC-Web
+                // trailer frame and relabels the content-type) leaves the
+                // response no longer native gRPC. Emitting the reconciled
+                // native TRAILERS frame as well would double-signal terminal
+                // status and confuse gRPC-Web clients/intermediaries, so
+                // suppress the wire trailers whenever the final content-type
+                // positively indicates a conversion away from native
+                // `application/grpc` — keyed on the content-type, not on any
+                // specific plugin, so future transforms behave the same. An
+                // absent content-type keeps native gRPC semantics (we are on
+                // the gRPC dispatch path).
+                if !response_trailers.is_empty() {
+                    let converted_away_from_grpc =
+                        response_headers.get("content-type").is_some_and(|ct| {
+                            !crate::proxy::backend_dispatch::is_native_grpc_content_type(
+                                ct.as_bytes(),
+                            )
+                        });
+                    if converted_away_from_grpc {
+                        response_trailers.clear();
                     }
                 }
 
