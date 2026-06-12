@@ -107,14 +107,19 @@ struct StreamBackendRoutingKey {
     backend_port: u16,
     upstream_id: Option<String>,
     upstream_subset: Option<String>,
-    /// Sorted `(host, port)` target set of the referenced upstream (`None`
-    /// when the proxy routes by `backend_host`/`backend_port` directly,
-    /// `Some(empty)` when the upstream no longer exists). A config update can
-    /// change an upstream's targets without touching any proxy field, and
+    /// Sorted `(host, port)` set of the targets this proxy can actually dial
+    /// (`None` when the proxy routes by `backend_host`/`backend_port`
+    /// directly, `Some(empty)` when the upstream no longer exists or the
+    /// subset matches nothing). When `upstream_subset` is set, the set is
+    /// filtered through the same labels-⊆-tags rule the load balancer uses
+    /// to build `subset_indices`, so a subset-label or target-tag edit that
+    /// changes effective membership registers as routing drift even though
+    /// the upstream's full endpoint list is intact. A config update can
+    /// change all of this without touching any proxy field, and
     /// `resolve_backend_target` reads the live load-balancer snapshot — so
-    /// the keep-old-listener guard must treat a target-set change as routing
-    /// drift, or stale cached TLS could be paired with connections dialing
-    /// newly added targets.
+    /// the keep-old-listener guard must treat the change as routing drift,
+    /// or stale cached TLS could be paired with connections dialing newly
+    /// selected targets.
     upstream_targets: Option<Vec<(String, u16)>>,
 }
 
@@ -125,7 +130,32 @@ impl StreamBackendRoutingKey {
                 .upstreams
                 .iter()
                 .find(|u| u.id.as_str() == upstream_id.as_str())
-                .map(|u| u.targets.iter().map(|t| (t.host.clone(), t.port)).collect())
+                .map(|u| {
+                    // Mirror `LoadBalancer::with_subsets_and_port_overrides`:
+                    // a target belongs to a subset when its tags contain
+                    // every subset label. A requested-but-undefined subset
+                    // matches nothing — same as subset selection returning
+                    // `None`.
+                    match proxy.upstream_subset.as_deref() {
+                        Some(subset_name) => u
+                            .subsets
+                            .as_deref()
+                            .and_then(|defs| defs.iter().find(|d| d.name == subset_name))
+                            .map(|def| {
+                                u.targets
+                                    .iter()
+                                    .filter(|t| {
+                                        def.labels
+                                            .iter()
+                                            .all(|(k, v)| t.tags.get(k).is_some_and(|tv| tv == v))
+                                    })
+                                    .map(|t| (t.host.clone(), t.port))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        None => u.targets.iter().map(|t| (t.host.clone(), t.port)).collect(),
+                    }
+                })
                 .unwrap_or_default();
             targets.sort();
             targets
@@ -1986,6 +2016,70 @@ mod tests {
             key_one, key_two,
             "an upstream target-set change must register as routing drift even \
              though no proxy field changed"
+        );
+    }
+
+    #[test]
+    fn stream_backend_routing_key_tracks_subset_membership() {
+        let config =
+            |subset_labels: serde_json::Value, a_tags: serde_json::Value| -> GatewayConfig {
+                serde_json::from_value(serde_json::json!({
+                    "version": "1",
+                    "proxies": [],
+                    "consumers": [],
+                    "plugin_configs": [],
+                    "upstreams": [{
+                        "id": "up-1",
+                        "targets": [
+                            {"host": "a.example", "port": 5001, "tags": a_tags},
+                            {"host": "b.example", "port": 5002, "tags": {"version": "v2"}},
+                        ],
+                        "subsets": [{"name": "v1", "labels": subset_labels}],
+                    }],
+                }))
+                .expect("config deserialize")
+            };
+        let proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "tls-stream",
+            "backend_host": "unused.example",
+            "backend_port": 5000,
+            "backend_scheme": "tcps",
+            "listen_port": 6000,
+            "upstream_id": "up-1",
+            "upstream_subset": "v1",
+        }))
+        .expect("proxy deserialize");
+
+        let v1_is_a = config(
+            serde_json::json!({"version": "v1"}),
+            serde_json::json!({"version": "v1"}),
+        );
+        // Subset label edit re-points "v1" at the v2 target — the upstream's
+        // full endpoint list is unchanged.
+        let v1_is_b = config(
+            serde_json::json!({"version": "v2"}),
+            serde_json::json!({"version": "v1"}),
+        );
+        // Target tag edit evicts a.example from the subset — again without
+        // touching the endpoint list.
+        let a_untagged = config(serde_json::json!({"version": "v1"}), serde_json::json!({}));
+
+        let key_a = StreamBackendRoutingKey::from_proxy(&proxy, &v1_is_a);
+        let key_b = StreamBackendRoutingKey::from_proxy(&proxy, &v1_is_b);
+        let key_untagged = StreamBackendRoutingKey::from_proxy(&proxy, &a_untagged);
+
+        assert_ne!(
+            key_a, key_b,
+            "a subset-label edit that changes effective membership must register as routing drift"
+        );
+        assert_ne!(
+            key_a, key_untagged,
+            "a target-tag edit that changes effective membership must register as routing drift"
+        );
+        assert_eq!(
+            key_a,
+            StreamBackendRoutingKey::from_proxy(&proxy, &v1_is_a),
+            "unchanged subset membership must compare equal"
         );
     }
 }
