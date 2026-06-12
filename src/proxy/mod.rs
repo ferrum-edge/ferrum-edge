@@ -86,7 +86,9 @@ use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::identity::{SharedSvidBundle, SvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
-use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
+use crate::load_balancer::{
+    HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
+};
 use crate::modes::mesh::node_waypoint::{
     NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver,
 };
@@ -1020,34 +1022,40 @@ pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> 
 }
 
 /// Whether an authenticated inbound HBONE CONNECT to `host:port` may be
-/// transparently relayed. SAFE local targets only: a loopback address (the
-/// co-located app — Ferrum's per-workload Ambient/Sidecar model puts the app on
-/// loopback) or an in-mesh workload address+port the slice already declares.
-/// This bounds the terminator to mesh-known destinations, so an authenticated
-/// peer can never use the HBONE listener as an open proxy to arbitrary internal
-/// hosts. (`handle_hbone_request` separately requires the peer to be an
-/// authenticated, trust-domain-verified mesh identity before dialing.)
+/// transparently relayed. SAFE local targets only: a loopback address on an
+/// application port declared by the slice, or an in-mesh workload address+port
+/// the slice already declares. This bounds the terminator to mesh-known
+/// destinations, so an authenticated peer can never use the HBONE listener as
+/// an open proxy to arbitrary internal hosts or undeclared loopback listeners.
+/// (`handle_hbone_request` separately requires the peer to be an authenticated,
+/// trust-domain-verified mesh identity before dialing.)
 fn inbound_hbone_relay_destination_allowed(
     host: &str,
     port: u16,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
 ) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>()
-        && ip.is_loopback()
+    let Some(mesh) = mesh else {
+        return false;
+    };
+
+    if host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
     {
-        return true;
+        return mesh
+            .workloads
+            .iter()
+            .flat_map(|workload| &workload.ports)
+            .any(|workload_port| workload_port.port == port);
     }
+
     // Otherwise the destination must be an in-mesh workload address+port the
     // slice declares — never an arbitrary host. A workload that declares no
     // ports admits any port for its address (the slice does not constrain it).
-    mesh.is_some_and(|mesh| {
-        mesh.workloads.iter().any(|workload| {
-            workload.addresses.iter().any(|addr| addr == host)
-                && (workload.ports.is_empty() || workload.ports.iter().any(|wp| wp.port == port))
-        })
+    mesh.workloads.iter().any(|workload| {
+        workload.addresses.iter().any(|addr| addr == host)
+            && (workload.ports.is_empty() || workload.ports.iter().any(|wp| wp.port == port))
     })
 }
 
@@ -1553,6 +1561,35 @@ fn record_grpc_backend_status_outcome(
     } else {
         cb.record_success(is_half_open_probe);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_grpc_backend_dispatch_outcome(
+    state: &ProxyState,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
+    upstream_target: Option<&Arc<UpstreamTarget>>,
+    final_cb_target_key: Option<&str>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<retry::ErrorClass>,
+    backend_elapsed: Duration,
+) {
+    backend_dispatch::record_backend_outcome_no_conn_end(
+        state,
+        proxy,
+        lb_snapshot,
+        selected_balancer,
+        upstream_target.map(Arc::as_ref),
+        final_cb_target_key,
+        response_status,
+        connection_error,
+        error_class,
+        false,
+        true,
+        backend_elapsed,
+    );
 }
 
 /// Load a gRPC streaming late client-upload overflow flag with `Acquire`
@@ -5853,6 +5890,7 @@ async fn handle_websocket_request_authenticated(
         remote_addr.ip()
     );
     let mut ctx = ctx;
+    let mut current_cb_target_key = cb_target_key;
 
     // Build backend URL using upstream target if available
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
@@ -5879,6 +5917,15 @@ async fn handle_websocket_request_authenticated(
         Some(on_upgrade) => on_upgrade,
         None => {
             error!("Failed to extract OnUpgrade extension from WebSocket request");
+            // The caller's CB check may have claimed a HALF_OPEN probe slot —
+            // release it (gateway-side reject, not a backend outcome) so the
+            // breaker can admit the next probe instead of wedging.
+            release_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                current_cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
             return Ok(build_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 r#"{"error":"Internal server error during WebSocket upgrade"}"#,
@@ -5912,6 +5959,14 @@ async fn handle_websocket_request_authenticated(
                 )
                 .await;
                 record_request(&state, 503);
+                // Gateway-side reject after the CB check — release a claimed
+                // HALF_OPEN probe slot so the breaker doesn't wedge.
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    current_cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
                 return Ok(build_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"WebSocket connection limit exceeded"}"#,
@@ -5998,6 +6053,14 @@ async fn handle_websocket_request_authenticated(
                 )
                 .await;
                 record_request(&state, 503);
+                // Gateway-side reject after the CB check — release a claimed
+                // HALF_OPEN probe slot so the breaker doesn't wedge.
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    current_cb_target_key.as_deref(),
+                    ws_cb_probe_slot_available,
+                );
                 return Ok(build_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"Backend connection limit exceeded"}"#,
@@ -6019,7 +6082,7 @@ async fn handle_websocket_request_authenticated(
                 release_circuit_breaker_probe_on_admission_reject(
                     &state,
                     &proxy,
-                    cb_target_key.as_deref(),
+                    current_cb_target_key.as_deref(),
                     ws_cb_probe_slot_available,
                 );
                 return Ok(handle_backend_admission_rejection(
@@ -6088,6 +6151,9 @@ async fn handle_websocket_request_authenticated(
                     false
                 };
 
+                let mut cb_failure_already_recorded = false;
+                let mut backend_outcome_already_recorded = false;
+
                 if should_retry_ws {
                     if let Some(permits) = backend_admission_permits.take() {
                         permits.record_backend_outcome(BackendAdmissionOutcome {
@@ -6096,6 +6162,7 @@ async fn handle_websocket_request_authenticated(
                             error_class: Some(ws_error_class),
                             backend_elapsed: backend_admission_start.elapsed(),
                         });
+                        backend_outcome_already_recorded = true;
                     }
                     // Safety: should_retry_ws is only true when proxy.retry.is_some()
                     // (see condition above). Fall through to 502 if the invariant
@@ -6119,22 +6186,23 @@ async fn handle_websocket_request_authenticated(
                     // value keeps the invariant readable and survives a
                     // future refactor that moves this block.)
                     if let Some(cb_config) = &proxy.circuit_breaker {
-                        let current_cb_key = current_target
-                            .as_ref()
-                            .map(|t| crate::circuit_breaker::target_key(&t.host, t.port))
-                            .or_else(|| cb_target_key.clone());
                         let cb = state.circuit_breaker_cache.get_or_create(
                             &proxy.id,
-                            current_cb_key.as_deref(),
+                            current_cb_target_key.as_deref(),
                             cb_config,
                         );
                         cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
                         ws_cb_probe_slot_available = false;
+                        cb_failure_already_recorded = true;
                     }
 
                     let delay = retry::retry_delay(retry_config, ws_attempt);
                     tokio::time::sleep(delay).await;
                     ws_attempt += 1;
+
+                    let mut retry_backend_url = current_backend_url.clone();
+                    let mut retry_target = current_target.clone();
+                    let mut retry_cb_target_key = current_cb_target_key.clone();
 
                     // Try a different target on retry if load balancing is configured
                     if let (Some(_upstream_id), Some(prev_target)) =
@@ -6150,7 +6218,7 @@ async fn handle_websocket_request_authenticated(
                             &ctx.headers,
                         )
                     {
-                        current_backend_url = build_websocket_backend_url_with_target(
+                        retry_backend_url = build_websocket_backend_url_with_target(
                             &proxy,
                             &ctx.path,
                             &query_string,
@@ -6159,17 +6227,46 @@ async fn handle_websocket_request_authenticated(
                             strip_len,
                             next.path.as_deref(),
                         );
-                        current_target = Some(next);
+                        retry_cb_target_key =
+                            Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                        retry_target = Some(next);
                     }
 
-                    warn!(
-                        proxy_id = %proxy.id,
-                        attempt = ws_attempt,
-                        max_retries = retry_config.max_retries,
-                        error_class = %ws_error_class,
-                        "Retrying WebSocket backend connection"
-                    );
-                    continue;
+                    let mut retry_admitted_by_cb = true;
+                    if let Some(cb_config) = &proxy.circuit_breaker {
+                        match state.circuit_breaker_cache.can_execute(
+                            &proxy.id,
+                            retry_cb_target_key.as_deref(),
+                            cb_config,
+                        ) {
+                            Ok((_cb, is_half_open_probe)) => {
+                                ws_cb_probe_slot_available = is_half_open_probe;
+                            }
+                            Err(_) => {
+                                retry_admitted_by_cb = false;
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    attempt = ws_attempt,
+                                    "WebSocket retry target rejected by circuit breaker"
+                                );
+                            }
+                        }
+                    }
+
+                    if retry_admitted_by_cb {
+                        current_backend_url = retry_backend_url;
+                        current_target = retry_target;
+                        current_cb_target_key = retry_cb_target_key;
+
+                        warn!(
+                            proxy_id = %proxy.id,
+                            attempt = ws_attempt,
+                            max_retries = retry_config.max_retries,
+                            error_class = %ws_error_class,
+                            "Retrying WebSocket backend connection"
+                        );
+                        continue;
+                    }
                 }
 
                 // No retry — return error. Use the unified
@@ -6187,7 +6284,23 @@ async fn handle_websocket_request_authenticated(
                     error = %e,
                     "WebSocket backend connection failed"
                 );
-                if let Some(permits) = backend_admission_permits.take() {
+                // Record the failure so the breaker / passive health see it
+                // and a claimed HALF_OPEN probe slot is released. Previously
+                // only the retry branch recorded — with retries unconfigured
+                // (the default), WS backend connect failures never fed the
+                // breaker at all on H1/H2, and an admitted probe slot leaked
+                // permanently.
+                if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        current_cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                }
+                if !backend_outcome_already_recorded
+                    && let Some(permits) = backend_admission_permits.take()
+                {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: 502,
                         connection_error: ws_is_pre_wire,
@@ -6258,6 +6371,22 @@ async fn handle_websocket_request_authenticated(
             }
         }
     };
+
+    // Backend handshake succeeded — record the success so the breaker sees a
+    // healthy outcome and, when this request was admitted as a HALF_OPEN
+    // probe, the probe slot is released and the breaker can close. Without
+    // this, every successful WS upgrade admitted as a probe permanently
+    // consumed a `half_open_in_flight` slot, and after `half_open_max_requests`
+    // upgrades the breaker wedged in HALF_OPEN, 503ing ALL traffic to the
+    // target. Mirrors the H3 WS path (`src/http3/websocket.rs`).
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.id,
+            current_cb_target_key.as_deref(),
+            cb_config,
+        );
+        cb.record_success(ws_cb_probe_slot_available);
+    }
 
     let ws_lb_guard =
         LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
@@ -6578,12 +6707,12 @@ fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(
 /// Collect backend WebSocket headers while preserving repeated client-provided
 /// values when the sanitized proxy header map still represents the full raw set.
 ///
-/// `RequestContext::headers` is a `HashMap`, so repeated fields are necessarily
-/// collapsed or comma-folded after materialization. The raw `HeaderMap` is
-/// still available from the upgrade request; use it to retain handshake-
-/// equivalent repeated headers such as multiple `Sec-WebSocket-Protocol`
-/// values, while still honoring plugin-driven strips and rewrites reflected in
-/// `proxy_headers`.
+/// `RequestContext::headers` is a `HashMap`, so repeated fields are folded
+/// after materialization (`; ` for cookie crumbs, `, ` otherwise). The raw
+/// `HeaderMap` is still available from the upgrade request; use it to retain
+/// handshake-equivalent repeated headers such as multiple
+/// `Sec-WebSocket-Protocol` values, while still honoring plugin-driven strips
+/// and rewrites reflected in `proxy_headers`.
 fn collect_forwardable_websocket_headers(
     raw_headers: &hyper::HeaderMap,
     proxy_headers: &HashMap<String, String>,
@@ -6619,7 +6748,7 @@ fn collect_forwardable_websocket_headers(
             .iter()
             .filter_map(|value| value.to_str().ok())
             .collect();
-        if sanitized_value_preserves_raw_values(&raw_values, sanitized_value)
+        if sanitized_value_preserves_raw_values(name.as_str(), &raw_values, sanitized_value)
             || sanitized_value == &materialized_raw_header_value(name.as_str(), &raw_values)
         {
             preserved_raw_names.insert(lower_name);
@@ -6654,15 +6783,25 @@ fn collect_forwardable_websocket_headers(
     forwarded
 }
 
-fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &str) -> bool {
+fn sanitized_value_preserves_raw_values(
+    name: &str,
+    raw_values: &[&str],
+    sanitized_value: &str,
+) -> bool {
     match raw_values {
         [] => false,
         [only] => *only == sanitized_value,
         _ => {
             // This exact fast-path only applies to list-style values where
-            // individual raw values do not contain literal commas. If that is
-            // not true, callers fall back to the shared materialized form.
-            let mut sanitized_values = sanitized_value.split(',').map(str::trim);
+            // individual raw values do not contain the fold delimiter. If
+            // that is not true, callers fall back to the shared materialized
+            // form.
+            let delimiter = if name.eq_ignore_ascii_case("cookie") {
+                ';'
+            } else {
+                ','
+            };
+            let mut sanitized_values = sanitized_value.split(delimiter).map(str::trim);
             raw_values
                 .iter()
                 .map(|value| value.trim())
@@ -6673,11 +6812,7 @@ fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &s
 }
 
 fn materialized_raw_header_value(name: &str, raw_values: &[&str]) -> String {
-    if crate::plugins::is_comma_folded_list_header(name) {
-        raw_values.join(",")
-    } else {
-        raw_values.last().copied().unwrap_or_default().to_string()
-    }
+    raw_values.join(crate::plugins::repeated_request_header_separator(name))
 }
 
 fn proxy_header_entry_case_insensitive<'a>(
@@ -9618,8 +9753,9 @@ async fn handle_proxy_request_inner(
             // through a synthesized proxy instead of 404ing. The synthesized
             // proxy is built only on the inbound listener (`mesh_direction ==
             // Inbound`) and only for a loopback / slice-known workload
-            // destination; `handle_hbone_request` re-checks the
-            // authenticated-peer gate before dialing.
+            // destination, with loopback ports constrained to the slice's
+            // declared workload application ports; `handle_hbone_request`
+            // re-checks the authenticated-peer gate before dialing.
             let hbone_relay = if is_hbone_connect
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
@@ -10371,6 +10507,8 @@ async fn handle_proxy_request_inner(
         // `backend_admission_started_at`. `backend_start` itself stays the
         // origin for full backend-latency metrics (`backend_total_ms`).
         let mut grpc_backend_admission_started_at = backend_start;
+        let mut grpc_final_upstream_target = upstream_target.clone();
+        let mut grpc_lb_connection_guard: Option<LoadBalancerConnectionGuard> = None;
 
         // Streaming-response safety:
         //   * Retries are triggered by CONNECTION errors (BackendUnavailable,
@@ -10534,6 +10672,11 @@ async fn handle_proxy_request_inner(
                     // HALF_OPEN probe; an adaptive-concurrency reject here must
                     // release that probe slot so the breaker can admit the next
                     // probe (the retry path and HTTP/WS/H3 paths do the same).
+                    // Disarm the RAII guard FIRST — its Drop would otherwise
+                    // fire a second `record_neutral(true)` on the same breaker,
+                    // and the spurious extra decrement can free a DIFFERENT
+                    // in-flight probe's slot, over-admitting probes.
+                    grpc_probe_guard.disarm();
                     release_circuit_breaker_probe_on_admission_reject(
                         &state,
                         &proxy,
@@ -10553,6 +10696,10 @@ async fn handle_proxy_request_inner(
                     .await);
                 }
             };
+            grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                upstream_target.clone(),
+                upstream_balancer.clone(),
+            ));
             grpc_backend_admission_started_at = Instant::now();
             let result = grpc_proxy::proxy_grpc_request_core(
                 grpc_method,
@@ -10676,6 +10823,8 @@ async fn handle_proxy_request_inner(
                     Err(rejection) => {
                         // Release the CB HALF_OPEN probe slot before rejecting, as on
                         // the other admission paths (see the split-path branch above).
+                        // Disarm the RAII guard first so its Drop doesn't double-release.
+                        grpc_probe_guard.disarm();
                         release_circuit_breaker_probe_on_admission_reject(
                             &state,
                             &proxy,
@@ -10695,6 +10844,10 @@ async fn handle_proxy_request_inner(
                         .await);
                     }
                 };
+                grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                    upstream_target.clone(),
+                    upstream_balancer.clone(),
+                ));
                 grpc_backend_admission_started_at = Instant::now();
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
@@ -10734,6 +10887,9 @@ async fn handle_proxy_request_inner(
                                 Err(rejection) => {
                                     // Release the CB HALF_OPEN probe slot before
                                     // rejecting, as on the other admission paths.
+                                    // Disarm the RAII guard first so its Drop
+                                    // doesn't double-release.
+                                    grpc_probe_guard.disarm();
                                     release_circuit_breaker_probe_on_admission_reject(
                                         &state,
                                         &proxy,
@@ -10753,6 +10909,10 @@ async fn handle_proxy_request_inner(
                                     .await);
                                 }
                             };
+                        grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                            upstream_target.clone(),
+                            upstream_balancer.clone(),
+                        ));
                         grpc_backend_admission_started_at = Instant::now();
                         let result = grpc_proxy::proxy_grpc_request_core(
                             grpc_method,
@@ -10834,6 +10994,23 @@ async fn handle_proxy_request_inner(
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                let grpc_retry_error_class = match &grpc_result {
+                    Err(error) => Some(retry::classify_grpc_proxy_error(error)),
+                    Ok(_) => None,
+                };
+                record_grpc_backend_dispatch_outcome(
+                    &state,
+                    &proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer.as_ref(),
+                    grpc_current_target.as_ref(),
+                    grpc_current_cb_key.as_deref(),
+                    502,
+                    true,
+                    grpc_retry_error_class,
+                    grpc_backend_admission_started_at.elapsed(),
+                );
+                drop(grpc_lb_connection_guard.take());
 
                 // Record circuit breaker failure for current target
                 if let Some(cb_config) = &proxy.circuit_breaker {
@@ -10864,6 +11041,7 @@ async fn handle_proxy_request_inner(
                 // stays attributed to the target that produced it. Mirrors the
                 // HTTP retry path.
                 let grpc_pre_rotation_cb_key = grpc_current_cb_key.clone();
+                let grpc_pre_rotation_target = grpc_current_target.clone();
 
                 // Try a different target on retry if load balancing is configured
                 if let (Some(_upstream_id), Some(prev_target)) =
@@ -10918,6 +11096,7 @@ async fn handle_proxy_request_inner(
                             // post-dispatch record so we neither double-record
                             // nor attribute to the never-dispatched target.
                             grpc_final_cb_key = grpc_pre_rotation_cb_key;
+                            grpc_final_upstream_target = grpc_pre_rotation_target;
                             grpc_skip_final_cb_record = true;
                             break;
                         }
@@ -10979,6 +11158,11 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     grpc_current_target.as_deref(),
                 );
+                grpc_final_upstream_target = grpc_current_target.clone();
+                grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                    grpc_current_target.clone(),
+                    upstream_balancer.clone(),
+                ));
                 grpc_backend_admission_started_at = Instant::now();
                 grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
                     grpc_method.clone(),
@@ -11097,6 +11281,11 @@ async fn handle_proxy_request_inner(
 
                 // after_proxy plugins run on headers only (body is not yet in memory).
                 let mut response_headers: HashMap<String, String> = grpc_streaming.headers;
+                let grpc_backend_dispatch_status = grpc_proxy::grpc_admission_status_from_maps(
+                    &EMPTY_HEADERS,
+                    &response_headers,
+                    grpc_streaming.status,
+                );
                 {
                     let phase_start = Instant::now();
                     if let Some(reject) = run_after_proxy_hooks(
@@ -11124,6 +11313,19 @@ async fn handle_proxy_request_inner(
                                 backend_elapsed: grpc_backend_admission_elapsed,
                             });
                         }
+                        record_grpc_backend_dispatch_outcome(
+                            &state,
+                            &proxy,
+                            &epoch.load_balancer,
+                            upstream_balancer.as_ref(),
+                            grpc_final_upstream_target.as_ref(),
+                            grpc_final_cb_key.as_deref(),
+                            grpc_backend_dispatch_status,
+                            false,
+                            None,
+                            grpc_backend_admission_elapsed,
+                        );
+                        drop(grpc_lb_connection_guard.take());
                         // Use `original_request_path` so the log records the
                         // path the client actually requested, not the
                         // VirtualService-rewritten backend path in `ctx.path`.
@@ -11262,6 +11464,7 @@ async fn handle_proxy_request_inner(
 
                 if body_exceeded {
                     drop(backend_admission_permits.take());
+                    drop(grpc_lb_connection_guard.take());
                     record_request(&state, 200);
                     return Ok(grpc_proxy::build_grpc_error_response(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -11343,6 +11546,28 @@ async fn handle_proxy_request_inner(
                 if let Some(guard) = per_ip_guard {
                     body = body.with_per_ip_request_guard(guard);
                 }
+                if let Some(guard) = grpc_lb_connection_guard.take() {
+                    body = body.with_lb_connection_guard(guard);
+                }
+                body = body
+                    .with_deferred_backend_dispatch_outcome(
+                        Arc::new(state.clone()),
+                        Arc::clone(&proxy),
+                        Arc::clone(&epoch.load_balancer),
+                        upstream_balancer.clone(),
+                        grpc_final_upstream_target.clone(),
+                        grpc_final_cb_key.clone(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                        false,
+                        true,
+                        grpc_backend_admission_elapsed,
+                    )
+                    .with_grpc_trailer_backend_dispatch_classification()
+                    .with_deferred_dispatch_request_body_exceeded_flag(
+                        grpc_streaming.request_body_exceeded.clone(),
+                    );
                 if let Some(permits) = backend_admission_permits.take() {
                     body = body
                         .with_deferred_backend_admission_outcome(
@@ -11406,27 +11631,47 @@ async fn handle_proxy_request_inner(
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
                 let mut response_body = grpc_resp.body;
+                // `response_trailers` is the backend's untouched trailer map at
+                // this point (moved out of `grpc_resp` above, reconciled with
+                // plugin mutations only later), so the grpc-status mapping is
+                // correct for both the non-empty-body (status in trailers) and
+                // Trailers-Only (status in headers) encodings.
+                let grpc_backend_dispatch_status = grpc_proxy::grpc_admission_status_from_maps(
+                    &response_trailers,
+                    &response_headers,
+                    response_status,
+                );
                 if let Some(permits) = backend_admission_permits.take() {
                     // gRPC application failures ride in the `grpc-status` trailer
                     // (or header, for trailers-only) under HTTP 200, so the HTTP
                     // status alone mislabels an UNAVAILABLE/INTERNAL backend as a
                     // healthy success. Map the effective non-OK gRPC status to HTTP
                     // so a server-side failure surfaces as 5xx and shrinks the limit,
-                    // while client-side statuses stay <500 (healthy). `grpc_resp`
-                    // trailers are still intact here — drained into `response_headers`
-                    // below.
-                    let admission_status = grpc_proxy::grpc_admission_status_from_maps(
-                        &response_trailers,
-                        &response_headers,
-                        response_status,
-                    );
+                    // while client-side statuses stay <500 (healthy). The backend's
+                    // trailers are still intact here — plugin-view merge and wire
+                    // writeback happen below.
                     permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status: admission_status,
+                        response_status: grpc_backend_dispatch_status,
                         connection_error: false,
                         error_class: None,
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                if !grpc_skip_final_cb_record {
+                    record_grpc_backend_dispatch_outcome(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        grpc_final_upstream_target.as_ref(),
+                        grpc_final_cb_key.as_deref(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                        grpc_backend_admission_started_at.elapsed(),
+                    );
+                }
+                drop(grpc_lb_connection_guard.take());
 
                 // Plugins historically saw a merged header+trailer map on the
                 // buffered gRPC path because trailers were inserted into
@@ -11763,28 +12008,48 @@ async fn handle_proxy_request_inner(
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
+                let grpc_backend_connection_error = matches!(
+                    &e,
+                    GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
+                ) || matches!(
+                    &e,
+                    GrpcProxyError::BackendTimeout {
+                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                        ..
+                    }
+                );
                 if !matches!(
                     &e,
                     GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
                 ) && let Some(permits) = backend_admission_permits.take()
                 {
-                    let connection_error = matches!(
-                        &e,
-                        GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
-                    ) || matches!(
-                        &e,
-                        GrpcProxyError::BackendTimeout {
-                            kind: grpc_proxy::GrpcTimeoutKind::Connect,
-                            ..
-                        }
-                    );
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: 502,
-                        connection_error,
+                        connection_error: grpc_backend_connection_error,
                         error_class: Some(grpc_error_class),
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                if !grpc_skip_final_cb_record
+                    && !matches!(
+                        &e,
+                        GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
+                    )
+                {
+                    record_grpc_backend_dispatch_outcome(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        grpc_final_upstream_target.as_ref(),
+                        grpc_final_cb_key.as_deref(),
+                        502,
+                        grpc_backend_connection_error,
+                        Some(grpc_error_class),
+                        grpc_backend_admission_started_at.elapsed(),
+                    );
+                }
+                drop(grpc_lb_connection_guard.take());
                 if grpc_error_class == retry::ErrorClass::PortExhaustion {
                     state.overload.record_port_exhaustion();
                 }
@@ -21235,15 +21500,15 @@ mod tests {
         use crate::identity::spiffe::{SpiffeId, TrustDomain};
         use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadPort, WorkloadSelector};
 
-        // Loopback is always a safe relay target (the co-located app), even
-        // with no slice context.
-        assert!(inbound_hbone_relay_destination_allowed(
+        // With no slice context, even loopback is refused: the relay must not
+        // become a localhost open proxy to arbitrary gateway-host ports.
+        assert!(!inbound_hbone_relay_destination_allowed(
             "127.0.0.1",
             8080,
             None
         ));
-        assert!(inbound_hbone_relay_destination_allowed("::1", 8080, None));
-        assert!(inbound_hbone_relay_destination_allowed(
+        assert!(!inbound_hbone_relay_destination_allowed("::1", 8080, None));
+        assert!(!inbound_hbone_relay_destination_allowed(
             "localhost",
             8080,
             None
@@ -21275,7 +21540,35 @@ mod tests {
             service_account: None,
             pod_uid: None,
         });
-        // Now the workload's exact address+port is allowed...
+        // Now the workload's declared application port is allowed on loopback...
+        assert!(inbound_hbone_relay_destination_allowed(
+            "127.0.0.1",
+            8080,
+            Some(&mesh)
+        ));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "::1",
+            8080,
+            Some(&mesh)
+        ));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "localhost",
+            8080,
+            Some(&mesh)
+        ));
+        // ...but undeclared loopback ports remain refused.
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "127.0.0.1",
+            9999,
+            Some(&mesh)
+        ));
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "localhost",
+            9999,
+            Some(&mesh)
+        ));
+
+        // The workload's exact non-loopback address+port is allowed...
         assert!(inbound_hbone_relay_destination_allowed(
             "10.1.2.3",
             8080,

@@ -70,6 +70,82 @@ fn raw_header_values_exposes_all_duplicate_field_lines() {
 }
 
 #[test]
+fn materialize_headers_reassembles_cookie_crumbs_with_semicolon_space() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    let mut raw = HeaderMap::new();
+    raw.append("cookie", "session=abc".parse().unwrap());
+    raw.append("cookie", "theme=dark".parse().unwrap());
+    raw.append("cookie", "csrf=def".parse().unwrap());
+    ctx.set_raw_headers(raw);
+
+    ctx.materialize_headers();
+
+    assert_eq!(
+        ctx.headers.get("cookie").map(String::as_str),
+        Some("session=abc; theme=dark; csrf=def")
+    );
+}
+
+#[test]
+fn materialize_headers_comma_folds_repeated_request_fields() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    let mut raw = HeaderMap::new();
+    raw.append("x-forwarded-for", "198.51.100.10".parse().unwrap());
+    raw.append("x-forwarded-for", "203.0.113.77".parse().unwrap());
+    raw.append("accept", "application/json".parse().unwrap());
+    raw.append("accept", "text/plain".parse().unwrap());
+    ctx.set_raw_headers(raw);
+
+    ctx.materialize_headers();
+
+    assert_eq!(
+        ctx.headers.get("x-forwarded-for").map(String::as_str),
+        Some("198.51.100.10, 203.0.113.77")
+    );
+    assert_eq!(
+        ctx.headers.get("accept").map(String::as_str),
+        Some("application/json, text/plain")
+    );
+}
+
+#[test]
+fn materialize_headers_folds_duplicate_connection_lines() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    let mut raw = HeaderMap::new();
+    raw.append("connection", "x-one".parse().unwrap());
+    raw.append("connection", "x-two, x-three".parse().unwrap());
+    ctx.set_raw_headers(raw);
+
+    ctx.materialize_headers();
+
+    assert_eq!(
+        ctx.headers.get("connection").map(String::as_str),
+        Some("x-one, x-two, x-three")
+    );
+}
+
+#[test]
+fn materialize_headers_skips_reserved_identity_headers_even_when_repeated() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    let mut raw = HeaderMap::new();
+    raw.append("x-consumer-username", "spoofed".parse().unwrap());
+    raw.append("x-consumer-username", "also-spoofed".parse().unwrap());
+    raw.append("x-consumer-custom-id", "custom".parse().unwrap());
+    raw.append("x-forwarded-for", "198.51.100.10".parse().unwrap());
+    raw.append("x-forwarded-for", "203.0.113.77".parse().unwrap());
+    ctx.set_raw_headers(raw);
+
+    ctx.materialize_headers();
+
+    assert!(!ctx.headers.contains_key("x-consumer-username"));
+    assert!(!ctx.headers.contains_key("x-consumer-custom-id"));
+    assert_eq!(
+        ctx.headers.get("x-forwarded-for").map(String::as_str),
+        Some("198.51.100.10, 203.0.113.77")
+    );
+}
+
+#[test]
 fn raw_header_get_returns_none_after_materialization() {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
     let mut raw = HeaderMap::new();

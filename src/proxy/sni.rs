@@ -7,17 +7,31 @@
 /// A typical ClientHello is 200-600 bytes; 4096 covers large cipher suite lists.
 const MAX_CLIENT_HELLO_LEN: usize = 4096;
 
+/// Polling interval between peeks while waiting for the rest of a partially
+/// arrived ClientHello (mirrors `STREAM_FIRST_BYTES_PEEK_RETRY_INTERVAL` in
+/// `tcp_proxy.rs` — `peek()` returns as soon as ≥1 byte is readable, so
+/// back-to-back peeks would busy-loop).
+const SNI_PEEK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Extract the SNI hostname from a TLS ClientHello by peeking at a TCP stream.
 ///
 /// Uses `TcpStream::peek()` to read bytes without consuming them, so the same
 /// stream can be forwarded to the backend with the ClientHello intact.
 ///
 /// `handshake_timeout` bounds how long the peek can wait for the ClientHello
-/// before giving up. A `None` value preserves the unbounded behavior used by
+/// before giving up. A `None` value preserves the single-peek behavior used by
 /// internal callers that have already enforced a deadline elsewhere; passthrough
 /// listeners pass `Some(d)` (mapped from `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`)
 /// so a peer that opens a TCP connection and sends nothing cannot park a
 /// connection-handler task indefinitely.
+///
+/// When a deadline is set, the peek LOOPS until the full first TLS record
+/// (`5 + record_len` bytes, capped at [`MAX_CLIENT_HELLO_LEN`]) is buffered.
+/// `peek()` returns as soon as ≥1 byte is readable, so a single peek sees a
+/// truncated ClientHello whenever it spans multiple TCP segments — routine for
+/// modern ~1.7 KB post-quantum ClientHellos — and a truncated parse silently
+/// misroutes the connection to the catch-all proxy. Mirrors the bounded peek
+/// loop in `tcp_proxy::peek_tcp_first_bytes`.
 ///
 /// Returns `None` if the data is not a valid TLS ClientHello, has no SNI
 /// extension, the peek fails, or the timeout fires.
@@ -26,10 +40,19 @@ pub async fn extract_sni_from_tcp_stream(
     handshake_timeout: Option<std::time::Duration>,
 ) -> Option<String> {
     let mut buf = vec![0u8; MAX_CLIENT_HELLO_LEN];
-    let peek_fut = stream.peek(&mut buf);
-    let n = match handshake_timeout {
-        Some(d) => match tokio::time::timeout(d, peek_fut).await {
-            Ok(Ok(n)) => n,
+    let Some(d) = handshake_timeout else {
+        // No deadline: take a single peek and never loop, so a stalled peer
+        // cannot park the task waiting for a record that never completes.
+        let n = stream.peek(&mut buf).await.ok()?;
+        return extract_sni_from_client_hello(&buf[..n]);
+    };
+
+    let deadline = tokio::time::Instant::now() + d;
+    let mut have = 0usize;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {
+            Ok(Ok(0)) => return None, // EOF before a complete ClientHello
+            Ok(Ok(n)) => have = n,
             Ok(Err(_)) => return None,
             Err(_) => {
                 let peer = stream
@@ -39,14 +62,38 @@ pub async fn extract_sni_from_tcp_stream(
                 tracing::debug!(
                     peer = %peer,
                     timeout_ms = d.as_millis() as u64,
-                    "TCP passthrough SNI peek timed out before ClientHello arrived"
+                    buffered = have,
+                    "TCP passthrough SNI peek timed out before full ClientHello arrived"
                 );
-                return None;
+                // Parse whatever prefix was observed — a complete-but-slow
+                // record already parsed below, so this only salvages the
+                // (unlikely) case where SNI sits inside the partial prefix.
+                return extract_sni_from_client_hello(&buf[..have]);
             }
-        },
-        None => peek_fut.await.ok()?,
-    };
-    extract_sni_from_client_hello(&buf[..n])
+        }
+        // Reject non-TLS prefixes as soon as the first byte is visible. Waiting
+        // for the full record header would let one malformed byte park this
+        // task until the handshake timeout.
+        if have >= 1 && buf[0] != 0x16 {
+            return None;
+        }
+
+        // Need the 5-byte record header to know the full record length.
+        if have >= 5 {
+            let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+            let want = (5 + record_len).min(MAX_CLIENT_HELLO_LEN);
+            if have >= want {
+                // Full first record buffered.
+                return extract_sni_from_client_hello(&buf[..have]);
+            }
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return extract_sni_from_client_hello(&buf[..have]);
+        }
+        let wake = (now + SNI_PEEK_RETRY_INTERVAL).min(deadline);
+        tokio::time::sleep_until(wake).await;
+    }
 }
 
 /// Extract the SNI hostname from a TLS ClientHello byte slice.
@@ -317,6 +364,7 @@ pub fn resolve_proxy_by_sni<'a>(
     config: &crate::config::types::GatewayConfig,
 ) -> Option<&'a str> {
     let mut fallback: Option<&'a str> = None;
+    let mut wildcard_match: Option<&'a str> = None;
 
     for proxy_id in proxy_ids {
         let Some(proxy) = config.proxies.iter().find(|p| p.id == *proxy_id) else {
@@ -333,13 +381,22 @@ pub fn resolve_proxy_by_sni<'a>(
 
         if let Some(hostname) = sni {
             for host in &proxy.hosts {
-                if host == hostname || crate::config::types::wildcard_matches(host, hostname) {
+                if host == hostname {
+                    // Exact match wins immediately — a wildcard proxy listed
+                    // earlier in `proxy_ids` must not steal traffic from an
+                    // exact-host proxy (routing tier order: exact, wildcard,
+                    // catch-all).
                     return Some(proxy_id.as_str());
+                }
+                if wildcard_match.is_none()
+                    && crate::config::types::wildcard_matches(host, hostname)
+                {
+                    wildcard_match = Some(proxy_id.as_str());
                 }
             }
         }
     }
 
-    // No exact/wildcard match — use fallback (catch-all proxy) if available
-    fallback
+    // No exact match — first wildcard match, then catch-all fallback
+    wildcard_match.or(fallback)
 }
