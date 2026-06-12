@@ -39,6 +39,12 @@ struct ListenerHandle {
     frontend_tls: bool,
     passthrough: bool,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
+    /// Backend routing snapshot taken when this TCP+TLS listener was spawned
+    /// (`None` for non-TcpTls listeners). Compared against the live config in
+    /// the keep-old-listener guard so an invalid TLS rotation bundled with a
+    /// routing change tears the listener down instead of silently pairing the
+    /// stale cached TLS config with connections routed to a new backend.
+    backend_routing_key: Option<StreamBackendRoutingKey>,
     /// Sorted SNI-group member proxy IDs for shared `__sni_{port}` passthrough
     /// listeners (`None` for individual listeners). Part of the restart key:
     /// the accept loop captures the candidate-ID list at spawn, so a
@@ -80,6 +86,31 @@ struct BackendTlsReloadKey {
     san_allow_list: Vec<String>,
 }
 
+/// Backend routing identity for a TCP+TLS stream proxy, captured at listener
+/// spawn. Routing itself is read live per connection (via the request epoch),
+/// so a routing change alone never restarts a listener — this snapshot exists
+/// only to gate the keep-old-listener path on backend TLS rotation: keeping a
+/// listener's stale cached TLS config is only safe while its connections
+/// still route to the same backend the cache was built alongside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StreamBackendRoutingKey {
+    backend_host: String,
+    backend_port: u16,
+    upstream_id: Option<String>,
+    upstream_subset: Option<String>,
+}
+
+impl StreamBackendRoutingKey {
+    fn from_proxy(proxy: &Proxy) -> Self {
+        Self {
+            backend_host: proxy.backend_host.clone(),
+            backend_port: proxy.backend_port,
+            upstream_id: proxy.upstream_id.clone(),
+            upstream_subset: proxy.upstream_subset.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BackendTlsMaterialReloadKey {
     /// Stable, non-secret source identifier (inline PEM is digested — same
@@ -93,6 +124,33 @@ struct BackendTlsMaterialReloadKey {
 }
 
 impl BackendTlsReloadKey {
+    /// True when `other` references the same TLS *source configuration* as
+    /// `self`: verify flag, SAN allow-list, and the (non-fingerprint) source
+    /// identity of CA / client cert / client key are all unchanged. When this
+    /// holds, any difference between the two keys can only be rotated
+    /// material *content* under the same configured sources — the case the
+    /// keep-old-listener path in [`StreamListenerManager::reconcile`] is
+    /// allowed to ride out. A source identity change (new path/URI, source
+    /// added or removed, verify or SAN change) is a deliberate config edit
+    /// and must NOT be treated as an in-place rotation.
+    fn same_tls_sources(&self, other: &Self) -> bool {
+        fn source_matches(
+            a: &Option<BackendTlsMaterialReloadKey>,
+            b: &Option<BackendTlsMaterialReloadKey>,
+        ) -> bool {
+            match (a, b) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.source == b.source,
+                _ => false,
+            }
+        }
+        self.verify_server_cert == other.verify_server_cert
+            && self.san_allow_list == other.san_allow_list
+            && source_matches(&self.server_ca_cert, &other.server_ca_cert)
+            && source_matches(&self.client_cert, &other.client_cert)
+            && source_matches(&self.client_key, &other.client_key)
+    }
+
     fn from_proxy(proxy: &Proxy, global_tls_ca_bundle_path: Option<&str>) -> Self {
         let server_ca_cert_source = proxy
             .resolved_tls
@@ -803,6 +861,28 @@ impl StreamListenerManager {
         // Stop listeners for removed proxies or changed config
         let mut to_remove = Vec::new();
         for (key, handle) in listeners.iter() {
+            // A listener task that already exited is dead capacity. The
+            // spawned task's own TLS prebuild or socket bind can fail AFTER
+            // reconcile's validation + port probe passed (TOCTOU: material
+            // rotated away or the port was grabbed in the window), and the
+            // accept loop itself can return an error. The handle's keys still
+            // match the desired config, so without this check every later
+            // reconcile would see no drift and never restart the dead
+            // listener. Treat a finished task as drifted: drop the handle and
+            // let the start loop below re-validate and re-bind. Failures
+            // surface in `bind_failures` and are retried on the next
+            // reconcile; this never crashes reconcile.
+            if handle.join_handle.is_finished() {
+                warn!(
+                    listener_key = %key,
+                    port = handle.listen_port,
+                    scheme = %handle.scheme,
+                    "Stream listener task exited; scheduling restart on this reconcile"
+                );
+                to_remove.push(key.clone());
+                continue;
+            }
+
             let Some((port, scheme, frontend_tls, passthrough, backend_tls_reload_key, sni_ids)) =
                 effective_desired.get(key)
             else {
@@ -838,9 +918,50 @@ impl StreamListenerManager {
             // handle keeps its previous reload key, so every subsequent
             // reconcile re-detects the drift and retries once the material is
             // fixed.
+            //
+            // The keep-old path applies ONLY to a pure in-place content
+            // rotation: the proxy's TLS *source configuration* (verify flag,
+            // SAN allow-list, CA / client cert / client key source identity)
+            // AND its backend routing fields must both be unchanged, i.e. the
+            // only difference is rotated content under the same sources.
+            // Decision matrix:
+            //
+            //   TLS sources | backend routing | new TLS valid | action
+            //   ------------+-----------------+---------------+-----------------------------
+            //   unchanged   | unchanged       | valid         | restart with fresh config
+            //   unchanged   | unchanged       | invalid       | KEEP OLD listener, retry
+            //   changed     | (any)           | (any)         | normal teardown + restart;
+            //   unchanged   | changed         | (any)         |   invalid TLS -> port closed
+            //                                                 |   + bind_failures visible
+            //
+            // Rationale for the fall-through rows: backend routing
+            // (backend_host / backend_port / upstream) is read live per
+            // connection from the request epoch, so a single config update can
+            // change routing without changing listener identity. Keeping the
+            // old listener in that case would pair its stale cached TLS (old
+            // client cert / CA) with connections that now route to the NEW
+            // backend — a silently persisting hybrid. A deliberate TLS source
+            // change with broken material must likewise fail loudly (clean
+            // teardown, port closed, failure reported) instead of serving
+            // stale material from the previous sources.
             if !identity_changed && *scheme == BackendScheme::Tcps {
                 let proxy_id = sni_ids.as_ref().and_then(|ids| ids.first()).unwrap_or(key);
-                if let Err(msg) = self.validate_backend_tls_config(&current_config, proxy_id, *port)
+                let content_only_rotation =
+                    match (&handle.backend_tls_reload_key, backend_tls_reload_key) {
+                        (Some(old), Some(new)) => old.same_tls_sources(new),
+                        _ => false,
+                    };
+                let current_routing_key = current_config
+                    .proxies
+                    .iter()
+                    .find(|p| p.id.as_str() == proxy_id.as_str())
+                    .map(StreamBackendRoutingKey::from_proxy);
+                let routing_unchanged = handle.backend_routing_key.is_some()
+                    && handle.backend_routing_key == current_routing_key;
+                if content_only_rotation
+                    && routing_unchanged
+                    && let Err(msg) =
+                        self.validate_backend_tls_config(&current_config, proxy_id, *port)
                 {
                     error!(
                         proxy_id = %proxy_id,
@@ -1185,6 +1306,19 @@ impl StreamListenerManager {
                 "Started stream listener"
             );
 
+            // Snapshot routing identity for TCP+TLS listeners so the
+            // keep-old-listener path on TLS rotation can verify routing has
+            // not drifted since this listener's backend TLS cache was built.
+            let backend_routing_key = if backend_tls_reload_key.is_some() {
+                current_config
+                    .proxies
+                    .iter()
+                    .find(|p| p.id.as_str() == proxy_id.as_str())
+                    .map(StreamBackendRoutingKey::from_proxy)
+            } else {
+                None
+            };
+
             listeners.insert(
                 key.clone(),
                 ListenerHandle {
@@ -1195,6 +1329,7 @@ impl StreamListenerManager {
                     frontend_tls: *frontend_tls,
                     passthrough: *passthrough,
                     backend_tls_reload_key: backend_tls_reload_key.clone(),
+                    backend_routing_key,
                     sni_ids: sni_ids.clone(),
                     started,
                     tcp_metrics,
@@ -1593,6 +1728,71 @@ mod tests {
             key.fingerprint.starts_with("sha256:"),
             "inline PEM should fingerprint its content: {}",
             key.fingerprint
+        );
+    }
+
+    #[test]
+    fn same_tls_sources_distinguishes_content_rotation_from_source_or_policy_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, b"first-ca").expect("write first ca");
+        let ca_path_str = ca_path
+            .to_str()
+            .expect("test temp path must be utf-8 for proxy config");
+        let other_ca_path = dir.path().join("other-ca.pem");
+        std::fs::write(&other_ca_path, b"other-ca").expect("write other ca");
+        let other_ca_path_str = other_ca_path
+            .to_str()
+            .expect("test temp path must be utf-8 for proxy config");
+
+        let key = |source: &str, san: Vec<String>| BackendTlsReloadKey {
+            verify_server_cert: true,
+            server_ca_cert: Some(BackendTlsMaterialReloadKey::from_source_value(
+                source,
+                MaterialKind::CaBundle,
+            )),
+            client_cert: None,
+            client_key: None,
+            san_allow_list: san,
+        };
+
+        let original = key(ca_path_str, vec![]);
+
+        // In-place content rotation: same source, new bytes -> same sources,
+        // different key (eligible for the keep-old path).
+        std::fs::write(&ca_path, b"second-ca").expect("rotate ca");
+        let rotated = key(ca_path_str, vec![]);
+        assert_ne!(original, rotated, "rotation must change the key");
+        assert!(
+            original.same_tls_sources(&rotated),
+            "in-place rotation keeps the same source identity"
+        );
+
+        // Source path change -> NOT a content-only rotation.
+        let new_source = key(other_ca_path_str, vec![]);
+        assert!(
+            !original.same_tls_sources(&new_source),
+            "a different CA source must not count as an in-place rotation"
+        );
+
+        // SAN allow-list change -> NOT a content-only rotation.
+        let san_changed = key(ca_path_str, vec!["backend.example".to_string()]);
+        assert!(
+            !original.same_tls_sources(&san_changed),
+            "a SAN allow-list change must not count as an in-place rotation"
+        );
+
+        // Source removed entirely -> NOT a content-only rotation.
+        let removed = BackendTlsReloadKey {
+            verify_server_cert: true,
+            server_ca_cert: None,
+            client_cert: None,
+            client_key: None,
+            san_allow_list: vec![],
+        };
+        assert!(
+            !original.same_tls_sources(&removed),
+            "removing a source must not count as an in-place rotation"
         );
     }
 }

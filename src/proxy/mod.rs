@@ -3029,9 +3029,33 @@ impl ProxyState {
         self.health_checker
             .restart_with_shutdown(&config, self.health_check_shutdown_rx.clone());
 
+        // TCP+TLS stream listeners cache their backend `ClientConfig` at
+        // spawn and only recompute the content fingerprints in their reload
+        // keys inside `StreamListenerManager::reconcile()`. The live-reload
+        // watcher observes the same stream-proxy TLS sources (see
+        // `collect_backend_tls_watched_sources`), so a same-path CA / client
+        // cert rotation must also drive a stream reconcile here — otherwise
+        // stream listeners keep the stale cached config until an unrelated
+        // config delta or a restart. Spawned so this synchronous rebuild
+        // callback (invoked from the watcher task) never blocks on the
+        // listeners mutex; reconcile itself never crashes and reports
+        // per-listener failures, which we surface as warnings.
+        let stream_listener_manager = self.stream_listener_manager.clone();
+        tokio::spawn(async move {
+            let failures = stream_listener_manager.reconcile().await;
+            for (proxy_id, port, err) in &failures {
+                warn!(
+                    proxy_id = %proxy_id,
+                    port = port,
+                    "Stream listener reconcile after backend TLS material reload reported a failure: {}",
+                    err
+                );
+            }
+        });
+
         info!(
             validated_backend_tls_configs = validated,
-            "Backend TLS material reloaded; backend client pools were drained"
+            "Backend TLS material reloaded; backend client pools were drained and stream listeners reconciled"
         );
         Ok(())
     }
