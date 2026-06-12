@@ -151,6 +151,11 @@ impl HbonePoolError {
 /// task ever consumes the records, so the registry must be capped or a
 /// rotation storm grows it unbounded.
 const MAX_RETIRED_SVID_GENERATIONS: usize = 16;
+/// Upper bound on fingerprints filed under one generation. Normally a
+/// generation retires exactly one fingerprint; a frozen generation counter
+/// (starved rotation consumer) funnels every rotation into one bucket, which
+/// must not grow unbounded either.
+const MAX_RETIRED_FINGERPRINTS_PER_GENERATION: usize = 8;
 
 pub struct HboneConnectionPool {
     entries: DashMap<String, Vec<HbonePoolEntry>>,
@@ -184,6 +189,7 @@ struct HboneSvidIdentityCache {
 }
 
 impl HboneConnectionPool {
+    #[allow(dead_code)] // Used by tests and external lib callers; binary wires the shared generation counter.
     pub fn new(
         pool_config: PoolConfig,
         dns_cache: DnsCache,
@@ -299,12 +305,17 @@ impl HboneConnectionPool {
         let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
         let identity = bundle.spiffe_id.clone();
         let fingerprint: Arc<str> = Arc::from(svid_fingerprint(bundle)?);
-        if let Some(previous) = cached.as_ref()
-            && previous.fingerprint.as_ref() != fingerprint.as_ref()
-        {
-            // The fingerprint rotated: file the outgoing one under the
+        if let Some(previous) = cached.as_ref() {
+            // The SVID slot rotated: file the outgoing fingerprint under the
             // generation it was current for, so the delayed drain task can
-            // resolve `force_drain_svid_generation(old_gen)` to it.
+            // resolve `force_drain_svid_generation(old_gen)` to it. Slot
+            // stores are change-gated by the rotation watcher, so EVERY
+            // rebuild is a genuine material change — record even when the
+            // fingerprint is unchanged (a trust-bundle-only rotation keeps
+            // the leaf, but sessions verified against the previous bundle
+            // must still not outlive the drain window). A same-as-current
+            // fingerprint record makes that drain force a one-time reconnect
+            // wave for keys that are also current; that churn is the intent.
             self.record_retired_fingerprint(previous.svid_generation, previous.fingerprint.clone());
         }
         self.svid_identity_cache
@@ -318,6 +329,13 @@ impl HboneConnectionPool {
     }
 
     fn record_retired_fingerprint(&self, generation: u64, fingerprint: Arc<str>) {
+        // Bound the per-generation list as well as the generation count: when
+        // the rotation consumer is starved or dead, every rotation stamps the
+        // same frozen generation and would grow one Vec unbounded while the
+        // key-count cap below never trips. Overflow is drained immediately
+        // (early is safe, never is not). Drains happen after the shard guard
+        // is released.
+        let mut overflowed: Vec<Arc<str>> = Vec::new();
         {
             let mut retired = self
                 .retired_svid_fingerprints
@@ -329,10 +347,20 @@ impl HboneConnectionPool {
             {
                 retired.push(fingerprint);
             }
+            while retired.len() > MAX_RETIRED_FINGERPRINTS_PER_GENERATION {
+                overflowed.push(retired.remove(0));
+            }
+        }
+        if !overflowed.is_empty() {
+            self.drain_retired_fingerprints(&overflowed);
         }
         // Cap the registry: with the drain window disabled nothing consumes
         // these records, and a rotation storm must not grow them unbounded.
-        // Cold path (rotation only), so the min-scan eviction is fine.
+        // An evicted record's drain timer may not have fired yet (or drains
+        // may be disabled entirely) — dropping it silently would leak its
+        // sessions past the configured drain window, so drain the evicted
+        // fingerprints immediately: early is safe, never is not. Cold path
+        // (rotation only), so the min-scan eviction is fine.
         while self.retired_svid_fingerprints.len() > MAX_RETIRED_SVID_GENERATIONS {
             let Some(oldest) = self
                 .retired_svid_fingerprints
@@ -342,36 +370,15 @@ impl HboneConnectionPool {
             else {
                 break;
             };
-            self.retired_svid_fingerprints.remove(&oldest);
+            if let Some((_, evicted)) = self.retired_svid_fingerprints.remove(&oldest) {
+                self.drain_retired_fingerprints(&evicted);
+            }
         }
     }
 
-    /// Drain pool entries belonging to the retired SVID `generation`.
-    ///
-    /// Mirrors the `SvidGenerationMatcher` semantics of the HTTP/H2/gRPC/H3
-    /// pools: only the passed generation's entries are removed, so overlapping
-    /// rotation drain windows (A→B→C within one
-    /// `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` window) never drain a newer
-    /// generation's connections before that generation's own timer fires.
-    /// HBONE keys embed the SVID *fingerprint* rather than the generation, so
-    /// the identity cache records which fingerprint was current under each
-    /// generation and this method resolves the passed generation through that
-    /// registry.
-    pub fn force_drain_svid_generation(&self, generation: u64) {
-        // Refresh the identity cache first so a rotation with no HBONE traffic
-        // since the SVID slot swap still records the outgoing fingerprint.
-        if self.current_svid_identity_cached().is_err() {
-            // No SVID in the slot: every pooled connection is stale.
-            self.force_drain_all();
-            return;
-        }
-
-        let Some((_, retired)) = self.retired_svid_fingerprints.remove(&generation) else {
-            // Nothing was retired under this generation: either its
-            // fingerprint is still current or it never carried pool entries.
-            return;
-        };
-
+    /// Remove every pool entry and creation lock whose key embeds one of the
+    /// `retired` SVID fingerprints.
+    fn drain_retired_fingerprints(&self, retired: &[Arc<str>]) {
         let fingerprint_retired = |key: &str| {
             hbone_key_svid_fingerprint(key)
                 .is_some_and(|fingerprint| retired.iter().any(|fp| fp.as_ref() == fingerprint))
@@ -387,6 +394,58 @@ impl HboneConnectionPool {
         self.creation_locks
             .retain(|key, _| !fingerprint_retired(key));
         record_hbone_evictions(evicted);
+    }
+
+    /// Drain pool entries belonging to the retired SVID `generation` — and to
+    /// any older generation whose record is still pending.
+    ///
+    /// Mirrors the `SvidGenerationMatcher` semantics of the HTTP/H2/gRPC/H3
+    /// pools: generations NEWER than the passed one are never touched, so
+    /// overlapping rotation drain windows (A→B→C within one
+    /// `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` window) never drain a newer
+    /// generation's connections before that generation's own timer fires.
+    /// HBONE keys embed the SVID *fingerprint* rather than the generation, so
+    /// the identity cache records which fingerprint was current under each
+    /// generation and this method resolves the passed generation through that
+    /// registry.
+    ///
+    /// The sweep is `<= generation` rather than `== generation` to close the
+    /// slot-swap/generation-store race: the rotation watcher swaps the SVID
+    /// slot BEFORE the async rotation consumer advances
+    /// `backend_svid_generation`, so traffic landing in that window stamps the
+    /// incoming fingerprint with the outgoing generation and the next rotation
+    /// files it one generation too low. Drain timers fire in rotation order
+    /// with equal delays, so a record misfiled under an already-drained older
+    /// generation is picked up by the next drain instead of leaking until idle
+    /// pruning.
+    pub fn force_drain_svid_generation(&self, generation: u64) {
+        // Refresh the identity cache first so a rotation with no HBONE traffic
+        // since the SVID slot swap still records the outgoing fingerprint.
+        if self.current_svid_identity_cached().is_err() {
+            // No SVID in the slot: every pooled connection is stale.
+            self.force_drain_all();
+            return;
+        }
+
+        let stale_generations: Vec<u64> = self
+            .retired_svid_fingerprints
+            .iter()
+            .map(|entry| *entry.key())
+            .filter(|recorded| *recorded <= generation)
+            .collect();
+        let mut retired: Vec<Arc<str>> = Vec::new();
+        for stale in stale_generations {
+            if let Some((_, fingerprints)) = self.retired_svid_fingerprints.remove(&stale) {
+                retired.extend(fingerprints);
+            }
+        }
+        if retired.is_empty() {
+            // Nothing was retired at or before this generation: either its
+            // fingerprint is still current or it never carried pool entries.
+            return;
+        }
+
+        self.drain_retired_fingerprints(&retired);
     }
 
     pub fn force_drain_all(&self) {
@@ -579,6 +638,10 @@ impl HboneConnectionPool {
                 });
             }
         };
+        // Snapshot the SVID slot before dialing: the SPIFFE TLS resolver and
+        // verifier read the slot at HANDSHAKE time, so "slot unchanged across
+        // the dial" proves the session was built from exactly this material.
+        let svid_slot_before_dial = self.gateway_svid.load_full();
         let sender = match tokio::time::timeout(
             remaining,
             self.create_sender(proxy, target_host, hbone_port, expected_peer, pool_config),
@@ -607,6 +670,33 @@ impl HboneConnectionPool {
                 });
             }
         };
+        // An SVID rotation drain may have fired while this dial was in
+        // flight: pooling the sender under a retired-fingerprint key would
+        // resurrect it AFTER its one-shot drain already ran, leaving an
+        // old-identity session alive until idle pruning (forever with
+        // `idle_timeout_seconds=0`). Serve the triggering request on the
+        // connection, but only pool it while (a) the slot is unchanged across
+        // the dial — catches same-leaf trust-bundle rotations the fingerprint
+        // cannot see — and (b) the key's fingerprint is still the current one
+        // — catches rotations between key construction and the slot snapshot.
+        // Pre-drain inserts under a retired-but-undrained key are also
+        // skipped, which merely costs those stragglers pooling during the
+        // drain window.
+        let svid_slot_unchanged =
+            Arc::ptr_eq(&svid_slot_before_dial, &self.gateway_svid.load_full());
+        let key_fingerprint_is_current = self
+            .current_svid_identity_cached()
+            .ok()
+            .is_some_and(|(_, current)| hbone_key_svid_fingerprint(key) == Some(current.as_ref()));
+        if !svid_slot_unchanged || !key_fingerprint_is_current {
+            debug!(
+                target_host,
+                target_port,
+                hbone_port,
+                "HBONE HTTP/2 connection completed under a rotated SVID; serving without pooling"
+            );
+            return Ok(sender);
+        }
         self.entries
             .entry(key.to_string())
             .and_modify(|entries| {
@@ -1854,6 +1944,166 @@ mod tests {
 
         assert!(pool.entries.is_empty());
         assert!(pool.creation_locks.is_empty());
+    }
+
+    #[test]
+    fn force_drain_sweeps_generations_at_or_below_passed() {
+        // The slot-swap → generation-store race can file a fingerprint one
+        // generation too low (see `force_drain_svid_generation` docs). A
+        // record misfiled under an already-drained generation must be picked
+        // up by the next drain rather than leaking until idle pruning.
+        let bundle_a = svid_bundle(b"sweep-generation-a");
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle_a))));
+        let generation = Arc::new(AtomicU64::new(7));
+        let pool = HboneConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+        pool.current_svid_identity_cached().unwrap();
+
+        // Race: the slot swaps to B and traffic rebuilds the cache while the
+        // rotation consumer has not stored generation 8 yet, so B is stamped
+        // with generation 7.
+        let bundle_b = svid_bundle(b"sweep-generation-b");
+        let fingerprint_b = svid_fingerprint(&bundle_b).unwrap();
+        gateway_svid.store(Arc::new(Some(bundle_b)));
+        pool.current_svid_identity_cached().unwrap();
+        // Generation 7's drain fires and consumes A's record.
+        pool.force_drain_svid_generation(7);
+        generation.store(8, Ordering::Release);
+        let key_b = key_for_fingerprint("b.default.svc.cluster.local", &fingerprint_b);
+        insert_empty_entry(&pool, &key_b);
+
+        // Rotation B -> C files B's fingerprint under its (stale) stamped
+        // generation 7 — a generation whose drain already ran.
+        let bundle_c = svid_bundle(b"sweep-generation-c");
+        let fingerprint_c = svid_fingerprint(&bundle_c).unwrap();
+        gateway_svid.store(Arc::new(Some(bundle_c)));
+        generation.store(9, Ordering::Release);
+        pool.current_svid_identity_cached().unwrap();
+        let key_c = key_for_fingerprint("c.default.svc.cluster.local", &fingerprint_c);
+        insert_empty_entry(&pool, &key_c);
+
+        // Generation 8's drain must sweep the misfiled record; C (newer)
+        // stays untouched.
+        pool.force_drain_svid_generation(8);
+        assert!(
+            !pool.entries.contains_key(&key_b),
+            "record misfiled under an already-drained generation must be swept by the next drain"
+        );
+        assert!(pool.entries.contains_key(&key_c));
+    }
+
+    #[test]
+    fn trust_bundle_only_rotation_retires_current_fingerprint() {
+        // A trust-bundle-only reload keeps the leaf (and thus the
+        // fingerprint) but still publishes a rotation: sessions verified
+        // against the previous bundle must not outlive the drain window even
+        // though their keys collide with current ones.
+        let bundle_a = svid_bundle(b"bundle-rotation-leaf");
+        let fingerprint = svid_fingerprint(&bundle_a).unwrap();
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle_a))));
+        let generation = Arc::new(AtomicU64::new(5));
+        let pool = HboneConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+        pool.current_svid_identity_cached().unwrap();
+        let key = key_for_fingerprint("a.default.svc.cluster.local", &fingerprint);
+        insert_empty_entry(&pool, &key);
+
+        // Same leaf, fresh slot store (the rotation watcher is change-gated,
+        // so any store is a genuine material change — here: new trust
+        // bundle). No traffic runs before the drain.
+        gateway_svid.store(Arc::new(Some(svid_bundle(b"bundle-rotation-leaf"))));
+        generation.store(6, Ordering::Release);
+
+        pool.force_drain_svid_generation(5);
+        assert!(
+            !pool.entries.contains_key(&key),
+            "old-trust-bundle sessions must drain even when the leaf fingerprint is unchanged"
+        );
+    }
+
+    #[test]
+    fn capped_registry_eviction_drains_evicted_generations() {
+        let bundle_0 = svid_bundle(b"evict-leaf-0");
+        let fingerprint_0 = svid_fingerprint(&bundle_0).unwrap();
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle_0))));
+        let generation = Arc::new(AtomicU64::new(0));
+        let pool = HboneConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+        pool.current_svid_identity_cached().unwrap();
+        let key_0 = key_for_fingerprint("a.default.svc.cluster.local", &fingerprint_0);
+        insert_empty_entry(&pool, &key_0);
+
+        // Rotation storm overflows the registry; generation 0's record is
+        // evicted before any drain timer fires — its entries must drain at
+        // eviction instead of leaking until idle pruning.
+        for revision in 1..=(MAX_RETIRED_SVID_GENERATIONS as u64 + 2) {
+            let leaf = format!("evict-leaf-{revision}");
+            gateway_svid.store(Arc::new(Some(svid_bundle(leaf.as_bytes()))));
+            generation.store(revision, Ordering::Release);
+            pool.current_svid_identity_cached().unwrap();
+        }
+
+        assert!(
+            !pool.entries.contains_key(&key_0),
+            "registry cap eviction must drain the evicted generation's entries"
+        );
+        assert!(pool.retired_svid_fingerprints.len() <= MAX_RETIRED_SVID_GENERATIONS);
+    }
+
+    #[test]
+    fn per_generation_retired_list_is_capped_and_drains_overflow() {
+        let bundle_0 = svid_bundle(b"frozen-leaf-0");
+        let fingerprint_0 = svid_fingerprint(&bundle_0).unwrap();
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle_0))));
+        // Frozen generation counter: a starved rotation consumer stamps every
+        // rotation with the same generation, funnelling all retirements into
+        // one bucket.
+        let generation = Arc::new(AtomicU64::new(3));
+        let pool = HboneConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+        pool.current_svid_identity_cached().unwrap();
+        let key_0 = key_for_fingerprint("a.default.svc.cluster.local", &fingerprint_0);
+        insert_empty_entry(&pool, &key_0);
+
+        for revision in 1..=(MAX_RETIRED_FINGERPRINTS_PER_GENERATION as u64 * 2) {
+            let leaf = format!("frozen-leaf-{revision}");
+            gateway_svid.store(Arc::new(Some(svid_bundle(leaf.as_bytes()))));
+            pool.current_svid_identity_cached().unwrap();
+        }
+
+        let bucket_len = pool
+            .retired_svid_fingerprints
+            .get(&3)
+            .map(|bucket| bucket.len())
+            .unwrap_or(0);
+        assert!(
+            bucket_len <= MAX_RETIRED_FINGERPRINTS_PER_GENERATION,
+            "per-generation bucket must stay bounded under a frozen generation counter"
+        );
+        assert!(
+            !pool.entries.contains_key(&key_0),
+            "fingerprints evicted from a full bucket must drain their entries"
+        );
     }
 
     #[test]
