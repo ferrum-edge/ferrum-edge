@@ -1193,7 +1193,8 @@ pub(crate) fn supports_native_http3_backend(
 /// failure that should downgrade the cached H3 capability to
 /// `Unsupported`. Excludes application-layer / client-side errors
 /// (`ClientDisconnect`, `RequestBodyTooLarge`, `ResponseBodyTooLarge`,
-/// `RequestError`) which do not reflect backend QUIC health.
+/// `RequestError`) and backend response read timeouts, which do not prove
+/// the backend has lost H3 capability.
 pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
     matches!(
         class,
@@ -1206,7 +1207,6 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
             | retry::ErrorClass::DnsLookupError
             | retry::ErrorClass::PortExhaustion
             | retry::ErrorClass::ConnectionPoolError
-            | retry::ErrorClass::ReadWriteTimeout
     )
 }
 
@@ -1218,12 +1218,11 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
 /// on `error_class` ALONE — intentionally ignoring `connection_error`.
 ///
 /// Rationale: `classify_h3_error` marks GOAWAY / stream reset / other
-/// protocol errors and non-connect read timeouts with
-/// `connection_error=false`, yet they are still H3 transport failures.
-/// Routing the next request through the same native H3 pool would just
-/// repeat them. Only application-layer outcomes (`ClientDisconnect`,
-/// body-size errors, plain `RequestError`) leave the capability
-/// untouched — those reflect the request, not the backend.
+/// protocol errors with `connection_error=false`, yet they are still H3
+/// transport failures. Routing the next request through the same native H3
+/// pool would just repeat them. Application-layer outcomes and backend
+/// response read timeouts leave the capability untouched — those reflect
+/// the request or backend latency, not whether the backend speaks H3.
 fn is_h3_transport_failure(resp: &retry::BackendResponse) -> bool {
     resp.error_class.is_some_and(is_h3_transport_error_class)
 }
@@ -15814,25 +15813,36 @@ fn hbone_hyper_error_response(
 enum HyperBodyCollectError {
     TooLarge,
     Read(hyper::Error),
+    ReadTimeout { timeout_ms: u64 },
 }
 
 async fn collect_hyper_body_with_limit(
     mut body: Incoming,
     max_size: usize,
+    backend_read_timeout_ms: u64,
 ) -> Result<Vec<u8>, HyperBodyCollectError> {
-    if max_size == 0 {
-        return body
-            .collect()
-            .await
-            .map(|collected| collected.to_bytes().to_vec())
-            .map_err(HyperBodyCollectError::Read);
-    }
-
     let mut body_bytes = Vec::new();
-    while let Some(frame) = body.frame().await {
+    loop {
+        let next_frame = if backend_read_timeout_ms > 0 {
+            match tokio::time::timeout(Duration::from_millis(backend_read_timeout_ms), body.frame())
+                .await
+            {
+                Ok(frame) => frame,
+                Err(_) => {
+                    return Err(HyperBodyCollectError::ReadTimeout {
+                        timeout_ms: backend_read_timeout_ms,
+                    });
+                }
+            }
+        } else {
+            body.frame().await
+        };
+        let Some(frame) = next_frame else {
+            break;
+        };
         let frame = frame.map_err(HyperBodyCollectError::Read)?;
         if let Some(data) = frame.data_ref() {
-            if body_bytes.len().saturating_add(data.len()) > max_size {
+            if max_size > 0 && body_bytes.len().saturating_add(data.len()) > max_size {
                 return Err(HyperBodyCollectError::TooLarge);
             }
             body_bytes.extend_from_slice(data);
@@ -16298,6 +16308,7 @@ async fn proxy_to_backend_hbone(
         let body_bytes = match collect_hyper_body_with_limit(
             response.into_body(),
             state.max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
         )
         .await
         {
@@ -16315,6 +16326,26 @@ async fn proxy_to_backend_hbone(
             }
             Err(HyperBodyCollectError::Read(err)) => {
                 return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "HBONE backend response body read timed out"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                );
             }
         };
         (
@@ -16767,6 +16798,7 @@ async fn proxy_to_backend_mesh_mtls(
         let body_bytes = match collect_hyper_body_with_limit(
             response.into_body(),
             state.max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
         )
         .await
         {
@@ -16784,6 +16816,26 @@ async fn proxy_to_backend_mesh_mtls(
             }
             Err(HyperBodyCollectError::Read(err)) => {
                 return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "sidecar mTLS backend response body read timed out"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                );
             }
         };
         (
@@ -17025,9 +17077,34 @@ async fn proxy_to_backend_http2(
         }
     } else {
         // Buffer the full response body
-        let body_bytes = match response.into_body().collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(e) => {
+        let body_bytes = match collect_hyper_body_with_limit(
+            response.into_body(),
+            0,
+            proxy.backend_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(collected) => collected,
+            Err(HyperBodyCollectError::TooLarge) => {
+                // Defensive: cannot occur with max_size=0 (the size guard is
+                // disabled), but the proxy path must never panic — surface a
+                // 502 instead of `unreachable!` if the invariant ever breaks.
+                error!(
+                    proxy_id = %proxy.id,
+                    "HTTP/2 buffered body collection reported TooLarge despite max_size=0"
+                );
+                return retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Failed to read backend response"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                };
+            }
+            Err(HyperBodyCollectError::Read(e)) => {
                 error!(proxy_id = %proxy.id, error = %e, "Failed to read HTTP/2 response body");
                 return retry::BackendResponse {
                     status_code: 502,
@@ -17038,6 +17115,23 @@ async fn proxy_to_backend_http2(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ProtocolError),
+                };
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "HTTP/2 backend response body read timed out"
+                );
+                return retry::BackendResponse {
+                    status_code: 504,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ReadWriteTimeout),
                 };
             }
         };
@@ -17316,6 +17410,7 @@ async fn proxy_to_backend_http3(
                                 status,
                                 content_length,
                                 state.max_response_body_size_bytes,
+                                proxy.backend_read_timeout_ms,
                             )
                             .await
                             {
@@ -17345,13 +17440,18 @@ async fn proxy_to_backend_http3(
                                         None,
                                     );
                                 }
-                                Err(e) => {
-                                    let crate::http3::client::H3BodyDrainError::Stream(e) = e
-                                    else {
-                                        unreachable!(
-                                            "response-too-large handled by previous match arm"
-                                        );
-                                    };
+                                Err(crate::http3::client::H3BodyDrainError::ReadTimeout {
+                                    timeout_ms,
+                                }) => {
+                                    warn!(
+                                        proxy_id = %proxy.id,
+                                        backend_url = %strip_query_params(backend_url),
+                                        timeout_ms = timeout_ms,
+                                        "HTTP/3 backend buffered response read timed out"
+                                    );
+                                    return (h3_read_timeout_backend_response(resolved_ip), None);
+                                }
+                                Err(crate::http3::client::H3BodyDrainError::Stream(e)) => {
                                     let (error_kind, error_class) = classify_h3_error(&e);
                                     record_port_exhaustion_if_class(&state.overload, error_class);
                                     // We have already received response headers and
@@ -17447,6 +17547,18 @@ async fn proxy_to_backend_http3(
                                 },
                                 None,
                             )
+                        } else if e.is_read_timeout() {
+                            // `backend_read_timeout_ms` expired waiting for
+                            // response headers — surface 504 Backend timeout
+                            // like the direct-H2 / HBONE read-timeout arms,
+                            // not a generic 502.
+                            warn!(
+                                proxy_id = %proxy.id,
+                                backend_url = %strip_query_params(backend_url),
+                                error = %e,
+                                "HTTP/3 backend read timeout waiting for response (streaming request body)"
+                            );
+                            (h3_read_timeout_backend_response(resolved_ip), None)
                         } else {
                             // `H3PoolError::request_on_wire()` is the
                             // authoritative body-on-wire signal: it is set
@@ -17673,6 +17785,18 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
+                if e.is_read_timeout() {
+                    // `backend_read_timeout_ms` expired waiting for response
+                    // headers — surface 504 Backend timeout like the
+                    // direct-H2 / HBONE read-timeout arms, not a generic 502.
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(backend_url),
+                        error = %e,
+                        "HTTP/3 backend read timeout waiting for response (streaming response)"
+                    );
+                    return (h3_read_timeout_backend_response(resolved_ip), retained_body);
+                }
                 // Trust the pool's body-on-wire signal — see the
                 // streaming-incoming-body branch above for why we drop
                 // the error-class contribution here.
@@ -17752,6 +17876,20 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
+                if e.is_read_timeout() {
+                    // `backend_read_timeout_ms` expired waiting for response
+                    // headers (`recv_response`) or buffered body frames
+                    // (`recv_data` inside the pool's drain) — surface 504
+                    // Backend timeout like the direct-H2 / HBONE
+                    // read-timeout arms, not a generic 502.
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(backend_url),
+                        error = %e,
+                        "HTTP/3 backend read timeout waiting for response (buffered)"
+                    );
+                    return (h3_read_timeout_backend_response(resolved_ip), retained_body);
+                }
                 // Trust the pool's body-on-wire signal — see the streaming
                 // H3 branch above for why we drop the class contribution.
                 let is_conn_error = !e.request_on_wire();
@@ -17858,6 +17996,15 @@ fn classify_h3_pool_error(
         let class = retry::ErrorClass::GracefulRemoteClose;
         return (retry::error_class_log_kind(class), class);
     }
+    if e.is_read_timeout() {
+        // Typed `backend_read_timeout_ms` deadline signal from the pool —
+        // classify deterministically instead of relying on the "timeout"
+        // substring fallback in the shared classifier. `ReadWriteTimeout`
+        // is excluded from `is_h3_transport_error_class`, so this never
+        // drives `mark_h3_unsupported`.
+        let class = retry::ErrorClass::ReadWriteTimeout;
+        return (retry::error_class_log_kind(class), class);
+    }
     classify_h3_error(e.as_ref())
 }
 
@@ -17918,6 +18065,28 @@ fn declared_response_length_exceeds_limit(
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())?;
     (len > max_response_body_size_bytes).then_some(len)
+}
+
+/// Build the 504 `BackendResponse` for an H3 backend read timeout
+/// (`backend_read_timeout_ms` expired waiting for response headers via
+/// `recv_response()` or buffered body frames via `recv_data()`).
+///
+/// Mirrors the direct-H2 / HBONE / sidecar-mTLS read-timeout arms so the
+/// same proxy config produces the same client-visible outcome regardless
+/// of dispatch path: 504 + `{"error":"Backend timeout"}` +
+/// `ErrorClass::ReadWriteTimeout`. `connection_error=false` — the request
+/// reached the backend's application layer (post-wire), so
+/// `retry_on_connect_failure` must not replay it; retries are governed by
+/// `retry_on_methods` / `retryable_status_codes`.
+fn h3_read_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code: 504,
+        body: ResponseBody::Buffered(r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+    }
 }
 
 /// Replay a saved HTTP/3 request to an explicit target (used during retries).
@@ -18148,6 +18317,19 @@ async fn proxy_to_backend_http3_retry(
             }
         }
         Err(e) => {
+            if e.is_read_timeout() {
+                // `backend_read_timeout_ms` expired waiting for the retried
+                // response — surface 504 Backend timeout like the direct-H2
+                // / HBONE read-timeout arms, not a generic 502.
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_url = %strip_query_params(backend_url),
+                    target = %format!("{}:{}", effective_host, effective_port),
+                    error = %e,
+                    "HTTP/3 backend read timeout waiting for response (retry)"
+                );
+                return h3_read_timeout_backend_response(resolved_ip);
+            }
             // Trust the pool's body-on-wire signal — see the streaming
             // H3 branch above for why we drop the class contribution.
             let is_conn_error = !e.request_on_wire();
@@ -20007,7 +20189,6 @@ mod tests {
             retry::ErrorClass::DnsLookupError,
             retry::ErrorClass::PortExhaustion,
             retry::ErrorClass::ConnectionPoolError,
-            retry::ErrorClass::ReadWriteTimeout,
         ] {
             assert!(
                 is_h3_transport_error_class(class),
@@ -20031,11 +20212,16 @@ mod tests {
         // positive list in `is_h3_transport_error_class` would re-introduce
         // the regression where a fast responder racing FIN with
         // `CONNECTION_CLOSE` permanently disables H3 for the backend.
+        //
+        // `ReadWriteTimeout` is excluded for the same capability reason:
+        // a backend that stalls after accepting a request is slow or wedged,
+        // but it has not proved that the native H3 pool itself is invalid.
         for class in [
             retry::ErrorClass::ClientDisconnect,
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::ReadWriteTimeout,
             retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {
@@ -20048,11 +20234,11 @@ mod tests {
 
     #[test]
     fn is_h3_transport_failure_ignores_connection_error_flag() {
-        // `classify_h3_error` marks GOAWAY / stream reset / ReadWriteTimeout
-        // with `connection_error=false`, so the downgrade predicate must
-        // NOT require that flag. The decision hinges on `error_class`
-        // alone — any transport-level class downgrades, any application-
-        // layer class does not.
+        // `classify_h3_error` marks GOAWAY / stream reset with
+        // `connection_error=false`, so the downgrade predicate must NOT
+        // require that flag. The decision hinges on `error_class` alone:
+        // transport-level classes downgrade, application-layer classes and
+        // backend read timeouts do not.
         let mk = |connection_error: bool, error_class: Option<retry::ErrorClass>| {
             retry::BackendResponse {
                 status_code: 502,
@@ -20075,8 +20261,10 @@ mod tests {
             false,
             Some(retry::ErrorClass::ProtocolError)
         )));
-        // ReadWriteTimeout with connection_error=false also downgrades.
-        assert!(is_h3_transport_failure(&mk(
+        // ReadWriteTimeout with connection_error=false does NOT downgrade:
+        // the backend stalled after accepting the request, but capability is
+        // still valid.
+        assert!(!is_h3_transport_failure(&mk(
             false,
             Some(retry::ErrorClass::ReadWriteTimeout)
         )));
@@ -20247,8 +20435,8 @@ mod tests {
     fn classify_h3_pool_error_falls_through_on_post_wire_errors() {
         // Without the graceful-close flag, the classifier delegates to
         // `classify_h3_error` and returns the underlying class. A normal
-        // post-wire `recv_response` failure (e.g. timeout) MUST still
-        // classify as a transport failure so `mark_h3_unsupported` fires.
+        // post-wire `recv_response` timeout is a backend read timeout, not
+        // an H3 capability failure, so it must not fire `mark_h3_unsupported`.
         let e = crate::http3::client::H3PoolError::post_wire(anyhow::anyhow!(
             "recv_response failed: timed out reading from QUIC stream"
         ));
@@ -20257,9 +20445,57 @@ mod tests {
         // → ReadWriteTimeout (read-side, no "connect" token).
         assert_eq!(class, retry::ErrorClass::ReadWriteTimeout);
         assert!(
-            super::is_h3_transport_error_class(class),
-            "Post-wire transport failure must still trigger H3 downgrade"
+            !super::is_h3_transport_error_class(class),
+            "Post-wire backend read timeout must not trigger H3 downgrade"
         );
+    }
+
+    #[test]
+    fn classify_h3_pool_error_short_circuits_on_read_timeout_flag() {
+        // The typed `H3PoolError::read_timeout` constructor (used by the
+        // `backend_read_timeout_ms` deadline wraps around `recv_response()`
+        // and the buffered `recv_data` drain) must classify as
+        // `ReadWriteTimeout` regardless of the error message — no string
+        // heuristics. The message below deliberately avoids any "timeout"
+        // token to prove the typed flag drives classification.
+        let e = crate::http3::client::H3PoolError::read_timeout(anyhow::anyhow!(
+            "backend stalled mid-response"
+        ));
+        assert!(e.is_read_timeout());
+        assert!(
+            e.request_on_wire(),
+            "read timeouts are post-wire: the request was committed before \
+             the gateway started waiting on the response"
+        );
+        assert!(!e.is_graceful_close());
+        let (kind, class) = super::classify_h3_pool_error(&e);
+        assert_eq!(class, retry::ErrorClass::ReadWriteTimeout);
+        assert_eq!(kind, retry::error_class_log_kind(class));
+        assert!(
+            !super::is_h3_transport_error_class(class),
+            "H3 backend read timeout must not trigger mark_h3_unsupported"
+        );
+    }
+
+    #[test]
+    fn h3_read_timeout_backend_response_maps_to_504_backend_timeout() {
+        // The H3 read-timeout arms must produce the same client-visible
+        // outcome as the direct-H2 / HBONE / sidecar-mTLS read-timeout arms:
+        // 504 + {"error":"Backend timeout"} + ReadWriteTimeout, and
+        // connection_error=false so `retry_on_connect_failure` cannot replay
+        // a request the backend already received.
+        let resp = super::h3_read_timeout_backend_response(Some("10.0.0.1".to_string()));
+        assert_eq!(resp.status_code, 504);
+        let ResponseBody::Buffered(body) = &resp.body else {
+            panic!("H3 read-timeout response must be buffered");
+        };
+        assert_eq!(body.as_slice(), br#"{"error":"Backend timeout"}"#);
+        assert!(
+            !resp.connection_error,
+            "post-wire read timeout must not be treated as a connect failure"
+        );
+        assert_eq!(resp.error_class, Some(retry::ErrorClass::ReadWriteTimeout));
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("10.0.0.1"));
     }
 
     // ── `record_port_exhaustion_if_class` (H3 native paths) ─────────────
