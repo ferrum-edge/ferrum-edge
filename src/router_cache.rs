@@ -29,6 +29,22 @@ thread_local! {
     static CACHE_KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(128));
 }
 
+/// How [`RouterCache::search_route_table`] treats direction-scoped materialized
+/// mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`). The inbound and
+/// outbound capture listeners share one route table, so the slow path filters by
+/// the request's listener direction.
+#[derive(Clone, Copy)]
+enum MeshRouteDirectionFilter {
+    /// Admit all routes regardless of direction — the cached fast path. The
+    /// request handler re-resolves with `MatchingDirection` only if the cached
+    /// winner turns out to be a wrong-direction mesh route.
+    Unfiltered,
+    /// Admit non-mesh routes plus mesh routes whose direction equals this
+    /// request's listener direction (`None` ⇒ a non-mesh listener, which admits
+    /// no direction-scoped mesh route).
+    MatchingDirection(Option<crate::modes::mesh::MeshTrafficDirection>),
+}
+
 /// Result of a route match, containing the matched proxy and any extracted path parameters.
 #[derive(Clone, Debug)]
 pub struct RouteMatch {
@@ -155,6 +171,91 @@ pub(crate) struct HostRouteTable {
     has_regex_routes: bool,
     /// Pre-computed flag: true if any host-only routes exist (skip host-only path entirely when false).
     has_host_only_routes: bool,
+    /// Mesh outbound per-port sibling groups, keyed by the **representative**
+    /// proxy id (the lowest-port sibling — the only one inserted into the
+    /// host/path tiers, since they are (host, path)-keyed and every sibling
+    /// shares its service's hosts + `/`). After a representative matches on
+    /// the outbound capture listener,
+    /// [`HostRouteTable::select_mesh_outbound_port_route`] swaps in the
+    /// sibling whose service port equals the connection's captured original
+    /// destination port. Built at route-table construction; empty outside
+    /// mesh mode.
+    mesh_outbound_ports: HashMap<String, Arc<MeshOutboundPortGroup>>,
+}
+
+/// Per-service group of mesh outbound per-port sibling routes
+/// (`__mesh-outbound-{ns}-{name}-{port}`), derived from the prepared config's
+/// `mesh` block by `crate::modes::mesh::mesh_outbound_service_groups`.
+pub(crate) struct MeshOutboundPortGroup {
+    /// HTTP-family ports the service DECLARES — may exceed `ports.len()` when
+    /// a port materialized no sibling (unresolved named `targetPort`, no
+    /// reachable targets). Orig-dst-less requests fail closed whenever this
+    /// is > 1, even for a partially materialized group: without the captured
+    /// port, traffic meant for a skipped port is indistinguishable from the
+    /// surviving one.
+    declared_http_ports: usize,
+    /// `(service_port, route)` pairs sorted by port ascending; entry 0 is the
+    /// representative present in the route tiers.
+    ports: Vec<(u16, Arc<Proxy>)>,
+}
+
+/// Why [`HostRouteTable::select_mesh_outbound_port_route`] refused to pick a
+/// per-port sibling. Both cases fail closed at the request handler — captured
+/// traffic is never forwarded to a port the client did not dial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeshOutboundPortSelectError {
+    /// The matched service DECLARES multiple HTTP-family ports but the
+    /// connection carries no captured original destination (non-Linux, direct
+    /// dial, getsockopt failure) — the dialed port cannot be determined and
+    /// must never be guessed. Applies even when only one sibling
+    /// materialized (partially materialized multi-port service).
+    OrigDstUnavailable,
+    /// The captured original destination's port is not one of the matched
+    /// service's materialized HTTP-family ports.
+    PortNotMaterialized,
+}
+
+impl HostRouteTable {
+    /// Swap a matched mesh outbound representative route for the sibling
+    /// matching the connection's captured original-destination port.
+    ///
+    /// Behavior matrix (see [`MeshOutboundPortGroup`]):
+    /// - route not grouped (an outbound-prefixed proxy no mesh service
+    ///   claims) → keep `current`;
+    /// - no orig-dst and the service DECLARES exactly one HTTP-family port →
+    ///   keep `current` (back-compat: single-port services never needed
+    ///   orig-dst);
+    /// - no orig-dst and the service declares multiple HTTP-family ports →
+    ///   [`MeshOutboundPortSelectError::OrigDstUnavailable`] — even when only
+    ///   one sibling materialized (a partially materialized multi-port
+    ///   service must not silently absorb the skipped port's traffic);
+    /// - orig-dst port matches a sibling → that sibling (same `path_params`
+    ///   / `matched_prefix_len`: every sibling is the same `/` prefix route);
+    /// - orig-dst port matches no sibling → [`MeshOutboundPortSelectError::PortNotMaterialized`],
+    ///   even for single-port groups — the client dialed a port the mesh does
+    ///   not route, and forwarding it to a different port's backend would be a
+    ///   misroute.
+    pub(crate) fn select_mesh_outbound_port_route(
+        &self,
+        current: RouteMatch,
+        orig_dst_port: Option<u16>,
+    ) -> Result<RouteMatch, MeshOutboundPortSelectError> {
+        let Some(group) = self.mesh_outbound_ports.get(&current.proxy.id) else {
+            return Ok(current);
+        };
+        match orig_dst_port {
+            None if group.declared_http_ports == 1 => Ok(current),
+            None => Err(MeshOutboundPortSelectError::OrigDstUnavailable),
+            Some(port) => match group.ports.iter().find(|(p, _)| *p == port) {
+                Some((_, proxy)) => Ok(RouteMatch {
+                    proxy: Arc::clone(proxy),
+                    path_params: current.path_params,
+                    matched_prefix_len: current.matched_prefix_len,
+                }),
+                None => Err(MeshOutboundPortSelectError::PortNotMaterialized),
+            },
+        }
+    }
 }
 
 /// Cached regex match result (stored in regex_cache).
@@ -491,9 +592,11 @@ impl RouterCache {
         }
 
         // Slow path: search the host route table (cache miss). The normal lookup
-        // never excludes inbound routes; direction scoping is handled by the
-        // request handlers via `resolve_route_excluding_mesh_inbound`.
-        let result = Self::search_route_table(table, host, path, false);
+        // never filters by direction; direction scoping is handled by the request
+        // handlers via `resolve_route_excluding_wrong_direction` when the cached
+        // winner turns out to be a wrong-direction mesh route.
+        let result =
+            Self::search_route_table(table, host, path, MeshRouteDirectionFilter::Unfiltered);
 
         // Allocate the cache key String only on the cold path (cache miss + insert).
         let cache_key = make_cache_key(host, path);
@@ -570,15 +673,23 @@ impl RouterCache {
         table: &HostRouteTable,
         host: Option<&str>,
         path: &str,
-        exclude_mesh_inbound: bool,
+        direction_filter: MeshRouteDirectionFilter,
     ) -> Option<RouteMatch> {
-        // Admit a tier's match unless it is a materialized sidecar inbound route
-        // (`__mesh-inbound-*`) that this lookup is excluding. Dropping the match
-        // here lets the tiered search fall through to a lower-priority valid
-        // route instead of returning that inbound-only route. A no-op (and
-        // zero-cost via short-circuit) on the normal lookup path.
-        let admit = |rm: &RouteMatch| {
-            !(exclude_mesh_inbound && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id))
+        // Admit a tier's match unless it is a direction-scoped materialized mesh
+        // route (`__mesh-inbound-*` / `__mesh-outbound-*`) excluded by this lookup
+        // because the request's listener direction does not match the route's
+        // direction. Dropping the match here lets the tiered search fall through
+        // to a lower-priority valid route instead of returning a wrong-direction
+        // route. A no-op (and zero-cost via short-circuit) on the normal
+        // `Unfiltered` lookup path.
+        let admit = |rm: &RouteMatch| match direction_filter {
+            MeshRouteDirectionFilter::Unfiltered => true,
+            MeshRouteDirectionFilter::MatchingDirection(req_dir) => {
+                match crate::modes::mesh::mesh_route_direction(&rm.proxy.id) {
+                    None => true,
+                    Some(route_dir) => req_dir == Some(route_dir),
+                }
+            }
         };
         if let Some(host) = host {
             // 1. Exact host match — exact path, prefix, regex, then host-only
@@ -678,19 +789,30 @@ impl RouterCache {
         None
     }
 
-    /// Resolve a route while **excluding** materialized sidecar inbound
-    /// (`__mesh-inbound-*`) routes. Uncached slow-path lookup used by the request
-    /// handlers only when a non-inbound (e.g. outbound capture) request happens
-    /// to match an inbound-only route — it re-resolves so a valid lower-priority
-    /// route is found instead of serving the inbound loopback route or 404ing.
-    pub(crate) fn resolve_route_excluding_mesh_inbound(
+    /// Resolve a route while keeping only mesh routes whose direction matches the
+    /// request's listener direction (`req_direction`); non-mesh routes are always
+    /// admitted. Uncached slow-path lookup used by the request handlers only when
+    /// the cached winner is a direction-scoped mesh route (`__mesh-inbound-*` /
+    /// `__mesh-outbound-*`) that does NOT match the current listener direction:
+    /// it re-resolves so a valid lower-priority route is found instead of serving
+    /// a wrong-direction route or 404ing. The inbound and outbound capture
+    /// listeners share one route table, so this keeps each listener serving only
+    /// its own direction's materialized routes. `req_direction == None` (a
+    /// non-mesh listener) excludes every direction-scoped mesh route.
+    pub(crate) fn resolve_route_excluding_wrong_direction(
         &self,
         table: &HostRouteTable,
         host: Option<&str>,
         path: &str,
+        req_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     ) -> Option<RouteMatch> {
         let normalized = normalize_encoded_slashes(path);
-        Self::search_route_table(table, host, &normalized, true)
+        Self::search_route_table(
+            table,
+            host,
+            &normalized,
+            MeshRouteDirectionFilter::MatchingDirection(req_direction),
+        )
     }
 
     /// Cache statistics for metrics: (prefix_entries, regex_entries, prefix_evictions, regex_evictions, max_entries).
@@ -820,11 +942,70 @@ impl RouterCache {
         let mut exact_hosts_host_only: HashMap<String, Arc<Proxy>> = HashMap::new();
         let mut wildcard_hosts_host_only: HashMap<String, Arc<Proxy>> = HashMap::new();
 
+        // ── Mesh outbound per-port sibling groups ──────────────────────────
+        // The route tiers are (host, path)-keyed, so per-port outbound
+        // siblings (same hosts, same `/`) would silently clobber each other.
+        // Groups are derived FORWARD from the prepared config's `mesh` block
+        // (`mesh_outbound_service_groups` computes each service's expected
+        // sibling ids and its DECLARED HTTP-port count) — never by parsing
+        // ids backwards, which is lossy across the `{ns}-{name}` join and
+        // could conflate distinct services. Only the lowest-port materialized
+        // representative enters the tiers; the full group is registered for
+        // post-match selection by captured original-destination port. An
+        // outbound-prefixed proxy no mesh service claims (operator-crafted
+        // edge) stays ungrouped and inserts normally. Empty outside mesh
+        // mode (`config.mesh` is `None`).
+        let mut mesh_outbound_ports: HashMap<String, Arc<MeshOutboundPortGroup>> = HashMap::new();
+        let mut mesh_outbound_skip_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if let Some(mesh) = config.mesh.as_deref() {
+            let outbound_proxies: HashMap<&str, &Proxy> = config
+                .proxies
+                .iter()
+                .filter(|p| {
+                    !p.dispatch_kind.is_stream()
+                        && crate::modes::mesh::is_mesh_outbound_route_id(&p.id)
+                })
+                .map(|p| (p.id.as_str(), p))
+                .collect();
+            for group in crate::modes::mesh::mesh_outbound_service_groups(mesh) {
+                let mut members: Vec<(u16, Arc<Proxy>)> = group
+                    .siblings
+                    .iter()
+                    .filter_map(|(port, id)| {
+                        outbound_proxies
+                            .get(id.as_str())
+                            .map(|p| (*port, Arc::new((*p).clone())))
+                    })
+                    .collect();
+                if members.is_empty() {
+                    continue;
+                }
+                members.sort_by_key(|(port, _)| *port);
+                let representative_id = members[0].1.id.clone();
+                for (_, sibling) in members.iter().skip(1) {
+                    mesh_outbound_skip_ids.insert(sibling.id.clone());
+                }
+                mesh_outbound_ports.insert(
+                    representative_id,
+                    Arc::new(MeshOutboundPortGroup {
+                        declared_http_ports: group.declared_http_ports,
+                        ports: members,
+                    }),
+                );
+            }
+        }
+
         for proxy in config
             .proxies
             .iter()
             .filter(|p| !p.dispatch_kind.is_stream())
         {
+            // Non-representative mesh outbound siblings are reachable only via
+            // post-match port selection, never via the tiers.
+            if mesh_outbound_skip_ids.contains(proxy.id.as_str()) {
+                continue;
+            }
             let arc_proxy = Arc::new(proxy.clone());
 
             let Some(listen_path) = proxy.listen_path.as_deref() else {
@@ -1046,6 +1227,7 @@ impl RouterCache {
             has_exact_path_routes,
             has_regex_routes,
             has_host_only_routes,
+            mesh_outbound_ports,
         }
     }
 }
@@ -1650,6 +1832,350 @@ mod tests {
             proxies,
             ..GatewayConfig::default()
         }
+    }
+
+    #[test]
+    fn resolve_route_excluding_wrong_direction_scopes_mesh_routes_by_listener() {
+        use crate::modes::mesh::MeshTrafficDirection;
+        // A materialized mesh route is served ONLY on its own direction's
+        // listener. The inbound and outbound capture listeners share one route
+        // table; the slow-path resolver drops a route whose direction does not
+        // match the request's listener direction (and a non-mesh `None` listener
+        // — e.g. the H3 frontend — drops every direction-scoped mesh route),
+        // falling through to whatever lower-priority route remains (here, none).
+        let mut outbound = minimal_proxy_for_routing("__mesh-outbound-default-ratings-8080", "/");
+        outbound.hosts = vec!["ratings".to_string()];
+        let config = GatewayConfig {
+            proxies: vec![outbound],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        // Outbound listener: the outbound route is served.
+        let outb = cache
+            .resolve_route_excluding_wrong_direction(
+                &table,
+                Some("ratings"),
+                "/",
+                Some(MeshTrafficDirection::Outbound),
+            )
+            .expect("outbound listener serves the outbound route");
+        assert_eq!(outb.proxy.id, "__mesh-outbound-default-ratings-8080");
+        // Inbound listener and non-mesh (H3) listener: wrong direction → dropped.
+        assert!(
+            cache
+                .resolve_route_excluding_wrong_direction(
+                    &table,
+                    Some("ratings"),
+                    "/",
+                    Some(MeshTrafficDirection::Inbound),
+                )
+                .is_none(),
+            "an outbound route must not serve on the inbound listener"
+        );
+        assert!(
+            cache
+                .resolve_route_excluding_wrong_direction(&table, Some("ratings"), "/", None)
+                .is_none(),
+            "a non-mesh listener serves no direction-scoped mesh route"
+        );
+
+        // The inbound prefix is the mirror image: served on the inbound listener,
+        // dropped on the outbound listener.
+        let mut inbound = minimal_proxy_for_routing("__mesh-inbound-default-reviews-8080", "/");
+        inbound.hosts = vec!["reviews".to_string()];
+        let config = GatewayConfig {
+            proxies: vec![inbound],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+        assert_eq!(
+            cache
+                .resolve_route_excluding_wrong_direction(
+                    &table,
+                    Some("reviews"),
+                    "/",
+                    Some(MeshTrafficDirection::Inbound),
+                )
+                .expect("inbound listener serves the inbound route")
+                .proxy
+                .id,
+            "__mesh-inbound-default-reviews-8080"
+        );
+        assert!(
+            cache
+                .resolve_route_excluding_wrong_direction(
+                    &table,
+                    Some("reviews"),
+                    "/",
+                    Some(MeshTrafficDirection::Outbound),
+                )
+                .is_none(),
+            "an inbound route must not serve on the outbound listener"
+        );
+    }
+
+    /// Build the mesh block the router derives sibling groups from: one
+    /// service per entry, `(namespace, name, declared HTTP ports)`.
+    fn mesh_block(
+        services: &[(&str, &str, &[u16])],
+    ) -> Option<Box<crate::modes::mesh::config::MeshConfig>> {
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+        Some(Box::new(MeshConfig {
+            services: services
+                .iter()
+                .map(|(namespace, name, ports)| MeshService {
+                    name: name.to_string(),
+                    namespace: namespace.to_string(),
+                    ports: ports
+                        .iter()
+                        .map(|port| ServicePort {
+                            port: *port,
+                            protocol: AppProtocol::Http,
+                            name: None,
+                            target_port: None,
+                        })
+                        .collect(),
+                    workloads: Vec::new(),
+                    protocol_overrides: std::collections::HashMap::new(),
+                })
+                .collect(),
+            ..MeshConfig::default()
+        }))
+    }
+
+    /// Multi-port outbound siblings: one lowest-port representative in the
+    /// tiers, the rest reachable only via orig-dst-port selection. Groups are
+    /// derived from the config's `mesh` block, not from id parsing.
+    #[test]
+    fn mesh_outbound_port_group_selects_sibling_by_orig_dst_port() {
+        let mut proxies = Vec::new();
+        for port in [8080u16, 80, 90] {
+            let mut p =
+                minimal_proxy_for_routing(&format!("__mesh-outbound-default-reviews-{port}"), "/");
+            p.hosts = vec!["reviews".to_string()];
+            proxies.push(p);
+        }
+        let config = GatewayConfig {
+            proxies,
+            mesh: mesh_block(&[("default", "reviews", &[80, 90, 8080])]),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        // The tiers hold exactly the lowest-port representative — including on
+        // a cached second lookup (selection is post-cache, per request).
+        for _ in 0..2 {
+            let rm = cache
+                .find_proxy(Some("reviews"), "/")
+                .expect("representative route matches by host");
+            assert_eq!(rm.proxy.id, "__mesh-outbound-default-reviews-80");
+        }
+
+        // Orig-dst port picks each sibling (including the representative).
+        for port in [80u16, 90, 8080] {
+            let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+            let selected = table
+                .select_mesh_outbound_port_route(rm, Some(port))
+                .expect("materialized port selects its sibling");
+            assert_eq!(
+                selected.proxy.id,
+                format!("__mesh-outbound-default-reviews-{port}")
+            );
+        }
+
+        // A captured port the slice does not materialize fails closed.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(matches!(
+            table.select_mesh_outbound_port_route(rm, Some(7777)),
+            Err(MeshOutboundPortSelectError::PortNotMaterialized)
+        ));
+
+        // No orig-dst on a multi-port group: the dialed port is unknowable —
+        // fail closed, never guess a port.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(matches!(
+            table.select_mesh_outbound_port_route(rm, None),
+            Err(MeshOutboundPortSelectError::OrigDstUnavailable)
+        ));
+    }
+
+    /// Single-port services keep their orig-dst-free behavior (direct dials,
+    /// non-Linux), but a present orig-dst port still must match.
+    #[test]
+    fn mesh_outbound_single_port_group_without_orig_dst_keeps_route() {
+        let mut p = minimal_proxy_for_routing("__mesh-outbound-default-ratings-8080", "/");
+        p.hosts = vec!["ratings".to_string()];
+        let config = GatewayConfig {
+            proxies: vec![p],
+            mesh: mesh_block(&[("default", "ratings", &[8080])]),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
+        let kept = table
+            .select_mesh_outbound_port_route(rm, None)
+            .expect("single-port group needs no orig-dst");
+        assert_eq!(kept.proxy.id, "__mesh-outbound-default-ratings-8080");
+
+        let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
+        assert!(
+            table
+                .select_mesh_outbound_port_route(rm, Some(8080))
+                .is_ok(),
+            "matching orig-dst port keeps the route"
+        );
+
+        let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
+        assert!(
+            matches!(
+                table.select_mesh_outbound_port_route(rm, Some(99)),
+                Err(MeshOutboundPortSelectError::PortNotMaterialized)
+            ),
+            "a captured dial to a non-materialized port must not be forwarded \
+             to a different port's backend"
+        );
+    }
+
+    /// A partially materialized multi-port service (one declared HTTP port
+    /// produced no sibling — unresolved named targetPort / no targets) must
+    /// STILL require orig-dst: without the captured port, traffic meant for
+    /// the skipped port is indistinguishable from the surviving one.
+    #[test]
+    fn mesh_outbound_partially_materialized_multi_port_requires_orig_dst() {
+        // The service declares HTTP ports 80 + 90, but only 80 materialized.
+        let mut p = minimal_proxy_for_routing("__mesh-outbound-default-reviews-80", "/");
+        p.hosts = vec!["reviews".to_string()];
+        let config = GatewayConfig {
+            proxies: vec![p],
+            mesh: mesh_block(&[("default", "reviews", &[80, 90])]),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            matches!(
+                table.select_mesh_outbound_port_route(rm, None),
+                Err(MeshOutboundPortSelectError::OrigDstUnavailable)
+            ),
+            "a declared-multi-port service with one materialized sibling must not \
+             absorb orig-dst-less traffic"
+        );
+
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            table.select_mesh_outbound_port_route(rm, Some(80)).is_ok(),
+            "the surviving port still routes with a captured orig-dst"
+        );
+
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            matches!(
+                table.select_mesh_outbound_port_route(rm, Some(90)),
+                Err(MeshOutboundPortSelectError::PortNotMaterialized)
+            ),
+            "the skipped declared port fails closed instead of misrouting to port 80"
+        );
+    }
+
+    /// An outbound-prefixed proxy no mesh service claims (operator-crafted
+    /// edge, or no mesh block at all) is not grouped: it inserts normally and
+    /// selection is a no-op on it.
+    #[test]
+    fn mesh_outbound_unclaimed_reserved_prefix_is_not_grouped() {
+        let mut p = minimal_proxy_for_routing("__mesh-outbound-oddball", "/");
+        p.hosts = vec!["oddball".to_string()];
+        let config = GatewayConfig {
+            proxies: vec![p],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        let rm = cache.find_proxy(Some("oddball"), "/").expect("route");
+        let kept = table
+            .select_mesh_outbound_port_route(rm, Some(12345))
+            .expect("unclaimed reserved-prefix route passes through selection");
+        assert_eq!(kept.proxy.id, "__mesh-outbound-oddball");
+    }
+
+    /// Sibling groups must not leak across services — including the lossy
+    /// `{ns}-{name}` join collision (ns `a` / svc `b-c` vs ns `a-b` / svc
+    /// `c`): forward derivation from the mesh block keeps both services
+    /// independently routable instead of conflating them into one group.
+    #[test]
+    fn mesh_outbound_port_groups_are_per_service() {
+        let mut a80 = minimal_proxy_for_routing("__mesh-outbound-default-reviews-80", "/");
+        a80.hosts = vec!["reviews".to_string()];
+        let mut a90 = minimal_proxy_for_routing("__mesh-outbound-default-reviews-90", "/");
+        a90.hosts = vec!["reviews".to_string()];
+        let mut b = minimal_proxy_for_routing("__mesh-outbound-default-ratings-9080", "/");
+        b.hosts = vec!["ratings".to_string()];
+        // Lossy-join collision pair: their ids share the joined `{ns}-{name}`
+        // text, but they are distinct services with distinct hosts.
+        let mut c1 = minimal_proxy_for_routing("__mesh-outbound-a-b-c-80", "/");
+        c1.hosts = vec!["b-c.a.svc.cluster.local".to_string()];
+        let mut c2 = minimal_proxy_for_routing("__mesh-outbound-a-b-c-90", "/");
+        c2.hosts = vec!["c.a-b.svc.cluster.local".to_string()];
+        let config = GatewayConfig {
+            proxies: vec![a80, a90, b, c1, c2],
+            mesh: mesh_block(&[
+                ("default", "reviews", &[80, 90]),
+                ("default", "ratings", &[9080]),
+                ("a", "b-c", &[80]),
+                ("a-b", "c", &[90]),
+            ]),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
+        assert!(
+            matches!(
+                table.select_mesh_outbound_port_route(rm, Some(80)),
+                Err(MeshOutboundPortSelectError::PortNotMaterialized)
+            ),
+            "another service's port must not select into this service's group"
+        );
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        let selected = table
+            .select_mesh_outbound_port_route(rm, Some(90))
+            .expect("own port selects");
+        assert_eq!(selected.proxy.id, "__mesh-outbound-default-reviews-90");
+
+        // Both collision-pair services stay routable under their own hosts —
+        // a backwards id parse would have grouped them and dropped one from
+        // the tiers entirely.
+        let rm = cache
+            .find_proxy(Some("b-c.a.svc.cluster.local"), "/")
+            .expect("first collision-pair service routes");
+        assert_eq!(
+            table
+                .select_mesh_outbound_port_route(rm, Some(80))
+                .expect("own port selects")
+                .proxy
+                .id,
+            "__mesh-outbound-a-b-c-80"
+        );
+        let rm = cache
+            .find_proxy(Some("c.a-b.svc.cluster.local"), "/")
+            .expect("second collision-pair service routes");
+        assert_eq!(
+            table
+                .select_mesh_outbound_port_route(rm, Some(90))
+                .expect("own port selects")
+                .proxy
+                .id,
+            "__mesh-outbound-a-b-c-90"
+        );
     }
 
     #[test]

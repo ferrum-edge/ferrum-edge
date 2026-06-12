@@ -31,10 +31,17 @@ async fn connect_websocket_backend_sets_tcp_nodelay() {
         .expect("backend connect succeeds");
 
     match ws_stream.get_ref() {
-        tokio_tungstenite::MaybeTlsStream::Plain(tcp) => {
+        tokio_tungstenite::MaybeTlsStream::Plain(io) => {
+            let tcp = io.get_ref();
             assert!(
                 tcp.nodelay().expect("nodelay getsockopt"),
                 "backend WS TcpStream must have TCP_NODELAY set"
+            );
+            assert!(
+                socket2::SockRef::from(tcp)
+                    .keepalive()
+                    .expect("keepalive getsockopt"),
+                "backend WS TcpStream must have TCP keepalive set"
             );
         }
         _ => panic!("expected plain TCP backend"),

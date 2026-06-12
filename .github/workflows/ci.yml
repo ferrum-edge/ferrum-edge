@@ -234,6 +234,7 @@ jobs:
               integration::mesh_telemetry_k8s_provider_lookup_tests
               integration::mesh_telemetry_tracing_tests
               integration::mesh_federation_poller_tests
+              integration::mesh_file_source_tests
               integration::mesh_multicluster_discovery_tests
               integration::mesh_proxy_config_tests
               integration::mesh_outbound_registry_stream_tests
@@ -1192,16 +1193,21 @@ jobs:
         # namespaces (needs CAP_SYS_ADMIN) to prove a 127.0.0.1:15001 listener
         # bound INSIDE a pod netns is reachable from a client in that netns and
         # isolated from the host netns — the loopback property a single
-        # host-netns listener cannot satisfy. Each test self-skips (passes) when
-        # the runner lacks root / `unshare`. Run the prebuilt binary directly
-        # under sudo so cargo never runs as root against the user-owned target.
+        # host-netns listener cannot satisfy. Also runs the SO_ORIGINAL_DST
+        # live test (`src/socket_opts.rs::original_dst_live_tests`): a real
+        # iptables REDIRECT in a throwaway netns must report the pre-NAT
+        # destination on the accepted socket — the primitive mesh outbound
+        # multi-port routing rests on. Each test self-skips (passes) when
+        # the runner lacks root / `unshare` / `iptables`. Run the prebuilt
+        # binary directly under sudo so cargo never runs as root against the
+        # user-owned target.
         run: |
           set -euo pipefail
           BIN=$(cargo test --lib --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.profile.test == true and .executable != null and (.target.kind[0] == "lib")) | .executable' \
             | tail -n1)
           echo "In-netns live test binary: $BIN"
-          sudo -E "$BIN" proxy::netns_capture::live_netns_tests --ignored --nocapture --test-threads=1
+          sudo -E "$BIN" proxy::netns_capture::live_netns_tests socket_opts::original_dst_live_tests --ignored --nocapture --test-threads=1
         env:
           RUST_BACKTRACE: 1
 

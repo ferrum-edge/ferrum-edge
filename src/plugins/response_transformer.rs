@@ -350,7 +350,13 @@ impl Plugin for ResponseTransformer {
         !self.body_rules.is_empty()
     }
 
-    fn may_modify_response_content_type(&self, ctx: &RequestContext) -> bool {
+    fn may_modify_response_content_type(
+        &self,
+        ctx: &RequestContext,
+        _response_content_type: Option<&str>,
+    ) -> bool {
+        // Whether a rule fires is decided by config/route state, not the
+        // backend response type, so the backend `Content-Type` is not consulted.
         self.rules_enabled()
             && (self.static_rules_may_modify_content_type()
                 || Self::route_rules_may_modify_content_type(ctx))

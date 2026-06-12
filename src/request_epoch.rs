@@ -4,11 +4,12 @@
 //! consumer index, and load-balancer snapshot together. Writers build staged
 //! inners before publishing, then swap the whole epoch with one ArcSwap store.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 
-use crate::config::types::GatewayConfig;
+use crate::config::types::{GatewayConfig, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::consumer_index::ConsumerIndexInner;
 use crate::load_balancer::LoadBalancerCache;
@@ -21,6 +22,7 @@ use crate::router_cache::RouterCache;
 #[derive(Clone)]
 pub struct RequestEpoch {
     pub(crate) config: Arc<GatewayConfig>,
+    pub(crate) proxy_index_by_id: Arc<HashMap<String, usize>>,
     pub(crate) route_table: Arc<HostRouteTable>,
     pub(crate) plugin_cache: Arc<PluginCacheInner>,
     pub(crate) consumer_index: Arc<ConsumerIndexInner>,
@@ -28,6 +30,26 @@ pub struct RequestEpoch {
     pub(crate) config_generation: u64,
     pub(crate) route_generation: u64,
     pub(crate) lb_generation: u64,
+}
+
+impl RequestEpoch {
+    pub(crate) fn proxy_by_id(&self, id: &str) -> Option<&Proxy> {
+        self.proxy_index_by_id
+            .get(id)
+            .and_then(|idx| self.config.proxies.get(*idx))
+            .filter(|proxy| proxy.id == id)
+    }
+}
+
+pub(crate) fn build_proxy_index_by_id(config: &GatewayConfig) -> Arc<HashMap<String, usize>> {
+    Arc::new(
+        config
+            .proxies
+            .iter()
+            .enumerate()
+            .map(|(idx, proxy)| (proxy.id.clone(), idx))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -300,6 +322,68 @@ mod tests {
     }
 
     #[test]
+    fn proxy_by_id_index_tracks_published_config_snapshots() {
+        let initial = config(vec![proxy("p1", "/one", vec![])], vec![], vec![]);
+        let store = epoch_store(initial);
+        let before = store.load();
+        assert_eq!(
+            before
+                .proxy_by_id("p1")
+                .map(|proxy| proxy.listen_path.as_deref()),
+            Some(Some("/one"))
+        );
+        assert!(before.proxy_by_id("p2").is_none());
+
+        let next_config = config(
+            vec![
+                proxy("p1", "/one-renamed", vec![]),
+                proxy("p2", "/two", vec![]),
+            ],
+            vec![],
+            vec![],
+        );
+        store
+            .update_config(
+                |current| {
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::new(next_config.clone()),
+                        route_table: RouterCache::build_route_table_snapshot(&next_config),
+                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: true,
+                        lb_changed: false,
+                    }))
+                },
+                |_| {},
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let after_config_update = store.load();
+        assert_eq!(
+            after_config_update
+                .proxy_by_id("p1")
+                .map(|proxy| proxy.listen_path.as_deref()),
+            Some(Some("/one-renamed"))
+        );
+        assert_eq!(
+            after_config_update
+                .proxy_by_id("p2")
+                .map(|proxy| proxy.listen_path.as_deref()),
+            Some(Some("/two"))
+        );
+
+        store.update_load_balancer(|current| Some(Arc::clone(&current.load_balancer)), |_| {});
+        let after_lb_update = store.load();
+        assert_eq!(
+            after_lb_update
+                .proxy_by_id("p2")
+                .map(|proxy| proxy.listen_path.as_deref()),
+            Some(Some("/two"))
+        );
+    }
+
+    #[test]
     fn lb_state_for_unchanged_upstream_is_preserved() {
         let old = config(
             vec![proxy("p1", "/one", vec![])],
@@ -561,6 +645,7 @@ impl RequestEpochStore {
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),
             load_balancer: load_balancer_cache.load_inner(),
+            proxy_index_by_id: build_proxy_index_by_id(&config),
             config: Arc::new(config),
             config_generation: 1,
             route_generation: 1,
@@ -586,8 +671,10 @@ impl RequestEpochStore {
             return Ok(None);
         };
 
+        let proxy_index_by_id = build_proxy_index_by_id(&staged.config);
         let next = Arc::new(RequestEpoch {
             config: staged.config,
+            proxy_index_by_id,
             route_table: staged.route_table,
             plugin_cache: staged.plugin_cache,
             consumer_index: staged.consumer_index,
@@ -624,6 +711,7 @@ impl RequestEpochStore {
         let load_balancer = build(&current)?;
         let next = Arc::new(RequestEpoch {
             config: Arc::clone(&current.config),
+            proxy_index_by_id: Arc::clone(&current.proxy_index_by_id),
             route_table: Arc::clone(&current.route_table),
             plugin_cache: Arc::clone(&current.plugin_cache),
             consumer_index: Arc::clone(&current.consumer_index),

@@ -2165,6 +2165,36 @@ fn test_env_config_max_websocket_frame_size_bytes_custom() {
     );
 }
 
+#[test]
+fn test_env_config_websocket_idle_timeout_seconds_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.websocket_idle_timeout_seconds, 0);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_websocket_idle_timeout_seconds_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS", "45"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.websocket_idle_timeout_seconds, 45);
+        },
+    );
+}
+
 // ============================================================================
 // HTTP Header Read Timeout Tests
 // ============================================================================
