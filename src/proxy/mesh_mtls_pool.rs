@@ -144,6 +144,7 @@ struct MeshMtlsSvidIdentityCache {
 }
 
 impl MeshMtlsConnectionPool {
+    #[allow(dead_code)] // Used by tests and external lib callers; binary wires the shared generation counter.
     pub fn new(
         pool_config: PoolConfig,
         dns_cache: DnsCache,
