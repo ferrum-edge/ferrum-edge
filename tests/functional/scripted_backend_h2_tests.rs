@@ -836,6 +836,143 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_passive_health_ejects_trailer_unavailable_target() {
+    let bad_reservation = reserve_port().await.expect("reserve bad backend port");
+    let bad_port = bad_reservation.port;
+    let mut bad_builder = ScriptedGrpcBackend::builder_plain(bad_reservation.into_listener());
+    for _ in 0..6 {
+        bad_builder = bad_builder
+            .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+            .step(GrpcStep::SendInitialHeaders)
+            .step(GrpcStep::RespondStatus {
+                code: 14,
+                message: "unavailable",
+            });
+    }
+    let bad_backend = bad_builder.spawn().expect("spawn bad backend");
+
+    let good_reservation = reserve_port().await.expect("reserve good backend port");
+    let good_port = good_reservation.port;
+    let mut good_builder = ScriptedGrpcBackend::builder_plain(good_reservation.into_listener());
+    for _ in 0..16 {
+        good_builder = good_builder
+            .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+            .step(GrpcStep::SendInitialHeaders)
+            .step(GrpcStep::RespondMessage(Bytes::from_static(b"good")))
+            .step(GrpcStep::RespondStatus {
+                code: 0,
+                message: "",
+            });
+    }
+    let good_backend = good_builder.spawn().expect("spawn good backend");
+
+    let yaml = serde_yaml::to_string(&json!({
+        "version": "1",
+        "proxies": [{
+            "id": "grpc-passive",
+            "listen_path": "/grpc",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": bad_port,
+            "strip_listen_path": true,
+            "upstream_id": "grpc-passive-upstream",
+            "backend_connect_timeout_ms": 1000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+        }],
+        "upstreams": [{
+            "id": "grpc-passive-upstream",
+            "name": "gRPC passive health upstream",
+            "algorithm": "round_robin",
+            "targets": [
+                { "host": "127.0.0.1", "port": bad_port, "weight": 1 },
+                { "host": "127.0.0.1", "port": good_port, "weight": 1 },
+            ],
+            "health_checks": {
+                "passive": {
+                    "unhealthy_status_codes": [500, 502, 503],
+                    "unhealthy_threshold": 1,
+                    "unhealthy_window_seconds": 60,
+                    "healthy_after_seconds": 60,
+                },
+            },
+        }],
+        "consumers": [],
+        "plugin_configs": [],
+    }))
+    .expect("serialize grpc passive config");
+
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+
+    let mut observed_bad = false;
+    for i in 0..4 {
+        let response = client
+            .unary(
+                &format!("/grpc/ferrum.Echo/Warmup{i}"),
+                Bytes::from_static(b""),
+            )
+            .await
+            .expect("warmup response");
+        match response.grpc_status() {
+            Some(14) => {
+                observed_bad = true;
+                break;
+            }
+            Some(0) => {}
+            other => panic!(
+                "unexpected warmup grpc-status={other:?}; headers={:?} trailers={:?}",
+                response.headers, response.trailers
+            ),
+        }
+    }
+    assert!(
+        observed_bad,
+        "warmup never reached the bad target; bad_streams={} good_streams={}",
+        bad_backend.received_stream_count(),
+        good_backend.received_stream_count()
+    );
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    for i in 0..8 {
+        let response = client
+            .unary(
+                &format!("/grpc/ferrum.Echo/AfterEject{i}"),
+                Bytes::from_static(b""),
+            )
+            .await
+            .expect("post-ejection response");
+        assert_eq!(
+            response.grpc_status(),
+            Some(0),
+            "passive health did not eject the grpc-status=14 target; response={response:?}"
+        );
+        assert!(
+            response.messages.iter().any(|m| m.as_ref() == b"good"),
+            "healthy backend response missing expected payload; response={response:?}"
+        );
+    }
+
+    bad_backend.assert_no_step_errors().await;
+    good_backend.assert_no_step_errors().await;
+}
+
 // A small-but-mighty regression test: the scripted-backend framework
 // itself shouldn't prevent the `TestCa` ECDSA cert from building an h2
 // ALPN server. This doesn't exercise the gateway; it catches "did we
