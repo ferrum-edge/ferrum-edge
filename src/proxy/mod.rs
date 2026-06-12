@@ -86,7 +86,9 @@ use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::identity::{SharedSvidBundle, SvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
-use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
+use crate::load_balancer::{
+    HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
+};
 use crate::modes::mesh::node_waypoint::{
     NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver,
 };
@@ -1020,34 +1022,40 @@ pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> 
 }
 
 /// Whether an authenticated inbound HBONE CONNECT to `host:port` may be
-/// transparently relayed. SAFE local targets only: a loopback address (the
-/// co-located app — Ferrum's per-workload Ambient/Sidecar model puts the app on
-/// loopback) or an in-mesh workload address+port the slice already declares.
-/// This bounds the terminator to mesh-known destinations, so an authenticated
-/// peer can never use the HBONE listener as an open proxy to arbitrary internal
-/// hosts. (`handle_hbone_request` separately requires the peer to be an
-/// authenticated, trust-domain-verified mesh identity before dialing.)
+/// transparently relayed. SAFE local targets only: a loopback address on an
+/// application port declared by the slice, or an in-mesh workload address+port
+/// the slice already declares. This bounds the terminator to mesh-known
+/// destinations, so an authenticated peer can never use the HBONE listener as
+/// an open proxy to arbitrary internal hosts or undeclared loopback listeners.
+/// (`handle_hbone_request` separately requires the peer to be an authenticated,
+/// trust-domain-verified mesh identity before dialing.)
 fn inbound_hbone_relay_destination_allowed(
     host: &str,
     port: u16,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
 ) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>()
-        && ip.is_loopback()
+    let Some(mesh) = mesh else {
+        return false;
+    };
+
+    if host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
     {
-        return true;
+        return mesh
+            .workloads
+            .iter()
+            .flat_map(|workload| &workload.ports)
+            .any(|workload_port| workload_port.port == port);
     }
+
     // Otherwise the destination must be an in-mesh workload address+port the
     // slice declares — never an arbitrary host. A workload that declares no
     // ports admits any port for its address (the slice does not constrain it).
-    mesh.is_some_and(|mesh| {
-        mesh.workloads.iter().any(|workload| {
-            workload.addresses.iter().any(|addr| addr == host)
-                && (workload.ports.is_empty() || workload.ports.iter().any(|wp| wp.port == port))
-        })
+    mesh.workloads.iter().any(|workload| {
+        workload.addresses.iter().any(|addr| addr == host)
+            && (workload.ports.is_empty() || workload.ports.iter().any(|wp| wp.port == port))
     })
 }
 
@@ -1185,7 +1193,8 @@ pub(crate) fn supports_native_http3_backend(
 /// failure that should downgrade the cached H3 capability to
 /// `Unsupported`. Excludes application-layer / client-side errors
 /// (`ClientDisconnect`, `RequestBodyTooLarge`, `ResponseBodyTooLarge`,
-/// `RequestError`) which do not reflect backend QUIC health.
+/// `RequestError`) and backend response read timeouts, which do not prove
+/// the backend has lost H3 capability.
 pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
     matches!(
         class,
@@ -1198,7 +1207,6 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
             | retry::ErrorClass::DnsLookupError
             | retry::ErrorClass::PortExhaustion
             | retry::ErrorClass::ConnectionPoolError
-            | retry::ErrorClass::ReadWriteTimeout
     )
 }
 
@@ -1210,12 +1218,11 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
 /// on `error_class` ALONE — intentionally ignoring `connection_error`.
 ///
 /// Rationale: `classify_h3_error` marks GOAWAY / stream reset / other
-/// protocol errors and non-connect read timeouts with
-/// `connection_error=false`, yet they are still H3 transport failures.
-/// Routing the next request through the same native H3 pool would just
-/// repeat them. Only application-layer outcomes (`ClientDisconnect`,
-/// body-size errors, plain `RequestError`) leave the capability
-/// untouched — those reflect the request, not the backend.
+/// protocol errors with `connection_error=false`, yet they are still H3
+/// transport failures. Routing the next request through the same native H3
+/// pool would just repeat them. Application-layer outcomes and backend
+/// response read timeouts leave the capability untouched — those reflect
+/// the request or backend latency, not whether the backend speaks H3.
 fn is_h3_transport_failure(resp: &retry::BackendResponse) -> bool {
     resp.error_class.is_some_and(is_h3_transport_error_class)
 }
@@ -1553,6 +1560,35 @@ fn record_grpc_backend_status_outcome(
     } else {
         cb.record_success(is_half_open_probe);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_grpc_backend_dispatch_outcome(
+    state: &ProxyState,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
+    upstream_target: Option<&Arc<UpstreamTarget>>,
+    final_cb_target_key: Option<&str>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<retry::ErrorClass>,
+    backend_elapsed: Duration,
+) {
+    backend_dispatch::record_backend_outcome_no_conn_end(
+        state,
+        proxy,
+        lb_snapshot,
+        selected_balancer,
+        upstream_target.map(Arc::as_ref),
+        final_cb_target_key,
+        response_status,
+        connection_error,
+        error_class,
+        false,
+        true,
+        backend_elapsed,
+    );
 }
 
 /// Load a gRPC streaming late client-upload overflow flag with `Acquire`
@@ -2647,23 +2683,26 @@ async fn run_gateway_svid_file_rotation_loop(
     }
 }
 
-/// Bundle of the four backend pools whose entries are partitioned by SVID
+/// Bundle of the backend pools whose entries are partitioned by SVID
 /// generation. Grouping them keeps the rotation-task signature manageable and
 /// makes "another pool joined the family" a one-line edit.
 ///
 /// NOTE on the asymmetric drain calls: only `connection_pool`, `http2_pool`,
 /// and `grpc_pool` get a `drain_backend_tls_config_cache_svid_generation()`
 /// call on rotation — the H3 pool's TLS config cache is co-located on
-/// `connection_pool.backend_h3_tls_configs`, so it is drained transitively.
-/// All four pools get a `force_drain_svid_generation()` call when the
-/// operator-configured drain window elapses, because each pool keeps its own
-/// `DashMap` of live connections.
+/// `connection_pool.backend_h3_tls_configs`, so it is drained transitively,
+/// and the HBONE and mesh mTLS pools build their SPIFFE client config per
+/// connect (no cache to drain). All pools get a `force_drain_svid_generation()` call when
+/// the operator-configured drain window elapses, because each pool keeps its
+/// own `DashMap` of live connections.
 #[derive(Clone)]
 struct BackendPoolFamily {
     connection_pool: Arc<ConnectionPool>,
     http2_pool: Arc<Http2ConnectionPool>,
     grpc_pool: Arc<GrpcConnectionPool>,
     h3_pool: Arc<Http3ConnectionPool>,
+    hbone_pool: Arc<HboneConnectionPool>,
+    mesh_mtls_pool: Arc<mesh_mtls_pool::MeshMtlsConnectionPool>,
 }
 
 impl BackendPoolFamily {
@@ -2687,6 +2726,8 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_svid_generation(generation);
         self.grpc_pool.force_drain_svid_generation(generation);
         self.h3_pool.force_drain_svid_generation(generation);
+        self.hbone_pool.force_drain_svid_generation(generation);
+        self.mesh_mtls_pool.force_drain_svid_generation(generation);
     }
 
     fn force_drain_all(&self) {
@@ -2694,6 +2735,8 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_all();
         self.grpc_pool.force_drain_all();
         self.h3_pool.force_drain_all();
+        self.hbone_pool.force_drain_all();
+        self.mesh_mtls_pool.force_drain_all();
     }
 }
 
@@ -2729,8 +2772,8 @@ fn spawn_backend_svid_rotation_task(
         // on graceful shutdown; otherwise each runs to completion independently
         // so the operator's `drain_seconds` window is honoured per-generation
         // even under rotation storms (e.g. a misbehaving CA issuing 30s certs).
-        // Each task only retains four `Arc` pool handles and ends with a
-        // single `invalidate_matching` pass per pool, so memory + CPU cost
+        // Each task only retains the family's `Arc` pool handles and ends with
+        // a single `invalidate_matching` pass per pool, so memory + CPU cost
         // remains O(rotations within drain_seconds) which is bounded by the
         // operator-chosen window.
         let mut pending_force_drains: std::collections::VecDeque<tokio::task::JoinHandle<()>> =
@@ -3021,9 +3064,23 @@ impl ProxyState {
             http2_pool: self.http2_pool.clone(),
             grpc_pool: self.grpc_pool.clone(),
             h3_pool: self.h3_pool.clone(),
+            hbone_pool: self.hbone_pool.clone(),
+            mesh_mtls_pool: self.mesh_mtls_pool.clone(),
         };
         pools.clear_tls_config_caches();
         pools.force_drain_all();
+        // UDP/DTLS listeners keep listener-local backend DTLS config caches
+        // keyed by paths/options; bump the shared epoch so new sessions
+        // rebuild from the rotated bytes instead of serving stale params.
+        self.stream_listener_manager.bump_backend_tls_reload_epoch();
+        // Publish the reloaded CRLs to the stream listener manager BEFORE the
+        // reconcile below: TCP+TLS reload keys fold in the CRL content
+        // fingerprint, so this swap is what makes a CRL-only rotation restart
+        // those listeners with the new revocation list (and what makes any
+        // restarted listener rebuild against the rotated CRLs rather than the
+        // startup snapshot).
+        self.stream_listener_manager
+            .set_crls(self.shared_crls.load_full());
 
         let config = self.config.load_full();
         self.health_checker
@@ -3055,7 +3112,7 @@ impl ProxyState {
 
         info!(
             validated_backend_tls_configs = validated,
-            "Backend TLS material reloaded; backend client pools were drained and stream listeners reconciled"
+            "Backend TLS material reloaded; backend client pools and DTLS config caches were drained and stream listeners reconciled"
         );
         Ok(())
     }
@@ -3334,18 +3391,22 @@ impl ProxyState {
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
-        let hbone_pool = Arc::new(HboneConnectionPool::new(
+        let hbone_pool = Arc::new(HboneConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
             dns_cache.clone(),
             gateway_svid_bundle.clone(),
             pool_shard_amount,
+            backend_svid_generation.clone(),
         ));
-        let mesh_mtls_pool = Arc::new(mesh_mtls_pool::MeshMtlsConnectionPool::new(
-            global_pool_config.clone(),
-            dns_cache.clone(),
-            gateway_svid_bundle.clone(),
-            pool_shard_amount,
-        ));
+        let mesh_mtls_pool = Arc::new(
+            mesh_mtls_pool::MeshMtlsConnectionPool::new_with_svid_generation(
+                global_pool_config.clone(),
+                dns_cache.clone(),
+                gateway_svid_bundle.clone(),
+                pool_shard_amount,
+                backend_svid_generation.clone(),
+            ),
+        );
         let h3_pool = Arc::new(Http3ConnectionPool::new_with_svid_generation(
             env_config_arc.clone(),
             dns_cache.clone(),
@@ -3470,6 +3531,8 @@ impl ProxyState {
                     http2_pool: http2_pool.clone(),
                     grpc_pool: grpc_pool.clone(),
                     h3_pool: h3_pool.clone(),
+                    hbone_pool: hbone_pool.clone(),
+                    mesh_mtls_pool: mesh_mtls_pool.clone(),
                 },
                 health_checker: health_checker.clone(),
                 config: config_arc.clone(),
@@ -6728,12 +6791,12 @@ fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(
 /// Collect backend WebSocket headers while preserving repeated client-provided
 /// values when the sanitized proxy header map still represents the full raw set.
 ///
-/// `RequestContext::headers` is a `HashMap`, so repeated fields are necessarily
-/// collapsed or comma-folded after materialization. The raw `HeaderMap` is
-/// still available from the upgrade request; use it to retain handshake-
-/// equivalent repeated headers such as multiple `Sec-WebSocket-Protocol`
-/// values, while still honoring plugin-driven strips and rewrites reflected in
-/// `proxy_headers`.
+/// `RequestContext::headers` is a `HashMap`, so repeated fields are folded
+/// after materialization (`; ` for cookie crumbs, `, ` otherwise). The raw
+/// `HeaderMap` is still available from the upgrade request; use it to retain
+/// handshake-equivalent repeated headers such as multiple
+/// `Sec-WebSocket-Protocol` values, while still honoring plugin-driven strips
+/// and rewrites reflected in `proxy_headers`.
 fn collect_forwardable_websocket_headers(
     raw_headers: &hyper::HeaderMap,
     proxy_headers: &HashMap<String, String>,
@@ -6769,7 +6832,7 @@ fn collect_forwardable_websocket_headers(
             .iter()
             .filter_map(|value| value.to_str().ok())
             .collect();
-        if sanitized_value_preserves_raw_values(&raw_values, sanitized_value)
+        if sanitized_value_preserves_raw_values(name.as_str(), &raw_values, sanitized_value)
             || sanitized_value == &materialized_raw_header_value(name.as_str(), &raw_values)
         {
             preserved_raw_names.insert(lower_name);
@@ -6804,15 +6867,25 @@ fn collect_forwardable_websocket_headers(
     forwarded
 }
 
-fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &str) -> bool {
+fn sanitized_value_preserves_raw_values(
+    name: &str,
+    raw_values: &[&str],
+    sanitized_value: &str,
+) -> bool {
     match raw_values {
         [] => false,
         [only] => *only == sanitized_value,
         _ => {
             // This exact fast-path only applies to list-style values where
-            // individual raw values do not contain literal commas. If that is
-            // not true, callers fall back to the shared materialized form.
-            let mut sanitized_values = sanitized_value.split(',').map(str::trim);
+            // individual raw values do not contain the fold delimiter. If
+            // that is not true, callers fall back to the shared materialized
+            // form.
+            let delimiter = if name.eq_ignore_ascii_case("cookie") {
+                ';'
+            } else {
+                ','
+            };
+            let mut sanitized_values = sanitized_value.split(delimiter).map(str::trim);
             raw_values
                 .iter()
                 .map(|value| value.trim())
@@ -6823,11 +6896,7 @@ fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &s
 }
 
 fn materialized_raw_header_value(name: &str, raw_values: &[&str]) -> String {
-    if crate::plugins::is_comma_folded_list_header(name) {
-        raw_values.join(",")
-    } else {
-        raw_values.last().copied().unwrap_or_default().to_string()
-    }
+    raw_values.join(crate::plugins::repeated_request_header_separator(name))
 }
 
 fn proxy_header_entry_case_insensitive<'a>(
@@ -9768,8 +9837,9 @@ async fn handle_proxy_request_inner(
             // through a synthesized proxy instead of 404ing. The synthesized
             // proxy is built only on the inbound listener (`mesh_direction ==
             // Inbound`) and only for a loopback / slice-known workload
-            // destination; `handle_hbone_request` re-checks the
-            // authenticated-peer gate before dialing.
+            // destination, with loopback ports constrained to the slice's
+            // declared workload application ports; `handle_hbone_request`
+            // re-checks the authenticated-peer gate before dialing.
             let hbone_relay = if is_hbone_connect
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
@@ -10521,6 +10591,8 @@ async fn handle_proxy_request_inner(
         // `backend_admission_started_at`. `backend_start` itself stays the
         // origin for full backend-latency metrics (`backend_total_ms`).
         let mut grpc_backend_admission_started_at = backend_start;
+        let mut grpc_final_upstream_target = upstream_target.clone();
+        let mut grpc_lb_connection_guard: Option<LoadBalancerConnectionGuard> = None;
 
         // Streaming-response safety:
         //   * Retries are triggered by CONNECTION errors (BackendUnavailable,
@@ -10708,6 +10780,10 @@ async fn handle_proxy_request_inner(
                     .await);
                 }
             };
+            grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                upstream_target.clone(),
+                upstream_balancer.clone(),
+            ));
             grpc_backend_admission_started_at = Instant::now();
             let result = grpc_proxy::proxy_grpc_request_core(
                 grpc_method,
@@ -10852,6 +10928,10 @@ async fn handle_proxy_request_inner(
                         .await);
                     }
                 };
+                grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                    upstream_target.clone(),
+                    upstream_balancer.clone(),
+                ));
                 grpc_backend_admission_started_at = Instant::now();
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
@@ -10913,6 +10993,10 @@ async fn handle_proxy_request_inner(
                                     .await);
                                 }
                             };
+                        grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                            upstream_target.clone(),
+                            upstream_balancer.clone(),
+                        ));
                         grpc_backend_admission_started_at = Instant::now();
                         let result = grpc_proxy::proxy_grpc_request_core(
                             grpc_method,
@@ -10994,6 +11078,23 @@ async fn handle_proxy_request_inner(
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                let grpc_retry_error_class = match &grpc_result {
+                    Err(error) => Some(retry::classify_grpc_proxy_error(error)),
+                    Ok(_) => None,
+                };
+                record_grpc_backend_dispatch_outcome(
+                    &state,
+                    &proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer.as_ref(),
+                    grpc_current_target.as_ref(),
+                    grpc_current_cb_key.as_deref(),
+                    502,
+                    true,
+                    grpc_retry_error_class,
+                    grpc_backend_admission_started_at.elapsed(),
+                );
+                drop(grpc_lb_connection_guard.take());
 
                 // Record circuit breaker failure for current target
                 if let Some(cb_config) = &proxy.circuit_breaker {
@@ -11024,6 +11125,7 @@ async fn handle_proxy_request_inner(
                 // stays attributed to the target that produced it. Mirrors the
                 // HTTP retry path.
                 let grpc_pre_rotation_cb_key = grpc_current_cb_key.clone();
+                let grpc_pre_rotation_target = grpc_current_target.clone();
 
                 // Try a different target on retry if load balancing is configured
                 if let (Some(_upstream_id), Some(prev_target)) =
@@ -11078,6 +11180,7 @@ async fn handle_proxy_request_inner(
                             // post-dispatch record so we neither double-record
                             // nor attribute to the never-dispatched target.
                             grpc_final_cb_key = grpc_pre_rotation_cb_key;
+                            grpc_final_upstream_target = grpc_pre_rotation_target;
                             grpc_skip_final_cb_record = true;
                             break;
                         }
@@ -11139,6 +11242,11 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     grpc_current_target.as_deref(),
                 );
+                grpc_final_upstream_target = grpc_current_target.clone();
+                grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                    grpc_current_target.clone(),
+                    upstream_balancer.clone(),
+                ));
                 grpc_backend_admission_started_at = Instant::now();
                 grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
                     grpc_method.clone(),
@@ -11257,6 +11365,11 @@ async fn handle_proxy_request_inner(
 
                 // after_proxy plugins run on headers only (body is not yet in memory).
                 let mut response_headers: HashMap<String, String> = grpc_streaming.headers;
+                let grpc_backend_dispatch_status = grpc_proxy::grpc_admission_status_from_maps(
+                    &EMPTY_HEADERS,
+                    &response_headers,
+                    grpc_streaming.status,
+                );
                 {
                     let phase_start = Instant::now();
                     if let Some(reject) = run_after_proxy_hooks(
@@ -11284,6 +11397,19 @@ async fn handle_proxy_request_inner(
                                 backend_elapsed: grpc_backend_admission_elapsed,
                             });
                         }
+                        record_grpc_backend_dispatch_outcome(
+                            &state,
+                            &proxy,
+                            &epoch.load_balancer,
+                            upstream_balancer.as_ref(),
+                            grpc_final_upstream_target.as_ref(),
+                            grpc_final_cb_key.as_deref(),
+                            grpc_backend_dispatch_status,
+                            false,
+                            None,
+                            grpc_backend_admission_elapsed,
+                        );
+                        drop(grpc_lb_connection_guard.take());
                         // Use `original_request_path` so the log records the
                         // path the client actually requested, not the
                         // VirtualService-rewritten backend path in `ctx.path`.
@@ -11422,6 +11548,7 @@ async fn handle_proxy_request_inner(
 
                 if body_exceeded {
                     drop(backend_admission_permits.take());
+                    drop(grpc_lb_connection_guard.take());
                     record_request(&state, 200);
                     return Ok(grpc_proxy::build_grpc_error_response(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -11503,6 +11630,28 @@ async fn handle_proxy_request_inner(
                 if let Some(guard) = per_ip_guard {
                     body = body.with_per_ip_request_guard(guard);
                 }
+                if let Some(guard) = grpc_lb_connection_guard.take() {
+                    body = body.with_lb_connection_guard(guard);
+                }
+                body = body
+                    .with_deferred_backend_dispatch_outcome(
+                        Arc::new(state.clone()),
+                        Arc::clone(&proxy),
+                        Arc::clone(&epoch.load_balancer),
+                        upstream_balancer.clone(),
+                        grpc_final_upstream_target.clone(),
+                        grpc_final_cb_key.clone(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                        false,
+                        true,
+                        grpc_backend_admission_elapsed,
+                    )
+                    .with_grpc_trailer_backend_dispatch_classification()
+                    .with_deferred_dispatch_request_body_exceeded_flag(
+                        grpc_streaming.request_body_exceeded.clone(),
+                    );
                 if let Some(permits) = backend_admission_permits.take() {
                     body = body
                         .with_deferred_backend_admission_outcome(
@@ -11564,33 +11713,79 @@ async fn handle_proxy_request_inner(
             Ok(GrpcResponseKind::Buffered(grpc_resp)) => {
                 let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
+                let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
                 let mut response_body = grpc_resp.body;
+                // `response_trailers` is the backend's untouched trailer map at
+                // this point (moved out of `grpc_resp` above, reconciled with
+                // plugin mutations only later), so the grpc-status mapping is
+                // correct for both the non-empty-body (status in trailers) and
+                // Trailers-Only (status in headers) encodings.
+                let grpc_backend_dispatch_status = grpc_proxy::grpc_admission_status_from_maps(
+                    &response_trailers,
+                    &response_headers,
+                    response_status,
+                );
                 if let Some(permits) = backend_admission_permits.take() {
                     // gRPC application failures ride in the `grpc-status` trailer
                     // (or header, for trailers-only) under HTTP 200, so the HTTP
                     // status alone mislabels an UNAVAILABLE/INTERNAL backend as a
                     // healthy success. Map the effective non-OK gRPC status to HTTP
                     // so a server-side failure surfaces as 5xx and shrinks the limit,
-                    // while client-side statuses stay <500 (healthy). `grpc_resp`
-                    // trailers are still intact here — drained into `response_headers`
-                    // below.
-                    let admission_status = grpc_proxy::grpc_admission_status_from_maps(
-                        &grpc_resp.trailers,
-                        &response_headers,
-                        response_status,
-                    );
+                    // while client-side statuses stay <500 (healthy). The backend's
+                    // trailers are still intact here — plugin-view merge and wire
+                    // writeback happen below.
                     permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status: admission_status,
+                        response_status: grpc_backend_dispatch_status,
                         connection_error: false,
                         error_class: None,
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                if !grpc_skip_final_cb_record {
+                    record_grpc_backend_dispatch_outcome(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        grpc_final_upstream_target.as_ref(),
+                        grpc_final_cb_key.as_deref(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                        grpc_backend_admission_started_at.elapsed(),
+                    );
+                }
+                drop(grpc_lb_connection_guard.take());
 
-                // Forward trailers as response headers (gRPC Trailers-Only encoding).
-                // Drain instead of clone to avoid per-trailer String allocations.
-                for (k, v) in grpc_resp.trailers {
-                    response_headers.insert(k, v);
+                // Plugins historically saw a merged header+trailer map on the
+                // buffered gRPC path because trailers were inserted into
+                // response headers before hooks ran. Keep that compatibility
+                // view (same convention as the H3 bridge in
+                // `http3::cross_protocol`: a trailer never overrides a real
+                // header in the view), but split the wire response back into
+                // HEADERS + DATA + TRAILERS when the final body is non-empty.
+                // Trailer keys the backend ALSO sent as real initial headers
+                // are tracked so the post-hook writeback never copies the
+                // header's value into the wire trailer (the view value for
+                // those keys belongs to the header, not the trailer).
+                //
+                // Exception: the reserved gRPC terminal-status keys
+                // (grpc-status / grpc-message / grpc-status-details-bin) are
+                // trailer-authoritative and never shadowed — a malformed
+                // backend that duplicates them into the initial headers must
+                // not feed plugins (or the wire) the bogus header copy, so
+                // the trailing value wins in the view and the header copy is
+                // stripped on the non-empty wire path below.
+                let mut plugin_response_headers = response_headers.clone();
+                let mut header_shadowed_trailer_keys: HashSet<String> = HashSet::new();
+                for (k, v) in &response_trailers {
+                    if response_headers.contains_key(k)
+                        && !grpc_proxy::is_reserved_grpc_terminal_metadata(k)
+                    {
+                        header_shadowed_trailer_keys.insert(k.clone());
+                    } else {
+                        plugin_response_headers.insert(k.clone(), v.clone());
+                    }
                 }
 
                 // after_proxy hooks
@@ -11601,7 +11796,7 @@ async fn handle_proxy_request_inner(
                         &plugins,
                         &mut ctx,
                         response_status,
-                        &mut response_headers,
+                        &mut plugin_response_headers,
                     )
                     .await
                     {
@@ -11615,6 +11810,8 @@ async fn handle_proxy_request_inner(
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
                         response_status = normalized.http_status.as_u16();
                         response_headers = normalized.headers;
+                        plugin_response_headers = response_headers.clone();
+                        response_trailers.clear();
                         response_body = normalized.body;
                         after_proxy_rejected = true;
                     }
@@ -11628,7 +11825,7 @@ async fn handle_proxy_request_inner(
                             .on_response_body(
                                 &mut ctx,
                                 response_status,
-                                &response_headers,
+                                &plugin_response_headers,
                                 &response_body,
                             )
                             .await;
@@ -11650,6 +11847,8 @@ async fn handle_proxy_request_inner(
                                     .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
+                                plugin_response_headers = response_headers.clone();
+                                response_trailers.clear();
                                 response_body = normalized.body;
                                 break;
                             }
@@ -11660,14 +11859,18 @@ async fn handle_proxy_request_inner(
 
                 if !after_proxy_rejected {
                     let phase_start = Instant::now();
-                    let content_type = response_headers.get("content-type").cloned();
+                    let content_type = plugin_response_headers.get("content-type").cloned();
                     let ct_ref = content_type.as_deref();
                     for plugin in plugins.iter() {
                         if let Some(transformed) = plugin
-                            .transform_response_body(&response_body, ct_ref, &response_headers)
+                            .transform_response_body(
+                                &response_body,
+                                ct_ref,
+                                &plugin_response_headers,
+                            )
                             .await
                         {
-                            response_headers.insert(
+                            plugin_response_headers.insert(
                                 "content-length".to_string(),
                                 transformed.len().to_string(),
                             );
@@ -11684,7 +11887,7 @@ async fn handle_proxy_request_inner(
                             .on_final_response_body(
                                 &mut ctx,
                                 response_status,
-                                &response_headers,
+                                &plugin_response_headers,
                                 &response_body,
                             )
                             .await;
@@ -11706,6 +11909,8 @@ async fn handle_proxy_request_inner(
                                     .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
+                                plugin_response_headers = response_headers.clone();
+                                response_trailers.clear();
                                 response_body = normalized.body;
                                 break;
                             }
@@ -11772,6 +11977,84 @@ async fn handle_proxy_request_inner(
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
+                if !after_proxy_rejected {
+                    // Reconcile hook mutations from the merged view back into
+                    // the wire trailers: a trailer-originated key now absent
+                    // from the view was removed by a hook (honor the removal,
+                    // matching the pre-split behavior where trailers lived in
+                    // the headers map plugins mutated); a changed value is a
+                    // hook edit. Keys shadowed by a real backend header were
+                    // never plugin-visible as trailers, so while the key is
+                    // still in the view they keep the backend's true trailer
+                    // value — but a hook that removed the key from the view
+                    // suppresses the hidden trailer too (a security plugin
+                    // stripping a sensitive key must not leak its trailer
+                    // copy on the wire).
+                    response_trailers.retain(|k, v| {
+                        if header_shadowed_trailer_keys.contains(k) {
+                            return plugin_response_headers.contains_key(k);
+                        }
+                        match plugin_response_headers.get(k) {
+                            Some(plugin_value) => {
+                                if plugin_value != v {
+                                    *v = plugin_value.clone();
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    });
+                    response_headers = plugin_response_headers;
+                }
+                if response_body.is_empty() {
+                    // True Trailers-Only encoding: no DATA frame, grpc-status
+                    // and friends ride in the initial HEADERS with END_STREAM.
+                    // Trailer values are authoritative on collapse (pre-split
+                    // merge order), including over duplicate initial headers.
+                    for (k, v) in response_trailers.drain() {
+                        response_headers.insert(k, v);
+                    }
+                } else {
+                    // Non-empty gRPC responses must carry grpc-status in a
+                    // terminal TRAILERS frame. Strip the view-merged trailer
+                    // copies from the initial headers; keys the backend also
+                    // sent as real initial headers stay headers — the wire
+                    // trailer carries the backend's true trailer value (same
+                    // wire shape as the H3 bridge). Reserved terminal-status
+                    // keys are never shadowed, so a malformed duplicate
+                    // grpc-status initial header is always stripped here:
+                    // status must only appear in the trailers.
+                    for k in response_trailers.keys() {
+                        if !header_shadowed_trailer_keys.contains(k) {
+                            response_headers.remove(k);
+                        }
+                    }
+                }
+
+                // A response transform that re-encodes the gRPC terminal
+                // status into the body (e.g. `grpc_web` appends a gRPC-Web
+                // trailer frame and relabels the content-type) leaves the
+                // response no longer native gRPC. Emitting the reconciled
+                // native TRAILERS frame as well would double-signal terminal
+                // status and confuse gRPC-Web clients/intermediaries, so
+                // suppress the wire trailers whenever the final content-type
+                // positively indicates a conversion away from native
+                // `application/grpc` — keyed on the content-type, not on any
+                // specific plugin, so future transforms behave the same. An
+                // absent content-type keeps native gRPC semantics (we are on
+                // the gRPC dispatch path).
+                if !response_trailers.is_empty() {
+                    let converted_away_from_grpc =
+                        response_headers.get("content-type").is_some_and(|ct| {
+                            !crate::proxy::backend_dispatch::is_native_grpc_content_type(
+                                ct.as_bytes(),
+                            )
+                        });
+                    if converted_away_from_grpc {
+                        response_trailers.clear();
+                    }
+                }
+
                 // Inject sticky session cookie for gRPC responses
                 if sticky_cookie_needed
                     && let (Some(upstream_id), Some(target)) =
@@ -11825,39 +12108,73 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                 );
 
-                return Ok(resp_builder
-                    .body(ProxyBody::full(Bytes::from(response_body)))
-                    .unwrap_or_else(|_| {
-                        grpc_proxy::build_grpc_error_response(
-                            grpc_proxy::grpc_status::UNAVAILABLE,
-                            "Internal gateway error",
-                        )
-                    }));
+                let response_body = Bytes::from(response_body);
+                let body = if !response_body.is_empty() && !response_trailers.is_empty() {
+                    let mut trailers = hyper::HeaderMap::new();
+                    for (k, v) in &response_trailers {
+                        if let (Ok(name), Ok(value)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            hyper::header::HeaderValue::from_str(v),
+                        ) {
+                            trailers.append(name, value);
+                        }
+                    }
+                    ProxyBody::buffered_grpc_with_trailers(response_body, trailers)
+                } else {
+                    ProxyBody::full(response_body)
+                };
+
+                return Ok(resp_builder.body(body).unwrap_or_else(|_| {
+                    grpc_proxy::build_grpc_error_response(
+                        grpc_proxy::grpc_status::UNAVAILABLE,
+                        "Internal gateway error",
+                    )
+                }));
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
+                let grpc_backend_connection_error = matches!(
+                    &e,
+                    GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
+                ) || matches!(
+                    &e,
+                    GrpcProxyError::BackendTimeout {
+                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                        ..
+                    }
+                );
                 if !matches!(
                     &e,
                     GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
                 ) && let Some(permits) = backend_admission_permits.take()
                 {
-                    let connection_error = matches!(
-                        &e,
-                        GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
-                    ) || matches!(
-                        &e,
-                        GrpcProxyError::BackendTimeout {
-                            kind: grpc_proxy::GrpcTimeoutKind::Connect,
-                            ..
-                        }
-                    );
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: 502,
-                        connection_error,
+                        connection_error: grpc_backend_connection_error,
                         error_class: Some(grpc_error_class),
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                if !grpc_skip_final_cb_record
+                    && !matches!(
+                        &e,
+                        GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
+                    )
+                {
+                    record_grpc_backend_dispatch_outcome(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        grpc_final_upstream_target.as_ref(),
+                        grpc_final_cb_key.as_deref(),
+                        502,
+                        grpc_backend_connection_error,
+                        Some(grpc_error_class),
+                        grpc_backend_admission_started_at.elapsed(),
+                    );
+                }
+                drop(grpc_lb_connection_guard.take());
                 if grpc_error_class == retry::ErrorClass::PortExhaustion {
                     state.overload.record_port_exhaustion();
                 }
@@ -13126,7 +13443,7 @@ async fn handle_proxy_request_inner(
                     response_status,
                     cl,
                 )
-            } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
+            } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
                     h3_resp.recv_stream,
                     state.max_response_body_size_bytes,
@@ -15659,25 +15976,36 @@ fn hbone_hyper_error_response(
 enum HyperBodyCollectError {
     TooLarge,
     Read(hyper::Error),
+    ReadTimeout { timeout_ms: u64 },
 }
 
 async fn collect_hyper_body_with_limit(
     mut body: Incoming,
     max_size: usize,
+    backend_read_timeout_ms: u64,
 ) -> Result<Vec<u8>, HyperBodyCollectError> {
-    if max_size == 0 {
-        return body
-            .collect()
-            .await
-            .map(|collected| collected.to_bytes().to_vec())
-            .map_err(HyperBodyCollectError::Read);
-    }
-
     let mut body_bytes = Vec::new();
-    while let Some(frame) = body.frame().await {
+    loop {
+        let next_frame = if backend_read_timeout_ms > 0 {
+            match tokio::time::timeout(Duration::from_millis(backend_read_timeout_ms), body.frame())
+                .await
+            {
+                Ok(frame) => frame,
+                Err(_) => {
+                    return Err(HyperBodyCollectError::ReadTimeout {
+                        timeout_ms: backend_read_timeout_ms,
+                    });
+                }
+            }
+        } else {
+            body.frame().await
+        };
+        let Some(frame) = next_frame else {
+            break;
+        };
         let frame = frame.map_err(HyperBodyCollectError::Read)?;
         if let Some(data) = frame.data_ref() {
-            if body_bytes.len().saturating_add(data.len()) > max_size {
+            if max_size > 0 && body_bytes.len().saturating_add(data.len()) > max_size {
                 return Err(HyperBodyCollectError::TooLarge);
             }
             body_bytes.extend_from_slice(data);
@@ -15717,6 +16045,52 @@ fn hbone_response_body_too_large_response(
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
     }
+}
+
+fn h3_response_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = size,
+            max_response_body_size_bytes = max_size,
+            "HTTP/3 backend response body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_response_body_size_bytes = max_size,
+            "HTTP/3 backend response body exceeded configured size limit while streaming"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+    }
+}
+
+fn declared_response_length_exceeds_limit(
+    headers: &HashMap<String, String>,
+    max_response_body_size_bytes: usize,
+) -> Option<usize> {
+    if max_response_body_size_bytes == 0 {
+        return None;
+    }
+    let len = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())?;
+    (len > max_response_body_size_bytes).then_some(len)
 }
 
 fn hbone_request_body_too_large_response(
@@ -16141,6 +16515,7 @@ async fn proxy_to_backend_hbone(
         let body_bytes = match collect_hyper_body_with_limit(
             response.into_body(),
             state.max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
         )
         .await
         {
@@ -16158,6 +16533,26 @@ async fn proxy_to_backend_hbone(
             }
             Err(HyperBodyCollectError::Read(err)) => {
                 return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "HBONE backend response body read timed out"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                );
             }
         };
         (
@@ -16608,6 +17003,7 @@ async fn proxy_to_backend_mesh_mtls(
         let body_bytes = match collect_hyper_body_with_limit(
             response.into_body(),
             state.max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
         )
         .await
         {
@@ -16625,6 +17021,26 @@ async fn proxy_to_backend_mesh_mtls(
             }
             Err(HyperBodyCollectError::Read(err)) => {
                 return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "sidecar mTLS backend response body read timed out"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                );
             }
         };
         (
@@ -16864,9 +17280,34 @@ async fn proxy_to_backend_http2(
         }
     } else {
         // Buffer the full response body
-        let body_bytes = match response.into_body().collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(e) => {
+        let body_bytes = match collect_hyper_body_with_limit(
+            response.into_body(),
+            0,
+            proxy.backend_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(collected) => collected,
+            Err(HyperBodyCollectError::TooLarge) => {
+                // Defensive: cannot occur with max_size=0 (the size guard is
+                // disabled), but the proxy path must never panic — surface a
+                // 502 instead of `unreachable!` if the invariant ever breaks.
+                error!(
+                    proxy_id = %proxy.id,
+                    "HTTP/2 buffered body collection reported TooLarge despite max_size=0"
+                );
+                return retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Failed to read backend response"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                };
+            }
+            Err(HyperBodyCollectError::Read(e)) => {
                 error!(proxy_id = %proxy.id, error = %e, "Failed to read HTTP/2 response body");
                 return retry::BackendResponse {
                     status_code: 502,
@@ -16877,6 +17318,23 @@ async fn proxy_to_backend_http2(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ProtocolError),
+                };
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "HTTP/2 backend response body read timed out"
+                );
+                return retry::BackendResponse {
+                    status_code: 504,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ReadWriteTimeout),
                 };
             }
         };
@@ -17121,6 +17579,20 @@ async fn proxy_to_backend_http3(
                 return match h3_result {
                     Ok(response) => {
                         if stream_response {
+                            if let Some(len) = declared_response_length_exceeds_limit(
+                                &response.headers,
+                                state.max_response_body_size_bytes,
+                            ) {
+                                return (
+                                    h3_response_body_too_large_response(
+                                        proxy,
+                                        resolved_ip,
+                                        Some(len),
+                                        state.max_response_body_size_bytes,
+                                    ),
+                                    None,
+                                );
+                            }
                             debug!(
                                 proxy_id = %proxy.id,
                                 status = response.status,
@@ -17130,6 +17602,10 @@ async fn proxy_to_backend_http3(
                                 retry::BackendResponse {
                                     status_code: response.status,
                                     body: ResponseBody::StreamingH3(Box::new(response)),
+                                    // The sole caller moves the headers out of the
+                                    // `StreamingH3` payload via
+                                    // `std::mem::take(&mut h3_resp.headers)` — leave
+                                    // this empty instead of cloning the map per request.
                                     headers: HashMap::new(),
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip,
@@ -17151,6 +17627,7 @@ async fn proxy_to_backend_http3(
                                 status,
                                 content_length,
                                 state.max_response_body_size_bytes,
+                                proxy.backend_read_timeout_ms,
                             )
                             .await
                             {
@@ -17180,13 +17657,18 @@ async fn proxy_to_backend_http3(
                                         None,
                                     );
                                 }
-                                Err(e) => {
-                                    let crate::http3::client::H3BodyDrainError::Stream(e) = e
-                                    else {
-                                        unreachable!(
-                                            "response-too-large handled by previous match arm"
-                                        );
-                                    };
+                                Err(crate::http3::client::H3BodyDrainError::ReadTimeout {
+                                    timeout_ms,
+                                }) => {
+                                    warn!(
+                                        proxy_id = %proxy.id,
+                                        backend_url = %strip_query_params(backend_url),
+                                        timeout_ms = timeout_ms,
+                                        "HTTP/3 backend buffered response read timed out"
+                                    );
+                                    return (h3_read_timeout_backend_response(resolved_ip), None);
+                                }
+                                Err(crate::http3::client::H3BodyDrainError::Stream(e)) => {
                                     let (error_kind, error_class) = classify_h3_error(&e);
                                     record_port_exhaustion_if_class(&state.overload, error_class);
                                     // We have already received response headers and
@@ -17282,6 +17764,18 @@ async fn proxy_to_backend_http3(
                                 },
                                 None,
                             )
+                        } else if e.is_read_timeout() {
+                            // `backend_read_timeout_ms` expired waiting for
+                            // response headers — surface 504 Backend timeout
+                            // like the direct-H2 / HBONE read-timeout arms,
+                            // not a generic 502.
+                            warn!(
+                                proxy_id = %proxy.id,
+                                backend_url = %strip_query_params(backend_url),
+                                error = %e,
+                                "HTTP/3 backend read timeout waiting for response (streaming request body)"
+                            );
+                            (h3_read_timeout_backend_response(resolved_ip), None)
                         } else {
                             // `H3PoolError::request_on_wire()` is the
                             // authoritative body-on-wire signal: it is set
@@ -17489,6 +17983,20 @@ async fn proxy_to_backend_http3(
 
         match h3_result {
             Ok(response) => {
+                if let Some(len) = declared_response_length_exceeds_limit(
+                    &response.headers,
+                    state.max_response_body_size_bytes,
+                ) {
+                    return (
+                        h3_response_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            Some(len),
+                            state.max_response_body_size_bytes,
+                        ),
+                        retained_body,
+                    );
+                }
                 debug!(
                     proxy_id = %proxy.id,
                     status = response.status,
@@ -17498,6 +18006,10 @@ async fn proxy_to_backend_http3(
                     retry::BackendResponse {
                         status_code: response.status,
                         body: ResponseBody::StreamingH3(Box::new(response)),
+                        // The sole caller moves the headers out of the
+                        // `StreamingH3` payload via
+                        // `std::mem::take(&mut h3_resp.headers)` — leave
+                        // this empty instead of cloning the map per request.
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
@@ -17507,6 +18019,18 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
+                if e.is_read_timeout() {
+                    // `backend_read_timeout_ms` expired waiting for response
+                    // headers — surface 504 Backend timeout like the
+                    // direct-H2 / HBONE read-timeout arms, not a generic 502.
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(backend_url),
+                        error = %e,
+                        "HTTP/3 backend read timeout waiting for response (streaming response)"
+                    );
+                    return (h3_read_timeout_backend_response(resolved_ip), retained_body);
+                }
                 // Trust the pool's body-on-wire signal — see the
                 // streaming-incoming-body branch above for why we drop
                 // the error-class contribution here.
@@ -17586,6 +18110,20 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
+                if e.is_read_timeout() {
+                    // `backend_read_timeout_ms` expired waiting for response
+                    // headers (`recv_response`) or buffered body frames
+                    // (`recv_data` inside the pool's drain) — surface 504
+                    // Backend timeout like the direct-H2 / HBONE
+                    // read-timeout arms, not a generic 502.
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(backend_url),
+                        error = %e,
+                        "HTTP/3 backend read timeout waiting for response (buffered)"
+                    );
+                    return (h3_read_timeout_backend_response(resolved_ip), retained_body);
+                }
                 // Trust the pool's body-on-wire signal — see the streaming
                 // H3 branch above for why we drop the class contribution.
                 let is_conn_error = !e.request_on_wire();
@@ -17692,7 +18230,38 @@ fn classify_h3_pool_error(
         let class = retry::ErrorClass::GracefulRemoteClose;
         return (retry::error_class_log_kind(class), class);
     }
+    if e.is_read_timeout() {
+        // Typed `backend_read_timeout_ms` deadline signal from the pool —
+        // classify deterministically instead of relying on the "timeout"
+        // substring fallback in the shared classifier. `ReadWriteTimeout`
+        // is excluded from `is_h3_transport_error_class`, so this never
+        // drives `mark_h3_unsupported`.
+        let class = retry::ErrorClass::ReadWriteTimeout;
+        return (retry::error_class_log_kind(class), class);
+    }
     classify_h3_error(e.as_ref())
+}
+
+/// Build the 504 `BackendResponse` for an H3 backend read timeout
+/// (`backend_read_timeout_ms` expired waiting for response headers via
+/// `recv_response()` or buffered body frames via `recv_data()`).
+///
+/// Mirrors the direct-H2 / HBONE / sidecar-mTLS read-timeout arms so the
+/// same proxy config produces the same client-visible outcome regardless
+/// of dispatch path: 504 + `{"error":"Backend timeout"}` +
+/// `ErrorClass::ReadWriteTimeout`. `connection_error=false` — the request
+/// reached the backend's application layer (post-wire), so
+/// `retry_on_connect_failure` must not replay it; retries are governed by
+/// `retry_on_methods` / `retryable_status_codes`.
+fn h3_read_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code: 504,
+        body: ResponseBody::Buffered(r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+    }
 }
 
 /// Replay a saved HTTP/3 request to an explicit target (used during retries).
@@ -17827,6 +18396,19 @@ async fn proxy_to_backend_http3_retry(
             }
         }
         Err(e) => {
+            if e.is_read_timeout() {
+                // `backend_read_timeout_ms` expired waiting for the retried
+                // response — surface 504 Backend timeout like the direct-H2
+                // / HBONE read-timeout arms, not a generic 502.
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_url = %strip_query_params(backend_url),
+                    target = %format!("{}:{}", effective_host, effective_port),
+                    error = %e,
+                    "HTTP/3 backend read timeout waiting for response (retry)"
+                );
+                return h3_read_timeout_backend_response(resolved_ip);
+            }
             // Trust the pool's body-on-wire signal — see the streaming
             // H3 branch above for why we drop the class contribution.
             let is_conn_error = !e.request_on_wire();
@@ -17871,6 +18453,23 @@ mod tests {
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
+
+    #[test]
+    fn declared_response_length_exceeds_limit_only_when_header_is_over_cap() {
+        let mut headers = HashMap::new();
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+
+        headers.insert("content-length".to_string(), "11".to_string());
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 0), None);
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 11), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit(&headers, 10),
+            Some(11)
+        );
+
+        headers.insert("content-length".to_string(), "not-a-number".to_string());
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+    }
 
     /// Directly exercises the gRPC streaming circuit-breaker classification:
     /// a late client-upload overflow is gateway-side and must be NEUTRAL, while
@@ -19675,7 +20274,6 @@ mod tests {
             retry::ErrorClass::DnsLookupError,
             retry::ErrorClass::PortExhaustion,
             retry::ErrorClass::ConnectionPoolError,
-            retry::ErrorClass::ReadWriteTimeout,
         ] {
             assert!(
                 is_h3_transport_error_class(class),
@@ -19699,11 +20297,16 @@ mod tests {
         // positive list in `is_h3_transport_error_class` would re-introduce
         // the regression where a fast responder racing FIN with
         // `CONNECTION_CLOSE` permanently disables H3 for the backend.
+        //
+        // `ReadWriteTimeout` is excluded for the same capability reason:
+        // a backend that stalls after accepting a request is slow or wedged,
+        // but it has not proved that the native H3 pool itself is invalid.
         for class in [
             retry::ErrorClass::ClientDisconnect,
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::ReadWriteTimeout,
             retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {
@@ -19716,11 +20319,11 @@ mod tests {
 
     #[test]
     fn is_h3_transport_failure_ignores_connection_error_flag() {
-        // `classify_h3_error` marks GOAWAY / stream reset / ReadWriteTimeout
-        // with `connection_error=false`, so the downgrade predicate must
-        // NOT require that flag. The decision hinges on `error_class`
-        // alone — any transport-level class downgrades, any application-
-        // layer class does not.
+        // `classify_h3_error` marks GOAWAY / stream reset with
+        // `connection_error=false`, so the downgrade predicate must NOT
+        // require that flag. The decision hinges on `error_class` alone:
+        // transport-level classes downgrade, application-layer classes and
+        // backend read timeouts do not.
         let mk = |connection_error: bool, error_class: Option<retry::ErrorClass>| {
             retry::BackendResponse {
                 status_code: 502,
@@ -19743,8 +20346,10 @@ mod tests {
             false,
             Some(retry::ErrorClass::ProtocolError)
         )));
-        // ReadWriteTimeout with connection_error=false also downgrades.
-        assert!(is_h3_transport_failure(&mk(
+        // ReadWriteTimeout with connection_error=false does NOT downgrade:
+        // the backend stalled after accepting the request, but capability is
+        // still valid.
+        assert!(!is_h3_transport_failure(&mk(
             false,
             Some(retry::ErrorClass::ReadWriteTimeout)
         )));
@@ -19915,8 +20520,8 @@ mod tests {
     fn classify_h3_pool_error_falls_through_on_post_wire_errors() {
         // Without the graceful-close flag, the classifier delegates to
         // `classify_h3_error` and returns the underlying class. A normal
-        // post-wire `recv_response` failure (e.g. timeout) MUST still
-        // classify as a transport failure so `mark_h3_unsupported` fires.
+        // post-wire `recv_response` timeout is a backend read timeout, not
+        // an H3 capability failure, so it must not fire `mark_h3_unsupported`.
         let e = crate::http3::client::H3PoolError::post_wire(anyhow::anyhow!(
             "recv_response failed: timed out reading from QUIC stream"
         ));
@@ -19925,9 +20530,57 @@ mod tests {
         // → ReadWriteTimeout (read-side, no "connect" token).
         assert_eq!(class, retry::ErrorClass::ReadWriteTimeout);
         assert!(
-            super::is_h3_transport_error_class(class),
-            "Post-wire transport failure must still trigger H3 downgrade"
+            !super::is_h3_transport_error_class(class),
+            "Post-wire backend read timeout must not trigger H3 downgrade"
         );
+    }
+
+    #[test]
+    fn classify_h3_pool_error_short_circuits_on_read_timeout_flag() {
+        // The typed `H3PoolError::read_timeout` constructor (used by the
+        // `backend_read_timeout_ms` deadline wraps around `recv_response()`
+        // and the buffered `recv_data` drain) must classify as
+        // `ReadWriteTimeout` regardless of the error message — no string
+        // heuristics. The message below deliberately avoids any "timeout"
+        // token to prove the typed flag drives classification.
+        let e = crate::http3::client::H3PoolError::read_timeout(anyhow::anyhow!(
+            "backend stalled mid-response"
+        ));
+        assert!(e.is_read_timeout());
+        assert!(
+            e.request_on_wire(),
+            "read timeouts are post-wire: the request was committed before \
+             the gateway started waiting on the response"
+        );
+        assert!(!e.is_graceful_close());
+        let (kind, class) = super::classify_h3_pool_error(&e);
+        assert_eq!(class, retry::ErrorClass::ReadWriteTimeout);
+        assert_eq!(kind, retry::error_class_log_kind(class));
+        assert!(
+            !super::is_h3_transport_error_class(class),
+            "H3 backend read timeout must not trigger mark_h3_unsupported"
+        );
+    }
+
+    #[test]
+    fn h3_read_timeout_backend_response_maps_to_504_backend_timeout() {
+        // The H3 read-timeout arms must produce the same client-visible
+        // outcome as the direct-H2 / HBONE / sidecar-mTLS read-timeout arms:
+        // 504 + {"error":"Backend timeout"} + ReadWriteTimeout, and
+        // connection_error=false so `retry_on_connect_failure` cannot replay
+        // a request the backend already received.
+        let resp = super::h3_read_timeout_backend_response(Some("10.0.0.1".to_string()));
+        assert_eq!(resp.status_code, 504);
+        let ResponseBody::Buffered(body) = &resp.body else {
+            panic!("H3 read-timeout response must be buffered");
+        };
+        assert_eq!(body.as_slice(), br#"{"error":"Backend timeout"}"#);
+        assert!(
+            !resp.connection_error,
+            "post-wire read timeout must not be treated as a connect failure"
+        );
+        assert_eq!(resp.error_class, Some(retry::ErrorClass::ReadWriteTimeout));
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("10.0.0.1"));
     }
 
     // ── `record_port_exhaustion_if_class` (H3 native paths) ─────────────
@@ -21308,15 +21961,15 @@ mod tests {
         use crate::identity::spiffe::{SpiffeId, TrustDomain};
         use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadPort, WorkloadSelector};
 
-        // Loopback is always a safe relay target (the co-located app), even
-        // with no slice context.
-        assert!(inbound_hbone_relay_destination_allowed(
+        // With no slice context, even loopback is refused: the relay must not
+        // become a localhost open proxy to arbitrary gateway-host ports.
+        assert!(!inbound_hbone_relay_destination_allowed(
             "127.0.0.1",
             8080,
             None
         ));
-        assert!(inbound_hbone_relay_destination_allowed("::1", 8080, None));
-        assert!(inbound_hbone_relay_destination_allowed(
+        assert!(!inbound_hbone_relay_destination_allowed("::1", 8080, None));
+        assert!(!inbound_hbone_relay_destination_allowed(
             "localhost",
             8080,
             None
@@ -21348,7 +22001,35 @@ mod tests {
             service_account: None,
             pod_uid: None,
         });
-        // Now the workload's exact address+port is allowed...
+        // Now the workload's declared application port is allowed on loopback...
+        assert!(inbound_hbone_relay_destination_allowed(
+            "127.0.0.1",
+            8080,
+            Some(&mesh)
+        ));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "::1",
+            8080,
+            Some(&mesh)
+        ));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "localhost",
+            8080,
+            Some(&mesh)
+        ));
+        // ...but undeclared loopback ports remain refused.
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "127.0.0.1",
+            9999,
+            Some(&mesh)
+        ));
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "localhost",
+            9999,
+            Some(&mesh)
+        ));
+
+        // The workload's exact non-loopback address+port is allowed...
         assert!(inbound_hbone_relay_destination_allowed(
             "10.1.2.3",
             8080,

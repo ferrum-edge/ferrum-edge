@@ -185,6 +185,7 @@ pub fn build_backend_dtls_config(
 }
 
 /// Parameters for creating a backend DTLS connection.
+#[derive(Clone)]
 pub struct BackendDtlsParams {
     pub config: Arc<Config>,
     pub certificate: DtlsCertificate,

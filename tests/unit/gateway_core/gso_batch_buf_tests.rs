@@ -68,9 +68,12 @@ fn push_over_max_bytes_returns_false_without_touching_buffer() {
 }
 
 #[test]
-fn push_empty_slice_is_noop_returns_true() {
+fn push_empty_slice_returns_false_without_touching_buffer() {
     let mut buf = GsoBatchBuf::new(1024);
-    assert!(buf.push(&[]));
+    assert!(
+        !buf.push(&[]),
+        "empty datagrams cannot be represented by UDP GSO and must fall back to direct send"
+    );
     assert!(buf.is_empty());
     // Followed by a real push: must behave like a fresh buffer.
     assert!(buf.push(&[1u8; 30]));

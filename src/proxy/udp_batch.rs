@@ -626,7 +626,7 @@ impl GsoBatchBuf {
     /// the caller should flush first and then call `push` again.
     pub fn push(&mut self, data: &[u8]) -> bool {
         if data.is_empty() {
-            return true; // skip empty datagrams
+            return false;
         }
         if self.count == 0 {
             // First datagram — set segment size.
