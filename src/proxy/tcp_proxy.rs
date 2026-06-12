@@ -2062,17 +2062,37 @@ async fn handle_tcp_connection_inner(
         #[cfg(not(target_os = "linux"))]
         let splice_used = false;
 
-        // Resolve backend IP via DNS
-        let resolved_ip = dns_cache
+        // Resolve backend IP via DNS. A resolution failure is a backend
+        // reachability failure: record it against the breaker (mirrors the
+        // non-passthrough path) so the failure counts toward opening AND any
+        // half-open probe slot claimed by can_execute above is released —
+        // otherwise an unresolvable passthrough hostname wedges HALF_OPEN
+        // until reload.
+        let resolved_ip = match dns_cache
             .resolve(
                 &params.backend_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
             )
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("DNS resolution failed for {}: {}", params.backend_host, e)
-            })?;
+        {
+            Ok(ip) => ip,
+            Err(e) => {
+                if let Some(ref cb_config) = cb_info.cb_config {
+                    let cb = circuit_breaker_cache.get_or_create(
+                        proxy_id,
+                        cb_info.cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(502, true, cb_info.is_half_open_probe);
+                }
+                return Err(anyhow::anyhow!(
+                    "DNS resolution failed for {}: {}",
+                    params.backend_host,
+                    e
+                ));
+            }
+        };
         let addr = SocketAddr::new(resolved_ip, params.backend_port);
         backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
 

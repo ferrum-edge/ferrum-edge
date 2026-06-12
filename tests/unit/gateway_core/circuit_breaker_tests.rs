@@ -819,6 +819,48 @@ fn test_connection_error_reopens_half_open() {
     assert_eq!(cb.state_name(), "open");
 }
 
+/// A connection-class failure on a half-open probe (e.g. DNS resolution
+/// failure on the TCP passthrough path, which records
+/// `record_failure(502, true, probe)` before backend connect) must release
+/// the probe slot while reopening, so the next half-open cycle can admit a
+/// fresh probe instead of staying wedged on a leaked `half_open_in_flight`.
+#[test]
+fn test_connection_error_probe_failure_releases_slot_for_next_cycle() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    // Trip open with a connection error (e.g. first DNS failure).
+    cb.record_failure(502, true, false);
+    assert_eq!(cb.state_name(), "open");
+
+    // Timeout elapsed (timeout_seconds: 0) — admitted as half-open probe.
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.half_open_in_flight(), 1);
+
+    // Probe fails before reaching the backend (DNS still unresolvable).
+    cb.record_failure(502, true, true);
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "tripping connection-error probe failure must release the probe slot"
+    );
+
+    // Next half-open cycle must admit a fresh probe — not reject on a
+    // leaked in-flight slot.
+    assert!(
+        cb.can_execute().unwrap(),
+        "subsequent half-open cycle should admit a new probe"
+    );
+}
+
 /// Connection errors in half-open do NOT reopen when disabled.
 #[test]
 fn test_connection_error_ignored_in_half_open_when_disabled() {
