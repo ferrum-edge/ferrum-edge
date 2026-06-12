@@ -1473,27 +1473,83 @@ fn mesh_outbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_OUTBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
-/// The per-service stem of a materialized mesh outbound route id — the id
-/// minus its trailing `-{port}` segment — or `None` when the id is not a
-/// mesh outbound route or lacks a parseable numeric port suffix.
+/// HTTP-family service ports of an in-mesh service, with `protocol_overrides`
+/// applied — the canonical "which ports does outbound materialization route"
+/// predicate, shared by the materializer, the router's sibling grouping, and
+/// the listen-path uniqueness exemption so the three can never drift.
+pub(crate) fn service_http_family_ports(
+    service: &crate::modes::mesh::config::MeshService,
+) -> Vec<&crate::modes::mesh::config::ServicePort> {
+    service
+        .ports
+        .iter()
+        .filter(|sp| {
+            is_http_family_mesh_protocol(
+                service
+                    .protocol_overrides
+                    .get(&sp.port)
+                    .copied()
+                    .unwrap_or(sp.protocol),
+            )
+        })
+        .collect()
+}
+
+/// Expected per-port outbound sibling routes of one in-mesh service.
 ///
-/// **Single source of truth for per-port sibling identity.** The numeric
-/// suffix of [`mesh_outbound_proxy_id`] is load-bearing: per-port siblings of
-/// one service share a stem, and both consumers key off it —
-/// `RouterCache::build_route_table` groups siblings under one lowest-port
-/// tier representative, and `validate_unique_listen_paths` exempts same-stem
-/// siblings from the host+path uniqueness conflict (they intentionally share
-/// hosts + `/` and are disambiguated post-match by the captured
-/// original-destination port). Operator configs cannot reach the exemption:
-/// resource-id validation rejects ids starting with `_`, so `__mesh-*` ids
-/// exist only via mesh materialization.
-pub(crate) fn mesh_outbound_route_id_stem(id: &str) -> Option<&str> {
-    if !is_mesh_outbound_route_id(id) {
-        return None;
-    }
-    let (stem, port) = id.rsplit_once('-')?;
-    port.parse::<u16>().ok()?;
-    Some(stem)
+/// **Single source of truth for per-port sibling identity.** Derived
+/// *forward* from the mesh service (the exact ids [`mesh_outbound_proxy_id`]
+/// emits), never by parsing ids backwards — `{namespace}-{name}` joining is
+/// lossy (`ns "a" / svc "b-c"` and `ns "a-b" / svc "c"` collide), so id
+/// parsing could conflate distinct services. Consumers:
+/// `RouterCache::build_route_table` groups a service's materialized siblings
+/// under one lowest-port tier representative, and
+/// `validate_unique_listen_paths` exempts same-service sibling pairs from the
+/// host+path uniqueness conflict (they intentionally share hosts + `/` and
+/// are disambiguated post-match by the captured original-destination port).
+/// Operator configs cannot reach either consumer's special-casing:
+/// resource-id validation rejects ids starting with `_`, so
+/// `__mesh-outbound-*` ids exist only via mesh materialization, and both
+/// consumers key strictly off the `mesh` block the slice carried.
+pub(crate) struct MeshOutboundServiceGroup {
+    /// How many HTTP-family ports the service DECLARES — which can exceed the
+    /// materialized sibling count (e.g. an unresolved named `targetPort`
+    /// produced no targets for one port). Orig-dst-less requests must fail
+    /// closed whenever this is > 1, even if only one sibling materialized:
+    /// without the captured port, traffic meant for a skipped port is
+    /// indistinguishable from the surviving one.
+    pub declared_http_ports: usize,
+    /// `(service_port, expected proxy id)` for every declared HTTP-family
+    /// port, whether or not it materialized.
+    pub siblings: Vec<(u16, String)>,
+}
+
+/// Compute [`MeshOutboundServiceGroup`]s for every in-mesh service carried by
+/// the prepared config's `mesh` block. Empty outside mesh mode.
+pub(crate) fn mesh_outbound_service_groups(
+    mesh: &crate::modes::mesh::config::MeshConfig,
+) -> Vec<MeshOutboundServiceGroup> {
+    mesh.services
+        .iter()
+        .filter_map(|service| {
+            let http_ports = service_http_family_ports(service);
+            if http_ports.is_empty() {
+                return None;
+            }
+            Some(MeshOutboundServiceGroup {
+                declared_http_ports: http_ports.len(),
+                siblings: http_ports
+                    .iter()
+                    .map(|sp| {
+                        (
+                            sp.port,
+                            mesh_outbound_proxy_id(&service.namespace, &service.name, sp.port),
+                        )
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 /// Upstream id for a materialized mesh outbound route, one per HTTP-family
@@ -1976,20 +2032,29 @@ fn materialize_mesh_outbound_proxies(
         // original-destination port (`SO_ORIGINAL_DST`), failing closed when
         // the dialed port cannot be determined. Per-port upstreams keep LB
         // counters, hash rings, passive health, and pool keys isolated per
-        // app port.
-        let http_ports: Vec<_> = service
-            .ports
-            .iter()
-            .filter(|sp| {
-                is_http_family_mesh_protocol(
-                    service
-                        .protocol_overrides
-                        .get(&sp.port)
-                        .copied()
-                        .unwrap_or(sp.protocol),
-                )
-            })
-            .collect();
+        // app port. Shared predicate with the router grouping / uniqueness
+        // exemption (`mesh_outbound_service_groups`) so they cannot drift.
+        let http_ports = service_http_family_ports(service);
+        // Sidecar destination INBOUND multi-port still fails closed (inbound
+        // :15006 dials are direct, never NATed — disambiguation by the
+        // preserved Host port is a later stage), so per-port Sidecar egress
+        // would dial the peer only to 404 there. Keep Sidecar multi-port
+        // fail-closed AT THE SOURCE until inbound disambiguation lands;
+        // Ambient is end-to-end complete (its inbound is the transparent
+        // HBONE relay dialing the CONNECT authority's app port).
+        if transport == MeshEgressTransport::SidecarMtls && http_ports.len() > 1 {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                http_ports = http_ports.len(),
+                "In-mesh service exposes multiple HTTP-family ports; Sidecar egress stays \
+                 fail-closed until the destination sidecar's inbound port disambiguation lands \
+                 (the peer's inbound materializer still skips multi-port local services). \
+                 Skipping outbound materialization for this service; define an explicit proxy \
+                 to route a specific port."
+            );
+            continue;
+        }
         for service_port in &http_ports {
             let protocol = service
                 .protocol_overrides
@@ -8212,7 +8277,17 @@ mod tests {
             services: vec![svc],
             ..MeshSlice::default()
         };
-        let mut config = GatewayConfig::default();
+        // Mirror `gateway_config_from_mesh_slice`: the prepared config carries
+        // the slice's services in its `mesh` block — the uniqueness validator
+        // and the router grouping both derive sibling identity from it.
+        let mut config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: slice.services.clone(),
+                workloads: slice.workloads.clone(),
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
         materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
 
         for port in [80u16, 90] {
@@ -8244,12 +8319,47 @@ mod tests {
         );
         // The swap path (`ProxyState::update_config` → `validate_full_config`)
         // runs this validator on every slice apply; the per-port siblings
-        // share hosts + `/` by design and must pass via the same-stem
+        // share hosts + `/` by design and must pass via the same-service
         // exemption — otherwise multi-port slices are rejected at apply.
         assert!(
             config.validate_unique_listen_paths().is_ok(),
             "per-port outbound siblings must survive the uniqueness validator: {:?}",
             config.validate_unique_listen_paths()
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_sidecar_keeps_multi_port_fail_closed() {
+        // Sidecar destination INBOUND multi-port still fails closed (inbound
+        // dials are direct, never NATed), so per-port Sidecar egress would
+        // dial the peer only to 404 there. Until inbound port disambiguation
+        // lands, Sidecar multi-port services materialize NOTHING — the old
+        // source-side fail-closed behavior. Ambient (above) is per-port.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut svc = http_mesh_service("reviews", 80, spiffe);
+        svc.ports.push(ServicePort {
+            port: 90,
+            protocol: AppProtocol::Grpc,
+            name: Some("grpc".to_string()),
+            target_port: None,
+        });
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("reviews", "reviews", "10.0.0.1")],
+            services: vec![svc],
+            ..MeshSlice::default()
+        };
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.topology, MeshTopology::Sidecar);
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &runtime, &slice);
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-outbound-")),
+            "Sidecar multi-port services must stay fail-closed at the source until \
+             inbound port disambiguation lands"
         );
     }
 
@@ -8582,38 +8692,64 @@ mod tests {
         assert_eq!(mesh_route_direction("__mesh-ew-svc-default-reviews"), None);
     }
 
-    /// The numeric port suffix of `mesh_outbound_proxy_id` is load-bearing:
-    /// `RouterCache` sibling grouping and the `validate_unique_listen_paths`
-    /// exemption both key on this stem parse. Lock the contract.
+    /// `mesh_outbound_service_groups` is the single source of truth for
+    /// per-port sibling identity: `RouterCache` grouping and the
+    /// `validate_unique_listen_paths` exemption both consume it. Lock the
+    /// forward-derivation contract — including immunity to the lossy
+    /// `{ns}-{name}` id join (ns `a` / svc `b-c` vs ns `a-b` / svc `c`).
     #[test]
-    fn mesh_outbound_route_id_stem_parses_port_suffix() {
+    fn mesh_outbound_service_groups_derive_sibling_ids_forward() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/x";
+        let mut multi = http_mesh_service("reviews", 80, spiffe);
+        multi.ports.push(ServicePort {
+            port: 9080,
+            protocol: AppProtocol::Grpc,
+            name: Some("grpc".to_string()),
+            target_port: None,
+        });
+        multi.ports.push(ServicePort {
+            port: 5432,
+            protocol: AppProtocol::Tcp,
+            name: Some("db".to_string()),
+            target_port: None,
+        });
+        // The lossy-join collision pair: distinct services whose joined ids
+        // share a prefix. Forward derivation keeps them in separate groups.
+        let mut svc_bc = http_mesh_service("b-c", 80, spiffe);
+        svc_bc.namespace = "a".to_string();
+        let mut svc_c = http_mesh_service("c", 90, spiffe);
+        svc_c.namespace = "a-b".to_string();
+
+        let mesh = MeshConfig {
+            services: vec![multi, svc_bc, svc_c],
+            ..MeshConfig::default()
+        };
+        let groups = mesh_outbound_service_groups(&mesh);
+        assert_eq!(groups.len(), 3, "one group per service with HTTP ports");
+
+        let reviews = &groups[0];
         assert_eq!(
-            mesh_outbound_route_id_stem(&mesh_outbound_proxy_id("default", "reviews", 8080)),
-            Some("__mesh-outbound-default-reviews")
+            reviews.declared_http_ports, 2,
+            "TCP ports are not HTTP-family-declared"
         );
-        // Same service, different ports → same stem (the sibling identity).
         assert_eq!(
-            mesh_outbound_route_id_stem("__mesh-outbound-default-reviews-80"),
-            mesh_outbound_route_id_stem("__mesh-outbound-default-reviews-9080")
+            reviews.siblings,
+            vec![
+                (80, "__mesh-outbound-default-reviews-80".to_string()),
+                (9080, "__mesh-outbound-default-reviews-9080".to_string()),
+            ]
         );
-        // Different services → different stems.
-        assert_ne!(
-            mesh_outbound_route_id_stem("__mesh-outbound-default-reviews-80"),
-            mesh_outbound_route_id_stem("__mesh-outbound-default-ratings-80")
-        );
-        // Reserved prefix without a parseable numeric suffix: not grouped.
-        assert_eq!(mesh_outbound_route_id_stem("__mesh-outbound-oddball"), None);
-        // Out-of-range numeric suffix is not a u16 port.
+
+        // Collision pair: ids share the joined prefix but belong to distinct
+        // groups, so the router never conflates them.
         assert_eq!(
-            mesh_outbound_route_id_stem("__mesh-outbound-default-reviews-99999"),
-            None
+            groups[1].siblings,
+            vec![(80, "__mesh-outbound-a-b-c-80".to_string())]
         );
-        // Non-outbound ids never have a stem.
         assert_eq!(
-            mesh_outbound_route_id_stem("__mesh-inbound-default-reviews-8080"),
-            None
+            groups[2].siblings,
+            vec![(90, "__mesh-outbound-a-b-c-90".to_string())]
         );
-        assert_eq!(mesh_outbound_route_id_stem("operator-proxy"), None);
     }
 
     #[test]

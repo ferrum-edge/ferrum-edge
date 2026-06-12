@@ -2162,15 +2162,47 @@ fn test_unique_listen_paths_same_path_overlapping_hosts() {
     assert!(err[0].contains("Overlapping"));
 }
 
+/// Mesh block for the sibling-exemption tests: one service per entry,
+/// `(namespace, name, declared HTTP ports)`. The validator derives sibling
+/// identity forward from this, exactly like the router grouping.
+fn mesh_block_for_uniqueness(
+    services: &[(&str, &str, &[u16])],
+) -> Option<Box<ferrum_edge::modes::mesh::config::MeshConfig>> {
+    use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+    Some(Box::new(MeshConfig {
+        services: services
+            .iter()
+            .map(|(namespace, name, ports)| MeshService {
+                name: name.to_string(),
+                namespace: namespace.to_string(),
+                ports: ports
+                    .iter()
+                    .map(|port| ServicePort {
+                        port: *port,
+                        protocol: AppProtocol::Http,
+                        name: None,
+                        target_port: None,
+                    })
+                    .collect(),
+                workloads: Vec::new(),
+                protocol_overrides: std::collections::HashMap::new(),
+            })
+            .collect(),
+        ..MeshConfig::default()
+    }))
+}
+
 #[test]
 fn test_unique_listen_paths_exempts_mesh_outbound_per_port_siblings() {
     // Materialized mesh outbound per-port siblings of ONE service share hosts
     // and `/` by design: the route table holds a single lowest-port
     // representative and the request path disambiguates by the captured
     // original-destination port. The uniqueness validator must not reject the
-    // slice apply that carries them. (Operator configs can't reach this
-    // shape: resource-id validation rejects ids starting with `_`.)
+    // slice apply that carries them. Sibling identity is derived from the
+    // config's mesh block. (Operator configs can't reach this shape:
+    // resource-id validation rejects ids starting with `_`.)
     let mut config = empty_config();
+    config.mesh = mesh_block_for_uniqueness(&[("default", "reviews", &[80, 9080])]);
     config.proxies = vec![
         make_proxy_with_hosts(
             "__mesh-outbound-default-reviews-80",
@@ -2191,10 +2223,14 @@ fn test_unique_listen_paths_exempts_mesh_outbound_per_port_siblings() {
 
 #[test]
 fn test_unique_listen_paths_mesh_outbound_different_services_still_conflict() {
-    // The sibling exemption is keyed on the per-service id stem: two DIFFERENT
+    // The sibling exemption is keyed on the OWNING SERVICE: two DIFFERENT
     // services' outbound routes overlapping on a host remain a genuine routing
-    // ambiguity and must still be rejected.
+    // ambiguity and must still be rejected — including the lossy `{ns}-{name}`
+    // id-join collision (ns `a` / svc `b-c` vs ns `a-b` / svc `c`), which a
+    // backwards id parse would have wrongly exempted.
     let mut config = empty_config();
+    config.mesh =
+        mesh_block_for_uniqueness(&[("default", "reviews", &[80]), ("default", "ratings", &[80])]);
     config.proxies = vec![
         make_proxy_with_hosts(
             "__mesh-outbound-default-reviews-80",
@@ -2209,6 +2245,44 @@ fn test_unique_listen_paths_mesh_outbound_different_services_still_conflict() {
     ];
     let err = config.validate_unique_listen_paths().unwrap_err();
     assert_eq!(err.len(), 1, "cross-service overlap must still conflict");
+
+    // The id-join collision pair: same joined `{ns}-{name}` text, distinct
+    // services. Overlapping hosts must still conflict.
+    let mut config = empty_config();
+    config.mesh = mesh_block_for_uniqueness(&[("a", "b-c", &[80]), ("a-b", "c", &[90])]);
+    config.proxies = vec![
+        make_proxy_with_hosts("__mesh-outbound-a-b-c-80", "/", vec!["shared.example.com"]),
+        make_proxy_with_hosts("__mesh-outbound-a-b-c-90", "/", vec!["shared.example.com"]),
+    ];
+    let err = config.validate_unique_listen_paths().unwrap_err();
+    assert_eq!(
+        err.len(),
+        1,
+        "the lossy id-join collision must not be exempted across services"
+    );
+}
+
+#[test]
+fn test_unique_listen_paths_mesh_outbound_without_mesh_block_conflicts() {
+    // Without a mesh block claiming the ids (non-mesh modes, hand-crafted
+    // configs), reserved-prefix proxies get no exemption.
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy_with_hosts(
+            "__mesh-outbound-default-reviews-80",
+            "/",
+            vec!["reviews.default.svc.cluster.local"],
+        ),
+        make_proxy_with_hosts(
+            "__mesh-outbound-default-reviews-9080",
+            "/",
+            vec!["reviews.default.svc.cluster.local"],
+        ),
+    ];
+    assert!(
+        config.validate_unique_listen_paths().is_err(),
+        "unclaimed reserved-prefix proxies must not be exempted"
+    );
 }
 
 #[test]

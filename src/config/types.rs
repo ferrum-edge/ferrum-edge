@@ -2039,29 +2039,47 @@ impl GatewayConfig {
             }
         }
 
+        // Materialized mesh outbound per-port siblings of ONE service
+        // intentionally share hosts + `/`: the route table inserts a single
+        // lowest-port representative and the request path disambiguates by
+        // the captured original-destination port, so they never route
+        // non-deterministically. Map each expected sibling id to its owning
+        // service (derived FORWARD from the mesh block by the same helper the
+        // router grouping uses — id parsing would be lossy across the
+        // `{ns}-{name}` join and could conflate distinct services); pairs
+        // owned by the same service are exempt below. Operator configs cannot
+        // reach this: resource-id validation rejects ids starting with `_`,
+        // so `__mesh-outbound-*` ids exist only via mesh materialization.
+        // Different services' routes still conflict normally. Empty (and
+        // zero-cost) outside mesh mode.
+        let mesh_outbound_sibling_owner: HashMap<String, usize> = self
+            .mesh
+            .as_deref()
+            .map(|mesh| {
+                crate::modes::mesh::mesh_outbound_service_groups(mesh)
+                    .into_iter()
+                    .enumerate()
+                    .flat_map(|(service_index, group)| {
+                        group
+                            .siblings
+                            .into_iter()
+                            .map(move |(_, id)| (id, service_index))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         for (path, group) in &by_path {
             if group.len() < 2 {
                 continue;
             }
             for (i, proxy_a) in group.iter().enumerate() {
                 for proxy_b in group.iter().skip(i + 1) {
-                    // Materialized mesh outbound per-port siblings of ONE
-                    // service intentionally share hosts + `/`: the route
-                    // table inserts a single lowest-port representative and
-                    // the request path disambiguates by the captured
-                    // original-destination port, so they never route
-                    // non-deterministically. Exempt same-stem pairs (shared
-                    // parser with the router grouping). Operator configs
-                    // cannot reach this: resource-id validation rejects ids
-                    // starting with `_`, so `__mesh-outbound-*` ids exist
-                    // only via mesh materialization. Different services'
-                    // routes (different stems) still conflict normally.
-                    if crate::modes::mesh::mesh_outbound_route_id_stem(&proxy_a.id).is_some_and(
-                        |stem| {
-                            crate::modes::mesh::mesh_outbound_route_id_stem(&proxy_b.id)
-                                == Some(stem)
-                        },
-                    ) {
+                    if let (Some(owner_a), Some(owner_b)) = (
+                        mesh_outbound_sibling_owner.get(proxy_a.id.as_str()),
+                        mesh_outbound_sibling_owner.get(proxy_b.id.as_str()),
+                    ) && owner_a == owner_b
+                    {
                         continue;
                     }
                     if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {

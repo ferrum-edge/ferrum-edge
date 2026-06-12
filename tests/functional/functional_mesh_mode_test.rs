@@ -2480,6 +2480,9 @@ async fn functional_mesh_outbound_multi_port_without_orig_dst_fails_closed() {
             start_static_mesh_cp(multi_port_egress_slice(&node_id, b_spiffe, backend_port)).await;
         let ports = reserve_mesh_ports().await;
         let outbound_port = ports.outbound;
+        // Ambient: the only topology with per-port multi-port egress today
+        // (Sidecar multi-port stays fail-closed at materialization until the
+        // destination's inbound port disambiguation lands).
         let mut child = spawn_mesh_gateway(
             &temp,
             MeshGatewaySpawnOptions {
@@ -2487,7 +2490,7 @@ async fn functional_mesh_outbound_multi_port_without_orig_dst_fails_closed() {
                 ports,
                 node_id: &node_id,
                 config_protocol: "native",
-                topology: "sidecar",
+                topology: "ambient",
                 waypoint_name: None,
                 env_overrides: Vec::new(),
             },
