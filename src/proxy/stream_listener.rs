@@ -4,7 +4,6 @@
 //! the current `GatewayConfig`. On config reload it starts new listeners,
 //! stops removed ones, and restarts listeners whose port or protocol changed.
 
-use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,6 +18,7 @@ use crate::dns::DnsCache;
 use crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver;
 use crate::request_epoch::RequestEpochStore;
 use crate::tls::TlsPolicy;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 use super::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics};
 use super::udp_proxy::{UdpListenerConfig, UdpProxyMetrics};
@@ -58,23 +58,43 @@ struct ListenerHandle {
     dtls_server: Option<DtlsServerSlot>,
 }
 
+/// Reload key for the cached backend TLS `ClientConfig` a TCP+TLS listener
+/// builds once at spawn ([`super::tcp_proxy::CachedBackendTlsConfig`]).
+///
+/// Must cover every input the builder bakes into the cached config: the
+/// verify flag, the effective CA (proxy-resolved or global fallback — same
+/// precedence as `BackendTlsConfigBuilder::custom_ca_path`), client cert/key,
+/// and the SAN allow-list (baked into the verifier). Fields are fingerprinted
+/// by *content* so in-place rotation (cert-manager rewriting the same path,
+/// or a secret backend serving new bytes under a stable URI) restarts the
+/// listener and refreshes the cached config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BackendTlsReloadKey {
     verify_server_cert: bool,
     server_ca_cert: Option<BackendTlsMaterialReloadKey>,
     client_cert: Option<BackendTlsMaterialReloadKey>,
     client_key: Option<BackendTlsMaterialReloadKey>,
+    /// SAN allow-list baked into the cached server verifier
+    /// (`SanAllowListVerifier`). Config-carried, not file-backed, but it still
+    /// changes the cached `ClientConfig`, so it must restart the listener.
+    san_allow_list: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BackendTlsMaterialReloadKey {
-    path: String,
+    /// Stable, non-secret source identifier (inline PEM is digested — same
+    /// redaction rule as `CertSource::pool_key_component`).
+    source: String,
+    /// `sha256:<hex>` of the materialized bytes, or `error:<details>` when the
+    /// source cannot be loaded — kept in the key so a load failure vs success
+    /// transition (file appears / secret becomes reachable) restarts the
+    /// listener.
     fingerprint: String,
 }
 
 impl BackendTlsReloadKey {
     fn from_proxy(proxy: &Proxy, global_tls_ca_bundle_path: Option<&str>) -> Self {
-        let server_ca_cert_path = proxy
+        let server_ca_cert_source = proxy
             .resolved_tls
             .server_ca_cert_path
             .as_deref()
@@ -82,30 +102,45 @@ impl BackendTlsReloadKey {
 
         Self {
             verify_server_cert: proxy.resolved_tls.verify_server_cert,
-            server_ca_cert: server_ca_cert_path.map(BackendTlsMaterialReloadKey::from_path),
+            server_ca_cert: server_ca_cert_source.map(|source| {
+                BackendTlsMaterialReloadKey::from_source_value(source, MaterialKind::CaBundle)
+            }),
             client_cert: proxy
                 .resolved_tls
                 .client_cert_path
                 .as_deref()
-                .map(BackendTlsMaterialReloadKey::from_path),
-            client_key: proxy
-                .resolved_tls
-                .client_key_path
-                .as_deref()
-                .map(BackendTlsMaterialReloadKey::from_path),
+                .map(|source| {
+                    BackendTlsMaterialReloadKey::from_source_value(source, MaterialKind::Cert)
+                }),
+            client_key: proxy.resolved_tls.client_key_path.as_deref().map(|source| {
+                BackendTlsMaterialReloadKey::from_source_value(source, MaterialKind::Key)
+            }),
+            san_allow_list: proxy.resolved_tls.san_allow_list.clone(),
         }
     }
 }
 
 impl BackendTlsMaterialReloadKey {
-    fn from_path(path: &str) -> Self {
-        let fingerprint = match std::fs::read(path) {
-            Ok(bytes) => format!("sha256:{}", hex::encode(Sha256::digest(&bytes))),
-            Err(err) => format!("error:{:?}:{}", err.kind(), err),
+    /// Fingerprint a backend TLS material source by the bytes the TLS builder
+    /// actually consumes.
+    ///
+    /// Resolves through the same [`CertSource`] / [`load_material_blocking`]
+    /// abstraction as `load_backend_material` in `src/tls/backend.rs`, so
+    /// every supported source kind (plain path, inline PEM, `file://`,
+    /// vault/aws/azure/gcp/k8s/acme/managed URIs) is fingerprinted by content.
+    /// A raw `std::fs::read` of the config string would freeze the key for
+    /// non-path sources: a `file:///x.pem` or stable secret URI rotation
+    /// would never change the key and the cached config would go stale
+    /// forever. Cold path only — runs during reconcile, never per connection.
+    fn from_source_value(value: &str, kind: MaterialKind) -> Self {
+        let source = CertSource::parse(value, kind);
+        let fingerprint = match load_material_blocking(&source, kind) {
+            Ok(material) => format!("sha256:{}", hex::encode(material.fingerprint)),
+            Err(err) => format!("error:{}", err),
         };
 
         Self {
-            path: path.to_string(),
+            source: source.pool_key_component(),
             fingerprint,
         }
     }
@@ -768,34 +803,61 @@ impl StreamListenerManager {
         // Stop listeners for removed proxies or changed config
         let mut to_remove = Vec::new();
         for (key, handle) in listeners.iter() {
-            match effective_desired.get(key) {
-                None => {
-                    to_remove.push(key.clone());
-                }
-                Some((
-                    port,
-                    scheme,
-                    frontend_tls,
-                    passthrough,
-                    backend_tls_reload_key,
-                    sni_ids,
-                )) => {
-                    if handle.listen_port != *port
-                        || handle.scheme != *scheme
-                        || handle.frontend_tls != *frontend_tls
-                        || handle.passthrough != *passthrough
-                        || handle.backend_tls_reload_key != *backend_tls_reload_key
-                        // SNI-group membership change on a shared passthrough
-                        // port: the running listener captured the old candidate
-                        // ID list at spawn, so it must be restarted. IDs are
-                        // sorted at group construction, making this a stable
-                        // comparison.
-                        || handle.sni_ids != *sni_ids
-                    {
-                        to_remove.push(key.clone());
-                    }
+            let Some((port, scheme, frontend_tls, passthrough, backend_tls_reload_key, sni_ids)) =
+                effective_desired.get(key)
+            else {
+                to_remove.push(key.clone());
+                continue;
+            };
+
+            // Listener identity: a change here means the OLD listener must
+            // stop serving regardless of whether its replacement can start
+            // (e.g. a port move with broken TLS material must still release
+            // the old port).
+            let identity_changed = handle.listen_port != *port
+                || handle.scheme != *scheme
+                || handle.frontend_tls != *frontend_tls
+                || handle.passthrough != *passthrough
+                // SNI-group membership change on a shared passthrough
+                // port: the running listener captured the old candidate
+                // ID list at spawn, so it must be restarted. IDs are
+                // sorted at group construction, making this a stable
+                // comparison.
+                || handle.sni_ids != *sni_ids;
+            let backend_tls_changed = handle.backend_tls_reload_key != *backend_tls_reload_key;
+
+            if !identity_changed && !backend_tls_changed {
+                continue;
+            }
+
+            // In-place backend TLS rotation on an otherwise unchanged TCP+TLS
+            // listener: validate the replacement TLS config BEFORE stopping
+            // the old listener. If the rotated material is unreadable or
+            // invalid, keep the old listener serving with its cached config
+            // instead of tearing it down and leaving the port closed. The
+            // handle keeps its previous reload key, so every subsequent
+            // reconcile re-detects the drift and retries once the material is
+            // fixed.
+            if !identity_changed && *scheme == BackendScheme::Tcps {
+                let proxy_id = sni_ids.as_ref().and_then(|ids| ids.first()).unwrap_or(key);
+                if let Err(msg) = self.validate_backend_tls_config(&current_config, proxy_id, *port)
+                {
+                    error!(
+                        proxy_id = %proxy_id,
+                        port = *port,
+                        "Backend TLS material rotated to invalid content; keeping the previous stream listener running: {}",
+                        msg
+                    );
+                    bind_failures.push((
+                        proxy_id.clone(),
+                        *port,
+                        format!("{} (kept previous listener running)", msg),
+                    ));
+                    continue;
                 }
             }
+
+            to_remove.push(key.clone());
         }
 
         let mut removed_listeners = Vec::new();
@@ -851,48 +913,17 @@ impl StreamListenerManager {
                 }
             }
 
-            if *scheme == BackendScheme::Tcps {
-                let backend_tls_proxy = current_config
-                    .proxies
-                    .iter()
-                    .find(|p| p.id.as_str() == proxy_id.as_str());
-                match backend_tls_proxy {
-                    Some(proxy) => {
-                        if let Err(err) = super::tcp_proxy::build_cached_backend_tls_config(
-                            proxy,
-                            self.tls_no_verify,
-                            self.tls_ca_bundle_path.as_deref(),
-                            self.tls_policy.as_deref(),
-                            &self.crls,
-                        ) {
-                            let msg = format!(
-                                "Backend TLS config failed for stream listener on port {}: {}",
-                                port, err
-                            );
-                            error!(
-                                proxy_id = %proxy_id,
-                                port = *port,
-                                "Stream listener backend TLS validation failed: {}",
-                                err
-                            );
-                            bind_failures.push((proxy_id.clone(), *port, msg));
-                            continue;
-                        }
-                    }
-                    None => {
-                        let msg = format!(
-                            "Backend TLS config failed for stream listener on port {}: proxy not found",
-                            port
-                        );
-                        error!(
-                            proxy_id = %proxy_id,
-                            port = *port,
-                            "Stream listener backend TLS validation failed: proxy not found"
-                        );
-                        bind_failures.push((proxy_id.clone(), *port, msg));
-                        continue;
-                    }
-                }
+            if *scheme == BackendScheme::Tcps
+                && let Err(msg) = self.validate_backend_tls_config(&current_config, proxy_id, *port)
+            {
+                error!(
+                    proxy_id = %proxy_id,
+                    port = *port,
+                    "Stream listener backend TLS validation failed: {}",
+                    msg
+                );
+                bind_failures.push((proxy_id.clone(), *port, msg));
+                continue;
             }
 
             // Pre-check port availability before spawning the listener task.
@@ -1207,6 +1238,47 @@ impl StreamListenerManager {
         bind_failures
     }
 
+    /// Build-validate the cached backend TLS `ClientConfig` for a TCP+TLS
+    /// stream proxy without installing it.
+    ///
+    /// Used in two places in [`Self::reconcile`]: (1) before tearing down a
+    /// running listener whose backend TLS material rotated in place, so an
+    /// invalid rotation keeps the old listener serving; (2) before spawning a
+    /// new listener, so an invalid config never installs a listener that
+    /// would fail every backend handshake. Returns the message to surface in
+    /// `bind_failures` on failure.
+    fn validate_backend_tls_config(
+        &self,
+        current_config: &GatewayConfig,
+        proxy_id: &str,
+        port: u16,
+    ) -> Result<(), String> {
+        let Some(proxy) = current_config
+            .proxies
+            .iter()
+            .find(|p| p.id.as_str() == proxy_id)
+        else {
+            return Err(format!(
+                "Backend TLS config failed for stream listener on port {}: proxy not found",
+                port
+            ));
+        };
+        super::tcp_proxy::build_cached_backend_tls_config(
+            proxy,
+            self.tls_no_verify,
+            self.tls_ca_bundle_path.as_deref(),
+            self.tls_policy.as_deref(),
+            &self.crls,
+        )
+        .map(drop)
+        .map_err(|err| {
+            format!(
+                "Backend TLS config failed for stream listener on port {}: {}",
+                port, err
+            )
+        })
+    }
+
     /// Lightweight stream-listener diagnostics included in the admin `/overload`
     /// response. Lock-free: reads pre-built metric references from an `ArcSwap`
     /// updated during reconciliation, so this never contends with config reloads.
@@ -1369,7 +1441,25 @@ async fn await_stream_listener_shutdown(listener_key: &str, handle: ListenerHand
                 "Timed out waiting for stream listener shutdown; aborting task before restart"
             );
             join_handle.abort();
-            let _ = join_handle.await;
+            // Bound the post-abort join too. Abort only takes effect at the
+            // task's next await point, so a task wedged in synchronous code
+            // would otherwise hang this await — and reconcile holds the
+            // listeners mutex, so a single wedged listener would deadlock
+            // every future reconcile. Giving up here is safe: reconcile never
+            // crashes, and if the old socket is still held the replacement's
+            // bind probe fails and skips only the conflicting proxy until the
+            // next reconcile.
+            if tokio::time::timeout(STREAM_LISTENER_SHUTDOWN_WAIT, &mut join_handle)
+                .await
+                .is_err()
+            {
+                warn!(
+                    listener_key = %listener_key,
+                    port = listen_port,
+                    scheme = %scheme,
+                    "Stream listener task did not stop after abort; continuing reconcile — the replacement bind may fail until the old socket is released"
+                );
+            }
         }
     }
 }
@@ -1420,11 +1510,12 @@ mod tests {
             .to_str()
             .expect("test temp path must be utf-8 for proxy config");
 
-        let first = BackendTlsMaterialReloadKey::from_path(ca_path);
+        let first = BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle);
         std::fs::write(ca_path, b"second-ca").expect("write second ca");
-        let second = BackendTlsMaterialReloadKey::from_path(ca_path);
+        let second =
+            BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle);
 
-        assert_eq!(first.path, second.path);
+        assert_eq!(first.source, second.source);
         assert_ne!(
             first.fingerprint, second.fingerprint,
             "same-path backend TLS material rotation must change the reload key"
@@ -1439,11 +1530,13 @@ mod tests {
             .to_str()
             .expect("test temp path must be utf-8 for proxy config");
 
-        let missing = BackendTlsMaterialReloadKey::from_path(ca_path);
+        let missing =
+            BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle);
         std::fs::write(ca_path, b"first-ca").expect("write ca");
-        let present = BackendTlsMaterialReloadKey::from_path(ca_path);
+        let present =
+            BackendTlsMaterialReloadKey::from_source_value(ca_path, MaterialKind::CaBundle);
 
-        assert_eq!(missing.path, present.path);
+        assert_eq!(missing.source, present.source);
         assert!(
             missing.fingerprint.starts_with("error:"),
             "missing file fingerprint should preserve the load failure state"
@@ -1453,5 +1546,53 @@ mod tests {
             "present file fingerprint should hash the material"
         );
         assert_ne!(missing.fingerprint, present.fingerprint);
+    }
+
+    #[test]
+    fn backend_tls_material_reload_key_file_uri_rotation_changes_fingerprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, b"first-ca").expect("write first ca");
+        let ca_uri = format!(
+            "file://{}",
+            ca_path
+                .to_str()
+                .expect("test temp path must be utf-8 for proxy config")
+        );
+
+        let first = BackendTlsMaterialReloadKey::from_source_value(&ca_uri, MaterialKind::CaBundle);
+        std::fs::write(&ca_path, b"second-ca").expect("write second ca");
+        let second =
+            BackendTlsMaterialReloadKey::from_source_value(&ca_uri, MaterialKind::CaBundle);
+
+        assert_eq!(first.source, second.source);
+        assert!(
+            first.fingerprint.starts_with("sha256:") && second.fingerprint.starts_with("sha256:"),
+            "file:// URI sources must be fingerprinted by material content, not by raw fs::read of the URI string: {} / {}",
+            first.fingerprint,
+            second.fingerprint
+        );
+        assert_ne!(
+            first.fingerprint, second.fingerprint,
+            "file:// URI backend TLS material rotation must change the reload key"
+        );
+    }
+
+    #[test]
+    fn backend_tls_material_reload_key_digests_inline_pem_without_leaking_it() {
+        let inline_pem = "-----BEGIN CERTIFICATE-----\nMIIBsecret\n-----END CERTIFICATE-----\n";
+
+        let key = BackendTlsMaterialReloadKey::from_source_value(inline_pem, MaterialKind::Cert);
+
+        assert!(
+            !key.source.contains("MIIBsecret"),
+            "inline PEM must be digested in the reload key, never stored raw: {}",
+            key.source
+        );
+        assert!(
+            key.fingerprint.starts_with("sha256:"),
+            "inline PEM should fingerprint its content: {}",
+            key.fingerprint
+        );
     }
 }

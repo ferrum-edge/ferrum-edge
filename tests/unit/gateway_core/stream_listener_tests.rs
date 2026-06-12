@@ -392,6 +392,193 @@ async fn test_reconcile_skips_tcp_tls_listener_when_backend_tls_material_unreada
     );
 }
 
+/// Generate a self-signed CA certificate PEM for backend TLS config builds.
+fn generate_test_ca_pem(common_name: &str) -> String {
+    let key_pair =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate CA key pair");
+    let mut params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA certificate params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name);
+    params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+    params.self_signed(&key_pair).expect("self-signed CA").pem()
+}
+
+/// In-place backend TLS rotation to invalid content must NOT tear down the
+/// running listener: the replacement TLS config is validated BEFORE the old
+/// listener is stopped, and on failure the old listener keeps serving with
+/// its cached config. Fixing the material on a later reconcile restarts the
+/// listener cleanly.
+#[tokio::test]
+async fn test_in_place_backend_tls_rotation_to_invalid_keeps_old_listener_serving() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let port = ephemeral_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, generate_test_ca_pem("Rotation CA A")).expect("write initial ca");
+
+    let mut proxy = create_stream_proxy("tcp-tls-rotate", BackendScheme::Tcps, port);
+    proxy.backend_tls_verify_server_cert = true;
+    proxy.backend_tls_server_ca_cert_path = Some(
+        ca_path
+            .to_str()
+            .expect("test temp path must be utf-8 for proxy config")
+            .to_string(),
+    );
+    proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let manager = create_manager(config);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial TCP TLS listener should start with valid CA material: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial TCP TLS listener should bind");
+
+    // Rotate the CA file IN PLACE to unparseable garbage. The content
+    // fingerprint changes the reload key, but the replacement TLS config
+    // cannot be built — reconcile must keep the OLD listener serving instead
+    // of tearing it down and leaving the port closed.
+    std::fs::write(&ca_path, b"not-a-pem-certificate").expect("rotate ca to garbage");
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "invalid in-place rotation should be reported: {:?}",
+        failures
+    );
+    assert_eq!(failures[0].0, "tcp-tls-rotate");
+    assert_eq!(failures[0].1, port);
+    assert!(
+        failures[0].2.contains("kept previous listener running"),
+        "failure should state the old listener was kept: {}",
+        failures[0].2
+    );
+    let conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+    assert!(
+        conn.is_ok(),
+        "old listener must keep serving port {} after an invalid in-place TLS rotation",
+        port
+    );
+
+    // A later reconcile with still-bad material keeps reporting and keeps
+    // serving (the handle retains its previous reload key, so the drift is
+    // re-detected every pass).
+    let failures = manager.reconcile().await;
+    assert_eq!(failures.len(), 1, "still-bad material keeps reporting");
+    let conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+    assert!(conn.is_ok(), "old listener must still be serving");
+
+    // Fix the material (different valid CA) — the next reconcile restarts the
+    // listener with the fresh cached config.
+    std::fs::write(&ca_path, generate_test_ca_pem("Rotation CA B")).expect("rotate to valid ca");
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "valid rotation should restart the listener cleanly: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("restarted TCP TLS listener should bind");
+    let conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+    assert!(conn.is_ok(), "restarted listener must serve the port");
+
+    manager.shutdown_all().await;
+}
+
+/// The backend TLS reload key must derive from `resolved_tls` — the
+/// upstream-projected view (`resolve_upstream_tls()`) — not from the proxy's
+/// own `backend_tls_*` fields. An upstream-only TLS change leaves the proxy
+/// fields untouched, so a key built from them would never notice the change.
+/// Detection is made observable by rotating to garbage material: reconcile
+/// reports the validation failure (proving the key changed) while keeping the
+/// old listener serving.
+#[tokio::test]
+async fn test_reconcile_detects_upstream_resolved_tls_change() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let port = ephemeral_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_a_path = dir.path().join("upstream-ca-a.pem");
+    let ca_b_path = dir.path().join("upstream-ca-b.pem");
+    std::fs::write(&ca_a_path, generate_test_ca_pem("Upstream CA A")).expect("write ca a");
+    std::fs::write(&ca_b_path, b"garbage-rotated-by-upstream").expect("write ca b");
+
+    // Proxy's own backend_tls_* fields stay empty; TLS arrives via
+    // resolved_tls, exactly as resolve_upstream_tls() projects from a
+    // referenced upstream.
+    let mut proxy = create_stream_proxy("tcp-tls-upstream", BackendScheme::Tcps, port);
+    proxy.resolved_tls = BackendTlsConfig {
+        server_ca_cert_path: Some(
+            ca_a_path
+                .to_str()
+                .expect("test temp path must be utf-8 for proxy config")
+                .to_string(),
+        ),
+        verify_server_cert: true,
+        ..BackendTlsConfig::default_verify()
+    };
+    let mut rotated_proxy = proxy.clone();
+    rotated_proxy.resolved_tls.server_ca_cert_path = Some(
+        ca_b_path
+            .to_str()
+            .expect("test temp path must be utf-8 for proxy config")
+            .to_string(),
+    );
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial upstream-resolved TLS should start cleanly: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial TCP TLS listener should bind");
+
+    // Upstream-only TLS change: identical proxy fields, new resolved_tls.
+    let rotated_config = GatewayConfig {
+        proxies: vec![rotated_proxy],
+        ..empty_config()
+    };
+    config_arc.store(Arc::new(rotated_config));
+
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "upstream-resolved TLS change must be detected via the reload key: {:?}",
+        failures
+    );
+    assert_eq!(failures[0].0, "tcp-tls-upstream");
+    let conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+    assert!(
+        conn.is_ok(),
+        "old listener must keep serving while the rotated upstream TLS material is invalid"
+    );
+
+    manager.shutdown_all().await;
+}
+
 // ============================================================================
 // Tests: TLS Deferral
 // ============================================================================

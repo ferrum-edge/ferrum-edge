@@ -5173,13 +5173,30 @@ impl ProxyState {
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
         self.spawn_backend_capability_refresh();
 
-        // Reconcile stream proxy listeners if any proxies changed
+        // Reconcile stream proxy listeners if any proxies changed.
+        //
+        // Upstream changes must also trigger reconcile: a TCP+TLS stream
+        // proxy's backend TLS (CA / client cert / verify / SAN list) can be
+        // supplied by its referenced upstream via `resolved_tls`, and an
+        // upstream-only update never marks the proxy itself as modified
+        // (delta diffing is `updated_at`-based). Conservative trigger — any
+        // upstream change while stream proxies exist — is fine: reconcile is
+        // idempotent and only restarts listeners whose reload key actually
+        // changed.
+        let upstreams_changed = !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty();
         let stream_proxies_changed = delta
             .added_proxies
             .iter()
             .chain(delta.modified_proxies.iter())
             .any(|p| p.dispatch_kind.is_stream())
-            || !delta.removed_proxy_ids.is_empty();
+            || !delta.removed_proxy_ids.is_empty()
+            || (upstreams_changed
+                && new_config
+                    .proxies
+                    .iter()
+                    .any(|p| p.dispatch_kind.is_stream()));
         if stream_proxies_changed {
             let slm = self.stream_listener_manager.clone();
             tokio::spawn(async move {
@@ -5543,7 +5560,16 @@ impl ProxyState {
         // one in-flight probe + one queued re-run.
         self.spawn_backend_capability_refresh();
 
-        // Reconcile stream proxy listeners if any stream proxies changed
+        // Reconcile stream proxy listeners if any stream proxies changed.
+        //
+        // Upstream changes must also trigger reconcile: a TCP+TLS stream
+        // proxy's backend TLS (CA / client cert / verify / SAN list) can be
+        // supplied by its referenced upstream via `resolved_tls`, and an
+        // upstream-only update never marks the proxy itself as modified
+        // (delta diffing is `updated_at`-based). Conservative trigger — any
+        // upstream change while stream proxies exist — is fine: reconcile is
+        // idempotent and only restarts listeners whose reload key actually
+        // changed.
         let removed_had_stream = if !delta.removed_proxy_ids.is_empty() {
             let removed_set: std::collections::HashSet<&str> =
                 delta.removed_proxy_ids.iter().map(|s| s.as_str()).collect();
@@ -5554,12 +5580,20 @@ impl ProxyState {
         } else {
             false
         };
+        let upstreams_changed = !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty();
         let stream_proxies_changed = delta
             .added_proxies
             .iter()
             .chain(delta.modified_proxies.iter())
             .any(|p| p.dispatch_kind.is_stream())
-            || removed_had_stream;
+            || removed_had_stream
+            || (upstreams_changed
+                && new_config
+                    .proxies
+                    .iter()
+                    .any(|p| p.dispatch_kind.is_stream()));
         if stream_proxies_changed {
             let failures = self.stream_listener_manager.reconcile().await;
             for (proxy_id, port, err) in &failures {
