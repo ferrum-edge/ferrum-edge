@@ -1,0 +1,1264 @@
+//! Sidecar-to-sidecar SVID-mTLS HTTP/2 connection pool (Sidecar egress).
+//!
+//! The Sidecar mesh transport is plain HTTP over mutual TLS to the peer
+//! sidecar's inbound listener (`:15006`) — NOT HBONE (HBONE is the
+//! Ambient/Waypoint transport on `:15008`; a Sidecar peer has no HBONE
+//! listener). This pool owns multiplexed HTTP/2 client connections whose TLS
+//! layer presents this gateway's SVID and verifies the peer's server SVID
+//! against the mesh trust bundle, PINNED to the destination workload identity
+//! from the target's `mesh.spiffe_id` tag. The peer's `auto`-serving frontend
+//! terminates mTLS, sniffs the h2 preface (its mesh inbound `ServerConfig`
+//! also advertises `h2` at ALPN), and routes the request by `:authority` to
+//! its materialized local inbound loopback route.
+//!
+//! Pool mechanics mirror [`super::hbone_pool::HboneConnectionPool`]: a
+//! `DashMap` of per-key sender lists with a shared-lock fast path, coalesced
+//! creation, idle pruning, and an SVID-fingerprint + pinned-peer pool key so a
+//! rotated SVID or a different pinned identity never reuses an old session.
+//! Errors reuse [`HbonePoolError`] — the two pools share every failure shape
+//! (DNS, TCP, SPIFFE TLS config, TLS/H2 handshake) except HBONE's CONNECT
+//! stream, so the dispatch error mapping stays single-sourced.
+
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
+use hyper::client::conn::http2;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use std::cell::RefCell;
+use std::fmt::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio_rustls::TlsConnector;
+use tracing::debug;
+
+use crate::config::PoolConfig;
+use crate::config::types::{Proxy, UpstreamTarget};
+use crate::dns::DnsCache;
+use crate::identity::{SharedSvidBundle, SpiffeId, SvidBundle};
+use crate::proxy::body::SizeLimitedIncoming;
+use crate::tls::backend::BackendSvidGeneration;
+use crate::tls::spiffe::build_spiffe_outbound_config;
+
+use super::hbone_pool::{
+    HbonePoolError, MESH_SPIFFE_ID_TAG, entry_idle_expired, matches_boolish_true, svid_fingerprint,
+    target_expected_peer_spiffe, unix_secs, write_pool_config_key,
+};
+
+/// Tag marking a target for Sidecar SVID-mTLS dispatch (the peer is a mesh
+/// sidecar reached over mutual TLS on its inbound listener). Mutually
+/// exclusive with `mesh.hbone` — the materializer emits exactly one per
+/// topology.
+pub const MESH_MTLS_TARGET_TAG: &str = "mesh.mtls";
+/// Tag overriding the peer sidecar's inbound mTLS port. Absent ⇒ Istio's
+/// conventional `15006`.
+pub const MESH_MTLS_PORT_TAG: &str = "mesh.mtls_port";
+/// Istio-convention sidecar inbound mTLS port.
+pub const ISTIO_SIDECAR_INBOUND_PORT: u16 = 15006;
+
+/// Multiplexed hyper H2 sender over the SVID-mTLS session. The body type is
+/// [`SizeLimitedIncoming`] so dispatch enforces `max_request_body_size_bytes`
+/// on the streamed request body exactly like the HBONE path.
+pub type MeshMtlsSender = http2::SendRequest<SizeLimitedIncoming>;
+
+thread_local! {
+    static MESH_MTLS_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(192));
+}
+
+struct MeshMtlsPoolEntry {
+    sender: MeshMtlsSender,
+    /// Unix seconds of the last checkout; atomic so the shared-lock fast path
+    /// refreshes recency without the exclusive shard write lock.
+    last_used_at: AtomicU64,
+    idle_timeout_seconds: u64,
+}
+
+pub fn target_mesh_mtls_enabled(target: &UpstreamTarget) -> bool {
+    target
+        .tags
+        .get(MESH_MTLS_TARGET_TAG)
+        .is_some_and(|value| matches_boolish_true(value))
+}
+
+pub fn target_mesh_mtls_port(target: &UpstreamTarget) -> u16 {
+    target
+        .tags
+        .get(MESH_MTLS_PORT_TAG)
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(ISTIO_SIDECAR_INBOUND_PORT)
+}
+
+/// The pinned peer identity a `mesh.mtls` target MUST declare. Unlike HBONE
+/// (where operator-supplied targets may legitimately omit the tag), Sidecar
+/// mTLS targets are only ever produced by the mesh materializer, which always
+/// stamps the destination workload identity — so an absent tag here is a
+/// config-corruption signal and fails the dial closed rather than silently
+/// downgrading to trust-domain-only verification.
+pub fn target_mesh_mtls_expected_peer(target: &UpstreamTarget) -> Result<SpiffeId, HbonePoolError> {
+    target_expected_peer_spiffe(target)?.ok_or_else(|| HbonePoolError::InvalidPeerSpiffeTag {
+        value: String::new(),
+        message: format!(
+            "mesh.mtls target {}:{} carries no {MESH_SPIFFE_ID_TAG} tag; refusing unpinned \
+             sidecar mTLS dial",
+            target.host, target.port
+        ),
+    })
+}
+
+/// Upper bound on retired-generation records kept while waiting for their
+/// drain timers. With `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0` no drain
+/// task ever consumes the records, so the registry must be capped or a
+/// rotation storm grows it unbounded.
+const MAX_RETIRED_SVID_GENERATIONS: usize = 16;
+/// Upper bound on fingerprints filed under one generation. Normally a
+/// generation retires exactly one fingerprint; a frozen generation counter
+/// (starved rotation consumer) funnels every rotation into one bucket, which
+/// must not grow unbounded either.
+const MAX_RETIRED_FINGERPRINTS_PER_GENERATION: usize = 8;
+
+pub struct MeshMtlsConnectionPool {
+    entries: DashMap<String, Vec<MeshMtlsPoolEntry>>,
+    creation_locks: DashMap<String, Arc<Mutex<()>>>,
+    gateway_svid: SharedSvidBundle,
+    svid_identity_cache: ArcSwap<Option<MeshMtlsSvidIdentityCache>>,
+    /// Shared backend SVID generation counter (same `Arc` the HTTP/H2/gRPC/H3
+    /// pools stamp into their `|svidg=` key fields). Mesh mTLS keys embed the
+    /// SVID *fingerprint* instead, so the identity cache stamps the generation
+    /// it was built under and `retired_svid_fingerprints` maps each retired
+    /// generation back to its fingerprint(s) for the rotation drain.
+    backend_svid_generation: BackendSvidGeneration,
+    /// generation -> fingerprints that were current under that generation but
+    /// have since rotated out. Written only on rotation (cold path); consumed
+    /// and removed by `force_drain_svid_generation`.
+    retired_svid_fingerprints: DashMap<u64, Vec<Arc<str>>>,
+    dns_cache: DnsCache,
+    pool_config: PoolConfig,
+    last_idle_prune_unix_secs: AtomicU64,
+}
+
+struct MeshMtlsSvidIdentityCache {
+    source: Arc<Option<SvidBundle>>,
+    fingerprint: Arc<str>,
+    /// Backend SVID generation observed when this cache entry was built.
+    /// Used to file the fingerprint under the right generation once it
+    /// rotates out, so `force_drain_svid_generation(old_gen)` can resolve
+    /// the passed generation to the fingerprint embedded in pool keys.
+    svid_generation: u64,
+}
+
+impl MeshMtlsConnectionPool {
+    #[allow(dead_code)] // Used by tests and external lib callers; binary wires the shared generation counter.
+    pub fn new(
+        pool_config: PoolConfig,
+        dns_cache: DnsCache,
+        gateway_svid: SharedSvidBundle,
+        shard_amount: usize,
+    ) -> Self {
+        Self::new_with_svid_generation(
+            pool_config,
+            dns_cache,
+            gateway_svid,
+            shard_amount,
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    pub fn new_with_svid_generation(
+        pool_config: PoolConfig,
+        dns_cache: DnsCache,
+        gateway_svid: SharedSvidBundle,
+        shard_amount: usize,
+        backend_svid_generation: BackendSvidGeneration,
+    ) -> Self {
+        Self {
+            entries: DashMap::with_shard_amount(shard_amount),
+            creation_locks: DashMap::with_shard_amount(shard_amount),
+            gateway_svid,
+            svid_identity_cache: ArcSwap::new(Arc::new(None)),
+            backend_svid_generation,
+            // Low-cardinality, rotation-only map — default sharding is fine.
+            retired_svid_fingerprints: DashMap::new(),
+            dns_cache,
+            pool_config,
+            last_idle_prune_unix_secs: AtomicU64::new(0),
+        }
+    }
+
+    pub fn pool_size(&self) -> usize {
+        self.entries.iter().map(|entry| entry.value().len()).sum()
+    }
+
+    /// Cached gateway SVID fingerprint, keyed by `Arc::ptr_eq` on the SVID
+    /// slot snapshot — recomputing `Sha256::digest` + hex-formatting on every
+    /// dispatched request is hot-path waste when the SVID rotates rarely.
+    /// Unlike the HBONE pool's identity cache this stores only the
+    /// fingerprint: sidecar mTLS dispatch never needs the source SPIFFE id
+    /// (there is no baggage header on this transport).
+    fn current_svid_fingerprint_cached(&self) -> Result<Arc<str>, HbonePoolError> {
+        let snapshot = self.gateway_svid.load_full();
+        let cached = self.svid_identity_cache.load_full();
+        if let Some(cache) = cached.as_ref()
+            && Arc::ptr_eq(&cache.source, &snapshot)
+        {
+            return Ok(cache.fingerprint.clone());
+        }
+
+        let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
+        let fingerprint: Arc<str> = Arc::from(svid_fingerprint(bundle)?);
+        if let Some(previous) = cached.as_ref() {
+            // The SVID slot rotated: file the outgoing fingerprint under the
+            // generation it was current for, so the delayed drain task can
+            // resolve `force_drain_svid_generation(old_gen)` to it. Slot
+            // stores are change-gated by the rotation watcher, so EVERY
+            // rebuild is a genuine material change — record even when the
+            // fingerprint is unchanged (a trust-bundle-only rotation keeps
+            // the leaf, but sessions verified against the previous bundle
+            // must still not outlive the drain window). A same-as-current
+            // fingerprint record makes that drain force a one-time reconnect
+            // wave for keys that are also current; that churn is the intent.
+            self.record_retired_fingerprint(previous.svid_generation, previous.fingerprint.clone());
+        }
+        self.svid_identity_cache
+            .store(Arc::new(Some(MeshMtlsSvidIdentityCache {
+                source: snapshot,
+                fingerprint: fingerprint.clone(),
+                svid_generation: self.backend_svid_generation.load(Ordering::Acquire),
+            })));
+        Ok(fingerprint)
+    }
+
+    fn record_retired_fingerprint(&self, generation: u64, fingerprint: Arc<str>) {
+        // Bound the per-generation list as well as the generation count: when
+        // the rotation consumer is starved or dead, every rotation stamps the
+        // same frozen generation and would grow one Vec unbounded while the
+        // key-count cap below never trips. Overflow is drained immediately
+        // (early is safe, never is not). Drains happen after the shard guard
+        // is released.
+        let mut overflowed: Vec<Arc<str>> = Vec::new();
+        {
+            let mut retired = self
+                .retired_svid_fingerprints
+                .entry(generation)
+                .or_default();
+            if !retired
+                .iter()
+                .any(|existing| existing.as_ref() == fingerprint.as_ref())
+            {
+                retired.push(fingerprint);
+            }
+            while retired.len() > MAX_RETIRED_FINGERPRINTS_PER_GENERATION {
+                overflowed.push(retired.remove(0));
+            }
+        }
+        if !overflowed.is_empty() {
+            self.drain_retired_fingerprints(&overflowed);
+        }
+        // Cap the registry: with the drain window disabled nothing consumes
+        // these records, and a rotation storm must not grow them unbounded.
+        // An evicted record's drain timer may not have fired yet (or drains
+        // may be disabled entirely) — dropping it silently would leak its
+        // sessions past the configured drain window, so drain the evicted
+        // fingerprints immediately: early is safe, never is not. Cold path
+        // (rotation only), so the min-scan eviction is fine.
+        while self.retired_svid_fingerprints.len() > MAX_RETIRED_SVID_GENERATIONS {
+            let Some(oldest) = self
+                .retired_svid_fingerprints
+                .iter()
+                .map(|entry| *entry.key())
+                .min()
+            else {
+                break;
+            };
+            if let Some((_, evicted)) = self.retired_svid_fingerprints.remove(&oldest) {
+                self.drain_retired_fingerprints(&evicted);
+            }
+        }
+    }
+
+    /// Remove every pool entry and creation lock whose key embeds one of the
+    /// `retired` SVID fingerprints.
+    fn drain_retired_fingerprints(&self, retired: &[Arc<str>]) {
+        let fingerprint_retired = |key: &str| {
+            mesh_mtls_key_svid_fingerprint(key)
+                .is_some_and(|fingerprint| retired.iter().any(|fp| fp.as_ref() == fingerprint))
+        };
+        let mut evicted = 0usize;
+        self.entries.retain(|key, entries| {
+            let drain = fingerprint_retired(key);
+            if drain {
+                evicted = evicted.saturating_add(entries.len());
+            }
+            !drain
+        });
+        self.creation_locks
+            .retain(|key, _| !fingerprint_retired(key));
+        record_mesh_mtls_evictions(evicted);
+    }
+
+    /// Drain pool entries belonging to the retired SVID `generation` — and to
+    /// any older generation whose record is still pending.
+    ///
+    /// Mirrors the `SvidGenerationMatcher` semantics of the HTTP/H2/gRPC/H3
+    /// pools: generations NEWER than the passed one are never touched, so
+    /// overlapping rotation drain windows (A→B→C within one
+    /// `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` window) never drain a newer
+    /// generation's connections before that generation's own timer fires.
+    /// Mesh mTLS keys embed the SVID *fingerprint* rather than the generation,
+    /// so the identity cache records which fingerprint was current under each
+    /// generation and this method resolves the passed generation through that
+    /// registry.
+    ///
+    /// The sweep is `<= generation` rather than `== generation` to close the
+    /// slot-swap/generation-store race: the rotation watcher swaps the SVID
+    /// slot BEFORE the async rotation consumer advances
+    /// `backend_svid_generation`, so traffic landing in that window stamps the
+    /// incoming fingerprint with the outgoing generation and the next rotation
+    /// files it one generation too low. Drain timers fire in rotation order
+    /// with equal delays, so a record misfiled under an already-drained older
+    /// generation is picked up by the next drain instead of leaking until idle
+    /// pruning.
+    pub fn force_drain_svid_generation(&self, generation: u64) {
+        // Refresh the identity cache first so a rotation with no sidecar mTLS
+        // traffic since the SVID slot swap still records the outgoing
+        // fingerprint.
+        if self.current_svid_fingerprint_cached().is_err() {
+            // No SVID in the slot: every pooled connection is stale.
+            self.force_drain_all();
+            return;
+        }
+
+        let stale_generations: Vec<u64> = self
+            .retired_svid_fingerprints
+            .iter()
+            .map(|entry| *entry.key())
+            .filter(|recorded| *recorded <= generation)
+            .collect();
+        let mut retired: Vec<Arc<str>> = Vec::new();
+        for stale in stale_generations {
+            if let Some((_, fingerprints)) = self.retired_svid_fingerprints.remove(&stale) {
+                retired.extend(fingerprints);
+            }
+        }
+        if retired.is_empty() {
+            // Nothing was retired at or before this generation: either its
+            // fingerprint is still current or it never carried pool entries.
+            return;
+        }
+
+        self.drain_retired_fingerprints(&retired);
+    }
+
+    pub fn force_drain_all(&self) {
+        let evicted = self.pool_size();
+        self.entries.clear();
+        self.creation_locks.clear();
+        self.retired_svid_fingerprints.clear();
+        record_mesh_mtls_evictions(evicted);
+    }
+
+    /// Checkout (or create) a multiplexed H2 sender to `target_host:mtls_port`
+    /// whose mTLS session is pinned to `expected_peer`. The returned sender is
+    /// a cheap clone of the pooled connection handle.
+    pub async fn get_sender(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        mtls_port: u16,
+        expected_peer: &SpiffeId,
+    ) -> Result<MeshMtlsSender, HbonePoolError> {
+        let fingerprint = self.current_svid_fingerprint_cached()?;
+        let pool_config = self.pool_config.for_proxy(proxy);
+
+        let fast_sender = with_mesh_mtls_pool_key(
+            target_host,
+            mtls_port,
+            proxy.dns_override.as_deref(),
+            fingerprint.as_ref(),
+            expected_peer,
+            &pool_config,
+            |key| self.try_cached_sender_read(key),
+        );
+        if let Some(sender) = fast_sender {
+            return Ok(sender);
+        }
+
+        let key = with_mesh_mtls_pool_key(
+            target_host,
+            mtls_port,
+            proxy.dns_override.as_deref(),
+            fingerprint.as_ref(),
+            expected_peer,
+            &pool_config,
+            |key| key.to_string(),
+        );
+        self.get_or_create_sender(
+            proxy,
+            target_host,
+            mtls_port,
+            expected_peer,
+            &key,
+            &pool_config,
+        )
+        .await
+    }
+
+    async fn get_or_create_sender(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        mtls_port: u16,
+        expected_peer: &SpiffeId,
+        key: &str,
+        pool_config: &PoolConfig,
+    ) -> Result<MeshMtlsSender, HbonePoolError> {
+        self.maybe_prune_idle_entries();
+        let max_entries = pool_config.http2_connections_per_host.max(1);
+        if let Some(sender) = self.cached_sender(key, max_entries) {
+            return Ok(sender);
+        }
+
+        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        let creation_started = Instant::now();
+        let creation_lock = self
+            .creation_locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _creation_guard = tokio::time::timeout(connect_timeout, creation_lock.lock())
+            .await
+            .map_err(|_| HbonePoolError::ConnectTimeout {
+                addr: format!("{target_host}:{mtls_port}"),
+                timeout_ms: proxy.backend_connect_timeout_ms,
+            })?;
+        // Double-check under the creation lock: a coalesced waiter may find the
+        // winner's connection already inserted.
+        if let Some(sender) = self.cached_sender(key, max_entries) {
+            return Ok(sender);
+        }
+
+        let remaining = crate::pool::remaining_connect_timeout(creation_started, connect_timeout)
+            .ok_or_else(|| HbonePoolError::ConnectTimeout {
+            addr: format!("{target_host}:{mtls_port}"),
+            timeout_ms: proxy.backend_connect_timeout_ms,
+        })?;
+        // Snapshot the SVID slot before dialing: the SPIFFE TLS resolver and
+        // verifier read the slot at HANDSHAKE time, so "slot unchanged across
+        // the dial" proves the session was built from exactly this material.
+        let svid_slot_before_dial = self.gateway_svid.load_full();
+        let sender = match tokio::time::timeout(
+            remaining,
+            self.create_sender(proxy, target_host, mtls_port, expected_peer, pool_config),
+        )
+        .await
+        {
+            Ok(Ok(sender)) => {
+                crate::runtime_metrics::global_ref()
+                    .record_pool_handshake(crate::runtime_metrics::PoolKind::MeshMtls);
+                sender
+            }
+            Ok(Err(err)) => {
+                crate::runtime_metrics::global_ref()
+                    .record_pool_failure(crate::runtime_metrics::PoolKind::MeshMtls);
+                return Err(err);
+            }
+            Err(_) => {
+                crate::runtime_metrics::global_ref()
+                    .record_pool_failure(crate::runtime_metrics::PoolKind::MeshMtls);
+                return Err(HbonePoolError::ConnectTimeout {
+                    addr: format!("{target_host}:{mtls_port}"),
+                    timeout_ms: proxy.backend_connect_timeout_ms,
+                });
+            }
+        };
+        // An SVID rotation drain may have fired while this dial was in
+        // flight: pooling the sender under a retired-fingerprint key would
+        // resurrect it AFTER its one-shot drain already ran, leaving an
+        // old-identity session alive until idle pruning (forever with
+        // `idle_timeout_seconds=0`). Serve the triggering request on the
+        // connection, but only pool it while (a) the slot is unchanged across
+        // the dial — catches same-leaf trust-bundle rotations the fingerprint
+        // cannot see — and (b) the key's fingerprint is still the current one
+        // — catches rotations between key construction and the slot snapshot.
+        // Pre-drain inserts under a retired-but-undrained key are also
+        // skipped, which merely costs those stragglers pooling during the
+        // drain window.
+        let svid_slot_unchanged =
+            Arc::ptr_eq(&svid_slot_before_dial, &self.gateway_svid.load_full());
+        let key_fingerprint_is_current = self
+            .current_svid_fingerprint_cached()
+            .ok()
+            .is_some_and(|current| mesh_mtls_key_svid_fingerprint(key) == Some(current.as_ref()));
+        if !svid_slot_unchanged || !key_fingerprint_is_current {
+            debug!(
+                target_host,
+                mtls_port,
+                expected_peer = %expected_peer.as_str(),
+                "Sidecar SVID-mTLS connection completed under a rotated SVID; serving without pooling"
+            );
+            return Ok(sender);
+        }
+        self.entries
+            .entry(key.to_string())
+            .and_modify(|entries| {
+                record_mesh_mtls_evictions(prune_pool_entries(entries));
+                entries.push(MeshMtlsPoolEntry {
+                    sender: sender.clone(),
+                    last_used_at: AtomicU64::new(unix_secs()),
+                    idle_timeout_seconds: pool_config.idle_timeout_seconds,
+                });
+                if entries.len() > max_entries {
+                    let overflow = entries.len() - max_entries;
+                    entries.drain(0..overflow);
+                    record_mesh_mtls_evictions(overflow);
+                }
+            })
+            .or_insert_with(|| {
+                vec![MeshMtlsPoolEntry {
+                    sender: sender.clone(),
+                    last_used_at: AtomicU64::new(unix_secs()),
+                    idle_timeout_seconds: pool_config.idle_timeout_seconds,
+                }]
+            });
+        debug!(
+            target_host,
+            mtls_port,
+            expected_peer = %expected_peer.as_str(),
+            "Created sidecar SVID-mTLS HTTP/2 connection"
+        );
+        Ok(sender)
+    }
+
+    /// Exclusive-lock scan: prune dead/idle entries, return the first live
+    /// multiplexed sender. Unlike the HBONE pool there is no Ready/Pending
+    /// split — hyper's H2 sender accepts new streams as long as the connection
+    /// is open (`is_closed()`); per-stream backpressure is awaited at send.
+    fn cached_sender(&self, key: &str, _max_entries: usize) -> Option<MeshMtlsSender> {
+        let mut entries = self.entries.get_mut(key)?;
+        record_mesh_mtls_evictions(prune_pool_entries(&mut entries));
+        for entry in entries.iter() {
+            if entry.sender.is_closed() {
+                continue;
+            }
+            entry.last_used_at.store(unix_secs(), Ordering::Relaxed);
+            return Some(entry.sender.clone());
+        }
+        None
+    }
+
+    /// Shared-lock fast path mirroring the HBONE pool: scan for a live sender
+    /// and refresh recency via a relaxed store, avoiding the exclusive shard
+    /// write lock. Expired entries are skipped (not removed); dead senders fall
+    /// through to the write path.
+    fn try_cached_sender_read(&self, key: &str) -> Option<MeshMtlsSender> {
+        let entries = self.entries.get(key)?;
+        let now = unix_secs();
+        for entry in entries.value().iter() {
+            let last_used = entry.last_used_at.load(Ordering::Relaxed);
+            if entry_idle_expired(last_used, entry.idle_timeout_seconds, now) {
+                continue;
+            }
+            if entry.sender.is_closed() {
+                continue;
+            }
+            entry.last_used_at.store(now, Ordering::Relaxed);
+            return Some(entry.sender.clone());
+        }
+        None
+    }
+
+    fn maybe_prune_idle_entries(&self) {
+        let now = unix_secs();
+        let interval = if self.pool_config.idle_timeout_seconds == 0 {
+            60
+        } else {
+            self.pool_config.idle_timeout_seconds.clamp(1, 60)
+        };
+        let last = self.last_idle_prune_unix_secs.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < interval {
+            return;
+        }
+        if self
+            .last_idle_prune_unix_secs
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        self.entries.retain(|_, entries| {
+            record_mesh_mtls_evictions(prune_pool_entries(entries));
+            !entries.is_empty()
+        });
+        self.creation_locks.retain(|key, lock| {
+            self.entries.contains_key(key.as_str()) || Arc::strong_count(lock) > 1
+        });
+    }
+
+    async fn create_sender(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        mtls_port: u16,
+        expected_peer: &SpiffeId,
+        pool_config: &PoolConfig,
+    ) -> Result<MeshMtlsSender, HbonePoolError> {
+        let resolved_ip = self
+            .dns_cache
+            .resolve(
+                target_host,
+                proxy.dns_override.as_deref(),
+                proxy.dns_cache_ttl_seconds,
+            )
+            .await
+            .map_err(|e| HbonePoolError::DnsLookup {
+                host: target_host.to_string(),
+                message: e.to_string(),
+            })?;
+        let sock_addr = std::net::SocketAddr::new(resolved_ip, mtls_port);
+        let addr = sock_addr.to_string();
+        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        let connect_started = Instant::now();
+
+        let tcp = tokio::time::timeout(
+            connect_timeout,
+            crate::socket_opts::connect_with_socket_opts(sock_addr),
+        )
+        .await
+        .map_err(|_| HbonePoolError::ConnectTimeout {
+            addr: addr.clone(),
+            timeout_ms: proxy.backend_connect_timeout_ms,
+        })?
+        .map_err(|source| HbonePoolError::Connect {
+            addr: addr.clone(),
+            source,
+        })?;
+        let _ = tcp.set_nodelay(true);
+        if pool_config.enable_http_keep_alive {
+            set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
+        }
+
+        // Plain mesh HTTP over mTLS speaks h2 to the peer sidecar's frontend
+        // (which advertises h2 and preface-sniffs via `auto`), so advertise h2
+        // only. The peer identity is PINNED: its server SVID URI SAN must equal
+        // `expected_peer` exactly.
+        let tls_config = build_spiffe_outbound_config(
+            self.gateway_svid.clone(),
+            Some(expected_peer.clone()),
+            vec![b"h2".to_vec()],
+        )?;
+        let connector = TlsConnector::from(tls_config);
+        let server_name = rustls::pki_types::ServerName::try_from(target_host.to_string())
+            .map_err(|e| HbonePoolError::InvalidServerName {
+                host: target_host.to_string(),
+                message: e.to_string(),
+            })?;
+
+        let Some(remaining) =
+            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
+        else {
+            return Err(HbonePoolError::ConnectTimeout {
+                addr,
+                timeout_ms: proxy.backend_connect_timeout_ms,
+            });
+        };
+        let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| HbonePoolError::ConnectTimeout {
+                addr: addr.clone(),
+                timeout_ms: proxy.backend_connect_timeout_ms,
+            })?
+            .map_err(|e| HbonePoolError::TlsHandshake {
+                host: target_host.to_string(),
+                message: e.to_string(),
+            })?;
+
+        let mut builder = http2::Builder::new(TokioExecutor::new());
+        builder.timer(TokioTimer::new());
+        if pool_config.enable_http2 {
+            builder
+                .keep_alive_interval(Duration::from_secs(
+                    pool_config.http2_keep_alive_interval_seconds,
+                ))
+                .keep_alive_timeout(Duration::from_secs(
+                    pool_config.http2_keep_alive_timeout_seconds,
+                ))
+                .max_concurrent_reset_streams(4096);
+        }
+        builder
+            .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
+            .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
+            .adaptive_window(pool_config.http2_adaptive_window)
+            .max_frame_size(pool_config.http2_max_frame_size);
+        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+            builder.max_concurrent_streams(max_streams);
+            builder.initial_max_send_streams(max_streams as usize);
+        }
+
+        let Some(remaining) =
+            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
+        else {
+            return Err(HbonePoolError::ConnectTimeout {
+                addr,
+                timeout_ms: proxy.backend_connect_timeout_ms,
+            });
+        };
+        let io = TokioIo::new(tls_stream);
+        let (sender, connection) = tokio::time::timeout(remaining, builder.handshake(io))
+            .await
+            .map_err(|_| HbonePoolError::ConnectTimeout {
+                addr,
+                timeout_ms: proxy.backend_connect_timeout_ms,
+            })?
+            .map_err(|e| HbonePoolError::H2Handshake {
+                host: target_host.to_string(),
+                message: e.to_string(),
+            })?;
+
+        // Connection driver exits when all sender handles are dropped.
+        // In-flight requests are covered by RequestGuard on the dispatch path.
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                debug!(
+                    "mesh_mtls_pool: sidecar mTLS HTTP/2 connection closed: {}",
+                    e
+                );
+            }
+        });
+
+        Ok(sender)
+    }
+}
+
+/// SVID-fingerprint field of a mesh mTLS pool key:
+/// `mesh-mtls|{host}|{mtls_port}|{dns_override}|{svid_fingerprint}|{peer}|pool=...`
+fn mesh_mtls_key_svid_fingerprint(key: &str) -> Option<&str> {
+    key.split('|').nth(4)
+}
+
+fn prune_pool_entries(entries: &mut Vec<MeshMtlsPoolEntry>) -> usize {
+    let before = entries.len();
+    let now = unix_secs();
+    entries.retain(|entry| {
+        !entry.sender.is_closed()
+            && !entry_idle_expired(
+                entry.last_used_at.load(Ordering::Relaxed),
+                entry.idle_timeout_seconds,
+                now,
+            )
+    });
+    before.saturating_sub(entries.len())
+}
+
+fn record_mesh_mtls_evictions(count: usize) {
+    crate::runtime_metrics::global_ref()
+        .record_pool_evictions(crate::runtime_metrics::PoolKind::MeshMtls, count as u64);
+}
+
+fn set_tcp_keepalive(stream: &TcpStream, keepalive_seconds: u64) {
+    #[cfg(unix)]
+    use std::os::fd::AsFd;
+    #[cfg(windows)]
+    use std::os::windows::io::AsSocket;
+
+    #[cfg(unix)]
+    let borrowed = stream.as_fd();
+    #[cfg(windows)]
+    let borrowed = stream.as_socket();
+    let socket = socket2::SockRef::from(&borrowed);
+    let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(keepalive_seconds));
+    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+        debug!("mesh_mtls_pool: failed to set TCP keepalive: {}", e);
+    }
+}
+
+fn with_mesh_mtls_pool_key<R>(
+    host: &str,
+    mtls_port: u16,
+    dns_override: Option<&str>,
+    svid_fingerprint: &str,
+    expected_peer: &SpiffeId,
+    pool_config: &PoolConfig,
+    f: impl FnOnce(&str) -> R,
+) -> R {
+    MESH_MTLS_POOL_KEY_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        write_mesh_mtls_pool_key(
+            &mut buf,
+            host,
+            mtls_port,
+            dns_override,
+            svid_fingerprint,
+            expected_peer,
+            pool_config,
+        );
+        f(&buf)
+    })
+}
+
+fn write_mesh_mtls_pool_key(
+    buf: &mut String,
+    host: &str,
+    mtls_port: u16,
+    dns_override: Option<&str>,
+    svid_fingerprint: &str,
+    expected_peer: &SpiffeId,
+    pool_config: &PoolConfig,
+) {
+    buf.clear();
+    // The pinned peer identity is connection identity: a session verified
+    // against one expected SVID must never serve a target pinning another.
+    let _ = write!(
+        buf,
+        "mesh-mtls|{host}|{mtls_port}|{}|{svid_fingerprint}|{}",
+        dns_override.unwrap_or_default(),
+        expected_peer.as_str()
+    );
+    write_pool_config_key(buf, pool_config);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dns::DnsConfig;
+    use crate::identity::spiffe::TrustDomain;
+    use crate::identity::{TrustBundle, TrustBundleSet};
+    use std::collections::HashMap;
+
+    fn target_with_tags(tags: &[(&str, &str)]) -> UpstreamTarget {
+        UpstreamTarget {
+            host: "10.0.0.1".to_string(),
+            port: 8080,
+            weight: 1,
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>(),
+            locality: None,
+            path: None,
+        }
+    }
+
+    #[test]
+    fn mtls_tag_and_port_parse() {
+        assert!(!target_mesh_mtls_enabled(&target_with_tags(&[])));
+        assert!(target_mesh_mtls_enabled(&target_with_tags(&[(
+            MESH_MTLS_TARGET_TAG,
+            "true"
+        )])));
+        assert_eq!(
+            target_mesh_mtls_port(&target_with_tags(&[])),
+            ISTIO_SIDECAR_INBOUND_PORT
+        );
+        assert_eq!(
+            target_mesh_mtls_port(&target_with_tags(&[(MESH_MTLS_PORT_TAG, "16006")])),
+            16006
+        );
+        assert_eq!(
+            target_mesh_mtls_port(&target_with_tags(&[(MESH_MTLS_PORT_TAG, "0")])),
+            ISTIO_SIDECAR_INBOUND_PORT
+        );
+    }
+
+    #[test]
+    fn mtls_expected_peer_is_required_and_fails_closed() {
+        // Absent tag: a mesh.mtls target without a pinned identity must error.
+        let err =
+            target_mesh_mtls_expected_peer(&target_with_tags(&[(MESH_MTLS_TARGET_TAG, "true")]))
+                .expect_err("missing mesh.spiffe_id must fail closed");
+        assert!(matches!(err, HbonePoolError::InvalidPeerSpiffeTag { .. }));
+
+        // Corrupt tag: same fail-closed shape.
+        let err = target_mesh_mtls_expected_peer(&target_with_tags(&[
+            (MESH_MTLS_TARGET_TAG, "true"),
+            (MESH_SPIFFE_ID_TAG, "not-a-spiffe-id"),
+        ]))
+        .expect_err("invalid mesh.spiffe_id must fail closed");
+        assert!(matches!(err, HbonePoolError::InvalidPeerSpiffeTag { .. }));
+
+        // Valid tag resolves to the pinned identity.
+        let peer = target_mesh_mtls_expected_peer(&target_with_tags(&[
+            (MESH_MTLS_TARGET_TAG, "true"),
+            (
+                MESH_SPIFFE_ID_TAG,
+                "spiffe://cluster.local/ns/default/sa/reviews",
+            ),
+        ]))
+        .expect("valid pinned identity");
+        assert_eq!(
+            peer.as_str(),
+            "spiffe://cluster.local/ns/default/sa/reviews"
+        );
+    }
+
+    #[test]
+    fn pool_key_partitions_by_peer_identity_and_svid() {
+        let pool_config = PoolConfig::default();
+        let peer_a = SpiffeId::new("spiffe://cluster.local/ns/default/sa/a").unwrap();
+        let peer_b = SpiffeId::new("spiffe://cluster.local/ns/default/sa/b").unwrap();
+        let key = |peer: &SpiffeId, fp: &str| {
+            with_mesh_mtls_pool_key("10.0.0.1", 15006, None, fp, peer, &pool_config, |key| {
+                key.to_string()
+            })
+        };
+        assert_ne!(
+            key(&peer_a, "fp"),
+            key(&peer_b, "fp"),
+            "different pinned identities must not share a session"
+        );
+        assert_ne!(
+            key(&peer_a, "fp1"),
+            key(&peer_a, "fp2"),
+            "an SVID rotation must repartition the pool"
+        );
+        assert_eq!(key(&peer_a, "fp"), key(&peer_a, "fp"));
+    }
+
+    fn svid_bundle(leaf: &[u8]) -> SvidBundle {
+        let td = TrustDomain::new("cluster.local").unwrap();
+        SvidBundle {
+            spiffe_id: SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap(),
+            cert_chain_der: vec![leaf.to_vec()],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td,
+                x509_authorities: vec![],
+                jwt_authorities: vec![],
+                refresh_hint_seconds: None,
+            }),
+        }
+    }
+
+    fn test_peer() -> SpiffeId {
+        SpiffeId::new("spiffe://cluster.local/ns/default/sa/orders").unwrap()
+    }
+
+    fn key_for_fingerprint(host: &str, fingerprint: &str) -> String {
+        with_mesh_mtls_pool_key(
+            host,
+            ISTIO_SIDECAR_INBOUND_PORT,
+            None,
+            fingerprint,
+            &test_peer(),
+            &PoolConfig::default(),
+            |key| key.to_string(),
+        )
+    }
+
+    fn insert_empty_entry(pool: &MeshMtlsConnectionPool, key: &str) {
+        pool.entries.insert(key.to_string(), Vec::new());
+        pool.creation_locks
+            .insert(key.to_string(), Arc::new(Mutex::new(())));
+    }
+
+    #[test]
+    fn mesh_mtls_key_svid_fingerprint_reads_fingerprint_field() {
+        let key = key_for_fingerprint("orders.default.svc.cluster.local", "0123456789abcdef");
+
+        assert_eq!(
+            mesh_mtls_key_svid_fingerprint(&key),
+            Some("0123456789abcdef")
+        );
+        assert_eq!(mesh_mtls_key_svid_fingerprint("not-a-pool-key"), None);
+    }
+
+    #[test]
+    fn force_drain_svid_generation_removes_only_passed_generation() {
+        let bundle_a = svid_bundle(b"generation-a-leaf");
+        let fingerprint_a = svid_fingerprint(&bundle_a).unwrap();
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle_a))));
+        let generation = Arc::new(AtomicU64::new(7));
+        let pool = MeshMtlsConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+
+        // Traffic under generation 7 builds the identity cache for A.
+        let cached_fp = pool.current_svid_fingerprint_cached().unwrap();
+        assert_eq!(cached_fp.as_ref(), fingerprint_a);
+        let key_a = key_for_fingerprint("a.default.svc.cluster.local", &fingerprint_a);
+        insert_empty_entry(&pool, &key_a);
+
+        // Rotation A -> B: slot swap, then the rotation consumer bumps the
+        // generation. Traffic under generation 8 builds B entries.
+        let bundle_b = svid_bundle(b"generation-b-leaf");
+        let fingerprint_b = svid_fingerprint(&bundle_b).unwrap();
+        gateway_svid.store(Arc::new(Some(bundle_b)));
+        generation.store(8, Ordering::Release);
+        let cached_fp = pool.current_svid_fingerprint_cached().unwrap();
+        assert_eq!(cached_fp.as_ref(), fingerprint_b);
+        let key_b = key_for_fingerprint("b.default.svc.cluster.local", &fingerprint_b);
+        insert_empty_entry(&pool, &key_b);
+
+        // Rotation B -> C before A's drain timer fires.
+        let bundle_c = svid_bundle(b"generation-c-leaf");
+        let fingerprint_c = svid_fingerprint(&bundle_c).unwrap();
+        gateway_svid.store(Arc::new(Some(bundle_c)));
+        generation.store(9, Ordering::Release);
+        let key_c = key_for_fingerprint("c.default.svc.cluster.local", &fingerprint_c);
+        insert_empty_entry(&pool, &key_c);
+
+        // A's delayed drain must remove only generation-7 (fingerprint A)
+        // entries: B's own drain window has not elapsed yet.
+        pool.force_drain_svid_generation(7);
+        assert!(!pool.entries.contains_key(&key_a));
+        assert!(pool.entries.contains_key(&key_b));
+        assert!(pool.entries.contains_key(&key_c));
+        assert!(!pool.creation_locks.contains_key(&key_a));
+        assert!(pool.creation_locks.contains_key(&key_b));
+        assert!(pool.creation_locks.contains_key(&key_c));
+
+        // B's drain removes B; C (current) stays.
+        pool.force_drain_svid_generation(8);
+        assert!(!pool.entries.contains_key(&key_b));
+        assert!(pool.entries.contains_key(&key_c));
+        assert!(!pool.creation_locks.contains_key(&key_b));
+        assert!(pool.creation_locks.contains_key(&key_c));
+    }
+
+    #[test]
+    fn force_drain_svid_generation_records_rotation_with_no_traffic() {
+        // No sidecar mTLS request runs between the slot swap and the drain
+        // timer: the drain itself must refresh the identity cache, record the
+        // outgoing fingerprint, and still drain the old generation.
+        let bundle_a = svid_bundle(b"idle-generation-a");
+        let fingerprint_a = svid_fingerprint(&bundle_a).unwrap();
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle_a))));
+        let generation = Arc::new(AtomicU64::new(3));
+        let pool = MeshMtlsConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+
+        let cached_fp = pool.current_svid_fingerprint_cached().unwrap();
+        assert_eq!(cached_fp.as_ref(), fingerprint_a);
+        let key_a = key_for_fingerprint("a.default.svc.cluster.local", &fingerprint_a);
+        insert_empty_entry(&pool, &key_a);
+
+        let bundle_b = svid_bundle(b"idle-generation-b");
+        let fingerprint_b = svid_fingerprint(&bundle_b).unwrap();
+        gateway_svid.store(Arc::new(Some(bundle_b)));
+        generation.store(4, Ordering::Release);
+        let key_b = key_for_fingerprint("b.default.svc.cluster.local", &fingerprint_b);
+        insert_empty_entry(&pool, &key_b);
+
+        pool.force_drain_svid_generation(3);
+        assert!(!pool.entries.contains_key(&key_a));
+        assert!(pool.entries.contains_key(&key_b));
+
+        // Draining the current generation is a no-op: nothing was retired
+        // under it.
+        pool.force_drain_svid_generation(4);
+        assert!(pool.entries.contains_key(&key_b));
+    }
+
+    #[test]
+    fn force_drain_svid_generation_drains_all_without_svid() {
+        let pool = MeshMtlsConnectionPool::new(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            Arc::new(ArcSwap::new(Arc::new(None))),
+            4,
+        );
+        let key = key_for_fingerprint("a.default.svc.cluster.local", "anyfingerprint");
+        insert_empty_entry(&pool, &key);
+
+        pool.force_drain_svid_generation(1);
+
+        assert!(pool.entries.is_empty());
+        assert!(pool.creation_locks.is_empty());
+    }
+
+    #[test]
+    fn force_drain_sweeps_generations_at_or_below_passed() {
+        // The slot-swap → generation-store race can file a fingerprint one
+        // generation too low (see `force_drain_svid_generation` docs). A
+        // record misfiled under an already-drained generation must be picked
+        // up by the next drain rather than leaking until idle pruning.
+        let bundle_a = svid_bundle(b"sweep-generation-a");
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle_a))));
+        let generation = Arc::new(AtomicU64::new(7));
+        let pool = MeshMtlsConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+        pool.current_svid_fingerprint_cached().unwrap();
+
+        // Race: the slot swaps to B and traffic rebuilds the cache while the
+        // rotation consumer has not stored generation 8 yet, so B is stamped
+        // with generation 7.
+        let bundle_b = svid_bundle(b"sweep-generation-b");
+        let fingerprint_b = svid_fingerprint(&bundle_b).unwrap();
+        gateway_svid.store(Arc::new(Some(bundle_b)));
+        pool.current_svid_fingerprint_cached().unwrap();
+        // Generation 7's drain fires and consumes A's record.
+        pool.force_drain_svid_generation(7);
+        generation.store(8, Ordering::Release);
+        let key_b = key_for_fingerprint("b.default.svc.cluster.local", &fingerprint_b);
+        insert_empty_entry(&pool, &key_b);
+
+        // Rotation B -> C files B's fingerprint under its (stale) stamped
+        // generation 7 — a generation whose drain already ran.
+        let bundle_c = svid_bundle(b"sweep-generation-c");
+        let fingerprint_c = svid_fingerprint(&bundle_c).unwrap();
+        gateway_svid.store(Arc::new(Some(bundle_c)));
+        generation.store(9, Ordering::Release);
+        pool.current_svid_fingerprint_cached().unwrap();
+        let key_c = key_for_fingerprint("c.default.svc.cluster.local", &fingerprint_c);
+        insert_empty_entry(&pool, &key_c);
+
+        // Generation 8's drain must sweep the misfiled record; C (newer)
+        // stays untouched.
+        pool.force_drain_svid_generation(8);
+        assert!(
+            !pool.entries.contains_key(&key_b),
+            "record misfiled under an already-drained generation must be swept by the next drain"
+        );
+        assert!(pool.entries.contains_key(&key_c));
+    }
+
+    #[test]
+    fn trust_bundle_only_rotation_retires_current_fingerprint() {
+        // A trust-bundle-only reload keeps the leaf (and thus the
+        // fingerprint) but still publishes a rotation: sessions verified
+        // against the previous bundle must not outlive the drain window even
+        // though their keys collide with current ones.
+        let bundle_a = svid_bundle(b"bundle-rotation-leaf");
+        let fingerprint = svid_fingerprint(&bundle_a).unwrap();
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle_a))));
+        let generation = Arc::new(AtomicU64::new(5));
+        let pool = MeshMtlsConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+        pool.current_svid_fingerprint_cached().unwrap();
+        let key = key_for_fingerprint("a.default.svc.cluster.local", &fingerprint);
+        insert_empty_entry(&pool, &key);
+
+        // Same leaf, fresh slot store (the rotation watcher is change-gated,
+        // so any store is a genuine material change — here: new trust
+        // bundle). No traffic runs before the drain.
+        gateway_svid.store(Arc::new(Some(svid_bundle(b"bundle-rotation-leaf"))));
+        generation.store(6, Ordering::Release);
+
+        pool.force_drain_svid_generation(5);
+        assert!(
+            !pool.entries.contains_key(&key),
+            "old-trust-bundle sessions must drain even when the leaf fingerprint is unchanged"
+        );
+    }
+
+    #[test]
+    fn capped_registry_eviction_drains_evicted_generations() {
+        let bundle_0 = svid_bundle(b"evict-leaf-0");
+        let fingerprint_0 = svid_fingerprint(&bundle_0).unwrap();
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle_0))));
+        let generation = Arc::new(AtomicU64::new(0));
+        let pool = MeshMtlsConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+        pool.current_svid_fingerprint_cached().unwrap();
+        let key_0 = key_for_fingerprint("a.default.svc.cluster.local", &fingerprint_0);
+        insert_empty_entry(&pool, &key_0);
+
+        // Rotation storm overflows the registry; generation 0's record is
+        // evicted before any drain timer fires — its entries must drain at
+        // eviction instead of leaking until idle pruning.
+        for revision in 1..=(MAX_RETIRED_SVID_GENERATIONS as u64 + 2) {
+            let leaf = format!("evict-leaf-{revision}");
+            gateway_svid.store(Arc::new(Some(svid_bundle(leaf.as_bytes()))));
+            generation.store(revision, Ordering::Release);
+            pool.current_svid_fingerprint_cached().unwrap();
+        }
+
+        assert!(
+            !pool.entries.contains_key(&key_0),
+            "registry cap eviction must drain the evicted generation's entries"
+        );
+        assert!(pool.retired_svid_fingerprints.len() <= MAX_RETIRED_SVID_GENERATIONS);
+    }
+
+    #[test]
+    fn per_generation_retired_list_is_capped_and_drains_overflow() {
+        let bundle_0 = svid_bundle(b"frozen-leaf-0");
+        let fingerprint_0 = svid_fingerprint(&bundle_0).unwrap();
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle_0))));
+        // Frozen generation counter: a starved rotation consumer stamps every
+        // rotation with the same generation, funnelling all retirements into
+        // one bucket.
+        let generation = Arc::new(AtomicU64::new(3));
+        let pool = MeshMtlsConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+        pool.current_svid_fingerprint_cached().unwrap();
+        let key_0 = key_for_fingerprint("a.default.svc.cluster.local", &fingerprint_0);
+        insert_empty_entry(&pool, &key_0);
+
+        for revision in 1..=(MAX_RETIRED_FINGERPRINTS_PER_GENERATION as u64 * 2) {
+            let leaf = format!("frozen-leaf-{revision}");
+            gateway_svid.store(Arc::new(Some(svid_bundle(leaf.as_bytes()))));
+            pool.current_svid_fingerprint_cached().unwrap();
+        }
+
+        let bucket_len = pool
+            .retired_svid_fingerprints
+            .get(&3)
+            .map(|bucket| bucket.len())
+            .unwrap_or(0);
+        assert!(
+            bucket_len <= MAX_RETIRED_FINGERPRINTS_PER_GENERATION,
+            "per-generation bucket must stay bounded under a frozen generation counter"
+        );
+        assert!(
+            !pool.entries.contains_key(&key_0),
+            "fingerprints evicted from a full bucket must drain their entries"
+        );
+    }
+
+    #[test]
+    fn retired_fingerprint_registry_is_capped() {
+        let bundle = svid_bundle(b"cap-initial-leaf");
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle))));
+        let generation = Arc::new(AtomicU64::new(0));
+        let pool = MeshMtlsConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+        pool.current_svid_fingerprint_cached().unwrap();
+
+        // Rotation storm with the drain window disabled: nothing consumes the
+        // retired records, so the registry must stay capped.
+        for revision in 1..=(MAX_RETIRED_SVID_GENERATIONS as u64 * 3) {
+            let leaf = format!("cap-leaf-{revision}");
+            gateway_svid.store(Arc::new(Some(svid_bundle(leaf.as_bytes()))));
+            generation.store(revision, Ordering::Release);
+            pool.current_svid_fingerprint_cached().unwrap();
+        }
+
+        assert!(pool.retired_svid_fingerprints.len() <= MAX_RETIRED_SVID_GENERATIONS);
+    }
+}

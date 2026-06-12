@@ -70,6 +70,26 @@ async fn test_detects_grpc_web_binary() {
 }
 
 #[tokio::test]
+async fn test_may_modify_response_content_type_tracks_grpc_web_request() {
+    let plugin = create_plugin_default();
+
+    // A gRPC-Web request records its original content-type in
+    // on_request_received; after_proxy relabels the response back to the
+    // gRPC-Web variant, so the proxy must keep the body buffered for
+    // final-response inspection rather than trusting the backend's
+    // application/grpc header.
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    let _ = plugin.on_request_received(&mut ctx).await;
+    // The marker is the precise signal; the backend response type is irrelevant
+    // (the relabel keys off the recorded request content-type).
+    assert!(plugin.may_modify_response_content_type(&ctx, Some("application/grpc")));
+
+    // A non-gRPC-Web request records no marker, so no relabel will occur.
+    let plain = create_test_context();
+    assert!(!plugin.may_modify_response_content_type(&plain, Some("application/grpc")));
+}
+
+#[tokio::test]
 async fn test_detects_grpc_web_binary_proto() {
     let plugin = create_plugin_default();
     let mut ctx = create_grpc_web_context("application/grpc-web+proto");

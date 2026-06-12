@@ -40,6 +40,7 @@ pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
+pub mod mesh_mtls_pool;
 pub mod netns_capture;
 pub mod sni;
 pub mod stream_error;
@@ -50,7 +51,7 @@ pub mod udp_proxy;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -63,13 +64,14 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{
-    WebSocketStream, connect_async_tls_with_config, tungstenite::handshake::derive_accept_key,
+    WebSocketStream, client_async_tls_with_config, tungstenite::handshake::derive_accept_key,
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -85,7 +87,9 @@ use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::identity::{SharedSvidBundle, SvidBundle, TrustBundleSet as RuntimeTrustBundleSet};
-use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
+use crate::load_balancer::{
+    HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
+};
 use crate::modes::mesh::node_waypoint::{
     NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver,
 };
@@ -255,6 +259,8 @@ struct HboneProbeTarget<'a> {
     host: &'a str,
     port: u16,
     hbone_port: u16,
+    /// Pinned destination identity for the probe handshake (mirrors dispatch).
+    expected_peer: Option<&'a crate::identity::SpiffeId>,
     previous_hbone: Option<ProtocolSupport>,
 }
 
@@ -376,10 +382,10 @@ fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig) -> bool
 }
 
 fn gateway_hbone_mtls_observed(
-    dispatch_hbone: bool,
+    dispatch_mesh_transport: bool,
     error_class: Option<retry::ErrorClass>,
 ) -> bool {
-    dispatch_hbone
+    dispatch_mesh_transport
         && !matches!(
             error_class,
             Some(
@@ -399,13 +405,19 @@ fn gateway_hbone_mtls_observed(
         )
 }
 
-fn annotate_gateway_hbone_metadata(
+/// Stamp mesh transport metadata for an outbound mesh-mTLS-secured dispatch.
+/// `transport` is `Some("hbone")` for Ambient HBONE and `Some("mtls")` for
+/// Sidecar SVID-mTLS; `None` (non-mesh dispatch) stamps nothing.
+fn annotate_gateway_mesh_metadata(
     ctx: &mut RequestContext,
     target: Option<&UpstreamTarget>,
-    dispatch_hbone: bool,
+    transport: Option<&'static str>,
     error_class: Option<retry::ErrorClass>,
 ) {
-    if !gateway_hbone_mtls_observed(dispatch_hbone, error_class) {
+    let Some(transport) = transport else {
+        return;
+    };
+    if !gateway_hbone_mtls_observed(true, error_class) {
         return;
     }
 
@@ -414,7 +426,7 @@ fn annotate_gateway_hbone_metadata(
         "mutual_tls".to_string(),
     );
     ctx.metadata
-        .insert("mesh.gateway.transport".to_string(), "hbone".to_string());
+        .insert("mesh.gateway.transport".to_string(), transport.to_string());
 
     let Some(target) = target else {
         return;
@@ -664,10 +676,25 @@ fn collect_reqwest_warmup_candidates_for_proxy(
         && let Some(upstream) = upstream_map.get(upstream_id.as_str())
     {
         for target in &upstream.targets {
+            // Mesh-transport-tagged targets are NOT plaintext reqwest backends.
+            // HBONE targets warm via their own capability probe; SVID-mTLS
+            // targets dial a peer's mTLS listener — a plaintext reqwest HEAD to
+            // the app port would fail (or, worse, dial the app outside the mesh
+            // transport). Leave both to their transport-specific paths.
+            if hbone_pool::target_hbone_enabled(target)
+                || mesh_mtls_pool::target_mesh_mtls_enabled(target)
+            {
+                continue;
+            }
             targets.push((target.host.clone(), target.port));
         }
     }
-    if targets.is_empty() {
+    // Fall back to the proxy's own backend only when it has one. A mesh egress
+    // proxy carries `upstream_id` + an empty `backend_host`, so once its
+    // mesh-tagged targets are filtered out above, `targets` is empty and there
+    // is nothing to warm — do NOT synthesize a `:0` candidate from the empty
+    // backend.
+    if targets.is_empty() && !proxy.backend_host.is_empty() {
         targets.push((proxy.backend_host.clone(), proxy.backend_port));
     }
 
@@ -863,13 +890,13 @@ pub(crate) fn refine_stream_response_for_content_type(
     let Some(ctx) = ctx else {
         return false;
     };
+    let content_type = response_headers.get("content-type").map(String::as_str);
     if plugins
         .iter()
-        .any(|plugin| plugin.may_modify_response_content_type(ctx))
+        .any(|plugin| plugin.may_modify_response_content_type(ctx, content_type))
     {
         return false;
     }
-    let content_type = response_headers.get("content-type").map(String::as_str);
     // Keep buffering only while at least one plugin still needs the body for
     // this content-type; otherwise stream it straight through.
     !plugins
@@ -995,6 +1022,67 @@ pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> 
     hbone_proxy::is_connect_request(req, env_config)
 }
 
+/// Whether an authenticated inbound HBONE CONNECT to `host:port` may be
+/// transparently relayed. SAFE local targets only: a loopback address on an
+/// application port declared by the slice, or an in-mesh workload address+port
+/// the slice already declares. This bounds the terminator to mesh-known
+/// destinations, so an authenticated peer can never use the HBONE listener as
+/// an open proxy to arbitrary internal hosts or undeclared loopback listeners.
+/// (`handle_hbone_request` separately requires the peer to be an authenticated,
+/// trust-domain-verified mesh identity before dialing.)
+fn inbound_hbone_relay_destination_allowed(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> bool {
+    let Some(mesh) = mesh else {
+        return false;
+    };
+
+    if host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        return mesh
+            .workloads
+            .iter()
+            .flat_map(|workload| &workload.ports)
+            .any(|workload_port| workload_port.port == port);
+    }
+
+    // Otherwise the destination must be an in-mesh workload address+port the
+    // slice declares — never an arbitrary host. A workload that declares no
+    // ports admits any port for its address (the slice does not constrain it).
+    mesh.workloads.iter().any(|workload| {
+        workload.addresses.iter().any(|addr| addr == host)
+            && (workload.ports.is_empty() || workload.ports.iter().any(|wp| wp.port == port))
+    })
+}
+
+/// Build a transparent inbound HBONE relay proxy that dials the CONNECT
+/// `:authority` of an authenticated mesh peer, for an Ambient/Waypoint
+/// terminator where no inbound route is materialized. Returns `None` (caller
+/// 404s) when the authority is missing/portless or is not a safe local relay
+/// target per [`inbound_hbone_relay_destination_allowed`].
+fn build_inbound_hbone_relay_proxy(
+    authority: Option<&http::uri::Authority>,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> Option<Arc<Proxy>> {
+    let authority = authority?;
+    let host = authority.host();
+    let port = authority.port_u16()?;
+    if host.is_empty() || port == 0 {
+        return None;
+    }
+    if !inbound_hbone_relay_destination_allowed(host, port, mesh) {
+        return None;
+    }
+    Some(Arc::new(
+        crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
+    ))
+}
+
 #[allow(dead_code)]
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
     let headers = req.headers();
@@ -1106,7 +1194,8 @@ pub(crate) fn supports_native_http3_backend(
 /// failure that should downgrade the cached H3 capability to
 /// `Unsupported`. Excludes application-layer / client-side errors
 /// (`ClientDisconnect`, `RequestBodyTooLarge`, `ResponseBodyTooLarge`,
-/// `RequestError`) which do not reflect backend QUIC health.
+/// `RequestError`) and backend response read timeouts, which do not prove
+/// the backend has lost H3 capability.
 pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
     matches!(
         class,
@@ -1119,7 +1208,6 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
             | retry::ErrorClass::DnsLookupError
             | retry::ErrorClass::PortExhaustion
             | retry::ErrorClass::ConnectionPoolError
-            | retry::ErrorClass::ReadWriteTimeout
     )
 }
 
@@ -1131,12 +1219,11 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
 /// on `error_class` ALONE — intentionally ignoring `connection_error`.
 ///
 /// Rationale: `classify_h3_error` marks GOAWAY / stream reset / other
-/// protocol errors and non-connect read timeouts with
-/// `connection_error=false`, yet they are still H3 transport failures.
-/// Routing the next request through the same native H3 pool would just
-/// repeat them. Only application-layer outcomes (`ClientDisconnect`,
-/// body-size errors, plain `RequestError`) leave the capability
-/// untouched — those reflect the request, not the backend.
+/// protocol errors with `connection_error=false`, yet they are still H3
+/// transport failures. Routing the next request through the same native H3
+/// pool would just repeat them. Application-layer outcomes and backend
+/// response read timeouts leave the capability untouched — those reflect
+/// the request or backend latency, not whether the backend speaks H3.
 fn is_h3_transport_failure(resp: &retry::BackendResponse) -> bool {
     resp.error_class.is_some_and(is_h3_transport_error_class)
 }
@@ -1168,6 +1255,27 @@ fn supports_hbone_backend(
             .backend_capabilities
             .get(proxy, Some(target))
             .is_some_and(|record| record.hbone.is_supported())
+}
+
+/// Whether a target dispatches over the Sidecar egress SVID-mTLS HTTP/2 pool
+/// (`mesh.mtls=true` tag). Unlike HBONE there is no capability-registry gate:
+/// `mesh.mtls` targets are produced only by the mesh outbound materializer for
+/// slice-declared sidecar peers, so the peer's transport is known by
+/// construction — a failed dial is a connection error, not a capability
+/// classification signal.
+fn supports_mesh_mtls_backend(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> bool {
+    let Some(target) = upstream_target else {
+        return false;
+    };
+    // Same dispatch-kind gate as HBONE: only plaintext HttpPool proxies carry
+    // mesh egress routes.
+    proxy_can_dispatch_hbone(proxy)
+        && mesh_mtls_pool::target_mesh_mtls_enabled(target)
+        && state.gateway_svid_bundle.load().is_some()
 }
 
 fn should_fallback_to_reqwest_after_http2_pool_error(err: &http2_pool::Http2PoolError) -> bool {
@@ -1453,6 +1561,35 @@ fn record_grpc_backend_status_outcome(
     } else {
         cb.record_success(is_half_open_probe);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_grpc_backend_dispatch_outcome(
+    state: &ProxyState,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
+    upstream_target: Option<&Arc<UpstreamTarget>>,
+    final_cb_target_key: Option<&str>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<retry::ErrorClass>,
+    backend_elapsed: Duration,
+) {
+    backend_dispatch::record_backend_outcome_no_conn_end(
+        state,
+        proxy,
+        lb_snapshot,
+        selected_balancer,
+        upstream_target.map(Arc::as_ref),
+        final_cb_target_key,
+        response_status,
+        connection_error,
+        error_class,
+        false,
+        true,
+        backend_elapsed,
+    );
 }
 
 /// Load a gRPC streaming late client-upload overflow flag with `Acquire`
@@ -1953,6 +2090,8 @@ pub struct ProxyState {
     pub http2_pool: Arc<Http2ConnectionPool>,
     /// HBONE connection pool for gateway-to-mesh outbound tunnels.
     pub hbone_pool: Arc<HboneConnectionPool>,
+    /// Sidecar egress SVID-mTLS HTTP/2 pool (`mesh.mtls` targets).
+    pub mesh_mtls_pool: Arc<mesh_mtls_pool::MeshMtlsConnectionPool>,
     /// HTTP/3 connection pool for QUIC backends (reuses QUIC connections)
     pub h3_pool: Arc<Http3ConnectionPool>,
     /// Startup-classified backend protocol capabilities keyed by real backend target identity.
@@ -2164,6 +2303,11 @@ struct RequestConnectionMetadata {
     /// Direction stamped at listener-spawn time for mesh listeners.
     /// `None` outside mesh mode.
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    /// Pre-NAT original destination of an iptables-REDIRECTed connection,
+    /// read once at accept on mesh outbound capture listeners
+    /// (`SO_ORIGINAL_DST`). `None` everywhere else — see
+    /// [`crate::socket_opts::original_dst`] for the exact contract.
+    orig_dst: Option<SocketAddr>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -2545,23 +2689,26 @@ async fn run_gateway_svid_file_rotation_loop(
     }
 }
 
-/// Bundle of the four backend pools whose entries are partitioned by SVID
+/// Bundle of the backend pools whose entries are partitioned by SVID
 /// generation. Grouping them keeps the rotation-task signature manageable and
 /// makes "another pool joined the family" a one-line edit.
 ///
 /// NOTE on the asymmetric drain calls: only `connection_pool`, `http2_pool`,
 /// and `grpc_pool` get a `drain_backend_tls_config_cache_svid_generation()`
 /// call on rotation — the H3 pool's TLS config cache is co-located on
-/// `connection_pool.backend_h3_tls_configs`, so it is drained transitively.
-/// All four pools get a `force_drain_svid_generation()` call when the
-/// operator-configured drain window elapses, because each pool keeps its own
-/// `DashMap` of live connections.
+/// `connection_pool.backend_h3_tls_configs`, so it is drained transitively,
+/// and the HBONE and mesh mTLS pools build their SPIFFE client config per
+/// connect (no cache to drain). All pools get a `force_drain_svid_generation()` call when
+/// the operator-configured drain window elapses, because each pool keeps its
+/// own `DashMap` of live connections.
 #[derive(Clone)]
 struct BackendPoolFamily {
     connection_pool: Arc<ConnectionPool>,
     http2_pool: Arc<Http2ConnectionPool>,
     grpc_pool: Arc<GrpcConnectionPool>,
     h3_pool: Arc<Http3ConnectionPool>,
+    hbone_pool: Arc<HboneConnectionPool>,
+    mesh_mtls_pool: Arc<mesh_mtls_pool::MeshMtlsConnectionPool>,
 }
 
 impl BackendPoolFamily {
@@ -2585,6 +2732,8 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_svid_generation(generation);
         self.grpc_pool.force_drain_svid_generation(generation);
         self.h3_pool.force_drain_svid_generation(generation);
+        self.hbone_pool.force_drain_svid_generation(generation);
+        self.mesh_mtls_pool.force_drain_svid_generation(generation);
     }
 
     fn force_drain_all(&self) {
@@ -2592,6 +2741,8 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_all();
         self.grpc_pool.force_drain_all();
         self.h3_pool.force_drain_all();
+        self.hbone_pool.force_drain_all();
+        self.mesh_mtls_pool.force_drain_all();
     }
 }
 
@@ -2627,8 +2778,8 @@ fn spawn_backend_svid_rotation_task(
         // on graceful shutdown; otherwise each runs to completion independently
         // so the operator's `drain_seconds` window is honoured per-generation
         // even under rotation storms (e.g. a misbehaving CA issuing 30s certs).
-        // Each task only retains four `Arc` pool handles and ends with a
-        // single `invalidate_matching` pass per pool, so memory + CPU cost
+        // Each task only retains the family's `Arc` pool handles and ends with
+        // a single `invalidate_matching` pass per pool, so memory + CPU cost
         // remains O(rotations within drain_seconds) which is bounded by the
         // operator-chosen window.
         let mut pending_force_drains: std::collections::VecDeque<tokio::task::JoinHandle<()>> =
@@ -2919,17 +3070,55 @@ impl ProxyState {
             http2_pool: self.http2_pool.clone(),
             grpc_pool: self.grpc_pool.clone(),
             h3_pool: self.h3_pool.clone(),
+            hbone_pool: self.hbone_pool.clone(),
+            mesh_mtls_pool: self.mesh_mtls_pool.clone(),
         };
         pools.clear_tls_config_caches();
         pools.force_drain_all();
+        // UDP/DTLS listeners keep listener-local backend DTLS config caches
+        // keyed by paths/options; bump the shared epoch so new sessions
+        // rebuild from the rotated bytes instead of serving stale params.
+        self.stream_listener_manager.bump_backend_tls_reload_epoch();
+        // Publish the reloaded CRLs to the stream listener manager BEFORE the
+        // reconcile below: TCP+TLS reload keys fold in the CRL content
+        // fingerprint, so this swap is what makes a CRL-only rotation restart
+        // those listeners with the new revocation list (and what makes any
+        // restarted listener rebuild against the rotated CRLs rather than the
+        // startup snapshot).
+        self.stream_listener_manager
+            .set_crls(self.shared_crls.load_full());
 
         let config = self.config.load_full();
         self.health_checker
             .restart_with_shutdown(&config, self.health_check_shutdown_rx.clone());
 
+        // TCP+TLS stream listeners cache their backend `ClientConfig` at
+        // spawn and only recompute the content fingerprints in their reload
+        // keys inside `StreamListenerManager::reconcile()`. The live-reload
+        // watcher observes the same stream-proxy TLS sources (see
+        // `collect_backend_tls_watched_sources`), so a same-path CA / client
+        // cert rotation must also drive a stream reconcile here — otherwise
+        // stream listeners keep the stale cached config until an unrelated
+        // config delta or a restart. Spawned so this synchronous rebuild
+        // callback (invoked from the watcher task) never blocks on the
+        // listeners mutex; reconcile itself never crashes and reports
+        // per-listener failures, which we surface as warnings.
+        let stream_listener_manager = self.stream_listener_manager.clone();
+        tokio::spawn(async move {
+            let failures = stream_listener_manager.reconcile().await;
+            for (proxy_id, port, err) in &failures {
+                warn!(
+                    proxy_id = %proxy_id,
+                    port = port,
+                    "Stream listener reconcile after backend TLS material reload reported a failure: {}",
+                    err
+                );
+            }
+        });
+
         info!(
             validated_backend_tls_configs = validated,
-            "Backend TLS material reloaded; backend client pools were drained"
+            "Backend TLS material reloaded; backend client pools and DTLS config caches were drained and stream listeners reconciled"
         );
         Ok(())
     }
@@ -3208,12 +3397,22 @@ impl ProxyState {
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
-        let hbone_pool = Arc::new(HboneConnectionPool::new(
+        let hbone_pool = Arc::new(HboneConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
             dns_cache.clone(),
             gateway_svid_bundle.clone(),
             pool_shard_amount,
+            backend_svid_generation.clone(),
         ));
+        let mesh_mtls_pool = Arc::new(
+            mesh_mtls_pool::MeshMtlsConnectionPool::new_with_svid_generation(
+                global_pool_config.clone(),
+                dns_cache.clone(),
+                gateway_svid_bundle.clone(),
+                pool_shard_amount,
+                backend_svid_generation.clone(),
+            ),
+        );
         let h3_pool = Arc::new(Http3ConnectionPool::new_with_svid_generation(
             env_config_arc.clone(),
             dns_cache.clone(),
@@ -3280,6 +3479,7 @@ impl ProxyState {
         let load_balancer_cache = Arc::new(LoadBalancerCache::new(&config));
         let request_epoch = Arc::new(RequestEpochStore::new(RequestEpoch {
             config: Arc::new(config.clone()),
+            proxy_index_by_id: crate::request_epoch::build_proxy_index_by_id(&config),
             route_table: RouterCache::build_route_table_snapshot(&config),
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),
@@ -3338,6 +3538,8 @@ impl ProxyState {
                     http2_pool: http2_pool.clone(),
                     grpc_pool: grpc_pool.clone(),
                     h3_pool: h3_pool.clone(),
+                    hbone_pool: hbone_pool.clone(),
+                    mesh_mtls_pool: mesh_mtls_pool.clone(),
                 },
                 health_checker: health_checker.clone(),
                 config: config_arc.clone(),
@@ -3422,22 +3624,24 @@ impl ProxyState {
                         tracing::info!(
                             "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
                         );
-                        // Warn if the tokio blocking-thread pool is too small for the
-                        // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
-                        // tasks per TCP connection (one per direction). With the default
-                        // cap of 512, thousands of concurrent streams will saturate the
-                        // pool and new splices will queue, causing latency spikes. 1024
-                        // is the rule-of-thumb floor; operators with very high connection
-                        // counts should set FERRUM_BLOCKING_THREADS much higher or
-                        // disable io_uring splice entirely.
+                        // io_uring splice spawns 2 `spawn_blocking` tasks per relayed
+                        // TCP connection (one per direction), but concurrent io_uring
+                        // relays are semaphore-capped at IO_URING_SPLICE_MAX_CONCURRENT
+                        // (128) in tcp_proxy.rs — beyond the cap, additional relays
+                        // transparently fall back to the async splice path instead of
+                        // queueing on the blocking pool. Worst-case io_uring usage is
+                        // therefore 256 blocking threads. Warn only when the configured
+                        // pool is smaller than the default 512: 256 io_uring threads
+                        // would then crowd out other `spawn_blocking` users.
                         let effective_blocking_threads =
                             env_config_arc.blocking_threads.unwrap_or(512);
-                        if effective_blocking_threads < 1024 {
+                        if effective_blocking_threads < 512 {
                             tracing::warn!(
                                 blocking_threads = effective_blocking_threads,
-                                "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
-                             each TCP stream consumes 2 blocking threads. \
-                             Recommended: FERRUM_BLOCKING_THREADS >= 1024 for io_uring splice.",
+                                "FERRUM_IO_URING_SPLICE_ENABLED=true with FERRUM_BLOCKING_THREADS={} below the 512 default; \
+                             io_uring splice can occupy up to 256 blocking threads (128 concurrent relays x 2 directions; \
+                             further relays fall back to async splice). \
+                             Recommended: FERRUM_BLOCKING_THREADS >= 512 so other spawn_blocking work keeps headroom.",
                                 effective_blocking_threads
                             );
                         }
@@ -3488,6 +3692,7 @@ impl ProxyState {
                     }
                     v
                 },
+                env_config_arc.pool_shard_amount,
                 mesh_outbound_enforcement.clone(),
             ),
         );
@@ -3523,6 +3728,7 @@ impl ProxyState {
             grpc_pool,
             http2_pool,
             hbone_pool,
+            mesh_mtls_pool,
             h3_pool,
             backend_capabilities,
             backend_capabilities_refresh,
@@ -3861,6 +4067,7 @@ impl ProxyState {
                     host,
                     port,
                     hbone_port: target.hbone_port,
+                    expected_peer: target.hbone_expected_peer.as_ref(),
                     previous_hbone,
                 },
                 &mut record,
@@ -3984,8 +4191,13 @@ impl ProxyState {
 
         match tokio::time::timeout(
             probe_timeout,
-            self.hbone_pool
-                .warmup_connection(probe_proxy, host, port, hbone_port),
+            self.hbone_pool.warmup_connection(
+                probe_proxy,
+                host,
+                port,
+                hbone_port,
+                target.expected_peer,
+            ),
         )
         .await
         {
@@ -5058,13 +5270,30 @@ impl ProxyState {
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
         self.spawn_backend_capability_refresh();
 
-        // Reconcile stream proxy listeners if any proxies changed
+        // Reconcile stream proxy listeners if any proxies changed.
+        //
+        // Upstream changes must also trigger reconcile: a TCP+TLS stream
+        // proxy's backend TLS (CA / client cert / verify / SAN list) can be
+        // supplied by its referenced upstream via `resolved_tls`, and an
+        // upstream-only update never marks the proxy itself as modified
+        // (delta diffing is `updated_at`-based). Conservative trigger — any
+        // upstream change while stream proxies exist — is fine: reconcile is
+        // idempotent and only restarts listeners whose reload key actually
+        // changed.
+        let upstreams_changed = !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty();
         let stream_proxies_changed = delta
             .added_proxies
             .iter()
             .chain(delta.modified_proxies.iter())
             .any(|p| p.dispatch_kind.is_stream())
-            || !delta.removed_proxy_ids.is_empty();
+            || !delta.removed_proxy_ids.is_empty()
+            || (upstreams_changed
+                && new_config
+                    .proxies
+                    .iter()
+                    .any(|p| p.dispatch_kind.is_stream()));
         if stream_proxies_changed {
             let slm = self.stream_listener_manager.clone();
             tokio::spawn(async move {
@@ -5428,7 +5657,16 @@ impl ProxyState {
         // one in-flight probe + one queued re-run.
         self.spawn_backend_capability_refresh();
 
-        // Reconcile stream proxy listeners if any stream proxies changed
+        // Reconcile stream proxy listeners if any stream proxies changed.
+        //
+        // Upstream changes must also trigger reconcile: a TCP+TLS stream
+        // proxy's backend TLS (CA / client cert / verify / SAN list) can be
+        // supplied by its referenced upstream via `resolved_tls`, and an
+        // upstream-only update never marks the proxy itself as modified
+        // (delta diffing is `updated_at`-based). Conservative trigger — any
+        // upstream change while stream proxies exist — is fine: reconcile is
+        // idempotent and only restarts listeners whose reload key actually
+        // changed.
         let removed_had_stream = if !delta.removed_proxy_ids.is_empty() {
             let removed_set: std::collections::HashSet<&str> =
                 delta.removed_proxy_ids.iter().map(|s| s.as_str()).collect();
@@ -5439,12 +5677,20 @@ impl ProxyState {
         } else {
             false
         };
+        let upstreams_changed = !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty();
         let stream_proxies_changed = delta
             .added_proxies
             .iter()
             .chain(delta.modified_proxies.iter())
             .any(|p| p.dispatch_kind.is_stream())
-            || removed_had_stream;
+            || removed_had_stream
+            || (upstreams_changed
+                && new_config
+                    .proxies
+                    .iter()
+                    .any(|p| p.dispatch_kind.is_stream()));
         if stream_proxies_changed {
             let failures = self.stream_listener_manager.reconcile().await;
             for (proxy_id, port, err) in &failures {
@@ -5548,14 +5794,16 @@ async fn run_per_ip_cleanup_loop(
 /// connections continue to accept new streams indefinitely after the listener
 /// exits, forcing every shutdown to wait the full
 /// `FERRUM_SHUTDOWN_DRAIN_SECONDS` timeout.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     frontend_listen_port: Option<u16>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    orig_dst: Option<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -5602,13 +5850,14 @@ async fn handle_connection(
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
     let svc = service_fn(move |req: Request<Incoming>| {
-        let state = state.clone();
+        let state = Arc::clone(&state);
         let addr = remote_addr;
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
             frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
             mesh_direction,
+            orig_dst,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -5705,7 +5954,7 @@ pub fn try_acquire_websocket_connection_permit(
 #[allow(clippy::too_many_arguments)]
 async fn handle_websocket_request_authenticated(
     req: Request<Incoming>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     proxy: Arc<Proxy>,
     ctx: RequestContext,
@@ -5738,6 +5987,7 @@ async fn handle_websocket_request_authenticated(
         remote_addr.ip()
     );
     let mut ctx = ctx;
+    let mut current_cb_target_key = cb_target_key;
 
     // Build backend URL using upstream target if available
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
@@ -5764,6 +6014,15 @@ async fn handle_websocket_request_authenticated(
         Some(on_upgrade) => on_upgrade,
         None => {
             error!("Failed to extract OnUpgrade extension from WebSocket request");
+            // The caller's CB check may have claimed a HALF_OPEN probe slot —
+            // release it (gateway-side reject, not a backend outcome) so the
+            // breaker can admit the next probe instead of wedging.
+            release_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                current_cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
             return Ok(build_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 r#"{"error":"Internal server error during WebSocket upgrade"}"#,
@@ -5797,6 +6056,14 @@ async fn handle_websocket_request_authenticated(
                 )
                 .await;
                 record_request(&state, 503);
+                // Gateway-side reject after the CB check — release a claimed
+                // HALF_OPEN probe slot so the breaker doesn't wedge.
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    current_cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
                 return Ok(build_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"WebSocket connection limit exceeded"}"#,
@@ -5840,6 +6107,13 @@ async fn handle_websocket_request_authenticated(
     let mut ws_cb_probe_slot_available = cb_is_half_open_probe;
     let mut ws_attempt = 0u32;
 
+    // Connection-wide idle tracker created BEFORE the backend dial so the
+    // byte-level activity adapter can be installed under the backend framer
+    // inside `connect_websocket_backend`; the same tracker is later wired
+    // under the client framer by `run_websocket_proxy`. `None` disables the
+    // idle bound entirely.
+    let ws_idle_tracker =
+        WsIdleTracker::from_timeout_seconds(state.env_config.websocket_idle_timeout_seconds);
     // The backend WebSocket connection acquired below is held for the full
     // session lifetime (moved into the spawned task), so this guard's slot is
     // released exactly when the dedicated backend connection closes. Captured
@@ -5883,6 +6157,14 @@ async fn handle_websocket_request_authenticated(
                 )
                 .await;
                 record_request(&state, 503);
+                // Gateway-side reject after the CB check — release a claimed
+                // HALF_OPEN probe slot so the breaker doesn't wedge.
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    current_cb_target_key.as_deref(),
+                    ws_cb_probe_slot_available,
+                );
                 return Ok(build_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"Backend connection limit exceeded"}"#,
@@ -5904,7 +6186,7 @@ async fn handle_websocket_request_authenticated(
                 release_circuit_breaker_probe_on_admission_reject(
                     &state,
                     &proxy,
-                    cb_target_key.as_deref(),
+                    current_cb_target_key.as_deref(),
                     ws_cb_probe_slot_available,
                 );
                 return Ok(handle_backend_admission_rejection(
@@ -5930,6 +6212,7 @@ async fn handle_websocket_request_authenticated(
             &state.crls,
             state.max_websocket_frame_size_bytes,
             state.websocket_write_buffer_size,
+            ws_idle_tracker.clone(),
         )
         .await
         {
@@ -5973,6 +6256,9 @@ async fn handle_websocket_request_authenticated(
                     false
                 };
 
+                let mut cb_failure_already_recorded = false;
+                let mut backend_outcome_already_recorded = false;
+
                 if should_retry_ws {
                     if let Some(permits) = backend_admission_permits.take() {
                         permits.record_backend_outcome(BackendAdmissionOutcome {
@@ -5981,6 +6267,7 @@ async fn handle_websocket_request_authenticated(
                             error_class: Some(ws_error_class),
                             backend_elapsed: backend_admission_start.elapsed(),
                         });
+                        backend_outcome_already_recorded = true;
                     }
                     // Safety: should_retry_ws is only true when proxy.retry.is_some()
                     // (see condition above). Fall through to 502 if the invariant
@@ -6004,22 +6291,23 @@ async fn handle_websocket_request_authenticated(
                     // value keeps the invariant readable and survives a
                     // future refactor that moves this block.)
                     if let Some(cb_config) = &proxy.circuit_breaker {
-                        let current_cb_key = current_target
-                            .as_ref()
-                            .map(|t| crate::circuit_breaker::target_key(&t.host, t.port))
-                            .or_else(|| cb_target_key.clone());
                         let cb = state.circuit_breaker_cache.get_or_create(
                             &proxy.id,
-                            current_cb_key.as_deref(),
+                            current_cb_target_key.as_deref(),
                             cb_config,
                         );
                         cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
                         ws_cb_probe_slot_available = false;
+                        cb_failure_already_recorded = true;
                     }
 
                     let delay = retry::retry_delay(retry_config, ws_attempt);
                     tokio::time::sleep(delay).await;
                     ws_attempt += 1;
+
+                    let mut retry_backend_url = current_backend_url.clone();
+                    let mut retry_target = current_target.clone();
+                    let mut retry_cb_target_key = current_cb_target_key.clone();
 
                     // Try a different target on retry if load balancing is configured
                     if let (Some(_upstream_id), Some(prev_target)) =
@@ -6035,7 +6323,7 @@ async fn handle_websocket_request_authenticated(
                             &ctx.headers,
                         )
                     {
-                        current_backend_url = build_websocket_backend_url_with_target(
+                        retry_backend_url = build_websocket_backend_url_with_target(
                             &proxy,
                             &ctx.path,
                             &query_string,
@@ -6044,17 +6332,46 @@ async fn handle_websocket_request_authenticated(
                             strip_len,
                             next.path.as_deref(),
                         );
-                        current_target = Some(next);
+                        retry_cb_target_key =
+                            Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                        retry_target = Some(next);
                     }
 
-                    warn!(
-                        proxy_id = %proxy.id,
-                        attempt = ws_attempt,
-                        max_retries = retry_config.max_retries,
-                        error_class = %ws_error_class,
-                        "Retrying WebSocket backend connection"
-                    );
-                    continue;
+                    let mut retry_admitted_by_cb = true;
+                    if let Some(cb_config) = &proxy.circuit_breaker {
+                        match state.circuit_breaker_cache.can_execute(
+                            &proxy.id,
+                            retry_cb_target_key.as_deref(),
+                            cb_config,
+                        ) {
+                            Ok((_cb, is_half_open_probe)) => {
+                                ws_cb_probe_slot_available = is_half_open_probe;
+                            }
+                            Err(_) => {
+                                retry_admitted_by_cb = false;
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    attempt = ws_attempt,
+                                    "WebSocket retry target rejected by circuit breaker"
+                                );
+                            }
+                        }
+                    }
+
+                    if retry_admitted_by_cb {
+                        current_backend_url = retry_backend_url;
+                        current_target = retry_target;
+                        current_cb_target_key = retry_cb_target_key;
+
+                        warn!(
+                            proxy_id = %proxy.id,
+                            attempt = ws_attempt,
+                            max_retries = retry_config.max_retries,
+                            error_class = %ws_error_class,
+                            "Retrying WebSocket backend connection"
+                        );
+                        continue;
+                    }
                 }
 
                 // No retry — return error. Use the unified
@@ -6072,7 +6389,23 @@ async fn handle_websocket_request_authenticated(
                     error = %e,
                     "WebSocket backend connection failed"
                 );
-                if let Some(permits) = backend_admission_permits.take() {
+                // Record the failure so the breaker / passive health see it
+                // and a claimed HALF_OPEN probe slot is released. Previously
+                // only the retry branch recorded — with retries unconfigured
+                // (the default), WS backend connect failures never fed the
+                // breaker at all on H1/H2, and an admitted probe slot leaked
+                // permanently.
+                if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        current_cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                }
+                if !backend_outcome_already_recorded
+                    && let Some(permits) = backend_admission_permits.take()
+                {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: 502,
                         connection_error: ws_is_pre_wire,
@@ -6144,6 +6477,22 @@ async fn handle_websocket_request_authenticated(
         }
     };
 
+    // Backend handshake succeeded — record the success so the breaker sees a
+    // healthy outcome and, when this request was admitted as a HALF_OPEN
+    // probe, the probe slot is released and the breaker can close. Without
+    // this, every successful WS upgrade admitted as a probe permanently
+    // consumed a `half_open_in_flight` slot, and after `half_open_max_requests`
+    // upgrades the breaker wedged in HALF_OPEN, 503ing ALL traffic to the
+    // target. Mirrors the H3 WS path (`src/http3/websocket.rs`).
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.id,
+            current_cb_target_key.as_deref(),
+            cb_config,
+        );
+        cb.record_success(ws_cb_probe_slot_available);
+    }
+
     let ws_lb_guard =
         LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
     if let Some(permits) = backend_admission_permits.as_ref() {
@@ -6168,11 +6517,13 @@ async fn handle_websocket_request_authenticated(
     // Measure total latency using monotonic Instant (NTP-safe).
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
-    // Resolve backend IP from DNS cache for WebSocket tx log
+    // Resolve backend IP from DNS cache for WebSocket tx log. Use the
+    // effective LB target when present, not the proxy's static backend_host.
+    let ws_resolve_host = websocket_dns_resolution_host(&proxy, current_target.as_deref());
     let ws_resolved_ip = state
         .dns_cache
         .resolve(
-            &proxy.backend_host,
+            ws_resolve_host,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
         )
@@ -6395,6 +6746,7 @@ async fn handle_websocket_request_authenticated(
                     // `src/http3/websocket.rs` passes `true` for
                     // RFC 9220 §5 compliance.
                     false,
+                    ws_idle_tracker,
                     &adaptive_buf,
                 )
                 .await
@@ -6463,12 +6815,12 @@ fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(
 /// Collect backend WebSocket headers while preserving repeated client-provided
 /// values when the sanitized proxy header map still represents the full raw set.
 ///
-/// `RequestContext::headers` is a `HashMap`, so repeated fields are necessarily
-/// collapsed or comma-folded after materialization. The raw `HeaderMap` is
-/// still available from the upgrade request; use it to retain handshake-
-/// equivalent repeated headers such as multiple `Sec-WebSocket-Protocol`
-/// values, while still honoring plugin-driven strips and rewrites reflected in
-/// `proxy_headers`.
+/// `RequestContext::headers` is a `HashMap`, so repeated fields are folded
+/// after materialization (`; ` for cookie crumbs, `, ` otherwise). The raw
+/// `HeaderMap` is still available from the upgrade request; use it to retain
+/// handshake-equivalent repeated headers such as multiple
+/// `Sec-WebSocket-Protocol` values, while still honoring plugin-driven strips
+/// and rewrites reflected in `proxy_headers`.
 fn collect_forwardable_websocket_headers(
     raw_headers: &hyper::HeaderMap,
     proxy_headers: &HashMap<String, String>,
@@ -6504,7 +6856,7 @@ fn collect_forwardable_websocket_headers(
             .iter()
             .filter_map(|value| value.to_str().ok())
             .collect();
-        if sanitized_value_preserves_raw_values(&raw_values, sanitized_value)
+        if sanitized_value_preserves_raw_values(name.as_str(), &raw_values, sanitized_value)
             || sanitized_value == &materialized_raw_header_value(name.as_str(), &raw_values)
         {
             preserved_raw_names.insert(lower_name);
@@ -6539,15 +6891,25 @@ fn collect_forwardable_websocket_headers(
     forwarded
 }
 
-fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &str) -> bool {
+fn sanitized_value_preserves_raw_values(
+    name: &str,
+    raw_values: &[&str],
+    sanitized_value: &str,
+) -> bool {
     match raw_values {
         [] => false,
         [only] => *only == sanitized_value,
         _ => {
             // This exact fast-path only applies to list-style values where
-            // individual raw values do not contain literal commas. If that is
-            // not true, callers fall back to the shared materialized form.
-            let mut sanitized_values = sanitized_value.split(',').map(str::trim);
+            // individual raw values do not contain the fold delimiter. If
+            // that is not true, callers fall back to the shared materialized
+            // form.
+            let delimiter = if name.eq_ignore_ascii_case("cookie") {
+                ';'
+            } else {
+                ','
+            };
+            let mut sanitized_values = sanitized_value.split(delimiter).map(str::trim);
             raw_values
                 .iter()
                 .map(|value| value.trim())
@@ -6558,11 +6920,7 @@ fn sanitized_value_preserves_raw_values(raw_values: &[&str], sanitized_value: &s
 }
 
 fn materialized_raw_header_value(name: &str, raw_values: &[&str]) -> String {
-    if crate::plugins::is_comma_folded_list_header(name) {
-        raw_values.join(",")
-    } else {
-        raw_values.last().copied().unwrap_or_default().to_string()
-    }
+    raw_values.join(crate::plugins::repeated_request_header_separator(name))
 }
 
 fn proxy_header_entry_case_insensitive<'a>(
@@ -6667,6 +7025,19 @@ fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
     } else {
         std::borrow::Cow::Borrowed(host)
     }
+}
+
+/// Host used for WebSocket transaction-log DNS resolution. Load-balanced
+/// WebSocket sessions dial the selected target host, not the proxy's static
+/// `backend_host`, so `backend_resolved_ip` must follow the same effective
+/// destination as `backend_target`.
+pub(crate) fn websocket_dns_resolution_host<'a>(
+    proxy: &'a Proxy,
+    target: Option<&'a UpstreamTarget>,
+) -> &'a str {
+    target
+        .map(|target| target.host.as_str())
+        .unwrap_or(proxy.backend_host.as_str())
 }
 
 /// Build a WebSocket backend URL using a specific target host/port,
@@ -6795,8 +7166,16 @@ fn build_websocket_tls_connector(
 /// `Sec-WebSocket-Extensions` is intentionally NOT forwarded: the bridge
 /// doesn't speak `permessage-deflate` end-to-end, so signalling a negotiated
 /// extension would lead the client to decode raw frames as compressed.
+/// Backend WebSocket transport: TLS (or plain) over the byte-level idle
+/// activity adapter over TCP. The `WsActivityIo` layer sits UNDER the
+/// framer so fragmented-message read progress refreshes the shared idle
+/// watermark (see `WsActivityIo`); with no tracker configured it is a pure
+/// passthrough.
+pub type BackendWsStream =
+    WebSocketStream<tokio_tungstenite::MaybeTlsStream<WsActivityIo<tokio::net::TcpStream>>>;
+
 pub(crate) struct BackendWsHandshake {
-    pub stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    pub stream: BackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
 }
 
@@ -6813,6 +7192,7 @@ pub(crate) async fn connect_websocket_backend(
     crls: &crate::tls::CrlList,
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
+    idle_tracker: Option<Arc<WsIdleTracker>>,
 ) -> Result<BackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
@@ -6831,9 +7211,42 @@ pub(crate) async fn connect_websocket_backend(
 
     let connector = build_websocket_tls_connector(proxy, env_config, tls_policy, crls)?;
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
-    // Without this, 70 KB WS messages hit Nagle + delayed-ACK (~40 ms/msg).
-    let connect_future =
-        connect_async_tls_with_config(ws_request, Some(ws_config), true, connector);
+    // Dial the TCP stream ourselves (instead of `connect_async_tls_with_config`)
+    // so the byte-level `WsActivityIo` idle adapter can be installed UNDER the
+    // TLS layer and WebSocket framer — read progress on a fragmented or large
+    // backend message then refreshes the shared idle watermark even before
+    // tungstenite yields a complete `Message`. Host/port resolution matches
+    // what tungstenite's own dialer would use (request URI + scheme default).
+    let uri = ws_request.uri();
+    let dial_host = uri
+        .host()
+        .ok_or("WebSocket backend URL is missing a host")?
+        // `TcpStream::connect` expects bare IPv6 addresses, not URI-bracketed.
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let dial_port = uri.port_u16().unwrap_or_else(|| {
+        if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        }
+    });
+    let connect_future = async {
+        let tcp = tokio::net::TcpStream::connect((dial_host.as_str(), dial_port)).await?;
+        // Without nodelay, 70 KB WS messages hit Nagle + delayed-ACK
+        // (~40 ms/msg); keepalive bounds dead-peer detection on idle
+        // long-lived sessions.
+        set_tcp_keepalive(&tcp);
+        client_async_tls_with_config(
+            ws_request,
+            WsActivityIo::new(tcp, idle_tracker),
+            Some(ws_config),
+            connector,
+        )
+        .await
+        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+    };
 
     let (backend_ws_stream, backend_response) =
         match tokio::time::timeout(connect_timeout, connect_future).await {
@@ -7009,6 +7422,178 @@ fn guard_ws_control_transform(
     }
 }
 
+enum WsNextMessage {
+    Item(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
+    IdleTimeout,
+}
+
+/// Connection-wide WebSocket idle tracker shared by both relay directions.
+///
+/// `last_activity_ms` holds milliseconds since `epoch`, refreshed whenever a
+/// frame (data or control) arrives from EITHER side. Each direction derives
+/// its wait from this shared watermark, so a timer expiry on one half is only
+/// terminal when the OTHER half also produced no traffic inside the window.
+/// This mirrors the shared `last_activity` idle watchdog used by the
+/// tunnel-mode raw copy (`tcp_proxy::bidirectional_copy_for_relay`) and the
+/// TCP relay: asymmetric sessions (quiet client, chatty backend pushing
+/// notifications/pings) stay open, and the session is torn down only when the
+/// connection as a whole is idle.
+pub struct WsIdleTracker {
+    timeout: Duration,
+    epoch: Instant,
+    last_activity_ms: AtomicU64,
+}
+
+impl WsIdleTracker {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            epoch: Instant::now(),
+            last_activity_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Build the shared tracker from the configured timeout seconds;
+    /// `None` (idle timeout disabled) when the value is `0`.
+    pub(crate) fn from_timeout_seconds(seconds: u64) -> Option<Arc<Self>> {
+        (seconds > 0).then(|| Arc::new(Self::new(Duration::from_secs(seconds))))
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Record activity: bytes or a frame received from either direction.
+    fn touch(&self) {
+        self.last_activity_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// Time left before the shared idle window elapses; `None` when expired.
+    fn remaining(&self) -> Option<Duration> {
+        let idle_ms = self
+            .now_ms()
+            .saturating_sub(self.last_activity_ms.load(Ordering::Relaxed));
+        self.timeout
+            .checked_sub(Duration::from_millis(idle_ms))
+            .filter(|remaining| !remaining.is_zero())
+    }
+}
+
+/// Byte-level activity adapter feeding [`WsIdleTracker`].
+///
+/// Wraps the raw transport UNDER the WebSocket framer (client: the upgraded
+/// H1/H2 stream or the H3 duplex bridge; backend: the TCP stream beneath
+/// `MaybeTlsStream`) and refreshes the shared idle watermark whenever read
+/// progress is made. Tracking at the byte level — rather than only when
+/// tungstenite yields a complete `Message` — keeps a slowly arriving large or
+/// fragmented WebSocket message alive: continuation frames refresh the
+/// watermark as their bytes land even though no complete message has been
+/// assembled yet. This matches the byte-level shared idle timer used by the
+/// tunnel-mode raw copy, so frame-parsed and tunnel sessions expire under the
+/// same "no bytes in either direction" rule.
+///
+/// Writes don't touch the watermark: every byte written to one side was just
+/// read from the other, so read-side tracking already covers both directions.
+/// With `tracker == None` (idle timeout disabled) the adapter is a pure
+/// passthrough.
+pub struct WsActivityIo<S> {
+    inner: S,
+    tracker: Option<Arc<WsIdleTracker>>,
+}
+
+impl<S> WsActivityIo<S> {
+    pub(crate) fn new(inner: S, tracker: Option<Arc<WsIdleTracker>>) -> Self {
+        Self { inner, tracker }
+    }
+
+    /// Access the wrapped transport (socket-option tweaks, tests).
+    #[allow(dead_code)] // Used by library consumers and external unit tests; the binary tree has no caller.
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WsActivityIo<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result
+            && buf.filled().len() > before
+            && let Some(tracker) = &self.tracker
+        {
+            tracker.touch();
+        }
+        result
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WsActivityIo<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+async fn next_websocket_message<S>(stream: &mut S, idle: Option<&WsIdleTracker>) -> WsNextMessage
+where
+    S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let Some(idle) = idle else {
+        // Idle timeout disabled: await the stream directly — no timer, no
+        // atomics, zero added overhead.
+        return WsNextMessage::Item(stream.next().await);
+    };
+    loop {
+        // Re-derive the wait from the shared watermark each pass: the other
+        // relay direction may have refreshed it while this half was parked,
+        // in which case the local timer expiry is not terminal and the wait
+        // continues for the remainder of the window.
+        let Some(remaining) = idle.remaining() else {
+            return WsNextMessage::IdleTimeout;
+        };
+        if let Ok(item) = tokio::time::timeout(remaining, stream.next()).await {
+            if item.is_some() {
+                idle.touch();
+            }
+            return WsNextMessage::Item(item);
+        }
+    }
+}
+
 /// Generic over the client transport type `C`. The H1/H2 frontend passes
 /// `TokioIo::new(upgraded)` (hyper's `Upgraded` adapted to tokio AsyncRead+AsyncWrite);
 /// the H3 frontend (RFC 9220 Extended CONNECT) passes a `tokio::io::DuplexStream`
@@ -7036,7 +7621,7 @@ fn guard_ws_control_transform(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C>(
     client_io: C,
-    backend_ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    backend_ws_stream: BackendWsStream,
     proxy_id: &str,
     connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
@@ -7047,6 +7632,7 @@ pub(crate) async fn run_websocket_proxy<C>(
     websocket_write_buffer_size: usize,
     websocket_tunnel_mode: bool,
     accept_unmasked_client_frames: bool,
+    ws_idle_tracker: Option<Arc<WsIdleTracker>>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -7066,6 +7652,7 @@ where
         "run_websocket_proxy: tunnel mode is incompatible with unmasked client \
          frames (H3 caller must pass websocket_tunnel_mode=false)"
     );
+    let websocket_idle_timeout = ws_idle_tracker.as_ref().map(|tracker| tracker.timeout);
 
     // When tunnel mode is enabled and no plugins need frame-level hooks, bypass
     // WebSocket frame parsing entirely and do raw TCP bidirectional copy. This
@@ -7095,35 +7682,40 @@ where
         // and `into_inner()` will drop them. Deployments where the backend
         // sends immediately after upgrade should use frame-parsing mode (set
         // a frame-level plugin or disable `FERRUM_WEBSOCKET_TUNNEL_MODE`).
-        let mut backend = backend_ws_stream.into_inner();
-        let mut client_io = client_io;
+        let backend = backend_ws_stream.into_inner();
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
-        let result = tokio::io::copy_bidirectional_with_sizes(
-            &mut client_io,
-            &mut backend,
-            buf_size,
+        let copy_result = tcp_proxy::bidirectional_copy_for_relay(
+            client_io,
+            backend,
+            websocket_idle_timeout,
+            None,
+            None,
+            None,
             buf_size,
         )
         .await;
-        let tunnel_failure = match &result {
-            Ok((c2b, b2c)) => {
-                adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
-                None
-            }
-            Err(e) => {
-                // `copy_bidirectional` doesn't report which half failed, so fall
-                // back to `Direction::Unknown`. Observers that rely on direction
-                // attribution should enable frame-level plugins instead of tunnel
-                // mode.
-                let anyhow_err: anyhow::Error =
-                    anyhow::anyhow!("WebSocket tunnel copy error: {}", e);
-                Some((
-                    crate::plugins::Direction::Unknown,
-                    crate::retry::classify_boxed_error(anyhow_err.as_ref()),
-                    None,
-                ))
-            }
-        };
+        adaptive_buffer.record_connection(
+            proxy_id,
+            copy_result
+                .bytes_client_to_backend
+                .saturating_add(copy_result.bytes_backend_to_client),
+        );
+        let tunnel_failure =
+            copy_result
+                .first_failure
+                .as_ref()
+                .map(|(direction, class, side, message)| {
+                    debug!(
+                        proxy_id = %proxy_id,
+                        connection_id,
+                        direction = ?direction,
+                        error_class = %class,
+                        io_side = ?side,
+                        error = %message,
+                        "WebSocket tunnel relay ended with failure"
+                    );
+                    (*direction, *class, *side)
+                });
         // Fire on_ws_disconnect so plugins that opted into disconnect hooks see
         // the tunnel-mode session teardown. Frame counts are 0 because tunnel
         // mode does raw TCP bidirectional copy — no frames are parsed.
@@ -7146,8 +7738,12 @@ where
     // H3 callers pass `true`.
     ws_config.accept_unmasked_frames = accept_unmasked_client_frames;
 
+    // Byte-level idle activity adapter under the client-side framer, matching
+    // the wrap applied beneath the backend stream at connect time: read
+    // progress on a partially received (fragmented/large) client message
+    // refreshes the shared watermark before a complete `Message` is yielded.
     let ws_stream = WebSocketStream::from_raw_socket(
-        client_io,
+        WsActivityIo::new(client_io, ws_idle_tracker.clone()),
         tokio_tungstenite::tungstenite::protocol::Role::Server,
         Some(ws_config),
     )
@@ -7191,6 +7787,13 @@ where
     > = Arc::new(std::sync::OnceLock::new());
     let first_failure_ctb = first_failure.clone();
     let first_failure_btc = first_failure.clone();
+    // Connection-wide idle tracker shared by both relay halves (see
+    // `WsIdleTracker`). `None` when the timeout is disabled — the relay then
+    // awaits `stream.next()` directly with zero added overhead. The same
+    // tracker is wired into the byte-level `WsActivityIo` adapters under both
+    // framers, so mid-message read progress also refreshes the watermark.
+    let ws_idle_tracker_ctb = ws_idle_tracker.clone();
+    let ws_idle_tracker_btc = ws_idle_tracker;
 
     // Cancellation token for clean bidirectional close when a plugin triggers Close.
     // Each direction checks this token to know if the other side initiated a close.
@@ -7221,8 +7824,32 @@ where
                     .await;
                     break;
                 }
-                msg = ws_stream.next() => {
-                    let Some(msg) = msg else { break };
+                msg = next_websocket_message(&mut ws_stream, ws_idle_tracker_ctb.as_deref()) => {
+                    let msg = match msg {
+                        WsNextMessage::Item(Some(msg)) => msg,
+                        WsNextMessage::Item(None) => break,
+                        WsNextMessage::IdleTimeout => {
+                            debug!(
+                                proxy_id = %proxy_id_ctb,
+                                connection_id,
+                                idle_timeout_seconds = ws_idle_tracker_ctb
+                                    .as_deref()
+                                    .map(|idle| idle.timeout.as_secs())
+                                    .unwrap_or_default(),
+                                "WebSocket session idle timeout: no frames in either direction \
+                                 (observed on client->backend half)"
+                            );
+                            // Connection-wide idle: neither direction produced
+                            // a frame, so attribution matches the tunnel-mode
+                            // shared idle watchdog (Unknown direction, no side).
+                            let _ = first_failure_ctb.set((
+                                crate::plugins::Direction::Unknown,
+                                retry::ErrorClass::ReadWriteTimeout,
+                                None,
+                            ));
+                            break;
+                        }
+                    };
                     match msg {
                         Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
@@ -7378,8 +8005,32 @@ where
                     .await;
                     break;
                 }
-                msg = backend_stream.next() => {
-                    let Some(msg) = msg else { break };
+                msg = next_websocket_message(&mut backend_stream, ws_idle_tracker_btc.as_deref()) => {
+                    let msg = match msg {
+                        WsNextMessage::Item(Some(msg)) => msg,
+                        WsNextMessage::Item(None) => break,
+                        WsNextMessage::IdleTimeout => {
+                            debug!(
+                                proxy_id = %proxy_id_btc,
+                                connection_id,
+                                idle_timeout_seconds = ws_idle_tracker_btc
+                                    .as_deref()
+                                    .map(|idle| idle.timeout.as_secs())
+                                    .unwrap_or_default(),
+                                "WebSocket session idle timeout: no frames in either direction \
+                                 (observed on backend->client half)"
+                            );
+                            // Connection-wide idle: neither direction produced
+                            // a frame, so attribution matches the tunnel-mode
+                            // shared idle watchdog (Unknown direction, no side).
+                            let _ = first_failure_btc.set((
+                                crate::plugins::Direction::Unknown,
+                                retry::ErrorClass::ReadWriteTimeout,
+                                None,
+                            ));
+                            break;
+                        }
+                    };
                     match msg {
                         Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
@@ -7629,6 +8280,7 @@ pub async fn start_proxy_listener_with_bound_listener(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
+    let state = Arc::new(state);
     // Optional connection limit, mirroring the bound-port path. The semaphore
     // is sized from `max_connections` and shared with the connection guard.
     let conn_semaphore: Option<Arc<tokio::sync::Semaphore>> =
@@ -7936,6 +8588,8 @@ struct TlsConnectionMetadata {
     record_mesh_mtls_metric: bool,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    /// See [`RequestConnectionMetadata::orig_dst`].
+    orig_dst: Option<SocketAddr>,
 }
 
 async fn start_proxy_listener_with_tls_source_and_signal(
@@ -7988,6 +8642,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         } else {
             None
         };
+    let state = Arc::new(state);
 
     if accept_threads > 1 {
         // Multi-listener mode: spawn N-1 additional accept loops, each with its
@@ -7998,7 +8653,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
             let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
-            let state = state.clone();
+            let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
             let shutdown_rx = shutdown.clone();
@@ -8089,7 +8744,7 @@ impl SourceIpOverride {
 #[allow(clippy::too_many_arguments)]
 async fn run_accept_loop(
     listener: TcpListener,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     tls_source: ListenerTlsSource,
     conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -8151,7 +8806,7 @@ async fn run_accept_loop(
                             None
                         };
 
-                        let state = state.clone();
+                        let state = Arc::clone(&state);
                         let node_waypoint_identity =
                             if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
                                 match resolver.resolve_stream(&stream) {
@@ -8194,6 +8849,19 @@ async fn run_accept_loop(
                             continue;
                         }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
+                        // Read the captured connection's pre-NAT original
+                        // destination ONCE per accept, only on mesh outbound
+                        // capture listeners (one getsockopt; every request on
+                        // the connection shares it). `None` everywhere else
+                        // and for non-redirected traffic — see
+                        // `socket_opts::original_dst`.
+                        let orig_dst = if mesh_direction
+                            == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+                        {
+                            crate::socket_opts::original_dst(&stream)
+                        } else {
+                            None
+                        };
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
                         // future (sending GOAWAY on H2 / closing keepalive
@@ -8216,6 +8884,7 @@ async fn run_accept_loop(
                                     record_mesh_mtls_metric,
                                     node_waypoint_identity,
                                     mesh_direction,
+                                    orig_dst,
                                 };
                                 handle_tls_connection(
                                     stream,
@@ -8235,8 +8904,9 @@ async fn run_accept_loop(
                                     frontend_listen_port,
                                     node_waypoint_identity,
                                     mesh_direction,
+                                    orig_dst,
                                 )
-                                    .await
+                                .await
                             };
 
                             if let Err(e) = result {
@@ -8284,7 +8954,7 @@ async fn run_accept_loop(
 async fn handle_tls_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     tls_config: Arc<rustls::ServerConfig>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     tls_connection_metadata: TlsConnectionMetadata,
@@ -8365,7 +9035,7 @@ async fn handle_tls_connection(
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-        let state = state.clone();
+        let state = Arc::clone(&state);
         let addr = remote_addr;
         let cert = client_cert_der.clone();
         let chain = client_cert_chain_der.clone();
@@ -8375,6 +9045,7 @@ async fn handle_tls_connection(
             frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
             mesh_direction: tls_connection_metadata.mesh_direction,
+            orig_dst: tls_connection_metadata.orig_dst,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -8988,7 +9659,7 @@ pub async fn handle_proxy_request(
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     handle_proxy_request_on_frontend_port(
         req,
-        state,
+        Arc::new(state),
         remote_addr,
         is_tls,
         tls_client_cert_der,
@@ -9000,7 +9671,7 @@ pub async fn handle_proxy_request(
 
 async fn handle_proxy_request_on_frontend_port(
     req: Request<Incoming>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -9073,7 +9744,7 @@ async fn handle_proxy_request_on_frontend_port(
 /// function can attach the [`RequestGuard`] to the response body.
 async fn handle_proxy_request_inner(
     req: Request<Incoming>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -9112,6 +9783,7 @@ async fn handle_proxy_request_inner(
     ));
     ctx.frontend_sni_hostname = connection_metadata.frontend_sni_hostname;
     ctx.mesh_direction = connection_metadata.mesh_direction;
+    ctx.orig_dst = connection_metadata.orig_dst;
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
@@ -9424,21 +10096,76 @@ async fn handle_proxy_request_inner(
         &path,
     );
 
-    // Materialized sidecar inbound routes (`__mesh-inbound-*`) are direction-
-    // scoped: only the inbound listener may serve them. If a non-inbound request
-    // matched one, re-resolve excluding inbound routes so a valid lower-priority
-    // route is found instead of shortcutting the app's own-service traffic to
-    // loopback (or 404ing past a real outbound route).
+    // Materialized mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`) are
+    // direction-scoped: the inbound and outbound capture listeners share one
+    // route table, so each may serve only its own direction's routes. If the
+    // cached winner is a mesh route whose direction does not match this request's
+    // listener direction, re-resolve keeping only matching-direction routes — so
+    // a peer's inbound request is not re-tunnelled out an outbound HBONE route,
+    // and an app's outbound request is not shortcut to the local inbound loopback
+    // (and neither 404s past a valid lower-priority route).
     let route_match = match route_match {
         Some(rm)
-            if ctx.mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
-                && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id) =>
+            if crate::modes::mesh::mesh_route_direction(&rm.proxy.id)
+                .is_some_and(|route_dir| Some(route_dir) != ctx.mesh_direction) =>
         {
-            state.router_cache.resolve_route_excluding_mesh_inbound(
+            state.router_cache.resolve_route_excluding_wrong_direction(
                 &epoch.route_table,
                 request_host.as_deref(),
                 &path,
+                ctx.mesh_direction,
             )
+        }
+        other => other,
+    };
+
+    // Mesh outbound multi-port disambiguation: host routing picked the
+    // service (the route tiers hold one representative per outbound service);
+    // the captured original-destination port now picks the per-port sibling.
+    // Fails closed (502, like `hbone_required`) when the dialed port cannot
+    // be determined for a multi-port service or is not a materialized
+    // HTTP-family port — captured traffic is never forwarded to a port the
+    // client did not dial. Single-port services keep their orig-dst-free
+    // behavior, so direct dials (functional tests, non-Linux dev) are
+    // unaffected.
+    let route_match = match route_match {
+        Some(rm)
+            if ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+                && crate::modes::mesh::is_mesh_outbound_route_id(&rm.proxy.id) =>
+        {
+            let representative_id = Arc::clone(&rm.proxy);
+            match epoch
+                .route_table
+                .select_mesh_outbound_port_route(rm, ctx.orig_dst.map(|addr| addr.port()))
+            {
+                Ok(rm) => Some(rm),
+                Err(reason) => {
+                    debug!(
+                        proxy_id = %representative_id.id,
+                        orig_dst = ?ctx.orig_dst,
+                        reason = ?reason,
+                        client_ip = %ctx.client_ip,
+                        "Mesh outbound port selection failed; rejecting captured request"
+                    );
+                    state.request_count.fetch_add(1, Ordering::Relaxed);
+                    let body: &[u8] = match reason {
+                        crate::router_cache::MeshOutboundPortSelectError::OrigDstUnavailable => {
+                            br#"{"error":"Mesh outbound destination port is ambiguous without a captured original destination"}"#
+                        }
+                        crate::router_cache::MeshOutboundPortSelectError::PortNotMaterialized => {
+                            br#"{"error":"Original destination port is not a mesh-routable port of this service"}"#
+                        }
+                    };
+                    let reject = normalize_reject_response(
+                        StatusCode::BAD_GATEWAY,
+                        body,
+                        &EMPTY_HEADERS,
+                        request_uses_grpc_content_type,
+                    );
+                    record_status(&state, reject.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(reject));
+                }
+            }
         }
         other => other,
     };
@@ -9492,16 +10219,43 @@ async fn handle_proxy_request_inner(
             (rm.proxy, rm.matched_prefix_len)
         }
         None => {
-            debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
-            state.request_count.fetch_add(1, Ordering::Relaxed);
-            let reject = normalize_reject_response(
-                StatusCode::NOT_FOUND,
-                br#"{"error":"Not Found"}"#,
-                &EMPTY_HEADERS,
-                request_uses_grpc_content_type,
-            );
-            record_status(&state, reject.http_status.as_u16());
-            return Ok(build_response_from_normalized_reject(reject));
+            // Ambient / Waypoint inbound HBONE terminators materialize NO
+            // inbound routes — the relay is transparent: it dials the CONNECT
+            // `:authority`, the original destination the mesh peer asked for.
+            // An authenticated CONNECT to a safe local target therefore relays
+            // through a synthesized proxy instead of 404ing. The synthesized
+            // proxy is built only on the inbound listener (`mesh_direction ==
+            // Inbound`) and only for a loopback / slice-known workload
+            // destination, with loopback ports constrained to the slice's
+            // declared workload application ports; `handle_hbone_request`
+            // re-checks the authenticated-peer gate before dialing.
+            let hbone_relay = if is_hbone_connect
+                && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+            {
+                build_inbound_hbone_relay_proxy(req.uri().authority(), epoch.config.mesh.as_deref())
+            } else {
+                None
+            };
+            match hbone_relay {
+                Some(relay_proxy) => {
+                    // Plugins (incl. the mesh global chain / `mesh_authz`) read
+                    // `ctx.headers`, so materialize them before the chain runs.
+                    ctx.materialize_headers();
+                    (relay_proxy, 0)
+                }
+                None => {
+                    debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
+                    state.request_count.fetch_add(1, Ordering::Relaxed);
+                    let reject = normalize_reject_response(
+                        StatusCode::NOT_FOUND,
+                        br#"{"error":"Not Found"}"#,
+                        &EMPTY_HEADERS,
+                        request_uses_grpc_content_type,
+                    );
+                    record_status(&state, reject.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(reject));
+                }
+            }
         }
     };
 
@@ -10226,6 +10980,8 @@ async fn handle_proxy_request_inner(
         // `backend_admission_started_at`. `backend_start` itself stays the
         // origin for full backend-latency metrics (`backend_total_ms`).
         let mut grpc_backend_admission_started_at = backend_start;
+        let mut grpc_final_upstream_target = upstream_target.clone();
+        let mut grpc_lb_connection_guard: Option<LoadBalancerConnectionGuard> = None;
 
         // Streaming-response safety:
         //   * Retries are triggered by CONNECTION errors (BackendUnavailable,
@@ -10389,6 +11145,11 @@ async fn handle_proxy_request_inner(
                     // HALF_OPEN probe; an adaptive-concurrency reject here must
                     // release that probe slot so the breaker can admit the next
                     // probe (the retry path and HTTP/WS/H3 paths do the same).
+                    // Disarm the RAII guard FIRST — its Drop would otherwise
+                    // fire a second `record_neutral(true)` on the same breaker,
+                    // and the spurious extra decrement can free a DIFFERENT
+                    // in-flight probe's slot, over-admitting probes.
+                    grpc_probe_guard.disarm();
                     release_circuit_breaker_probe_on_admission_reject(
                         &state,
                         &proxy,
@@ -10408,6 +11169,10 @@ async fn handle_proxy_request_inner(
                     .await);
                 }
             };
+            grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                upstream_target.clone(),
+                upstream_balancer.clone(),
+            ));
             grpc_backend_admission_started_at = Instant::now();
             let result = grpc_proxy::proxy_grpc_request_core(
                 grpc_method,
@@ -10531,6 +11296,8 @@ async fn handle_proxy_request_inner(
                     Err(rejection) => {
                         // Release the CB HALF_OPEN probe slot before rejecting, as on
                         // the other admission paths (see the split-path branch above).
+                        // Disarm the RAII guard first so its Drop doesn't double-release.
+                        grpc_probe_guard.disarm();
                         release_circuit_breaker_probe_on_admission_reject(
                             &state,
                             &proxy,
@@ -10550,6 +11317,10 @@ async fn handle_proxy_request_inner(
                         .await);
                     }
                 };
+                grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                    upstream_target.clone(),
+                    upstream_balancer.clone(),
+                ));
                 grpc_backend_admission_started_at = Instant::now();
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
@@ -10589,6 +11360,9 @@ async fn handle_proxy_request_inner(
                                 Err(rejection) => {
                                     // Release the CB HALF_OPEN probe slot before
                                     // rejecting, as on the other admission paths.
+                                    // Disarm the RAII guard first so its Drop
+                                    // doesn't double-release.
+                                    grpc_probe_guard.disarm();
                                     release_circuit_breaker_probe_on_admission_reject(
                                         &state,
                                         &proxy,
@@ -10608,6 +11382,10 @@ async fn handle_proxy_request_inner(
                                     .await);
                                 }
                             };
+                        grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                            upstream_target.clone(),
+                            upstream_balancer.clone(),
+                        ));
                         grpc_backend_admission_started_at = Instant::now();
                         let result = grpc_proxy::proxy_grpc_request_core(
                             grpc_method,
@@ -10689,6 +11467,23 @@ async fn handle_proxy_request_inner(
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                let grpc_retry_error_class = match &grpc_result {
+                    Err(error) => Some(retry::classify_grpc_proxy_error(error)),
+                    Ok(_) => None,
+                };
+                record_grpc_backend_dispatch_outcome(
+                    &state,
+                    &proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer.as_ref(),
+                    grpc_current_target.as_ref(),
+                    grpc_current_cb_key.as_deref(),
+                    502,
+                    true,
+                    grpc_retry_error_class,
+                    grpc_backend_admission_started_at.elapsed(),
+                );
+                drop(grpc_lb_connection_guard.take());
 
                 // Record circuit breaker failure for current target
                 if let Some(cb_config) = &proxy.circuit_breaker {
@@ -10719,6 +11514,7 @@ async fn handle_proxy_request_inner(
                 // stays attributed to the target that produced it. Mirrors the
                 // HTTP retry path.
                 let grpc_pre_rotation_cb_key = grpc_current_cb_key.clone();
+                let grpc_pre_rotation_target = grpc_current_target.clone();
 
                 // Try a different target on retry if load balancing is configured
                 if let (Some(_upstream_id), Some(prev_target)) =
@@ -10773,6 +11569,7 @@ async fn handle_proxy_request_inner(
                             // post-dispatch record so we neither double-record
                             // nor attribute to the never-dispatched target.
                             grpc_final_cb_key = grpc_pre_rotation_cb_key;
+                            grpc_final_upstream_target = grpc_pre_rotation_target;
                             grpc_skip_final_cb_record = true;
                             break;
                         }
@@ -10834,6 +11631,11 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     grpc_current_target.as_deref(),
                 );
+                grpc_final_upstream_target = grpc_current_target.clone();
+                grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
+                    grpc_current_target.clone(),
+                    upstream_balancer.clone(),
+                ));
                 grpc_backend_admission_started_at = Instant::now();
                 grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
                     grpc_method.clone(),
@@ -10952,6 +11754,11 @@ async fn handle_proxy_request_inner(
 
                 // after_proxy plugins run on headers only (body is not yet in memory).
                 let mut response_headers: HashMap<String, String> = grpc_streaming.headers;
+                let grpc_backend_dispatch_status = grpc_proxy::grpc_admission_status_from_maps(
+                    &EMPTY_HEADERS,
+                    &response_headers,
+                    grpc_streaming.status,
+                );
                 {
                     let phase_start = Instant::now();
                     if let Some(reject) = run_after_proxy_hooks(
@@ -10979,6 +11786,19 @@ async fn handle_proxy_request_inner(
                                 backend_elapsed: grpc_backend_admission_elapsed,
                             });
                         }
+                        record_grpc_backend_dispatch_outcome(
+                            &state,
+                            &proxy,
+                            &epoch.load_balancer,
+                            upstream_balancer.as_ref(),
+                            grpc_final_upstream_target.as_ref(),
+                            grpc_final_cb_key.as_deref(),
+                            grpc_backend_dispatch_status,
+                            false,
+                            None,
+                            grpc_backend_admission_elapsed,
+                        );
+                        drop(grpc_lb_connection_guard.take());
                         // Use `original_request_path` so the log records the
                         // path the client actually requested, not the
                         // VirtualService-rewritten backend path in `ctx.path`.
@@ -11117,6 +11937,7 @@ async fn handle_proxy_request_inner(
 
                 if body_exceeded {
                     drop(backend_admission_permits.take());
+                    drop(grpc_lb_connection_guard.take());
                     record_request(&state, 200);
                     return Ok(grpc_proxy::build_grpc_error_response(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -11198,6 +12019,28 @@ async fn handle_proxy_request_inner(
                 if let Some(guard) = per_ip_guard {
                     body = body.with_per_ip_request_guard(guard);
                 }
+                if let Some(guard) = grpc_lb_connection_guard.take() {
+                    body = body.with_lb_connection_guard(guard);
+                }
+                body = body
+                    .with_deferred_backend_dispatch_outcome(
+                        Arc::clone(&state),
+                        Arc::clone(&proxy),
+                        Arc::clone(&epoch.load_balancer),
+                        upstream_balancer.clone(),
+                        grpc_final_upstream_target.clone(),
+                        grpc_final_cb_key.clone(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                        false,
+                        true,
+                        grpc_backend_admission_elapsed,
+                    )
+                    .with_grpc_trailer_backend_dispatch_classification()
+                    .with_deferred_dispatch_request_body_exceeded_flag(
+                        grpc_streaming.request_body_exceeded.clone(),
+                    );
                 if let Some(permits) = backend_admission_permits.take() {
                     body = body
                         .with_deferred_backend_admission_outcome(
@@ -11259,33 +12102,79 @@ async fn handle_proxy_request_inner(
             Ok(GrpcResponseKind::Buffered(grpc_resp)) => {
                 let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
+                let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
                 let mut response_body = grpc_resp.body;
+                // `response_trailers` is the backend's untouched trailer map at
+                // this point (moved out of `grpc_resp` above, reconciled with
+                // plugin mutations only later), so the grpc-status mapping is
+                // correct for both the non-empty-body (status in trailers) and
+                // Trailers-Only (status in headers) encodings.
+                let grpc_backend_dispatch_status = grpc_proxy::grpc_admission_status_from_maps(
+                    &response_trailers,
+                    &response_headers,
+                    response_status,
+                );
                 if let Some(permits) = backend_admission_permits.take() {
                     // gRPC application failures ride in the `grpc-status` trailer
                     // (or header, for trailers-only) under HTTP 200, so the HTTP
                     // status alone mislabels an UNAVAILABLE/INTERNAL backend as a
                     // healthy success. Map the effective non-OK gRPC status to HTTP
                     // so a server-side failure surfaces as 5xx and shrinks the limit,
-                    // while client-side statuses stay <500 (healthy). `grpc_resp`
-                    // trailers are still intact here — drained into `response_headers`
-                    // below.
-                    let admission_status = grpc_proxy::grpc_admission_status_from_maps(
-                        &grpc_resp.trailers,
-                        &response_headers,
-                        response_status,
-                    );
+                    // while client-side statuses stay <500 (healthy). The backend's
+                    // trailers are still intact here — plugin-view merge and wire
+                    // writeback happen below.
                     permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status: admission_status,
+                        response_status: grpc_backend_dispatch_status,
                         connection_error: false,
                         error_class: None,
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                if !grpc_skip_final_cb_record {
+                    record_grpc_backend_dispatch_outcome(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        grpc_final_upstream_target.as_ref(),
+                        grpc_final_cb_key.as_deref(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                        grpc_backend_admission_started_at.elapsed(),
+                    );
+                }
+                drop(grpc_lb_connection_guard.take());
 
-                // Forward trailers as response headers (gRPC Trailers-Only encoding).
-                // Drain instead of clone to avoid per-trailer String allocations.
-                for (k, v) in grpc_resp.trailers {
-                    response_headers.insert(k, v);
+                // Plugins historically saw a merged header+trailer map on the
+                // buffered gRPC path because trailers were inserted into
+                // response headers before hooks ran. Keep that compatibility
+                // view (same convention as the H3 bridge in
+                // `http3::cross_protocol`: a trailer never overrides a real
+                // header in the view), but split the wire response back into
+                // HEADERS + DATA + TRAILERS when the final body is non-empty.
+                // Trailer keys the backend ALSO sent as real initial headers
+                // are tracked so the post-hook writeback never copies the
+                // header's value into the wire trailer (the view value for
+                // those keys belongs to the header, not the trailer).
+                //
+                // Exception: the reserved gRPC terminal-status keys
+                // (grpc-status / grpc-message / grpc-status-details-bin) are
+                // trailer-authoritative and never shadowed — a malformed
+                // backend that duplicates them into the initial headers must
+                // not feed plugins (or the wire) the bogus header copy, so
+                // the trailing value wins in the view and the header copy is
+                // stripped on the non-empty wire path below.
+                let mut plugin_response_headers = response_headers.clone();
+                let mut header_shadowed_trailer_keys: HashSet<String> = HashSet::new();
+                for (k, v) in &response_trailers {
+                    if response_headers.contains_key(k)
+                        && !grpc_proxy::is_reserved_grpc_terminal_metadata(k)
+                    {
+                        header_shadowed_trailer_keys.insert(k.clone());
+                    } else {
+                        plugin_response_headers.insert(k.clone(), v.clone());
+                    }
                 }
 
                 // after_proxy hooks
@@ -11296,7 +12185,7 @@ async fn handle_proxy_request_inner(
                         &plugins,
                         &mut ctx,
                         response_status,
-                        &mut response_headers,
+                        &mut plugin_response_headers,
                     )
                     .await
                     {
@@ -11310,6 +12199,8 @@ async fn handle_proxy_request_inner(
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
                         response_status = normalized.http_status.as_u16();
                         response_headers = normalized.headers;
+                        plugin_response_headers = response_headers.clone();
+                        response_trailers.clear();
                         response_body = normalized.body;
                         after_proxy_rejected = true;
                     }
@@ -11323,7 +12214,7 @@ async fn handle_proxy_request_inner(
                             .on_response_body(
                                 &mut ctx,
                                 response_status,
-                                &response_headers,
+                                &plugin_response_headers,
                                 &response_body,
                             )
                             .await;
@@ -11345,6 +12236,8 @@ async fn handle_proxy_request_inner(
                                     .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
+                                plugin_response_headers = response_headers.clone();
+                                response_trailers.clear();
                                 response_body = normalized.body;
                                 break;
                             }
@@ -11355,14 +12248,18 @@ async fn handle_proxy_request_inner(
 
                 if !after_proxy_rejected {
                     let phase_start = Instant::now();
-                    let content_type = response_headers.get("content-type").cloned();
+                    let content_type = plugin_response_headers.get("content-type").cloned();
                     let ct_ref = content_type.as_deref();
                     for plugin in plugins.iter() {
                         if let Some(transformed) = plugin
-                            .transform_response_body(&response_body, ct_ref, &response_headers)
+                            .transform_response_body(
+                                &response_body,
+                                ct_ref,
+                                &plugin_response_headers,
+                            )
                             .await
                         {
-                            response_headers.insert(
+                            plugin_response_headers.insert(
                                 "content-length".to_string(),
                                 transformed.len().to_string(),
                             );
@@ -11379,7 +12276,7 @@ async fn handle_proxy_request_inner(
                             .on_final_response_body(
                                 &mut ctx,
                                 response_status,
-                                &response_headers,
+                                &plugin_response_headers,
                                 &response_body,
                             )
                             .await;
@@ -11401,6 +12298,8 @@ async fn handle_proxy_request_inner(
                                     .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
+                                plugin_response_headers = response_headers.clone();
+                                response_trailers.clear();
                                 response_body = normalized.body;
                                 break;
                             }
@@ -11467,6 +12366,84 @@ async fn handle_proxy_request_inner(
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
+                if !after_proxy_rejected {
+                    // Reconcile hook mutations from the merged view back into
+                    // the wire trailers: a trailer-originated key now absent
+                    // from the view was removed by a hook (honor the removal,
+                    // matching the pre-split behavior where trailers lived in
+                    // the headers map plugins mutated); a changed value is a
+                    // hook edit. Keys shadowed by a real backend header were
+                    // never plugin-visible as trailers, so while the key is
+                    // still in the view they keep the backend's true trailer
+                    // value — but a hook that removed the key from the view
+                    // suppresses the hidden trailer too (a security plugin
+                    // stripping a sensitive key must not leak its trailer
+                    // copy on the wire).
+                    response_trailers.retain(|k, v| {
+                        if header_shadowed_trailer_keys.contains(k) {
+                            return plugin_response_headers.contains_key(k);
+                        }
+                        match plugin_response_headers.get(k) {
+                            Some(plugin_value) => {
+                                if plugin_value != v {
+                                    *v = plugin_value.clone();
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    });
+                    response_headers = plugin_response_headers;
+                }
+                if response_body.is_empty() {
+                    // True Trailers-Only encoding: no DATA frame, grpc-status
+                    // and friends ride in the initial HEADERS with END_STREAM.
+                    // Trailer values are authoritative on collapse (pre-split
+                    // merge order), including over duplicate initial headers.
+                    for (k, v) in response_trailers.drain() {
+                        response_headers.insert(k, v);
+                    }
+                } else {
+                    // Non-empty gRPC responses must carry grpc-status in a
+                    // terminal TRAILERS frame. Strip the view-merged trailer
+                    // copies from the initial headers; keys the backend also
+                    // sent as real initial headers stay headers — the wire
+                    // trailer carries the backend's true trailer value (same
+                    // wire shape as the H3 bridge). Reserved terminal-status
+                    // keys are never shadowed, so a malformed duplicate
+                    // grpc-status initial header is always stripped here:
+                    // status must only appear in the trailers.
+                    for k in response_trailers.keys() {
+                        if !header_shadowed_trailer_keys.contains(k) {
+                            response_headers.remove(k);
+                        }
+                    }
+                }
+
+                // A response transform that re-encodes the gRPC terminal
+                // status into the body (e.g. `grpc_web` appends a gRPC-Web
+                // trailer frame and relabels the content-type) leaves the
+                // response no longer native gRPC. Emitting the reconciled
+                // native TRAILERS frame as well would double-signal terminal
+                // status and confuse gRPC-Web clients/intermediaries, so
+                // suppress the wire trailers whenever the final content-type
+                // positively indicates a conversion away from native
+                // `application/grpc` — keyed on the content-type, not on any
+                // specific plugin, so future transforms behave the same. An
+                // absent content-type keeps native gRPC semantics (we are on
+                // the gRPC dispatch path).
+                if !response_trailers.is_empty() {
+                    let converted_away_from_grpc =
+                        response_headers.get("content-type").is_some_and(|ct| {
+                            !crate::proxy::backend_dispatch::is_native_grpc_content_type(
+                                ct.as_bytes(),
+                            )
+                        });
+                    if converted_away_from_grpc {
+                        response_trailers.clear();
+                    }
+                }
+
                 // Inject sticky session cookie for gRPC responses
                 if sticky_cookie_needed
                     && let (Some(upstream_id), Some(target)) =
@@ -11520,39 +12497,73 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                 );
 
-                return Ok(resp_builder
-                    .body(ProxyBody::full(Bytes::from(response_body)))
-                    .unwrap_or_else(|_| {
-                        grpc_proxy::build_grpc_error_response(
-                            grpc_proxy::grpc_status::UNAVAILABLE,
-                            "Internal gateway error",
-                        )
-                    }));
+                let response_body = Bytes::from(response_body);
+                let body = if !response_body.is_empty() && !response_trailers.is_empty() {
+                    let mut trailers = hyper::HeaderMap::new();
+                    for (k, v) in &response_trailers {
+                        if let (Ok(name), Ok(value)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            hyper::header::HeaderValue::from_str(v),
+                        ) {
+                            trailers.append(name, value);
+                        }
+                    }
+                    ProxyBody::buffered_grpc_with_trailers(response_body, trailers)
+                } else {
+                    ProxyBody::full(response_body)
+                };
+
+                return Ok(resp_builder.body(body).unwrap_or_else(|_| {
+                    grpc_proxy::build_grpc_error_response(
+                        grpc_proxy::grpc_status::UNAVAILABLE,
+                        "Internal gateway error",
+                    )
+                }));
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
+                let grpc_backend_connection_error = matches!(
+                    &e,
+                    GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
+                ) || matches!(
+                    &e,
+                    GrpcProxyError::BackendTimeout {
+                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                        ..
+                    }
+                );
                 if !matches!(
                     &e,
                     GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
                 ) && let Some(permits) = backend_admission_permits.take()
                 {
-                    let connection_error = matches!(
-                        &e,
-                        GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
-                    ) || matches!(
-                        &e,
-                        GrpcProxyError::BackendTimeout {
-                            kind: grpc_proxy::GrpcTimeoutKind::Connect,
-                            ..
-                        }
-                    );
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: 502,
-                        connection_error,
+                        connection_error: grpc_backend_connection_error,
                         error_class: Some(grpc_error_class),
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
+                if !grpc_skip_final_cb_record
+                    && !matches!(
+                        &e,
+                        GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
+                    )
+                {
+                    record_grpc_backend_dispatch_outcome(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        grpc_final_upstream_target.as_ref(),
+                        grpc_final_cb_key.as_deref(),
+                        502,
+                        grpc_backend_connection_error,
+                        Some(grpc_error_class),
+                        grpc_backend_admission_started_at.elapsed(),
+                    );
+                }
+                drop(grpc_lb_connection_guard.take());
                 if grpc_error_class == retry::ErrorClass::PortExhaustion {
                     state.overload.record_port_exhaustion();
                 }
@@ -11763,6 +12774,33 @@ async fn handle_proxy_request_inner(
             r#"{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}"#,
         ));
     }
+    // Sidecar egress mirrors the HBONE fail-closed contract: a `mesh.mtls=true`
+    // target that cannot dispatch over the SVID-mTLS pool must never fall back
+    // to a plaintext direct-backend dial.
+    let mesh_mtls_required = upstream_target
+        .as_deref()
+        .is_some_and(mesh_mtls_pool::target_mesh_mtls_enabled);
+    let current_dispatch_mesh_mtls = !has_retry
+        && can_use_hbone_pool(
+            has_retry,
+            requires_request_body_buffering,
+            stream_request_body,
+        )
+        && supports_mesh_mtls_backend(&state, &proxy, upstream_target.as_deref());
+    if mesh_mtls_required && !current_dispatch_mesh_mtls {
+        warn!(
+            proxy_id = %proxy.id,
+            upstream_target = ?upstream_target,
+            has_retry,
+            requires_request_body_buffering,
+            stream_request_body,
+            "mesh.mtls=true target requires sidecar SVID-mTLS dispatch; refusing direct-backend fallback"
+        );
+        return Ok(build_response(
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Bad Gateway","message":"Sidecar mTLS dispatch required for this backend target"}"#,
+        ));
+    }
     let mut current_dispatch_h3 = !requires_response_stream_inspection
         && supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
@@ -11797,6 +12835,7 @@ async fn handle_proxy_request_inner(
             has_retry,
             &request_client_ip,
             is_tls,
+            false,
             false,
             current_dispatch_h3,
             &bytes_sent_observed,
@@ -12058,6 +13097,7 @@ async fn handle_proxy_request_inner(
             &request_client_ip,
             is_tls,
             current_dispatch_hbone,
+            current_dispatch_mesh_mtls,
             current_dispatch_h3,
             &bytes_sent_observed,
             inbound_version,
@@ -12106,10 +13146,16 @@ async fn handle_proxy_request_inner(
     let mut response_headers = backend_resp.headers;
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
     let backend_error_class = backend_resp.error_class;
-    annotate_gateway_hbone_metadata(
+    annotate_gateway_mesh_metadata(
         &mut ctx,
         upstream_target.as_deref(),
-        current_dispatch_hbone,
+        if current_dispatch_hbone {
+            Some("hbone")
+        } else if current_dispatch_mesh_mtls {
+            Some("mtls")
+        } else {
+            None
+        },
         backend_error_class,
     );
 
@@ -12786,7 +13832,7 @@ async fn handle_proxy_request_inner(
                     response_status,
                     cl,
                 )
-            } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
+            } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
                     h3_resp.recv_stream,
                     state.max_response_body_size_bytes,
@@ -13619,6 +14665,7 @@ async fn proxy_to_backend(
     client_ip: &str,
     is_tls: bool,
     dispatch_hbone: bool,
+    dispatch_mesh_mtls: bool,
     dispatch_h3: bool,
     // Shared counter for request body bytes observed on the wire. Populated
     // by the body handling block below via either `fetch_max` (buffered paths)
@@ -13711,6 +14758,45 @@ async fn proxy_to_backend(
         };
         *backend_admission_started_at = Instant::now();
         let (backend_resp, body_bytes) = proxy_to_backend_hbone(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            client_request_body,
+            upstream_target,
+            plugins,
+            response_decision_ctx,
+            stream_response,
+            client_ip,
+            is_tls,
+            resolved_ip.clone(),
+            ctx_bytes_sent_observed,
+        )
+        .await;
+        return backend_dispatch_response(backend_resp, body_bytes, backend_admission_permits);
+    }
+
+    // Sidecar egress: plain HTTP/2 over SVID-mTLS to the peer sidecar's
+    // inbound listener. Same admission ordering as the HBONE path.
+    if dispatch_mesh_mtls {
+        if let Some(reject) =
+            oversized_request_body_dispatch_reject(state, method, headers, resolved_ip.clone())
+        {
+            return reject;
+        }
+        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+            backend_admission_plugins,
+            request_ctx,
+            proxy,
+            upstream_target,
+            ProxyProtocol::Http,
+        ) {
+            Ok(permits) => permits,
+            Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+        };
+        *backend_admission_started_at = Instant::now();
+        let (backend_resp, body_bytes) = proxy_to_backend_mesh_mtls(
             state,
             proxy,
             backend_url,
@@ -15281,25 +16367,36 @@ fn hbone_hyper_error_response(
 enum HyperBodyCollectError {
     TooLarge,
     Read(hyper::Error),
+    ReadTimeout { timeout_ms: u64 },
 }
 
 async fn collect_hyper_body_with_limit(
     mut body: Incoming,
     max_size: usize,
+    backend_read_timeout_ms: u64,
 ) -> Result<Vec<u8>, HyperBodyCollectError> {
-    if max_size == 0 {
-        return body
-            .collect()
-            .await
-            .map(|collected| collected.to_bytes().to_vec())
-            .map_err(HyperBodyCollectError::Read);
-    }
-
     let mut body_bytes = Vec::new();
-    while let Some(frame) = body.frame().await {
+    loop {
+        let next_frame = if backend_read_timeout_ms > 0 {
+            match tokio::time::timeout(Duration::from_millis(backend_read_timeout_ms), body.frame())
+                .await
+            {
+                Ok(frame) => frame,
+                Err(_) => {
+                    return Err(HyperBodyCollectError::ReadTimeout {
+                        timeout_ms: backend_read_timeout_ms,
+                    });
+                }
+            }
+        } else {
+            body.frame().await
+        };
+        let Some(frame) = next_frame else {
+            break;
+        };
         let frame = frame.map_err(HyperBodyCollectError::Read)?;
         if let Some(data) = frame.data_ref() {
-            if body_bytes.len().saturating_add(data.len()) > max_size {
+            if max_size > 0 && body_bytes.len().saturating_add(data.len()) > max_size {
                 return Err(HyperBodyCollectError::TooLarge);
             }
             body_bytes.extend_from_slice(data);
@@ -15339,6 +16436,52 @@ fn hbone_response_body_too_large_response(
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
     }
+}
+
+fn h3_response_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = size,
+            max_response_body_size_bytes = max_size,
+            "HTTP/3 backend response body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_response_body_size_bytes = max_size,
+            "HTTP/3 backend response body exceeded configured size limit while streaming"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+    }
+}
+
+fn declared_response_length_exceeds_limit(
+    headers: &HashMap<String, String>,
+    max_response_body_size_bytes: usize,
+) -> Option<usize> {
+    if max_response_body_size_bytes == 0 {
+        return None;
+    }
+    let len = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())?;
+    (len > max_response_body_size_bytes).then_some(len)
 }
 
 fn hbone_request_body_too_large_response(
@@ -15455,9 +16598,33 @@ async fn proxy_to_backend_hbone(
     }
 
     let hbone_port = hbone_pool::target_hbone_port(target);
+    // Pin the destination workload identity declared on the target. A present
+    // but corrupt `mesh.spiffe_id` tag fails CLOSED here — never silently
+    // downgrade a pinned dial to trust-domain-only verification.
+    let expected_peer = match hbone_pool::target_expected_peer_spiffe(target) {
+        Ok(peer) => peer,
+        Err(err) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                error = %err,
+                "Refusing HBONE dispatch: invalid pinned peer identity tag"
+            );
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+            );
+        }
+    };
     let tunnel = match state
         .hbone_pool
-        .get_tunnel(proxy, &target.host, target.port, hbone_port)
+        .get_tunnel(
+            proxy,
+            &target.host,
+            target.port,
+            hbone_port,
+            expected_peer.as_ref(),
+        )
         .await
     {
         Ok(tunnel) => tunnel,
@@ -15739,6 +16906,7 @@ async fn proxy_to_backend_hbone(
         let body_bytes = match collect_hyper_body_with_limit(
             response.into_body(),
             state.max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
         )
         .await
         {
@@ -15756,6 +16924,514 @@ async fn proxy_to_backend_hbone(
             }
             Err(HyperBodyCollectError::Read(err)) => {
                 return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "HBONE backend response body read timed out"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                );
+            }
+        };
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::Buffered(body_bytes),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+        )
+    }
+}
+
+/// Sidecar egress dispatch: send the request as HTTP/2 over a pooled SVID-mTLS
+/// session to the destination sidecar's inbound listener (`mesh.mtls` targets).
+///
+/// Mirrors [`proxy_to_backend_hbone`]'s contract — streaming-only request body
+/// wrapped in `SizeLimitedIncoming`, baggage-stripped inner headers, the same
+/// size-limit and timeout handling, fail-closed on a missing/corrupt pinned
+/// peer identity — but speaks h2 directly to the peer (no CONNECT tunnel):
+/// the request `:authority` carries the service host the peer's inbound route
+/// matches on, and the Host header is left to hyper's `:authority` mapping.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_mesh_mtls(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: ClientRequestBody,
+    upstream_target: Option<&UpstreamTarget>,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&RequestContext>,
+    stream_response: bool,
+    client_ip: &str,
+    is_tls: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+) -> (retry::BackendResponse, Option<Bytes>) {
+    let Some(target) = upstream_target else {
+        return (
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Sidecar mTLS target missing"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: true,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ConnectionPoolError),
+            },
+            None,
+        );
+    };
+
+    // The pinned destination identity is mandatory for mesh.mtls targets —
+    // missing or corrupt fails closed before any dial.
+    let expected_peer = match mesh_mtls_pool::target_mesh_mtls_expected_peer(target) {
+        Ok(peer) => peer,
+        Err(err) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                error = %err,
+                "Refusing sidecar mTLS dispatch: unusable pinned peer identity"
+            );
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+            );
+        }
+    };
+
+    debug!(
+        proxy_id = %proxy.id,
+        target_host = %target.host,
+        target_port = target.port,
+        expected_peer = %expected_peer.as_str(),
+        "Proxying request via sidecar SVID-mTLS HTTP/2"
+    );
+
+    let original_req = match client_request_body {
+        ClientRequestBody::Streaming(request) => *request,
+        ClientRequestBody::Buffered(_) => {
+            debug_assert!(
+                false,
+                "mesh mTLS pool should not be used when request body is pre-buffered"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 500,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"mesh mTLS request buffering invariant violated"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+
+    if request_may_have_body(method, headers)
+        && state.max_request_body_size_bytes > 0
+        && let Some(content_length) = headers.get("content-length")
+        && let Ok(len) = content_length.parse::<usize>()
+        && len > state.max_request_body_size_bytes
+    {
+        return (
+            hbone_request_body_too_large_response(
+                proxy,
+                resolved_ip,
+                Some(len),
+                state.max_request_body_size_bytes,
+            ),
+            None,
+        );
+    }
+
+    let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
+    let mut sender = match state
+        .mesh_mtls_pool
+        .get_sender(proxy, &target.host, mtls_port, &expected_peer)
+        .await
+    {
+        Ok(sender) => sender,
+        Err(err) => {
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+            );
+        }
+    };
+    // Bound readiness by the connect budget: a pooled-but-saturated connection
+    // (stream-cap reached) must not stall the request indefinitely.
+    match tokio::time::timeout(
+        Duration::from_millis(proxy.backend_connect_timeout_ms),
+        sender.ready(),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return (hbone_hyper_error_response(proxy, err, resolved_ip), None),
+        Err(_) => {
+            warn!(
+                proxy_id = %proxy.id,
+                "sidecar mTLS HTTP/2 sender readiness timed out ({}ms)",
+                proxy.backend_connect_timeout_ms
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 504,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ConnectionTimeout),
+                },
+                None,
+            );
+        }
+    }
+
+    let uri: hyper::Uri = match backend_url.parse() {
+        Ok(uri) => uri,
+        Err(e) => {
+            error!(proxy_id = %proxy.id, error = %e, "Invalid sidecar mTLS backend URL");
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+    // `:authority` is the routing key on the peer: its materialized inbound
+    // route matches the SERVICE host, so a preserved client Host wins; without
+    // preservation fall back to the dial authority (peer pod + app port),
+    // matching the HBONE inner request's Host fallback.
+    let authority_owned;
+    let authority = if proxy.preserve_host_header
+        && let Some(host) = headers.get("host")
+        && !host.is_empty()
+    {
+        host.as_str()
+    } else {
+        authority_owned = hbone_pool::authority_for_host_port(&target.host, target.port);
+        authority_owned.as_str()
+    };
+    let tunneled_uri = match hyper::Uri::builder()
+        .scheme("https")
+        .authority(authority)
+        .path_and_query(path_and_query)
+        .build()
+    {
+        Ok(uri) => uri,
+        Err(e) => {
+            error!(
+                proxy_id = %proxy.id,
+                authority,
+                error = %e,
+                "Invalid sidecar mTLS request authority"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Invalid backend authority"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+
+    let (mut parts, body) = original_req.into_parts();
+    let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_request_body_size = if state.max_request_body_size_bytes > 0 {
+        state.max_request_body_size_bytes
+    } else {
+        usize::MAX
+    };
+    let body = body::SizeLimitedIncoming::new_with_counter(
+        body,
+        max_request_body_size,
+        Arc::clone(&body_size_exceeded),
+        Arc::clone(ctx_bytes_sent_observed),
+    );
+    parts.uri = tunneled_uri;
+    parts.version = hyper::Version::HTTP_2;
+    parts.method = match parse_hyper_method(method) {
+        Ok(method) => method,
+        Err(()) => {
+            return (
+                retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+    parts.headers.clear();
+    // Same inner-header hygiene as HBONE: client-supplied identity baggage is
+    // stripped so a captured app cannot assert a forged source principal.
+    let owned_mesh_headers =
+        hbone_inner_headers_with_stripped_baggage(headers, &state.mesh_egress_strip_baggage_keys);
+    let headers = owned_mesh_headers.as_ref().unwrap_or(headers);
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    for (k, v) in headers {
+        match k.as_str() {
+            // H2 carries the request host in `:authority` (set above); a
+            // duplicate `host` header would trip the peer's host/authority
+            // consistency check.
+            "host" => continue,
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            _ => {
+                if let (Ok(name), Ok(val)) = (
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                    hyper::header::HeaderValue::from_str(v),
+                ) {
+                    parts.headers.insert(name, val);
+                }
+            }
+        }
+    }
+
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+    );
+    if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
+        parts.headers.insert("x-forwarded-for", val);
+    }
+    if let Ok(val) = hyper::header::HeaderValue::from_str(if is_tls { "https" } else { "http" }) {
+        parts.headers.insert("x-forwarded-proto", val);
+    }
+    if let Some(host) = headers.get("host")
+        && let Ok(val) = hyper::header::HeaderValue::from_str(host)
+    {
+        parts.headers.insert("x-forwarded-host", val);
+    }
+    if let Some(ref via) = state.via_header_http2
+        && let Ok(val) = hyper::header::HeaderValue::from_str(via)
+    {
+        parts.headers.insert("via", val);
+    }
+    if state.add_forwarded_header {
+        let proto_str = if is_tls { "https" } else { "http" };
+        let fwd = build_forwarded_value(
+            client_ip,
+            proto_str,
+            headers.get("host").map(|s| s.as_str()),
+        );
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&fwd) {
+            parts.headers.insert("forwarded", val);
+        }
+    }
+
+    let backend_req = Request::from_parts(parts, body);
+    let send_fut = sender.send_request(backend_req);
+    let response = if proxy.backend_read_timeout_ms > 0 {
+        let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        match tokio::time::timeout(timeout, send_fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+            Err(_) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                warn!(
+                    proxy_id = %proxy.id,
+                    "sidecar mTLS HTTP read timeout ({}ms) waiting for backend response",
+                    proxy.backend_read_timeout_ms
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                );
+            }
+        }
+    } else {
+        match send_fut.await {
+            Ok(response) => response,
+            Err(err) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+        }
+    };
+
+    let status = response.status().as_u16();
+    let content_length = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if state.max_response_body_size_bytes > 0
+        && let Some(len) = content_length
+        && len > state.max_response_body_size_bytes
+    {
+        return (
+            hbone_response_body_too_large_response(
+                proxy,
+                resolved_ip,
+                Some(len),
+                state.max_response_body_size_bytes,
+            ),
+            None,
+        );
+    }
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+
+    // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
+    let stream_response = refine_stream_response_for_content_type(
+        stream_response,
+        proxy,
+        plugins,
+        ctx,
+        &resp_headers,
+    );
+
+    if stream_response {
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::StreamingH2(response),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+        )
+    } else {
+        let body_bytes = match collect_hyper_body_with_limit(
+            response.into_body(),
+            state.max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(body_bytes) => body_bytes,
+            Err(HyperBodyCollectError::TooLarge) => {
+                return (
+                    hbone_response_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        None,
+                        state.max_response_body_size_bytes,
+                    ),
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::Read(err)) => {
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "sidecar mTLS backend response body read timed out"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                );
             }
         };
         (
@@ -15995,9 +17671,34 @@ async fn proxy_to_backend_http2(
         }
     } else {
         // Buffer the full response body
-        let body_bytes = match response.into_body().collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(e) => {
+        let body_bytes = match collect_hyper_body_with_limit(
+            response.into_body(),
+            0,
+            proxy.backend_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(collected) => collected,
+            Err(HyperBodyCollectError::TooLarge) => {
+                // Defensive: cannot occur with max_size=0 (the size guard is
+                // disabled), but the proxy path must never panic — surface a
+                // 502 instead of `unreachable!` if the invariant ever breaks.
+                error!(
+                    proxy_id = %proxy.id,
+                    "HTTP/2 buffered body collection reported TooLarge despite max_size=0"
+                );
+                return retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Failed to read backend response"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                };
+            }
+            Err(HyperBodyCollectError::Read(e)) => {
                 error!(proxy_id = %proxy.id, error = %e, "Failed to read HTTP/2 response body");
                 return retry::BackendResponse {
                     status_code: 502,
@@ -16008,6 +17709,23 @@ async fn proxy_to_backend_http2(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ProtocolError),
+                };
+            }
+            Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = timeout_ms,
+                    "HTTP/2 backend response body read timed out"
+                );
+                return retry::BackendResponse {
+                    status_code: 504,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ReadWriteTimeout),
                 };
             }
         };
@@ -16252,6 +17970,20 @@ async fn proxy_to_backend_http3(
                 return match h3_result {
                     Ok(response) => {
                         if stream_response {
+                            if let Some(len) = declared_response_length_exceeds_limit(
+                                &response.headers,
+                                state.max_response_body_size_bytes,
+                            ) {
+                                return (
+                                    h3_response_body_too_large_response(
+                                        proxy,
+                                        resolved_ip,
+                                        Some(len),
+                                        state.max_response_body_size_bytes,
+                                    ),
+                                    None,
+                                );
+                            }
                             debug!(
                                 proxy_id = %proxy.id,
                                 status = response.status,
@@ -16261,6 +17993,10 @@ async fn proxy_to_backend_http3(
                                 retry::BackendResponse {
                                     status_code: response.status,
                                     body: ResponseBody::StreamingH3(Box::new(response)),
+                                    // The sole caller moves the headers out of the
+                                    // `StreamingH3` payload via
+                                    // `std::mem::take(&mut h3_resp.headers)` — leave
+                                    // this empty instead of cloning the map per request.
                                     headers: HashMap::new(),
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip,
@@ -16282,6 +18018,7 @@ async fn proxy_to_backend_http3(
                                 status,
                                 content_length,
                                 state.max_response_body_size_bytes,
+                                proxy.backend_read_timeout_ms,
                             )
                             .await
                             {
@@ -16311,13 +18048,18 @@ async fn proxy_to_backend_http3(
                                         None,
                                     );
                                 }
-                                Err(e) => {
-                                    let crate::http3::client::H3BodyDrainError::Stream(e) = e
-                                    else {
-                                        unreachable!(
-                                            "response-too-large handled by previous match arm"
-                                        );
-                                    };
+                                Err(crate::http3::client::H3BodyDrainError::ReadTimeout {
+                                    timeout_ms,
+                                }) => {
+                                    warn!(
+                                        proxy_id = %proxy.id,
+                                        backend_url = %strip_query_params(backend_url),
+                                        timeout_ms = timeout_ms,
+                                        "HTTP/3 backend buffered response read timed out"
+                                    );
+                                    return (h3_read_timeout_backend_response(resolved_ip), None);
+                                }
+                                Err(crate::http3::client::H3BodyDrainError::Stream(e)) => {
                                     let (error_kind, error_class) = classify_h3_error(&e);
                                     record_port_exhaustion_if_class(&state.overload, error_class);
                                     // We have already received response headers and
@@ -16413,6 +18155,18 @@ async fn proxy_to_backend_http3(
                                 },
                                 None,
                             )
+                        } else if e.is_read_timeout() {
+                            // `backend_read_timeout_ms` expired waiting for
+                            // response headers — surface 504 Backend timeout
+                            // like the direct-H2 / HBONE read-timeout arms,
+                            // not a generic 502.
+                            warn!(
+                                proxy_id = %proxy.id,
+                                backend_url = %strip_query_params(backend_url),
+                                error = %e,
+                                "HTTP/3 backend read timeout waiting for response (streaming request body)"
+                            );
+                            (h3_read_timeout_backend_response(resolved_ip), None)
                         } else {
                             // `H3PoolError::request_on_wire()` is the
                             // authoritative body-on-wire signal: it is set
@@ -16620,6 +18374,20 @@ async fn proxy_to_backend_http3(
 
         match h3_result {
             Ok(response) => {
+                if let Some(len) = declared_response_length_exceeds_limit(
+                    &response.headers,
+                    state.max_response_body_size_bytes,
+                ) {
+                    return (
+                        h3_response_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            Some(len),
+                            state.max_response_body_size_bytes,
+                        ),
+                        retained_body,
+                    );
+                }
                 debug!(
                     proxy_id = %proxy.id,
                     status = response.status,
@@ -16629,6 +18397,10 @@ async fn proxy_to_backend_http3(
                     retry::BackendResponse {
                         status_code: response.status,
                         body: ResponseBody::StreamingH3(Box::new(response)),
+                        // The sole caller moves the headers out of the
+                        // `StreamingH3` payload via
+                        // `std::mem::take(&mut h3_resp.headers)` — leave
+                        // this empty instead of cloning the map per request.
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
@@ -16638,6 +18410,18 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
+                if e.is_read_timeout() {
+                    // `backend_read_timeout_ms` expired waiting for response
+                    // headers — surface 504 Backend timeout like the
+                    // direct-H2 / HBONE read-timeout arms, not a generic 502.
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(backend_url),
+                        error = %e,
+                        "HTTP/3 backend read timeout waiting for response (streaming response)"
+                    );
+                    return (h3_read_timeout_backend_response(resolved_ip), retained_body);
+                }
                 // Trust the pool's body-on-wire signal — see the
                 // streaming-incoming-body branch above for why we drop
                 // the error-class contribution here.
@@ -16717,6 +18501,20 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
+                if e.is_read_timeout() {
+                    // `backend_read_timeout_ms` expired waiting for response
+                    // headers (`recv_response`) or buffered body frames
+                    // (`recv_data` inside the pool's drain) — surface 504
+                    // Backend timeout like the direct-H2 / HBONE
+                    // read-timeout arms, not a generic 502.
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(backend_url),
+                        error = %e,
+                        "HTTP/3 backend read timeout waiting for response (buffered)"
+                    );
+                    return (h3_read_timeout_backend_response(resolved_ip), retained_body);
+                }
                 // Trust the pool's body-on-wire signal — see the streaming
                 // H3 branch above for why we drop the class contribution.
                 let is_conn_error = !e.request_on_wire();
@@ -16823,7 +18621,38 @@ fn classify_h3_pool_error(
         let class = retry::ErrorClass::GracefulRemoteClose;
         return (retry::error_class_log_kind(class), class);
     }
+    if e.is_read_timeout() {
+        // Typed `backend_read_timeout_ms` deadline signal from the pool —
+        // classify deterministically instead of relying on the "timeout"
+        // substring fallback in the shared classifier. `ReadWriteTimeout`
+        // is excluded from `is_h3_transport_error_class`, so this never
+        // drives `mark_h3_unsupported`.
+        let class = retry::ErrorClass::ReadWriteTimeout;
+        return (retry::error_class_log_kind(class), class);
+    }
     classify_h3_error(e.as_ref())
+}
+
+/// Build the 504 `BackendResponse` for an H3 backend read timeout
+/// (`backend_read_timeout_ms` expired waiting for response headers via
+/// `recv_response()` or buffered body frames via `recv_data()`).
+///
+/// Mirrors the direct-H2 / HBONE / sidecar-mTLS read-timeout arms so the
+/// same proxy config produces the same client-visible outcome regardless
+/// of dispatch path: 504 + `{"error":"Backend timeout"}` +
+/// `ErrorClass::ReadWriteTimeout`. `connection_error=false` — the request
+/// reached the backend's application layer (post-wire), so
+/// `retry_on_connect_failure` must not replay it; retries are governed by
+/// `retry_on_methods` / `retryable_status_codes`.
+fn h3_read_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code: 504,
+        body: ResponseBody::Buffered(r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+    }
 }
 
 /// Replay a saved HTTP/3 request to an explicit target (used during retries).
@@ -16958,6 +18787,19 @@ async fn proxy_to_backend_http3_retry(
             }
         }
         Err(e) => {
+            if e.is_read_timeout() {
+                // `backend_read_timeout_ms` expired waiting for the retried
+                // response — surface 504 Backend timeout like the direct-H2
+                // / HBONE read-timeout arms, not a generic 502.
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_url = %strip_query_params(backend_url),
+                    target = %format!("{}:{}", effective_host, effective_port),
+                    error = %e,
+                    "HTTP/3 backend read timeout waiting for response (retry)"
+                );
+                return h3_read_timeout_backend_response(resolved_ip);
+            }
             // Trust the pool's body-on-wire signal — see the streaming
             // H3 branch above for why we drop the class contribution.
             let is_conn_error = !e.request_on_wire();
@@ -17002,6 +18844,23 @@ mod tests {
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
+
+    #[test]
+    fn declared_response_length_exceeds_limit_only_when_header_is_over_cap() {
+        let mut headers = HashMap::new();
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+
+        headers.insert("content-length".to_string(), "11".to_string());
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 0), None);
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 11), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit(&headers, 10),
+            Some(11)
+        );
+
+        headers.insert("content-length".to_string(), "not-a-number".to_string());
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+    }
 
     /// Directly exercises the gRPC streaming circuit-breaker classification:
     /// a late client-upload overflow is gateway-side and must be NEUTRAL, while
@@ -17298,6 +19157,132 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    #[test]
+    fn websocket_dns_resolution_host_prefers_selected_upstream_target() {
+        let proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "static.example.com",
+            "backend_port": 443,
+        }))
+        .expect("test proxy should deserialize");
+        let target = UpstreamTarget {
+            host: "selected.example.com".to_string(),
+            port: 8443,
+            weight: 1,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        };
+
+        assert_eq!(
+            websocket_dns_resolution_host(&proxy, Some(&target)),
+            "selected.example.com"
+        );
+        assert_eq!(
+            websocket_dns_resolution_host(&proxy, None),
+            "static.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_websocket_message_times_out_when_idle_bound_elapsed() {
+        let mut stream = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+        let idle = WsIdleTracker::new(Duration::from_millis(5));
+
+        let item = next_websocket_message(&mut stream, Some(&idle)).await;
+
+        assert!(matches!(item, WsNextMessage::IdleTimeout));
+    }
+
+    #[tokio::test]
+    async fn next_websocket_message_counter_direction_activity_prevents_expiry() {
+        let mut stream = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+        let idle = Arc::new(WsIdleTracker::new(Duration::from_millis(300)));
+
+        // Simulate the OTHER relay half receiving frames: refresh the shared
+        // watermark every 100ms, well inside the 300ms idle window.
+        let toucher = {
+            let idle = idle.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    idle.touch();
+                }
+            })
+        };
+
+        // The quiet half's wait must NOT expire while the counter-direction
+        // keeps refreshing the watermark, even though 350ms > the 300ms
+        // window. Pre-fix, a per-direction timeout would have fired at 300ms.
+        let waited = tokio::time::timeout(
+            Duration::from_millis(350),
+            next_websocket_message(&mut stream, Some(idle.as_ref())),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "counter-direction activity must defer the shared idle expiry"
+        );
+
+        // Once the counter-direction goes quiet too, the same wait expires
+        // after the idle window truly elapses with no activity on either side.
+        toucher.abort();
+        let item = next_websocket_message(&mut stream, Some(idle.as_ref())).await;
+        assert!(matches!(item, WsNextMessage::IdleTimeout));
+    }
+
+    /// Byte-level activity through the `WsActivityIo` adapter must refresh
+    /// the shared idle watermark even though no complete WebSocket `Message`
+    /// is ever yielded — this is what keeps a slowly arriving large or
+    /// fragmented message alive past the idle window.
+    #[tokio::test]
+    async fn ws_activity_io_read_progress_refreshes_idle_watermark() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let idle = Arc::new(WsIdleTracker::new(Duration::from_millis(200)));
+        let (client, server) = tokio::io::duplex(64);
+        let mut tracked = WsActivityIo::new(server, Some(idle.clone()));
+
+        // Writer drips raw bytes (mid-message continuation data) every 50ms,
+        // never completing a frame.
+        let writer = tokio::spawn(async move {
+            let mut client = client;
+            for _ in 0..8u8 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = client.write_all(b"x").await;
+            }
+        });
+
+        // Read through the adapter for 400ms — twice the idle window. Each
+        // read with progress must touch the tracker, so `remaining()` never
+        // hits zero while bytes keep arriving.
+        let mut buf = [0u8; 8];
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, tracked.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(_)) => {
+                    assert!(
+                        idle.remaining().is_some(),
+                        "mid-message byte progress must keep the idle window open"
+                    );
+                }
+                Ok(Err(e)) => panic!("duplex read failed: {e}"),
+            }
+        }
+        writer.abort();
+
+        // With the byte drip stopped, the window finally elapses.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            idle.remaining().is_none(),
+            "idle window must expire once byte progress stops"
+        );
     }
 
     #[tokio::test]
@@ -17732,6 +19717,7 @@ mod tests {
                 "127.0.0.1",
                 false, // is_tls
                 false, // dispatch_hbone
+                false, // dispatch_mesh_mtls
                 false, // dispatch_h3
                 &bytes_sent,
                 hyper::Version::HTTP_11,
@@ -18805,7 +20791,6 @@ mod tests {
             retry::ErrorClass::DnsLookupError,
             retry::ErrorClass::PortExhaustion,
             retry::ErrorClass::ConnectionPoolError,
-            retry::ErrorClass::ReadWriteTimeout,
         ] {
             assert!(
                 is_h3_transport_error_class(class),
@@ -18829,11 +20814,16 @@ mod tests {
         // positive list in `is_h3_transport_error_class` would re-introduce
         // the regression where a fast responder racing FIN with
         // `CONNECTION_CLOSE` permanently disables H3 for the backend.
+        //
+        // `ReadWriteTimeout` is excluded for the same capability reason:
+        // a backend that stalls after accepting a request is slow or wedged,
+        // but it has not proved that the native H3 pool itself is invalid.
         for class in [
             retry::ErrorClass::ClientDisconnect,
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::ReadWriteTimeout,
             retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {
@@ -18846,11 +20836,11 @@ mod tests {
 
     #[test]
     fn is_h3_transport_failure_ignores_connection_error_flag() {
-        // `classify_h3_error` marks GOAWAY / stream reset / ReadWriteTimeout
-        // with `connection_error=false`, so the downgrade predicate must
-        // NOT require that flag. The decision hinges on `error_class`
-        // alone — any transport-level class downgrades, any application-
-        // layer class does not.
+        // `classify_h3_error` marks GOAWAY / stream reset with
+        // `connection_error=false`, so the downgrade predicate must NOT
+        // require that flag. The decision hinges on `error_class` alone:
+        // transport-level classes downgrade, application-layer classes and
+        // backend read timeouts do not.
         let mk = |connection_error: bool, error_class: Option<retry::ErrorClass>| {
             retry::BackendResponse {
                 status_code: 502,
@@ -18873,8 +20863,10 @@ mod tests {
             false,
             Some(retry::ErrorClass::ProtocolError)
         )));
-        // ReadWriteTimeout with connection_error=false also downgrades.
-        assert!(is_h3_transport_failure(&mk(
+        // ReadWriteTimeout with connection_error=false does NOT downgrade:
+        // the backend stalled after accepting the request, but capability is
+        // still valid.
+        assert!(!is_h3_transport_failure(&mk(
             false,
             Some(retry::ErrorClass::ReadWriteTimeout)
         )));
@@ -19045,8 +21037,8 @@ mod tests {
     fn classify_h3_pool_error_falls_through_on_post_wire_errors() {
         // Without the graceful-close flag, the classifier delegates to
         // `classify_h3_error` and returns the underlying class. A normal
-        // post-wire `recv_response` failure (e.g. timeout) MUST still
-        // classify as a transport failure so `mark_h3_unsupported` fires.
+        // post-wire `recv_response` timeout is a backend read timeout, not
+        // an H3 capability failure, so it must not fire `mark_h3_unsupported`.
         let e = crate::http3::client::H3PoolError::post_wire(anyhow::anyhow!(
             "recv_response failed: timed out reading from QUIC stream"
         ));
@@ -19055,9 +21047,57 @@ mod tests {
         // → ReadWriteTimeout (read-side, no "connect" token).
         assert_eq!(class, retry::ErrorClass::ReadWriteTimeout);
         assert!(
-            super::is_h3_transport_error_class(class),
-            "Post-wire transport failure must still trigger H3 downgrade"
+            !super::is_h3_transport_error_class(class),
+            "Post-wire backend read timeout must not trigger H3 downgrade"
         );
+    }
+
+    #[test]
+    fn classify_h3_pool_error_short_circuits_on_read_timeout_flag() {
+        // The typed `H3PoolError::read_timeout` constructor (used by the
+        // `backend_read_timeout_ms` deadline wraps around `recv_response()`
+        // and the buffered `recv_data` drain) must classify as
+        // `ReadWriteTimeout` regardless of the error message — no string
+        // heuristics. The message below deliberately avoids any "timeout"
+        // token to prove the typed flag drives classification.
+        let e = crate::http3::client::H3PoolError::read_timeout(anyhow::anyhow!(
+            "backend stalled mid-response"
+        ));
+        assert!(e.is_read_timeout());
+        assert!(
+            e.request_on_wire(),
+            "read timeouts are post-wire: the request was committed before \
+             the gateway started waiting on the response"
+        );
+        assert!(!e.is_graceful_close());
+        let (kind, class) = super::classify_h3_pool_error(&e);
+        assert_eq!(class, retry::ErrorClass::ReadWriteTimeout);
+        assert_eq!(kind, retry::error_class_log_kind(class));
+        assert!(
+            !super::is_h3_transport_error_class(class),
+            "H3 backend read timeout must not trigger mark_h3_unsupported"
+        );
+    }
+
+    #[test]
+    fn h3_read_timeout_backend_response_maps_to_504_backend_timeout() {
+        // The H3 read-timeout arms must produce the same client-visible
+        // outcome as the direct-H2 / HBONE / sidecar-mTLS read-timeout arms:
+        // 504 + {"error":"Backend timeout"} + ReadWriteTimeout, and
+        // connection_error=false so `retry_on_connect_failure` cannot replay
+        // a request the backend already received.
+        let resp = super::h3_read_timeout_backend_response(Some("10.0.0.1".to_string()));
+        assert_eq!(resp.status_code, 504);
+        let ResponseBody::Buffered(body) = &resp.body else {
+            panic!("H3 read-timeout response must be buffered");
+        };
+        assert_eq!(body.as_slice(), br#"{"error":"Backend timeout"}"#);
+        assert!(
+            !resp.connection_error,
+            "post-wire read timeout must not be treated as a connect failure"
+        );
+        assert_eq!(resp.error_class, Some(retry::ErrorClass::ReadWriteTimeout));
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("10.0.0.1"));
     }
 
     // ── `record_port_exhaustion_if_class` (H3 native paths) ─────────────
@@ -20341,7 +22381,7 @@ mod tests {
             "edge-proxy-default".to_string(),
         );
 
-        annotate_gateway_hbone_metadata(&mut ctx, Some(&target), true, None);
+        annotate_gateway_mesh_metadata(&mut ctx, Some(&target), Some("hbone"), None);
 
         assert_eq!(
             ctx.metadata
@@ -20374,7 +22414,12 @@ mod tests {
         let mut ctx =
             RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
 
-        annotate_gateway_hbone_metadata(&mut ctx, None, true, Some(retry::ErrorClass::TlsError));
+        annotate_gateway_mesh_metadata(
+            &mut ctx,
+            None,
+            Some("hbone"),
+            Some(retry::ErrorClass::TlsError),
+        );
 
         assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
         assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
@@ -20385,10 +22430,10 @@ mod tests {
         let mut ctx =
             RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
 
-        annotate_gateway_hbone_metadata(
+        annotate_gateway_mesh_metadata(
             &mut ctx,
             None,
-            true,
+            Some("hbone"),
             Some(retry::ErrorClass::RequestError),
         );
 
@@ -20401,10 +22446,10 @@ mod tests {
         let mut ctx =
             RequestContext::new("127.0.0.1".to_string(), "POST".to_string(), "/".to_string());
 
-        annotate_gateway_hbone_metadata(
+        annotate_gateway_mesh_metadata(
             &mut ctx,
             None,
-            true,
+            Some("hbone"),
             Some(retry::ErrorClass::RequestBodyTooLarge),
         );
 
@@ -20417,15 +22462,108 @@ mod tests {
         let mut ctx =
             RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
 
-        annotate_gateway_hbone_metadata(
+        annotate_gateway_mesh_metadata(
             &mut ctx,
             None,
-            true,
+            Some("hbone"),
             Some(retry::ErrorClass::ProtocolError),
         );
 
         assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
         assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
+    #[test]
+    fn inbound_hbone_relay_guard_allows_only_local_destinations() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadPort, WorkloadSelector};
+
+        // With no slice context, even loopback is refused: the relay must not
+        // become a localhost open proxy to arbitrary gateway-host ports.
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "127.0.0.1",
+            8080,
+            None
+        ));
+        assert!(!inbound_hbone_relay_destination_allowed("::1", 8080, None));
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "localhost",
+            8080,
+            None
+        ));
+
+        // A non-loopback host is REFUSED when it is not a slice-known workload —
+        // an authenticated peer must not be able to relay to arbitrary hosts.
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "10.1.2.3", 8080, None
+        ));
+
+        let mut mesh = MeshConfig::default();
+        mesh.workloads.push(Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
+            selector: WorkloadSelector::default(),
+            service_name: "app".to_string(),
+            addresses: vec!["10.1.2.3".to_string()],
+            ports: vec![WorkloadPort {
+                port: 8080,
+                protocol: crate::modes::mesh::config::AppProtocol::Http,
+                name: None,
+            }],
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+        });
+        // Now the workload's declared application port is allowed on loopback...
+        assert!(inbound_hbone_relay_destination_allowed(
+            "127.0.0.1",
+            8080,
+            Some(&mesh)
+        ));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "::1",
+            8080,
+            Some(&mesh)
+        ));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "localhost",
+            8080,
+            Some(&mesh)
+        ));
+        // ...but undeclared loopback ports remain refused.
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "127.0.0.1",
+            9999,
+            Some(&mesh)
+        ));
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "localhost",
+            9999,
+            Some(&mesh)
+        ));
+
+        // The workload's exact non-loopback address+port is allowed...
+        assert!(inbound_hbone_relay_destination_allowed(
+            "10.1.2.3",
+            8080,
+            Some(&mesh)
+        ));
+        // ...but a port the workload does not expose is refused...
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "10.1.2.3",
+            9999,
+            Some(&mesh)
+        ));
+        // ...and an address the slice does not declare is refused.
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "10.9.9.9",
+            8080,
+            Some(&mesh)
+        ));
     }
 
     #[test]

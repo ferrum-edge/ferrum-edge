@@ -268,7 +268,18 @@ impl A2aGateway {
         if let Some(batch) = value.as_array() {
             return self.detect_jsonrpc_batch(batch, headers);
         }
-        self.detect_jsonrpc_value(&value, headers)
+        match self.detect_jsonrpc_value(&value, headers) {
+            Some(detection) => Some(detection),
+            // A body that carries a JSON-RPC `method` but is not a well-formed
+            // 2.0 request (wrong/absent `jsonrpc`, etc.) must not slip past a
+            // deny policy via a malformed envelope. Fail closed here exactly as
+            // batch members do below. Bodies with no `method` are not method
+            // calls, so they pass through unchanged (no over-blocking).
+            None if value.get("method").is_some() => {
+                self.jsonrpc_inspection_failed_detection(false)
+            }
+            None => None,
+        }
     }
 
     fn detect_jsonrpc_batch(

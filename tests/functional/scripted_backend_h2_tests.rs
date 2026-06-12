@@ -22,10 +22,12 @@ use crate::scaffolding::backends::{
     ScriptedH2Backend,
 };
 use crate::scaffolding::certs::TestCa;
-use crate::scaffolding::clients::GrpcClient;
+use crate::scaffolding::clients::{GrpcClient, Http2Client};
+use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
 use bytes::Bytes;
+use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -732,6 +734,87 @@ async fn h2_window_stall_triggers_backend_read_timeout_on_grpc() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Test 6b — direct-H2 buffered response body stalls are bounded by
+//            `backend_read_timeout_ms`.
+// ────────────────────────────────────────────────────────────────────────────
+//
+// The direct HTTP/2 backend pool used to wrap only `send_request(...)` with
+// `backend_read_timeout_ms`. Once response HEADERS arrived, buffered response
+// body collection used an unbounded `collect().await`, so a backend could send
+// `:status` and then never send DATA/END_STREAM. This pins the missing second
+// deadline: every body-frame wait must also honor `backend_read_timeout_ms`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_buffered_response_body_stall_triggers_backend_read_timeout() {
+    let ca = TestCa::new("h2-response-stall").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+            ("content-length", "4".into()),
+        ]))
+        .step(H2Step::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn backend");
+
+    let read_timeout_ms: u64 = 800;
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "backend_read_timeout_ms": read_timeout_ms,
+            "response_body_mode": "buffer",
+            "pool_enable_http2": true,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+        .pool_warmup_enabled(true)
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let started = Instant::now();
+    let response = client
+        .get(&format!("{}/api/stall", harness.proxy_base_url()))
+        .await
+        .expect("gateway returns timeout response");
+    let elapsed = started.elapsed();
+    let body = String::from_utf8_lossy(&response.body_bytes);
+
+    assert_eq!(response.status, StatusCode::GATEWAY_TIMEOUT, "body={body}");
+    assert!(
+        body.contains("Backend timeout"),
+        "unexpected timeout response body: {body}"
+    );
+
+    let expected = Duration::from_millis(read_timeout_ms);
+    let floor = expected.saturating_sub(Duration::from_millis(200));
+    let ceiling = expected + Duration::from_millis(1500);
+    assert!(
+        elapsed >= floor,
+        "timed out too fast: {elapsed:?} < floor {floor:?} (timeout was {read_timeout_ms}ms)"
+    );
+    assert!(
+        elapsed <= ceiling,
+        "timed out too slowly: {elapsed:?} > ceiling {ceiling:?} (timeout was {read_timeout_ms}ms)"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Test 7 (bonus) — gRPC pool reuses the same H2 connection for back-to-back
 // requests.
 // ────────────────────────────────────────────────────────────────────────────
@@ -834,6 +917,143 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
          expected connection reuse (each RPC should have ridden the same \
          h2 connection)"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_passive_health_ejects_trailer_unavailable_target() {
+    let bad_reservation = reserve_port().await.expect("reserve bad backend port");
+    let bad_port = bad_reservation.port;
+    let mut bad_builder = ScriptedGrpcBackend::builder_plain(bad_reservation.into_listener());
+    for _ in 0..6 {
+        bad_builder = bad_builder
+            .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+            .step(GrpcStep::SendInitialHeaders)
+            .step(GrpcStep::RespondStatus {
+                code: 14,
+                message: "unavailable",
+            });
+    }
+    let bad_backend = bad_builder.spawn().expect("spawn bad backend");
+
+    let good_reservation = reserve_port().await.expect("reserve good backend port");
+    let good_port = good_reservation.port;
+    let mut good_builder = ScriptedGrpcBackend::builder_plain(good_reservation.into_listener());
+    for _ in 0..16 {
+        good_builder = good_builder
+            .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+            .step(GrpcStep::SendInitialHeaders)
+            .step(GrpcStep::RespondMessage(Bytes::from_static(b"good")))
+            .step(GrpcStep::RespondStatus {
+                code: 0,
+                message: "",
+            });
+    }
+    let good_backend = good_builder.spawn().expect("spawn good backend");
+
+    let yaml = serde_yaml::to_string(&json!({
+        "version": "1",
+        "proxies": [{
+            "id": "grpc-passive",
+            "listen_path": "/grpc",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": bad_port,
+            "strip_listen_path": true,
+            "upstream_id": "grpc-passive-upstream",
+            "backend_connect_timeout_ms": 1000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+        }],
+        "upstreams": [{
+            "id": "grpc-passive-upstream",
+            "name": "gRPC passive health upstream",
+            "algorithm": "round_robin",
+            "targets": [
+                { "host": "127.0.0.1", "port": bad_port, "weight": 1 },
+                { "host": "127.0.0.1", "port": good_port, "weight": 1 },
+            ],
+            "health_checks": {
+                "passive": {
+                    "unhealthy_status_codes": [500, 502, 503],
+                    "unhealthy_threshold": 1,
+                    "unhealthy_window_seconds": 60,
+                    "healthy_after_seconds": 60,
+                },
+            },
+        }],
+        "consumers": [],
+        "plugin_configs": [],
+    }))
+    .expect("serialize grpc passive config");
+
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+
+    let mut observed_bad = false;
+    for i in 0..4 {
+        let response = client
+            .unary(
+                &format!("/grpc/ferrum.Echo/Warmup{i}"),
+                Bytes::from_static(b""),
+            )
+            .await
+            .expect("warmup response");
+        match response.grpc_status() {
+            Some(14) => {
+                observed_bad = true;
+                break;
+            }
+            Some(0) => {}
+            other => panic!(
+                "unexpected warmup grpc-status={other:?}; headers={:?} trailers={:?}",
+                response.headers, response.trailers
+            ),
+        }
+    }
+    assert!(
+        observed_bad,
+        "warmup never reached the bad target; bad_streams={} good_streams={}",
+        bad_backend.received_stream_count(),
+        good_backend.received_stream_count()
+    );
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    for i in 0..8 {
+        let response = client
+            .unary(
+                &format!("/grpc/ferrum.Echo/AfterEject{i}"),
+                Bytes::from_static(b""),
+            )
+            .await
+            .expect("post-ejection response");
+        assert_eq!(
+            response.grpc_status(),
+            Some(0),
+            "passive health did not eject the grpc-status=14 target; response={response:?}"
+        );
+        assert!(
+            response.messages.iter().any(|m| m.as_ref() == b"good"),
+            "healthy backend response missing expected payload; response={response:?}"
+        );
+    }
+
+    bad_backend.assert_no_step_errors().await;
+    good_backend.assert_no_step_errors().await;
 }
 
 // A small-but-mighty regression test: the scripted-backend framework

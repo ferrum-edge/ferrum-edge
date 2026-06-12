@@ -833,6 +833,43 @@ fn invalid_config_shapes_are_rejected() {
     }
 }
 
+#[test]
+fn validation_upstream_and_catalog_limits_parse() {
+    let mut config = transparent_config("http://127.0.0.1:9/mcp");
+    config["validation"] = json!({
+        "max_upstream_response_bytes": 1024,
+        "max_catalog_items_per_list": 5,
+        "max_catalog_bytes_per_list": 2048
+    });
+    assert!(
+        create_plugin("mcp_gateway", &config).is_ok(),
+        "positive upstream/catalog limit overrides should be accepted"
+    );
+}
+
+#[test]
+fn validation_zero_limits_are_rejected() {
+    // Zero would disable a DoS backstop, so each limit must reject 0.
+    for field in [
+        "max_upstream_response_bytes",
+        "max_catalog_items_per_list",
+        "max_catalog_bytes_per_list",
+    ] {
+        let mut config = transparent_config("http://127.0.0.1:9/mcp");
+        let mut validation = serde_json::Map::new();
+        validation.insert(field.to_string(), json!(0));
+        config["validation"] = Value::Object(validation);
+
+        let err = create_plugin("mcp_gateway", &config)
+            .err()
+            .unwrap_or_else(|| panic!("{field} = 0 must be rejected"));
+        assert!(
+            err.contains(field),
+            "rejection should name {field}, got: {err}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn transparent_post_sets_direct_route_override_and_metadata() {
     let plugin = create_plugin(
