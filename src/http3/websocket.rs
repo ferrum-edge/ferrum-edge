@@ -405,7 +405,7 @@ pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_h3_websocket(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     request_guard: crate::overload::RequestGuard,
     per_ip_guard: Option<crate::proxy::PerIpRequestGuard>,
     epoch: Arc<RequestEpoch>,

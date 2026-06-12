@@ -280,6 +280,11 @@ pub async fn start_http3_listener_with_signal(
     }
 
     let mut shutdown_rx = shutdown;
+    // Wrap the ~60-Arc ProxyState in a single Arc once at listener start so
+    // per-connection and per-request-stream handoffs cost one refcount bump
+    // instead of a full field-by-field clone (issue #1570 sub-item 1; same
+    // treatment as the H1/H2 service_fn path).
+    let state = Arc::new(state);
     // Captured before the accept loop so each spawned connection task can apply
     // the same QUIC handshake bound without reading `state.env_config` per-conn.
     // `Duration::ZERO` preserves the documented "0 disables" semantic.
@@ -327,7 +332,7 @@ pub async fn start_http3_listener_with_signal(
                             connecting.refuse();
                             continue;
                         }
-                        let state = state.clone();
+                        let state = Arc::clone(&state);
                         tokio::spawn(async move {
                             let _conn_guard =
                                 crate::overload::ConnectionGuard::new(&state.overload);
@@ -471,7 +476,7 @@ where
 /// Handle a single HTTP/3 connection (may carry multiple streams/requests).
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     handshake_timeout: Duration,
     frontend_listen_port: Option<u16>,
 ) -> Result<(), anyhow::Error> {
@@ -631,7 +636,7 @@ async fn handle_h3_connection(
                     socket_ip = Arc::from(current_addr.ip().to_string());
                 }
 
-                let state = state.clone();
+                let state = Arc::clone(&state);
                 let cert = client_cert_der.clone();
                 let chain = client_cert_chain_der.clone();
                 let frontend_sni_hostname = frontend_sni_hostname.clone();
@@ -685,7 +690,7 @@ async fn handle_h3_connection(
 async fn handle_h3_request(
     req: http::Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     socket_ip: &str,
     frontend_listen_port: Option<u16>,

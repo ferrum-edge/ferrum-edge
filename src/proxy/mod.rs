@@ -3531,22 +3531,24 @@ impl ProxyState {
                         tracing::info!(
                             "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
                         );
-                        // Warn if the tokio blocking-thread pool is too small for the
-                        // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
-                        // tasks per TCP connection (one per direction). With the default
-                        // cap of 512, thousands of concurrent streams will saturate the
-                        // pool and new splices will queue, causing latency spikes. 1024
-                        // is the rule-of-thumb floor; operators with very high connection
-                        // counts should set FERRUM_BLOCKING_THREADS much higher or
-                        // disable io_uring splice entirely.
+                        // io_uring splice spawns 2 `spawn_blocking` tasks per relayed
+                        // TCP connection (one per direction), but concurrent io_uring
+                        // relays are semaphore-capped at IO_URING_SPLICE_MAX_CONCURRENT
+                        // (128) in tcp_proxy.rs — beyond the cap, additional relays
+                        // transparently fall back to the async splice path instead of
+                        // queueing on the blocking pool. Worst-case io_uring usage is
+                        // therefore 256 blocking threads. Warn only when the configured
+                        // pool is smaller than the default 512: 256 io_uring threads
+                        // would then crowd out other `spawn_blocking` users.
                         let effective_blocking_threads =
                             env_config_arc.blocking_threads.unwrap_or(512);
-                        if effective_blocking_threads < 1024 {
+                        if effective_blocking_threads < 512 {
                             tracing::warn!(
                                 blocking_threads = effective_blocking_threads,
-                                "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
-                             each TCP stream consumes 2 blocking threads. \
-                             Recommended: FERRUM_BLOCKING_THREADS >= 1024 for io_uring splice.",
+                                "FERRUM_IO_URING_SPLICE_ENABLED=true with FERRUM_BLOCKING_THREADS={} below the 512 default; \
+                             io_uring splice can occupy up to 256 blocking threads (128 concurrent relays x 2 directions; \
+                             further relays fall back to async splice). \
+                             Recommended: FERRUM_BLOCKING_THREADS >= 512 so other spawn_blocking work keeps headroom.",
                                 effective_blocking_threads
                             );
                         }

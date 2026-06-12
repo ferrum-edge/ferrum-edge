@@ -1111,11 +1111,7 @@ async fn run_tcp_accept_loop(
                             &client_ip,
                         );
                     let epoch = request_epoch.load();
-                    let base_proxy = epoch
-                        .config
-                        .proxies
-                        .iter()
-                        .find(|p| p.id.as_str() == proxy_id.as_ref());
+                    let base_proxy = epoch.proxy_by_id(proxy_id.as_ref());
                     let consumer_index =
                         Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
 
@@ -1201,11 +1197,7 @@ async fn run_tcp_accept_loop(
                     // config reloads; using the connection epoch preserves a
                     // consistent view of SNI-selected proxy metadata and
                     // stream plugins for the full connection lifetime.
-                    let final_proxy = epoch
-                        .config
-                        .proxies
-                        .iter()
-                        .find(|p| p.id == final_proxy_id);
+                    let final_proxy = epoch.proxy_by_id(&final_proxy_id);
                     let plugins = epoch
                         .plugin_cache
                         .get_plugins_for_protocol(&final_proxy_id, ProxyProtocol::Tcp);

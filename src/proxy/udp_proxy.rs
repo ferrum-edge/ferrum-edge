@@ -2074,10 +2074,7 @@ async fn handle_dtls_client_inner(
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let proxy = epoch
-        .config
-        .proxies
-        .iter()
-        .find(|p| p.id == proxy_id)
+        .proxy_by_id(proxy_id)
         .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", proxy_id))?
         .clone();
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
