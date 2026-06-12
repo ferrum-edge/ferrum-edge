@@ -7240,17 +7240,76 @@ enum WsNextMessage {
     IdleTimeout,
 }
 
-async fn next_websocket_message<S>(stream: &mut S, idle_timeout: Option<Duration>) -> WsNextMessage
+/// Connection-wide WebSocket idle tracker shared by both relay directions.
+///
+/// `last_activity_ms` holds milliseconds since `epoch`, refreshed whenever a
+/// frame (data or control) arrives from EITHER side. Each direction derives
+/// its wait from this shared watermark, so a timer expiry on one half is only
+/// terminal when the OTHER half also produced no traffic inside the window.
+/// This mirrors the shared `last_activity` idle watchdog used by the
+/// tunnel-mode raw copy (`tcp_proxy::bidirectional_copy_for_relay`) and the
+/// TCP relay: asymmetric sessions (quiet client, chatty backend pushing
+/// notifications/pings) stay open, and the session is torn down only when the
+/// connection as a whole is idle.
+struct WsIdleTracker {
+    timeout: Duration,
+    epoch: Instant,
+    last_activity_ms: AtomicU64,
+}
+
+impl WsIdleTracker {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            epoch: Instant::now(),
+            last_activity_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Record activity: a frame received from either direction.
+    fn touch(&self) {
+        self.last_activity_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// Time left before the shared idle window elapses; `None` when expired.
+    fn remaining(&self) -> Option<Duration> {
+        let idle_ms = self
+            .now_ms()
+            .saturating_sub(self.last_activity_ms.load(Ordering::Relaxed));
+        self.timeout
+            .checked_sub(Duration::from_millis(idle_ms))
+            .filter(|remaining| !remaining.is_zero())
+    }
+}
+
+async fn next_websocket_message<S>(stream: &mut S, idle: Option<&WsIdleTracker>) -> WsNextMessage
 where
     S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    if let Some(timeout) = idle_timeout.filter(|timeout| !timeout.is_zero()) {
-        match tokio::time::timeout(timeout, stream.next()).await {
-            Ok(item) => WsNextMessage::Item(item),
-            Err(_) => WsNextMessage::IdleTimeout,
+    let Some(idle) = idle else {
+        // Idle timeout disabled: await the stream directly — no timer, no
+        // atomics, zero added overhead.
+        return WsNextMessage::Item(stream.next().await);
+    };
+    loop {
+        // Re-derive the wait from the shared watermark each pass: the other
+        // relay direction may have refreshed it while this half was parked,
+        // in which case the local timer expiry is not terminal and the wait
+        // continues for the remainder of the window.
+        let Some(remaining) = idle.remaining() else {
+            return WsNextMessage::IdleTimeout;
+        };
+        if let Ok(item) = tokio::time::timeout(remaining, stream.next()).await {
+            if item.is_some() {
+                idle.touch();
+            }
+            return WsNextMessage::Item(item);
         }
-    } else {
-        WsNextMessage::Item(stream.next().await)
     }
 }
 
@@ -7447,8 +7506,13 @@ where
     > = Arc::new(std::sync::OnceLock::new());
     let first_failure_ctb = first_failure.clone();
     let first_failure_btc = first_failure.clone();
-    let websocket_idle_timeout_ctb = websocket_idle_timeout;
-    let websocket_idle_timeout_btc = websocket_idle_timeout;
+    // Connection-wide idle tracker shared by both relay halves (see
+    // `WsIdleTracker`). `None` when the timeout is disabled — the relay then
+    // awaits `stream.next()` directly with zero added overhead.
+    let ws_idle_tracker =
+        websocket_idle_timeout.map(|timeout| Arc::new(WsIdleTracker::new(timeout)));
+    let ws_idle_tracker_ctb = ws_idle_tracker.clone();
+    let ws_idle_tracker_btc = ws_idle_tracker;
 
     // Cancellation token for clean bidirectional close when a plugin triggers Close.
     // Each direction checks this token to know if the other side initiated a close.
@@ -7479,7 +7543,7 @@ where
                     .await;
                     break;
                 }
-                msg = next_websocket_message(&mut ws_stream, websocket_idle_timeout_ctb) => {
+                msg = next_websocket_message(&mut ws_stream, ws_idle_tracker_ctb.as_deref()) => {
                     let msg = match msg {
                         WsNextMessage::Item(Some(msg)) => msg,
                         WsNextMessage::Item(None) => break,
@@ -7487,15 +7551,20 @@ where
                             debug!(
                                 proxy_id = %proxy_id_ctb,
                                 connection_id,
-                                idle_timeout_seconds = websocket_idle_timeout_ctb
-                                    .map(|timeout| timeout.as_secs())
+                                idle_timeout_seconds = ws_idle_tracker_ctb
+                                    .as_deref()
+                                    .map(|idle| idle.timeout.as_secs())
                                     .unwrap_or_default(),
-                                "WebSocket client->backend relay idle timeout"
+                                "WebSocket session idle timeout: no frames in either direction \
+                                 (observed on client->backend half)"
                             );
+                            // Connection-wide idle: neither direction produced
+                            // a frame, so attribution matches the tunnel-mode
+                            // shared idle watchdog (Unknown direction, no side).
                             let _ = first_failure_ctb.set((
-                                crate::plugins::Direction::ClientToBackend,
+                                crate::plugins::Direction::Unknown,
                                 retry::ErrorClass::ReadWriteTimeout,
-                                Some(tcp_proxy::StreamIoSide::Read),
+                                None,
                             ));
                             break;
                         }
@@ -7655,7 +7724,7 @@ where
                     .await;
                     break;
                 }
-                msg = next_websocket_message(&mut backend_stream, websocket_idle_timeout_btc) => {
+                msg = next_websocket_message(&mut backend_stream, ws_idle_tracker_btc.as_deref()) => {
                     let msg = match msg {
                         WsNextMessage::Item(Some(msg)) => msg,
                         WsNextMessage::Item(None) => break,
@@ -7663,15 +7732,20 @@ where
                             debug!(
                                 proxy_id = %proxy_id_btc,
                                 connection_id,
-                                idle_timeout_seconds = websocket_idle_timeout_btc
-                                    .map(|timeout| timeout.as_secs())
+                                idle_timeout_seconds = ws_idle_tracker_btc
+                                    .as_deref()
+                                    .map(|idle| idle.timeout.as_secs())
                                     .unwrap_or_default(),
-                                "WebSocket backend->client relay idle timeout"
+                                "WebSocket session idle timeout: no frames in either direction \
+                                 (observed on backend->client half)"
                             );
+                            // Connection-wide idle: neither direction produced
+                            // a frame, so attribution matches the tunnel-mode
+                            // shared idle watchdog (Unknown direction, no side).
                             let _ = first_failure_btc.set((
-                                crate::plugins::Direction::BackendToClient,
+                                crate::plugins::Direction::Unknown,
                                 retry::ErrorClass::ReadWriteTimeout,
-                                Some(tcp_proxy::StreamIoSide::Read),
+                                None,
                             ));
                             break;
                         }
@@ -18231,9 +18305,49 @@ mod tests {
         let mut stream = futures_util::stream::pending::<
             Result<Message, tokio_tungstenite::tungstenite::Error>,
         >();
+        let idle = WsIdleTracker::new(Duration::from_millis(5));
 
-        let item = next_websocket_message(&mut stream, Some(Duration::from_millis(5))).await;
+        let item = next_websocket_message(&mut stream, Some(&idle)).await;
 
+        assert!(matches!(item, WsNextMessage::IdleTimeout));
+    }
+
+    #[tokio::test]
+    async fn next_websocket_message_counter_direction_activity_prevents_expiry() {
+        let mut stream = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+        let idle = Arc::new(WsIdleTracker::new(Duration::from_millis(300)));
+
+        // Simulate the OTHER relay half receiving frames: refresh the shared
+        // watermark every 100ms, well inside the 300ms idle window.
+        let toucher = {
+            let idle = idle.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    idle.touch();
+                }
+            })
+        };
+
+        // The quiet half's wait must NOT expire while the counter-direction
+        // keeps refreshing the watermark, even though 350ms > the 300ms
+        // window. Pre-fix, a per-direction timeout would have fired at 300ms.
+        let waited = tokio::time::timeout(
+            Duration::from_millis(350),
+            next_websocket_message(&mut stream, Some(idle.as_ref())),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "counter-direction activity must defer the shared idle expiry"
+        );
+
+        // Once the counter-direction goes quiet too, the same wait expires
+        // after the idle window truly elapses with no activity on either side.
+        toucher.abort();
+        let item = next_websocket_message(&mut stream, Some(idle.as_ref())).await;
         assert!(matches!(item, WsNextMessage::IdleTimeout));
     }
 
