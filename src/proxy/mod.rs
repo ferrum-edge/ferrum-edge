@@ -17109,9 +17109,8 @@ async fn proxy_to_backend_http3(
                 return match h3_result {
                     Ok(response) => {
                         if stream_response {
-                            let response_headers = response.headers.clone();
                             if let Some(len) = declared_response_length_exceeds_limit(
-                                &response_headers,
+                                &response.headers,
                                 state.max_response_body_size_bytes,
                             ) {
                                 return (
@@ -17133,7 +17132,11 @@ async fn proxy_to_backend_http3(
                                 retry::BackendResponse {
                                     status_code: response.status,
                                     body: ResponseBody::StreamingH3(Box::new(response)),
-                                    headers: response_headers,
+                                    // The sole caller moves the headers out of the
+                                    // `StreamingH3` payload via
+                                    // `std::mem::take(&mut h3_resp.headers)` — leave
+                                    // this empty instead of cloning the map per request.
+                                    headers: HashMap::new(),
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip,
                                     error_class: None,
@@ -17492,9 +17495,8 @@ async fn proxy_to_backend_http3(
 
         match h3_result {
             Ok(response) => {
-                let response_headers = response.headers.clone();
                 if let Some(len) = declared_response_length_exceeds_limit(
-                    &response_headers,
+                    &response.headers,
                     state.max_response_body_size_bytes,
                 ) {
                     return (
@@ -17516,7 +17518,11 @@ async fn proxy_to_backend_http3(
                     retry::BackendResponse {
                         status_code: response.status,
                         body: ResponseBody::StreamingH3(Box::new(response)),
-                        headers: response_headers,
+                        // The sole caller moves the headers out of the
+                        // `StreamingH3` payload via
+                        // `std::mem::take(&mut h3_resp.headers)` — leave
+                        // this empty instead of cloning the map per request.
+                        headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: None,

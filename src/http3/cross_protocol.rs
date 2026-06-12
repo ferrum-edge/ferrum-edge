@@ -3024,7 +3024,7 @@ where
                                 Ok(d) => d,
                                 Err(_) => {
                                     body_error_class = Some(ErrorClass::ProtocolError);
-                                    let _ = stream.finish().await;
+                                    crate::http3::stream_util::abort_response_stream(stream);
                                     break 'outer;
                                 }
                             };

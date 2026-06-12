@@ -246,30 +246,54 @@ fn build_h3_quinn_server_config(
     Ok(server_config)
 }
 
+/// Failure side for [`finish_h3_response_with_backend_trailers`].
+///
+/// The trailer-finish phase touches both ends of the relay: reading
+/// trailers from the BACKEND recv stream and sending trailers/FIN to the
+/// CLIENT send stream. Call sites must not conflate the two — a backend
+/// trailer-read fault is a backend transport error (classified via
+/// `classify_http3_error`, reported to circuit breaker / passive health),
+/// while a client send/finish failure is a genuine `ClientDisconnect`.
+enum H3TrailerFinishError {
+    /// `recv_trailers()` on the backend stream failed non-gracefully.
+    Backend(h3::error::StreamError),
+    /// `send_trailers()` / `finish()` toward the client failed. The
+    /// underlying error is intentionally dropped — call sites uniformly
+    /// classify this side as `ClientDisconnect`.
+    Client,
+}
+
 async fn finish_h3_response_with_backend_trailers<S>(
     h3_stream: &mut RequestStream<S, Bytes>,
     recv_stream: &mut crate::http3::client::H3RequestStream,
-) -> Result<(), h3::error::StreamError>
+) -> Result<(), H3TrailerFinishError>
 where
     S: SendStream<Bytes>,
 {
     let trailers = match recv_stream.recv_trailers().await {
         Ok(trailers) => trailers,
         Err(err) if crate::http3::client::is_h3_graceful_close(&err) => None,
-        Err(err) => return Err(err),
+        Err(err) => return Err(H3TrailerFinishError::Backend(err)),
     };
 
     match trailers {
         Some(mut trailers) => {
             strip_response_hop_by_hop_trailers(&mut trailers);
-            if trailers.is_empty() {
-                h3_stream.finish().await
-            } else {
-                h3_stream.send_trailers(trailers).await?;
-                h3_stream.finish().await
+            if !trailers.is_empty() {
+                h3_stream
+                    .send_trailers(trailers)
+                    .await
+                    .map_err(|_| H3TrailerFinishError::Client)?;
             }
+            h3_stream
+                .finish()
+                .await
+                .map_err(|_| H3TrailerFinishError::Client)
         }
-        None => h3_stream.finish().await,
+        None => h3_stream
+            .finish()
+            .await
+            .map_err(|_| H3TrailerFinishError::Client),
     }
 }
 
@@ -2810,14 +2834,25 @@ async fn handle_h3_request(
                     bytes_streamed += data_len;
                 }
                 let finish_result = if response_inspector.is_some() {
-                    stream.finish().await
+                    stream
+                        .finish()
+                        .await
+                        .map_err(|_| H3TrailerFinishError::Client)
                 } else {
                     finish_h3_response_with_backend_trailers(&mut stream, &mut h3_resp.recv_stream)
                         .await
                 };
                 match finish_result {
                     Ok(_) => body_completed = true,
-                    Err(_) => {
+                    Err(H3TrailerFinishError::Backend(err)) => {
+                        error!(
+                            "Error reading backend h3 response trailers during streaming: {}",
+                            err
+                        );
+                        crate::http3::stream_util::abort_response_stream(&mut stream);
+                        body_error_class = Some(crate::http3::client::classify_http3_error(&err));
+                    }
+                    Err(H3TrailerFinishError::Client) => {
                         client_disconnected = true;
                         body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                     }
@@ -4662,7 +4697,17 @@ async fn stream_h3_open_response_to_client(
             }
             match finish_h3_response_with_backend_trailers(h3_stream, &mut recv_stream).await {
                 Ok(_) => body_completed = true,
-                Err(_) => {
+                Err(H3TrailerFinishError::Backend(err)) => {
+                    error!(
+                        "Error reading backend h3 response trailers during refined streaming: {}",
+                        err
+                    );
+                    crate::http3::stream_util::abort_response_stream(h3_stream);
+                    let class = crate::http3::client::classify_http3_error(&err);
+                    terminal_error_class = Some(class);
+                    body_error_class = Some(class);
+                }
+                Err(H3TrailerFinishError::Client) => {
                     client_disconnected = true;
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                 }
@@ -5058,7 +5103,17 @@ async fn proxy_to_backend_h3_streaming(
                 .await
             {
                 Ok(_) => body_completed = true,
-                Err(_) => {
+                Err(H3TrailerFinishError::Backend(err)) => {
+                    error!(
+                        "Error reading backend h3 response trailers during streaming: {}",
+                        err
+                    );
+                    crate::http3::stream_util::abort_response_stream(h3_stream);
+                    let class = crate::http3::client::classify_http3_error(&err);
+                    terminal_error_class = Some(class);
+                    body_error_class = Some(class);
+                }
+                Err(H3TrailerFinishError::Client) => {
                     client_disconnected = true;
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                 }
