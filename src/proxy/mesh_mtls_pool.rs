@@ -112,6 +112,11 @@ pub fn target_mesh_mtls_expected_peer(target: &UpstreamTarget) -> Result<SpiffeI
 /// task ever consumes the records, so the registry must be capped or a
 /// rotation storm grows it unbounded.
 const MAX_RETIRED_SVID_GENERATIONS: usize = 16;
+/// Upper bound on fingerprints filed under one generation. Normally a
+/// generation retires exactly one fingerprint; a frozen generation counter
+/// (starved rotation consumer) funnels every rotation into one bucket, which
+/// must not grow unbounded either.
+const MAX_RETIRED_FINGERPRINTS_PER_GENERATION: usize = 8;
 
 pub struct MeshMtlsConnectionPool {
     entries: DashMap<String, Vec<MeshMtlsPoolEntry>>,
@@ -225,6 +230,13 @@ impl MeshMtlsConnectionPool {
     }
 
     fn record_retired_fingerprint(&self, generation: u64, fingerprint: Arc<str>) {
+        // Bound the per-generation list as well as the generation count: when
+        // the rotation consumer is starved or dead, every rotation stamps the
+        // same frozen generation and would grow one Vec unbounded while the
+        // key-count cap below never trips. Overflow is drained immediately
+        // (early is safe, never is not). Drains happen after the shard guard
+        // is released.
+        let mut overflowed: Vec<Arc<str>> = Vec::new();
         {
             let mut retired = self
                 .retired_svid_fingerprints
@@ -236,6 +248,12 @@ impl MeshMtlsConnectionPool {
             {
                 retired.push(fingerprint);
             }
+            while retired.len() > MAX_RETIRED_FINGERPRINTS_PER_GENERATION {
+                overflowed.push(retired.remove(0));
+            }
+        }
+        if !overflowed.is_empty() {
+            self.drain_retired_fingerprints(&overflowed);
         }
         // Cap the registry: with the drain window disabled nothing consumes
         // these records, and a rotation storm must not grow them unbounded.
@@ -425,6 +443,10 @@ impl MeshMtlsConnectionPool {
             addr: format!("{target_host}:{mtls_port}"),
             timeout_ms: proxy.backend_connect_timeout_ms,
         })?;
+        // Snapshot the SVID slot before dialing: the SPIFFE TLS resolver and
+        // verifier read the slot at HANDSHAKE time, so "slot unchanged across
+        // the dial" proves the session was built from exactly this material.
+        let svid_slot_before_dial = self.gateway_svid.load_full();
         let sender = match tokio::time::timeout(
             remaining,
             self.create_sender(proxy, target_host, mtls_port, expected_peer, pool_config),
@@ -455,15 +477,20 @@ impl MeshMtlsConnectionPool {
         // resurrect it AFTER its one-shot drain already ran, leaving an
         // old-identity session alive until idle pruning (forever with
         // `idle_timeout_seconds=0`). Serve the triggering request on the
-        // connection, but only pool it while the key's fingerprint is still
-        // the current one — pre-drain inserts under a retired-but-undrained
-        // key are also skipped, which merely costs those stragglers pooling
-        // during the drain window.
+        // connection, but only pool it while (a) the slot is unchanged across
+        // the dial — catches same-leaf trust-bundle rotations the fingerprint
+        // cannot see — and (b) the key's fingerprint is still the current one
+        // — catches rotations between key construction and the slot snapshot.
+        // Pre-drain inserts under a retired-but-undrained key are also
+        // skipped, which merely costs those stragglers pooling during the
+        // drain window.
+        let svid_slot_unchanged =
+            Arc::ptr_eq(&svid_slot_before_dial, &self.gateway_svid.load_full());
         let key_fingerprint_is_current = self
             .current_svid_fingerprint_cached()
             .ok()
             .is_some_and(|current| mesh_mtls_key_svid_fingerprint(key) == Some(current.as_ref()));
-        if !key_fingerprint_is_current {
+        if !svid_slot_unchanged || !key_fingerprint_is_current {
             debug!(
                 target_host,
                 mtls_port,
@@ -1166,6 +1193,47 @@ mod tests {
             "registry cap eviction must drain the evicted generation's entries"
         );
         assert!(pool.retired_svid_fingerprints.len() <= MAX_RETIRED_SVID_GENERATIONS);
+    }
+
+    #[test]
+    fn per_generation_retired_list_is_capped_and_drains_overflow() {
+        let bundle_0 = svid_bundle(b"frozen-leaf-0");
+        let fingerprint_0 = svid_fingerprint(&bundle_0).unwrap();
+        let gateway_svid = Arc::new(ArcSwap::new(Arc::new(Some(bundle_0))));
+        // Frozen generation counter: a starved rotation consumer stamps every
+        // rotation with the same generation, funnelling all retirements into
+        // one bucket.
+        let generation = Arc::new(AtomicU64::new(3));
+        let pool = MeshMtlsConnectionPool::new_with_svid_generation(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            gateway_svid.clone(),
+            4,
+            generation.clone(),
+        );
+        pool.current_svid_fingerprint_cached().unwrap();
+        let key_0 = key_for_fingerprint("a.default.svc.cluster.local", &fingerprint_0);
+        insert_empty_entry(&pool, &key_0);
+
+        for revision in 1..=(MAX_RETIRED_FINGERPRINTS_PER_GENERATION as u64 * 2) {
+            let leaf = format!("frozen-leaf-{revision}");
+            gateway_svid.store(Arc::new(Some(svid_bundle(leaf.as_bytes()))));
+            pool.current_svid_fingerprint_cached().unwrap();
+        }
+
+        let bucket_len = pool
+            .retired_svid_fingerprints
+            .get(&3)
+            .map(|bucket| bucket.len())
+            .unwrap_or(0);
+        assert!(
+            bucket_len <= MAX_RETIRED_FINGERPRINTS_PER_GENERATION,
+            "per-generation bucket must stay bounded under a frozen generation counter"
+        );
+        assert!(
+            !pool.entries.contains_key(&key_0),
+            "fingerprints evicted from a full bucket must drain their entries"
+        );
     }
 
     #[test]
