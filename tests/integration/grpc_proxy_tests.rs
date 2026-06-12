@@ -22,7 +22,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, ResponseBodyMode,
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginConfig, PluginScope, Proxy,
+    ResponseBodyMode,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::ProxyState;
@@ -198,6 +199,48 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
 /// Create a ProxyState configured with gRPC proxies.
 fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
     create_test_proxy_state_with_env(proxies, create_test_env_config())
+}
+
+/// Like [`create_test_proxy_state`] but with caller-supplied plugin configs so
+/// a test can attach response hooks (e.g. `response_transformer`).
+fn create_test_proxy_state_with_plugins(
+    proxies: Vec<Proxy>,
+    plugin_configs: Vec<PluginConfig>,
+) -> ProxyState {
+    let dns_cache = DnsCache::new(DnsConfig {
+        global_overrides: HashMap::new(),
+        resolver_addresses: None,
+        hosts_file_path: None,
+        dns_order: None,
+        ttl_override_seconds: None,
+        min_ttl_seconds: 5,
+        stale_ttl_seconds: 3600,
+        error_ttl_seconds: 1,
+        max_cache_size: 10_000,
+        warmup_concurrency: 500,
+        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        slow_threshold_ms: None,
+        refresh_threshold_percent: 90,
+        failed_retry_interval_seconds: 10,
+        try_tcp_on_error: true,
+        num_concurrent_reqs: 3,
+        max_active_requests: 512,
+        max_concurrent_refreshes: 64,
+        shard_amount: 0,
+    });
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        proxies,
+        consumers: vec![],
+        plugin_configs,
+        upstreams: vec![],
+        loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
+        ..Default::default()
+    };
+    let (state, _health_check_handles) =
+        ProxyState::new(config, dns_cache, create_test_env_config(), None, None).unwrap();
+    state
 }
 
 /// Like [`create_test_proxy_state`] but with a caller-supplied `EnvConfig` so a
@@ -887,6 +930,186 @@ async fn grpc_buffered_non_empty_response_sends_status_as_trailer() {
     assert!(saw_data, "backend DATA frame was not forwarded");
     assert_eq!(grpc_status.as_deref(), Some("0"));
     assert_eq!(grpc_message.as_deref(), Some("OK"));
+}
+
+/// Mock gRPC backend that sends a non-empty DATA frame plus a fixed trailer
+/// fixture, with `x-dup-key` present in BOTH the initial headers
+/// (`header-value`) and the trailers (`trailer-value`), and an extra
+/// `x-removed-trailer` trailer for a response hook to strip.
+async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let _ = stream.set_nodelay(true);
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let builder = Http2ServerBuilder::new(TokioExecutor::new());
+
+                let service = service_fn(move |_req: Request<Incoming>| async move {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<
+                        Result<Frame<Bytes>, std::convert::Infallible>,
+                    >(4);
+
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(Ok(Frame::data(Bytes::from_static(b"grpc-payload"))))
+                            .await;
+                        let mut trailers = hyper::HeaderMap::new();
+                        trailers.insert(
+                            hyper::header::HeaderName::from_static("grpc-status"),
+                            hyper::header::HeaderValue::from_static("0"),
+                        );
+                        trailers.insert(
+                            hyper::header::HeaderName::from_static("grpc-message"),
+                            hyper::header::HeaderValue::from_static("OK"),
+                        );
+                        trailers.insert(
+                            hyper::header::HeaderName::from_static("x-dup-key"),
+                            hyper::header::HeaderValue::from_static("trailer-value"),
+                        );
+                        trailers.insert(
+                            hyper::header::HeaderName::from_static("x-removed-trailer"),
+                            hyper::header::HeaderValue::from_static("should-not-reach-client"),
+                        );
+                        let _ = tx.send(Ok(Frame::trailers(trailers))).await;
+                    });
+
+                    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                    let body = StreamBody::new(stream);
+
+                    let response = Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .header("x-dup-key", "header-value")
+                        .body(body)
+                        .unwrap();
+
+                    Ok::<_, hyper::Error>(response)
+                });
+
+                if let Err(e) = builder.serve_connection(io, service).await {
+                    eprintln!("Trailer-fixture backend connection error: {}", e);
+                }
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, handle)
+}
+
+/// Buffered gRPC writeback reconciliation:
+/// - a trailer key removed by a response hook (response_transformer `remove`)
+///   must NOT be forwarded in the wire trailers;
+/// - a key the backend sent in BOTH initial headers and trailers must keep the
+///   backend's true trailer value in the wire TRAILERS frame while the initial
+///   header stays an initial header (H3 bridge wire shape).
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys() {
+    let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
+
+    let mut proxy = create_grpc_proxy("grpc-trailer-writeback", "/grpc", backend_addr.port());
+    proxy.response_body_mode = ResponseBodyMode::Buffer;
+    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: "rt-trailer-remove".to_string(),
+    }];
+    let plugin = PluginConfig {
+        id: "rt-trailer-remove".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "response_transformer".to_string(),
+        enabled: true,
+        config: serde_json::json!({
+            "rules": [
+                { "target": "header", "operation": "remove", "key": "x-removed-trailer" }
+            ]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("grpc-trailer-writeback".to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/grpc/my.Service/Unary")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let response = sender.send_request(req).await.expect("request send failed");
+    assert_eq!(response.status(), 200);
+    assert!(
+        response.headers().get("grpc-status").is_none(),
+        "grpc-status must not appear as initial metadata for non-empty responses"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-dup-key")
+            .and_then(|v| v.to_str().ok()),
+        Some("header-value"),
+        "backend initial header duplicated in trailers must stay an initial header"
+    );
+    assert!(
+        response.headers().get("x-removed-trailer").is_none(),
+        "hook-removed key must not appear as an initial header"
+    );
+
+    let mut saw_data = false;
+    let mut wire_trailers: Option<hyper::HeaderMap> = None;
+    let mut body = response.into_body();
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.expect("response frame");
+        if let Some(data) = frame.data_ref()
+            && !data.is_empty()
+        {
+            saw_data = true;
+        }
+        if let Some(trailers) = frame.trailers_ref() {
+            wire_trailers = Some(trailers.clone());
+        }
+    }
+
+    assert!(saw_data, "backend DATA frame was not forwarded");
+    let trailers = wire_trailers.expect("wire TRAILERS frame missing");
+    assert_eq!(
+        trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("0")
+    );
+    assert_eq!(
+        trailers.get("x-dup-key").and_then(|v| v.to_str().ok()),
+        Some("trailer-value"),
+        "wire trailer must carry the backend's true trailer value, not the duplicate initial header value"
+    );
+    assert!(
+        trailers.get("x-removed-trailer").is_none(),
+        "trailer removed by a response hook must not be forwarded to the client"
+    );
 }
 
 /// Fix 4: with retry configured, a gRPC server-streaming response with

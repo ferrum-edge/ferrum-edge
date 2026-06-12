@@ -11431,13 +11431,22 @@ async fn handle_proxy_request_inner(
                 // Plugins historically saw a merged header+trailer map on the
                 // buffered gRPC path because trailers were inserted into
                 // response headers before hooks ran. Keep that compatibility
-                // view, but split the wire response back into HEADERS + DATA +
-                // TRAILERS when the final body is non-empty.
+                // view (same convention as the H3 bridge in
+                // `http3::cross_protocol`: a trailer never overrides a real
+                // header in the view), but split the wire response back into
+                // HEADERS + DATA + TRAILERS when the final body is non-empty.
+                // Trailer keys the backend ALSO sent as real initial headers
+                // are tracked so the post-hook writeback never copies the
+                // header's value into the wire trailer (the view value for
+                // those keys belongs to the header, not the trailer).
                 let mut plugin_response_headers = response_headers.clone();
+                let mut header_shadowed_trailer_keys: HashSet<String> = HashSet::new();
                 for (k, v) in &response_trailers {
-                    plugin_response_headers
-                        .entry(k.clone())
-                        .or_insert_with(|| v.clone());
+                    if response_headers.contains_key(k) {
+                        header_shadowed_trailer_keys.insert(k.clone());
+                    } else {
+                        plugin_response_headers.insert(k.clone(), v.clone());
+                    }
                 }
 
                 // after_proxy hooks
@@ -11630,27 +11639,49 @@ async fn handle_proxy_request_inner(
                 }
 
                 if !after_proxy_rejected {
-                    response_headers = plugin_response_headers.clone();
+                    // Reconcile hook mutations from the merged view back into
+                    // the wire trailers: a trailer-originated key now absent
+                    // from the view was removed by a hook (honor the removal,
+                    // matching the pre-split behavior where trailers lived in
+                    // the headers map plugins mutated); a changed value is a
+                    // hook edit. Keys shadowed by a real backend header were
+                    // never plugin-visible as trailers, so they keep the
+                    // backend's true trailer value.
+                    response_trailers.retain(|k, v| {
+                        if header_shadowed_trailer_keys.contains(k) {
+                            return true;
+                        }
+                        match plugin_response_headers.get(k) {
+                            Some(plugin_value) => {
+                                if plugin_value != v {
+                                    *v = plugin_value.clone();
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    });
+                    response_headers = plugin_response_headers;
                 }
                 if response_body.is_empty() {
                     // True Trailers-Only encoding: no DATA frame, grpc-status
-                    // and friends stay in the initial HEADERS with END_STREAM.
-                    for (k, v) in &response_trailers {
-                        response_headers
-                            .entry(k.clone())
-                            .or_insert_with(|| v.clone());
+                    // and friends ride in the initial HEADERS with END_STREAM.
+                    // Trailer values are authoritative on collapse (pre-split
+                    // merge order), including over duplicate initial headers.
+                    for (k, v) in response_trailers.drain() {
+                        response_headers.insert(k, v);
                     }
-                    response_trailers.clear();
                 } else {
                     // Non-empty gRPC responses must carry grpc-status in a
-                    // terminal trailers frame. Preserve plugin mutations to
-                    // existing trailer keys, then strip those keys from the
-                    // initial headers.
-                    for (k, v) in &mut response_trailers {
-                        if let Some(plugin_value) = plugin_response_headers.get(k) {
-                            *v = plugin_value.clone();
+                    // terminal TRAILERS frame. Strip the view-merged trailer
+                    // copies from the initial headers; keys the backend also
+                    // sent as real initial headers stay headers — the wire
+                    // trailer carries the backend's true trailer value (same
+                    // wire shape as the H3 bridge).
+                    for k in response_trailers.keys() {
+                        if !header_shadowed_trailer_keys.contains(k) {
+                            response_headers.remove(k);
                         }
-                        response_headers.remove(k);
                     }
                 }
 
