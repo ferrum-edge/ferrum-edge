@@ -615,6 +615,14 @@ pub struct RequestContext {
     /// CLIENT vs SERVER span kinds reflect which side of the hop the
     /// listener represents.
     pub mesh_direction: Option<MeshTrafficDirection>,
+    /// Pre-NAT original destination of an iptables-REDIRECTed connection,
+    /// read once per accepted connection on mesh outbound capture listeners
+    /// (`SO_ORIGINAL_DST`) and shared by every request on the connection.
+    /// `None` on non-capture listeners, non-Linux platforms, and
+    /// non-redirected (direct-dial) traffic. Mesh outbound routing uses the
+    /// port to disambiguate multi-port services; the address is reserved for
+    /// the raw-TCP egress follow-up.
+    pub orig_dst: Option<std::net::SocketAddr>,
 }
 
 fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
@@ -685,6 +693,7 @@ impl RequestContext {
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
             mesh_direction: None,
+            orig_dst: None,
         }
     }
 
@@ -748,6 +757,7 @@ impl RequestContext {
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
+            orig_dst: self.orig_dst,
         }
     }
 

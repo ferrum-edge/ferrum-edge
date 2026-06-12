@@ -1448,14 +1448,16 @@ fn mesh_outbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_OUTBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
-/// Upstream id for a materialized Ambient outbound HBONE route. Deliberately
+/// Upstream id for a materialized mesh outbound route, one per HTTP-family
+/// service port (per-port upstreams keep LB counters, hash rings, passive
+/// health, and pool keys isolated per app port). Deliberately
 /// does NOT start with [`MESH_OUTBOUND_PROXY_ID_PREFIX`] (`__mesh-outbound-`) so
 /// it is never misclassified as a direction-scoped *route* by
 /// [`mesh_route_direction`] / [`is_mesh_outbound_route_id`] — those predicates
 /// run on proxy ids, and a shared prefix would be a latent footgun if one were
 /// ever handed an upstream id. Parallels the east-west `__mesh-ew-upstream-` id.
-fn mesh_outbound_upstream_id(namespace: &str, name: &str) -> String {
-    format!("__mesh-out-upstream-{namespace}-{name}").replace(['/', '.'], "-")
+fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("__mesh-out-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
 /// Materialize inbound routes for the sidecar's **local** workload so that
@@ -1564,23 +1566,26 @@ fn materialize_sidecar_inbound_proxies(
             // EVERY service port and would silently forward it to the FIRST
             // port's backend (e.g. `Host: reviews:90` -> the port-80 backend).
             // That is a cross-port misroute, not the clean "unsupported"
-            // rejection callers expect. Until original-destination routing
-            // (Stage 1) can disambiguate by the captured port, fail closed:
-            // materialize NOTHING for a service exposing more than one
-            // HTTP-family port, and warn. Operators who need a specific port
-            // routed sooner can define an explicit proxy (which this
-            // materializer yields to). Single-HTTP-port services — the common
-            // case — are unaffected.
+            // rejection callers expect. OUTBOUND multi-port disambiguation has
+            // landed (captured original destination — `SO_ORIGINAL_DST` — picks
+            // the per-port sibling), but INBOUND `:15006` dials are direct
+            // (never NATed), so the inbound side will instead disambiguate by
+            // the pre-strip `Host`/`:authority` port the egress side preserves
+            // (a later stage). Until then, fail closed: materialize NOTHING for
+            // a local service exposing more than one HTTP-family port, and
+            // warn. Operators who need a specific port routed sooner can define
+            // an explicit proxy (which this materializer yields to).
+            // Single-HTTP-port services — the common case — are unaffected.
             if http_ports.len() > 1 {
                 warn!(
                     service = %service.name,
                     namespace = %service.namespace,
                     http_ports = http_ports.len(),
-                    "Local service exposes multiple HTTP-family ports; host-only routing cannot \
-                     disambiguate them yet (original-destination routing lands in a later stage). \
-                     Skipping inbound materialization for this service to avoid forwarding one \
-                     port's traffic to another port's backend; define an explicit proxy to route \
-                     a specific port."
+                    "Local service exposes multiple HTTP-family ports; inbound host-only routing \
+                     cannot disambiguate them yet (inbound port disambiguation lands in a later \
+                     stage). Skipping inbound materialization for this service to avoid \
+                     forwarding one port's traffic to another port's backend; define an explicit \
+                     proxy to route a specific port."
                 );
                 continue;
             }
@@ -1879,11 +1884,18 @@ enum MeshEgressTransport {
 /// service: host = the service FQDN variants (the router strips the request
 /// port), upstream targets = the service's local-cluster workload addresses
 /// tagged for the topology's transport (each carrying the destination identity
-/// the outbound mTLS handshake pins), one HTTP-family `/` proxy. Proxies carry
+/// the outbound mTLS handshake pins), one HTTP-family `/` proxy **per
+/// HTTP-family service port** with a matching per-port upstream. The route
+/// table groups a service's per-port siblings under one lowest-port
+/// representative (they share hosts + `/`) and the request path swaps in the
+/// sibling matching the connection's captured original-destination port
+/// (`SO_ORIGINAL_DST`), failing closed when the dialed port cannot be
+/// determined for a multi-port service — see
+/// `HostRouteTable::select_mesh_outbound_port_route`. Proxies carry
 /// [`MESH_OUTBOUND_PROXY_ID_PREFIX`] so the request path keeps them off the
 /// inbound listener (direction scoping); they yield to explicit operator proxies
-/// on overlapping hosts. Multi-port services fail closed and `targetPort` is
-/// honored, mirroring the inbound materializer.
+/// on overlapping hosts. `targetPort` is honored, mirroring the inbound
+/// materializer.
 fn materialize_mesh_outbound_proxies(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -1909,11 +1921,14 @@ fn materialize_mesh_outbound_proxies(
     for service in &mesh_slice.services {
         // HTTP-family routability is read from the SERVICE port protocol
         // (Kubernetes container ports carry only the transport protocol).
-        // Fail-closed multi-port rule: host-only routing strips the request port,
-        // so a single `/` route on the service host would forward EVERY port's
-        // outbound traffic to the first port's backend. Materialize nothing for a
-        // service exposing more than one HTTP-family port until
-        // original-destination routing lands.
+        // Multi-port services materialize one route + upstream PER HTTP-family
+        // port: the route table holds one lowest-port representative per
+        // service (host tiers are (host, path)-keyed) and the request path
+        // swaps in the sibling matching the connection's captured
+        // original-destination port (`SO_ORIGINAL_DST`), failing closed when
+        // the dialed port cannot be determined. Per-port upstreams keep LB
+        // counters, hash rings, passive health, and pool keys isolated per
+        // app port.
         let http_ports: Vec<_> = service
             .ports
             .iter()
@@ -1927,109 +1942,105 @@ fn materialize_mesh_outbound_proxies(
                 )
             })
             .collect();
-        if http_ports.len() > 1 {
-            warn!(
-                service = %service.name,
-                namespace = %service.namespace,
-                http_ports = http_ports.len(),
-                "In-mesh service exposes multiple HTTP-family ports; host-only routing cannot \
-                 disambiguate them yet (original-destination routing lands in a later stage). \
-                 Skipping outbound materialization for this service to avoid forwarding one \
-                 port's traffic to another port's backend; define an explicit proxy to route \
-                 a specific port."
+        for service_port in &http_ports {
+            let protocol = service
+                .protocol_overrides
+                .get(&service_port.port)
+                .copied()
+                .unwrap_or(service_port.protocol);
+            let targets = build_outbound_mesh_targets(
+                transport,
+                runtime,
+                service,
+                service_port,
+                protocol,
+                &mesh_slice.workloads,
+                local_cluster,
             );
-            continue;
-        }
-        let Some(service_port) = http_ports.first() else {
-            continue;
-        };
-        let protocol = service
-            .protocol_overrides
-            .get(&service_port.port)
-            .copied()
-            .unwrap_or(service_port.protocol);
-        let targets = build_outbound_mesh_targets(
-            transport,
-            runtime,
-            service,
-            service_port,
-            protocol,
-            &mesh_slice.workloads,
-            local_cluster,
-        );
-        if targets.is_empty() {
-            debug!(
-                service = %service.name,
-                namespace = %service.namespace,
-                "Skipping outbound mesh service with no reachable local-cluster workload targets"
-            );
-            continue;
-        }
-        let upstream_id = mesh_outbound_upstream_id(&service.namespace, &service.name);
-        let proxy = mesh_outbound_route_proxy(
-            &mesh_outbound_proxy_id(&service.namespace, &service.name, service_port.port),
-            mesh_service_host_variants(&service.name, &service.namespace, &runtime.cluster_domain),
-            &service.namespace,
-            &upstream_id,
-            now,
-        );
-        // Yield to any existing proxy already routing this host at an
-        // overlapping path. That covers explicit operator proxies (the
-        // operator's routing wins) AND — for Sidecar — the local workload's own
-        // materialized INBOUND loopback route (materialized before this pass):
-        // the route table holds one proxy per host+path, so the local service's
-        // host must keep its inbound route rather than be re-tunnelled out to
-        // the mesh. Sibling OUTBOUND routes carry distinct service hosts and
-        // are skipped only for re-materialization idempotency. Stream proxies
-        // route by `listen_port` and are skipped.
-        if config.proxies.iter().any(|p| {
-            if p.id == proxy.id || p.dispatch_kind.is_stream() || is_mesh_outbound_route_id(&p.id) {
-                return false;
+            if targets.is_empty() {
+                debug!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    service_port = service_port.port,
+                    "Skipping outbound mesh service port with no reachable local-cluster workload targets"
+                );
+                continue;
             }
-            let shadows_or_collides = p.listen_path == proxy.listen_path
-                || p.listen_path.is_none()
-                || p.listen_path
-                    .as_deref()
-                    .is_some_and(|lp| lp.starts_with('~'));
-            shadows_or_collides && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
-        }) {
-            debug!(
-                proxy_id = %proxy.id,
-                "Skipping outbound route materialization; an existing operator proxy already routes this host/path"
+            let upstream_id =
+                mesh_outbound_upstream_id(&service.namespace, &service.name, service_port.port);
+            let proxy = mesh_outbound_route_proxy(
+                &mesh_outbound_proxy_id(&service.namespace, &service.name, service_port.port),
+                mesh_service_host_variants(
+                    &service.name,
+                    &service.namespace,
+                    &runtime.cluster_domain,
+                ),
+                &service.namespace,
+                &upstream_id,
+                now,
             );
-            continue;
+            // Yield to any existing proxy already routing this host at an
+            // overlapping path. That covers explicit operator proxies (the
+            // operator's routing wins) AND — for Sidecar — the local workload's own
+            // materialized INBOUND loopback route (materialized before this pass):
+            // the route table holds one proxy per host+path, so the local service's
+            // host must keep its inbound route rather than be re-tunnelled out to
+            // the mesh. Sibling OUTBOUND routes carry distinct service hosts (or are
+            // this service's own per-port siblings, grouped by the router) and
+            // are skipped only for re-materialization idempotency. Stream proxies
+            // route by `listen_port` and are skipped.
+            if config.proxies.iter().any(|p| {
+                if p.id == proxy.id
+                    || p.dispatch_kind.is_stream()
+                    || is_mesh_outbound_route_id(&p.id)
+                {
+                    return false;
+                }
+                let shadows_or_collides = p.listen_path == proxy.listen_path
+                    || p.listen_path.is_none()
+                    || p.listen_path
+                        .as_deref()
+                        .is_some_and(|lp| lp.starts_with('~'));
+                shadows_or_collides && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
+            }) {
+                debug!(
+                    proxy_id = %proxy.id,
+                    "Skipping outbound route materialization; an existing operator proxy already routes this host/path"
+                );
+                continue;
+            }
+            // Name the upstream with the service FQDN (not the internal id) so a
+            // DestinationRule keyed on the service host matches it
+            // (`destination_rule_matches_upstream` matches by target host / upstream
+            // NAME / id, and the targets are pod IPs) — otherwise no DR traffic policy
+            // would apply to outbound HBONE routes (top-level connectTimeout / LB /
+            // outlier, plus per-port `portLevelSettings`, which `apply_destination_rules`
+            // re-keys onto the dial port via `mesh_outbound_upstream_port_remap`).
+            let service_fqdn = format!(
+                "{}.{}.svc.{}",
+                service.name,
+                service.namespace,
+                runtime.cluster_domain.trim_matches('.')
+            );
+            let upstream = mesh_outbound_route_upstream(
+                &upstream_id,
+                &service.namespace,
+                &service_fqdn,
+                targets,
+                now,
+            );
+            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+                *existing = upstream;
+            } else {
+                config.upstreams.push(upstream);
+            }
+            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+                *existing = proxy;
+            } else {
+                config.proxies.push(proxy);
+            }
+            materialized += 1;
         }
-        // Name the upstream with the service FQDN (not the internal id) so a
-        // DestinationRule keyed on the service host matches it
-        // (`destination_rule_matches_upstream` matches by target host / upstream
-        // NAME / id, and the targets are pod IPs) — otherwise no DR traffic policy
-        // would apply to outbound HBONE routes (top-level connectTimeout / LB /
-        // outlier, plus per-port `portLevelSettings`, which `apply_destination_rules`
-        // re-keys onto the dial port via `mesh_outbound_upstream_port_remap`).
-        let service_fqdn = format!(
-            "{}.{}.svc.{}",
-            service.name,
-            service.namespace,
-            runtime.cluster_domain.trim_matches('.')
-        );
-        let upstream = mesh_outbound_route_upstream(
-            &upstream_id,
-            &service.namespace,
-            &service_fqdn,
-            targets,
-            now,
-        );
-        if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
-            *existing = upstream;
-        } else {
-            config.upstreams.push(upstream);
-        }
-        if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
-            *existing = proxy;
-        } else {
-            config.proxies.push(proxy);
-        }
-        materialized += 1;
     }
 
     if materialized > 0 {
@@ -2313,15 +2324,21 @@ fn mesh_outbound_upstream_port_remap(
     mesh_slice
         .services
         .iter()
-        .filter(|svc| upstream.id == mesh_outbound_upstream_id(&svc.namespace, &svc.name))
         .flat_map(|svc| {
-            svc.ports.iter().filter_map(|sp| match sp.target_port {
-                Some(ServiceTargetPort::Number(t))
-                    if t != 0 && t != sp.port && target_ports.contains(&t) =>
-                {
-                    Some((sp.port, t))
+            // Upstreams are per service port; remap only the owning port's
+            // DR entry onto its resolved numeric targetPort.
+            svc.ports.iter().filter_map(|sp| {
+                if upstream.id != mesh_outbound_upstream_id(&svc.namespace, &svc.name, sp.port) {
+                    return None;
                 }
-                _ => None,
+                match sp.target_port {
+                    Some(ServiceTargetPort::Number(t))
+                        if t != 0 && t != sp.port && target_ports.contains(&t) =>
+                    {
+                        Some((sp.port, t))
+                    }
+                    _ => None,
+                }
             })
         })
         .collect()
@@ -7943,7 +7960,7 @@ mod tests {
         assert_eq!(proxy.backend_scheme, Some(BackendScheme::Http));
         assert_eq!(
             proxy.upstream_id.as_deref(),
-            Some("__mesh-out-upstream-default-reviews")
+            Some("__mesh-out-upstream-default-reviews-8080")
         );
         assert!(
             proxy.retry.is_none(),
@@ -7959,7 +7976,7 @@ mod tests {
         let upstream = config
             .upstreams
             .iter()
-            .find(|u| u.id == "__mesh-out-upstream-default-reviews")
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-8080")
             .expect("ambient outbound upstream materialized");
         let target = &upstream.targets[0];
         assert_eq!(target.host, "10.0.0.1");
@@ -7977,13 +7994,23 @@ mod tests {
     }
 
     #[test]
-    fn mesh_outbound_skips_multi_http_port_service() {
+    fn mesh_outbound_materializes_per_port_routes_for_multi_port_service() {
+        // Multi-port services materialize one route + one upstream PER
+        // HTTP-family port; the route table groups the siblings and the
+        // request path picks by captured original-destination port. Non-HTTP
+        // ports still materialize nothing.
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let mut svc = http_mesh_service("reviews", 80, spiffe);
         svc.ports.push(ServicePort {
             port: 90,
             protocol: AppProtocol::Grpc,
             name: Some("grpc".to_string()),
+            target_port: None,
+        });
+        svc.ports.push(ServicePort {
+            port: 5432,
+            protocol: AppProtocol::Tcp,
+            name: Some("db".to_string()),
             target_port: None,
         });
         let slice = MeshSlice {
@@ -7994,12 +8021,33 @@ mod tests {
         };
         let mut config = GatewayConfig::default();
         materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+
+        for port in [80u16, 90] {
+            let proxy = config
+                .proxies
+                .iter()
+                .find(|p| p.id == format!("__mesh-outbound-default-reviews-{port}"))
+                .unwrap_or_else(|| panic!("per-port outbound proxy for {port} materialized"));
+            assert_eq!(
+                proxy.upstream_id.as_deref(),
+                Some(format!("__mesh-out-upstream-default-reviews-{port}").as_str())
+            );
+            let upstream = config
+                .upstreams
+                .iter()
+                .find(|u| u.id == format!("__mesh-out-upstream-default-reviews-{port}"))
+                .unwrap_or_else(|| panic!("per-port outbound upstream for {port} materialized"));
+            assert_eq!(
+                upstream.targets[0].port, port,
+                "each per-port upstream dials its own service port's app port"
+            );
+        }
         assert!(
             !config
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-outbound-")),
-            "a service with >1 HTTP-family port must materialize no outbound route"
+                .any(|p| p.id == "__mesh-outbound-default-reviews-5432"),
+            "non-HTTP (TCP) service ports must not materialize HTTP outbound routes"
         );
     }
 
@@ -8019,7 +8067,7 @@ mod tests {
         let upstream = config
             .upstreams
             .iter()
-            .find(|u| u.id == "__mesh-out-upstream-default-reviews")
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
             .expect("upstream");
         assert_eq!(
             upstream.targets[0].port, 8080,
@@ -8066,7 +8114,7 @@ mod tests {
         let upstream = config
             .upstreams
             .iter()
-            .find(|u| u.id == "__mesh-out-upstream-default-reviews")
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
             .expect("outbound upstream materialized");
         assert_eq!(
             upstream
@@ -8164,7 +8212,7 @@ mod tests {
         let upstream = config
             .upstreams
             .iter()
-            .find(|u| u.id == "__mesh-out-upstream-default-reviews")
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-8080")
             .expect("sidecar outbound upstream materialized");
         let target = &upstream.targets[0];
         assert_eq!(target.host, "10.0.0.1");
@@ -8249,7 +8297,7 @@ mod tests {
         let target = &config
             .upstreams
             .iter()
-            .find(|u| u.id == "__mesh-out-upstream-default-reviews")
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-8080")
             .expect("upstream")
             .targets[0];
         assert_eq!(
@@ -8268,7 +8316,7 @@ mod tests {
         let target = &config
             .upstreams
             .iter()
-            .find(|u| u.id == "__mesh-out-upstream-default-reviews")
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-8080")
             .expect("upstream")
             .targets[0];
         assert_eq!(
@@ -8281,7 +8329,7 @@ mod tests {
         let target = &config
             .upstreams
             .iter()
-            .find(|u| u.id == "__mesh-out-upstream-default-reviews")
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-8080")
             .expect("upstream")
             .targets[0];
         assert!(

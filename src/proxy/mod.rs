@@ -2302,6 +2302,11 @@ struct RequestConnectionMetadata {
     /// Direction stamped at listener-spawn time for mesh listeners.
     /// `None` outside mesh mode.
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    /// Pre-NAT original destination of an iptables-REDIRECTed connection,
+    /// read once at accept on mesh outbound capture listeners
+    /// (`SO_ORIGINAL_DST`). `None` everywhere else — see
+    /// [`crate::socket_opts::original_dst`] for the exact contract.
+    orig_dst: Option<SocketAddr>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -5708,6 +5713,7 @@ async fn run_per_ip_cleanup_loop(
 /// connections continue to accept new streams indefinitely after the listener
 /// exits, forcing every shutdown to wait the full
 /// `FERRUM_SHUTDOWN_DRAIN_SECONDS` timeout.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
@@ -5716,6 +5722,7 @@ async fn handle_connection(
     frontend_listen_port: Option<u16>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    orig_dst: Option<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -5769,6 +5776,7 @@ async fn handle_connection(
             frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
             mesh_direction,
+            orig_dst,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -8194,6 +8202,8 @@ struct TlsConnectionMetadata {
     record_mesh_mtls_metric: bool,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    /// See [`RequestConnectionMetadata::orig_dst`].
+    orig_dst: Option<SocketAddr>,
 }
 
 async fn start_proxy_listener_with_tls_source_and_signal(
@@ -8452,6 +8462,19 @@ async fn run_accept_loop(
                             continue;
                         }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
+                        // Read the captured connection's pre-NAT original
+                        // destination ONCE per accept, only on mesh outbound
+                        // capture listeners (one getsockopt; every request on
+                        // the connection shares it). `None` everywhere else
+                        // and for non-redirected traffic — see
+                        // `socket_opts::original_dst`.
+                        let orig_dst = if mesh_direction
+                            == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+                        {
+                            crate::socket_opts::original_dst(&stream)
+                        } else {
+                            None
+                        };
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
                         // future (sending GOAWAY on H2 / closing keepalive
@@ -8474,6 +8497,7 @@ async fn run_accept_loop(
                                     record_mesh_mtls_metric,
                                     node_waypoint_identity,
                                     mesh_direction,
+                                    orig_dst,
                                 };
                                 handle_tls_connection(
                                     stream,
@@ -8493,8 +8517,9 @@ async fn run_accept_loop(
                                     frontend_listen_port,
                                     node_waypoint_identity,
                                     mesh_direction,
+                                    orig_dst,
                                 )
-                                    .await
+                                .await
                             };
 
                             if let Err(e) = result {
@@ -8633,6 +8658,7 @@ async fn handle_tls_connection(
             frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
             mesh_direction: tls_connection_metadata.mesh_direction,
+            orig_dst: tls_connection_metadata.orig_dst,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -9370,6 +9396,7 @@ async fn handle_proxy_request_inner(
     ));
     ctx.frontend_sni_hostname = connection_metadata.frontend_sni_hostname;
     ctx.mesh_direction = connection_metadata.mesh_direction;
+    ctx.orig_dst = connection_metadata.orig_dst;
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
@@ -9701,6 +9728,57 @@ async fn handle_proxy_request_inner(
                 &path,
                 ctx.mesh_direction,
             )
+        }
+        other => other,
+    };
+
+    // Mesh outbound multi-port disambiguation: host routing picked the
+    // service (the route tiers hold one representative per outbound service);
+    // the captured original-destination port now picks the per-port sibling.
+    // Fails closed (502, like `hbone_required`) when the dialed port cannot
+    // be determined for a multi-port service or is not a materialized
+    // HTTP-family port — captured traffic is never forwarded to a port the
+    // client did not dial. Single-port services keep their orig-dst-free
+    // behavior, so direct dials (functional tests, non-Linux dev) are
+    // unaffected.
+    let route_match = match route_match {
+        Some(rm)
+            if ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+                && crate::modes::mesh::is_mesh_outbound_route_id(&rm.proxy.id) =>
+        {
+            let representative_id = Arc::clone(&rm.proxy);
+            match epoch
+                .route_table
+                .select_mesh_outbound_port_route(rm, ctx.orig_dst.map(|addr| addr.port()))
+            {
+                Ok(rm) => Some(rm),
+                Err(reason) => {
+                    debug!(
+                        proxy_id = %representative_id.id,
+                        orig_dst = ?ctx.orig_dst,
+                        reason = ?reason,
+                        client_ip = %ctx.client_ip,
+                        "Mesh outbound port selection failed; rejecting captured request"
+                    );
+                    state.request_count.fetch_add(1, Ordering::Relaxed);
+                    let body: &[u8] = match reason {
+                        crate::router_cache::MeshOutboundPortSelectError::OrigDstUnavailable => {
+                            br#"{"error":"Mesh outbound destination port is ambiguous without a captured original destination"}"#
+                        }
+                        crate::router_cache::MeshOutboundPortSelectError::PortNotMaterialized => {
+                            br#"{"error":"Original destination port is not a mesh-routable port of this service"}"#
+                        }
+                    };
+                    let reject = normalize_reject_response(
+                        StatusCode::BAD_GATEWAY,
+                        body,
+                        &EMPTY_HEADERS,
+                        request_uses_grpc_content_type,
+                    );
+                    record_status(&state, reject.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(reject));
+                }
+            }
         }
         other => other,
     };

@@ -2249,3 +2249,92 @@ async fn functional_mesh_sidecar_egress_rejects_untrusted_client_gateway() {
         "no backend body may leak through an unverified mTLS session: {body:?}\n{logs}"
     );
 }
+
+// ── Multi-port egress original-destination fail-closed ──────────────────────
+
+/// Slice with one in-mesh service exposing TWO HTTP-family ports backed by a
+/// remote workload — the multi-port shape that materializes per-port outbound
+/// siblings disambiguated by `SO_ORIGINAL_DST`.
+fn multi_port_egress_slice(node_id: &str, b_spiffe: &str, backend_port: u16) -> MeshSlice {
+    let mut slice = egress_service_slice(node_id, b_spiffe, backend_port);
+    slice.services[0].ports.push(ServicePort {
+        port: backend_port.wrapping_add(1),
+        protocol: AppProtocol::Grpc,
+        name: Some("grpc".to_string()),
+        target_port: None,
+    });
+    // This test exercises only the OUTBOUND capture listener's routing
+    // decision; the gateway runs without SVID material, and the inherited
+    // STRICT PeerAuthentication would make the inbound listener's missing
+    // server identity fatal at startup. Default (PERMISSIVE) suffices here.
+    slice.peer_authentications.clear();
+    slice
+}
+
+/// A captured request to a MULTI-port service without a captured original
+/// destination must be rejected 502 (fail-closed), never forwarded to an
+/// arbitrary port's backend. A direct (non-REDIRECTed) dial of the outbound
+/// capture listener is exactly the "no orig-dst" condition, so this exercises
+/// the production fail-closed arm end-to-end without needing iptables.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_outbound_multi_port_without_orig_dst_fails_closed() {
+    ensure_gateway_built().expect("gateway build");
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-origdst-multiport-{attempt}");
+        let temp = TempDir::new().expect("temp dir");
+        let backend_port = start_echo_backend().await;
+        let cp =
+            start_static_mesh_cp(multi_port_egress_slice(&node_id, b_spiffe, backend_port)).await;
+        let ports = reserve_mesh_ports().await;
+        let outbound_port = ports.outbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: Vec::new(),
+            },
+        );
+
+        if !wait_for_tcp_port(outbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: outbound listener never bound\n{}",
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let result = plaintext_http_get(outbound_port, "svc-b.ferrum.svc.cluster.local", "/").await;
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        let (status, body) = result.expect("plaintext GET against the outbound listener");
+        assert_eq!(
+            status, 502,
+            "a multi-port service without a captured original destination must fail closed; \
+             body: {body:?}\n{output}"
+        );
+        assert!(
+            !body.contains("backend-ok"),
+            "the request must never reach a port's backend by guessing: {body:?}"
+        );
+        return;
+    }
+
+    panic!(
+        "mesh gateway never bound its outbound listener after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
+    );
+}

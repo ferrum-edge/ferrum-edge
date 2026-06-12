@@ -124,6 +124,101 @@ pub fn socket_cookie(_stream: &tokio::net::TcpStream) -> std::io::Result<u64> {
     ))
 }
 
+// ── SO_ORIGINAL_DST ─────────────────────────────────────────────────────────
+
+/// Read the pre-NAT original destination of an iptables-`REDIRECT`ed TCP
+/// connection (Linux netfilter `SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST`).
+///
+/// The mesh outbound capture listener uses this to recover which
+/// `service:port` a captured pod actually dialed — host-based routing alone
+/// cannot disambiguate a multi-port service because the router strips ports
+/// from `Host`. **`None` means "no captured original destination"**: non-Linux
+/// platforms, traffic that was not NATed (direct dials — every functional test
+/// and any sidecar-less client), `getsockopt` failure (`ENOENT` for
+/// un-redirected flows), or a reported destination identical to the accepted
+/// socket's local address (defensive: some conntrack states answer with the
+/// post-NAT address). Callers must treat `None` as "fall back to existing
+/// behavior", never as an error.
+///
+/// Note this only covers netfilter REDIRECT capture (Sidecar's injector
+/// iptables model). eBPF `connect4`-rewritten capture (NodeWaypoint) never
+/// creates a conntrack entry; its original destination lives in the eBPF
+/// orig-dst records instead.
+#[cfg(target_os = "linux")]
+pub fn original_dst(stream: &tokio::net::TcpStream) -> Option<std::net::SocketAddr> {
+    use std::os::fd::AsRawFd;
+    let local_addr = stream.local_addr().ok()?;
+    original_dst_from_raw_fd(stream.as_raw_fd(), local_addr)
+}
+
+/// Raw-fd core of [`original_dst`] (mirrors `socket_cookie_from_raw_fd`) so
+/// the privileged live-netns test can exercise the real getsockopt path on a
+/// std socket without a tokio runtime inside its `setns` thread.
+#[cfg(target_os = "linux")]
+pub fn original_dst_from_raw_fd(
+    fd: std::os::fd::RawFd,
+    local_addr: std::net::SocketAddr,
+) -> Option<std::net::SocketAddr> {
+    // Linux uapi: include/uapi/linux/netfilter_ipv4.h (SO_ORIGINAL_DST = 80)
+    // and include/uapi/linux/netfilter_ipv6/ip6_tables.h
+    // (IP6T_SO_ORIGINAL_DST = 80).
+    const SO_ORIGINAL_DST: libc::c_int = 80;
+    const IP6T_SO_ORIGINAL_DST: libc::c_int = 80;
+
+    let orig: std::net::SocketAddr = if local_addr.is_ipv4() {
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_IP,
+                SO_ORIGINAL_DST,
+                &mut addr as *mut libc::sockaddr_in as *mut libc::c_void,
+                &mut len as *mut libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr))),
+            u16::from_be(addr.sin_port),
+        )
+    } else {
+        let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_IPV6,
+                IP6T_SO_ORIGINAL_DST,
+                &mut addr as *mut libc::sockaddr_in6 as *mut libc::c_void,
+                &mut len as *mut libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr)),
+            u16::from_be(addr.sin6_port),
+        )
+    };
+
+    // A destination equal to the accepted socket's own local address means the
+    // flow was not redirected (or conntrack echoed the post-NAT tuple back) —
+    // there is no original destination to act on.
+    if orig == local_addr {
+        return None;
+    }
+    Some(orig)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn original_dst(_stream: &tokio::net::TcpStream) -> Option<std::net::SocketAddr> {
+    None
+}
+
 // ── TCP_FASTOPEN ────────────────────────────────────────────────────────────
 
 /// Enable `TCP_FASTOPEN` on a server (listening) socket (Linux only).
@@ -2517,5 +2612,148 @@ mod keepalive_tests {
         // Any further getsockopt would EBADF if the helper accidentally
         // dropped the borrowed fd.
         let _ = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE);
+    }
+}
+
+#[cfg(test)]
+mod original_dst_tests {
+    //! `original_dst` contract: a non-REDIRECTed (direct-dial) accepted socket
+    //! has no usable conntrack original destination — the helper must answer
+    //! `None`, never an error, on every platform. On Linux with conntrack
+    //! loaded, `SO_ORIGINAL_DST` for an un-NATed flow either fails (`ENOENT`)
+    //! or echoes the post-NAT tuple (= the accepted socket's local address);
+    //! both must normalize to `None`. The positive (REDIRECTed) case requires
+    //! iptables in a privileged netns and is covered by the live-CI module.
+
+    #[tokio::test]
+    async fn direct_dial_has_no_original_dst() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        assert_eq!(crate::socket_opts::original_dst(&server), None);
+    }
+
+    #[tokio::test]
+    async fn direct_dial_ipv6_has_no_original_dst() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return; // environment without IPv6 loopback
+        };
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        assert_eq!(crate::socket_opts::original_dst(&server), None);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod original_dst_live_tests {
+    //! Privileged live verification of `SO_ORIGINAL_DST` against a real
+    //! iptables `REDIRECT` rule, inside a throwaway network namespace (the
+    //! host's iptables are never touched). Runs in CI's `netns-capture-live`
+    //! job as root; self-skips (passes) without root / `unshare` / `iptables`.
+
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::os::fd::AsRawFd;
+    use std::process::{Child, Command};
+    use std::time::Duration;
+
+    /// Where the synthetic sidecar capture listener binds (the :15001 shape).
+    const CAPTURE_PORT: u16 = 25001;
+    /// The "service port" the client dials; REDIRECTed to `CAPTURE_PORT`.
+    const DIAL_PORT: u16 = 18080;
+
+    fn is_root() -> bool {
+        // Safety: `geteuid` is always sound and never fails.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// Reaps the netns child on drop so the test never leaks it.
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Spawn a child in a fresh netns with loopback up and the sidecar-shaped
+    /// nat rule: TCP to :18080 is REDIRECTed to :25001. Exits 97 when
+    /// `iptables` is unavailable inside the netns so the test can skip.
+    fn spawn_redirect_netns_child() -> Option<Child> {
+        Command::new("unshare")
+            .args([
+                "--net",
+                "sh",
+                "-c",
+                &format!(
+                    "ip link set lo up 2>/dev/null || true; \
+                     iptables -t nat -A OUTPUT -p tcp --dport {DIAL_PORT} \
+                     -j REDIRECT --to-ports {CAPTURE_PORT} 2>/dev/null || exit 97; \
+                     exec sleep 30"
+                ),
+            ])
+            .spawn()
+            .ok()
+    }
+
+    #[test]
+    #[ignore = "requires root + iptables to create a REDIRECT rule in a fresh netns"]
+    fn redirected_connection_reports_pre_nat_destination() {
+        if !is_root() {
+            eprintln!("SKIP: not root; cannot create network namespaces");
+            return;
+        }
+        let Some(child) = spawn_redirect_netns_child() else {
+            eprintln!("SKIP: `unshare --net` unavailable");
+            return;
+        };
+        let pid = child.id();
+        let _guard = ChildGuard(child);
+        // Let the child unshare, bring loopback up, and install the rule.
+        std::thread::sleep(Duration::from_millis(500));
+        // Child already gone == iptables install failed (exit 97): skip.
+        // Safety: signal 0 only probes liveness.
+        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+            eprintln!("SKIP: iptables unavailable inside the test netns");
+            return;
+        }
+
+        // Everything runs on one throwaway thread inside the child's netns
+        // (`setns` mutates only the calling thread, which exits right after).
+        let orig = std::thread::spawn(move || -> Result<Option<SocketAddr>, String> {
+            let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+                .map_err(|e| format!("open netns handle: {e}"))?;
+            // Safety: `ns` is an open netns handle owned for the call.
+            if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
+            }
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, CAPTURE_PORT)))
+                .map_err(|e| format!("bind capture listener: {e}"))?;
+            // Dial the "service port"; netfilter REDIRECTs it onto the
+            // capture listener — exactly the sidecar capture shape.
+            let _client = TcpStream::connect_timeout(
+                &SocketAddr::from((Ipv4Addr::LOCALHOST, DIAL_PORT)),
+                Duration::from_secs(2),
+            )
+            .map_err(|e| format!("redirected connect: {e}"))?;
+            let (accepted, _) = listener.accept().map_err(|e| format!("accept: {e}"))?;
+            let local = accepted
+                .local_addr()
+                .map_err(|e| format!("local_addr: {e}"))?;
+            Ok(crate::socket_opts::original_dst_from_raw_fd(
+                accepted.as_raw_fd(),
+                local,
+            ))
+        })
+        .join()
+        .expect("netns scenario thread must not panic")
+        .expect("live SO_ORIGINAL_DST scenario must complete");
+
+        assert_eq!(
+            orig,
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, DIAL_PORT))),
+            "an accepted REDIRECTed connection must report the pre-NAT destination"
+        );
     }
 }
