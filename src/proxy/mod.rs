@@ -1020,34 +1020,40 @@ pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> 
 }
 
 /// Whether an authenticated inbound HBONE CONNECT to `host:port` may be
-/// transparently relayed. SAFE local targets only: a loopback address (the
-/// co-located app — Ferrum's per-workload Ambient/Sidecar model puts the app on
-/// loopback) or an in-mesh workload address+port the slice already declares.
-/// This bounds the terminator to mesh-known destinations, so an authenticated
-/// peer can never use the HBONE listener as an open proxy to arbitrary internal
-/// hosts. (`handle_hbone_request` separately requires the peer to be an
-/// authenticated, trust-domain-verified mesh identity before dialing.)
+/// transparently relayed. SAFE local targets only: a loopback address on an
+/// application port declared by the slice, or an in-mesh workload address+port
+/// the slice already declares. This bounds the terminator to mesh-known
+/// destinations, so an authenticated peer can never use the HBONE listener as
+/// an open proxy to arbitrary internal hosts or undeclared loopback listeners.
+/// (`handle_hbone_request` separately requires the peer to be an authenticated,
+/// trust-domain-verified mesh identity before dialing.)
 fn inbound_hbone_relay_destination_allowed(
     host: &str,
     port: u16,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
 ) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>()
-        && ip.is_loopback()
+    let Some(mesh) = mesh else {
+        return false;
+    };
+
+    if host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
     {
-        return true;
+        return mesh
+            .workloads
+            .iter()
+            .flat_map(|workload| &workload.ports)
+            .any(|workload_port| workload_port.port == port);
     }
+
     // Otherwise the destination must be an in-mesh workload address+port the
     // slice declares — never an arbitrary host. A workload that declares no
     // ports admits any port for its address (the slice does not constrain it).
-    mesh.is_some_and(|mesh| {
-        mesh.workloads.iter().any(|workload| {
-            workload.addresses.iter().any(|addr| addr == host)
-                && (workload.ports.is_empty() || workload.ports.iter().any(|wp| wp.port == port))
-        })
+    mesh.workloads.iter().any(|workload| {
+        workload.addresses.iter().any(|addr| addr == host)
+            && (workload.ports.is_empty() || workload.ports.iter().any(|wp| wp.port == port))
     })
 }
 
@@ -9618,8 +9624,9 @@ async fn handle_proxy_request_inner(
             // through a synthesized proxy instead of 404ing. The synthesized
             // proxy is built only on the inbound listener (`mesh_direction ==
             // Inbound`) and only for a loopback / slice-known workload
-            // destination; `handle_hbone_request` re-checks the
-            // authenticated-peer gate before dialing.
+            // destination, with loopback ports constrained to the slice's
+            // declared workload application ports; `handle_hbone_request`
+            // re-checks the authenticated-peer gate before dialing.
             let hbone_relay = if is_hbone_connect
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
@@ -21148,15 +21155,15 @@ mod tests {
         use crate::identity::spiffe::{SpiffeId, TrustDomain};
         use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadPort, WorkloadSelector};
 
-        // Loopback is always a safe relay target (the co-located app), even
-        // with no slice context.
-        assert!(inbound_hbone_relay_destination_allowed(
+        // With no slice context, even loopback is refused: the relay must not
+        // become a localhost open proxy to arbitrary gateway-host ports.
+        assert!(!inbound_hbone_relay_destination_allowed(
             "127.0.0.1",
             8080,
             None
         ));
-        assert!(inbound_hbone_relay_destination_allowed("::1", 8080, None));
-        assert!(inbound_hbone_relay_destination_allowed(
+        assert!(!inbound_hbone_relay_destination_allowed("::1", 8080, None));
+        assert!(!inbound_hbone_relay_destination_allowed(
             "localhost",
             8080,
             None
@@ -21188,7 +21195,35 @@ mod tests {
             service_account: None,
             pod_uid: None,
         });
-        // Now the workload's exact address+port is allowed...
+        // Now the workload's declared application port is allowed on loopback...
+        assert!(inbound_hbone_relay_destination_allowed(
+            "127.0.0.1",
+            8080,
+            Some(&mesh)
+        ));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "::1",
+            8080,
+            Some(&mesh)
+        ));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "localhost",
+            8080,
+            Some(&mesh)
+        ));
+        // ...but undeclared loopback ports remain refused.
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "127.0.0.1",
+            9999,
+            Some(&mesh)
+        ));
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "localhost",
+            9999,
+            Some(&mesh)
+        ));
+
+        // The workload's exact non-loopback address+port is allowed...
         assert!(inbound_hbone_relay_destination_allowed(
             "10.1.2.3",
             8080,
