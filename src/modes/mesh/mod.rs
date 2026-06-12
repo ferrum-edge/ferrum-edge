@@ -2716,6 +2716,38 @@ fn apply_destination_rules(
                         override_slot.tls = Some(slot.clone());
                     }
                 }
+
+                // SELECTION-TIME fields of an owner-gated per-port upstream's
+                // owning entry additionally land at the UPSTREAM level: the
+                // LB engages a per-port lane only when one dial port covers
+                // every target (`initial_dispatch_port_override`), so a named
+                // `targetPort` resolving heterogeneously across replicas
+                // leaves no full-coverage lane and selection falls back to
+                // upstream-level LB/hash/locality (and upstream-level passive
+                // thresholds back the per-target slots). This upstream serves
+                // exactly one Service port, so its port policy IS the
+                // whole-upstream policy. Additive like the per-port slot
+                // convention — only fields the entry sets are applied, so a
+                // top-level trafficPolicy's other fields survive.
+                if outbound_upstream_owner_port.get(&upstream.id) == Some(port) {
+                    if let Some(algorithm) = mesh_lb_to_ferrum(&port_policy.load_balancer) {
+                        upstream.algorithm = algorithm;
+                    }
+                    if let Some(hash_on) = mesh_hash_on_to_ferrum(&port_policy.load_balancer) {
+                        upstream.hash_on = Some(hash_on);
+                    }
+                    if let Some(ref od) = port_policy.outlier_detection {
+                        let passive = upstream
+                            .health_checks
+                            .get_or_insert_with(HealthCheckConfig::default)
+                            .passive
+                            .get_or_insert_with(PassiveHealthCheck::default);
+                        apply_outlier_detection_to_passive(passive, od);
+                    }
+                    if let Some(ref locality) = port_policy.locality_lb_setting {
+                        upstream.locality_lb_setting = Some(into_upstream_locality(locality));
+                    }
+                }
             }
 
             if !dr.subsets.is_empty() {
@@ -8609,6 +8641,7 @@ mod tests {
                     80u16,
                     MeshTrafficPolicy {
                         connect_timeout_ms: Some(1234),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
                         ..MeshTrafficPolicy::default()
                     },
                 )]),
@@ -8646,6 +8679,17 @@ mod tests {
         assert!(
             !upstream.port_overrides.contains_key(&80),
             "the entry must not be stranded under the service port"
+        );
+        // SELECTION-TIME policy must also land at the UPSTREAM level: with
+        // heterogeneous dial ports no per-port LB lane covers every target
+        // (`initial_dispatch_port_override` stays 0), so selection falls back
+        // to upstream-level LB — which must therefore carry the owning
+        // Service port's policy.
+        assert_eq!(
+            upstream.algorithm,
+            LoadBalancerAlgorithm::Random,
+            "the owning port's loadBalancer must apply at the upstream level \
+             so heterogeneous-dial-port selection honors it"
         );
     }
 
@@ -8686,6 +8730,7 @@ mod tests {
                         8080u16,
                         MeshTrafficPolicy {
                             connect_timeout_ms: Some(2222),
+                            load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
                             ..MeshTrafficPolicy::default()
                         },
                     ),
@@ -8713,6 +8758,12 @@ mod tests {
             "port 80's upstream carries ITS OWN service port's policy, \
              re-keyed onto its dial port 8080"
         );
+        assert_eq!(
+            upstream_80.algorithm,
+            LoadBalancerAlgorithm::RoundRobin,
+            "service port 8080's SELECTION-TIME policy must not bleed onto \
+             port 80's upstream-level LB"
+        );
 
         let upstream_8080 = config
             .upstreams
@@ -8726,6 +8777,12 @@ mod tests {
                 .and_then(|slot| slot.connect_timeout_ms),
             Some(2222),
             "service port 8080's policy lands only on its own sibling upstream"
+        );
+        assert_eq!(
+            upstream_8080.algorithm,
+            LoadBalancerAlgorithm::Random,
+            "the owning port's SELECTION-TIME policy lands on its own \
+             upstream's LB"
         );
     }
 
