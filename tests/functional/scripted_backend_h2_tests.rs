@@ -22,10 +22,12 @@ use crate::scaffolding::backends::{
     ScriptedH2Backend,
 };
 use crate::scaffolding::certs::TestCa;
-use crate::scaffolding::clients::GrpcClient;
+use crate::scaffolding::clients::{GrpcClient, Http2Client};
+use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
 use bytes::Bytes;
+use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -728,6 +730,87 @@ async fn h2_window_stall_triggers_backend_read_timeout_on_grpc() {
     assert!(
         has_timeout_signal(&logs),
         "expected timeout signal in gateway logs; elapsed={elapsed:?}, logs:\n{logs}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 6b — direct-H2 buffered response body stalls are bounded by
+//            `backend_read_timeout_ms`.
+// ────────────────────────────────────────────────────────────────────────────
+//
+// The direct HTTP/2 backend pool used to wrap only `send_request(...)` with
+// `backend_read_timeout_ms`. Once response HEADERS arrived, buffered response
+// body collection used an unbounded `collect().await`, so a backend could send
+// `:status` and then never send DATA/END_STREAM. This pins the missing second
+// deadline: every body-frame wait must also honor `backend_read_timeout_ms`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_buffered_response_body_stall_triggers_backend_read_timeout() {
+    let ca = TestCa::new("h2-response-stall").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+            ("content-length", "4".into()),
+        ]))
+        .step(H2Step::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn backend");
+
+    let read_timeout_ms: u64 = 800;
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "backend_read_timeout_ms": read_timeout_ms,
+            "response_body_mode": "buffer",
+            "pool_enable_http2": true,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+        .pool_warmup_enabled(true)
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let started = Instant::now();
+    let response = client
+        .get(&format!("{}/api/stall", harness.proxy_base_url()))
+        .await
+        .expect("gateway returns timeout response");
+    let elapsed = started.elapsed();
+    let body = String::from_utf8_lossy(&response.body_bytes);
+
+    assert_eq!(response.status, StatusCode::GATEWAY_TIMEOUT, "body={body}");
+    assert!(
+        body.contains("Backend timeout"),
+        "unexpected timeout response body: {body}"
+    );
+
+    let expected = Duration::from_millis(read_timeout_ms);
+    let floor = expected.saturating_sub(Duration::from_millis(200));
+    let ceiling = expected + Duration::from_millis(1500);
+    assert!(
+        elapsed >= floor,
+        "timed out too fast: {elapsed:?} < floor {floor:?} (timeout was {read_timeout_ms}ms)"
+    );
+    assert!(
+        elapsed <= ceiling,
+        "timed out too slowly: {elapsed:?} > ceiling {ceiling:?} (timeout was {read_timeout_ms}ms)"
     );
 }
 
