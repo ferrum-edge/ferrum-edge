@@ -128,7 +128,97 @@ struct UdpSession {
 /// SocketAddr keys are kernel-provided (not attacker-controlled), so cryptographic
 /// hashing is unnecessary — speed wins here.
 type SessionMap = Arc<DashMap<SocketAddr, Arc<UdpSession>, ahash::RandomState>>;
-type PendingSessionMap = Arc<DashMap<SocketAddr, (), ahash::RandomState>>;
+type PendingSessionMap = Arc<DashMap<SocketAddr, PendingDatagramQueue, ahash::RandomState>>;
+
+/// Maximum number of follow-up datagrams queued per pending (setup-in-progress)
+/// session. Sized for real opening flights — a QUIC Initial + 0-RTT coalesced
+/// flight or a multi-record DTLS ClientHello is well under this — while keeping
+/// the per-source memory bound tight.
+const PENDING_SESSION_MAX_QUEUED_DATAGRAMS: usize = 16;
+
+/// Maximum total bytes queued per pending session. Together with
+/// `max_sessions` (the slot reservation taken before the gate is inserted)
+/// this bounds worst-case pending-queue memory to
+/// `max_sessions * PENDING_SESSION_MAX_QUEUED_BYTES`, so a spoofed-source
+/// flood cannot grow memory past the same flood bound that limits sessions.
+const PENDING_SESSION_MAX_QUEUED_BYTES: usize = 16 * 1024;
+
+/// Bounded FIFO of datagrams that arrived for a source while its session
+/// setup (DNS, `on_stream_connect` plugins, backend DTLS handshake) is still
+/// running in the background task. The previous synchronous setup path left
+/// these packets in the kernel socket buffer and forwarded them after setup;
+/// this queue preserves that behavior without blocking the recv loop.
+#[derive(Default)]
+struct PendingDatagramQueue {
+    datagrams: Vec<Vec<u8>>,
+    queued_bytes: usize,
+}
+
+impl PendingDatagramQueue {
+    /// Append a follow-up datagram, tail-dropping once either cap is hit.
+    /// Returns `false` when the datagram was dropped. Zero-length datagrams
+    /// are valid UDP and are queued like any other.
+    fn push_bounded(&mut self, data: &[u8]) -> bool {
+        if self.datagrams.len() >= PENDING_SESSION_MAX_QUEUED_DATAGRAMS
+            || self.queued_bytes.saturating_add(data.len()) > PENDING_SESSION_MAX_QUEUED_BYTES
+        {
+            return false;
+        }
+        self.queued_bytes += data.len();
+        self.datagrams.push(data.to_vec());
+        true
+    }
+}
+
+/// Removes the pending-session gate (dropping any still-queued datagrams) when
+/// the setup task exits without completing the queue handoff — setup error,
+/// plugin block, mesh deny, or mid-drain forward failure. The success path
+/// removes the gate atomically via [`take_pending_datagrams`] and disarms.
+struct PendingSessionGate {
+    pending_sessions: PendingSessionMap,
+    client_addr: SocketAddr,
+    armed: bool,
+}
+
+impl PendingSessionGate {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingSessionGate {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pending_sessions.remove(&self.client_addr);
+        }
+    }
+}
+
+/// Atomically either remove the pending gate (when its queue is observed
+/// empty) or take the queued datagrams for draining. Both the empty-check +
+/// removal and the take happen under the same DashMap shard lock the recv
+/// loop's append path uses, so a datagram appended concurrently is either
+/// returned by a later call here or forwarded directly by the recv loop once
+/// the gate is gone — never lost in between, never reordered relative to
+/// backend sends.
+fn take_pending_datagrams(
+    pending_sessions: &PendingSessionMap,
+    client_addr: SocketAddr,
+) -> Option<Vec<Vec<u8>>> {
+    match pending_sessions.entry(client_addr) {
+        dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+            if occupied.get().datagrams.is_empty() {
+                occupied.remove();
+                None
+            } else {
+                let queue = occupied.get_mut();
+                queue.queued_bytes = 0;
+                Some(std::mem::take(&mut queue.datagrams))
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(_) => None,
+    }
+}
 
 #[derive(Debug)]
 struct UdpDtlsIdleTimeout;
@@ -431,6 +521,52 @@ fn flush_gso_batch(
     gso_batch.flush_to(frontend.as_raw_fd(), &dest, dest_len, effective_local)
 }
 
+/// Send a single datagram directly to the client, honoring the captured
+/// IP(v6)_PKTINFO reply-source address when present.
+///
+/// Escape hatch for datagrams the GSO batch cannot represent — zero-length
+/// keepalives (`GsoBatchBuf::push` rejects empty payloads because a UDP GSO
+/// segment cannot be zero-sized) and oversize post-flush refusals. Plain
+/// `UdpSocket::send_to` here would bypass pktinfo and let the kernel pick the
+/// source IP, so replies from a wildcard-bound listener could leave with the
+/// wrong source address and be discarded by the client.
+#[cfg(target_os = "linux")]
+async fn direct_send_to_client(
+    frontend: &Arc<UdpSocket>,
+    data: &[u8],
+    client_addr: SocketAddr,
+    local: Option<crate::socket_opts::PktinfoLocal>,
+) -> std::io::Result<usize> {
+    use std::os::unix::io::AsRawFd;
+    // Only honor the local source when its address family matches the
+    // destination — mirrors `flush_gso_batch` / `SendMmsgBatch::push_with_local`.
+    let effective_local = match (local.map(|l| l.ip), client_addr) {
+        (Some(IpAddr::V4(_)), SocketAddr::V4(_)) | (Some(IpAddr::V6(_)), SocketAddr::V6(_)) => {
+            local
+        }
+        _ => None,
+    };
+    let Some(local) = effective_local else {
+        return frontend.send_to(data, client_addr).await;
+    };
+    let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage(client_addr);
+    loop {
+        match crate::socket_opts::send_with_pktinfo(
+            frontend.as_raw_fd(),
+            data,
+            local,
+            &dest,
+            dest_len,
+            None,
+        ) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                frontend.writable().await?;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Try to enqueue a datagram into the GSO batch; on batch-full or size-mismatch,
 /// flush and retry, and on GSO socket failure drain the buffered datagrams
 /// through the sendmmsg fallback.
@@ -464,16 +600,17 @@ async fn try_gso_send_or_fallback(
     match flush_gso_batch(gso_batch, frontend, client_addr, local_ip) {
         Ok(_) => {
             if !gso_batch.push(data) {
-                // Post-flush push still refused (oversize / >max_bytes). Previously
-                // this datagram was silently dropped. Log and send it directly as
-                // a best-effort single datagram so at least we don't vanish it.
+                // Post-flush push still refused (zero-length or oversize /
+                // >max_bytes — GSO cannot represent either). Send it directly
+                // as a single datagram through the pktinfo-aware path so the
+                // reply still leaves with the captured source address.
                 debug!(
                     proxy_id = %proxy_id,
                     client = %client_addr,
                     size = data.len(),
                     "GSO post-flush push refused datagram, sending directly"
                 );
-                if let Err(e) = frontend.send_to(data, client_addr).await {
+                if let Err(e) = direct_send_to_client(frontend, data, client_addr, local_ip).await {
                     warn!(
                         proxy_id = %proxy_id,
                         client = %client_addr,
@@ -513,7 +650,9 @@ async fn try_gso_send_or_fallback(
                         size = data.len(),
                         "sendmmsg post-flush push refused datagram, sending directly"
                     );
-                    if let Err(e) = frontend.send_to(data, client_addr).await {
+                    if let Err(e) =
+                        direct_send_to_client(frontend, data, client_addr, local_ip).await
+                    {
                         warn!(
                             proxy_id = %proxy_id,
                             client = %client_addr,
@@ -739,9 +878,21 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     started.store(true, Ordering::Release);
     info!(proxy_id = %proxy_id, "UDP proxy listener started on {}", addr);
 
-    let sessions: SessionMap = Arc::new(DashMap::with_hasher(ahash::RandomState::default()));
-    let pending_sessions: PendingSessionMap =
-        Arc::new(DashMap::with_hasher(ahash::RandomState::default()));
+    // Both maps are consulted on every received datagram, so shard sizing
+    // goes through the shared hot-path contract instead of DashMap's
+    // `4 * num_cpus` default. `0` is the auto sentinel
+    // (`next_power_of_two(max(64, num_cpus * 16))`) — the operator
+    // `FERRUM_POOL_SHARD_AMOUNT` override is not plumbed into stream
+    // listeners, matching `BackendConnectionLimiter::new()`.
+    let shard_amount = crate::util::sharding::pool_shard_amount(0);
+    let sessions: SessionMap = Arc::new(DashMap::with_hasher_and_shard_amount(
+        ahash::RandomState::default(),
+        shard_amount,
+    ));
+    let pending_sessions: PendingSessionMap = Arc::new(DashMap::with_hasher_and_shard_amount(
+        ahash::RandomState::default(),
+        shard_amount,
+    ));
 
     // Spawn session cleanup task
     spawn_session_cleanup(
@@ -1225,7 +1376,14 @@ async fn process_datagram(
     mesh_outbound_enforcement:
         &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 ) -> Result<(), anyhow::Error> {
-    if pending_sessions.contains_key(&client_addr) {
+    if let Some(mut pending) = pending_sessions.get_mut(&client_addr) {
+        // Session setup for this source is still in flight. Queue the
+        // datagram (bounded) so opening flights spanning multiple datagrams
+        // (QUIC Initial + 0-RTT, multi-record DTLS ClientHello) survive setup
+        // instead of being dropped; the setup task drains the queue in
+        // arrival order before releasing the gate. Beyond the caps we
+        // tail-drop, preserving the pending gate's flood-resistance bound.
+        let _ = pending.push_bounded(data);
         return Ok(());
     }
 
@@ -1251,8 +1409,18 @@ async fn process_datagram(
 
     let Some(session) = existing_session else {
         let reservation = reserve_udp_session_slot(metrics, max_sessions)?;
-        if pending_sessions.insert(client_addr, ()).is_some() {
-            return Ok(());
+        match pending_sessions.entry(client_addr) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                // Defensive: a gate appeared after the check at the top of
+                // this function (not expected — the recv loop is a single
+                // task). Treat this datagram as a follow-up for the in-flight
+                // setup; the dropped `reservation` releases the extra slot.
+                let _ = occupied.get_mut().push_bounded(data);
+                return Ok(());
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(PendingDatagramQueue::default());
+            }
         }
         spawn_new_session_datagram(
             data.to_vec(),
@@ -1342,6 +1510,15 @@ fn spawn_new_session_datagram(
     reservation: UdpSessionSlotReservation,
 ) {
     tokio::spawn(async move {
+        // The gate removes the pending entry (dropping any queued follow-up
+        // datagrams wholesale) on every path that doesn't complete the
+        // queue-drain handoff; the success path removes the entry atomically
+        // inside `take_pending_datagrams` and disarms the gate.
+        let gate = PendingSessionGate {
+            pending_sessions: Arc::clone(&pending_sessions),
+            client_addr,
+            armed: true,
+        };
         let result = process_new_session_datagram(
             data,
             client_addr,
@@ -1350,6 +1527,7 @@ fn spawn_new_session_datagram(
             &dns_cache,
             &frontend_socket,
             &sessions,
+            &pending_sessions,
             &metrics,
             tls_no_verify,
             tls_ca_bundle_path.as_deref(),
@@ -1365,9 +1543,9 @@ fn spawn_new_session_datagram(
             &overload,
             &mesh_outbound_enforcement,
             reservation,
+            gate,
         )
         .await;
-        pending_sessions.remove(&client_addr);
         if let Err(e) = result {
             debug!(proxy_id = %proxy_id, client = %client_addr, "UDP session setup/initial forward error: {}", e);
         }
@@ -1383,6 +1561,7 @@ async fn process_new_session_datagram(
     dns_cache: &DnsCache,
     frontend_socket: &Arc<UdpSocket>,
     sessions: &SessionMap,
+    pending_sessions: &PendingSessionMap,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
     tls_ca_bundle_path: Option<&str>,
@@ -1399,6 +1578,7 @@ async fn process_new_session_datagram(
     mesh_outbound_enforcement:
         &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
     mut reservation: UdpSessionSlotReservation,
+    mut gate: PendingSessionGate,
 ) -> Result<(), anyhow::Error> {
     if sessions.contains_key(&client_addr) {
         return Ok(());
@@ -1504,6 +1684,39 @@ async fn process_new_session_datagram(
     metrics
         .bytes_out
         .fetch_add(data.len() as u64, Ordering::Relaxed);
+
+    // Drain follow-up datagrams that arrived while setup ran, in arrival
+    // order, then atomically remove the pending gate. Each drained datagram
+    // goes through the same per-datagram plugin hooks as the
+    // established-session path. A mid-drain forward failure propagates and
+    // the still-armed gate drops the remainder of the queue wholesale.
+    while let Some(batch) = take_pending_datagrams(pending_sessions, client_addr) {
+        for dgram in batch {
+            if !udp_datagram_allowed(
+                &session.datagram_plugins,
+                client_addr,
+                &session.proxy_id,
+                session.proxy_name.as_deref(),
+                session.listen_port,
+                &dgram,
+                session.datagram_payload_kind,
+                UdpDatagramDirection::ClientToBackend,
+                Some(UdpMetadataSink::new(&session.metadata)),
+            )
+            .await
+            {
+                continue;
+            }
+            forward_client_datagram_to_backend(&session, &dgram).await?;
+            metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .bytes_out
+                .fetch_add(dgram.len() as u64, Ordering::Relaxed);
+        }
+    }
+    // `take_pending_datagrams` removed the gate entry under the shard lock;
+    // disarm so Drop doesn't double-remove (harmless, but explicit).
+    gate.disarm();
     Ok(())
 }
 
@@ -3852,6 +4065,127 @@ mod tests {
         assert_eq!(
             dtls_disconnect_direction(&e, &ErrorClass::ReadWriteTimeout),
             Direction::Unknown
+        );
+    }
+
+    fn test_pending_map() -> super::PendingSessionMap {
+        Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::default()))
+    }
+
+    fn test_client_addr() -> std::net::SocketAddr {
+        "127.0.0.1:40000".parse().expect("valid addr")
+    }
+
+    #[test]
+    fn pending_datagram_queue_preserves_order_and_enforces_caps() {
+        let mut queue = super::PendingDatagramQueue::default();
+
+        // Zero-length datagrams are valid UDP and must be queued.
+        assert!(queue.push_bounded(&[]));
+        assert!(queue.push_bounded(&[1]));
+        assert!(queue.push_bounded(&[2, 2]));
+        assert_eq!(
+            queue.datagrams,
+            vec![Vec::<u8>::new(), vec![1], vec![2, 2]],
+            "queue must preserve arrival order"
+        );
+        assert_eq!(queue.queued_bytes, 3);
+
+        // Byte cap: a datagram that would exceed the total byte budget is
+        // tail-dropped without touching the queue.
+        let oversize = vec![0u8; super::PENDING_SESSION_MAX_QUEUED_BYTES];
+        assert!(!queue.push_bounded(&oversize));
+        assert_eq!(queue.datagrams.len(), 3);
+        assert_eq!(queue.queued_bytes, 3);
+
+        // Datagram-count cap: beyond the max entry count everything is
+        // tail-dropped, even zero-length datagrams.
+        for _ in queue.datagrams.len()..super::PENDING_SESSION_MAX_QUEUED_DATAGRAMS {
+            assert!(queue.push_bounded(&[7]));
+        }
+        assert!(!queue.push_bounded(&[8]));
+        assert!(!queue.push_bounded(&[]));
+        assert_eq!(
+            queue.datagrams.len(),
+            super::PENDING_SESSION_MAX_QUEUED_DATAGRAMS
+        );
+    }
+
+    #[test]
+    fn take_pending_datagrams_drains_in_order_then_removes_gate() {
+        let pending = test_pending_map();
+        let addr = test_client_addr();
+
+        // Absent entry: nothing to drain, nothing inserted.
+        assert!(super::take_pending_datagrams(&pending, addr).is_none());
+        assert!(!pending.contains_key(&addr));
+
+        pending.insert(addr, super::PendingDatagramQueue::default());
+        {
+            let mut entry = pending.get_mut(&addr).expect("gate present");
+            assert!(entry.push_bounded(&[1]));
+            assert!(entry.push_bounded(&[2]));
+        }
+
+        // First take hands off the queued batch in arrival order and leaves
+        // the gate in place so concurrent arrivals keep queueing.
+        let batch = super::take_pending_datagrams(&pending, addr).expect("queued batch");
+        assert_eq!(batch, vec![vec![1], vec![2]]);
+        assert!(
+            pending.contains_key(&addr),
+            "gate must survive a non-empty take"
+        );
+
+        // A datagram that "arrived during the drain" is returned by the next
+        // take, byte accounting reset in between.
+        {
+            let mut entry = pending.get_mut(&addr).expect("gate present");
+            assert_eq!(entry.queued_bytes, 0, "take must reset byte accounting");
+            assert!(entry.push_bounded(&[3]));
+        }
+        let batch = super::take_pending_datagrams(&pending, addr).expect("late batch");
+        assert_eq!(batch, vec![vec![3]]);
+
+        // Empty queue: the gate is removed atomically and the drain ends.
+        assert!(super::take_pending_datagrams(&pending, addr).is_none());
+        assert!(
+            !pending.contains_key(&addr),
+            "empty take must remove the pending gate"
+        );
+    }
+
+    #[test]
+    fn pending_session_gate_drops_queue_unless_disarmed() {
+        let pending = test_pending_map();
+        let addr = test_client_addr();
+
+        // Armed gate (setup failure path): entry and queued datagrams removed.
+        pending.insert(addr, super::PendingDatagramQueue::default());
+        {
+            let _gate = super::PendingSessionGate {
+                pending_sessions: Arc::clone(&pending),
+                client_addr: addr,
+                armed: true,
+            };
+        }
+        assert!(
+            !pending.contains_key(&addr),
+            "armed gate must remove the pending entry on drop"
+        );
+
+        // Disarmed gate (successful handoff): entry left alone.
+        pending.insert(addr, super::PendingDatagramQueue::default());
+        {
+            let mut gate = super::PendingSessionGate {
+                pending_sessions: Arc::clone(&pending),
+                client_addr: addr,
+                armed: true,
+            };
+            gate.disarm();
+        }
+        assert!(
+            pending.contains_key(&addr),
+            "disarmed gate must not touch the map"
         );
     }
 

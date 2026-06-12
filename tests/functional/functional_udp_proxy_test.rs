@@ -322,6 +322,113 @@ plugin_configs: []
     echo_server.abort();
 }
 
+/// Regression: datagrams sent while background session setup is still running
+/// for a new source (the pending-session window) must be queued and flushed to
+/// the backend in arrival order — not dropped. Models a multi-datagram opening
+/// flight (QUIC Initial + 0-RTT coalesced flight, multi-record DTLS
+/// ClientHello).
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_opening_flight_burst_preserved_in_order() {
+    let backend_port = 19836u16;
+    let proxy_port = 19837u16;
+    let gateway_http_port = 18223u16;
+
+    // Recording echo backend: tracks the payload arrival order so we can
+    // assert the pending-session queue flushed to the backend in order.
+    let received: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received_server = std::sync::Arc::clone(&received);
+    let backend = tokio::spawn(async move {
+        let socket = UdpSocket::bind(format!("127.0.0.1:{}", backend_port))
+            .await
+            .unwrap_or_else(|_| panic!("Failed to bind UDP backend on port {}", backend_port));
+        let mut buf = vec![0u8; 65535];
+        while let Ok((len, src)) = socket.recv_from(&mut buf).await {
+            received_server
+                .lock()
+                .expect("recording mutex poisoned")
+                .push(buf[..len].to_vec());
+            let _ = socket.send_to(&buf[..len], src).await;
+        }
+    });
+    sleep(Duration::from_millis(200)).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-opening-flight"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_idle_timeout_seconds: 30
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway =
+        start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+
+    // Fire the whole opening flight back-to-back, without waiting for any
+    // reply, so the follow-up datagrams land while the gateway's background
+    // session setup for this brand-new source is still in flight.
+    let flight: Vec<Vec<u8>> = (0..6).map(|i| format!("flight-{i}").into_bytes()).collect();
+    for dgram in &flight {
+        client.send(dgram).await.expect("send failed");
+    }
+
+    // Every datagram of the flight must come back (echo backend), proving
+    // none were dropped during the pending-session window.
+    let mut buf = vec![0u8; 1024];
+    let mut echoes = Vec::new();
+    for i in 0..flight.len() {
+        let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("echo {i} timed out — opening-flight datagram lost"))
+            .expect("recv error");
+        echoes.push(buf[..n].to_vec());
+    }
+    assert_eq!(echoes, flight, "opening flight must be echoed in order");
+
+    // The backend must have observed the flight in arrival order — the
+    // pending-session queue drains oldest-first after setup completes.
+    {
+        let recorded = received.lock().expect("recording mutex poisoned");
+        assert_eq!(
+            *recorded, flight,
+            "backend must receive the opening flight in order"
+        );
+    }
+
+    // Session stays usable after the handoff.
+    let followup = b"post-flight";
+    client.send(followup).await.expect("send failed");
+    let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+        .await
+        .expect("post-flight echo timed out")
+        .expect("recv error");
+    assert_eq!(&buf[..n], followup);
+
+    shutdown_gateway(&mut gateway);
+    backend.abort();
+}
+
 /// Test 2: Multiple concurrent UDP clients — verify session isolation.
 /// Each client should get back only its own data.
 #[ignore]
