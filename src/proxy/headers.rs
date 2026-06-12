@@ -163,9 +163,9 @@ pub fn parse_connection_listed_from_str_map(
     headers: &std::collections::HashMap<String, String>,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    // The materialised request map folds multi-valued headers with `, `
-    // (see the request handler). Walk every case variant defensively so a
-    // plugin-added `Connection` does not bypass listed-header stripping.
+    // The materialised request map folds repeated non-cookie headers with
+    // `, ` (see the request handler). Walk every case variant defensively
+    // so a plugin-added `Connection` does not bypass listed-header stripping.
     for value in headers.iter().filter_map(|(name, value)| {
         name.eq_ignore_ascii_case("connection")
             .then_some(value.as_str())
