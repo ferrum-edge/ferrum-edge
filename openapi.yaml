@@ -13726,6 +13726,24 @@ components:
               default: false
               enum: [false]
               description: Reserved; tool result validation is not implemented yet, so true is rejected at config validation.
+            max_upstream_response_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 4194304
+              description: "Maximum bytes read from a single non-SSE upstream application/json response before the read is aborted (DoS backstop). Must be greater than 0."
+            max_catalog_items_per_list:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 10000
+              description: "Maximum items accumulated across paginated catalog list pages (tools/resources/prompts) before the aggregation is rejected. Must be greater than 0."
+            max_catalog_bytes_per_list:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 8388608
+              description: "Maximum total serialized bytes accumulated across paginated catalog list pages before the aggregation is rejected. Must be greater than 0."
         observability:
           type: object
           properties:

@@ -36,8 +36,8 @@ use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConf
 use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequest};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication, PolicyAction,
-    PolicyScope, PrincipalMatch, ServicePort, Workload, WorkloadPort, WorkloadRef,
+    AppProtocol, MeshConfig, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication,
+    PolicyAction, PolicyScope, PrincipalMatch, ServicePort, Workload, WorkloadPort, WorkloadRef,
     WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
@@ -1850,5 +1850,683 @@ async fn functional_mesh_sidecar_inbound_denies_unauthorized_peer() {
     assert!(
         !body.contains("backend-ok"),
         "a denied request must NOT reach the local backend (no backend body): {body:?}"
+    );
+}
+
+// ── Live OUTBOUND (egress) datapath: point A → point B over the mesh ─────────
+//
+// These are the egress keystones: TWO real gateways on one host. Gateway A
+// captures a plaintext app request on its outbound listener, routes it through
+// the materialized egress route, and originates the topology's mesh transport —
+// Ambient HBONE (HTTP/2 CONNECT over SVID-mTLS to B's :15008-equivalent) or
+// Sidecar SVID-mTLS HTTP/2 (to B's inbound :15006-equivalent). Gateway B
+// terminates the mTLS, verifies A's SVID against the shared mesh CA, and
+// delivers the request to the point-B echo backend. The non-default test ports
+// ride FERRUM_MESH_EGRESS_{HBONE,MTLS}_PORT → `mesh.{hbone,mtls}_port` tags.
+
+/// Two gateway SVID file-sets minted under ONE shared mesh CA, so gateways A
+/// and B mutually verify over the same trust bundle. Mirrors
+/// `generate_gateway_svid`'s leaf shape (SPIFFE URI SAN, client+server EKU).
+struct TwoGatewaySvids {
+    a: GeneratedGatewaySvid,
+    b: GeneratedGatewaySvid,
+}
+
+fn generate_two_gateway_svids(
+    dir: &std::path::Path,
+    a_spiffe: &str,
+    b_spiffe: &str,
+) -> TwoGatewaySvids {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa,
+        Issuer, KeyPair, KeyUsagePurpose,
+    };
+
+    let not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+    let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    ca_params.not_before = not_before;
+    ca_params.not_after = not_after;
+    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+    let ca_pem = ca_cert.pem();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let trust_bundle_path = dir.join("mesh-egress-ca.pem");
+    std::fs::write(&trust_bundle_path, &ca_pem).expect("write trust bundle");
+    let bundle = trust_bundle_path
+        .to_str()
+        .expect("bundle path is UTF-8")
+        .to_string();
+
+    let mint = |prefix: &str, spiffe: &str| -> GeneratedGatewaySvid {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        let id = SpiffeId::new(spiffe).expect("valid SPIFFE ID");
+        params
+            .subject_alt_names
+            .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let cert = params.signed_by(&key, &issuer).expect("leaf cert");
+
+        let cert_path = dir.join(format!("{prefix}-svid.crt"));
+        let key_path = dir.join(format!("{prefix}-svid.key"));
+        std::fs::write(&cert_path, cert.pem()).expect("write svid cert");
+        std::fs::write(&key_path, key.serialize_pem()).expect("write svid key");
+        GeneratedGatewaySvid {
+            cert_path: cert_path.to_str().expect("path utf8").to_string(),
+            key_path: key_path.to_str().expect("path utf8").to_string(),
+            trust_bundle_path: bundle.clone(),
+        }
+    };
+
+    TwoGatewaySvids {
+        a: mint("gateway-a", a_spiffe),
+        b: mint("gateway-b", b_spiffe),
+    }
+}
+
+/// The egress slice BOTH gateways consume: one in-mesh HTTP service `svc-b`
+/// backed by gateway B's workload at `127.0.0.1:backend_port`, under STRICT
+/// PeerAuthentication. The same slice serves both roles — B's inbound
+/// materializer recognizes `b_spiffe` as local (via
+/// `FERRUM_MESH_WORKLOAD_SPIFFE_ID`) and builds the loopback route; A's
+/// outbound materializer (whose workload identity differs) builds the egress
+/// route whose targets dial B.
+fn egress_service_slice(node_id: &str, b_spiffe: &str, backend_port: u16) -> MeshSlice {
+    let b_id = SpiffeId::new(b_spiffe).expect("b SPIFFE id");
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![Workload {
+            spiffe_id: b_id.clone(),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "svc-b".to_string())]),
+                namespace: Some("ferrum".to_string()),
+            },
+            service_name: "svc-b".to_string(),
+            addresses: vec!["127.0.0.1".to_string()],
+            ports: vec![WorkloadPort {
+                port: backend_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain,
+            namespace: "ferrum".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("svc-b".to_string()),
+            pod_uid: None,
+        }],
+        services: vec![MeshService {
+            name: "svc-b".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: backend_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef { spiffe_id: b_id }],
+            protocol_overrides: HashMap::new(),
+        }],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// Drive one captured app request from gateway A to the echo backend behind
+/// gateway B over the given topology's egress transport. `client_trusted`
+/// selects whether A's gateway SVID chains to the shared mesh CA (the mTLS
+/// hooks negative: an untrusted A must NOT reach the backend). Returns the
+/// final HTTP status + response body observed at point A's captured client.
+async fn drive_egress_a_to_b(
+    topology: &str,
+    client_trusted: bool,
+) -> Result<(u16, String, String), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
+    let trust_label = if client_trusted {
+        "trusted"
+    } else {
+        "untrusted"
+    };
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_a = format!("functional-mesh-egress-{topology}-{trust_label}-a-{attempt}");
+        let node_b = format!("functional-mesh-egress-{topology}-{trust_label}-b-{attempt}");
+        let temp_a = TempDir::new().map_err(|e| format!("temp dir a: {e}"))?;
+        let temp_b = TempDir::new().map_err(|e| format!("temp dir b: {e}"))?;
+        let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
+        // An untrusted A mints its OWN CA + SVID: its cert does not chain to the
+        // mesh CA (B rejects it) and its bundle does not contain the mesh CA (A
+        // rejects B). Either side failing must fail the request closed.
+        let a_svid = if client_trusted {
+            svids.a
+        } else {
+            generate_gateway_svid(temp_a.path(), a_spiffe)
+        };
+        let backend_port = start_echo_backend().await;
+
+        let cp_b =
+            start_static_mesh_cp(egress_service_slice(&node_b, b_spiffe, backend_port)).await;
+        let cp_a =
+            start_static_mesh_cp(egress_service_slice(&node_a, b_spiffe, backend_port)).await;
+        let ports_a = reserve_mesh_ports().await;
+        let ports_b = reserve_mesh_ports().await;
+        let a_outbound_port = ports_a.outbound;
+        let b_transport_port = match topology {
+            "sidecar" => ports_b.inbound,
+            "ambient" => ports_b.hbone,
+            other => return Err(format!("unsupported egress topology {other}")),
+        };
+
+        // Gateway B: the destination. Its workload identity makes the slice's
+        // svc-b local, so (sidecar) the inbound materializer routes
+        // :inbound → 127.0.0.1:backend_port, or (ambient) the HBONE relay
+        // tunnels CONNECT authorities directly.
+        let mut child_b = spawn_mesh_gateway(
+            &temp_b,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_b.addr,
+                ports: ports_b,
+                node_id: &node_b,
+                config_protocol: "native",
+                topology,
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        svids.b.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+        if !wait_for_tcp_port(b_transport_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway B transport listener never bound\n{}",
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            cp_a.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Gateway A: the source. Its egress dial port points the materialized
+        // outbound targets at B's transport listener. Ambient keeps warmup ON so
+        // the HBONE capability probe classifies B Supported before the request
+        // (the fail-closed `hbone_required` gate refuses dispatch on an
+        // unprobed target).
+        let mut a_env = vec![
+            ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+            // Debug-level logs so capability-probe outcomes (logged at debug)
+            // surface in the captured output on test failures.
+            ("FERRUM_LOG_LEVEL", "debug".to_string()),
+            ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", a_spiffe.to_string()),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", a_svid.cert_path.clone()),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", a_svid.key_path.clone()),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                a_svid.trust_bundle_path.clone(),
+            ),
+        ];
+        match topology {
+            "sidecar" => {
+                a_env.push(("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()));
+                a_env.push(("FERRUM_MESH_EGRESS_MTLS_PORT", b_transport_port.to_string()));
+            }
+            _ => {
+                a_env.push(("FERRUM_POOL_WARMUP_ENABLED", "true".to_string()));
+                a_env.push((
+                    "FERRUM_MESH_EGRESS_HBONE_PORT",
+                    b_transport_port.to_string(),
+                ));
+            }
+        }
+        let mut child_a = spawn_mesh_gateway(
+            &temp_a,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_a.addr,
+                ports: ports_a,
+                node_id: &node_a,
+                config_protocol: "native",
+                topology,
+                waypoint_name: None,
+                env_overrides: a_env,
+            },
+        );
+        if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway A outbound listener never bound\n{}",
+                captured_output(&temp_a)
+            );
+            kill_child(&mut child_a);
+            kill_child(&mut child_b);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Point A's captured app request. Retried briefly: the HBONE capability
+        // probe and pool warmup race the first request, and a 502 from the
+        // fail-closed gate is expected to converge to 200 once classified. The
+        // negative (untrusted) case asserts the FINAL state instead — it must
+        // never converge to 200.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let last: Result<(u16, String), String> = loop {
+            let attempt =
+                match plaintext_http_get(a_outbound_port, "svc-b.ferrum.svc.cluster.local", "/")
+                    .await
+                {
+                    Ok((status, body)) => {
+                        if status == 200 && body.contains("backend-ok") {
+                            break Ok((status, body));
+                        }
+                        Ok((status, body))
+                    }
+                    Err(e) => Err(format!("egress GET failed: {e}")),
+                };
+            if Instant::now() >= deadline {
+                break attempt;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let output_a = captured_output(&temp_a);
+        let output_b = captured_output(&temp_b);
+        kill_child(&mut child_a);
+        kill_child(&mut child_b);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+
+        // Carry both gateways' captured logs so a failed assertion (locally or
+        // in CI) shows WHY the datapath did not converge.
+        let logs = format!("--- gateway A ---\n{output_a}\n--- gateway B ---\n{output_b}");
+        return match last {
+            Ok((status, body)) => Ok((status, body, logs)),
+            Err(e) => Err(format!("{e}\n{logs}")),
+        };
+    }
+
+    Err(format!(
+        "egress gateways never bound their listeners after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// Egress keystone (Ambient): a captured plaintext request at gateway A reaches
+/// the echo backend behind gateway B over **HBONE** — outbound capture →
+/// materialized egress route → HBONE CONNECT over SVID-mTLS (peer pinned to
+/// B's workload identity) → B's transparent relay → point-B backend → response
+/// relayed back to point A.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_egress_routes_a_to_b_over_hbone() {
+    let (status, body, logs) = drive_egress_a_to_b("ambient", true)
+        .await
+        .expect("ambient egress drive");
+    assert_eq!(
+        status, 200,
+        "the captured request must traverse A's HBONE egress to B's backend; body: {body:?}\n{logs}"
+    );
+    assert!(
+        body.contains("backend-ok"),
+        "the response must carry point B's backend body: {body:?}\n{logs}"
+    );
+}
+
+/// Egress keystone (Sidecar): a captured plaintext request at gateway A reaches
+/// the echo backend behind gateway B over **plain SVID-mTLS HTTP/2** to B's
+/// inbound listener — outbound capture → materialized egress route → mTLS
+/// origination (peer pinned to B's workload identity) → B's STRICT inbound
+/// termination → materialized loopback route → point-B backend → response back
+/// to point A. HBONE is never involved: this is Sidecar's transport.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_egress_routes_a_to_b_over_mtls() {
+    let (status, body, logs) = drive_egress_a_to_b("sidecar", true)
+        .await
+        .expect("sidecar egress drive");
+    assert_eq!(
+        status, 200,
+        "the captured request must traverse A's SVID-mTLS egress to B's backend; body: {body:?}\n{logs}"
+    );
+    assert!(
+        body.contains("backend-ok"),
+        "the response must carry point B's backend body: {body:?}\n{logs}"
+    );
+}
+
+/// Egress mTLS negative (Sidecar): a gateway whose SVID does NOT chain to the
+/// mesh CA must not reach point B. A's client config rejects B's server SVID
+/// (unknown CA) and B's STRICT inbound rejects A's client cert — both fail the
+/// request closed at A's captured client, proving the egress transport really
+/// verifies SVIDs rather than blindly tunneling.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_egress_rejects_untrusted_client_gateway() {
+    let (status, body, logs) = drive_egress_a_to_b("sidecar", false)
+        .await
+        .expect("untrusted egress drive");
+    assert_ne!(
+        status, 200,
+        "an untrusted gateway's egress request must fail closed, not reach the backend\n{logs}"
+    );
+    assert!(
+        !body.contains("backend-ok"),
+        "no backend body may leak through an unverified mTLS session: {body:?}\n{logs}"
+    );
+}
+
+// ── Localized file config source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) ────────
+
+/// JSON mesh document equivalent of `inbound_authz_slice`: the same routing +
+/// authz content, but expressed as the file source's `{ "mesh": ... }`
+/// document so the data plane builds the slice locally.
+fn inbound_authz_mesh_document(
+    server_spiffe: &str,
+    client_spiffe: &str,
+    backend_port: u16,
+    allow: bool,
+) -> String {
+    let slice = inbound_authz_slice("unused", server_spiffe, client_spiffe, backend_port, allow);
+    let mesh = MeshConfig {
+        workloads: slice.workloads,
+        services: slice.services,
+        peer_authentications: slice.peer_authentications,
+        mesh_policies: slice.mesh_policies,
+        ..MeshConfig::default()
+    };
+    serde_json::to_string(&serde_json::json!({ "mesh": mesh })).expect("mesh document serializes")
+}
+
+/// Keystone for the localized file source: a mesh data plane with **no control
+/// plane** loads its slice from disk, materializes the sidecar inbound route,
+/// serves an authorized peer's mTLS request to the co-located backend, and
+/// hot-applies a DENY policy when the document changes and SIGHUP arrives —
+/// all through the same datapath the native/xDS keystones exercise.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_file_source_serves_inbound_and_reloads_on_sighup() {
+    ensure_gateway_built().expect("gateway build");
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+    let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+
+    let mut last_failure = String::new();
+    'attempts: for attempt in 1..=RETRY_ATTEMPTS {
+        let temp = TempDir::new().expect("temp dir");
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let backend_port = start_echo_backend().await;
+
+        let mesh_doc_path = temp.path().join("mesh.json");
+        std::fs::write(
+            &mesh_doc_path,
+            inbound_authz_mesh_document(server_spiffe, client_spiffe, backend_port, true),
+        )
+        .expect("write mesh document");
+        let mesh_doc_env = mesh_doc_path
+            .to_str()
+            .expect("mesh document path is UTF-8")
+            .to_string();
+
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                // The file protocol consumes no CP; the harness's default
+                // FERRUM_DP_CP_GRPC_URLS points at a dead port and must be
+                // ignored by the file source.
+                cp_addr: "127.0.0.1:1".parse().expect("dummy addr"),
+                ports,
+                node_id: &format!("functional-mesh-file-source-{attempt}"),
+                config_protocol: "file",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_FILE_CONFIG_PATH", mesh_doc_env),
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        if !wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: inbound listener never bound\n{}",
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue 'attempts;
+        }
+
+        // Phase 1: the file-built slice materializes the inbound route and an
+        // authorized peer reaches the local backend.
+        let (status, body) = match mesh_inbound_http_get(
+            inbound_port,
+            &peers.ca_pem,
+            server_spiffe,
+            Some((&peers.client_cert_pem, &peers.client_key_pem)),
+            "echo.ferrum.svc.cluster.local",
+            "/",
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!("inbound mTLS HTTP GET failed: {e}\n{output}");
+            }
+        };
+        assert_eq!(
+            status,
+            200,
+            "an authorized peer must reach the backend through the file-built slice; body: \
+             {body:?}\n{}",
+            captured_output(&temp)
+        );
+        assert!(
+            body.contains("backend-ok"),
+            "the response must carry the local backend's body: {body:?}"
+        );
+
+        // Phase 2: rewrite the document with a DENY policy for the client
+        // principal and SIGHUP the gateway; the reload must take effect
+        // without a restart.
+        std::fs::write(
+            &mesh_doc_path,
+            inbound_authz_mesh_document(server_spiffe, client_spiffe, backend_port, false),
+        )
+        .expect("rewrite mesh document");
+        let pid = child.id().to_string();
+        let hup = Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .expect("send SIGHUP");
+        assert!(hup.success(), "SIGHUP delivery failed for pid {pid}");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match mesh_inbound_http_get(
+                inbound_port,
+                &peers.ca_pem,
+                server_spiffe,
+                Some((&peers.client_cert_pem, &peers.client_key_pem)),
+                "echo.ferrum.svc.cluster.local",
+                "/",
+            )
+            .await
+            {
+                Ok((403, denied_body)) => {
+                    assert!(
+                        !denied_body.contains("backend-ok"),
+                        "a denied request must not reach the backend: {denied_body:?}"
+                    );
+                    kill_child(&mut child);
+                    return;
+                }
+                Ok(_) | Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                Ok((other, other_body)) => {
+                    let output = captured_output(&temp);
+                    kill_child(&mut child);
+                    panic!(
+                        "SIGHUP-reloaded DENY policy never enforced: last status {other} body \
+                         {other_body:?}\n{output}"
+                    );
+                }
+                Err(e) => {
+                    let output = captured_output(&temp);
+                    kill_child(&mut child);
+                    panic!("inbound request failed while awaiting reload: {e}\n{output}");
+                }
+            }
+        }
+    }
+
+    panic!(
+        "mesh file-source gateway never bound its inbound listener after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
+    );
+}
+
+// ── Multi-port egress original-destination fail-closed ──────────────────────
+
+/// Slice with one in-mesh service exposing TWO HTTP-family ports backed by a
+/// remote workload — the multi-port shape that materializes per-port outbound
+/// siblings disambiguated by `SO_ORIGINAL_DST`.
+fn multi_port_egress_slice(node_id: &str, b_spiffe: &str, backend_port: u16) -> MeshSlice {
+    let mut slice = egress_service_slice(node_id, b_spiffe, backend_port);
+    slice.services[0].ports.push(ServicePort {
+        port: backend_port.wrapping_add(1),
+        protocol: AppProtocol::Grpc,
+        name: Some("grpc".to_string()),
+        target_port: None,
+    });
+    // This test exercises only the OUTBOUND capture listener's routing
+    // decision; the gateway runs without SVID material, and the inherited
+    // STRICT PeerAuthentication would make the inbound listener's missing
+    // server identity fatal at startup. Default (PERMISSIVE) suffices here.
+    slice.peer_authentications.clear();
+    slice
+}
+
+/// A captured request to a MULTI-port service without a captured original
+/// destination must be rejected 502 (fail-closed), never forwarded to an
+/// arbitrary port's backend. A direct (non-REDIRECTed) dial of the outbound
+/// capture listener is exactly the "no orig-dst" condition, so this exercises
+/// the production fail-closed arm end-to-end without needing iptables.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_outbound_multi_port_without_orig_dst_fails_closed() {
+    ensure_gateway_built().expect("gateway build");
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-origdst-multiport-{attempt}");
+        let temp = TempDir::new().expect("temp dir");
+        let backend_port = start_echo_backend().await;
+        let cp =
+            start_static_mesh_cp(multi_port_egress_slice(&node_id, b_spiffe, backend_port)).await;
+        let ports = reserve_mesh_ports().await;
+        let outbound_port = ports.outbound;
+        // Ambient: the only topology with per-port multi-port egress today
+        // (Sidecar multi-port stays fail-closed at materialization until the
+        // destination's inbound port disambiguation lands).
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "ambient",
+                waypoint_name: None,
+                env_overrides: Vec::new(),
+            },
+        );
+
+        if !wait_for_tcp_port(outbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: outbound listener never bound\n{}",
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let result = plaintext_http_get(outbound_port, "svc-b.ferrum.svc.cluster.local", "/").await;
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        let (status, body) = result.expect("plaintext GET against the outbound listener");
+        assert_eq!(
+            status, 502,
+            "a multi-port service without a captured original destination must fail closed; \
+             body: {body:?}\n{output}"
+        );
+        assert!(
+            !body.contains("backend-ok"),
+            "the request must never reach a port's backend by guessing: {body:?}"
+        );
+        return;
+    }
+
+    panic!(
+        "mesh gateway never bound its outbound listener after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
     );
 }

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
+use h3::quic::SendStream;
 use h3::server::RequestStream;
 use http::{Response, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
@@ -32,7 +33,7 @@ use crate::plugins::{
 };
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
-    parse_connection_listed_from_str_map,
+    parse_connection_listed_from_str_map, strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_after_proxy_hooks_to_rejection, apply_plugin_rejection_response,
@@ -245,6 +246,57 @@ fn build_h3_quinn_server_config(
     Ok(server_config)
 }
 
+/// Failure side for [`finish_h3_response_with_backend_trailers`].
+///
+/// The trailer-finish phase touches both ends of the relay: reading
+/// trailers from the BACKEND recv stream and sending trailers/FIN to the
+/// CLIENT send stream. Call sites must not conflate the two — a backend
+/// trailer-read fault is a backend transport error (classified via
+/// `classify_http3_error`, reported to circuit breaker / passive health),
+/// while a client send/finish failure is a genuine `ClientDisconnect`.
+enum H3TrailerFinishError {
+    /// `recv_trailers()` on the backend stream failed non-gracefully.
+    Backend(h3::error::StreamError),
+    /// `send_trailers()` / `finish()` toward the client failed. The
+    /// underlying error is intentionally dropped — call sites uniformly
+    /// classify this side as `ClientDisconnect`.
+    Client,
+}
+
+async fn finish_h3_response_with_backend_trailers<S>(
+    h3_stream: &mut RequestStream<S, Bytes>,
+    recv_stream: &mut crate::http3::client::H3RequestStream,
+) -> Result<(), H3TrailerFinishError>
+where
+    S: SendStream<Bytes>,
+{
+    let trailers = match recv_stream.recv_trailers().await {
+        Ok(trailers) => trailers,
+        Err(err) if crate::http3::client::is_h3_graceful_close(&err) => None,
+        Err(err) => return Err(H3TrailerFinishError::Backend(err)),
+    };
+
+    match trailers {
+        Some(mut trailers) => {
+            strip_response_hop_by_hop_trailers(&mut trailers);
+            if !trailers.is_empty() {
+                h3_stream
+                    .send_trailers(trailers)
+                    .await
+                    .map_err(|_| H3TrailerFinishError::Client)?;
+            }
+            h3_stream
+                .finish()
+                .await
+                .map_err(|_| H3TrailerFinishError::Client)
+        }
+        None => h3_stream
+            .finish()
+            .await
+            .map_err(|_| H3TrailerFinishError::Client),
+    }
+}
+
 /// Start the HTTP/3 listener and optionally emit a startup signal after bind.
 pub async fn start_http3_listener_with_signal(
     addr: SocketAddr,
@@ -280,6 +332,11 @@ pub async fn start_http3_listener_with_signal(
     }
 
     let mut shutdown_rx = shutdown;
+    // Wrap the ~60-Arc ProxyState in a single Arc once at listener start so
+    // per-connection and per-request-stream handoffs cost one refcount bump
+    // instead of a full field-by-field clone (issue #1570 sub-item 1; same
+    // treatment as the H1/H2 service_fn path).
+    let state = Arc::new(state);
     // Captured before the accept loop so each spawned connection task can apply
     // the same QUIC handshake bound without reading `state.env_config` per-conn.
     // `Duration::ZERO` preserves the documented "0 disables" semantic.
@@ -327,7 +384,7 @@ pub async fn start_http3_listener_with_signal(
                             connecting.refuse();
                             continue;
                         }
-                        let state = state.clone();
+                        let state = Arc::clone(&state);
                         tokio::spawn(async move {
                             let _conn_guard =
                                 crate::overload::ConnectionGuard::new(&state.overload);
@@ -471,7 +528,7 @@ where
 /// Handle a single HTTP/3 connection (may carry multiple streams/requests).
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     handshake_timeout: Duration,
     frontend_listen_port: Option<u16>,
 ) -> Result<(), anyhow::Error> {
@@ -631,7 +688,7 @@ async fn handle_h3_connection(
                     socket_ip = Arc::from(current_addr.ip().to_string());
                 }
 
-                let state = state.clone();
+                let state = Arc::clone(&state);
                 let cert = client_cert_der.clone();
                 let chain = client_cert_chain_der.clone();
                 let frontend_sni_hostname = frontend_sni_hostname.clone();
@@ -685,7 +742,7 @@ async fn handle_h3_connection(
 async fn handle_h3_request(
     req: http::Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     socket_ip: &str,
     frontend_listen_port: Option<u16>,
@@ -1093,19 +1150,21 @@ async fn handle_h3_request(
         &path,
     );
 
-    // Materialized sidecar inbound routes (`__mesh-inbound-*`) are direction-
-    // scoped: the H3 frontend is never the mesh inbound mTLS listener, so if a
-    // request matched one, re-resolve excluding inbound routes (mirrors the
-    // H1/H2 handler) so it is not shortcut to the local loopback backend.
+    // Materialized mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`) are
+    // direction-scoped (see the H1/H2 handler). The H3 frontend is never a mesh
+    // capture listener, so `ctx.mesh_direction` is `None` here and any matched
+    // mesh route is wrong-direction: re-resolve keeping only matching-direction
+    // routes so an H3 request is never shortcut to a loopback/HBONE mesh route.
     let route_match = match route_match {
         Some(rm)
-            if ctx.mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
-                && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id) =>
+            if crate::modes::mesh::mesh_route_direction(&rm.proxy.id)
+                .is_some_and(|route_dir| Some(route_dir) != ctx.mesh_direction) =>
         {
-            state.router_cache.resolve_route_excluding_mesh_inbound(
+            state.router_cache.resolve_route_excluding_wrong_direction(
                 &epoch.route_table,
                 request_host.as_deref(),
                 &path,
+                ctx.mesh_direction,
             )
         }
         other => other,
@@ -1888,6 +1947,14 @@ async fn handle_h3_request(
                     origin, proxy.id
                 );
                 record_request(&state, 403);
+                // Gateway-side reject after the CB check above — release a
+                // claimed HALF_OPEN probe slot so the breaker doesn't wedge.
+                crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
                 send_h3_error_flavor_aware(
                     &mut stream,
                     http_flavor,
@@ -2258,12 +2325,16 @@ async fn handle_h3_request(
                         .backend_capabilities
                         .mark_h3_unsupported(&proxy, upstream_target.as_deref());
                 }
-                let h3_error_body = r#"{"error":"Backend unavailable"}"#;
+                // Read timeouts surface as 504 Backend timeout (matching the
+                // direct-H2 / HBONE read-timeout arms); everything else keeps
+                // the generic 502.
+                let (reject_status, reject_body) = h3_backend_failure_status_body(&e);
+                let reject_status_code = reject_status.as_u16();
                 // Do NOT propagate a send error: record_backend_outcome below
                 // releases the LB active-connection count, so a `?` here would
                 // skip it and leak the count when the client disconnects during
-                // the 502 write.
-                let _ = send_h3_response(&mut stream, StatusCode::BAD_GATEWAY, h3_error_body).await;
+                // the reject write.
+                let _ = send_h3_response(&mut stream, reject_status, reject_body).await;
 
                 // Record outcome for CB/health even on failure.
                 // Frontend client aborts while uploading request bodies are
@@ -2278,6 +2349,7 @@ async fn handle_h3_request(
                 let (outcome_connection_error, outcome_error_class) =
                     h3_streaming_body_failure_outcome(
                         is_client_request_body_disconnect,
+                        e.is_read_timeout(),
                         h3_error_class,
                     );
                 crate::proxy::backend_dispatch::record_backend_outcome(
@@ -2287,7 +2359,7 @@ async fn handle_h3_request(
                     upstream_balancer.as_ref(),
                     upstream_target.as_deref(),
                     cb_target_key.as_deref(),
-                    502,
+                    reject_status_code,
                     outcome_connection_error,
                     outcome_error_class,
                     cb_is_half_open_probe,
@@ -2296,7 +2368,7 @@ async fn handle_h3_request(
                 );
                 record_h3_backend_admission_outcome(
                     &mut backend_admission_permits,
-                    502,
+                    reject_status_code,
                     outcome_connection_error,
                     outcome_error_class,
                     backend_admission_start.elapsed(),
@@ -2323,7 +2395,7 @@ async fn handle_h3_request(
                     proxy_name: proxy.name.clone(),
                     backend_target: Some(strip_query_params(&backend_url).to_string()),
                     backend_resolved_ip: backend_resolved_ip.clone(),
-                    response_status_code: 502,
+                    response_status_code: reject_status_code,
                     latency_total_ms: total_ms,
                     latency_gateway_processing_ms: gateway_processing_ms,
                     latency_backend_ttfb_ms: backend_total_ms,
@@ -2333,21 +2405,23 @@ async fn handle_h3_request(
                     latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms)
                         .max(0.0),
                     request_user_agent: proxy_headers.get("user-agent").cloned(),
-                    // Native H3 backend dispatch failed; the 502 response body is
-                    // built and sent synchronously below. This branch covers both
-                    // pre-wire failures (connect/handshake — zero request bytes
-                    // forwarded) and post-wire failures (send_data failed
-                    // mid-stream, or the client disconnected while sending the
-                    // request body), where request_body_bytes_seen is non-zero.
-                    // Loading it here reports the bytes actually forwarded before
-                    // the failure rather than assuming zero.
+                    // Native H3 backend dispatch failed; the reject response
+                    // body (502 generic, 504 for a backend read timeout) is
+                    // built and sent synchronously above. This branch covers
+                    // both pre-wire failures (connect/handshake — zero request
+                    // bytes forwarded) and post-wire failures (send_data failed
+                    // mid-stream, recv_response read timeout, or the client
+                    // disconnected while sending the request body), where
+                    // request_body_bytes_seen is non-zero. Loading it here
+                    // reports the bytes actually forwarded before the failure
+                    // rather than assuming zero.
                     error_class: Some(h3_error_class),
                     bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
                     metadata: crate::proxy::clone_log_metadata(&ctx),
                     ..TransactionSummary::default()
                 };
                 crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
-                record_request(&state, 502);
+                record_request(&state, reject_status_code);
                 return Ok(());
             }
         };
@@ -2562,7 +2636,23 @@ async fn handle_h3_request(
         let resp = resp_builder
             .body(())
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
-        stream.send_response(resp).await?;
+        // Do NOT `?`-propagate a send_response failure: `record_connection_start`
+        // already ran above, so bailing out here would leak the least-connections
+        // count, a CB HALF_OPEN probe slot, the admission outcome, and the
+        // transaction summary (the same client-disconnect case the sibling
+        // relays in `proxy_to_backend_h3_streaming` /
+        // `stream_h3_open_response_to_client` handle explicitly). Fall through
+        // to the outcome-recording block below instead.
+        let mut client_disconnected = false;
+        let mut body_error_class: Option<crate::retry::ErrorClass> = None;
+        if let Err(e) = stream.send_response(resp).await {
+            debug!(
+                "HTTP/3 client disconnected before streaming response headers: {}",
+                e
+            );
+            client_disconnected = true;
+            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+        }
 
         // Stream response body from backend h3 recv_stream to frontend h3 stream.
         // Uses a pinned Sleep that is reset in-place to avoid allocating a new
@@ -2578,11 +2668,12 @@ async fn handle_h3_request(
         tokio::pin!(flush_timer);
         let mut stream_done = false;
         let mut bytes_streamed: u64 = 0;
-        let mut client_disconnected = false;
         let mut body_completed = false;
-        let mut body_error_class: Option<crate::retry::ErrorClass> = None;
 
-        'outer: loop {
+        // Skipped entirely when send_response already failed above — the
+        // relay loop would only rediscover the dead stream on its first
+        // send_data and there is no backend data worth pulling for it.
+        'outer: while !client_disconnected {
             tokio::select! {
                 chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
                     match chunk_result {
@@ -2600,7 +2691,7 @@ async fn handle_h3_request(
                                     "Backend response exceeded {} byte limit during streaming",
                                     state.max_response_body_size_bytes
                                 );
-                                let _ = stream.finish().await;
+                                crate::http3::stream_util::abort_response_stream(&mut stream);
                                 body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                                 break 'outer;
                             }
@@ -2701,14 +2792,8 @@ async fn handle_h3_request(
                                 stream_done = true;
                             } else {
                                 error!("Error reading backend h3 response during streaming: {}", e);
-                                if !coalesce_buf.is_empty() {
-                                    let data = coalesce_buf.split().freeze();
-                                    let data_len = data.len() as u64;
-                                    if stream.send_data(data).await.is_ok() {
-                                        bytes_streamed += data_len;
-                                    }
-                                }
-                                let _ = stream.finish().await;
+                                coalesce_buf.clear();
+                                crate::http3::stream_util::abort_response_stream(&mut stream);
                                 body_error_class = Some(crate::http3::client::classify_http3_error(&e));
                                 break 'outer;
                             }
@@ -2760,9 +2845,26 @@ async fn handle_h3_request(
                     }
                     bytes_streamed += data_len;
                 }
-                match stream.finish().await {
+                let finish_result = if response_inspector.is_some() {
+                    stream
+                        .finish()
+                        .await
+                        .map_err(|_| H3TrailerFinishError::Client)
+                } else {
+                    finish_h3_response_with_backend_trailers(&mut stream, &mut h3_resp.recv_stream)
+                        .await
+                };
+                match finish_result {
                     Ok(_) => body_completed = true,
-                    Err(_) => {
+                    Err(H3TrailerFinishError::Backend(err)) => {
+                        error!(
+                            "Error reading backend h3 response trailers during streaming: {}",
+                            err
+                        );
+                        crate::http3::stream_util::abort_response_stream(&mut stream);
+                        body_error_class = Some(crate::http3::client::classify_http3_error(&err));
+                    }
+                    Err(H3TrailerFinishError::Client) => {
                         client_disconnected = true;
                         body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                     }
@@ -3921,7 +4023,7 @@ fn build_h3_backend_headers(
     // X-Forwarded-Proto
     h3_headers.push((
         http::header::HeaderName::from_static("x-forwarded-proto"),
-        http::header::HeaderValue::from_static("h3"),
+        http::header::HeaderValue::from_static("https"),
     ));
 
     // X-Forwarded-Host
@@ -3947,7 +4049,7 @@ fn build_h3_backend_headers(
             .get("host")
             .or_else(|| headers.get(":authority"))
             .map(|s| s.as_str());
-        let fwd = crate::proxy::build_forwarded_value(client_ip, "h3", host);
+        let fwd = crate::proxy::build_forwarded_value(client_ip, "https", host);
         if let Ok(val) = http::header::HeaderValue::from_str(&fwd) {
             h3_headers.push((http::header::HeaderName::from_static("forwarded"), val));
         }
@@ -4014,6 +4116,14 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
     if e.is_graceful_close() {
         return crate::retry::ErrorClass::GracefulRemoteClose;
     }
+    // Typed `backend_read_timeout_ms` deadline signal from the pool —
+    // classify deterministically instead of relying on the "timeout"
+    // substring fallback. `ReadWriteTimeout` is excluded from
+    // `is_h3_transport_error_class`, so this never drives
+    // `mark_h3_unsupported`.
+    if e.is_read_timeout() {
+        return crate::retry::ErrorClass::ReadWriteTimeout;
+    }
     // Delegate to the shared HTTP/3 classifier, which walks the source chain
     // for typed quinn::ConnectionError / quinn::ConnectError / io::Error
     // variants before falling back to string heuristics. This gives more
@@ -4028,6 +4138,27 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
     crate::http3::client::classify_http3_error(e.as_error().as_ref())
 }
 
+/// Select the client-facing status + JSON body for a native-H3 backend
+/// dispatch failure. A `backend_read_timeout_ms` deadline expiry maps to
+/// 504 `{"error":"Backend timeout"}` — matching the direct-H2 / HBONE /
+/// sidecar-mTLS read-timeout arms in `crate::proxy` — while every other
+/// failure keeps the generic 502 `{"error":"Backend unavailable"}`.
+fn h3_backend_failure_status_body(
+    e: &crate::http3::client::H3PoolError,
+) -> (StatusCode, &'static str) {
+    if e.is_read_timeout() {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            r#"{"error":"Backend timeout"}"#,
+        )
+    } else {
+        (
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Backend unavailable"}"#,
+        )
+    }
+}
+
 fn is_h3_client_request_body_disconnect(err_msg: &str) -> bool {
     err_msg
         .to_ascii_lowercase()
@@ -4036,10 +4167,18 @@ fn is_h3_client_request_body_disconnect(err_msg: &str) -> bool {
 
 fn h3_streaming_body_failure_outcome(
     is_client_request_body_disconnect: bool,
+    is_read_timeout: bool,
     h3_error_class: crate::retry::ErrorClass,
 ) -> (bool, Option<crate::retry::ErrorClass>) {
     if is_client_request_body_disconnect {
         (false, Some(crate::retry::ErrorClass::ClientDisconnect))
+    } else if is_read_timeout {
+        // `backend_read_timeout_ms` expired after the request was committed
+        // to the backend (post-wire). Report `connection_error=false` so
+        // CB / passive health / adaptive concurrency see a 504 status fault
+        // — matching the direct-H2 / HBONE read-timeout arms — rather than
+        // a transport-level connection failure.
+        (false, Some(h3_error_class))
     } else {
         (true, Some(h3_error_class))
     }
@@ -4121,23 +4260,26 @@ enum H3RefinedResponse {
 /// Build the `H3StreamResult` for a pre-headers backend-dispatch failure on the
 /// H3 streaming / refined paths.
 ///
-/// `reject_sent` is whether the synthesized 502 write reached the client. A
-/// failed write is reported as `client_disconnected` rather than propagated as
-/// an error: these dispatch functions start least-connections LB tracking before
-/// dispatch and their caller releases the active-connection count via
-/// `record_backend_outcome` off the returned result, so returning `Err` on a
-/// failed reject write would skip that accounting and leak the count. The
-/// backend never produced a response here, so `backend_status` is the
-/// gateway-synthesized 502.
+/// `status` is the gateway-synthesized reject status already written to the
+/// client (502 generic, or 504 for a `backend_read_timeout_ms` expiry — see
+/// [`h3_backend_failure_status_body`]). `reject_sent` is whether that write
+/// reached the client. A failed write is reported as `client_disconnected`
+/// rather than propagated as an error: these dispatch functions start
+/// least-connections LB tracking before dispatch and their caller releases
+/// the active-connection count via `record_backend_outcome` off the returned
+/// result, so returning `Err` on a failed reject write would skip that
+/// accounting and leak the count. The backend never produced a response here,
+/// so `backend_status` is the same gateway-synthesized status.
 fn h3_backend_unavailable_stream_result(
+    status: u16,
     error_class: crate::retry::ErrorClass,
     request_on_wire: bool,
     reject_sent: bool,
     backend_admission_elapsed: std::time::Duration,
 ) -> H3StreamResult {
     H3StreamResult {
-        status: 502,
-        backend_status: 502,
+        status,
+        backend_status: status,
         error_class: Some(error_class),
         body_completed: false,
         bytes_streamed: 0,
@@ -4232,15 +4374,13 @@ async fn proxy_to_backend_h3_refined_response(
             // disconnect in the result so the caller still records the outcome
             // and releases the connection — mirrors the size-limit / after_proxy
             // reject paths in `stream_h3_open_response_to_client`.
-            let reject_sent = send_h3_response(
-                h3_stream,
-                StatusCode::BAD_GATEWAY,
-                r#"{"error":"Backend unavailable"}"#,
-            )
-            .await
-            .is_ok();
+            let (reject_status, reject_body) = h3_backend_failure_status_body(&error);
+            let reject_sent = send_h3_response(h3_stream, reject_status, reject_body)
+                .await
+                .is_ok();
             return Ok(H3RefinedResponse::Streamed(
                 h3_backend_unavailable_stream_result(
+                    reject_status.as_u16(),
                     h3_error_class,
                     request_on_wire,
                     reject_sent,
@@ -4322,7 +4462,42 @@ async fn collect_h3_open_response_body(
 
     let mut response_body = Vec::new();
     loop {
-        match recv_stream.recv_data().await {
+        // Bound every buffered body-frame wait by `backend_read_timeout_ms`
+        // — mirrors `drain_h3_response_body` in the H3 pool. Without this,
+        // a backend that sends headers and then stalls mid-body pins the
+        // request (and its guards/permits) indefinitely on the refined
+        // buffered path.
+        let recv_result = if proxy.backend_read_timeout_ms > 0 {
+            match tokio::time::timeout(
+                Duration::from_millis(proxy.backend_read_timeout_ms),
+                recv_stream.recv_data(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        timeout_ms = proxy.backend_read_timeout_ms,
+                        "HTTP/3 backend buffered response read timed out (refined path)"
+                    );
+                    // Read timeout: 504 Backend timeout (matching the
+                    // direct-H2 / HBONE read-timeout arms), classified as
+                    // ReadWriteTimeout. No capability downgrade — a stalled
+                    // backend has not proved it lost H3 support.
+                    return H3BufferedDispatchResult {
+                        status: 504,
+                        body: br#"{"error":"Backend timeout"}"#.to_vec(),
+                        headers: HashMap::new(),
+                        error_class: Some(crate::retry::ErrorClass::ReadWriteTimeout),
+                        request_on_wire: true,
+                    };
+                }
+            }
+        } else {
+            recv_stream.recv_data().await
+        };
+        match recv_result {
             Ok(Some(mut chunk)) => {
                 let chunk_bytes = crate::http3::config::copy_remaining_response_chunk(&mut chunk);
                 if state.max_response_body_size_bytes > 0
@@ -4518,7 +4693,7 @@ async fn stream_h3_open_response_to_client(
                         if state.max_response_body_size_bytes > 0
                             && total_streamed > state.max_response_body_size_bytes
                         {
-                            let _ = h3_stream.finish().await;
+                            crate::http3::stream_util::abort_response_stream(h3_stream);
                             terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                             body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                             break 'outer;
@@ -4572,14 +4747,8 @@ async fn stream_h3_open_response_to_client(
                             stream_done = true;
                         } else {
                             error!("Error reading backend h3 response during refined streaming: {}", error);
-                            if !coalesce_buf.is_empty() {
-                                let data = coalesce_buf.split().freeze();
-                                let data_len = data.len() as u64;
-                                if h3_stream.send_data(data).await.is_ok() {
-                                    bytes_streamed += data_len;
-                                }
-                            }
-                            let _ = h3_stream.finish().await;
+                            coalesce_buf.clear();
+                            crate::http3::stream_util::abort_response_stream(h3_stream);
                             let class = crate::http3::client::classify_http3_error(&error);
                             terminal_error_class = Some(class);
                             body_error_class = Some(class);
@@ -4611,9 +4780,19 @@ async fn stream_h3_open_response_to_client(
                 }
                 bytes_streamed += data_len;
             }
-            match h3_stream.finish().await {
+            match finish_h3_response_with_backend_trailers(h3_stream, &mut recv_stream).await {
                 Ok(_) => body_completed = true,
-                Err(_) => {
+                Err(H3TrailerFinishError::Backend(err)) => {
+                    error!(
+                        "Error reading backend h3 response trailers during refined streaming: {}",
+                        err
+                    );
+                    crate::http3::stream_util::abort_response_stream(h3_stream);
+                    let class = crate::http3::client::classify_http3_error(&err);
+                    terminal_error_class = Some(class);
+                    body_error_class = Some(class);
+                }
+                Err(H3TrailerFinishError::Client) => {
                     client_disconnected = true;
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                 }
@@ -4717,7 +4896,7 @@ async fn proxy_to_backend_h3_streaming(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
-            let h3_error_body = r#"{"error":"Backend unavailable"}"#;
+            let (reject_status, reject_body) = h3_backend_failure_status_body(&e);
             // Do NOT propagate a send error here: this path already started
             // least-connections LB tracking before dispatch, so returning `Err`
             // would skip the caller's `record_backend_outcome` and leak the
@@ -4725,12 +4904,14 @@ async fn proxy_to_backend_h3_streaming(
             // disconnects during the reject write. Report the disconnect so the
             // caller still records the outcome and releases the connection —
             // same contract as the size-limit / after_proxy reject paths below.
-            let reject_sent = send_h3_response(h3_stream, StatusCode::BAD_GATEWAY, h3_error_body)
+            let reject_sent = send_h3_response(h3_stream, reject_status, reject_body)
                 .await
                 .is_ok();
             // No backend response was received (pre-headers dispatch failure),
-            // so backend_status is the gateway-synthesized 502.
+            // so backend_status is the gateway-synthesized reject status
+            // (502 generic, 504 for a backend read timeout).
             return Ok(h3_backend_unavailable_stream_result(
+                reject_status.as_u16(),
                 h3_error_class,
                 request_on_wire,
                 reject_sent,
@@ -4911,7 +5092,7 @@ async fn proxy_to_backend_h3_streaming(
                                 "Backend response exceeded {} byte limit during streaming",
                                 state.max_response_body_size_bytes
                             );
-                            let _ = h3_stream.finish().await;
+                            crate::http3::stream_util::abort_response_stream(h3_stream);
                             terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                             body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                             break 'outer;
@@ -4970,14 +5151,8 @@ async fn proxy_to_backend_h3_streaming(
                             stream_done = true;
                         } else {
                             error!("Error reading backend h3 response during streaming: {}", e);
-                            if !coalesce_buf.is_empty() {
-                                let data = coalesce_buf.split().freeze();
-                                let data_len = data.len() as u64;
-                                if h3_stream.send_data(data).await.is_ok() {
-                                    bytes_streamed += data_len;
-                                }
-                            }
-                            let _ = h3_stream.finish().await;
+                            coalesce_buf.clear();
+                            crate::http3::stream_util::abort_response_stream(h3_stream);
                             let class = crate::http3::client::classify_http3_error(&e);
                             terminal_error_class = Some(class);
                             body_error_class = Some(class);
@@ -5011,9 +5186,21 @@ async fn proxy_to_backend_h3_streaming(
                 }
                 bytes_streamed += data_len;
             }
-            match h3_stream.finish().await {
+            match finish_h3_response_with_backend_trailers(h3_stream, &mut h3_resp.recv_stream)
+                .await
+            {
                 Ok(_) => body_completed = true,
-                Err(_) => {
+                Err(H3TrailerFinishError::Backend(err)) => {
+                    error!(
+                        "Error reading backend h3 response trailers during streaming: {}",
+                        err
+                    );
+                    crate::http3::stream_util::abort_response_stream(h3_stream);
+                    let class = crate::http3::client::classify_http3_error(&err);
+                    terminal_error_class = Some(class);
+                    body_error_class = Some(class);
+                }
+                Err(H3TrailerFinishError::Client) => {
                     client_disconnected = true;
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                 }
@@ -5176,10 +5363,13 @@ async fn proxy_to_backend_h3(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
-            let error_body: &[u8] = br#"{"error":"Backend unavailable"}"#;
+            // Read timeouts surface as 504 Backend timeout (matching the
+            // direct-H2 / HBONE read-timeout arms); everything else keeps
+            // the generic 502.
+            let (reject_status, reject_body) = h3_backend_failure_status_body(&e);
             H3BufferedDispatchResult {
-                status: 502,
-                body: error_body.to_vec(),
+                status: reject_status.as_u16(),
+                body: reject_body.as_bytes().to_vec(),
                 headers: HashMap::new(),
                 error_class: Some(h3_error_class),
                 request_on_wire,
@@ -5738,7 +5928,7 @@ mod h3_streaming_outcome_tests {
     #[test]
     fn request_body_upload_client_disconnect_maps_to_neutral_outcome() {
         let (connection_error, error_class) =
-            super::h3_streaming_body_failure_outcome(true, ErrorClass::ConnectionClosed);
+            super::h3_streaming_body_failure_outcome(true, false, ErrorClass::ConnectionClosed);
 
         assert!(
             !connection_error,
@@ -5751,7 +5941,7 @@ mod h3_streaming_outcome_tests {
     #[test]
     fn request_body_upload_backend_failure_keeps_original_class() {
         let (connection_error, error_class) =
-            super::h3_streaming_body_failure_outcome(false, ErrorClass::ProtocolError);
+            super::h3_streaming_body_failure_outcome(false, false, ErrorClass::ProtocolError);
 
         assert!(
             connection_error,
@@ -5759,6 +5949,23 @@ mod h3_streaming_outcome_tests {
              connection failures"
         );
         assert_eq!(error_class, Some(ErrorClass::ProtocolError));
+    }
+
+    #[test]
+    fn request_body_upload_backend_read_timeout_is_not_a_connection_error() {
+        // `backend_read_timeout_ms` expiry is post-wire: the request reached
+        // the backend, which then stalled. It must be recorded as a 504
+        // status fault (connection_error=false), matching the direct-H2 /
+        // HBONE read-timeout arms — not as a transport connection failure.
+        let (connection_error, error_class) =
+            super::h3_streaming_body_failure_outcome(false, true, ErrorClass::ReadWriteTimeout);
+
+        assert!(
+            !connection_error,
+            "post-wire H3 backend read timeouts must not count as backend \
+             connection failures"
+        );
+        assert_eq!(error_class, Some(ErrorClass::ReadWriteTimeout));
     }
 
     #[test]
@@ -5990,6 +6197,7 @@ mod h3_streaming_outcome_tests {
         // disconnect. The inline native-H3 reject paths share the same contract
         // by swallowing the send error instead of returning a result.
         let disconnected = super::h3_backend_unavailable_stream_result(
+            502,
             ErrorClass::ProtocolError,
             /* request_on_wire = */ true,
             /* reject_sent = */ false,
@@ -6012,11 +6220,26 @@ mod h3_streaming_outcome_tests {
         );
 
         let delivered = super::h3_backend_unavailable_stream_result(
+            502,
             ErrorClass::ProtocolError,
             /* request_on_wire = */ false,
             /* reject_sent = */ true,
             std::time::Duration::from_millis(11),
         );
+
+        let timed_out = super::h3_backend_unavailable_stream_result(
+            504,
+            ErrorClass::ReadWriteTimeout,
+            /* request_on_wire = */ true,
+            /* reject_sent = */ true,
+            std::time::Duration::from_millis(13),
+        );
+        assert_eq!(
+            timed_out.status, 504,
+            "backend read timeouts surface as 504 Backend timeout"
+        );
+        assert_eq!(timed_out.backend_status, 504);
+        assert_eq!(timed_out.error_class, Some(ErrorClass::ReadWriteTimeout));
         assert!(
             !delivered.client_disconnected,
             "a delivered 502 reject write is not a client disconnect"
@@ -6323,6 +6546,53 @@ mod build_h3_backend_headers_tests {
             .iter()
             .find(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
             .map(|(_, v)| v)
+    }
+
+    #[tokio::test]
+    async fn native_h3_forwarded_proto_uses_uri_scheme_not_alpn_token() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "api.example".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ false,
+        );
+
+        assert_eq!(
+            header_value(&out, "x-forwarded-proto").map(|v| v.as_bytes()),
+            Some(&b"https"[..]),
+            "X-Forwarded-Proto must carry the URI scheme, not the H3 ALPN token"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_h3_forwarded_header_uses_https_scheme() {
+        let mut state = minimal_proxy_state();
+        state.add_forwarded_header = true;
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "api.example".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ false,
+        );
+
+        assert_eq!(
+            header_value(&out, "forwarded").and_then(|v| v.to_str().ok()),
+            Some("for=203.0.113.1;proto=https;host=api.example"),
+            "Forwarded proto must be the URI scheme, not the H3 ALPN token"
+        );
     }
 
     #[tokio::test]

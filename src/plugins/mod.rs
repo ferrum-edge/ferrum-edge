@@ -615,6 +615,14 @@ pub struct RequestContext {
     /// CLIENT vs SERVER span kinds reflect which side of the hop the
     /// listener represents.
     pub mesh_direction: Option<MeshTrafficDirection>,
+    /// Pre-NAT original destination of an iptables-REDIRECTed connection,
+    /// read once per accepted connection on mesh outbound capture listeners
+    /// (`SO_ORIGINAL_DST`) and shared by every request on the connection.
+    /// `None` on non-capture listeners, non-Linux platforms, and
+    /// non-redirected (direct-dial) traffic. Mesh outbound routing uses the
+    /// port to disambiguate multi-port services; the address is reserved for
+    /// the raw-TCP egress follow-up.
+    pub orig_dst: Option<std::net::SocketAddr>,
 }
 
 fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
@@ -685,6 +693,7 @@ impl RequestContext {
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
             mesh_direction: None,
+            orig_dst: None,
         }
     }
 
@@ -748,6 +757,7 @@ impl RequestContext {
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
+            orig_dst: self.orig_dst,
         }
     }
 
@@ -1089,20 +1099,14 @@ impl RequestContext {
                     if matches!(key, "x-consumer-username" | "x-consumer-custom-id") {
                         continue;
                     }
-                    if is_comma_folded_list_header(key) {
-                        // These are list headers, so multiple field lines are
-                        // equivalent to one comma-separated value. Preserve that
-                        // before raw headers are consumed by materialization.
-                        self.headers
-                            .entry(key.to_owned())
-                            .and_modify(|existing| {
-                                existing.push(',');
-                                existing.push_str(v);
-                            })
-                            .or_insert_with(|| v.to_owned());
-                    } else {
-                        self.headers.insert(key.to_owned(), v.to_owned());
-                    }
+                    let separator = repeated_request_header_separator(key);
+                    self.headers
+                        .entry(key.to_owned())
+                        .and_modify(|existing| {
+                            existing.push_str(separator);
+                            existing.push_str(v);
+                        })
+                        .or_insert_with(|| v.to_owned());
                 }
             }
         }
@@ -1232,13 +1236,18 @@ impl RequestContext {
     }
 }
 
-/// Headers that are materialized by comma-folding repeated request values.
+/// Separator used when materializing repeated request header field lines.
 ///
-/// This is used both when `RequestContext` is built and when the WebSocket
-/// proxy path reconstructs the materialized form to decide whether raw
-/// repeated headers can be preserved for the backend handshake.
-pub(crate) fn is_comma_folded_list_header(name: &str) -> bool {
-    matches!(name, "baggage" | "sec-websocket-protocol")
+/// RFC 9113 §8.2.3 requires H2/H3 cookie crumbs to be reassembled with
+/// `"; "`. Other repeated request fields use the standard comma-list form so
+/// materialized plugin headers, backend forwarding, and `Connection`-listed
+/// stripping all see the complete value set.
+pub(crate) fn repeated_request_header_separator(name: &str) -> &'static str {
+    if name.eq_ignore_ascii_case("cookie") {
+        "; "
+    } else {
+        ", "
+    }
 }
 
 fn dispatch_port_overrides_from_upstream(
@@ -2295,12 +2304,24 @@ pub trait Plugin: Send + Sync {
     /// Returns `true` when this plugin may change the response `Content-Type`
     /// in `after_proxy` for the current request.
     ///
+    /// `response_content_type` is the backend's `Content-Type` — the value the
+    /// downgrade would otherwise key off. Plugins that relabel only *some*
+    /// backend types should consult it so the gate matches their `after_proxy`
+    /// exactly: a plugin that rewrites a non-SSE type to `text/event-stream`
+    /// must return `false` when the backend already sent `text/event-stream`,
+    /// otherwise an unbounded stream is pinned to the buffered path and
+    /// collected until the max-response-body limit 502s it.
+    ///
     /// The proxy uses this as a safety gate before content-type-aware
     /// buffer-to-stream downgrades. If a later `after_proxy` hook can relabel a
     /// response from a non-inspectable type to an inspectable one, body
     /// inspection plugins must keep the buffered path selected by the
     /// pre-flight decision.
-    fn may_modify_response_content_type(&self, _ctx: &RequestContext) -> bool {
+    fn may_modify_response_content_type(
+        &self,
+        _ctx: &RequestContext,
+        _response_content_type: Option<&str>,
+    ) -> bool {
         false
     }
 

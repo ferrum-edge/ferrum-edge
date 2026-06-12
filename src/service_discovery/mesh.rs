@@ -167,32 +167,12 @@ impl MeshServiceDiscoverer {
         workload: &Workload,
         selected_port: &SelectedPort,
     ) -> HashMap<String, String> {
-        let mut tags = HashMap::new();
-        tags.insert("mesh.hbone".to_string(), "true".to_string());
-        tags.insert("mesh.namespace".to_string(), workload.namespace.clone());
-        tags.insert("mesh.service".to_string(), service.name.clone());
-        tags.insert(
-            "mesh.spiffe_id".to_string(),
-            workload.spiffe_id.as_str().to_string(),
-        );
-        tags.insert(
-            "mesh.trust_domain".to_string(),
-            workload.trust_domain.as_str().to_string(),
-        );
-        tags.insert(
-            "mesh.protocol".to_string(),
-            protocol_tag(selected_port.protocol).to_string(),
-        );
-        if let Some(port_name) = &selected_port.name {
-            tags.insert("mesh.port_name".to_string(), port_name.clone());
-        }
-        if let Some(network) = &workload.network {
-            tags.insert("mesh.network".to_string(), network.clone());
-        }
-        if let Some(cluster) = &workload.cluster {
-            tags.insert("mesh.cluster".to_string(), cluster.clone());
-        }
-        tags
+        mesh_hbone_target_tags(
+            service,
+            workload,
+            selected_port.protocol,
+            selected_port.name.as_deref(),
+        )
     }
 }
 
@@ -295,6 +275,85 @@ fn protocol_tag(protocol: AppProtocol) -> &'static str {
         AppProtocol::Postgres => "postgres",
         AppProtocol::Unknown => "unknown",
     }
+}
+
+/// Build the `mesh.*` UpstreamTarget tags that mark a target for HBONE dispatch
+/// (HTTP/2 CONNECT over auto-originated SVID mTLS) and carry the peer identity
+/// the mTLS handshake PINS (`mesh.spiffe_id` / `mesh.trust_domain`).
+///
+/// Shared by runtime mesh service discovery
+/// ([`MeshServiceDiscoverer::tags_for_target`]) and by Ambient outbound route
+/// materialization (`modes::mesh::build_outbound_mesh_targets`) so the two paths
+/// cannot drift on the tag contract that `proxy::hbone_pool` and
+/// `supports_hbone_backend` consume.
+pub(crate) fn mesh_hbone_target_tags(
+    service: &MeshService,
+    workload: &Workload,
+    protocol: AppProtocol,
+    port_name: Option<&str>,
+) -> HashMap<String, String> {
+    let mut tags = mesh_target_tags_core(service, workload, protocol, port_name);
+    tags.insert(
+        crate::proxy::hbone_pool::HBONE_TARGET_TAG.to_string(),
+        "true".to_string(),
+    );
+    tags
+}
+
+/// Build the `mesh.*` UpstreamTarget tags that mark a target for Sidecar
+/// SVID-mTLS dispatch (plain HTTP/2 over mutual TLS to the peer sidecar's
+/// inbound listener). Same shared identity tags as the HBONE builder, but with
+/// `mesh.mtls=true` instead of `mesh.hbone` — the transports are per-topology
+/// and a target carries exactly one.
+pub(crate) fn mesh_sidecar_mtls_target_tags(
+    service: &MeshService,
+    workload: &Workload,
+    protocol: AppProtocol,
+    port_name: Option<&str>,
+) -> HashMap<String, String> {
+    let mut tags = mesh_target_tags_core(service, workload, protocol, port_name);
+    tags.insert(
+        crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG.to_string(),
+        "true".to_string(),
+    );
+    tags
+}
+
+/// Transport-agnostic core of the mesh target tag contract: destination
+/// identity (pinned by the outbound mTLS handshake), service metadata, and
+/// topology hints. The transport-selecting tag (`mesh.hbone` / `mesh.mtls`) is
+/// layered on by the wrappers above.
+fn mesh_target_tags_core(
+    service: &MeshService,
+    workload: &Workload,
+    protocol: AppProtocol,
+    port_name: Option<&str>,
+) -> HashMap<String, String> {
+    let mut tags = HashMap::new();
+    tags.insert("mesh.namespace".to_string(), workload.namespace.clone());
+    tags.insert("mesh.service".to_string(), service.name.clone());
+    tags.insert(
+        crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG.to_string(),
+        workload.spiffe_id.as_str().to_string(),
+    );
+    tags.insert(
+        "mesh.trust_domain".to_string(),
+        workload.trust_domain.as_str().to_string(),
+    );
+    tags.insert(
+        "mesh.protocol".to_string(),
+        protocol_tag(protocol).to_string(),
+    );
+    if let Some(port_name) = port_name {
+        tags.insert("mesh.port_name".to_string(), port_name.to_string());
+    }
+    if let Some(network) = &workload.network {
+        tags.insert("mesh.network".to_string(), network.clone());
+    }
+    if let Some(cluster) = &workload.cluster {
+        tags.insert("mesh.cluster".to_string(), cluster.clone());
+    }
+    tags
 }
 
 #[cfg(test)]

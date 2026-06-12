@@ -738,8 +738,13 @@ pub struct EnvConfig {
     /// clamp or ignore this value.
     pub mesh_cert_ttl_seconds: u64,
     /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe;
-    /// `xds` consumes Envoy-compatible ADS.
+    /// `xds` consumes Envoy-compatible ADS; `file` loads a localized mesh
+    /// config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control plane).
     pub mesh_config_protocol: String,
+    /// Path to the localized mesh config document (YAML/JSON) consumed when
+    /// `mesh_config_protocol` is `file`. The document carries only the `mesh`
+    /// section of a gateway config; reloaded on SIGHUP (Unix).
+    pub mesh_file_config_path: Option<String>,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when validating HBONE baggage `source.principal`.
     /// Default empty: strict same-trust-domain match. Each entry must parse
@@ -988,6 +993,10 @@ pub struct EnvConfig {
     ///
     /// Default: false (safe, frame-parsed path for all connections)
     pub websocket_tunnel_mode: bool,
+    /// WebSocket relay idle timeout in seconds. When non-zero, an upgraded
+    /// session is closed if neither side produces data for this duration.
+    /// 0 = disabled. Default: 0.
+    pub websocket_idle_timeout_seconds: u64,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
     /// HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks
@@ -1686,6 +1695,7 @@ impl Default for EnvConfig {
             mesh_spire_agent_socket: "/run/spire/sockets/agent.sock".to_string(),
             mesh_cert_ttl_seconds: 3600,
             mesh_config_protocol: "native".to_string(),
+            mesh_file_config_path: None,
             mesh_trust_domain_aliases: Vec::new(),
             mesh_trusted_hbone_assertors: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
@@ -1741,6 +1751,7 @@ impl Default for EnvConfig {
             max_websocket_frame_size_bytes: 16_777_216,
             websocket_write_buffer_size: 131_072, // 128 KB
             websocket_tunnel_mode: false,
+            websocket_idle_timeout_seconds: 0,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
             frontend_tls_handshake_timeout_seconds: 10,
@@ -2014,8 +2025,12 @@ impl EnvConfig {
         env_config! {
             conf = conf, mode = &mode;
             [cp_dp]
+            // Mesh mode also requires this secret unless the localized `file`
+            // config protocol is active — that conditional check lives in
+            // `EnvConfig::validate()`'s Mesh arm (the macro cannot see
+            // FERRUM_MESH_CONFIG_PROTOCOL).
             cp_dp_grpc_jwt_secret: Option<String> = "FERRUM_CP_DP_GRPC_JWT_SECRET"
-                => required_for(["cp", "dp", "mesh"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
+                => required_for(["cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             cp_dp_grpc_jwt_issuer: String = "FERRUM_CP_DP_GRPC_JWT_ISSUER" => "ferrum-edge-cp-dp".to_string();
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
             dp_cp_failover_primary_retry_secs: u64 = "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS" => 300u64;
@@ -2032,6 +2047,7 @@ impl EnvConfig {
             mesh_spire_agent_socket: String = "FERRUM_MESH_SPIRE_AGENT_SOCKET" => "/run/spire/sockets/agent.sock".to_string();
             mesh_cert_ttl_seconds: u64 = "FERRUM_MESH_CERT_TTL_SECONDS" => 3600u64;
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
+            mesh_file_config_path: Option<String> = "FERRUM_MESH_FILE_CONFIG_PATH";
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_trusted_hbone_assertors: Vec<String> = "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
@@ -2103,6 +2119,7 @@ impl EnvConfig {
             max_websocket_frame_size_bytes: usize = "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES" => 16_777_216usize;
             websocket_write_buffer_size: usize = "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE" => 131_072usize;
             websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
+            websocket_idle_timeout_seconds: u64 = "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS" => 0u64;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
             frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
@@ -2518,6 +2535,10 @@ impl EnvConfig {
         let gateway_svid_key_path = gateway_svid_key_path.filter(|s| !s.trim().is_empty());
         let gateway_svid_trust_bundle_path =
             gateway_svid_trust_bundle_path.filter(|s| !s.trim().is_empty());
+        // Same blank-means-unset normalization for the localized mesh config
+        // file path so the `file` protocol's required-path validation can use
+        // a plain presence check.
+        let mesh_file_config_path = mesh_file_config_path.filter(|s| !s.trim().is_empty());
         let dtls_cert_path = resolve_tls_source_override(
             conf,
             "FERRUM_DTLS_CERT_SOURCE",
@@ -2620,6 +2641,7 @@ impl EnvConfig {
             mesh_spire_agent_socket,
             mesh_cert_ttl_seconds,
             mesh_config_protocol,
+            mesh_file_config_path,
             mesh_trust_domain_aliases,
             mesh_trusted_hbone_assertors,
             mesh_egress_strip_baggage_keys,
@@ -2675,6 +2697,7 @@ impl EnvConfig {
             max_websocket_frame_size_bytes,
             websocket_write_buffer_size,
             websocket_tunnel_mode,
+            websocket_idle_timeout_seconds,
             max_credentials_per_type,
             http_header_read_timeout_seconds,
             frontend_tls_handshake_timeout_seconds,
@@ -3282,8 +3305,49 @@ impl EnvConfig {
                 }
             }
             OperatingMode::Mesh => {
-                if self.dp_cp_grpc_urls.is_empty() {
-                    return Err("FERRUM_DP_CP_GRPC_URLS is required in mesh mode".into());
+                // Validate the protocol value before the per-protocol CP
+                // requirements so a typo'd FERRUM_MESH_CONFIG_PROTOCOL fails
+                // with the protocol error, not a misleading missing-CP-URL one.
+                match self
+                    .mesh_config_protocol
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "native" | "xds" | "file" => {}
+                    other => {
+                        return Err(format!(
+                            "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. \
+                             Expected: native, xds, or file"
+                        ));
+                    }
+                }
+                // The localized `file` protocol has no control plane: the CP
+                // URL and CP/DP JWT secret are not required (nor consumed).
+                // Native/xDS keep both hard requirements, including the
+                // minimum secret length the env macro used to enforce when
+                // `required_for` still listed "mesh".
+                let file_protocol = self
+                    .mesh_config_protocol
+                    .trim()
+                    .eq_ignore_ascii_case("file");
+                if file_protocol {
+                    if self.mesh_file_config_path.is_none() {
+                        return Err("FERRUM_MESH_FILE_CONFIG_PATH is required when \
+                             FERRUM_MESH_CONFIG_PROTOCOL=file"
+                            .into());
+                    }
+                } else {
+                    if self.dp_cp_grpc_urls.is_empty() {
+                        return Err("FERRUM_DP_CP_GRPC_URLS is required in mesh mode".into());
+                    }
+                    crate::config::env_config::env_config_macro::validate_required_string_in_modes(
+                        "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                        self.cp_dp_grpc_jwt_secret.as_deref(),
+                        &OperatingMode::Mesh,
+                        &["mesh"],
+                        crate::config::types::MIN_JWT_SECRET_LENGTH,
+                    )?;
                 }
                 // Validate the mesh CA backend value (reject unknown strings).
                 // NOTE: the backend is parsed/validated here but is NOT yet
@@ -3386,19 +3450,6 @@ impl EnvConfig {
                              the data plane."
                                 .into(),
                         );
-                    }
-                }
-                match self
-                    .mesh_config_protocol
-                    .trim()
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "native" | "xds" => {}
-                    other => {
-                        return Err(format!(
-                            "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. Expected: native or xds"
-                        ));
                     }
                 }
             }

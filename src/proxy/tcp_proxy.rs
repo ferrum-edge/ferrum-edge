@@ -10,12 +10,16 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+#[cfg(target_os = "linux")]
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::backend_conn_limit::{
@@ -631,7 +635,7 @@ pub(crate) async fn bidirectional_splice_io_uring_for_test_with_timeouts(
 
 /// Cached backend TLS configuration to avoid reading certificate files from
 /// disk on every connection. Built once per listener lifecycle and reused.
-struct CachedBackendTlsConfig {
+pub(crate) struct CachedBackendTlsConfig {
     config: Arc<rustls::ClientConfig>,
 }
 
@@ -661,6 +665,22 @@ impl CachedBackendTlsConfig {
             config: Arc::new(tls_config),
         })
     }
+}
+
+pub(crate) fn build_cached_backend_tls_config(
+    proxy: &Proxy,
+    tls_no_verify: bool,
+    global_tls_ca_bundle_path: Option<&str>,
+    tls_policy: Option<&TlsPolicy>,
+    crls: &crate::tls::CrlList,
+) -> Result<CachedBackendTlsConfig, anyhow::Error> {
+    CachedBackendTlsConfig::build(
+        proxy,
+        tls_no_verify,
+        global_tls_ca_bundle_path,
+        tls_policy,
+        crls,
+    )
 }
 
 /// Metrics for a single TCP proxy listener.
@@ -896,30 +916,24 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
             .proxies
             .iter()
             .find(|p| *p.id == *proxy_id)
-            .filter(|p| p.dispatch_kind == crate::config::types::DispatchKind::TcpTls)
+            // Passthrough proxies relay raw bytes without originating backend
+            // TLS; their listener must not fail because unrelated TLS material
+            // (global CA bundle / upstream-resolved fields) is unreadable.
+            .filter(|p| {
+                p.dispatch_kind == crate::config::types::DispatchKind::TcpTls && !p.passthrough
+            })
             .map(|proxy| {
-                CachedBackendTlsConfig::build(
+                build_cached_backend_tls_config(
                     proxy,
                     tls_no_verify,
                     tls_ca_bundle_path.as_deref(),
                     tls_policy.as_deref(),
                     &crls,
                 )
-                    .map(Arc::new)
-                    .unwrap_or_else(|e| {
-                        warn!(proxy_id = %proxy_id, "Failed to pre-build backend TLS config: {}, will retry per-connection", e);
-                        // Return a dummy config that will be rebuilt per-connection
-                        let dummy_builder = crate::tls::backend_client_config_builder(tls_policy.as_deref())
-                            .unwrap_or_else(|_| rustls::ClientConfig::builder());
-                        Arc::new(CachedBackendTlsConfig {
-                            config: Arc::new(
-                                dummy_builder
-                                    .with_root_certificates(rustls::RootCertStore::empty())
-                                    .with_no_client_auth()
-                            ),
-                        })
-                    })
+                .map(Arc::new)
             })
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Failed to pre-build backend TLS config: {}", e))?
     };
 
     let loop_state = TcpAcceptLoopState {
@@ -1107,11 +1121,7 @@ async fn run_tcp_accept_loop(
                             &client_ip,
                         );
                     let epoch = request_epoch.load();
-                    let base_proxy = epoch
-                        .config
-                        .proxies
-                        .iter()
-                        .find(|p| p.id.as_str() == proxy_id.as_ref());
+                    let base_proxy = epoch.proxy_by_id(proxy_id.as_ref());
                     let consumer_index =
                         Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
 
@@ -1197,11 +1207,7 @@ async fn run_tcp_accept_loop(
                     // config reloads; using the connection epoch preserves a
                     // consistent view of SNI-selected proxy metadata and
                     // stream plugins for the full connection lifetime.
-                    let final_proxy = epoch
-                        .config
-                        .proxies
-                        .iter()
-                        .find(|p| p.id == final_proxy_id);
+                    let final_proxy = epoch.proxy_by_id(&final_proxy_id);
                     let plugins = epoch
                         .plugin_cache
                         .get_plugins_for_protocol(&final_proxy_id, ProxyProtocol::Tcp);
@@ -1782,7 +1788,7 @@ async fn handle_tcp_connection_inner(
         let sni = super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
         stream_ctx.sni_hostname = sni.clone();
 
-        let matched = super::sni::resolve_proxy_by_sni(sni.as_deref(), sni_ids, &epoch.config)
+        let matched = super::sni::resolve_proxy_by_sni_in_epoch(sni.as_deref(), sni_ids, epoch)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "No matching passthrough proxy for SNI {:?} on port {}",
@@ -1793,12 +1799,7 @@ async fn handle_tcp_connection_inner(
         _resolved_proxy_id = Some(matched.to_string());
         // Update stream_ctx to reflect the resolved proxy
         stream_ctx.proxy_id = matched.to_string();
-        stream_ctx.proxy_name = epoch
-            .config
-            .proxies
-            .iter()
-            .find(|p| p.id == matched)
-            .and_then(|p| p.name.clone());
+        stream_ctx.proxy_name = epoch.proxy_by_id(matched).and_then(|p| p.name.clone());
         _resolved_proxy_id.as_deref().unwrap_or(proxy_id)
     } else {
         _resolved_proxy_id = None;
@@ -1808,10 +1809,7 @@ async fn handle_tcp_connection_inner(
     // Look up the proxy config and extract only the fields we need.
     let (params, cb_info) = {
         let proxy = epoch
-            .config
-            .proxies
-            .iter()
-            .find(|p| p.id == proxy_id)
+            .proxy_by_id(proxy_id)
             .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?;
 
         stream_ctx.proxy_id = proxy.id.clone();
@@ -1964,6 +1962,7 @@ async fn handle_tcp_connection_inner(
 
     // ----- Passthrough mode: forward encrypted bytes without TLS termination -----
     if params.passthrough {
+        let mut cb_info = cb_info;
         // Peek at the ClientHello to extract SNI for logging/routing.
         // Skip if already extracted during SNI-based proxy resolution above.
         if stream_ctx.sni_hostname.is_none() {
@@ -2002,6 +2001,35 @@ async fn handle_tcp_connection_inner(
             }
         }
 
+        // Circuit breaker check — reject before DNS resolution or backend
+        // connect if the passthrough target is open. This mirrors the
+        // terminating TCP path; passthrough still records backend outcomes
+        // below, so it must also honor breaker admission and preserve the
+        // half-open probe flag for the matching record_success/failure call.
+        if let Some(ref cb_config) = cb_info.cb_config {
+            match circuit_breaker_cache.can_execute(
+                proxy_id,
+                cb_info.cb_target_key.as_deref(),
+                cb_config,
+            ) {
+                Ok((_cb, is_half_open_probe)) => {
+                    cb_info.is_half_open_probe = is_half_open_probe;
+                }
+                Err(_) => {
+                    warn!(
+                        proxy_id = %proxy_id,
+                        client = %remote_addr,
+                        "TCP passthrough connection rejected: circuit breaker open"
+                    );
+                    return Err(StreamSetupError::new(
+                        StreamSetupKind::CircuitBreakerOpen,
+                        format!("for {}:{}", params.backend_host, params.backend_port),
+                    )
+                    .into());
+                }
+            }
+        }
+
         let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
         let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
             Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
@@ -2032,17 +2060,37 @@ async fn handle_tcp_connection_inner(
         #[cfg(not(target_os = "linux"))]
         let splice_used = false;
 
-        // Resolve backend IP via DNS
-        let resolved_ip = dns_cache
+        // Resolve backend IP via DNS. A resolution failure is a backend
+        // reachability failure: record it against the breaker (mirrors the
+        // non-passthrough path) so the failure counts toward opening AND any
+        // half-open probe slot claimed by can_execute above is released —
+        // otherwise an unresolvable passthrough hostname wedges HALF_OPEN
+        // until reload.
+        let resolved_ip = match dns_cache
             .resolve(
                 &params.backend_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
             )
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("DNS resolution failed for {}: {}", params.backend_host, e)
-            })?;
+        {
+            Ok(ip) => ip,
+            Err(e) => {
+                if let Some(ref cb_config) = cb_info.cb_config {
+                    let cb = circuit_breaker_cache.get_or_create(
+                        proxy_id,
+                        cb_info.cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(502, true, cb_info.is_half_open_probe);
+                }
+                return Err(anyhow::anyhow!(
+                    "DNS resolution failed for {}: {}",
+                    params.backend_host,
+                    e
+                ));
+            }
+        };
         let addr = SocketAddr::new(resolved_ip, params.backend_port);
         backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
 
@@ -2065,6 +2113,18 @@ async fn handle_tcp_connection_inner(
                     reason = %reason,
                     "TCP passthrough rejected: backend maxConnections reached"
                 );
+                // This is a gateway-local policy rejection, not a backend
+                // outcome. If the breaker admission above claimed a
+                // half-open probe slot, release it neutrally so passthrough
+                // traffic cannot wedge HALF_OPEN.
+                if let Some(ref cb_config) = cb_info.cb_config {
+                    let cb = circuit_breaker_cache.get_or_create(
+                        proxy_id,
+                        cb_info.cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_neutral(cb_info.is_half_open_probe);
+                }
                 return Err(StreamSetupError::with_source(
                     StreamSetupKind::BackendMaxConnectionsExceeded,
                     format!(
@@ -2102,6 +2162,7 @@ async fn handle_tcp_connection_inner(
             passthrough_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
         );
 
+        let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
 
         // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
@@ -2111,7 +2172,7 @@ async fn handle_tcp_connection_inner(
         // watermarks inside their loops, so we no longer fall back to bidirectional_copy.
         #[cfg(target_os = "linux")]
         let copy_result = if io_uring_splice_enabled {
-            bidirectional_splice_io_uring(
+            bidirectional_splice_io_uring_bounded_or_async(
                 client_stream,
                 backend_stream,
                 idle_timeout,
@@ -2787,7 +2848,7 @@ async fn handle_tcp_connection_inner(
                     {
                         used_splice = true;
                         if io_uring_splice_enabled {
-                            bidirectional_splice_io_uring(
+                            bidirectional_splice_io_uring_bounded_or_async(
                                 client_stream,
                                 bs,
                                 idle_timeout,
@@ -4307,11 +4368,6 @@ async fn bidirectional_splice(
     backend_write_timeout: Option<Duration>,
     pipe_size: usize,
 ) -> StreamCopyResult {
-    use std::os::unix::io::AsRawFd;
-
-    let client_fd = client.as_raw_fd();
-    let backend_fd = backend.as_raw_fd();
-
     // Create two pipes: one for each direction. Guards close fds on drop.
     let (c2b_pipe_r, c2b_pipe_w) = match create_splice_pipe(pipe_size) {
         Ok(p) => p,
@@ -4375,20 +4431,20 @@ async fn bidirectional_splice(
 
     // Pin both direction futures for use with select! — no spawned tasks.
     let c2b_fut = splice_one_direction_no_guard(
-        client_fd,
+        &client,
         c2b_pipe_w,
         c2b_pipe_r,
-        backend_fd,
+        &backend,
         la_c2b,
         c2b_bytes_task,
         None,
         c2b_write_watermark.clone(),
     );
     let b2c_fut = splice_one_direction_no_guard(
-        backend_fd,
+        &backend,
         b2c_pipe_w,
         b2c_pipe_r,
-        client_fd,
+        &client,
         la_b2c,
         b2c_bytes_task,
         b2c_read_watermark.clone(),
@@ -4740,6 +4796,88 @@ fn classify_splice_worker_failure(
     }
 }
 
+#[cfg(target_os = "linux")]
+const IO_URING_SPLICE_MAX_CONCURRENT: usize = 128;
+
+#[cfg(target_os = "linux")]
+static IO_URING_SPLICE_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn io_uring_splice_limit() -> Arc<Semaphore> {
+    IO_URING_SPLICE_LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(IO_URING_SPLICE_MAX_CONCURRENT)))
+        .clone()
+}
+
+#[cfg(target_os = "linux")]
+fn try_acquire_io_uring_splice_permit(limit: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    limit.clone().try_acquire_owned().ok()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod io_uring_splice_limit_tests {
+    use super::*;
+
+    #[test]
+    fn permit_gate_returns_none_when_limit_is_exhausted() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit =
+            try_acquire_io_uring_splice_permit(&limit).expect("first permit should be available");
+
+        assert!(
+            try_acquire_io_uring_splice_permit(&limit).is_none(),
+            "saturated io_uring splice limit should decline another relay"
+        );
+
+        drop(permit);
+        assert!(
+            try_acquire_io_uring_splice_permit(&limit).is_some(),
+            "released permit should make the relay slot available again"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn bidirectional_splice_io_uring_bounded_or_async(
+    client: TcpStream,
+    backend: TcpStream,
+    idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
+    backend_read_timeout: Option<Duration>,
+    backend_write_timeout: Option<Duration>,
+    pipe_size: usize,
+) -> StreamCopyResult {
+    let limit = io_uring_splice_limit();
+    if let Some(_permit) = try_acquire_io_uring_splice_permit(&limit) {
+        bidirectional_splice_io_uring(
+            client,
+            backend,
+            idle_timeout,
+            half_close_cap,
+            backend_read_timeout,
+            backend_write_timeout,
+            pipe_size,
+        )
+        .await
+    } else {
+        debug!(
+            max_concurrent = IO_URING_SPLICE_MAX_CONCURRENT,
+            "io_uring splice concurrency limit reached; falling back to async splice"
+        );
+        bidirectional_splice(
+            client,
+            backend,
+            idle_timeout,
+            half_close_cap,
+            backend_read_timeout,
+            backend_write_timeout,
+            pipe_size,
+        )
+        .await
+    }
+}
+
 /// Bidirectional zero-copy relay using io_uring `IORING_OP_SPLICE`.
 ///
 /// Each direction gets its own io_uring ring (8 entries) and runs on a
@@ -4769,8 +4907,6 @@ async fn bidirectional_splice_io_uring(
     // unwind instead of pinning under a stalled peer when
     // `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0`.
     use std::os::unix::io::AsRawFd;
-    use std::sync::OnceLock;
-
     let client_fd = client.as_raw_fd();
     let backend_fd = backend.as_raw_fd();
 
@@ -5132,6 +5268,133 @@ fn io_uring_splice_direction(
 /// `write_timeout_ms` mirror the io_uring path — see
 /// `io_uring_splice_direction` for which worker carries which watermark.
 #[cfg(target_os = "linux")]
+fn splice_once(in_fd: i32, out_fd: i32, len: usize, flags: u32) -> std::io::Result<isize> {
+    let n = unsafe {
+        libc::splice(
+            in_fd,
+            std::ptr::null_mut(),
+            out_fd,
+            std::ptr::null_mut(),
+            len,
+            flags,
+        )
+    };
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n)
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn splice_when_ready<F>(
+    stream: &TcpStream,
+    interest: tokio::io::Interest,
+    mut op: F,
+) -> std::io::Result<isize>
+where
+    F: FnMut() -> std::io::Result<isize>,
+{
+    loop {
+        stream.ready(interest).await?;
+        match stream.try_io(interest, &mut op) {
+            Ok(n) => return Ok(n),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn min_splice_deadline_remaining(
+    current_min: &mut Option<u64>,
+    now: u64,
+    last: u64,
+    timeout_ms: u64,
+) {
+    if timeout_ms == 0 || last == u64::MAX {
+        return;
+    }
+    let remaining = timeout_ms.saturating_sub(now.saturating_sub(last));
+    *current_min = Some(current_min.map_or(remaining, |min| min.min(remaining)));
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn splice_poll_timeout_ms_at(
+    now: u64,
+    timeout_ms: u64,
+    shared_activity: &AtomicU64,
+    read_watermark: Option<&AtomicU64>,
+    read_timeout_ms: u64,
+    write_watermark: Option<&AtomicU64>,
+    write_timeout_ms: u64,
+) -> i32 {
+    let mut remaining = None;
+    min_splice_deadline_remaining(
+        &mut remaining,
+        now,
+        shared_activity.load(Ordering::Relaxed),
+        timeout_ms,
+    );
+    if let Some(wm) = read_watermark {
+        min_splice_deadline_remaining(
+            &mut remaining,
+            now,
+            wm.load(Ordering::Relaxed),
+            read_timeout_ms,
+        );
+    }
+    if let Some(wm) = write_watermark {
+        min_splice_deadline_remaining(
+            &mut remaining,
+            now,
+            wm.load(Ordering::Relaxed),
+            write_timeout_ms,
+        );
+    }
+    remaining.map_or(-1, |ms| ms.min(i32::MAX as u64) as i32)
+}
+
+#[cfg(target_os = "linux")]
+fn splice_poll_timeout_ms(
+    timeout_ms: u64,
+    shared_activity: &AtomicU64,
+    read_watermark: Option<&AtomicU64>,
+    read_timeout_ms: u64,
+    write_watermark: Option<&AtomicU64>,
+    write_timeout_ms: u64,
+) -> i32 {
+    splice_poll_timeout_ms_at(
+        coarse_now_ms(),
+        timeout_ms,
+        shared_activity,
+        read_watermark,
+        read_timeout_ms,
+        write_watermark,
+        write_timeout_ms,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn poll_splice_fd(fd: i32, events: libc::c_short, timeout_ms: i32) -> std::io::Result<()> {
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret >= 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn libc_splice_loop(
     src_fd: i32,
@@ -5293,7 +5556,20 @@ fn libc_splice_loop(
                                 ));
                             }
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        let wait_ms = splice_poll_timeout_ms(
+                            timeout_ms,
+                            shared_activity,
+                            read_watermark,
+                            read_timeout_ms,
+                            write_watermark,
+                            write_timeout_ms,
+                        );
+                        if let Err(err) = poll_splice_fd(dst_fd, libc::POLLOUT, wait_ms) {
+                            return Err((
+                                StreamIoSide::Write,
+                                anyhow::anyhow!("splice write readiness error: {}", err),
+                            ));
+                        }
                         continue;
                     }
                     return Err((
@@ -5349,7 +5625,20 @@ fn libc_splice_loop(
                         ));
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                let wait_ms = splice_poll_timeout_ms(
+                    timeout_ms,
+                    shared_activity,
+                    read_watermark,
+                    read_timeout_ms,
+                    write_watermark,
+                    write_timeout_ms,
+                );
+                if let Err(err) = poll_splice_fd(src_fd, libc::POLLIN, wait_ms) {
+                    return Err((
+                        StreamIoSide::Read,
+                        anyhow::anyhow!("splice read readiness error: {}", err),
+                    ));
+                }
                 continue;
             }
             return Err((
@@ -5401,30 +5690,37 @@ fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn splice_one_direction_no_guard(
-    src_fd: i32,
+    src: &TcpStream,
     pipe_w: i32,
     pipe_r: i32,
-    dst_fd: i32,
+    dst: &TcpStream,
     last_activity: Option<Arc<AtomicU64>>,
     bytes: Arc<AtomicU64>,
     read_watermark: Option<Arc<AtomicU64>>,
     write_watermark: Option<Arc<AtomicU64>>,
 ) -> Result<(), (StreamIoSide, anyhow::Error)> {
+    use std::os::unix::io::AsRawFd;
+
     let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
+    let src_fd = src.as_raw_fd();
+    let dst_fd = dst.as_raw_fd();
 
     loop {
         // Phase 1: splice from source fd into write end of pipe
-        let n = unsafe {
-            libc::splice(
-                src_fd,
-                std::ptr::null_mut(),
-                pipe_w,
-                std::ptr::null_mut(),
-                // Use 128 KB per splice call — large enough to amortize syscall
-                // overhead, small enough to avoid holding the pipe buffer too long.
-                128 * 1024,
-                splice_flags,
-            )
+        let n = match splice_when_ready(src, tokio::io::Interest::READABLE, || {
+            // Use 128 KB per splice call — large enough to amortize syscall
+            // overhead, small enough to avoid holding the pipe buffer too long.
+            splice_once(src_fd, pipe_w, 128 * 1024, splice_flags)
+        })
+        .await
+        {
+            Ok(n) => n,
+            Err(err) => {
+                return Err((
+                    StreamIoSide::Read,
+                    anyhow::anyhow!("splice read readiness error: {}", err),
+                ));
+            }
         };
 
         if n > 0 {
@@ -5444,15 +5740,18 @@ async fn splice_one_direction_no_guard(
             // Phase 2: splice from read end of pipe into destination fd
             let mut remaining = n as usize;
             while remaining > 0 {
-                let written = unsafe {
-                    libc::splice(
-                        pipe_r,
-                        std::ptr::null_mut(),
-                        dst_fd,
-                        std::ptr::null_mut(),
-                        remaining,
-                        splice_flags,
-                    )
+                let written = match splice_when_ready(dst, tokio::io::Interest::WRITABLE, || {
+                    splice_once(pipe_r, dst_fd, remaining, splice_flags)
+                })
+                .await
+                {
+                    Ok(n) => n,
+                    Err(err) => {
+                        return Err((
+                            StreamIoSide::Write,
+                            anyhow::anyhow!("splice write readiness error: {}", err),
+                        ));
+                    }
                 };
                 if written > 0 {
                     remaining -= written as usize;
@@ -5466,36 +5765,12 @@ async fn splice_one_direction_no_guard(
                     // the relay half-close before this direction exits Ok.
                     shutdown_write_fd(dst_fd);
                     return Ok(());
-                } else {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                        // Destination not ready — back off briefly before retrying
-                        // so idle sockets cannot busy-spin the worker thread.
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                        continue;
-                    }
-                    return Err((
-                        StreamIoSide::Write,
-                        anyhow::anyhow!("splice write error: {}", err),
-                    ));
                 }
             }
         } else if n == 0 {
             // EOF — source closed
             shutdown_write_fd(dst_fd);
             return Ok(());
-        } else {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                // Source not ready — back off briefly before retrying
-                // so idle sockets cannot busy-spin the worker thread.
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                continue;
-            }
-            return Err((
-                StreamIoSide::Read,
-                anyhow::anyhow!("splice read error: {}", err),
-            ));
         }
     }
 }
@@ -5958,6 +6233,78 @@ mod ktls_param_tests {
             ),
         };
         assert!(build_ktls_params(0x0303, &secrets).is_none());
+    }
+}
+
+#[cfg(test)]
+mod splice_readiness_wait_tests {
+    use super::splice_poll_timeout_ms_at;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const NOW_MS: u64 = 10_000;
+
+    #[test]
+    fn splice_poll_timeout_waits_indefinitely_without_active_deadlines() {
+        let now = NOW_MS;
+        let activity = AtomicU64::new(now);
+
+        assert_eq!(
+            splice_poll_timeout_ms_at(now, 0, &activity, None, 0, None, 0),
+            -1
+        );
+    }
+
+    #[test]
+    fn splice_poll_timeout_uses_nearest_active_watermark_deadline() {
+        let now = NOW_MS;
+        let activity = AtomicU64::new(now.saturating_sub(100));
+        let read = AtomicU64::new(now.saturating_sub(750));
+        let write = AtomicU64::new(now.saturating_sub(200));
+
+        let wait = splice_poll_timeout_ms_at(
+            now,
+            5_000,
+            &activity,
+            Some(&read),
+            1_000,
+            Some(&write),
+            2_000,
+        );
+
+        assert_eq!(wait, 250);
+    }
+
+    #[test]
+    fn splice_poll_timeout_ignores_unprimed_write_watermark() {
+        let now = NOW_MS;
+        let activity = AtomicU64::new(now);
+        let write = AtomicU64::new(u64::MAX);
+
+        let wait = splice_poll_timeout_ms_at(now, 2_000, &activity, None, 0, Some(&write), 10);
+
+        assert_eq!(wait, 2_000);
+    }
+
+    #[test]
+    fn splice_poll_timeout_returns_zero_for_expired_deadline() {
+        let now = NOW_MS;
+        let activity = AtomicU64::new(now.saturating_sub(2_000));
+
+        assert_eq!(
+            splice_poll_timeout_ms_at(now, 1_000, &activity, None, 0, None, 0),
+            0
+        );
+    }
+
+    #[test]
+    fn splice_poll_timeout_observes_updated_activity() {
+        let now = NOW_MS;
+        let activity = AtomicU64::new(now.saturating_sub(900));
+
+        activity.store(now, Ordering::Relaxed);
+
+        let wait = splice_poll_timeout_ms_at(now, 1_000, &activity, None, 0, None, 0);
+        assert_eq!(wait, 1_000);
     }
 }
 

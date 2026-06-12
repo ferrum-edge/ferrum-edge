@@ -39,6 +39,8 @@ pub enum PoolKind {
     Http3,
     Grpc,
     Hbone,
+    /// Sidecar egress SVID-mTLS HTTP/2 pool (`mesh_mtls_pool`).
+    MeshMtls,
 }
 
 impl PoolKind {
@@ -49,6 +51,7 @@ impl PoolKind {
             Self::Http3 => "http3",
             Self::Grpc => "grpc",
             Self::Hbone => "hbone",
+            Self::MeshMtls => "mesh_mtls",
         }
     }
 }

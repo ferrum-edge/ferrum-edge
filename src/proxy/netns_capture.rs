@@ -555,7 +555,7 @@ impl NetnsBackend for ProxyNetnsBackend {
         tokio::spawn(async move {
             run_accept_loop(
                 listener,
-                state,
+                Arc::new(state),
                 ListenerTlsSource::Static {
                     tls_config: None,
                     record_mesh_mtls_metric: false,

@@ -183,7 +183,7 @@ pub mod _test_support {
         proxy: &crate::config::types::Proxy,
     ) -> Result<
         tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            tokio_tungstenite::MaybeTlsStream<crate::proxy::WsActivityIo<tokio::net::TcpStream>>,
         >,
         Box<dyn std::error::Error + Send + Sync>,
     > {
@@ -198,6 +198,7 @@ pub mod _test_support {
             &crls,
             65_536,
             4_096,
+            None,
         )
         .await?;
         Ok(handshake.stream)
@@ -214,7 +215,9 @@ pub mod _test_support {
     ) -> Result<
         (
             tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                tokio_tungstenite::MaybeTlsStream<
+                    crate::proxy::WsActivityIo<tokio::net::TcpStream>,
+                >,
             >,
             Option<String>,
         ),
@@ -239,6 +242,7 @@ pub mod _test_support {
             &crls,
             65_536,
             4_096,
+            None,
         )
         .await?;
         let proto = handshake

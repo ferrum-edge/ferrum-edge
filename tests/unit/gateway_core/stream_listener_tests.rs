@@ -5,7 +5,9 @@
 
 use arc_swap::ArcSwap;
 use ferrum_edge::circuit_breaker::CircuitBreakerCache;
-use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig, Proxy};
+use ferrum_edge::config::types::{
+    BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, Proxy,
+};
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::load_balancer::LoadBalancerCache;
@@ -21,7 +23,7 @@ use std::time::Duration;
 // ============================================================================
 
 fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
-    Proxy {
+    let mut proxy = Proxy {
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -77,7 +79,9 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         udp_max_response_amplification_factor: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-    }
+    };
+    proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+    proxy
 }
 
 /// Allocate an ephemeral port by binding and immediately dropping.
@@ -90,12 +94,19 @@ async fn ephemeral_port() -> u16 {
 
 fn create_manager(config: GatewayConfig) -> StreamListenerManager {
     let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    create_manager_with_config_arc(config_arc, &config)
+}
+
+fn create_manager_with_config_arc(
+    config_arc: Arc<ArcSwap<GatewayConfig>>,
+    config: &GatewayConfig,
+) -> StreamListenerManager {
     let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    let lb_cache = Arc::new(LoadBalancerCache::new(config));
     let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
+    let plugin_cache = Arc::new(PluginCache::new(config).expect("PluginCache::new failed"));
     let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
-        config.clone(),
+        (*config).clone(),
         &plugin_cache,
         &consumer_index,
         &lb_cache,
@@ -290,6 +301,454 @@ async fn test_reconcile_detects_port_conflict() {
 
     // Keep blocker alive until end of test
     drop(blocker);
+}
+
+#[tokio::test]
+async fn test_reconcile_restarts_changed_tcp_listener_without_bind_failure() {
+    let port = ephemeral_port().await;
+    let proxy = create_stream_proxy("tcp-restart", BackendScheme::Tcp, port);
+    let config = GatewayConfig {
+        proxies: vec![proxy.clone()],
+        ..empty_config()
+    };
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial TCP listener should start without failures: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial TCP listener should bind");
+
+    let mut restarted_proxy = proxy;
+    restarted_proxy.backend_scheme = Some(BackendScheme::Tcps);
+    restarted_proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcps);
+    restarted_proxy.backend_tls_verify_server_cert = false;
+    let restarted_config = GatewayConfig {
+        proxies: vec![restarted_proxy],
+        ..empty_config()
+    };
+    config_arc.store(Arc::new(restarted_config));
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "same-port listener restart should wait for the old socket before probing: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("restarted TCP TLS listener should bind");
+
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn test_reconcile_skips_tcp_tls_listener_when_backend_tls_material_unreadable() {
+    let port = ephemeral_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing_ca_path = dir.path().join("missing-ca.pem");
+    let mut proxy = create_stream_proxy("tcp-tls-bad-ca", BackendScheme::Tcps, port);
+    proxy.backend_tls_verify_server_cert = true;
+    proxy.backend_tls_server_ca_cert_path = Some(
+        missing_ca_path
+            .to_str()
+            .expect("test temp path must be utf-8 for proxy config")
+            .to_string(),
+    );
+    proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let manager = create_manager(config);
+
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "bad backend TLS material should fail only that stream listener: {:?}",
+        failures
+    );
+    assert_eq!(failures[0].0, "tcp-tls-bad-ca");
+    assert_eq!(failures[0].1, port);
+    assert!(
+        failures[0].2.contains("Backend TLS config failed"),
+        "error should identify backend TLS validation: {}",
+        failures[0].2
+    );
+
+    let probe = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await;
+    assert!(
+        probe.is_ok(),
+        "failed backend TLS validation must not leave a dead listener occupying port {}",
+        port
+    );
+}
+
+/// Generate a self-signed CA certificate PEM for backend TLS config builds.
+fn generate_test_ca_pem(common_name: &str) -> String {
+    let key_pair =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate CA key pair");
+    let mut params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA certificate params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name);
+    params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+    params.self_signed(&key_pair).expect("self-signed CA").pem()
+}
+
+/// In-place backend TLS rotation to invalid content must NOT tear down the
+/// running listener: the replacement TLS config is validated BEFORE the old
+/// listener is stopped, and on failure the old listener keeps serving with
+/// its cached config. Fixing the material on a later reconcile restarts the
+/// listener cleanly.
+#[tokio::test]
+async fn test_in_place_backend_tls_rotation_to_invalid_keeps_old_listener_serving() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let port = ephemeral_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, generate_test_ca_pem("Rotation CA A")).expect("write initial ca");
+
+    let mut proxy = create_stream_proxy("tcp-tls-rotate", BackendScheme::Tcps, port);
+    proxy.backend_tls_verify_server_cert = true;
+    proxy.backend_tls_server_ca_cert_path = Some(
+        ca_path
+            .to_str()
+            .expect("test temp path must be utf-8 for proxy config")
+            .to_string(),
+    );
+    proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let manager = create_manager(config);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial TCP TLS listener should start with valid CA material: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial TCP TLS listener should bind");
+
+    // Rotate the CA file IN PLACE to unparseable garbage. The content
+    // fingerprint changes the reload key, but the replacement TLS config
+    // cannot be built — reconcile must keep the OLD listener serving instead
+    // of tearing it down and leaving the port closed.
+    std::fs::write(&ca_path, b"not-a-pem-certificate").expect("rotate ca to garbage");
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "invalid in-place rotation should be reported: {:?}",
+        failures
+    );
+    assert_eq!(failures[0].0, "tcp-tls-rotate");
+    assert_eq!(failures[0].1, port);
+    assert!(
+        failures[0].2.contains("kept previous listener running"),
+        "failure should state the old listener was kept: {}",
+        failures[0].2
+    );
+    let conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+    assert!(
+        conn.is_ok(),
+        "old listener must keep serving port {} after an invalid in-place TLS rotation",
+        port
+    );
+
+    // A later reconcile with still-bad material keeps reporting and keeps
+    // serving (the handle retains its previous reload key, so the drift is
+    // re-detected every pass).
+    let failures = manager.reconcile().await;
+    assert_eq!(failures.len(), 1, "still-bad material keeps reporting");
+    let conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+    assert!(conn.is_ok(), "old listener must still be serving");
+
+    // Fix the material (different valid CA) — the next reconcile restarts the
+    // listener with the fresh cached config.
+    std::fs::write(&ca_path, generate_test_ca_pem("Rotation CA B")).expect("rotate to valid ca");
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "valid rotation should restart the listener cleanly: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("restarted TCP TLS listener should bind");
+    let conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+    assert!(conn.is_ok(), "restarted listener must serve the port");
+
+    manager.shutdown_all().await;
+}
+
+/// A mixed config update that rotates backend TLS material to invalid content
+/// IN PLACE *and* changes backend routing (fields outside listener identity,
+/// read live per connection) must NOT take the keep-old-listener path: keeping
+/// the old listener would pair its stale cached TLS config with connections
+/// that now route to the NEW backend. Expected behavior: normal teardown, the
+/// invalid TLS surfaces as a clean bind failure, and the port is left closed
+/// (visible failure) until the material is fixed.
+#[tokio::test]
+async fn test_mixed_routing_change_and_invalid_tls_rotation_tears_down_listener() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let port = ephemeral_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, generate_test_ca_pem("Mixed Update CA")).expect("write initial ca");
+
+    let mut proxy = create_stream_proxy("tcp-tls-mixed", BackendScheme::Tcps, port);
+    proxy.backend_tls_verify_server_cert = true;
+    proxy.backend_tls_server_ca_cert_path = Some(
+        ca_path
+            .to_str()
+            .expect("test temp path must be utf-8 for proxy config")
+            .to_string(),
+    );
+    proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+    let config = GatewayConfig {
+        proxies: vec![proxy.clone()],
+        ..empty_config()
+    };
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial TCP TLS listener should start cleanly: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial TCP TLS listener should bind");
+
+    // Single update: same-path rotation to garbage AND a backend routing
+    // change. Listener identity (port/scheme/frontend_tls/passthrough) is
+    // unchanged, so without the routing gate this would hit the
+    // keep-old-listener path.
+    std::fs::write(&ca_path, b"not-a-pem-certificate").expect("rotate ca to garbage");
+    let mut updated = proxy;
+    updated.backend_port = 19999;
+    let updated_config = GatewayConfig {
+        proxies: vec![updated],
+        ..empty_config()
+    };
+    config_arc.store(Arc::new(updated_config));
+
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "invalid TLS in a mixed update must surface a failure: {:?}",
+        failures
+    );
+    assert_eq!(failures[0].0, "tcp-tls-mixed");
+    assert!(
+        failures[0].2.contains("Backend TLS config failed"),
+        "failure should be the TLS validation error: {}",
+        failures[0].2
+    );
+    assert!(
+        !failures[0].2.contains("kept previous listener running"),
+        "mixed routing+TLS update must not keep the old listener: {}",
+        failures[0].2
+    );
+    let probe = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await;
+    assert!(
+        probe.is_ok(),
+        "port {} must be closed (clean failure) instead of serving stale TLS against the new backend",
+        port
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// A deliberate TLS *source* change (new CA path, not an in-place content
+/// rotation of the same source) whose new material is invalid must fall
+/// through to normal teardown — fail loudly with the port closed — rather
+/// than silently keep serving material from the previous source.
+#[tokio::test]
+async fn test_tls_source_change_to_invalid_material_tears_down_listener() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let port = ephemeral_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_a_path = dir.path().join("ca-a.pem");
+    std::fs::write(&ca_a_path, generate_test_ca_pem("Source Change CA A")).expect("write ca a");
+    let ca_b_path = dir.path().join("ca-b-missing.pem");
+
+    let mut proxy = create_stream_proxy("tcp-tls-source-change", BackendScheme::Tcps, port);
+    proxy.backend_tls_verify_server_cert = true;
+    proxy.backend_tls_server_ca_cert_path = Some(
+        ca_a_path
+            .to_str()
+            .expect("test temp path must be utf-8 for proxy config")
+            .to_string(),
+    );
+    proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+    let config = GatewayConfig {
+        proxies: vec![proxy.clone()],
+        ..empty_config()
+    };
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial TCP TLS listener should start cleanly: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial TCP TLS listener should bind");
+
+    // Operator points the proxy at a DIFFERENT CA source that is unreadable.
+    // Routing is unchanged, but the source identity changed, so this is not
+    // an in-place rotation and must not take the keep-old path.
+    let mut updated = proxy;
+    updated.backend_tls_server_ca_cert_path = Some(
+        ca_b_path
+            .to_str()
+            .expect("test temp path must be utf-8 for proxy config")
+            .to_string(),
+    );
+    updated.resolved_tls = BackendTlsConfig::from_proxy(&updated);
+    let updated_config = GatewayConfig {
+        proxies: vec![updated],
+        ..empty_config()
+    };
+    config_arc.store(Arc::new(updated_config));
+
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "invalid new TLS source must surface a failure: {:?}",
+        failures
+    );
+    assert!(
+        failures[0].2.contains("Backend TLS config failed")
+            && !failures[0].2.contains("kept previous listener running"),
+        "source change must tear down, not keep the old listener: {}",
+        failures[0].2
+    );
+    let probe = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await;
+    assert!(
+        probe.is_ok(),
+        "port {} must be closed after a deliberate source change to invalid material",
+        port
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// The backend TLS reload key must derive from `resolved_tls` — the
+/// upstream-projected view (`resolve_upstream_tls()`) — not from the proxy's
+/// own `backend_tls_*` fields. An upstream-only TLS change leaves the proxy
+/// fields untouched, so a key built from them would never notice the change.
+/// Detection is made observable by switching to a garbage CA at a different
+/// path: reconcile reports the validation failure (proving the key changed).
+/// Because the *source* changed (not an in-place content rotation), the
+/// listener is torn down and the port left closed — the keep-old path is
+/// reserved for same-source content rotation.
+#[tokio::test]
+async fn test_reconcile_detects_upstream_resolved_tls_change() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let port = ephemeral_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_a_path = dir.path().join("upstream-ca-a.pem");
+    let ca_b_path = dir.path().join("upstream-ca-b.pem");
+    std::fs::write(&ca_a_path, generate_test_ca_pem("Upstream CA A")).expect("write ca a");
+    std::fs::write(&ca_b_path, b"garbage-rotated-by-upstream").expect("write ca b");
+
+    // Proxy's own backend_tls_* fields stay empty; TLS arrives via
+    // resolved_tls, exactly as resolve_upstream_tls() projects from a
+    // referenced upstream.
+    let mut proxy = create_stream_proxy("tcp-tls-upstream", BackendScheme::Tcps, port);
+    proxy.resolved_tls = BackendTlsConfig {
+        server_ca_cert_path: Some(
+            ca_a_path
+                .to_str()
+                .expect("test temp path must be utf-8 for proxy config")
+                .to_string(),
+        ),
+        verify_server_cert: true,
+        ..BackendTlsConfig::default_verify()
+    };
+    let mut rotated_proxy = proxy.clone();
+    rotated_proxy.resolved_tls.server_ca_cert_path = Some(
+        ca_b_path
+            .to_str()
+            .expect("test temp path must be utf-8 for proxy config")
+            .to_string(),
+    );
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial upstream-resolved TLS should start cleanly: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial TCP TLS listener should bind");
+
+    // Upstream-only TLS change: identical proxy fields, new resolved_tls.
+    let rotated_config = GatewayConfig {
+        proxies: vec![rotated_proxy],
+        ..empty_config()
+    };
+    config_arc.store(Arc::new(rotated_config));
+
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "upstream-resolved TLS change must be detected via the reload key: {:?}",
+        failures
+    );
+    assert_eq!(failures[0].0, "tcp-tls-upstream");
+    assert!(
+        failures[0].2.contains("Backend TLS config failed")
+            && !failures[0].2.contains("kept previous listener running"),
+        "an upstream TLS source change must tear down rather than keep the old listener: {}",
+        failures[0].2
+    );
+    let probe = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await;
+    assert!(
+        probe.is_ok(),
+        "port {} must be closed after an upstream TLS source change to invalid material",
+        port
+    );
+
+    manager.shutdown_all().await;
 }
 
 // ============================================================================
@@ -651,6 +1110,95 @@ async fn test_global_shutdown_stops_udp_recv_loop() {
         "UDP port {} should be released after global shutdown signal",
         port
     );
+}
+
+// ============================================================================
+// Tests: dead listener task self-healing (TOCTOU prebuild/bind failures)
+// ============================================================================
+
+/// A listener whose spawned task has exited (TLS prebuild or bind failed
+/// after reconcile's validation/probe passed, accept loop errored, etc.)
+/// leaves a handle in the manager whose keys still match the desired config.
+/// Reconcile must detect the finished task and restart the listener instead
+/// of treating the dead handle as healthy forever.
+///
+/// The task is killed deterministically by firing a global shutdown channel
+/// (any exit path looks identical to the manager: the JoinHandle finishes
+/// while the handle stays in the map); a fresh, unfired channel is injected
+/// before the recovery reconcile so the restarted listener stays up. The same
+/// manager-level check covers TCP, UDP, and DTLS listeners — they share the
+/// reconcile loop.
+#[tokio::test]
+async fn test_reconcile_restarts_listener_whose_task_exited() {
+    let port = ephemeral_port().await;
+    let config = GatewayConfig {
+        proxies: vec![create_stream_proxy(
+            "tcp-dead-task",
+            BackendScheme::Tcp,
+            port,
+        )],
+        ..empty_config()
+    };
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = create_manager_with_config_arc(config_arc, &config);
+
+    let (first_tx, first_rx) = tokio::sync::watch::channel(false);
+    manager.set_global_shutdown_rx(first_rx);
+
+    let failures = manager.reconcile().await;
+    assert!(failures.is_empty(), "initial bind failed: {:?}", failures);
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("TCP listener should start");
+
+    // Kill the listener task out from under the manager. The handle stays in
+    // the map with keys that still match the desired config.
+    let _ = first_tx.send(true);
+    let port_freed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await {
+                Ok(_) => return true,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(port_freed, "listener task should have exited");
+
+    // Fresh, unfired global channel so the restarted listener stays alive.
+    let (_second_tx, second_rx) = tokio::sync::watch::channel(false);
+    manager.set_global_shutdown_rx(second_rx);
+
+    // Reconcile must notice the finished task and restart the listener.
+    // Retry: there is a small window between the port being released and the
+    // spawned task fully finishing (JoinHandle::is_finished flipping), and a
+    // probe here can also race the restarted listener's own bind.
+    let mut restarted = false;
+    for _ in 0..50 {
+        let failures = manager.reconcile().await;
+        assert!(
+            failures.is_empty(),
+            "restart reconcile should not fail: {:?}",
+            failures
+        );
+        if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+            .await
+            .is_err()
+        {
+            restarted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        restarted,
+        "reconcile must restart a listener whose task exited (port {} stayed free)",
+        port
+    );
+
+    manager.shutdown_all().await;
 }
 
 // ============================================================================

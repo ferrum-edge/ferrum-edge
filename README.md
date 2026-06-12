@@ -25,7 +25,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 - **Seven operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, and Migrate
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
 - **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
-- **Service mesh**: Six topologies (sidecar, ambient, node waypoint, service waypoint, east-west gateway, egress), native MeshSubscribe and xDS ADS config consumption, SPIFFE identity, HBONE, transparent DNS proxy, mesh authorization, REGISTRY_ONLY outbound policy, and Istio/GAMMA RED metrics. See [docs/mesh.md](docs/mesh.md)
+- **Service mesh**: Six topologies (sidecar, ambient, node waypoint, service waypoint, east-west gateway, egress), native MeshSubscribe, xDS ADS, or localized file config consumption, SPIFFE identity, HBONE, transparent DNS proxy, mesh authorization, REGISTRY_ONLY outbound policy, and Istio/GAMMA RED metrics. See [docs/mesh.md](docs/mesh.md)
 - **Runtime observability**: JWT-gated `/metrics/runtime` JSON snapshot with system/process state, HTTP status windows, error classes, DNS outcomes, backend pool churn, TCP resets, log counters, and overload state
 - **Kubernetes mesh translation**: Gateway API and Istio VirtualService route splits, Istio AuthorizationPolicy/RequestAuthentication/PeerAuthentication, and sidecar injection webhook
 
@@ -39,7 +39,7 @@ For the full feature list, see [FEATURES.md](FEATURES.md).
 | **File** | `FERRUM_MODE=file` | Single-instance, YAML/JSON config, SIGHUP reload | Read-only | Yes |
 | **Control Plane** | `FERRUM_MODE=cp` | Centralized config authority, gRPC distribution to DPs | Read/Write | No |
 | **Data Plane** | `FERRUM_MODE=dp` | Horizontally scalable traffic processing nodes | Read-only | Yes |
-| **Mesh** | `FERRUM_MODE=mesh` | Service-mesh data plane consuming native MeshSubscribe or xDS ADS with six topologies | Read-only | Yes |
+| **Mesh** | `FERRUM_MODE=mesh` | Service-mesh data plane consuming native MeshSubscribe, xDS ADS, or a localized config file with six topologies | Read-only | Yes |
 | **Injector** | `FERRUM_MODE=injector` | Kubernetes admission webhook that injects Ferrum mesh sidecars/init capture | No | No |
 | **Migrate** | `FERRUM_MODE=migrate` | Runs DB schema migrations then exits | No | No |
 

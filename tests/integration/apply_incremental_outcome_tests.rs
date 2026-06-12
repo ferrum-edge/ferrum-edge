@@ -540,3 +540,226 @@ async fn polling_cursor_only_advances_on_applied_or_no_changes() {
     assert_eq!(state.config.load().proxies.len(), 1);
     assert_eq!(state.config.load().proxies[0].id, "p3");
 }
+
+// ============================================================================
+// Stream listener reconcile trigger for upstream-only TLS changes
+// ============================================================================
+
+/// Generate a self-signed CA and a leaf cert/key signed by it with the given
+/// SANs. Returns (ca_pem, leaf_cert_pem, leaf_key_pem).
+fn generate_ca_and_leaf(ca_name: &str, sans: &[&str]) -> (String, String, String) {
+    let ca_key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate CA key pair");
+    let mut ca_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA certificate params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, ca_name);
+    ca_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    let ca_cert = ca_params
+        .clone()
+        .self_signed(&ca_key)
+        .expect("self-signed CA");
+    let ca_pem = ca_cert.pem();
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+    let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("generate leaf key pair");
+    let san_strings: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
+    let leaf_params = rcgen::CertificateParams::new(san_strings).expect("leaf params");
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("sign leaf cert");
+    (ca_pem, leaf_cert.pem(), leaf_key.serialize_pem())
+}
+
+/// Spawn a one-message TLS echo server presenting `cert_pem`/`key_pem`.
+fn spawn_tls_echo_server(
+    listener: tokio::net::TcpListener,
+    cert_pem: &str,
+    key_pem: &str,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse echo server cert");
+    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key_pem.as_bytes()))
+        .expect("parse echo server key")
+        .expect("echo server key present");
+    let server_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("echo server protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .expect("echo server TLS config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                if let Ok(mut tls) = acceptor.accept(stream).await {
+                    let mut buf = [0u8; 64];
+                    if let Ok(n) = tls.read(&mut buf).await
+                        && n > 0
+                    {
+                        let _ = tls.write_all(&buf[..n]).await;
+                        let _ = tls.flush().await;
+                    }
+                    let _ = tls.shutdown().await;
+                }
+            });
+        }
+    })
+}
+
+/// Round-trip one message through the TCP+TLS stream proxy. Returns the echo
+/// bytes (empty when the proxy closed the relay, e.g. backend TLS handshake
+/// failure).
+async fn relay_round_trip(proxy_port: u16) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .expect("connect to stream proxy frontend");
+    // Tolerate write errors: when the backend TLS handshake fails the proxy
+    // may have already closed the relay (broken pipe), which is exactly the
+    // failure mode the empty-echo assertion captures.
+    let _ = client.write_all(b"ping").await;
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.read_to_end(&mut buf),
+    )
+    .await;
+    buf
+}
+
+/// Regression test: an UPSTREAM-only TLS change must trigger stream listener
+/// reconcile through `apply_incremental`.
+///
+/// A TCP+TLS stream proxy takes its backend trust (CA / client cert / verify)
+/// from its referenced upstream via `resolved_tls`, and an upstream-only
+/// update never marks the proxy itself modified (delta diffing is
+/// `updated_at`-based). Without the upstream-change trigger, the listener's
+/// cached backend `ClientConfig` keeps trusting the OLD CA forever.
+///
+/// Proof is end-to-end observable: the backend echo server presents a cert
+/// signed by CA-B; the upstream initially trusts CA-A (relay dies at the
+/// backend handshake), then an upstream-only delta switches trust to CA-B and
+/// the relay must start echoing — which only happens if `apply_incremental`
+/// reconciled and the restarted listener rebuilt its cached config.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_incremental_upstream_only_tls_change_reconciles_stream_listeners() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_a_pem, _, _) = generate_ca_and_leaf("Upstream CA A", &["127.0.0.1"]);
+    let (ca_b_pem, leaf_cert_pem, leaf_key_pem) =
+        generate_ca_and_leaf("Upstream CA B", &["127.0.0.1", "localhost"]);
+    let ca_a_path = dir.path().join("ca-a.pem");
+    let ca_b_path = dir.path().join("ca-b.pem");
+    std::fs::write(&ca_a_path, &ca_a_pem).expect("write ca a");
+    std::fs::write(&ca_b_path, &ca_b_pem).expect("write ca b");
+
+    // Backend: TLS echo server with a CA-B-signed cert.
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend echo listener");
+    let backend_port = backend_listener
+        .local_addr()
+        .expect("backend local addr")
+        .port();
+    let _echo = spawn_tls_echo_server(backend_listener, &leaf_cert_pem, &leaf_key_pem);
+
+    // Frontend: ephemeral port for the stream proxy.
+    let front = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("probe frontend port");
+    let proxy_port = front.local_addr().expect("frontend local addr").port();
+    drop(front);
+
+    let mut upstream = test_upstream("u-tls", "127.0.0.1", backend_port);
+    upstream.backend_tls_verify_server_cert = true;
+    upstream.backend_tls_server_ca_cert_path =
+        Some(ca_a_path.to_str().expect("utf-8 temp path").to_string());
+
+    let mut proxy = test_proxy("p-tcp-tls", "/unused");
+    proxy.listen_path = None;
+    proxy.listen_port = Some(proxy_port);
+    proxy.backend_scheme = Some(BackendScheme::Tcps);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcps);
+    proxy.upstream_id = Some("u-tls".to_string());
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        upstreams: vec![upstream.clone()],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+    let state = proxy_state_with_config(config);
+
+    state
+        .initial_reconcile_stream_listeners()
+        .await
+        .expect("initial stream listener reconcile");
+    state
+        .stream_listener_manager
+        .wait_until_started(std::time::Duration::from_secs(5))
+        .await
+        .expect("stream listener should bind");
+
+    // With trust pinned to CA-A, the backend handshake (CA-B cert) fails and
+    // the relay closes without echoing.
+    let echoed = relay_round_trip(proxy_port).await;
+    assert!(
+        echoed.is_empty(),
+        "relay should fail while the upstream trusts the wrong CA, got {:?}",
+        echoed
+    );
+
+    // UPSTREAM-only delta: rotate trust to CA-B. The proxy row is untouched.
+    let mut rotated_upstream = upstream;
+    rotated_upstream.backend_tls_server_ca_cert_path =
+        Some(ca_b_path.to_str().expect("utf-8 temp path").to_string());
+    rotated_upstream.updated_at = Utc::now();
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![rotated_upstream],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    let outcome = state.apply_incremental(delta).await;
+    assert_eq!(outcome, IncrementalApplyOutcome::Applied);
+
+    state
+        .stream_listener_manager
+        .wait_until_started(std::time::Duration::from_secs(5))
+        .await
+        .expect("restarted stream listener should bind");
+
+    let echoed = relay_round_trip(proxy_port).await;
+    assert_eq!(
+        echoed, b"ping",
+        "upstream-only TLS change must reconcile the stream listener so the \
+         restarted listener's cached backend TLS config trusts the new CA"
+    );
+
+    state.stream_listener_manager.shutdown_all().await;
+}

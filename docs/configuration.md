@@ -216,7 +216,8 @@ With the xDS ADS protocol, invalid resource updates are NACKed and the last acce
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source. `native` uses Ferrum `MeshSubscribe`; `xds` uses the mesh ADS client against a Ferrum or compatible xDS control plane |
+| `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source. `native` uses Ferrum `MeshSubscribe`; `xds` uses the mesh ADS client against a Ferrum or compatible xDS control plane; `file` builds the mesh slice locally from `FERRUM_MESH_FILE_CONFIG_PATH` with no control plane (`FERRUM_DP_CP_GRPC_URLS` / `FERRUM_CP_DP_GRPC_JWT_SECRET` not required) |
+| `FERRUM_MESH_FILE_CONFIG_PATH` | `file` protocol only | — | Path to the localized mesh config document (YAML/JSON, optional `version` plus the `mesh` section only). Fail-closed at startup; reloaded on SIGHUP (Unix), keeping the last good slice when a reload fails |
 | `FERRUM_MESH_XDS_NODE_CLUSTER` | No | `FERRUM_NAMESPACE` | xDS `Node.cluster` identity sent by mesh-mode ADS clients |
 | `FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS` | No | `10` | Mesh xDS client connect timeout. `0` disables the explicit tonic connect timeout |
 | `FERRUM_MESH_NODE_ID` | No | `$HOSTNAME` or `ferrum-mesh-node` | Stable mesh data-plane node ID used for xDS/MeshSubscribe |
@@ -226,6 +227,8 @@ With the xDS ADS protocol, invalid resource updates are NACKed and the last acce
 | `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` | No | `127.0.0.1:15001` | Mesh outbound capture listener address for plaintext-in to mTLS-out or HBONE encapsulation. In NodeWaypoint topology its **port** also sets the node-agent's eBPF `connect4` rewrite target and the per-pod in-netns listener port, so co-deployed node-agent + proxy must set it consistently (port `0` disables outbound capture) |
 | `FERRUM_MESH_HBONE_LISTEN_ADDR` | No | `0.0.0.0:15008` | Ambient HBONE termination listener address (Istio-flavored HBONE over mTLS) |
 | `FERRUM_MESH_EAST_WEST_LISTEN_PORT` | No | `15443` | Shared TCP passthrough listener port for `east_west_gateway` topology; routes by TLS SNI using `mesh.multi_cluster.east_west_gateways` |
+| `FERRUM_MESH_EGRESS_HBONE_PORT` | No | `15008` | Port dialed on **destination** workloads for Ambient egress HBONE (materialized outbound routes). Set when the mesh's HBONE listeners are not on Istio's conventional `15008`; stamped onto egress targets as the `mesh.hbone_port` tag when non-default |
+| `FERRUM_MESH_EGRESS_MTLS_PORT` | No | `15006` | Port dialed on **destination** sidecars for Sidecar egress SVID-mTLS (materialized outbound routes). Set when the mesh's sidecar inbound listeners are not on Istio's conventional `15006`; stamped onto egress targets as the `mesh.mtls_port` tag when non-default |
 | `FERRUM_MESH_EGRESS_LISTEN_ADDR` | No | `0.0.0.0:15090` | Egress gateway mTLS listener address for `egress_gateway` topology. Requires `FERRUM_FRONTEND_TLS_CERT_PATH`, `FERRUM_FRONTEND_TLS_KEY_PATH`, and `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` |
 | `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | No | — | Optional workload SPIFFE ID hint sent to native MeshSubscribe |
 | `FERRUM_MESH_WORKLOAD_LABELS` | No | — | Workload labels for this mesh data plane (`k1=v1,k2=v2`). Drives `mesh_authz` `PolicyScope` filtering and `PeerAuthentication` selector filtering. For authorization, only policies whose scope (`MeshWide`, `Namespace`, or `WorkloadSelector`) matches these labels apply to this proxy. Set explicitly for current Kubernetes and non-K8s deployments; the injector can later populate this from pod labels via the downward API |
@@ -407,6 +410,7 @@ Injected sidecars run as the configured mesh proxy UID with `runAsNonRoot=true`,
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | No | `16777216` | Maximum WebSocket frame size in bytes; max message size = 4x frame size |
 | `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | No | `131072` | WebSocket write buffer size (128 KB). Increase for large WS frames (1 MB+). Only applies when frame-level plugins are active |
 | `FERRUM_WEBSOCKET_TUNNEL_MODE` | No | `false` | When true and no frame-level plugins are configured, bypass WebSocket frame parsing and use raw TCP bidirectional copy. Significantly improves throughput for large payloads (9 MB: 25→110 RPS). Trade-off: `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` is not enforced (no DoS risk — data streams through fixed-size copy buffer) |
+| `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` | No | `0` | Connection-wide WebSocket idle timeout in seconds for frame-parsed and tunnel-mode sessions. The session closes only when neither direction produces traffic within the window; activity from either side keeps it open. Tracked at the transport byte level in both modes, so a partially received large/fragmented message counts as activity while its bytes are still arriving. `0` disables |
 | `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | No | `10` | HTTP/1.1 header read timeout; `0` disables |
 
 See [size_limits.md](size_limits.md) for detailed sizing guidance.
