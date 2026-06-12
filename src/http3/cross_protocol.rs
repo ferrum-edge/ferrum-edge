@@ -180,6 +180,9 @@ where
     pub flavor: HttpFlavor,
     pub prebuffered_body: Option<Vec<u8>>,
     pub client_ip: &'a str,
+    /// Immediate QUIC peer address — appended to X-Forwarded-For so the H3
+    /// bridge matches the H1/H2 peer-append semantics (`build_xff_value`).
+    pub xff_append_ip: &'a str,
     pub ctx: &'a mut RequestContext,
     pub plugins: &'a [Arc<dyn Plugin>],
     pub backend_admission_plugins: &'a [Arc<dyn Plugin>],
@@ -432,6 +435,7 @@ where
         flavor,
         prebuffered_body,
         client_ip,
+        xff_append_ip,
         ctx,
         plugins,
         backend_admission_plugins,
@@ -503,6 +507,7 @@ where
                 prebuffered_body,
                 raw_prebuffered_body_bytes,
                 client_ip,
+                xff_append_ip,
                 backend_start,
                 ctx,
                 plugins,
@@ -531,6 +536,7 @@ where
                 prebuffered_body,
                 raw_prebuffered_body_bytes,
                 client_ip,
+                xff_append_ip,
                 backend_start,
                 ctx,
                 plugins,
@@ -579,6 +585,7 @@ fn build_plain_request_builder(
     backend_url: &str,
     effective_host: &str,
     client_ip: &str,
+    xff_append_ip: &str,
     is_early_data: bool,
 ) -> reqwest::RequestBuilder {
     let mut req_builder = client.request(req_method, backend_url);
@@ -619,7 +626,7 @@ fn build_plain_request_builder(
         }
     }
 
-    let xff_val = crate::proxy::build_xff_value(original_xff, client_ip);
+    let xff_val = crate::proxy::build_xff_value(original_xff, client_ip, xff_append_ip);
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", "https");
     if let Some(host) = original_host_header {
@@ -727,6 +734,7 @@ async fn dispatch_plain<S>(
     prebuffered_body: Option<Vec<u8>>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
+    xff_append_ip: &str,
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
@@ -889,6 +897,7 @@ where
                         &current_url,
                         effective_host,
                         client_ip,
+                        xff_append_ip,
                         ctx.is_early_data,
                     )
                     .body(buffered_body.clone())
@@ -1151,6 +1160,7 @@ where
                     &current_url,
                     effective_host,
                     client_ip,
+                    xff_append_ip,
                     ctx.is_early_data,
                 );
 
@@ -1844,6 +1854,7 @@ async fn dispatch_grpc<S>(
     prebuffered_body: Option<Vec<u8>>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
+    xff_append_ip: &str,
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
@@ -1955,7 +1966,7 @@ where
             hmap.append(name, val);
         }
     }
-    let xff_val = crate::proxy::build_xff_value(original_xff, client_ip);
+    let xff_val = crate::proxy::build_xff_value(original_xff, client_ip, xff_append_ip);
     if let Ok(val) = HeaderValue::from_str(&xff_val) {
         hmap.insert("x-forwarded-for", val);
     }
@@ -4389,6 +4400,7 @@ mod tests {
             "https://backend.example/path",
             "backend.example",
             "203.0.113.1",
+            "203.0.113.1",
             /* is_early_data = */ true,
         );
 
@@ -4423,6 +4435,7 @@ mod tests {
             "https://backend.example/path",
             "backend.example",
             "203.0.113.1",
+            "203.0.113.1",
             /* is_early_data = */ false,
         );
 
@@ -4454,6 +4467,7 @@ mod tests {
             &headers,
             "https://backend.example/path",
             "backend.example",
+            "203.0.113.1",
             "203.0.113.1",
             /* is_early_data = */ true,
         );
@@ -4493,6 +4507,7 @@ mod tests {
             "https://backend.example/path",
             "backend.example",
             "203.0.113.1",
+            "203.0.113.1",
             /* is_early_data = */ false,
         );
 
@@ -4502,6 +4517,84 @@ mod tests {
             0,
             "client-supplied Early-Data must be stripped, and no value \
              injected when is_early_data == false"
+        );
+    }
+
+    /// H1/H2/H3 XFF parity on the cross-protocol bridge: append the
+    /// immediate QUIC peer to an existing inbound chain, and seed a
+    /// generated chain with the resolved client when it differs from the
+    /// peer (real-IP-header deployments). See `proxy::build_xff_value`.
+    #[tokio::test]
+    async fn build_plain_request_builder_xff_appends_peer_and_seeds_resolved_client() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+
+        // Trusted LB sent XFF: append the peer, never the resolved client.
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("x-forwarded-for".to_string(), "198.51.100.7".to_string());
+        let req = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "198.51.100.7", // resolved client (already in the chain)
+            "10.0.0.7",     // immediate QUIC peer (the LB)
+            false,
+        )
+        .build()
+        .expect("request should build");
+        assert_eq!(
+            header_value(&req, "x-forwarded-for"),
+            Some(&b"198.51.100.7, 10.0.0.7"[..]),
+            "inbound chain + appended QUIC peer; resolved client must not duplicate"
+        );
+
+        // Trusted LB sent only a real-IP header (no XFF): seed with the
+        // resolved client, then the peer.
+        let headers: HashMap<String, String> = HashMap::new();
+        let req = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.9", // resolved from FERRUM_REAL_IP_HEADER
+            "10.0.0.7",    // immediate QUIC peer (the LB)
+            false,
+        )
+        .build()
+        .expect("request should build");
+        assert_eq!(
+            header_value(&req, "x-forwarded-for"),
+            Some(&b"203.0.113.9, 10.0.0.7"[..]),
+            "generated chain must carry the resolved real client before the peer"
+        );
+
+        // Direct client (no proxy in front): client == peer, single entry.
+        let req = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            "203.0.113.1",
+            false,
+        )
+        .build()
+        .expect("request should build");
+        assert_eq!(
+            header_value(&req, "x-forwarded-for"),
+            Some(&b"203.0.113.1"[..]),
+            "direct connections must not duplicate the peer"
         );
     }
 }

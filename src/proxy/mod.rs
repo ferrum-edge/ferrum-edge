@@ -1442,18 +1442,51 @@ fn parse_hyper_method(method: &str) -> Result<hyper::Method, ()> {
     }
 }
 
-/// Build X-Forwarded-For header value by appending the immediate peer IP to the existing value.
-/// Uses pre-allocated buffer instead of `format!()` to avoid format machinery overhead.
-pub(crate) fn build_xff_value(existing_xff: Option<&str>, append_ip: &str) -> String {
+/// Build the outbound X-Forwarded-For header value.
+///
+/// Standard `proxy_add_x_forwarded_for` semantics: append the immediate
+/// socket peer (`peer_ip`) to the inbound chain. When there is no inbound
+/// chain but trusted-proxy resolution produced a real client IP that differs
+/// from the peer (e.g. `FERRUM_REAL_IP_HEADER` from a trusted LB that does
+/// not send XFF), seed the generated chain with the resolved client so the
+/// real client is not lost.
+///
+/// Truth table (identical across H1/H2/H3 frontends):
+///
+/// | Deployment shape                   | inbound XFF | client vs peer | outbound XFF          |
+/// |------------------------------------|-------------|----------------|-----------------------|
+/// | no proxy in front                  | none        | equal          | `peer`                |
+/// | trusted LB sending XFF             | `…, client` | differ         | `…, client, peer`     |
+/// | trusted LB sending real-IP header  | none        | differ         | `client, peer`        |
+/// | untrusted peer (spoofed headers)   | none        | equal          | `peer`                |
+///
+/// When inbound XFF exists the resolved client is already in the chain, so
+/// only the peer is appended — never the resolved client (which would
+/// duplicate it; see issue #1571).
+///
+/// Uses pre-allocated buffers instead of `format!()` to avoid format
+/// machinery overhead.
+pub(crate) fn build_xff_value(
+    existing_xff: Option<&str>,
+    client_ip: &str,
+    peer_ip: &str,
+) -> String {
     match existing_xff {
         Some(xff) => {
-            let mut val = String::with_capacity(xff.len() + 2 + append_ip.len());
+            let mut val = String::with_capacity(xff.len() + 2 + peer_ip.len());
             val.push_str(xff);
             val.push_str(", ");
-            val.push_str(append_ip);
+            val.push_str(peer_ip);
             val
         }
-        None => append_ip.to_string(),
+        None if client_ip != peer_ip => {
+            let mut val = String::with_capacity(client_ip.len() + 2 + peer_ip.len());
+            val.push_str(client_ip);
+            val.push_str(", ");
+            val.push_str(peer_ip);
+            val
+        }
+        None => peer_ip.to_string(),
     }
 }
 
@@ -13583,6 +13616,7 @@ pub(crate) async fn proxy_to_backend_retry(
     // Add proxy-managed forwarding metadata.
     let xff_val = build_xff_value(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
         xff_append_ip,
     );
     let proto_str = if is_tls { "https" } else { "http" };
@@ -14473,6 +14507,7 @@ async fn proxy_to_backend(
     // Add proxy-managed forwarding metadata.
     let xff_val = build_xff_value(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
         xff_append_ip,
     );
     let proto_str = if is_tls { "https" } else { "http" };
@@ -15954,6 +15989,7 @@ async fn proxy_to_backend_hbone(
 
     let xff_val = build_xff_value(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
         xff_append_ip,
     );
     if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
@@ -16422,6 +16458,7 @@ async fn proxy_to_backend_mesh_mtls(
 
     let xff_val = build_xff_value(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
         xff_append_ip,
     );
     if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
@@ -16724,6 +16761,7 @@ async fn proxy_to_backend_http2(
     // Add proxy-managed forwarding metadata.
     let xff_val = build_xff_value(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
         xff_append_ip,
     );
     if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
@@ -16926,6 +16964,7 @@ fn build_http3_backend_headers(
 
     let xff = build_xff_value(
         headers.get("x-forwarded-for").map(String::as_str),
+        ctx.client_ip,
         ctx.xff_append_ip,
     );
     if let Ok(v) = xff.parse() {
@@ -17668,6 +17707,61 @@ fn should_stream_h3_retry_response(stream_response: bool, attempt: u32, max_retr
     stream_response && attempt >= max_retries
 }
 
+/// Build the 502 returned when an H3 backend response body exceeds
+/// `max_response_body_size_bytes`. `connection_error` stays `false` (the
+/// request demonstrably reached the backend) and the
+/// `ResponseBodyTooLarge` class is excluded from
+/// `is_h3_transport_error_class`, so this never downgrades the cached H3
+/// capability.
+fn h3_response_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = size,
+            max_response_body_size_bytes = max_size,
+            "HTTP/3 backend response body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_response_body_size_bytes = max_size,
+            "HTTP/3 backend response body exceeded configured size limit while streaming"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+    }
+}
+
+/// Fast-path size check on the declared `Content-Length` of a backend
+/// response, mirroring the reqwest retry path's pre-stream reject. Returns
+/// the declared length when it exceeds a nonzero limit.
+fn declared_response_length_exceeds_limit(
+    headers: &HashMap<String, String>,
+    max_response_body_size_bytes: usize,
+) -> Option<usize> {
+    if max_response_body_size_bytes == 0 {
+        return None;
+    }
+    let len = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())?;
+    (len > max_response_body_size_bytes).then_some(len)
+}
+
 /// Replay a saved HTTP/3 request to an explicit target (used during retries).
 ///
 /// Accepts pre-collected body bytes, method, URI, and headers so the original
@@ -17764,6 +17858,23 @@ async fn proxy_to_backend_http3_retry(
 
         return match h3_result {
             Ok(mut response) => {
+                // Fast path: reject before streaming when the declared
+                // Content-Length exceeds the configured response size limit —
+                // mirrors the reqwest retry path's pre-stream reject. Without
+                // this the final streaming retry attempt would forward an
+                // oversized declared body unguarded (the downstream H3 body
+                // builder only size-limits when Content-Length is absent).
+                if let Some(len) = declared_response_length_exceeds_limit(
+                    &response.headers,
+                    state.max_response_body_size_bytes,
+                ) {
+                    return h3_response_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        Some(len),
+                        state.max_response_body_size_bytes,
+                    );
+                }
                 debug!(
                     proxy_id = %proxy.id,
                     status = response.status,
@@ -18806,7 +18917,13 @@ mod tests {
         );
 
         assert_eq!(header_value(&out, "x-forwarded-proto"), Some("https"));
-        assert_eq!(header_value(&out, "x-forwarded-for"), Some("10.0.0.7"));
+        // No inbound XFF and resolved client != peer (real-IP-header
+        // deployment): the generated chain seeds the resolved client
+        // before the immediate peer.
+        assert_eq!(
+            header_value(&out, "x-forwarded-for"),
+            Some("203.0.113.9, 10.0.0.7")
+        );
         assert_eq!(header_value(&out, "via"), Some("2.0 ferrum-edge"));
         assert_eq!(
             header_value(&out, "forwarded"),
@@ -20171,6 +20288,87 @@ mod tests {
             super::should_stream_h3_retry_response(true, 2, 2),
             "the final H3 retry must preserve the original streaming response decision"
         );
+    }
+
+    /// Guards the declared-Content-Length fast-path reject used by the final
+    /// streaming H3 retry attempt: only a nonzero limit with a parseable
+    /// over-limit Content-Length triggers the pre-stream 502.
+    #[test]
+    fn declared_response_length_exceeds_limit_only_when_header_is_over_cap() {
+        let mut headers = HashMap::new();
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+
+        headers.insert("content-length".to_string(), "11".to_string());
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 0), None);
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 11), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit(&headers, 10),
+            Some(11)
+        );
+
+        headers.insert("content-length".to_string(), "not-a-number".to_string());
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+    }
+
+    /// The 502 built for an over-limit H3 response must not replay (no
+    /// retry: `ResponseBodyTooLarge` is in `should_retry`'s deny-list and
+    /// `connection_error` is false) and must not downgrade the cached H3
+    /// capability (`ResponseBodyTooLarge` is excluded from
+    /// `is_h3_transport_error_class`).
+    #[test]
+    fn h3_response_body_too_large_response_is_non_retryable_and_not_a_transport_failure() {
+        let proxy = test_proxy(ResponseBodyMode::Stream);
+        let resp = h3_response_body_too_large_response(&proxy, None, Some(11), 10);
+        assert_eq!(resp.status_code, 502);
+        assert!(!resp.connection_error);
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::ResponseBodyTooLarge)
+        );
+        assert!(
+            !super::is_h3_transport_failure(&resp),
+            "a size-limit reject must never mark the backend H3-unsupported"
+        );
+    }
+
+    /// XFF truth table — identical across H1/H2/H3 frontends (issue #1571):
+    ///
+    /// | shape                              | inbound XFF | client vs peer | outbound XFF       |
+    /// |------------------------------------|-------------|----------------|--------------------|
+    /// | no proxy in front                  | none        | equal          | peer               |
+    /// | trusted LB sending XFF             | chain       | differ         | chain, peer        |
+    /// | trusted LB sending real-IP header  | none        | differ         | client, peer       |
+    /// | untrusted peer                     | none        | equal          | peer               |
+    #[test]
+    fn build_xff_value_appends_peer_and_seeds_resolved_client() {
+        // No proxy in front: client == peer, no inbound chain.
+        assert_eq!(
+            build_xff_value(None, "203.0.113.1", "203.0.113.1"),
+            "203.0.113.1"
+        );
+
+        // Trusted LB sending XFF: resolved client is already in the chain —
+        // append only the immediate peer (never duplicate the client).
+        assert_eq!(
+            build_xff_value(Some("198.51.100.7"), "198.51.100.7", "10.0.0.7"),
+            "198.51.100.7, 10.0.0.7"
+        );
+        assert_eq!(
+            build_xff_value(Some("198.51.100.7, 172.16.0.3"), "198.51.100.7", "10.0.0.7"),
+            "198.51.100.7, 172.16.0.3, 10.0.0.7"
+        );
+
+        // Trusted LB sending only a real-IP header: no inbound chain but the
+        // resolved client differs from the peer — seed with the client so
+        // the real client is not lost.
+        assert_eq!(
+            build_xff_value(None, "203.0.113.9", "10.0.0.7"),
+            "203.0.113.9, 10.0.0.7"
+        );
+
+        // Untrusted peer (spoofed real-IP header ignored): resolution kept
+        // client == peer, so the seed must not duplicate.
+        assert_eq!(build_xff_value(None, "192.0.2.6", "192.0.2.6"), "192.0.2.6");
     }
 
     /// Regression guard: the gRPC request-body-hook branch must always

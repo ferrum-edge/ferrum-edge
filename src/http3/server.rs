@@ -32,7 +32,7 @@ use crate::plugins::{
 };
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
-    parse_connection_listed_from_str_map,
+    is_proxy_generated_forwarding_header, parse_connection_listed_from_str_map,
 };
 use crate::proxy::{
     ProxyState, apply_after_proxy_hooks_to_rejection, apply_plugin_rejection_response,
@@ -2043,6 +2043,7 @@ async fn handle_h3_request(
                 flavor: http_flavor,
                 prebuffered_body: prebuffered,
                 client_ip: &client_ip_owned,
+                xff_append_ip: socket_ip,
                 ctx: &mut ctx,
                 plugins: &plugins,
                 backend_admission_plugins: backend_admission_plugins.as_ref(),
@@ -2149,6 +2150,7 @@ async fn handle_h3_request(
             upstream_target.as_deref(),
             &proxy_headers,
             &client_ip_owned,
+            socket_ip,
             &state,
             ctx.is_early_data,
         );
@@ -3054,6 +3056,7 @@ async fn handle_h3_request(
             &proxy_headers,
             std::mem::take(&mut body_data),
             &client_ip_for_refined,
+            socket_ip,
             upstream_target.as_deref(),
             &epoch,
             sticky_cookie_needed,
@@ -3099,6 +3102,7 @@ async fn handle_h3_request(
                 &proxy_headers,
                 body_data,
                 &client_ip_owned,
+                socket_ip,
                 upstream_target.as_deref(),
                 &epoch,
                 sticky_cookie_needed,
@@ -3304,6 +3308,7 @@ async fn handle_h3_request(
                 &proxy_headers,
                 &body_data,
                 &ctx.client_ip,
+                socket_ip,
                 current_target.as_deref(),
                 ctx.is_early_data,
             )
@@ -3420,6 +3425,7 @@ async fn handle_h3_request(
                     &proxy_headers,
                     &body_data,
                     &ctx.client_ip,
+                    socket_ip,
                     current_target.as_deref(),
                     ctx.is_early_data,
                 )
@@ -3445,6 +3451,7 @@ async fn handle_h3_request(
                 &proxy_headers,
                 &body_data,
                 &ctx.client_ip,
+                socket_ip,
                 upstream_target.as_deref(),
                 ctx.is_early_data,
             )
@@ -3870,6 +3877,7 @@ fn build_h3_backend_headers(
     upstream_target: Option<&UpstreamTarget>,
     headers: &HashMap<String, String>,
     client_ip: &str,
+    xff_append_ip: &str,
     state: &ProxyState,
     is_early_data: bool,
 ) -> Vec<(http::header::HeaderName, http::header::HeaderValue)> {
@@ -3894,6 +3902,10 @@ fn build_h3_backend_headers(
             }
             // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
             n if is_backend_request_strip_header(n) => continue,
+            // Ferrum regenerates X-Forwarded-* below; copying the inbound
+            // value too would duplicate the header (the H1/H2 reqwest paths
+            // and the H3 cross-protocol bridge apply the same skip).
+            n if is_proxy_generated_forwarding_header(n) => continue,
             // RFC 9110 §7.6.1 Connection-listed strip — see
             // `parse_connection_listed_from_str_map`.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
@@ -3932,12 +3944,13 @@ fn build_h3_backend_headers(
         ));
     }
 
-    // X-Forwarded-For
-    let xff = if let Some(existing) = headers.get("x-forwarded-for") {
-        format!("{}, {}", existing, client_ip)
-    } else {
-        client_ip.to_string()
-    };
+    // X-Forwarded-For — same append-the-immediate-peer (+ resolved-client
+    // seeding) semantics as the H1/H2 paths; see `proxy::build_xff_value`.
+    let xff = crate::proxy::build_xff_value(
+        headers.get("x-forwarded-for").map(String::as_str),
+        client_ip,
+        xff_append_ip,
+    );
     if let Ok(val) = http::header::HeaderValue::from_str(&xff) {
         h3_headers.push((
             http::header::HeaderName::from_static("x-forwarded-for"),
@@ -4197,6 +4210,7 @@ async fn proxy_to_backend_h3_refined_response(
     headers: &HashMap<String, String>,
     body_bytes: Vec<u8>,
     client_ip: &str,
+    xff_append_ip: &str,
     upstream_target: Option<&UpstreamTarget>,
     epoch: &crate::request_epoch::RequestEpoch,
     sticky_cookie_needed: bool,
@@ -4212,6 +4226,7 @@ async fn proxy_to_backend_h3_refined_response(
         upstream_target,
         headers,
         client_ip,
+        xff_append_ip,
         state,
         is_early_data,
     );
@@ -4679,6 +4694,7 @@ async fn proxy_to_backend_h3_streaming(
     headers: &HashMap<String, String>,
     body_bytes: Vec<u8>,
     client_ip: &str,
+    xff_append_ip: &str,
     upstream_target: Option<&UpstreamTarget>,
     epoch: &crate::request_epoch::RequestEpoch,
     sticky_cookie_needed: bool,
@@ -4693,6 +4709,7 @@ async fn proxy_to_backend_h3_streaming(
         upstream_target,
         headers,
         client_ip,
+        xff_append_ip,
         state,
         ctx.is_early_data,
     );
@@ -5107,6 +5124,7 @@ async fn proxy_to_backend_h3(
     headers: &HashMap<String, String>,
     body_bytes: &[u8],
     client_ip: &str,
+    xff_append_ip: &str,
     upstream_target: Option<&UpstreamTarget>,
     is_early_data: bool,
 ) -> H3BufferedDispatchResult {
@@ -5115,6 +5133,7 @@ async fn proxy_to_backend_h3(
         upstream_target,
         headers,
         client_ip,
+        xff_append_ip,
         state,
         is_early_data,
     );
@@ -6364,6 +6383,7 @@ mod build_h3_backend_headers_tests {
             None,
             &headers,
             "203.0.113.1",
+            "203.0.113.1",
             &state,
             /* is_early_data = */ true,
         );
@@ -6391,6 +6411,7 @@ mod build_h3_backend_headers_tests {
             None,
             &headers,
             "203.0.113.1",
+            "203.0.113.1",
             &state,
             /* is_early_data = */ false,
         );
@@ -6415,6 +6436,7 @@ mod build_h3_backend_headers_tests {
             &proxy,
             None,
             &headers,
+            "203.0.113.1",
             "203.0.113.1",
             &state,
             /* is_early_data = */ true,
@@ -6451,6 +6473,7 @@ mod build_h3_backend_headers_tests {
             None,
             &headers,
             "203.0.113.1",
+            "203.0.113.1",
             &state,
             /* is_early_data = */ false,
         );
@@ -6458,6 +6481,69 @@ mod build_h3_backend_headers_tests {
         assert!(
             !header_present(&out, "early-data"),
             "client-supplied Early-Data must be stripped, and no value injected when is_early_data == false"
+        );
+    }
+
+    /// H1/H2/H3 XFF parity: the native H3 backend path must append the
+    /// immediate QUIC peer to an existing inbound chain (not the resolved
+    /// client, which is already in the chain) and seed a generated chain
+    /// with the resolved client when it differs from the peer
+    /// (real-IP-header deployments). See `proxy::build_xff_value`.
+    #[tokio::test]
+    async fn xff_appends_quic_peer_and_seeds_resolved_client() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+
+        // Trusted LB sent XFF: append the peer, never the resolved client.
+        let mut headers = HashMap::new();
+        headers.insert("x-forwarded-for".to_string(), "198.51.100.7".to_string());
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "198.51.100.7", // resolved client (already in the chain)
+            "10.0.0.7",     // immediate QUIC peer (the LB)
+            &state,
+            false,
+        );
+        assert_eq!(
+            header_value(&out, "x-forwarded-for").map(|v| v.as_bytes()),
+            Some(&b"198.51.100.7, 10.0.0.7"[..]),
+            "inbound chain + appended QUIC peer; resolved client must not duplicate"
+        );
+
+        // Trusted LB sent only a real-IP header (no XFF): seed with the
+        // resolved client, then the peer.
+        let headers = HashMap::new();
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.9", // resolved from FERRUM_REAL_IP_HEADER
+            "10.0.0.7",    // immediate QUIC peer (the LB)
+            &state,
+            false,
+        );
+        assert_eq!(
+            header_value(&out, "x-forwarded-for").map(|v| v.as_bytes()),
+            Some(&b"203.0.113.9, 10.0.0.7"[..]),
+            "generated chain must carry the resolved real client before the peer"
+        );
+
+        // Direct client (no proxy in front): client == peer, single entry.
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &state,
+            false,
+        );
+        assert_eq!(
+            header_value(&out, "x-forwarded-for").map(|v| v.as_bytes()),
+            Some(&b"203.0.113.1"[..]),
+            "direct connections must not duplicate the peer"
         );
     }
 }
