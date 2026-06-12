@@ -3028,6 +3028,10 @@ impl ProxyState {
         };
         pools.clear_tls_config_caches();
         pools.force_drain_all();
+        // UDP/DTLS listeners keep listener-local backend DTLS config caches
+        // keyed by paths/options; bump the shared epoch so new sessions
+        // rebuild from the rotated bytes instead of serving stale params.
+        self.stream_listener_manager.bump_backend_tls_reload_epoch();
 
         let config = self.config.load_full();
         self.health_checker
@@ -3035,7 +3039,7 @@ impl ProxyState {
 
         info!(
             validated_backend_tls_configs = validated,
-            "Backend TLS material reloaded; backend client pools were drained"
+            "Backend TLS material reloaded; backend client pools and DTLS config caches were drained"
         );
         Ok(())
     }
@@ -3314,11 +3318,12 @@ impl ProxyState {
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
-        let hbone_pool = Arc::new(HboneConnectionPool::new(
+        let hbone_pool = Arc::new(HboneConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
             dns_cache.clone(),
             gateway_svid_bundle.clone(),
             pool_shard_amount,
+            backend_svid_generation.clone(),
         ));
         let mesh_mtls_pool = Arc::new(mesh_mtls_pool::MeshMtlsConnectionPool::new(
             global_pool_config.clone(),

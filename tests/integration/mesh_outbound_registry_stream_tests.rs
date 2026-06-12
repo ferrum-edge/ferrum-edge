@@ -570,6 +570,7 @@ async fn try_spawn_udp_listener(
         cleanup_interval_seconds: 10,
         circuit_breaker_cache,
         crls: Arc::new(Vec::new()),
+        backend_tls_reload_epoch: Arc::new(AtomicU64::new(0)),
         started: listener_started,
         sni_proxy_ids: None,
         adaptive_buffer,
