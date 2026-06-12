@@ -686,7 +686,12 @@ fn build_plain_request_builder(
         }
     }
 
-    let xff_val = crate::proxy::build_xff_value(original_xff, client_ip, xff_append_ip);
+    let xff_val = crate::proxy::build_xff_value(
+        original_xff,
+        client_ip,
+        xff_append_ip,
+        &state.trusted_proxies,
+    );
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", "https");
     if let Some(host) = original_host_header {
@@ -2073,7 +2078,12 @@ where
             hmap.append(name, val);
         }
     }
-    let xff_val = crate::proxy::build_xff_value(original_xff, client_ip, xff_append_ip);
+    let xff_val = crate::proxy::build_xff_value(
+        original_xff,
+        client_ip,
+        xff_append_ip,
+        &state.trusted_proxies,
+    );
     if let Ok(val) = HeaderValue::from_str(&xff_val) {
         hmap.insert("x-forwarded-for", val);
     }

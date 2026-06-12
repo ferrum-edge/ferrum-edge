@@ -1458,6 +1458,14 @@ fn parse_hyper_method(method: &str) -> Result<hyper::Method, ()> {
 /// not send XFF), seed the generated chain with the resolved client so the
 /// real client is not lost.
 ///
+/// Trust gate: when `FERRUM_TRUSTED_PROXIES` is configured and the immediate
+/// peer is NOT in it, the inbound XFF is attacker-controlled and is dropped —
+/// the same rule `client_ip::resolve_client_ip` applies when resolving
+/// `ctx.client_ip`. Forwarding it (`spoofed, peer`) would hand backends an
+/// attacker-seeded chain the gateway itself refused to trust. With no
+/// trusted-proxy policy configured, the inbound chain passes through
+/// untouched (transparent nginx-style behavior).
+///
 /// Truth table (identical across H1/H2/H3 frontends):
 ///
 /// | Deployment shape                   | inbound XFF | client vs peer | outbound XFF          |
@@ -1465,7 +1473,7 @@ fn parse_hyper_method(method: &str) -> Result<hyper::Method, ()> {
 /// | no proxy in front                  | none        | equal          | `peer`                |
 /// | trusted LB sending XFF             | `…, client` | differ         | `…, client, peer`     |
 /// | trusted LB sending real-IP header  | none        | differ         | `client, peer`        |
-/// | untrusted peer (spoofed headers)   | none        | equal          | `peer`                |
+/// | untrusted peer (spoofed XFF)       | dropped     | equal          | `peer`                |
 ///
 /// When inbound XFF exists the resolved client is already in the chain, so
 /// only the peer is appended — never the resolved client (which would
@@ -1477,7 +1485,18 @@ pub(crate) fn build_xff_value(
     existing_xff: Option<&str>,
     client_ip: &str,
     peer_ip: &str,
+    trusted_proxies: &client_ip::TrustedProxies,
 ) -> String {
+    // Drop attacker-controlled inbound XFF: a trust policy exists and the
+    // immediate peer is not part of it. The peer-IP parse only runs when an
+    // inbound chain is present AND a policy is configured.
+    let existing_xff = existing_xff.filter(|_| {
+        trusted_proxies.is_empty()
+            || peer_ip
+                .parse::<std::net::IpAddr>()
+                .map(|ip| trusted_proxies.contains(&ip))
+                .unwrap_or(false)
+    });
     match existing_xff {
         Some(xff) => {
             let mut val = String::with_capacity(xff.len() + 2 + peer_ip.len());
@@ -13927,6 +13946,7 @@ pub(crate) async fn proxy_to_backend_retry(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
         client_ip,
         xff_append_ip,
+        &state.trusted_proxies,
     );
     let proto_str = if is_tls { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
@@ -14818,6 +14838,7 @@ async fn proxy_to_backend(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
         client_ip,
         xff_append_ip,
+        &state.trusted_proxies,
     );
     let proto_str = if is_tls { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
@@ -16311,6 +16332,7 @@ async fn proxy_to_backend_hbone(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
         client_ip,
         xff_append_ip,
+        &state.trusted_proxies,
     );
     if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
         parts.headers.insert("x-forwarded-for", val);
@@ -16801,6 +16823,7 @@ async fn proxy_to_backend_mesh_mtls(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
         client_ip,
         xff_append_ip,
+        &state.trusted_proxies,
     );
     if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
         parts.headers.insert("x-forwarded-for", val);
@@ -17125,6 +17148,7 @@ async fn proxy_to_backend_http2(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
         client_ip,
         xff_append_ip,
+        &state.trusted_proxies,
     );
     if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
         parts.headers.insert("x-forwarded-for", val);
@@ -17370,6 +17394,7 @@ fn build_http3_backend_headers(
         headers.get("x-forwarded-for").map(String::as_str),
         ctx.client_ip,
         ctx.xff_append_ip,
+        &state.trusted_proxies,
     );
     if let Ok(v) = xff.parse() {
         http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
@@ -20923,20 +20948,33 @@ mod tests {
     /// | untrusted peer                     | none        | equal          | peer               |
     #[test]
     fn build_xff_value_appends_peer_and_seeds_resolved_client() {
+        let no_policy = client_ip::TrustedProxies::parse("");
+        let lb_trusted = client_ip::TrustedProxies::parse("10.0.0.7");
+
         // No proxy in front: client == peer, no inbound chain.
         assert_eq!(
-            build_xff_value(None, "203.0.113.1", "203.0.113.1"),
+            build_xff_value(None, "203.0.113.1", "203.0.113.1", &no_policy),
             "203.0.113.1"
         );
 
         // Trusted LB sending XFF: resolved client is already in the chain —
         // append only the immediate peer (never duplicate the client).
         assert_eq!(
-            build_xff_value(Some("198.51.100.7"), "198.51.100.7", "10.0.0.7"),
+            build_xff_value(
+                Some("198.51.100.7"),
+                "198.51.100.7",
+                "10.0.0.7",
+                &lb_trusted
+            ),
             "198.51.100.7, 10.0.0.7"
         );
         assert_eq!(
-            build_xff_value(Some("198.51.100.7, 172.16.0.3"), "198.51.100.7", "10.0.0.7"),
+            build_xff_value(
+                Some("198.51.100.7, 172.16.0.3"),
+                "198.51.100.7",
+                "10.0.0.7",
+                &lb_trusted
+            ),
             "198.51.100.7, 172.16.0.3, 10.0.0.7"
         );
 
@@ -20944,13 +20982,31 @@ mod tests {
         // resolved client differs from the peer — seed with the client so
         // the real client is not lost.
         assert_eq!(
-            build_xff_value(None, "203.0.113.9", "10.0.0.7"),
+            build_xff_value(None, "203.0.113.9", "10.0.0.7", &lb_trusted),
             "203.0.113.9, 10.0.0.7"
         );
 
         // Untrusted peer (spoofed real-IP header ignored): resolution kept
         // client == peer, so the seed must not duplicate.
-        assert_eq!(build_xff_value(None, "192.0.2.6", "192.0.2.6"), "192.0.2.6");
+        assert_eq!(
+            build_xff_value(None, "192.0.2.6", "192.0.2.6", &lb_trusted),
+            "192.0.2.6"
+        );
+
+        // Untrusted peer sending a spoofed XFF chain while a trust policy is
+        // configured: the inbound chain is dropped — backends must never see
+        // attacker-seeded addresses the gateway itself refused to trust.
+        assert_eq!(
+            build_xff_value(Some("6.6.6.6"), "192.0.2.6", "192.0.2.6", &lb_trusted),
+            "192.0.2.6"
+        );
+
+        // No trust policy configured: transparent nginx-style passthrough —
+        // the inbound chain is preserved and the peer appended.
+        assert_eq!(
+            build_xff_value(Some("198.51.100.7"), "192.0.2.6", "192.0.2.6", &no_policy),
+            "198.51.100.7, 192.0.2.6"
+        );
     }
 
     /// Regression guard: the gRPC request-body-hook branch must always

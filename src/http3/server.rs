@@ -4021,6 +4021,7 @@ fn build_h3_backend_headers(
         headers.get("x-forwarded-for").map(String::as_str),
         client_ip,
         xff_append_ip,
+        &state.trusted_proxies,
     );
     if let Ok(val) = http::header::HeaderValue::from_str(&xff) {
         h3_headers.push((
