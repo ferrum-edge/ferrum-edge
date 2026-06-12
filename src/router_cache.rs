@@ -944,13 +944,15 @@ impl RouterCache {
             .iter()
             .filter(|p| !p.dispatch_kind.is_stream())
         {
-            if !crate::modes::mesh::is_mesh_outbound_route_id(&proxy.id) {
-                continue;
-            }
-            let Some((stem, port_str)) = proxy.id.rsplit_once('-') else {
+            // Shared stem parser (`mesh_outbound_route_id_stem`) keeps this
+            // grouping and the `validate_unique_listen_paths` sibling
+            // exemption keyed on the exact same identity.
+            let Some(stem) = crate::modes::mesh::mesh_outbound_route_id_stem(&proxy.id) else {
                 continue;
             };
-            let Ok(port) = port_str.parse::<u16>() else {
+            // The stem parse above guarantees a numeric suffix; re-parse
+            // defensively rather than panic on the hot-swap path.
+            let Ok(port) = proxy.id[stem.len() + 1..].parse::<u16>() else {
                 continue;
             };
             mesh_outbound_groups

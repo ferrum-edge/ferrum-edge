@@ -2045,6 +2045,25 @@ impl GatewayConfig {
             }
             for (i, proxy_a) in group.iter().enumerate() {
                 for proxy_b in group.iter().skip(i + 1) {
+                    // Materialized mesh outbound per-port siblings of ONE
+                    // service intentionally share hosts + `/`: the route
+                    // table inserts a single lowest-port representative and
+                    // the request path disambiguates by the captured
+                    // original-destination port, so they never route
+                    // non-deterministically. Exempt same-stem pairs (shared
+                    // parser with the router grouping). Operator configs
+                    // cannot reach this: resource-id validation rejects ids
+                    // starting with `_`, so `__mesh-outbound-*` ids exist
+                    // only via mesh materialization. Different services'
+                    // routes (different stems) still conflict normally.
+                    if crate::modes::mesh::mesh_outbound_route_id_stem(&proxy_a.id).is_some_and(
+                        |stem| {
+                            crate::modes::mesh::mesh_outbound_route_id_stem(&proxy_b.id)
+                                == Some(stem)
+                        },
+                    ) {
+                        continue;
+                    }
                     if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
                         if proxy_a.hosts.is_empty() && proxy_b.hosts.is_empty() {
                             errors.push(format!(

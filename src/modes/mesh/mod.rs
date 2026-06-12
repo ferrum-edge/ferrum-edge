@@ -1448,6 +1448,29 @@ fn mesh_outbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_OUTBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
+/// The per-service stem of a materialized mesh outbound route id — the id
+/// minus its trailing `-{port}` segment — or `None` when the id is not a
+/// mesh outbound route or lacks a parseable numeric port suffix.
+///
+/// **Single source of truth for per-port sibling identity.** The numeric
+/// suffix of [`mesh_outbound_proxy_id`] is load-bearing: per-port siblings of
+/// one service share a stem, and both consumers key off it —
+/// `RouterCache::build_route_table` groups siblings under one lowest-port
+/// tier representative, and `validate_unique_listen_paths` exempts same-stem
+/// siblings from the host+path uniqueness conflict (they intentionally share
+/// hosts + `/` and are disambiguated post-match by the captured
+/// original-destination port). Operator configs cannot reach the exemption:
+/// resource-id validation rejects ids starting with `_`, so `__mesh-*` ids
+/// exist only via mesh materialization.
+pub(crate) fn mesh_outbound_route_id_stem(id: &str) -> Option<&str> {
+    if !is_mesh_outbound_route_id(id) {
+        return None;
+    }
+    let (stem, port) = id.rsplit_once('-')?;
+    port.parse::<u16>().ok()?;
+    Some(stem)
+}
+
 /// Upstream id for a materialized mesh outbound route, one per HTTP-family
 /// service port (per-port upstreams keep LB counters, hash rings, passive
 /// health, and pool keys isolated per app port). Deliberately
@@ -8049,6 +8072,15 @@ mod tests {
                 .any(|p| p.id == "__mesh-outbound-default-reviews-5432"),
             "non-HTTP (TCP) service ports must not materialize HTTP outbound routes"
         );
+        // The swap path (`ProxyState::update_config` → `validate_full_config`)
+        // runs this validator on every slice apply; the per-port siblings
+        // share hosts + `/` by design and must pass via the same-stem
+        // exemption — otherwise multi-port slices are rejected at apply.
+        assert!(
+            config.validate_unique_listen_paths().is_ok(),
+            "per-port outbound siblings must survive the uniqueness validator: {:?}",
+            config.validate_unique_listen_paths()
+        );
     }
 
     #[test]
@@ -8378,6 +8410,40 @@ mod tests {
         );
         assert_eq!(mesh_route_direction("operator-proxy"), None);
         assert_eq!(mesh_route_direction("__mesh-ew-svc-default-reviews"), None);
+    }
+
+    /// The numeric port suffix of `mesh_outbound_proxy_id` is load-bearing:
+    /// `RouterCache` sibling grouping and the `validate_unique_listen_paths`
+    /// exemption both key on this stem parse. Lock the contract.
+    #[test]
+    fn mesh_outbound_route_id_stem_parses_port_suffix() {
+        assert_eq!(
+            mesh_outbound_route_id_stem(&mesh_outbound_proxy_id("default", "reviews", 8080)),
+            Some("__mesh-outbound-default-reviews")
+        );
+        // Same service, different ports → same stem (the sibling identity).
+        assert_eq!(
+            mesh_outbound_route_id_stem("__mesh-outbound-default-reviews-80"),
+            mesh_outbound_route_id_stem("__mesh-outbound-default-reviews-9080")
+        );
+        // Different services → different stems.
+        assert_ne!(
+            mesh_outbound_route_id_stem("__mesh-outbound-default-reviews-80"),
+            mesh_outbound_route_id_stem("__mesh-outbound-default-ratings-80")
+        );
+        // Reserved prefix without a parseable numeric suffix: not grouped.
+        assert_eq!(mesh_outbound_route_id_stem("__mesh-outbound-oddball"), None);
+        // Out-of-range numeric suffix is not a u16 port.
+        assert_eq!(
+            mesh_outbound_route_id_stem("__mesh-outbound-default-reviews-99999"),
+            None
+        );
+        // Non-outbound ids never have a stem.
+        assert_eq!(
+            mesh_outbound_route_id_stem("__mesh-inbound-default-reviews-8080"),
+            None
+        );
+        assert_eq!(mesh_outbound_route_id_stem("operator-proxy"), None);
     }
 
     #[test]

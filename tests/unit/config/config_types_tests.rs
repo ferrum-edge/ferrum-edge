@@ -2163,6 +2163,55 @@ fn test_unique_listen_paths_same_path_overlapping_hosts() {
 }
 
 #[test]
+fn test_unique_listen_paths_exempts_mesh_outbound_per_port_siblings() {
+    // Materialized mesh outbound per-port siblings of ONE service share hosts
+    // and `/` by design: the route table holds a single lowest-port
+    // representative and the request path disambiguates by the captured
+    // original-destination port. The uniqueness validator must not reject the
+    // slice apply that carries them. (Operator configs can't reach this
+    // shape: resource-id validation rejects ids starting with `_`.)
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy_with_hosts(
+            "__mesh-outbound-default-reviews-80",
+            "/",
+            vec!["reviews.default.svc.cluster.local"],
+        ),
+        make_proxy_with_hosts(
+            "__mesh-outbound-default-reviews-9080",
+            "/",
+            vec!["reviews.default.svc.cluster.local"],
+        ),
+    ];
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "same-service per-port outbound siblings must not conflict"
+    );
+}
+
+#[test]
+fn test_unique_listen_paths_mesh_outbound_different_services_still_conflict() {
+    // The sibling exemption is keyed on the per-service id stem: two DIFFERENT
+    // services' outbound routes overlapping on a host remain a genuine routing
+    // ambiguity and must still be rejected.
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy_with_hosts(
+            "__mesh-outbound-default-reviews-80",
+            "/",
+            vec!["shared-alias.example.com"],
+        ),
+        make_proxy_with_hosts(
+            "__mesh-outbound-default-ratings-80",
+            "/",
+            vec!["shared-alias.example.com"],
+        ),
+    ];
+    let err = config.validate_unique_listen_paths().unwrap_err();
+    assert_eq!(err.len(), 1, "cross-service overlap must still conflict");
+}
+
+#[test]
 fn test_unique_listen_paths_same_path_catchall_conflict() {
     // Two catch-all proxies (no hosts) with same path → conflict
     let mut config = empty_config();
