@@ -1547,8 +1547,11 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                 }
                 H3FrameSourceState::Trailers => {
                     match Pin::new(&mut this.recv_stream).poll_recv_trailers_map(cx) {
-                        Poll::Ready(Ok(Some(trailers))) => {
+                        Poll::Ready(Ok(Some(mut trailers))) => {
                             this.state = H3FrameSourceState::Done;
+                            crate::proxy::headers::strip_response_hop_by_hop_trailers(
+                                &mut trailers,
+                            );
                             return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
                         }
                         Poll::Ready(Ok(None)) => {
@@ -1907,15 +1910,6 @@ pub(crate) fn direct_streaming_body(
     ProxyBody::streaming(Box::pin(body))
 }
 
-pub(crate) fn coalescing_h2_body(
-    body: Incoming,
-    content_length: Option<u64>,
-    coalesce_target: usize,
-) -> ProxyBody {
-    let coalescing = Coalescing::new(body, coalesce_target, content_length);
-    ProxyBody::streaming(Box::pin(coalescing))
-}
-
 /// Build a streaming response body fed by [`run_response_inspection`] over an
 /// mpsc channel.
 ///
@@ -2031,27 +2025,6 @@ pub(crate) async fn run_response_inspection(
             }
         }
     }
-}
-
-pub(crate) fn size_limited_streaming_h2_body(
-    body: Incoming,
-    max_bytes: usize,
-    content_length: Option<u64>,
-    coalesce_target: usize,
-) -> ProxyBody {
-    let limited = SizeLimitedFrameSource::new(body, max_bytes);
-    let coalescing = Coalescing::new(limited, coalesce_target, content_length);
-    ProxyBody::streaming(Box::pin(coalescing))
-}
-
-pub(crate) fn direct_streaming_h2_body(body: Incoming, content_length: Option<u64>) -> ProxyBody {
-    use http_body_util::BodyExt;
-
-    let direct = DirectH2Body {
-        inner: body,
-        content_length,
-    };
-    ProxyBody::streaming(Box::pin(direct.map_err(|e| Box::new(e) as BoxError)))
 }
 
 /// HTTP/2 streaming body wrapped in a [`StripHopByHopTrailers`] filter so
@@ -2793,6 +2766,76 @@ mod tests {
         }
 
         assert!(matches!(poll_source(&mut source), Poll::Ready(None)));
+    }
+
+    #[test]
+    fn h3_frame_source_strips_hop_by_hop_trailers_and_preserves_frame() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        trailers.insert("x-custom-trailer", "ok".parse().unwrap());
+        trailers.insert("connection", "close".parse().unwrap());
+        trailers.insert("keep-alive", "timeout=5".parse().unwrap());
+        trailers.insert(
+            "proxy-authenticate",
+            "Basic realm=internal".parse().unwrap(),
+        );
+        trailers.insert("transfer-encoding", "chunked".parse().unwrap());
+
+        let mut source = H3FrameSource::new(
+            MockH3RecvStream::new(
+                vec![MockH3DataStep::End],
+                vec![MockH3TrailerStep::Trailers(trailers)],
+            ),
+            Arc::from("GET"),
+            200,
+            None,
+        );
+
+        match poll_source(&mut source) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let trailers = frame.trailers_ref().expect("expected trailers frame");
+                assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+                assert_eq!(trailers.get("x-custom-trailer").unwrap(), "ok");
+                for hop_by_hop in [
+                    "connection",
+                    "keep-alive",
+                    "proxy-authenticate",
+                    "transfer-encoding",
+                ] {
+                    assert!(
+                        trailers.get(hop_by_hop).is_none(),
+                        "hop-by-hop H3 trailer `{hop_by_hop}` must be stripped",
+                    );
+                }
+                assert!(source.is_done());
+            }
+            other => panic!("expected stripped trailer frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn h3_frame_source_emits_empty_trailer_frame_when_all_hop_by_hop() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("connection", "close".parse().unwrap());
+        trailers.insert("keep-alive", "timeout=5".parse().unwrap());
+
+        let mut source = H3FrameSource::new(
+            MockH3RecvStream::new(
+                vec![MockH3DataStep::End],
+                vec![MockH3TrailerStep::Trailers(trailers)],
+            ),
+            Arc::from("GET"),
+            200,
+            None,
+        );
+
+        match poll_source(&mut source) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let trailers = frame.trailers_ref().expect("expected trailers frame");
+                assert!(trailers.is_empty(), "all hop-by-hop trailers stripped");
+            }
+            other => panic!("expected empty trailer frame, got {other:?}"),
+        }
     }
 
     // ── StripHopByHopTrailers ───────────────────────────────────────────────

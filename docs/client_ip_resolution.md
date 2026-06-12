@@ -190,7 +190,8 @@ The resolved client IP (`ctx.client_ip`) is used throughout the gateway:
 | **Rate Limiting** | When `limit_by="ip"` (default), rate limit key is `ip:{client_ip}`. `consumer` and `spiffe_identity` modes fall back to this IP key when their identity is absent |
 | **Load Balancer Hashing** | `client_ip` used as hash key for consistent upstream selection |
 | **Transaction Logging** | `client_ip` included in all log entries and transaction summaries |
-| **X-Forwarded-For (outbound)** | Real client IP appended to XFF when proxying to backends |
+| **X-Forwarded-For (outbound)** | Outbound XFF chain built per standard `proxy_add_x_forwarded_for` semantics (see below) |
+| **Forwarded (outbound, RFC 7239)** | `for=` carries the resolved client IP when `FERRUM_ADD_FORWARDED_HEADER` is enabled |
 
 ## Troubleshooting
 
@@ -214,4 +215,13 @@ The resolved client IP (`ctx.client_ip`) is used throughout the gateway:
 
 ### XFF header is not being set on backend requests
 
-The gateway always sets the `X-Forwarded-For` header when proxying to backends, using the resolved client IP. If the header was already present, the client IP is appended; otherwise a new header is created.
+The gateway always sets the `X-Forwarded-For` header when proxying to backends, using standard `proxy_add_x_forwarded_for` semantics: the immediate socket peer is appended to the inbound chain. When there is no inbound XFF but the resolved client IP differs from the peer (a trusted proxy supplied `FERRUM_REAL_IP_HEADER`), the generated chain is seeded with the resolved client first. The same chain shape is produced on the HTTP/1.1, HTTP/2, and HTTP/3 frontends:
+
+| Deployment shape | Inbound XFF | Outbound XFF |
+|---|---|---|
+| No proxy in front | — | `client-peer` |
+| Trusted LB forwarding XFF | `…, client` | `…, client, lb-peer` |
+| Trusted LB sending only a real-IP header | — | `resolved-client, lb-peer` |
+| Untrusted peer (headers ignored) | any | `peer` |
+
+The resolved client IP itself always travels in the RFC 7239 `Forwarded` header (`for=`) when `FERRUM_ADD_FORWARDED_HEADER` is enabled, and in `ctx.client_ip` for plugins, rate limiting, and logging.
