@@ -2165,9 +2165,10 @@ where
     )
     .await;
 
-    if grpc_has_retry && let Some(retry_config) = &proxy.retry {
-        let hmap = retry_hmap.expect("retry hmap must exist when grpc retry is enabled");
-        let body_bytes = retry_body.expect("retry body must exist when grpc retry is enabled");
+    if grpc_has_retry
+        && let Some(retry_config) = &proxy.retry
+        && let (Some(hmap), Some(body_bytes)) = (retry_hmap, retry_body)
+    {
         let mut attempt = 0u32;
         loop {
             // Pre-wire predicate for the H3→gRPC retry loop, derived from
@@ -4779,6 +4780,12 @@ mod tests {
                  \x20\x20\x20\x20\x20\x20\x20\x20initial_body,"
             ),
             "initial gRPC dispatch must move the prepared headers/body instead of cloning them"
+        );
+        let forbidden_retry_hmap = ["retry_hmap", ".expect("].concat();
+        let forbidden_retry_body = ["retry_body", ".expect("].concat();
+        assert!(
+            !src.contains(&forbidden_retry_hmap) && !src.contains(&forbidden_retry_body),
+            "H3 gRPC retry replay buffers must not use panic-based extraction"
         );
     }
 }
