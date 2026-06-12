@@ -19465,9 +19465,12 @@ mod tests {
 
         assert_eq!(header_value(&out, "host"), Some("backend.internal"));
         assert_eq!(header_value(&out, "x-keep"), Some("ok"));
+        // The resolved client (203.0.113.44) is absent from the inbound
+        // chain, so the builder seeds it before the immediate peer — same
+        // real-IP-header semantics as build_xff_value's truth table.
         assert_eq!(
             header_value(&out, "x-forwarded-for"),
-            Some("198.51.100.7, 127.0.0.1")
+            Some("198.51.100.7, 203.0.113.44, 127.0.0.1")
         );
         assert_eq!(header_value(&out, "x-forwarded-proto"), Some("http"));
         assert_eq!(header_value(&out, "x-forwarded-host"), Some("edge.example"));
