@@ -177,6 +177,9 @@ impl MeshTopology {
 pub enum MeshConfigProtocol {
     Native,
     Xds,
+    /// Localized file source: the mesh slice is built DP-side from a local
+    /// YAML/JSON document (`FERRUM_MESH_FILE_CONFIG_PATH`), no control plane.
+    File,
 }
 
 impl MeshConfigProtocol {
@@ -184,8 +187,9 @@ impl MeshConfigProtocol {
         match raw.trim().to_ascii_lowercase().as_str() {
             "native" => Ok(Self::Native),
             "xds" => Ok(Self::Xds),
+            "file" => Ok(Self::File),
             other => Err(format!(
-                "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. Expected: native or xds"
+                "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. Expected: native, xds, or file"
             )),
         }
     }
@@ -194,7 +198,14 @@ impl MeshConfigProtocol {
         match self {
             Self::Native => "native",
             Self::Xds => "xds",
+            Self::File => "file",
         }
+    }
+
+    /// Whether this protocol consumes config from a control plane over gRPC
+    /// (and therefore needs CP URLs, the CP/DP JWT secret, and gRPC TLS).
+    fn requires_control_plane(self) -> bool {
+        matches!(self, Self::Native | Self::Xds)
     }
 }
 
@@ -206,6 +217,10 @@ pub struct MeshRuntimeConfig {
     pub namespace: String,
     pub cp_urls: Vec<String>,
     pub config_protocol: MeshConfigProtocol,
+    /// Localized mesh config document consumed when `config_protocol` is
+    /// [`MeshConfigProtocol::File`]. Required for that protocol, `None`
+    /// otherwise. Sourced from `FERRUM_MESH_FILE_CONFIG_PATH`.
+    pub file_config_path: Option<String>,
     pub topology: MeshTopology,
     pub inbound_listen_addr: SocketAddr,
     pub outbound_listen_addr: SocketAddr,
@@ -344,9 +359,20 @@ pub struct MeshRuntimeConfig {
 
 impl MeshRuntimeConfig {
     pub fn from_env_config(env_config: &EnvConfig) -> Result<Self, String> {
+        let config_protocol = MeshConfigProtocol::parse(&env_config.mesh_config_protocol)?;
         let cp_urls = env_config.resolved_dp_cp_grpc_urls();
-        if cp_urls.is_empty() {
+        if config_protocol.requires_control_plane() && cp_urls.is_empty() {
             return Err("FERRUM_DP_CP_GRPC_URLS is required in mesh mode".into());
+        }
+        let file_config_path = env_config
+            .mesh_file_config_path
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        if config_protocol == MeshConfigProtocol::File && file_config_path.is_none() {
+            return Err(
+                "FERRUM_MESH_FILE_CONFIG_PATH is required when FERRUM_MESH_CONFIG_PROTOCOL=file"
+                    .into(),
+            );
         }
 
         let node_id = resolve_ferrum_var("FERRUM_MESH_NODE_ID")
@@ -354,7 +380,6 @@ impl MeshRuntimeConfig {
             .or_else(|| std::env::var("HOSTNAME").ok())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "ferrum-mesh-node".to_string());
-        let config_protocol = MeshConfigProtocol::parse(&env_config.mesh_config_protocol)?;
         let topology = MeshTopology::parse(
             &resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string()),
         )?;
@@ -521,6 +546,7 @@ impl MeshRuntimeConfig {
             namespace: env_config.namespace.clone(),
             cp_urls,
             config_protocol,
+            file_config_path,
             topology,
             inbound_listen_addr,
             outbound_listen_addr,
@@ -650,7 +676,6 @@ impl MeshRuntimeConfig {
         })
     }
 
-    #[allow(dead_code)] // Used by tests and future xDS bootstrap wiring.
     pub fn mesh_slice_request(&self) -> MeshSliceRequest {
         MeshSliceRequest {
             node_id: self.node_id.clone(),
@@ -4493,32 +4518,77 @@ pub async fn run(
 
     let mesh_state = MeshRuntimeState::new();
 
-    let jwt_secret = GrpcJwtSecret::with_issuer(
-        env_config.cp_dp_grpc_jwt_secret.clone().ok_or_else(|| {
-            anyhow::anyhow!("FERRUM_CP_DP_GRPC_JWT_SECRET is required in mesh mode")
-        })?,
-        env_config.cp_dp_grpc_jwt_issuer.clone(),
-    );
     let mut background_handles = Vec::new();
-    let grpc_tls = build_dp_grpc_tls_config(&env_config, &runtime.cp_urls, "Mesh")?;
-    let mesh_grpc_tls_reload_handle = crate::modes::grpc_tls_reload::start_dp_grpc_tls_reload_task(
-        Arc::new(env_config.clone()),
-        Arc::new(runtime.cp_urls.clone()),
-        "Mesh",
-        Some(shutdown_tx.subscribe()),
-    );
-    let grpc_tls_reload = mesh_grpc_tls_reload_handle.map(|handle| {
-        let reload = DpGrpcTlsReload {
-            env_config: Arc::new(env_config.clone()),
-            label: "Mesh",
-            revision_rx: handle.revision_rx,
-        };
-        background_handles.push(handle.watcher_handle);
-        reload
-    });
+    if runtime.config_protocol == MeshConfigProtocol::File {
+        // Localized file source: no control plane, so no CP/DP JWT secret and
+        // no DP gRPC TLS machinery. The initial load is synchronous and
+        // fail-closed — an unreadable or invalid mesh document refuses
+        // startup, matching file-mode validation semantics. Subsequent SIGHUP
+        // reloads keep the last good slice on error.
+        let file_path = runtime.file_config_path.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "FERRUM_MESH_FILE_CONFIG_PATH is required when FERRUM_MESH_CONFIG_PROTOCOL=file"
+            )
+        })?;
+        let initial_slice = config_consumer::file_source::load_mesh_slice_from_file(
+            std::path::Path::new(&file_path),
+            runtime.mesh_slice_request(),
+        )
+        .with_context(|| format!("failed to load localized mesh config from '{file_path}'"))?;
+        // Fail-closed beyond mesh-field validity: run the full slice→config
+        // preparation (plugin injection, materialization, DestinationRule
+        // projection — which can reject e.g. unloadable ISTIO_MUTUAL TLS
+        // material) before installing the slice. The CP consumers tolerate a
+        // rejected initial slice by waiting for the CP to push a fix; the
+        // file source has no pusher, so a slice the runtime would reject must
+        // refuse startup instead of hanging in the initial-config wait.
+        gateway_config_from_mesh_slice(&initial_slice, &runtime, None, None).with_context(
+            || format!("localized mesh config '{file_path}' failed runtime preparation"),
+        )?;
+        let initial_version = initial_slice.version.clone();
+        mesh_state.install_slice(initial_slice);
+        let handle = tokio::spawn(
+            config_consumer::file_source::start_mesh_file_source_with_shutdown(
+                file_path.clone(),
+                runtime.mesh_slice_request(),
+                mesh_state.clone(),
+                shutdown_tx.subscribe(),
+            ),
+        );
+        background_handles.push(handle);
+        info!(
+            node_id = %runtime.node_id,
+            namespace = %runtime.namespace,
+            file_path = %file_path,
+            mesh_slice_version = %initial_version,
+            "Mesh mode initialized localized file config source (SIGHUP reloads)"
+        );
+    } else {
+        let jwt_secret = GrpcJwtSecret::with_issuer(
+            env_config.cp_dp_grpc_jwt_secret.clone().ok_or_else(|| {
+                anyhow::anyhow!("FERRUM_CP_DP_GRPC_JWT_SECRET is required in mesh mode")
+            })?,
+            env_config.cp_dp_grpc_jwt_issuer.clone(),
+        );
+        let grpc_tls = build_dp_grpc_tls_config(&env_config, &runtime.cp_urls, "Mesh")?;
+        let mesh_grpc_tls_reload_handle =
+            crate::modes::grpc_tls_reload::start_dp_grpc_tls_reload_task(
+                Arc::new(env_config.clone()),
+                Arc::new(runtime.cp_urls.clone()),
+                "Mesh",
+                Some(shutdown_tx.subscribe()),
+            );
+        let grpc_tls_reload = mesh_grpc_tls_reload_handle.map(|handle| {
+            let reload = DpGrpcTlsReload {
+                env_config: Arc::new(env_config.clone()),
+                label: "Mesh",
+                revision_rx: handle.revision_rx,
+            };
+            background_handles.push(handle.watcher_handle);
+            reload
+        });
 
-    match runtime.config_protocol {
-        MeshConfigProtocol::Native => {
+        if runtime.config_protocol == MeshConfigProtocol::Native {
             let client_config = runtime.native_client_config();
             let request = client_config.subscribe_request(crate::FERRUM_VERSION);
             let cp_urls = runtime.cp_urls.clone();
@@ -4543,8 +4613,7 @@ pub async fn run(
                 has_first_slice = mesh_state.has_first_slice(),
                 "Mesh mode initialized native MeshSubscribe consumer"
             );
-        }
-        MeshConfigProtocol::Xds => {
+        } else {
             let xds_config = runtime.xds_client_config();
             let state = mesh_state.clone();
             let shutdown_rx = shutdown_tx.subscribe();
@@ -4592,7 +4661,7 @@ fn ensure_runtime_config_protocol_supported(
     runtime: &MeshRuntimeConfig,
 ) -> Result<(), anyhow::Error> {
     match runtime.config_protocol {
-        MeshConfigProtocol::Native | MeshConfigProtocol::Xds => Ok(()),
+        MeshConfigProtocol::Native | MeshConfigProtocol::Xds | MeshConfigProtocol::File => Ok(()),
     }
 }
 
@@ -7067,6 +7136,7 @@ mod tests {
             "FERRUM_CP_DP_GRPC_JWT_SECRET",
             "FERRUM_MESH_NODE_ID",
             "FERRUM_MESH_CONFIG_PROTOCOL",
+            "FERRUM_MESH_FILE_CONFIG_PATH",
             "FERRUM_MESH_XDS_NODE_CLUSTER",
             "FERRUM_MESH_TOPOLOGY",
             "FERRUM_MESH_INBOUND_LISTEN_ADDR",
@@ -7294,6 +7364,104 @@ mod tests {
                 assert_eq!(
                     xds_config.labels.get("app").map(String::as_str),
                     Some("api")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_accepts_file_protocol_without_control_plane() {
+        // The localized file source has no CP: neither FERRUM_DP_CP_GRPC_URLS
+        // nor FERRUM_CP_DP_GRPC_JWT_SECRET is set here, and both EnvConfig
+        // validation and MeshRuntimeConfig parsing must accept that.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_MESH_NODE_ID", "node-f"),
+                ("FERRUM_MESH_CONFIG_PROTOCOL", "file"),
+                ("FERRUM_MESH_FILE_CONFIG_PATH", "/etc/ferrum/mesh.yaml"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config accepts file protocol");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                assert_eq!(runtime.config_protocol, MeshConfigProtocol::File);
+                assert!(!runtime.config_protocol.requires_control_plane());
+                assert!(ensure_runtime_config_protocol_supported(&runtime).is_ok());
+                assert_eq!(
+                    runtime.file_config_path.as_deref(),
+                    Some("/etc/ferrum/mesh.yaml")
+                );
+                assert!(runtime.cp_urls.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_file_protocol_requires_file_path() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_MESH_CONFIG_PROTOCOL", "file"),
+            ],
+            || {
+                let err = EnvConfig::from_env()
+                    .expect_err("file protocol without a path must fail validation");
+                assert!(
+                    err.contains("FERRUM_MESH_FILE_CONFIG_PATH"),
+                    "unexpected error: {err}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_native_protocol_still_requires_cp_urls_and_jwt_secret() {
+        // Relaxing the CP requirements for the file protocol must not loosen
+        // the native/xDS posture.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_MESH_CONFIG_PROTOCOL", "native"),
+            ],
+            || {
+                let err = EnvConfig::from_env()
+                    .expect_err("native protocol without CP URLs must fail validation");
+                assert!(
+                    err.contains("FERRUM_DP_CP_GRPC_URLS"),
+                    "unexpected error: {err}"
+                );
+            },
+        );
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_MESH_CONFIG_PROTOCOL", "native"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            ],
+            || {
+                let err = EnvConfig::from_env()
+                    .expect_err("native protocol without the CP/DP JWT secret must fail");
+                assert!(
+                    err.contains("FERRUM_CP_DP_GRPC_JWT_SECRET"),
+                    "unexpected error: {err}"
+                );
+            },
+        );
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_MESH_CONFIG_PROTOCOL", "native"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                ("FERRUM_CP_DP_GRPC_JWT_SECRET", "too-short"),
+            ],
+            || {
+                let err = EnvConfig::from_env()
+                    .expect_err("a sub-minimum CP/DP JWT secret must still fail in mesh mode");
+                assert!(
+                    err.contains("FERRUM_CP_DP_GRPC_JWT_SECRET") && err.contains("at least"),
+                    "unexpected error: {err}"
                 );
             },
         );
@@ -7598,6 +7766,7 @@ mod tests {
             namespace: "ferrum".to_string(),
             cp_urls: vec!["http://127.0.0.1:1".to_string()],
             config_protocol: MeshConfigProtocol::Native,
+            file_config_path: None,
             topology: MeshTopology::Sidecar,
             inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
             outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -7702,6 +7871,7 @@ mod tests {
             namespace: "default".to_string(),
             cp_urls: vec!["http://127.0.0.1:1".to_string()],
             config_protocol: MeshConfigProtocol::Native,
+            file_config_path: None,
             topology: MeshTopology::Sidecar,
             inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
             outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),

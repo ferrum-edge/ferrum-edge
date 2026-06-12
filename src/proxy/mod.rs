@@ -2696,8 +2696,8 @@ async fn run_gateway_svid_file_rotation_loop(
 /// and `grpc_pool` get a `drain_backend_tls_config_cache_svid_generation()`
 /// call on rotation — the H3 pool's TLS config cache is co-located on
 /// `connection_pool.backend_h3_tls_configs`, so it is drained transitively,
-/// and the mesh mTLS pool builds its SPIFFE client config per connect (no
-/// cache to drain). All pools get a `force_drain_svid_generation()` call when
+/// and the HBONE and mesh mTLS pools build their SPIFFE client config per
+/// connect (no cache to drain). All pools get a `force_drain_svid_generation()` call when
 /// the operator-configured drain window elapses, because each pool keeps its
 /// own `DashMap` of live connections.
 #[derive(Clone)]
@@ -2706,6 +2706,7 @@ struct BackendPoolFamily {
     http2_pool: Arc<Http2ConnectionPool>,
     grpc_pool: Arc<GrpcConnectionPool>,
     h3_pool: Arc<Http3ConnectionPool>,
+    hbone_pool: Arc<HboneConnectionPool>,
     mesh_mtls_pool: Arc<mesh_mtls_pool::MeshMtlsConnectionPool>,
 }
 
@@ -2730,6 +2731,7 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_svid_generation(generation);
         self.grpc_pool.force_drain_svid_generation(generation);
         self.h3_pool.force_drain_svid_generation(generation);
+        self.hbone_pool.force_drain_svid_generation(generation);
         self.mesh_mtls_pool.force_drain_svid_generation(generation);
     }
 
@@ -2738,6 +2740,7 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_all();
         self.grpc_pool.force_drain_all();
         self.h3_pool.force_drain_all();
+        self.hbone_pool.force_drain_all();
         self.mesh_mtls_pool.force_drain_all();
     }
 }
@@ -3066,10 +3069,15 @@ impl ProxyState {
             http2_pool: self.http2_pool.clone(),
             grpc_pool: self.grpc_pool.clone(),
             h3_pool: self.h3_pool.clone(),
+            hbone_pool: self.hbone_pool.clone(),
             mesh_mtls_pool: self.mesh_mtls_pool.clone(),
         };
         pools.clear_tls_config_caches();
         pools.force_drain_all();
+        // UDP/DTLS listeners keep listener-local backend DTLS config caches
+        // keyed by paths/options; bump the shared epoch so new sessions
+        // rebuild from the rotated bytes instead of serving stale params.
+        self.stream_listener_manager.bump_backend_tls_reload_epoch();
 
         let config = self.config.load_full();
         self.health_checker
@@ -3077,7 +3085,7 @@ impl ProxyState {
 
         info!(
             validated_backend_tls_configs = validated,
-            "Backend TLS material reloaded; backend client pools were drained"
+            "Backend TLS material reloaded; backend client pools and DTLS config caches were drained"
         );
         Ok(())
     }
@@ -3356,11 +3364,12 @@ impl ProxyState {
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
-        let hbone_pool = Arc::new(HboneConnectionPool::new(
+        let hbone_pool = Arc::new(HboneConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
             dns_cache.clone(),
             gateway_svid_bundle.clone(),
             pool_shard_amount,
+            backend_svid_generation.clone(),
         ));
         let mesh_mtls_pool = Arc::new(
             mesh_mtls_pool::MeshMtlsConnectionPool::new_with_svid_generation(
@@ -3495,6 +3504,7 @@ impl ProxyState {
                     http2_pool: http2_pool.clone(),
                     grpc_pool: grpc_pool.clone(),
                     h3_pool: h3_pool.clone(),
+                    hbone_pool: hbone_pool.clone(),
                     mesh_mtls_pool: mesh_mtls_pool.clone(),
                 },
                 health_checker: health_checker.clone(),
@@ -11715,9 +11725,15 @@ async fn handle_proxy_request_inner(
             Ok(GrpcResponseKind::Buffered(grpc_resp)) => {
                 let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
+                let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
                 let mut response_body = grpc_resp.body;
+                // `response_trailers` is the backend's untouched trailer map at
+                // this point (moved out of `grpc_resp` above, reconciled with
+                // plugin mutations only later), so the grpc-status mapping is
+                // correct for both the non-empty-body (status in trailers) and
+                // Trailers-Only (status in headers) encodings.
                 let grpc_backend_dispatch_status = grpc_proxy::grpc_admission_status_from_maps(
-                    &grpc_resp.trailers,
+                    &response_trailers,
                     &response_headers,
                     response_status,
                 );
@@ -11727,9 +11743,9 @@ async fn handle_proxy_request_inner(
                     // status alone mislabels an UNAVAILABLE/INTERNAL backend as a
                     // healthy success. Map the effective non-OK gRPC status to HTTP
                     // so a server-side failure surfaces as 5xx and shrinks the limit,
-                    // while client-side statuses stay <500 (healthy). `grpc_resp`
-                    // trailers are still intact here — drained into `response_headers`
-                    // below.
+                    // while client-side statuses stay <500 (healthy). The backend's
+                    // trailers are still intact here — plugin-view merge and wire
+                    // writeback happen below.
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: grpc_backend_dispatch_status,
                         connection_error: false,
@@ -11753,10 +11769,35 @@ async fn handle_proxy_request_inner(
                 }
                 drop(grpc_lb_connection_guard.take());
 
-                // Forward trailers as response headers (gRPC Trailers-Only encoding).
-                // Drain instead of clone to avoid per-trailer String allocations.
-                for (k, v) in grpc_resp.trailers {
-                    response_headers.insert(k, v);
+                // Plugins historically saw a merged header+trailer map on the
+                // buffered gRPC path because trailers were inserted into
+                // response headers before hooks ran. Keep that compatibility
+                // view (same convention as the H3 bridge in
+                // `http3::cross_protocol`: a trailer never overrides a real
+                // header in the view), but split the wire response back into
+                // HEADERS + DATA + TRAILERS when the final body is non-empty.
+                // Trailer keys the backend ALSO sent as real initial headers
+                // are tracked so the post-hook writeback never copies the
+                // header's value into the wire trailer (the view value for
+                // those keys belongs to the header, not the trailer).
+                //
+                // Exception: the reserved gRPC terminal-status keys
+                // (grpc-status / grpc-message / grpc-status-details-bin) are
+                // trailer-authoritative and never shadowed — a malformed
+                // backend that duplicates them into the initial headers must
+                // not feed plugins (or the wire) the bogus header copy, so
+                // the trailing value wins in the view and the header copy is
+                // stripped on the non-empty wire path below.
+                let mut plugin_response_headers = response_headers.clone();
+                let mut header_shadowed_trailer_keys: HashSet<String> = HashSet::new();
+                for (k, v) in &response_trailers {
+                    if response_headers.contains_key(k)
+                        && !grpc_proxy::is_reserved_grpc_terminal_metadata(k)
+                    {
+                        header_shadowed_trailer_keys.insert(k.clone());
+                    } else {
+                        plugin_response_headers.insert(k.clone(), v.clone());
+                    }
                 }
 
                 // after_proxy hooks
@@ -11767,7 +11808,7 @@ async fn handle_proxy_request_inner(
                         &plugins,
                         &mut ctx,
                         response_status,
-                        &mut response_headers,
+                        &mut plugin_response_headers,
                     )
                     .await
                     {
@@ -11781,6 +11822,8 @@ async fn handle_proxy_request_inner(
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
                         response_status = normalized.http_status.as_u16();
                         response_headers = normalized.headers;
+                        plugin_response_headers = response_headers.clone();
+                        response_trailers.clear();
                         response_body = normalized.body;
                         after_proxy_rejected = true;
                     }
@@ -11794,7 +11837,7 @@ async fn handle_proxy_request_inner(
                             .on_response_body(
                                 &mut ctx,
                                 response_status,
-                                &response_headers,
+                                &plugin_response_headers,
                                 &response_body,
                             )
                             .await;
@@ -11816,6 +11859,8 @@ async fn handle_proxy_request_inner(
                                     .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
+                                plugin_response_headers = response_headers.clone();
+                                response_trailers.clear();
                                 response_body = normalized.body;
                                 break;
                             }
@@ -11826,14 +11871,18 @@ async fn handle_proxy_request_inner(
 
                 if !after_proxy_rejected {
                     let phase_start = Instant::now();
-                    let content_type = response_headers.get("content-type").cloned();
+                    let content_type = plugin_response_headers.get("content-type").cloned();
                     let ct_ref = content_type.as_deref();
                     for plugin in plugins.iter() {
                         if let Some(transformed) = plugin
-                            .transform_response_body(&response_body, ct_ref, &response_headers)
+                            .transform_response_body(
+                                &response_body,
+                                ct_ref,
+                                &plugin_response_headers,
+                            )
                             .await
                         {
-                            response_headers.insert(
+                            plugin_response_headers.insert(
                                 "content-length".to_string(),
                                 transformed.len().to_string(),
                             );
@@ -11850,7 +11899,7 @@ async fn handle_proxy_request_inner(
                             .on_final_response_body(
                                 &mut ctx,
                                 response_status,
-                                &response_headers,
+                                &plugin_response_headers,
                                 &response_body,
                             )
                             .await;
@@ -11872,6 +11921,8 @@ async fn handle_proxy_request_inner(
                                     .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
+                                plugin_response_headers = response_headers.clone();
+                                response_trailers.clear();
                                 response_body = normalized.body;
                                 break;
                             }
@@ -11938,6 +11989,84 @@ async fn handle_proxy_request_inner(
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
+                if !after_proxy_rejected {
+                    // Reconcile hook mutations from the merged view back into
+                    // the wire trailers: a trailer-originated key now absent
+                    // from the view was removed by a hook (honor the removal,
+                    // matching the pre-split behavior where trailers lived in
+                    // the headers map plugins mutated); a changed value is a
+                    // hook edit. Keys shadowed by a real backend header were
+                    // never plugin-visible as trailers, so while the key is
+                    // still in the view they keep the backend's true trailer
+                    // value — but a hook that removed the key from the view
+                    // suppresses the hidden trailer too (a security plugin
+                    // stripping a sensitive key must not leak its trailer
+                    // copy on the wire).
+                    response_trailers.retain(|k, v| {
+                        if header_shadowed_trailer_keys.contains(k) {
+                            return plugin_response_headers.contains_key(k);
+                        }
+                        match plugin_response_headers.get(k) {
+                            Some(plugin_value) => {
+                                if plugin_value != v {
+                                    *v = plugin_value.clone();
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    });
+                    response_headers = plugin_response_headers;
+                }
+                if response_body.is_empty() {
+                    // True Trailers-Only encoding: no DATA frame, grpc-status
+                    // and friends ride in the initial HEADERS with END_STREAM.
+                    // Trailer values are authoritative on collapse (pre-split
+                    // merge order), including over duplicate initial headers.
+                    for (k, v) in response_trailers.drain() {
+                        response_headers.insert(k, v);
+                    }
+                } else {
+                    // Non-empty gRPC responses must carry grpc-status in a
+                    // terminal TRAILERS frame. Strip the view-merged trailer
+                    // copies from the initial headers; keys the backend also
+                    // sent as real initial headers stay headers — the wire
+                    // trailer carries the backend's true trailer value (same
+                    // wire shape as the H3 bridge). Reserved terminal-status
+                    // keys are never shadowed, so a malformed duplicate
+                    // grpc-status initial header is always stripped here:
+                    // status must only appear in the trailers.
+                    for k in response_trailers.keys() {
+                        if !header_shadowed_trailer_keys.contains(k) {
+                            response_headers.remove(k);
+                        }
+                    }
+                }
+
+                // A response transform that re-encodes the gRPC terminal
+                // status into the body (e.g. `grpc_web` appends a gRPC-Web
+                // trailer frame and relabels the content-type) leaves the
+                // response no longer native gRPC. Emitting the reconciled
+                // native TRAILERS frame as well would double-signal terminal
+                // status and confuse gRPC-Web clients/intermediaries, so
+                // suppress the wire trailers whenever the final content-type
+                // positively indicates a conversion away from native
+                // `application/grpc` — keyed on the content-type, not on any
+                // specific plugin, so future transforms behave the same. An
+                // absent content-type keeps native gRPC semantics (we are on
+                // the gRPC dispatch path).
+                if !response_trailers.is_empty() {
+                    let converted_away_from_grpc =
+                        response_headers.get("content-type").is_some_and(|ct| {
+                            !crate::proxy::backend_dispatch::is_native_grpc_content_type(
+                                ct.as_bytes(),
+                            )
+                        });
+                    if converted_away_from_grpc {
+                        response_trailers.clear();
+                    }
+                }
+
                 // Inject sticky session cookie for gRPC responses
                 if sticky_cookie_needed
                     && let (Some(upstream_id), Some(target)) =
@@ -11991,14 +12120,28 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                 );
 
-                return Ok(resp_builder
-                    .body(ProxyBody::full(Bytes::from(response_body)))
-                    .unwrap_or_else(|_| {
-                        grpc_proxy::build_grpc_error_response(
-                            grpc_proxy::grpc_status::UNAVAILABLE,
-                            "Internal gateway error",
-                        )
-                    }));
+                let response_body = Bytes::from(response_body);
+                let body = if !response_body.is_empty() && !response_trailers.is_empty() {
+                    let mut trailers = hyper::HeaderMap::new();
+                    for (k, v) in &response_trailers {
+                        if let (Ok(name), Ok(value)) = (
+                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                            hyper::header::HeaderValue::from_str(v),
+                        ) {
+                            trailers.append(name, value);
+                        }
+                    }
+                    ProxyBody::buffered_grpc_with_trailers(response_body, trailers)
+                } else {
+                    ProxyBody::full(response_body)
+                };
+
+                return Ok(resp_builder.body(body).unwrap_or_else(|_| {
+                    grpc_proxy::build_grpc_error_response(
+                        grpc_proxy::grpc_status::UNAVAILABLE,
+                        "Internal gateway error",
+                    )
+                }));
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
@@ -13312,7 +13455,7 @@ async fn handle_proxy_request_inner(
                     response_status,
                     cl,
                 )
-            } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
+            } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
                     h3_resp.recv_stream,
                     state.max_response_body_size_bytes,
@@ -15916,6 +16059,52 @@ fn hbone_response_body_too_large_response(
     }
 }
 
+fn h3_response_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = size,
+            max_response_body_size_bytes = max_size,
+            "HTTP/3 backend response body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_response_body_size_bytes = max_size,
+            "HTTP/3 backend response body exceeded configured size limit while streaming"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+    }
+}
+
+fn declared_response_length_exceeds_limit(
+    headers: &HashMap<String, String>,
+    max_response_body_size_bytes: usize,
+) -> Option<usize> {
+    if max_response_body_size_bytes == 0 {
+        return None;
+    }
+    let len = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())?;
+    (len > max_response_body_size_bytes).then_some(len)
+}
+
 fn hbone_request_body_too_large_response(
     proxy: &Proxy,
     resolved_ip: Option<String>,
@@ -17402,6 +17591,20 @@ async fn proxy_to_backend_http3(
                 return match h3_result {
                     Ok(response) => {
                         if stream_response {
+                            if let Some(len) = declared_response_length_exceeds_limit(
+                                &response.headers,
+                                state.max_response_body_size_bytes,
+                            ) {
+                                return (
+                                    h3_response_body_too_large_response(
+                                        proxy,
+                                        resolved_ip,
+                                        Some(len),
+                                        state.max_response_body_size_bytes,
+                                    ),
+                                    None,
+                                );
+                            }
                             debug!(
                                 proxy_id = %proxy.id,
                                 status = response.status,
@@ -17411,6 +17614,10 @@ async fn proxy_to_backend_http3(
                                 retry::BackendResponse {
                                     status_code: response.status,
                                     body: ResponseBody::StreamingH3(Box::new(response)),
+                                    // The sole caller moves the headers out of the
+                                    // `StreamingH3` payload via
+                                    // `std::mem::take(&mut h3_resp.headers)` — leave
+                                    // this empty instead of cloning the map per request.
                                     headers: HashMap::new(),
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip,
@@ -17788,6 +17995,20 @@ async fn proxy_to_backend_http3(
 
         match h3_result {
             Ok(response) => {
+                if let Some(len) = declared_response_length_exceeds_limit(
+                    &response.headers,
+                    state.max_response_body_size_bytes,
+                ) {
+                    return (
+                        h3_response_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            Some(len),
+                            state.max_response_body_size_bytes,
+                        ),
+                        retained_body,
+                    );
+                }
                 debug!(
                     proxy_id = %proxy.id,
                     status = response.status,
@@ -17797,6 +18018,10 @@ async fn proxy_to_backend_http3(
                     retry::BackendResponse {
                         status_code: response.status,
                         body: ResponseBody::StreamingH3(Box::new(response)),
+                        // The sole caller moves the headers out of the
+                        // `StreamingH3` payload via
+                        // `std::mem::take(&mut h3_resp.headers)` — leave
+                        // this empty instead of cloning the map per request.
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
@@ -18240,6 +18465,23 @@ mod tests {
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
+
+    #[test]
+    fn declared_response_length_exceeds_limit_only_when_header_is_over_cap() {
+        let mut headers = HashMap::new();
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+
+        headers.insert("content-length".to_string(), "11".to_string());
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 0), None);
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 11), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit(&headers, 10),
+            Some(11)
+        );
+
+        headers.insert("content-length".to_string(), "not-a-number".to_string());
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+    }
 
     /// Directly exercises the gRPC streaming circuit-breaker classification:
     /// a late client-upload overflow is gateway-side and must be NEUTRAL, while

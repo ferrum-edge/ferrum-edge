@@ -218,6 +218,14 @@ impl From<h3::error::StreamError> for H3BodyDrainError {
 /// reset) is NOT recovered — a stream reset means the server aborted this
 /// particular stream, whereas the connection-level signals above don't
 /// invalidate already-sent data.
+///
+/// Known residual (issue #1565 finding 3): buffered native-H3 paths drop
+/// backend trailers. This helper drains only DATA frames; any trailers the
+/// backend sends after the body are never read or forwarded. The streaming
+/// native-H3 paths forward trailers (`finish_h3_response_with_backend_trailers`
+/// in `http3/server.rs`), but plumbing trailers through the buffered paths
+/// requires a `ResponseBody::Buffered`-level trailer slot (and H1/H2 frontend
+/// chunked-trailer emission), which is deferred to a follow-up.
 pub(crate) async fn drain_h3_response_body(
     stream: &mut H3RequestStream,
     method: &str,

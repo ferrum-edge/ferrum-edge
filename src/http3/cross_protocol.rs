@@ -3014,7 +3014,7 @@ where
                                     "Backend response exceeded {} byte limit during cross-protocol H3 stream",
                                     max_response_body_size_bytes
                                 );
-                                let _ = stream.finish().await;
+                                crate::http3::stream_util::abort_response_stream(stream);
                                 body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
                                 break 'outer;
                             }
@@ -3055,14 +3055,8 @@ where
                     Ok(None) => { stream_done = true; }
                     Err(e) => {
                         let class = crate::retry::classify_reqwest_error(&e);
-                        if !coalesce_buf.is_empty() {
-                            let data = coalesce_buf.split().freeze();
-                            let data_len = data.len() as u64;
-                            if stream.send_data(data).await.is_ok() {
-                                bytes_streamed += data_len;
-                            }
-                        }
-                        let _ = stream.finish().await;
+                        coalesce_buf.clear();
+                        crate::http3::stream_util::abort_response_stream(stream);
                         body_error_class = Some(class);
                         break 'outer;
                     }
@@ -3145,7 +3139,7 @@ where
                             "Backend response exceeded {} byte limit during inspected cross-protocol H3 stream",
                             max_response_body_size_bytes
                         );
-                        let _ = stream.finish().await;
+                        crate::http3::stream_util::abort_response_stream(stream);
                         body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
                         break;
                     }
@@ -3213,7 +3207,7 @@ where
             }
             Err(e) => {
                 body_error_class = Some(crate::retry::classify_reqwest_error(&e));
-                let _ = stream.finish().await;
+                crate::http3::stream_util::abort_response_stream(stream);
                 break;
             }
         }
@@ -3260,7 +3254,7 @@ where
                                 Ok(d) => d,
                                 Err(_) => {
                                     body_error_class = Some(ErrorClass::ProtocolError);
-                                    let _ = stream.finish().await;
+                                    crate::http3::stream_util::abort_response_stream(stream);
                                     break 'outer;
                                 }
                             };
@@ -3272,7 +3266,7 @@ where
                                         "Backend response exceeded {} byte limit during cross-protocol H3 gRPC stream",
                                         max_response_body_size_bytes
                                     );
-                                    let _ = stream.finish().await;
+                                    crate::http3::stream_util::abort_response_stream(stream);
                                     body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
                                     break 'outer;
                                 }
@@ -3319,14 +3313,8 @@ where
                     }
                     Some(Err(e)) => {
                         body_error_class = Some(classify_hyper_error(&e));
-                        if !coalesce_buf.is_empty() {
-                            let out = coalesce_buf.split().freeze();
-                            let out_len = out.len() as u64;
-                            if stream.send_data(out).await.is_ok() {
-                                bytes_streamed += out_len;
-                            }
-                        }
-                        let _ = stream.finish().await;
+                        coalesce_buf.clear();
+                        crate::http3::stream_util::abort_response_stream(stream);
                         break 'outer;
                     }
                     None => { stream_done = true; }

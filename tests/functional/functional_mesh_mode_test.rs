@@ -36,8 +36,8 @@ use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConf
 use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequest};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication, PolicyAction,
-    PolicyScope, PrincipalMatch, ServicePort, Workload, WorkloadPort, WorkloadRef,
+    AppProtocol, MeshConfig, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication,
+    PolicyAction, PolicyScope, PrincipalMatch, ServicePort, Workload, WorkloadPort, WorkloadRef,
     WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
@@ -2247,6 +2247,195 @@ async fn functional_mesh_sidecar_egress_rejects_untrusted_client_gateway() {
     assert!(
         !body.contains("backend-ok"),
         "no backend body may leak through an unverified mTLS session: {body:?}\n{logs}"
+    );
+}
+
+// ── Localized file config source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) ────────
+
+/// JSON mesh document equivalent of `inbound_authz_slice`: the same routing +
+/// authz content, but expressed as the file source's `{ "mesh": ... }`
+/// document so the data plane builds the slice locally.
+fn inbound_authz_mesh_document(
+    server_spiffe: &str,
+    client_spiffe: &str,
+    backend_port: u16,
+    allow: bool,
+) -> String {
+    let slice = inbound_authz_slice("unused", server_spiffe, client_spiffe, backend_port, allow);
+    let mesh = MeshConfig {
+        workloads: slice.workloads,
+        services: slice.services,
+        peer_authentications: slice.peer_authentications,
+        mesh_policies: slice.mesh_policies,
+        ..MeshConfig::default()
+    };
+    serde_json::to_string(&serde_json::json!({ "mesh": mesh })).expect("mesh document serializes")
+}
+
+/// Keystone for the localized file source: a mesh data plane with **no control
+/// plane** loads its slice from disk, materializes the sidecar inbound route,
+/// serves an authorized peer's mTLS request to the co-located backend, and
+/// hot-applies a DENY policy when the document changes and SIGHUP arrives —
+/// all through the same datapath the native/xDS keystones exercise.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_file_source_serves_inbound_and_reloads_on_sighup() {
+    ensure_gateway_built().expect("gateway build");
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+    let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+
+    let mut last_failure = String::new();
+    'attempts: for attempt in 1..=RETRY_ATTEMPTS {
+        let temp = TempDir::new().expect("temp dir");
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let backend_port = start_echo_backend().await;
+
+        let mesh_doc_path = temp.path().join("mesh.json");
+        std::fs::write(
+            &mesh_doc_path,
+            inbound_authz_mesh_document(server_spiffe, client_spiffe, backend_port, true),
+        )
+        .expect("write mesh document");
+        let mesh_doc_env = mesh_doc_path
+            .to_str()
+            .expect("mesh document path is UTF-8")
+            .to_string();
+
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                // The file protocol consumes no CP; the harness's default
+                // FERRUM_DP_CP_GRPC_URLS points at a dead port and must be
+                // ignored by the file source.
+                cp_addr: "127.0.0.1:1".parse().expect("dummy addr"),
+                ports,
+                node_id: &format!("functional-mesh-file-source-{attempt}"),
+                config_protocol: "file",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_FILE_CONFIG_PATH", mesh_doc_env),
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        if !wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: inbound listener never bound\n{}",
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue 'attempts;
+        }
+
+        // Phase 1: the file-built slice materializes the inbound route and an
+        // authorized peer reaches the local backend.
+        let (status, body) = match mesh_inbound_http_get(
+            inbound_port,
+            &peers.ca_pem,
+            server_spiffe,
+            Some((&peers.client_cert_pem, &peers.client_key_pem)),
+            "echo.ferrum.svc.cluster.local",
+            "/",
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!("inbound mTLS HTTP GET failed: {e}\n{output}");
+            }
+        };
+        assert_eq!(
+            status,
+            200,
+            "an authorized peer must reach the backend through the file-built slice; body: \
+             {body:?}\n{}",
+            captured_output(&temp)
+        );
+        assert!(
+            body.contains("backend-ok"),
+            "the response must carry the local backend's body: {body:?}"
+        );
+
+        // Phase 2: rewrite the document with a DENY policy for the client
+        // principal and SIGHUP the gateway; the reload must take effect
+        // without a restart.
+        std::fs::write(
+            &mesh_doc_path,
+            inbound_authz_mesh_document(server_spiffe, client_spiffe, backend_port, false),
+        )
+        .expect("rewrite mesh document");
+        let pid = child.id().to_string();
+        let hup = Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .expect("send SIGHUP");
+        assert!(hup.success(), "SIGHUP delivery failed for pid {pid}");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match mesh_inbound_http_get(
+                inbound_port,
+                &peers.ca_pem,
+                server_spiffe,
+                Some((&peers.client_cert_pem, &peers.client_key_pem)),
+                "echo.ferrum.svc.cluster.local",
+                "/",
+            )
+            .await
+            {
+                Ok((403, denied_body)) => {
+                    assert!(
+                        !denied_body.contains("backend-ok"),
+                        "a denied request must not reach the backend: {denied_body:?}"
+                    );
+                    kill_child(&mut child);
+                    return;
+                }
+                Ok(_) | Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                Ok((other, other_body)) => {
+                    let output = captured_output(&temp);
+                    kill_child(&mut child);
+                    panic!(
+                        "SIGHUP-reloaded DENY policy never enforced: last status {other} body \
+                         {other_body:?}\n{output}"
+                    );
+                }
+                Err(e) => {
+                    let output = captured_output(&temp);
+                    kill_child(&mut child);
+                    panic!("inbound request failed while awaiting reload: {e}\n{output}");
+                }
+            }
+        }
+    }
+
+    panic!(
+        "mesh file-source gateway never bound its inbound listener after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
     );
 }
 
