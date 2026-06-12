@@ -18457,6 +18457,19 @@ async fn proxy_to_backend_http3_retry(
                 }
             }
             Err(e) => {
+                if e.is_read_timeout() {
+                    // `backend_read_timeout_ms` expired waiting for the
+                    // retried response headers — surface 504 Backend timeout
+                    // like the buffered retry arm below, not a generic 502.
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(backend_url),
+                        target = %format!("{}:{}", effective_host, effective_port),
+                        error = %e,
+                        "HTTP/3 backend read timeout waiting for response (streaming retry)"
+                    );
+                    return h3_read_timeout_backend_response(resolved_ip);
+                }
                 let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
                 record_port_exhaustion_if_class(&state.overload, error_class);
