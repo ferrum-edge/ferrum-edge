@@ -234,6 +234,7 @@ jobs:
               integration::mesh_telemetry_k8s_provider_lookup_tests
               integration::mesh_telemetry_tracing_tests
               integration::mesh_federation_poller_tests
+              integration::mesh_file_source_tests
               integration::mesh_multicluster_discovery_tests
               integration::mesh_proxy_config_tests
               integration::mesh_outbound_registry_stream_tests

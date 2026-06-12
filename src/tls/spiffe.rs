@@ -174,23 +174,20 @@ pub fn build_spiffe_outbound_config(
 /// rustls server-side resolver that presents the SVID currently in the slot.
 pub struct SpiffeServerCertResolver {
     slot: SharedBundleSlot,
+    certified_key_cache: ArcSwap<Option<SpiffeCertifiedKeyCache>>,
 }
 
 impl SpiffeServerCertResolver {
     pub fn new(slot: SharedBundleSlot) -> Self {
-        Self { slot }
+        Self {
+            slot,
+            certified_key_cache: ArcSwap::new(Arc::new(None)),
+        }
     }
 
     fn build_cert_key(&self) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let snapshot = self.slot.load_full();
-        let bundle = snapshot.as_ref().as_ref()?;
-        match certified_key_from_bundle(bundle) {
-            Ok(ck) => Some(Arc::new(ck)),
-            Err(e) => {
-                warn!(error = %e, "SPIFFE server resolver: failed to materialise CertifiedKey");
-                None
-            }
-        }
+        cached_certified_key(&self.certified_key_cache, snapshot, "server")
     }
 }
 
@@ -213,11 +210,15 @@ impl rustls::server::ResolvesServerCert for SpiffeServerCertResolver {
 
 pub struct SpiffeClientCertResolver {
     slot: SharedBundleSlot,
+    certified_key_cache: ArcSwap<Option<SpiffeCertifiedKeyCache>>,
 }
 
 impl SpiffeClientCertResolver {
     pub fn new(slot: SharedBundleSlot) -> Self {
-        Self { slot }
+        Self {
+            slot,
+            certified_key_cache: ArcSwap::new(Arc::new(None)),
+        }
     }
 }
 
@@ -234,13 +235,7 @@ impl rustls::client::ResolvesClientCert for SpiffeClientCertResolver {
         _sigschemes: &[rustls::SignatureScheme],
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let snapshot = self.slot.load_full();
-        let bundle = snapshot.as_ref().as_ref()?;
-        certified_key_from_bundle(bundle)
-            .map(Arc::new)
-            .map_err(|e| {
-                warn!(error = %e, "SPIFFE client resolver: failed to materialise CertifiedKey");
-            })
-            .ok()
+        cached_certified_key(&self.certified_key_cache, snapshot, "client")
     }
 
     fn has_certs(&self) -> bool {
@@ -459,6 +454,44 @@ fn certified_key_from_bundle(bundle: &SvidBundle) -> Result<rustls::sign::Certif
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| format!("ring sign init failed: {e}"))?;
     Ok(rustls::sign::CertifiedKey::new(chain, signing_key))
+}
+
+struct SpiffeCertifiedKeyCache {
+    source: Arc<Option<SvidBundle>>,
+    key: Arc<rustls::sign::CertifiedKey>,
+}
+
+fn cached_certified_key(
+    cache_slot: &ArcSwap<Option<SpiffeCertifiedKeyCache>>,
+    source: Arc<Option<SvidBundle>>,
+    resolver_kind: &'static str,
+) -> Option<Arc<rustls::sign::CertifiedKey>> {
+    let cached = cache_slot.load_full();
+    if let Some(cache) = cached.as_ref()
+        && Arc::ptr_eq(&cache.source, &source)
+    {
+        return Some(cache.key.clone());
+    }
+
+    let bundle = source.as_ref().as_ref()?;
+    match certified_key_from_bundle(bundle) {
+        Ok(key) => {
+            let key = Arc::new(key);
+            cache_slot.store(Arc::new(Some(SpiffeCertifiedKeyCache {
+                source,
+                key: key.clone(),
+            })));
+            Some(key)
+        }
+        Err(error) => {
+            warn!(
+                resolver = resolver_kind,
+                error = %error,
+                "SPIFFE resolver: failed to materialise CertifiedKey"
+            );
+            None
+        }
+    }
 }
 
 struct SpiffePeerVerifierCache {
@@ -761,6 +794,38 @@ mod tests {
         cert.der().to_vec()
     }
 
+    fn issue_leaf_with_key(
+        spiffe_id: &SpiffeId,
+        root_pem: &str,
+        root_key_pem: &str,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let issuer_kp = KeyPair::from_pem(root_key_pem).expect("re-parse root key");
+        let issuer: Issuer<'static, KeyPair> =
+            Issuer::from_ca_cert_pem(root_pem, issuer_kp).expect("issuer build");
+
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .subject_alt_names
+            .push(spiffe_id_to_san(spiffe_id).expect("spiffe SAN"));
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now;
+        params.not_after = now + time::Duration::seconds(3600);
+
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf keygen");
+        let cert = params.signed_by(&leaf_kp, &issuer).expect("sign leaf");
+        (cert.der().to_vec(), leaf_kp.serialize_der())
+    }
+
     fn bundle_for(td: TrustDomain, root_der: Vec<u8>) -> TrustBundleSet {
         TrustBundleSet::local_only(TrustBundle {
             trust_domain: td,
@@ -779,9 +844,55 @@ mod tests {
         }
     }
 
+    fn svid_bundle_with_key(
+        id: SpiffeId,
+        trust_bundles: TrustBundleSet,
+        leaf: Vec<u8>,
+        key: Vec<u8>,
+    ) -> SvidBundle {
+        SvidBundle {
+            spiffe_id: id,
+            cert_chain_der: vec![leaf],
+            private_key_pkcs8_der: key,
+            trust_bundles,
+        }
+    }
+
     /// An empty CRL list (`Arc<Vec<_>>`) — the no-revocation-checking default.
     fn empty_crls() -> CrlList {
         Arc::new(Vec::new())
+    }
+
+    #[test]
+    fn certified_key_cache_reuses_until_svid_snapshot_changes() {
+        let td = TrustDomain::new("cluster.local").unwrap();
+        let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+        let id = SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap();
+        let trust_bundles = bundle_for(td, root_der);
+        let (leaf, key) = issue_leaf_with_key(&id, &root_pem, &root_key_pem);
+        let source = Arc::new(Some(svid_bundle_with_key(
+            id.clone(),
+            trust_bundles.clone(),
+            leaf.clone(),
+            key.clone(),
+        )));
+        let cache = ArcSwap::new(Arc::new(None));
+
+        let first = cached_certified_key(&cache, source.clone(), "test").unwrap();
+        let second = cached_certified_key(&cache, source.clone(), "test").unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same ArcSwap snapshot should reuse CertifiedKey material"
+        );
+
+        let rotated_snapshot = Arc::new(Some(svid_bundle_with_key(id, trust_bundles, leaf, key)));
+        let third = cached_certified_key(&cache, rotated_snapshot, "test").unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "a new SVID snapshot pointer must rebuild CertifiedKey material"
+        );
     }
 
     /// Issue a leaf SVID under `root` with a known serial so a CRL can revoke

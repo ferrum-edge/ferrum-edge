@@ -67,6 +67,7 @@ fn test_runtime() -> MeshRuntimeConfig {
         namespace: "default".to_string(),
         cp_urls: vec!["http://127.0.0.1:1".to_string()],
         config_protocol: MeshConfigProtocol::Native,
+        file_config_path: None,
         topology: MeshTopology::Sidecar,
         inbound_listen_addr: test_addr("127.0.0.1:15006"),
         outbound_listen_addr: test_addr("127.0.0.1:15001"),

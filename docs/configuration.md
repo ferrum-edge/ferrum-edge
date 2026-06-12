@@ -216,7 +216,8 @@ With the xDS ADS protocol, invalid resource updates are NACKed and the last acce
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source. `native` uses Ferrum `MeshSubscribe`; `xds` uses the mesh ADS client against a Ferrum or compatible xDS control plane |
+| `FERRUM_MESH_CONFIG_PROTOCOL` | No | `native` | Mesh config source. `native` uses Ferrum `MeshSubscribe`; `xds` uses the mesh ADS client against a Ferrum or compatible xDS control plane; `file` builds the mesh slice locally from `FERRUM_MESH_FILE_CONFIG_PATH` with no control plane (`FERRUM_DP_CP_GRPC_URLS` / `FERRUM_CP_DP_GRPC_JWT_SECRET` not required) |
+| `FERRUM_MESH_FILE_CONFIG_PATH` | `file` protocol only | — | Path to the localized mesh config document (YAML/JSON, optional `version` plus the `mesh` section only). Fail-closed at startup; reloaded on SIGHUP (Unix), keeping the last good slice when a reload fails |
 | `FERRUM_MESH_XDS_NODE_CLUSTER` | No | `FERRUM_NAMESPACE` | xDS `Node.cluster` identity sent by mesh-mode ADS clients |
 | `FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS` | No | `10` | Mesh xDS client connect timeout. `0` disables the explicit tonic connect timeout |
 | `FERRUM_MESH_NODE_ID` | No | `$HOSTNAME` or `ferrum-mesh-node` | Stable mesh data-plane node ID used for xDS/MeshSubscribe |
