@@ -295,7 +295,7 @@ async fn recv_h3_response_with_timeout(
         match tokio::time::timeout(Duration::from_millis(backend_read_timeout_ms), recv).await {
             Ok(result) => result,
             Err(_) => {
-                return Err(H3PoolError::post_wire(anyhow::anyhow!(
+                return Err(H3PoolError::read_timeout(anyhow::anyhow!(
                     "recv_response read timeout after {}ms",
                     backend_read_timeout_ms
                 )));
@@ -542,6 +542,7 @@ pub struct H3PoolError {
     inner: anyhow::Error,
     request_on_wire: bool,
     graceful_close: bool,
+    read_timeout: bool,
 }
 
 impl H3PoolError {
@@ -554,6 +555,7 @@ impl H3PoolError {
             inner: error.into(),
             request_on_wire: false,
             graceful_close: false,
+            read_timeout: false,
         }
     }
 
@@ -566,6 +568,7 @@ impl H3PoolError {
             inner: error.into(),
             request_on_wire: true,
             graceful_close: false,
+            read_timeout: false,
         }
     }
 
@@ -585,6 +588,31 @@ impl H3PoolError {
             inner: error.into(),
             request_on_wire: true,
             graceful_close: true,
+            read_timeout: false,
+        }
+    }
+
+    /// Construct an error for a `backend_read_timeout_ms` deadline expiring
+    /// while waiting for the backend's response (headers via
+    /// `recv_response()` or buffered body frames via `recv_data()`).
+    ///
+    /// Post-wire by definition: the request was fully committed before the
+    /// gateway started waiting on the response, so `request_on_wire=true`
+    /// and gateway retries must respect `retry_on_methods`. The typed
+    /// [`is_read_timeout`](Self::is_read_timeout) signal lets dispatch
+    /// sites surface 504 Backend timeout (matching the direct-H2 / HBONE
+    /// read-timeout arms) instead of a generic 502, and classify as
+    /// [`ReadWriteTimeout`](crate::retry::ErrorClass::ReadWriteTimeout)
+    /// without relying on string heuristics. A read timeout must NOT
+    /// trigger `mark_h3_unsupported` — a stalled backend has not proved it
+    /// lost QUIC/H3 support (`is_h3_transport_error_class` excludes
+    /// `ReadWriteTimeout`).
+    pub fn read_timeout(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            inner: error.into(),
+            request_on_wire: true,
+            graceful_close: false,
+            read_timeout: true,
         }
     }
 
@@ -609,6 +637,17 @@ impl H3PoolError {
     /// signal, not a transport-level capability failure.
     pub fn is_graceful_close(&self) -> bool {
         self.graceful_close
+    }
+
+    /// Returns `true` if this error originates from a
+    /// `backend_read_timeout_ms` deadline expiring while waiting for the
+    /// backend response (header wait or buffered body drain). Gateway
+    /// dispatch sites use this typed signal to return 504 Backend timeout
+    /// (consistent with the direct-H2 / HBONE read-timeout arms) and to
+    /// classify as `ReadWriteTimeout` deterministically. Read timeouts do
+    /// not trigger `mark_h3_unsupported`.
+    pub fn is_read_timeout(&self) -> bool {
+        self.read_timeout
     }
 
     /// Conditionally promote the sticky `request_on_wire` flag.
@@ -1746,7 +1785,15 @@ impl Http3ConnectionPool {
             proxy.backend_read_timeout_ms,
         )
         .await
-        .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("recv_data failed: {}", e)))?;
+        .map_err(|e| match e {
+            H3BodyDrainError::ReadTimeout { .. } => {
+                // Preserve the typed read-timeout signal so the gateway
+                // dispatch sites map it to 504 Backend timeout instead of
+                // a generic 502 — see `H3PoolError::read_timeout`.
+                H3PoolError::read_timeout(anyhow::anyhow!("recv_data failed: {}", e))
+            }
+            other => H3PoolError::post_wire(anyhow::anyhow!("recv_data failed: {}", other)),
+        })?;
 
         Ok((status, response_body, response_headers))
     }
