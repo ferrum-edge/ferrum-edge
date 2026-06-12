@@ -2704,20 +2704,32 @@ mod original_dst_live_tests {
             eprintln!("SKIP: not root; cannot create network namespaces");
             return;
         }
-        let Some(child) = spawn_redirect_netns_child() else {
+        let Some(mut child) = spawn_redirect_netns_child() else {
             eprintln!("SKIP: `unshare --net` unavailable");
             return;
         };
-        let pid = child.id();
-        let _guard = ChildGuard(child);
-        // Let the child unshare, bring loopback up, and install the rule.
-        std::thread::sleep(Duration::from_millis(500));
-        // Child already gone == iptables install failed (exit 97): skip.
-        // Safety: signal 0 only probes liveness.
-        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        // Let the child unshare, bring loopback up, and install the rule;
+        // exit (97 = iptables unavailable, or any other failure) == skip.
+        // `try_wait` rather than `kill(pid, 0)`: an exited-but-unreaped child
+        // is a zombie that still answers signal 0, which would wrongly run
+        // the scenario in a namespace without the REDIRECT rule.
+        let mut child_exited = false;
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    child_exited = true;
+                    break;
+                }
+                Ok(None) => {}
+            }
+        }
+        if child_exited {
             eprintln!("SKIP: iptables unavailable inside the test netns");
             return;
         }
+        let pid = child.id();
+        let _guard = ChildGuard(child);
 
         // Everything runs on one throwaway thread inside the child's netns
         // (`setns` mutates only the calling thread, which exits right after).

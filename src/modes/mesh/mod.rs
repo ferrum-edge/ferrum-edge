@@ -716,6 +716,18 @@ pub fn prepare_gateway_config_for_mesh(
     config.normalize_fields();
     config.normalize_mesh_fields();
     let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+    // Back-project the slice's narrowed `services` view BEFORE preparation so
+    // every consumer of the prepared config sees exactly what materialization
+    // consumes — CP parity: on the CP-driven paths `gateway_config_from_mesh_slice`
+    // builds `config.mesh` FROM the slice, so a DP never carries un-narrowed
+    // services. Without this, a Sidecar egress scope that narrows a
+    // multi-port service's ports would leave the raw declaration in
+    // `config.mesh.services`, and the router's outbound sibling grouping
+    // (declared-HTTP-port fail-closed) would demand orig-dst for a service
+    // the slice narrowed to a single port.
+    if let Some(mesh) = config.mesh.as_deref_mut() {
+        mesh.services = mesh_slice.services.clone();
+    }
     prepare_normalized_gateway_config_for_mesh(config, runtime, &mesh_slice)
 }
 
@@ -2506,6 +2518,30 @@ fn apply_destination_rules(
         mesh_slice.destination_rules.iter().collect();
     sorted_destination_rules.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
 
+    // Owning Service port per materialized per-port outbound upstream
+    // (forward-derived from the slice, like `mesh_outbound_service_groups`).
+    // A per-port upstream accepts `portLevelSettings` ONLY for its owning
+    // Service port: its targets dial the resolved targetPort T, so the
+    // generic "entry port is a target port" acceptance below would otherwise
+    // let a DR entry authored for a DIFFERENT service port that numerically
+    // equals T leak onto this upstream — each sibling upstream must carry
+    // exactly its own port's policy.
+    let outbound_upstream_owner_port: std::collections::HashMap<String, u16> = mesh_slice
+        .services
+        .iter()
+        .flat_map(|svc| {
+            service_http_family_ports(svc)
+                .into_iter()
+                .map(|sp| {
+                    (
+                        mesh_outbound_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        sp.port,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
     for dr in sorted_destination_rules {
         let matching_upstream_indices: Vec<usize> = config
             .upstreams
@@ -2635,13 +2671,32 @@ fn apply_destination_rules(
             let upstream_id_for_tls = upstream.id.clone();
             for (port, port_policy) in &dr.port_level_settings {
                 // The `port_overrides` key this Service-port-scoped entry must
-                // land on. A mesh service-discovery upstream whose Service remaps
-                // the port via a numeric `targetPort` is re-keyed P→T (round-12
-                // F2); a direct target-port match needs no remap; a service-
-                // discovery upstream with no remap keeps the entry under the
-                // declared port (targets resolve at runtime); anything else is a
-                // phantom DR port.
-                let store_port = if upstream_target_ports.contains(port) {
+                // land on. A materialized per-port outbound upstream accepts
+                // ONLY its owning Service port's entry (re-keyed to the dial
+                // port when a numeric targetPort remap exists) — an entry for
+                // any other service port belongs to that port's own sibling
+                // upstream, even when it numerically equals this upstream's
+                // dial port. Otherwise: a mesh service-discovery upstream
+                // whose Service remaps the port via a numeric `targetPort` is
+                // re-keyed P→T (round-12 F2); a direct target-port match
+                // needs no remap; a service-discovery upstream with no remap
+                // keeps the entry under the declared port (targets resolve at
+                // runtime); anything else is a phantom DR port.
+                let store_port = if let Some(owning_port) =
+                    outbound_upstream_owner_port.get(&upstream.id)
+                {
+                    if port != owning_port {
+                        debug!(
+                            rule = %dr.name,
+                            upstream = %upstream.id,
+                            port = port,
+                            owning_port = owning_port,
+                            "DestinationRule portLevelSettings entry belongs to a sibling per-port upstream; skipping here"
+                        );
+                        continue;
+                    }
+                    *mesh_port_remap.get(port).unwrap_or(port)
+                } else if upstream_target_ports.contains(port) {
                     *port
                 } else if let Some(dial) = mesh_port_remap.get(port) {
                     *dial
@@ -8329,6 +8384,39 @@ mod tests {
     }
 
     #[test]
+    fn prepare_gateway_config_back_projects_narrowed_services() {
+        // `config.mesh.services` must carry the slice's NARROWED view after
+        // preparation (CP parity: `gateway_config_from_mesh_slice` builds the
+        // mesh block FROM the slice on the CP-driven paths). The router's
+        // outbound sibling grouping derives declared-HTTP-port counts from
+        // it, so an un-narrowed declaration would demand orig-dst for ports
+        // (or whole services) the slice narrowed away.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let local = http_mesh_service("reviews", 80, spiffe);
+        let mut foreign = http_mesh_service("ratings", 80, spiffe);
+        foreign.namespace = "other".to_string();
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![local, foreign],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.namespace, "default");
+        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh prepare");
+        let mesh = prepared.mesh.expect("mesh block survives preparation");
+        assert_eq!(
+            mesh.services
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reviews"],
+            "the prepared config carries the slice-narrowed services view"
+        );
+    }
+
+    #[test]
     fn mesh_outbound_sidecar_keeps_multi_port_fail_closed() {
         // Sidecar destination INBOUND multi-port still fails closed (inbound
         // dials are direct, never NATed), so per-port Sidecar egress would
@@ -8439,6 +8527,86 @@ mod tests {
         assert!(
             !upstream.port_overrides.contains_key(&80),
             "per-port policy must not remain under the service port 80"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_port_policy_does_not_leak_across_sibling_upstreams() {
+        // Service declares ports 80 (targetPort 8080) and 8080. Port 80's
+        // upstream DIALS 8080, so the generic "entry port is a target port"
+        // acceptance would wrongly apply the DR entry authored for SERVICE
+        // port 8080 to port 80's upstream. Each per-port sibling must carry
+        // exactly its own service port's policy.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut svc = http_mesh_service("reviews", 80, spiffe);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        svc.ports.push(ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http-alt".to_string()),
+            target_port: None,
+        });
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("reviews", "reviews", "10.0.0.1")],
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([
+                    (
+                        80u16,
+                        MeshTrafficPolicy {
+                            connect_timeout_ms: Some(1111),
+                            ..MeshTrafficPolicy::default()
+                        },
+                    ),
+                    (
+                        8080u16,
+                        MeshTrafficPolicy {
+                            connect_timeout_ms: Some(2222),
+                            ..MeshTrafficPolicy::default()
+                        },
+                    ),
+                ]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+
+        let upstream_80 = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
+            .expect("port-80 upstream materialized");
+        assert_eq!(
+            upstream_80
+                .port_overrides
+                .get(&8080)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(1111),
+            "port 80's upstream carries ITS OWN service port's policy, \
+             re-keyed onto its dial port 8080"
+        );
+
+        let upstream_8080 = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-8080")
+            .expect("port-8080 upstream materialized");
+        assert_eq!(
+            upstream_8080
+                .port_overrides
+                .get(&8080)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(2222),
+            "service port 8080's policy lands only on its own sibling upstream"
         );
     }
 
