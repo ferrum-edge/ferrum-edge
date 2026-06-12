@@ -2709,8 +2709,32 @@ fn apply_destination_rules(
                     None
                 };
 
+                let is_owner_entry = outbound_upstream_owner_port.get(&upstream.id) == Some(port);
+                // Seed a FRESH fanned slot's passive health from the upstream
+                // level — which carries this DR's top-level outlierDetection,
+                // applied above — so a PARTIAL per-port outlier override
+                // layers over the top-level window/recovery fields instead of
+                // over defaults (`passive_health_for_target` prefers a
+                // per-port slot outright). Owner-gated entries only, and only
+                // when the entry actually carries outlierDetection; a slot an
+                // earlier rule already populated keeps its accumulated
+                // layering.
+                let upstream_passive_seed =
+                    if is_owner_entry && port_policy.outlier_detection.is_some() {
+                        upstream
+                            .health_checks
+                            .as_ref()
+                            .and_then(|h| h.passive.clone())
+                    } else {
+                        None
+                    };
                 for store_port in store_ports {
                     let override_slot = upstream.port_overrides.entry(store_port).or_default();
+                    if override_slot.passive_health_check.is_none()
+                        && let Some(ref seed) = upstream_passive_seed
+                    {
+                        override_slot.passive_health_check = Some(seed.clone());
+                    }
                     apply_traffic_policy_to_port_override(override_slot, port_policy);
                     if let Some(ref slot) = resolved_port_tls {
                         override_slot.tls = Some(slot.clone());
@@ -2726,15 +2750,22 @@ fn apply_destination_rules(
                 // upstream-level LB/hash/locality (and upstream-level passive
                 // thresholds back the per-target slots). This upstream serves
                 // exactly one Service port, so its port policy IS the
-                // whole-upstream policy. Additive like the per-port slot
-                // convention — only fields the entry sets are applied, so a
-                // top-level trafficPolicy's other fields survive.
-                if outbound_upstream_owner_port.get(&upstream.id) == Some(port) {
+                // whole-upstream policy. Field semantics mirror the per-port
+                // slot helper: LB/outlier layer additively, hash keys are
+                // owned by the LB choice (cleared when the entry switches to
+                // a non-hash algorithm), and locality is owned by the entry
+                // with a fallback to this DR's top-level locality — exactly
+                // the per-port LANE's `.or(upstream-level)` fallback at LB
+                // build — assigned unconditionally so a later rule's owning
+                // entry that omits locality clears a stale earlier projection
+                // instead of pinning it.
+                if is_owner_entry {
                     if let Some(algorithm) = mesh_lb_to_ferrum(&port_policy.load_balancer) {
                         upstream.algorithm = algorithm;
-                    }
-                    if let Some(hash_on) = mesh_hash_on_to_ferrum(&port_policy.load_balancer) {
-                        upstream.hash_on = Some(hash_on);
+                        // Unconditional: clears stale hash keys when this
+                        // port switches to a non-hash algorithm (mirrors
+                        // `apply_traffic_policy_to_port_override`).
+                        upstream.hash_on = mesh_hash_on_to_ferrum(&port_policy.load_balancer);
                     }
                     if let Some(ref od) = port_policy.outlier_detection {
                         let passive = upstream
@@ -2744,9 +2775,15 @@ fn apply_destination_rules(
                             .get_or_insert_with(PassiveHealthCheck::default);
                         apply_outlier_detection_to_passive(passive, od);
                     }
-                    if let Some(ref locality) = port_policy.locality_lb_setting {
-                        upstream.locality_lb_setting = Some(into_upstream_locality(locality));
-                    }
+                    upstream.locality_lb_setting = port_policy
+                        .locality_lb_setting
+                        .as_ref()
+                        .or_else(|| {
+                            dr.traffic_policy
+                                .as_ref()
+                                .and_then(|tp| tp.locality_lb_setting.as_ref())
+                        })
+                        .map(into_upstream_locality);
                 }
             }
 
@@ -8636,7 +8673,20 @@ mod tests {
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
                 host: "reviews.default.svc.cluster.local".to_string(),
-                traffic_policy: None,
+                // Top-level consistentHash: the owning port entry's switch to
+                // a non-hash algorithm must clear the stale hash policy at
+                // the upstream level (the hash strategy is read independently
+                // of the selected algorithm).
+                traffic_policy: Some(MeshTrafficPolicy {
+                    load_balancer: Some(MeshLoadBalancer::ConsistentHash(
+                        crate::modes::mesh::config::MeshConsistentHash {
+                            http_header_name: Some("x-session".to_string()),
+                            http_cookie_name: None,
+                            use_source_ip: false,
+                        },
+                    )),
+                    ..MeshTrafficPolicy::default()
+                }),
                 port_level_settings: HashMap::from([(
                     80u16,
                     MeshTrafficPolicy {
@@ -8690,6 +8740,151 @@ mod tests {
             LoadBalancerAlgorithm::Random,
             "the owning port's loadBalancer must apply at the upstream level \
              so heterogeneous-dial-port selection honors it"
+        );
+        assert_eq!(
+            upstream.hash_on, None,
+            "switching the owning port to a non-hash algorithm must clear the \
+             top-level consistentHash key — the hash strategy is read \
+             independently of the selected algorithm"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_fanned_slots_layer_partial_outlier_over_top_level() {
+        // A top-level outlierDetection sets the detection window / recovery
+        // fields; the owning port entry overrides only consecutiveErrors. The
+        // fresh fanned dial-port slot must be SEEDED from the upstream-level
+        // passive config so `passive_health_for_target` (which prefers a
+        // per-port slot outright) still sees the top-level window/recovery
+        // fields layered under the per-port override.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut svc = http_mesh_service("reviews", 80, spiffe);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        let mut wl = workload_with_address("reviews", "reviews", "10.0.0.1");
+        wl.ports = vec![WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![wl],
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: None,
+                        interval_seconds: Some(33),
+                        base_ejection_seconds: Some(44),
+                        max_ejection_percent: None,
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::from([(
+                    80u16,
+                    MeshTrafficPolicy {
+                        outlier_detection: Some(MeshOutlierDetection {
+                            consecutive_errors: Some(7),
+                            interval_seconds: None,
+                            base_ejection_seconds: None,
+                            max_ejection_percent: None,
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
+            .expect("outbound upstream materialized");
+        let slot_passive = upstream
+            .port_overrides
+            .get(&8080)
+            .and_then(|slot| slot.passive_health_check.as_ref())
+            .expect("fanned slot carries passive health");
+        assert_eq!(
+            slot_passive.unhealthy_threshold, 7,
+            "the per-port consecutiveErrors override applies"
+        );
+        assert_eq!(
+            slot_passive.unhealthy_window_seconds, 33,
+            "the top-level detection interval must survive in the fanned slot"
+        );
+        assert_eq!(
+            slot_passive.healthy_after_seconds, 44,
+            "the top-level base ejection time must survive in the fanned slot"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_owner_locality_overlay_clears_stale_projection() {
+        // Rule "a" projects a locality policy via the owning port entry; a
+        // LATER rule "b" for the same host carries an owning-port entry that
+        // omits locality (and no top-level locality). The upstream-level
+        // overlay must CLEAR the earlier projection — heterogeneous-dial-port
+        // selection reads the upstream-level locality state, which must not
+        // pin a policy the latest rule no longer declares.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut svc = http_mesh_service("reviews", 80, spiffe);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        let mut wl = workload_with_address("reviews", "reviews", "10.0.0.1");
+        wl.ports = vec![WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let locality = MeshLocalityLbSetting {
+            enabled: true,
+            ..MeshLocalityLbSetting::default()
+        };
+        let dr = |name: &str, with_locality: bool| MeshDestinationRule {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            host: "reviews.default.svc.cluster.local".to_string(),
+            traffic_policy: None,
+            port_level_settings: HashMap::from([(
+                80u16,
+                MeshTrafficPolicy {
+                    locality_lb_setting: with_locality.then(|| locality.clone()),
+                    ..MeshTrafficPolicy::default()
+                },
+            )]),
+            subsets: Vec::new(),
+        };
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![wl],
+            services: vec![svc],
+            // Sorted application order: "a" (sets locality) then "b" (omits).
+            destination_rules: vec![dr("a", true), dr("b", false)],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
+            .expect("outbound upstream materialized");
+        assert!(
+            upstream.locality_lb_setting.is_none(),
+            "the later owning entry omitting locality must clear the earlier \
+             rule's upstream-level projection"
         );
     }
 
