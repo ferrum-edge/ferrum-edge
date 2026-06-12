@@ -1242,7 +1242,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     );
     // The appended gRPC-Web trailer frame is flagged 0x80.
     assert!(
-        body_bytes.iter().any(|&b| b == 0x80),
+        body_bytes.contains(&0x80),
         "gRPC-Web body must contain a trailer frame (flag 0x80)"
     );
 }
