@@ -1218,14 +1218,6 @@ pub fn svid_fingerprint(bundle: &SvidBundle) -> Result<String, HbonePoolError> {
     Ok(out)
 }
 
-pub(crate) fn current_svid_identity(
-    gateway_svid: &SharedSvidBundle,
-) -> Result<(crate::identity::SpiffeId, String), HbonePoolError> {
-    let snapshot = gateway_svid.load_full();
-    let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
-    Ok((bundle.spiffe_id.clone(), svid_fingerprint(bundle)?))
-}
-
 fn hbone_key_svid_fingerprint(key: &str) -> Option<&str> {
     key.split('|').nth(5)
 }
