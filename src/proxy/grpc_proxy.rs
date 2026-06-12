@@ -1235,6 +1235,22 @@ pub(crate) fn grpc_admission_status_from_maps(
         .unwrap_or(http_status)
 }
 
+/// Reserved gRPC terminal-status metadata keys (`grpc-status`,
+/// `grpc-message`, `grpc-status-details-bin`). Per the gRPC HTTP/2 mapping,
+/// a non-Trailers-Only response must carry these ONLY in the terminal
+/// TRAILERS frame — a copy in the initial HEADERS is malformed backend
+/// output. The buffered writeback path uses this to (a) let the trailing
+/// value win in the merged plugin view and (b) always strip the initial
+/// header copy on the non-empty wire path, even when the key would
+/// otherwise be header-shadowed. Keys are compared lowercase (hyper
+/// normalizes header names).
+pub(crate) fn is_reserved_grpc_terminal_metadata(key: &str) -> bool {
+    matches!(
+        key,
+        "grpc-status" | "grpc-message" | "grpc-status-details-bin"
+    )
+}
+
 /// HTTP/3 admission rejects use `425 Too Early` for 0-RTT policy failures.
 /// gRPC clients should see that transport retry signal as UNAVAILABLE.
 pub(crate) fn h3_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
@@ -1961,8 +1977,9 @@ pub(crate) async fn proxy_grpc_request_core(
 /// RFC 9110 §7.6.1 response-direction hop-by-hop names.
 ///
 /// gRPC carries `grpc-status` / `grpc-message` / `grpc-status-details-bin` in
-/// trailers, and at the forward boundary in `mod.rs` they are merged into
-/// the response header map (gRPC trailers-only encoding). A misbehaving or
+/// trailers, and the forward boundary in `mod.rs` emits them as true trailers
+/// when a buffered response has a non-empty body. Empty-body responses still
+/// use gRPC trailers-only encoding in initial headers. A misbehaving or
 /// malicious backend that puts hop-by-hop directives like `connection:
 /// close`, `proxy-authenticate`, `keep-alive`, `transfer-encoding`, or
 /// `upgrade` in the trailer map would otherwise leak past the proxy
