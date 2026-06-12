@@ -5156,7 +5156,7 @@ where
 {
     loop {
         stream.ready(interest).await?;
-        match stream.try_io(interest, || op()) {
+        match stream.try_io(interest, &mut op) {
             Ok(n) => return Ok(n),
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(err) => return Err(err),
