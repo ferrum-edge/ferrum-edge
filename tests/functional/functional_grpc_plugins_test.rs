@@ -186,13 +186,26 @@ async fn send_grpc_request(
     Ok((status, headers, body_bytes))
 }
 
-async fn wait_for_gateway(admin_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn wait_for_gateway(
+    admin_port: u16,
+    gateway_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let health_url = format!("http://127.0.0.1:{}/health", admin_port);
 
     for _ in 0..60 {
+        // Admin health alone is not enough: the proxy listener binds
+        // separately, and a parallel test can steal the freed proxy port
+        // between `free_port()`'s drop and the gateway's bind (the gateway
+        // fails silently with `Stdio::null()`). Require BOTH the admin
+        // health check and a successful TCP connect to the proxy port so a
+        // half-started gateway triggers the retry loop instead of a
+        // ConnectionRefused panic mid-test.
         if let Ok(resp) = client.get(&health_url).send().await
             && resp.status().is_success()
+            && tokio::net::TcpStream::connect(("127.0.0.1", gateway_port))
+                .await
+                .is_ok()
         {
             return Ok(());
         }
@@ -221,7 +234,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
             }
         };
 
-        match wait_for_gateway(admin_port).await {
+        match wait_for_gateway(admin_port, gateway_port).await {
             Ok(()) => return (child, gateway_port, admin_port),
             Err(e) => {
                 eprintln!(
