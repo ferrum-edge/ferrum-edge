@@ -1446,6 +1446,38 @@ fn test_unique_consumer_identities_own_custom_id_matches_own_username() {
     assert!(config.validate_unique_consumer_identities().is_ok());
 }
 
+#[test]
+fn test_unique_consumer_identities_username_collides_with_other_id() {
+    let c1 = make_consumer("alice-id", "alice");
+    let c2 = make_consumer("c2", "alice-id");
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_identities().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("collides with id"));
+}
+
+#[test]
+fn test_unique_consumer_identities_custom_id_collides_with_other_id() {
+    let c1 = make_consumer("alice-id", "alice");
+    let mut c2 = make_consumer("c2", "bob");
+    c2.custom_id = Some("alice-id".into());
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_identities().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("collides with id"));
+}
+
+#[test]
+fn test_unique_consumer_identities_own_custom_id_matches_own_id() {
+    let mut c1 = make_consumer("alice-id", "alice");
+    c1.custom_id = Some("alice-id".into());
+    let mut config = empty_config();
+    config.consumers = vec![c1];
+    assert!(config.validate_unique_consumer_identities().is_ok());
+}
+
 // ---- Upstream name uniqueness tests ----
 
 #[test]

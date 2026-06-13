@@ -2001,6 +2001,15 @@ mod inner {
 
         async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+            self.proxies()
+                .update_many(
+                    doc! { "plugins.plugin_config_id": id },
+                    doc! {
+                        "$pull": { "plugins": { "plugin_config_id": id } },
+                        "$set": { "updated_at": Utc::now().to_rfc3339() },
+                    },
+                )
+                .await?;
             let result = self.plugin_configs().delete_one(doc! { "_id": id }).await?;
             self.check_slow_query("delete_plugin_config", start);
             Ok(result.deleted_count > 0)
@@ -2287,16 +2296,26 @@ mod inner {
         async fn check_consumer_identity_unique(
             &self,
             namespace: &str,
+            consumer_id: &str,
             username: &str,
             custom_id: Option<&str>,
             exclude_consumer_id: Option<&str>,
         ) -> Result<Option<String>, anyhow::Error> {
-            // Build OR filter for username or custom_id match
-            let mut or_conditions = vec![doc! { "username": username }];
-            if let Some(cid) = custom_id {
-                or_conditions.push(doc! { "custom_id": cid });
+            let mut candidates = vec![
+                Bson::String(consumer_id.to_string()),
+                Bson::String(username.to_string()),
+            ];
+            if let Some(custom_id) = custom_id {
+                candidates.push(Bson::String(custom_id.to_string()));
             }
-            let mut filter = doc! { "namespace": namespace, "$or": or_conditions };
+            let mut filter = doc! {
+                "namespace": namespace,
+                "$or": [
+                    { "_id": { "$in": candidates.clone() } },
+                    { "username": { "$in": candidates.clone() } },
+                    { "custom_id": { "$in": candidates } },
+                ],
+            };
             if let Some(id) = exclude_consumer_id {
                 filter.insert("_id", doc! { "$ne": id });
             }
@@ -2608,6 +2627,13 @@ mod inner {
             self.proxies()
                 .create_index(
                     IndexModel::builder()
+                        .keys(doc! { "plugins.plugin_config_id": 1 })
+                        .build(),
+                )
+                .await?;
+            self.proxies()
+                .create_index(
+                    IndexModel::builder()
                         .keys(doc! { "namespace": 1, "listen_port": 1 })
                         .options(
                             IndexOptions::builder()
@@ -2678,6 +2704,36 @@ mod inner {
                 )
                 .await?;
             self.consumers()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "credentials.keyauth.key": 1 })
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "credentials.keyauth.key": { "$type": "string" }
+                                })
+                                .build(),
+                        )
+                        .build(),
+                )
+                .await?;
+            self.consumers()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "credentials.mtls_auth.identity": 1 })
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "credentials.mtls_auth.identity": { "$type": "string" }
+                                })
+                                .build(),
+                        )
+                        .build(),
+                )
+                .await?;
+            self.consumers()
                 .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
                 .await?;
             // No standalone {namespace} index — covered by {namespace, updated_at} below.
@@ -2725,6 +2781,13 @@ mod inner {
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "scope": 1 })
+                        .build(),
+                )
+                .await?;
+            self.plugin_configs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "scope": 1, "_id": 1 })
                         .build(),
                 )
                 .await?;
@@ -4494,6 +4557,30 @@ mod inner {
             assert_eq!(doc.get_str("_id").unwrap(), "unique-id-123");
             // The original id field should also be present (BSON serialization includes it)
             assert_eq!(doc.get_str("id").unwrap(), "unique-id-123");
+        }
+
+        #[test]
+        fn run_migrations_declares_proxy_plugin_cleanup_indexes() {
+            let source = include_str!("mongo_store.rs");
+            assert!(
+                source.contains(r#""plugins.plugin_config_id": 1"#),
+                "MongoDB must index proxy plugin associations for orphan cleanup"
+            );
+            assert!(
+                source.contains(r#""scope": 1, "_id": 1"#),
+                "MongoDB must have a scope-leading plugin_configs index for proxy_group cleanup"
+            );
+        }
+
+        #[test]
+        fn run_migrations_declares_unique_consumer_credential_indexes() {
+            let source = include_str!("mongo_store.rs");
+            assert!(
+                source.contains(r#""credentials.keyauth.key": 1"#)
+                    && source.contains(r#""credentials.mtls_auth.identity": 1"#)
+                    && source.contains(".unique(true)"),
+                "MongoDB must enforce keyauth and mTLS credential uniqueness with indexes"
+            );
         }
 
         /// Regression guard for the MongoDB unique+sparse index on

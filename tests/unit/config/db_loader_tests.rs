@@ -4,8 +4,9 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, LoadBalancerAlgorithm, Upstream, UpstreamTarget,
+    AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, Upstream, UpstreamTarget,
 };
+use serde_json::json;
 use std::collections::HashSet;
 
 fn make_upstream(id: &str) -> Upstream {
@@ -38,6 +39,19 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: Default::default(),
         api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+fn make_consumer(id: &str, username: &str) -> Consumer {
+    Consumer {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: username.to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -287,4 +301,105 @@ async fn upstream_backend_tls_identity_fields_round_trip_sql_store() {
         Some("ratings.mesh.internal")
     );
     assert_eq!(loaded.backend_tls_san_allow_list, vec!["10.0.0.8"]);
+}
+
+#[tokio::test]
+async fn consumer_credential_index_enforces_keyauth_uniqueness() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("consumer_credential_index.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials
+        .insert("keyauth".to_string(), json!([{ "key": "shared-key" }]));
+    store.create_consumer(&c1).await.unwrap();
+
+    assert!(
+        !store
+            .check_keyauth_key_unique("ferrum", "shared-key", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .check_keyauth_key_unique("ferrum", "shared-key", Some("c1"))
+            .await
+            .unwrap()
+    );
+
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials
+        .insert("keyauth".to_string(), json!([{ "key": "shared-key" }]));
+    let err = store
+        .create_consumer(&c2)
+        .await
+        .expect_err("duplicate keyauth key must violate credential index");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("consumer_credential_index")
+            || msg.contains("UNIQUE")
+            || msg.contains("constraint"),
+        "unexpected duplicate-key error: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn consumer_credential_index_updates_on_consumer_update() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("consumer_credential_index_update.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut consumer = make_consumer("c1", "alice");
+    consumer
+        .credentials
+        .insert("keyauth".to_string(), json!([{ "key": "old-key" }]));
+    consumer.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{ "identity": "spiffe://example.test/ns/default/sa/alice" }]),
+    );
+    store.create_consumer(&consumer).await.unwrap();
+
+    consumer
+        .credentials
+        .insert("keyauth".to_string(), json!([{ "key": "new-key" }]));
+    consumer.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{ "identity": "spiffe://example.test/ns/default/sa/alice-v2" }]),
+    );
+    store.update_consumer(&consumer).await.unwrap();
+
+    assert!(
+        store
+            .check_keyauth_key_unique("ferrum", "old-key", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .check_keyauth_key_unique("ferrum", "new-key", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .check_mtls_identity_unique("ferrum", "spiffe://example.test/ns/default/sa/alice", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .check_mtls_identity_unique(
+                "ferrum",
+                "spiffe://example.test/ns/default/sa/alice-v2",
+                None,
+            )
+            .await
+            .unwrap()
+    );
 }

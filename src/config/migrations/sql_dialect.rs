@@ -94,6 +94,7 @@ impl V001SqlBuilder {
         for sql in [
             self.create_upstreams_sql(),
             self.create_consumers_sql(),
+            self.create_consumer_credential_index_sql(),
             self.create_proxies_sql(),
             self.create_plugin_configs_sql(),
             self.create_proxy_plugins_sql(),
@@ -128,6 +129,7 @@ impl V001SqlBuilder {
             // rule. Keeping both would only add write amplification.
             "CREATE INDEX IF NOT EXISTS idx_proxies_ns_updated ON proxies (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_updated ON consumers (namespace, updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_consumer_credential_index_consumer_id ON consumer_credential_index (consumer_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_updated ON plugin_configs (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_updated ON upstreams (namespace, updated_at)",
             // Covering indexes for the incremental-poll deletion diff. Every
@@ -156,6 +158,7 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_id ON plugin_configs (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_id ON upstreams (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_scope ON plugin_configs (namespace, scope)",
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_scope_id ON plugin_configs (scope, id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_plugin_name ON plugin_configs (namespace, plugin_name)",
             // Cold-path index for cross-namespace mesh_route_dispatch lookups in
             // `mesh_route_dispatch_plugin_configs_tx`. Upstream IDs are globally
@@ -342,6 +345,31 @@ impl V001SqlBuilder {
                 acl_groups TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#
+        }
+    }
+
+    fn create_consumer_credential_index_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS consumer_credential_index (
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                credential_type VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                credential_hash VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                consumer_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                PRIMARY KEY (namespace, credential_type, credential_hash),
+                CONSTRAINT fk_consumer_credential_index_consumer FOREIGN KEY (consumer_id) REFERENCES consumers(id) ON DELETE CASCADE
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS consumer_credential_index (
+                namespace TEXT NOT NULL,
+                credential_type TEXT NOT NULL,
+                credential_hash TEXT NOT NULL,
+                consumer_id TEXT NOT NULL REFERENCES consumers(id) ON DELETE CASCADE,
+                PRIMARY KEY (namespace, credential_type, credential_hash)
             )
             "#
         }
@@ -938,6 +966,22 @@ mod tests {
             sql,
             "consumers",
             &["id", "namespace", "username", "custom_id"],
+        );
+    }
+
+    #[test]
+    fn test_mysql_consumer_credential_index_collation_on_identifier_columns() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_consumer_credential_index_sql();
+        assert_columns_have_collation(
+            sql,
+            "consumer_credential_index",
+            &[
+                "namespace",
+                "credential_type",
+                "credential_hash",
+                "consumer_id",
+            ],
         );
     }
 

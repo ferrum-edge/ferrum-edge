@@ -1136,6 +1136,10 @@ struct MeshPeerSvids {
     server_key_path: String,
     trust_bundle_path: String,
     ca_pem: String,
+    /// CA private key (PEM) so tests can re-issue the server leaf from the
+    /// SAME CA — the SVID-rotation keystone overwrites the server SVID files
+    /// in place and expects the inbound listener to pick the new leaf up.
+    ca_key_pem: String,
     client_cert_pem: String,
     client_key_pem: String,
     /// A client leaf signed by the **same CA** but bearing a SPIFFE ID in a trust
@@ -1169,6 +1173,7 @@ fn generate_mesh_peer_svids(
     ca_params.not_after = not_after;
     let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
     let ca_pem = ca_cert.pem();
+    let ca_key_pem = ca_key.serialize_pem();
     let issuer = Issuer::new(ca_params, ca_key);
 
     let leaf = |spiffe: &str| -> (String, String) {
@@ -1220,11 +1225,93 @@ fn generate_mesh_peer_svids(
         server_key_path: to_str(server_key_path),
         trust_bundle_path: to_str(trust_bundle_path),
         ca_pem,
+        ca_key_pem,
         client_cert_pem,
         client_key_pem,
         untrusted_td_client_cert_pem,
         untrusted_td_client_key_pem,
     }
+}
+
+/// Re-issue the server SVID leaf from the SAME CA (same SPIFFE identity, fresh
+/// key) and overwrite the on-disk cert/key files in place — exactly what an
+/// external SVID rotator does. The gateway's SVID file watcher should pick the
+/// change up within its poll interval and the inbound listener should start
+/// presenting the new leaf without a restart.
+fn rotate_server_svid_files(peers: &MeshPeerSvids) {
+    use rcgen::{
+        CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, Issuer, KeyPair, SanType,
+    };
+    let ca_key = KeyPair::from_pem(&peers.ca_key_pem).expect("ca key from pem");
+    let issuer = Issuer::from_ca_cert_pem(&peers.ca_pem, ca_key).expect("issuer from ca pem");
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("rotated leaf key");
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    let id = SpiffeId::new(&peers.server_spiffe).expect("valid SPIFFE ID");
+    params
+        .subject_alt_names
+        .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        )));
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+    params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+    let cert = params.signed_by(&key, &issuer).expect("rotated leaf cert");
+    std::fs::write(&peers.server_cert_path, cert.pem()).expect("overwrite server cert");
+    std::fs::write(&peers.server_key_path, key.serialize_pem()).expect("overwrite server key");
+}
+
+/// Complete one mTLS handshake against the inbound listener and return the
+/// server's presented leaf certificate (DER), verifying it chains to `ca_pem`
+/// and carries `expected_server_spiffe`. Used to observe WHICH leaf the
+/// listener serves across an SVID rotation.
+async fn mesh_inbound_server_leaf(
+    port: u16,
+    ca_pem: &str,
+    expected_server_spiffe: &str,
+    client_identity: (&str, &str),
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+        roots.add(cert)?;
+    }
+    let provider = rustls::crypto::ring::default_provider();
+    let (cert_pem, key_pem) = client_identity;
+    let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .filter_map(|c| c.ok())
+        .collect();
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
+        .ok_or("no client private key in PEM")?;
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_client_auth_cert(chain, key)?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())?;
+    let tls = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+        .await
+        .map_err(|_| "tls handshake timed out")??;
+    let (_io, conn) = tls.get_ref();
+    let leaf = conn
+        .peer_certificates()
+        .and_then(|chain| chain.first())
+        .ok_or("server presented no certificate")?;
+    let server_id = ferrum_edge::identity::spiffe::extract_spiffe_id_from_cert(leaf.as_ref())
+        .map_err(|e| format!("server leaf lacks a valid SPIFFE URI SAN: {e}"))?;
+    let expected = SpiffeId::new(expected_server_spiffe)?;
+    if server_id != expected {
+        return Err(
+            format!("server SPIFFE ID '{server_id}' does not match expected '{expected}'").into(),
+        );
+    }
+    Ok(leaf.as_ref().to_vec())
 }
 
 /// A mesh slice whose mesh-wide PeerAuthentication resolves the inbound mTLS mode
@@ -1353,6 +1440,134 @@ async fn mesh_inbound_mtls_connect(
 /// The request→authz→backend leg (which needs real capture/routing) is covered by
 /// the kind `mesh-e2e-sidecar` workflow (Increment B). The spawn is retried with
 /// fresh ports per the `tests/**` bind-race rule; the mTLS assertions are not.
+/// F1 keystone: the SVID-backed inbound server identity ROTATES LIVE. After an
+/// external rotator re-issues the server SVID files in place (same SPIFFE id,
+/// fresh leaf/key), the gateway's SVID file watcher installs the new bundle and
+/// the inbound listener starts presenting the NEW leaf — no restart. Before
+/// this, the inbound server cert was pinned at startup and kept serving the old
+/// leaf until it expired.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_inbound_server_identity_rotates_with_svid_files() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-inbound-svid-rotation-{attempt}");
+        let temp = TempDir::new().expect("temp dir");
+        let peers = generate_mesh_peer_svids(
+            temp.path(),
+            "spiffe://cluster.local/ns/ferrum/sa/server",
+            "spiffe://cluster.local/ns/default/sa/client",
+        );
+        let cp = start_static_mesh_cp(strict_peer_auth_slice(&node_id)).await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        if !wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: inbound listener never bound\n{}",
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let client_identity = (
+            peers.client_cert_pem.as_str(),
+            peers.client_key_pem.as_str(),
+        );
+        let leaf_before = mesh_inbound_server_leaf(
+            inbound_port,
+            &peers.ca_pem,
+            &peers.server_spiffe,
+            client_identity,
+        )
+        .await;
+        let leaf_before = match leaf_before {
+            Ok(leaf) => leaf,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                cp.shutdown().await;
+                panic!("startup leaf probe failed: {e}\n{output}");
+            }
+        };
+
+        // External rotation: overwrite the SVID files in place (same SPIFFE
+        // identity, same CA, fresh leaf + key).
+        rotate_server_svid_files(&peers);
+
+        // The SVID file watcher polls every second; give it a bounded window
+        // and require the served leaf to CHANGE while keeping the identity.
+        let mut rotated_leaf: Option<Vec<u8>> = None;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            match mesh_inbound_server_leaf(
+                inbound_port,
+                &peers.ca_pem,
+                &peers.server_spiffe,
+                client_identity,
+            )
+            .await
+            {
+                Ok(leaf) if leaf != leaf_before => {
+                    rotated_leaf = Some(leaf);
+                    break;
+                }
+                // Old leaf still served (rotation not picked up yet) or a
+                // transient handshake error mid-swap: keep polling.
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        assert!(
+            rotated_leaf.is_some(),
+            "inbound listener kept presenting the startup leaf for 10s after the \
+             SVID files rotated; the SVID-backed inbound identity must rotate \
+             live\n{output}"
+        );
+        return;
+    }
+
+    panic!(
+        "mesh gateway never bound its inbound listener after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
+    );
+}
+
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_mode_strict_inbound_requires_peer_svid() {

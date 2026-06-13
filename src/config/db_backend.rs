@@ -348,6 +348,7 @@ pub trait DatabaseBackend: Send + Sync {
     async fn check_consumer_identity_unique(
         &self,
         namespace: &str,
+        consumer_id: &str,
         username: &str,
         custom_id: Option<&str>,
         exclude_consumer_id: Option<&str>,

@@ -1389,6 +1389,7 @@ impl AdminResource for Consumer {
         match db
             .check_consumer_identity_unique(
                 namespace,
+                &resource.id,
                 &resource.username,
                 resource.custom_id.as_deref(),
                 exclude_id,

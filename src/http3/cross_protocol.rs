@@ -531,6 +531,15 @@ where
             {
                 PluginResult::Continue => Some(transformed),
                 reject => {
+                    // This is a client/request-body policy outcome before any
+                    // backend dispatch. Release a HALF_OPEN probe neutrally so
+                    // a client-fault rejection cannot wedge the breaker.
+                    release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                        state,
+                        proxy,
+                        cb_target_key,
+                        cb_is_half_open_probe,
+                    );
                     return write_final_body_reject(
                         stream,
                         flavor,
@@ -2009,6 +2018,12 @@ where
         match drain_h3_body(stream, state.max_grpc_recv_size_bytes).await {
             Ok(Some(b)) => b,
             Ok(None) => {
+                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                    state,
+                    proxy,
+                    current_cb_target_key.as_deref(),
+                    cb_retry_probe_slot_available,
+                );
                 return write_grpc_error(
                     stream,
                     grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -2023,6 +2038,12 @@ where
                     proxy_id = %proxy.id,
                     error = %e,
                     "cross-protocol H3→gRPC: request body read failed"
+                );
+                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                    state,
+                    proxy,
+                    current_cb_target_key.as_deref(),
+                    cb_retry_probe_slot_available,
                 );
                 return write_grpc_error(
                     stream,
@@ -3914,11 +3935,13 @@ mod tests {
         apply_buffered_grpc_plugin_reject, apply_buffered_plain_plugin_reject,
         apply_h3_grpc_reject_metadata, build_plain_request_builder,
         cross_protocol_header_write_disconnect_outcome, normalize_h3_grpc_reject,
-        reject_body_as_h3_grpc_message, sanitize_h3_grpc_message_for_header,
-        should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
+        reject_body_as_h3_grpc_message,
+        release_cross_protocol_circuit_breaker_probe_on_admission_reject,
+        sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
+        should_skip_cross_protocol_backend_header,
     };
     use crate::config::EnvConfig;
-    use crate::config::types::{GatewayConfig, Proxy};
+    use crate::config::types::{CircuitBreakerConfig, GatewayConfig, Proxy};
     use crate::dns::{DnsCache, DnsConfig};
     use crate::plugins::{Plugin, PluginResult, RequestContext, security_headers::SecurityHeaders};
     use crate::proxy::ProxyState;
@@ -4620,6 +4643,64 @@ mod tests {
             "backend_port": 443,
         }))
         .expect("minimal proxy should deserialize")
+    }
+
+    fn test_circuit_breaker_config() -> CircuitBreakerConfig {
+        CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_seconds: 0,
+            failure_status_codes: vec![500],
+            half_open_max_requests: 1,
+            trip_on_connection_errors: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn client_fault_release_frees_half_open_probe_slot() {
+        let state = minimal_proxy_state();
+        let mut proxy = minimal_proxy();
+        proxy.id = "h3-grpc-proxy".to_string();
+        let config = test_circuit_breaker_config();
+        proxy.circuit_breaker = Some(config.clone());
+        let target_key = Some("backend.example:443");
+        let cb = state
+            .circuit_breaker_cache
+            .get_or_create(&proxy.id, target_key, &config);
+
+        cb.record_failure(500, false, false);
+        assert_eq!(cb.state_name(), "open");
+
+        let (_, is_half_open_probe) = state
+            .circuit_breaker_cache
+            .can_execute(&proxy.id, target_key, &config)
+            .expect("half-open probe should be admitted");
+        assert!(is_half_open_probe);
+        assert_eq!(cb.half_open_in_flight(), 1);
+        assert!(
+            state
+                .circuit_breaker_cache
+                .can_execute(&proxy.id, target_key, &config)
+                .is_err(),
+            "single probe slot should be occupied before neutral release"
+        );
+
+        release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            target_key,
+            is_half_open_probe,
+        );
+
+        assert_eq!(cb.half_open_in_flight(), 0);
+        assert_eq!(cb.state_name(), "half_open");
+        assert!(
+            state
+                .circuit_breaker_cache
+                .can_execute(&proxy.id, target_key, &config)
+                .is_ok(),
+            "neutral client-fault release must allow the next half-open probe"
+        );
     }
 
     /// Count occurrences of a header (lowercase compare) in a built

@@ -29,6 +29,7 @@ use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
@@ -48,6 +49,79 @@ struct PluginConfigRef {
     id: String,
     scope: PluginScope,
     proxy_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ConsumerCredentialIndexEntry {
+    credential_type: &'static str,
+    credential_hash: String,
+}
+
+fn credential_value_hash(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn consumer_credential_index_entries(consumer: &Consumer) -> Vec<ConsumerCredentialIndexEntry> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for entry in consumer.credential_entries("keyauth") {
+        if let Some(key) = entry.get("key").and_then(|value| value.as_str()) {
+            let indexed = ConsumerCredentialIndexEntry {
+                credential_type: "keyauth",
+                credential_hash: credential_value_hash(key),
+            };
+            if seen.insert(indexed.clone()) {
+                entries.push(indexed);
+            }
+        }
+    }
+
+    for entry in consumer.credential_entries("mtls_auth") {
+        if let Some(identity) = entry.get("identity").and_then(|value| value.as_str()) {
+            let indexed = ConsumerCredentialIndexEntry {
+                credential_type: "mtls_auth",
+                credential_hash: credential_value_hash(identity),
+            };
+            if seen.insert(indexed.clone()) {
+                entries.push(indexed);
+            }
+        }
+    }
+
+    entries
+}
+
+fn format_consumer_identity_conflict(
+    candidate_field: &str,
+    candidate_value: &str,
+    existing_field: &str,
+    existing_id: &str,
+) -> String {
+    match (candidate_field, existing_field) {
+        ("username", "username") => format!(
+            "A consumer with username '{}' already exists (consumer '{}')",
+            candidate_value, existing_id
+        ),
+        ("custom_id", "custom_id") => format!(
+            "A consumer with custom_id '{}' already exists (consumer '{}')",
+            candidate_value, existing_id
+        ),
+        ("username", "custom_id") => format!(
+            "Consumer username '{}' conflicts with custom_id of consumer '{}'",
+            candidate_value, existing_id
+        ),
+        ("custom_id", "username") => format!(
+            "Consumer custom_id '{}' conflicts with username of consumer '{}'",
+            candidate_value, existing_id
+        ),
+        _ => format!(
+            "Consumer {} '{}' conflicts with {} of consumer '{}'",
+            candidate_field, candidate_value, existing_field, existing_id
+        ),
+    }
 }
 
 fn mesh_route_dispatch_references_upstream_id(plugin: &PluginConfig, upstream_id: &str) -> bool {
@@ -301,6 +375,37 @@ impl DatabaseStore {
             }
         }
         result
+    }
+
+    async fn delete_consumer_credential_index_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        consumer_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        sqlx::query(&self.q("DELETE FROM consumer_credential_index WHERE consumer_id = ?"))
+            .bind(consumer_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_consumer_credential_index_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        consumer: &Consumer,
+    ) -> Result<(), anyhow::Error> {
+        let sql = self.q("INSERT INTO consumer_credential_index \
+             (namespace, credential_type, credential_hash, consumer_id) VALUES (?, ?, ?, ?)");
+        for entry in consumer_credential_index_entries(consumer) {
+            sqlx::query(&sql)
+                .bind(&consumer.namespace)
+                .bind(entry.credential_type)
+                .bind(&entry.credential_hash)
+                .bind(&consumer.id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(())
     }
 
     // set_slow_query_threshold, set_cert_expiry_warning_days, and
@@ -1263,6 +1368,7 @@ impl DatabaseStore {
         let start = Instant::now();
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
+        let mut tx = self.pool().begin().await?;
         sqlx::query(
             &self.q("INSERT INTO consumers (id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         )
@@ -1274,8 +1380,11 @@ impl DatabaseStore {
         .bind(&acl_groups_json)
         .bind(consumer.created_at.to_rfc3339())
         .bind(consumer.updated_at.to_rfc3339())
-        .execute(&self.pool())
+        .execute(&mut *tx)
         .await?;
+        self.insert_consumer_credential_index_tx(&mut tx, consumer)
+            .await?;
+        tx.commit().await?;
 
         self.check_slow_query("create_consumer", start);
         Ok(())
@@ -1285,6 +1394,9 @@ impl DatabaseStore {
         let start = Instant::now();
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
+        let mut tx = self.pool().begin().await?;
+        self.delete_consumer_credential_index_tx(&mut tx, &consumer.id)
+            .await?;
         sqlx::query(&self.q(
             "UPDATE consumers SET username=?, custom_id=?, credentials=?, acl_groups=?, updated_at=? WHERE id=?",
         ))
@@ -1294,8 +1406,11 @@ impl DatabaseStore {
         .bind(&acl_groups_json)
         .bind(Utc::now().to_rfc3339())
         .bind(&consumer.id)
-        .execute(&self.pool())
+        .execute(&mut *tx)
         .await?;
+        self.insert_consumer_credential_index_tx(&mut tx, consumer)
+            .await?;
+        tx.commit().await?;
 
         self.check_slow_query("update_consumer", start);
         Ok(())
@@ -1303,10 +1418,14 @@ impl DatabaseStore {
 
     pub async fn delete_consumer(&self, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
+        let mut tx = self.pool().begin().await?;
+        self.delete_consumer_credential_index_tx(&mut tx, id)
+            .await?;
         let result = sqlx::query(&self.q("DELETE FROM consumers WHERE id = ?"))
             .bind(id)
-            .execute(&self.pool())
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         self.check_slow_query("delete_consumer", start);
         Ok(result.rows_affected() > 0)
     }
@@ -1388,11 +1507,34 @@ impl DatabaseStore {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
+        let affected_proxy_rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT proxy_id FROM proxy_plugins WHERE plugin_config_id = ?"))
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
+        let affected_proxy_ids: Vec<String> = affected_proxy_rows
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("proxy_id").ok())
+            .collect();
+
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE plugin_config_id = ?"))
             .bind(id)
             .execute(&mut *tx)
             .await?;
+
+        if !affected_proxy_ids.is_empty() {
+            let updated_at = Utc::now().to_rfc3339();
+            let sql = self.q("UPDATE proxies SET updated_at = ? WHERE id = ?");
+            for proxy_id in affected_proxy_ids {
+                sqlx::query(&sql)
+                    .bind(&updated_at)
+                    .bind(proxy_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
         let result = sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ?"))
             .bind(id)
             .execute(&mut *tx)
@@ -2048,38 +2190,42 @@ impl DatabaseStore {
         Ok(rows.is_empty())
     }
 
-    /// Check that a consumer username/custom_id combination does not collide
-    /// with another consumer's username/custom_id namespace.
+    /// Check that a consumer id/username/custom_id combination does not collide
+    /// with another consumer's shared identity namespace.
     pub async fn check_consumer_identity_unique(
         &self,
         namespace: &str,
+        consumer_id: &str,
         username: &str,
         custom_id: Option<&str>,
         exclude_id: Option<&str>,
     ) -> Result<Option<String>, anyhow::Error> {
         let start = Instant::now();
-        let (sql, binds): (String, Vec<&str>) = match custom_id {
-            Some(custom_id) => (
-                self.q("SELECT id, username, custom_id FROM consumers \
-                     WHERE namespace = ? AND (username = ? OR custom_id = ? OR username = ? OR custom_id = ?)"),
-                vec![namespace, username, custom_id, custom_id, username],
-            ),
-            None => (
-                self.q("SELECT id, username, custom_id FROM consumers \
-                     WHERE namespace = ? AND (username = ? OR custom_id = ?)"),
-                vec![namespace, username, username],
-            ),
-        };
+        let mut candidates = vec![("id", consumer_id), ("username", username)];
+        if let Some(custom_id) = custom_id {
+            candidates.push(("custom_id", custom_id));
+        }
 
+        let placeholders = std::iter::repeat_n("?", candidates.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, username, custom_id FROM consumers \
+             WHERE namespace = ? AND (id IN ({}) OR username IN ({}) OR custom_id IN ({}))",
+            placeholders, placeholders, placeholders
+        );
         let sql = if exclude_id.is_some() {
             format!("{} AND id != ?", sql)
         } else {
             sql
         };
 
-        let mut query = sqlx::query(&sql);
-        for value in binds {
-            query = query.bind(value);
+        let sql = self.q(&sql);
+        let mut query = sqlx::query(&sql).bind(namespace);
+        for _ in 0..3 {
+            for (_, value) in &candidates {
+                query = query.bind(*value);
+            }
         }
         if let Some(exclude_id) = exclude_id {
             query = query.bind(exclude_id);
@@ -2091,31 +2237,21 @@ impl DatabaseStore {
             let existing_username: String = row.try_get("username")?;
             let existing_custom_id: Option<String> = row.try_get("custom_id").ok();
 
-            if existing_username == username {
-                return Ok(Some(format!(
-                    "A consumer with username '{}' already exists (consumer '{}')",
-                    username, id
-                )));
-            }
-            if existing_custom_id.as_deref() == Some(username) {
-                return Ok(Some(format!(
-                    "Consumer username '{}' conflicts with custom_id of consumer '{}'",
-                    username, id
-                )));
-            }
-
-            if let Some(custom_id) = custom_id {
-                if existing_custom_id.as_deref() == Some(custom_id) {
-                    return Ok(Some(format!(
-                        "A consumer with custom_id '{}' already exists (consumer '{}')",
-                        custom_id, id
-                    )));
-                }
-                if existing_username == custom_id {
-                    return Ok(Some(format!(
-                        "Consumer custom_id '{}' conflicts with username of consumer '{}'",
-                        custom_id, id
-                    )));
+            let existing_fields = [
+                ("id", Some(id.as_str())),
+                ("username", Some(existing_username.as_str())),
+                ("custom_id", existing_custom_id.as_deref()),
+            ];
+            for (candidate_field, candidate_value) in &candidates {
+                for (existing_field, existing_value) in existing_fields {
+                    if existing_value == Some(*candidate_value) {
+                        return Ok(Some(format_consumer_identity_conflict(
+                            candidate_field,
+                            candidate_value,
+                            existing_field,
+                            &id,
+                        )));
+                    }
                 }
             }
         }
@@ -2127,8 +2263,6 @@ impl DatabaseStore {
     /// Check if a keyauth API key is unique across all consumers.
     /// Returns `true` if the key is unique (no conflicts found).
     ///
-    /// Since the API key is stored inside the credentials JSON blob,
-    /// this loads all consumers and checks in application code.
     pub async fn check_keyauth_key_unique(
         &self,
         namespace: &str,
@@ -2136,54 +2270,27 @@ impl DatabaseStore {
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT id, credentials FROM consumers WHERE namespace = ?"))
-                .bind(namespace)
-                .fetch_all(&self.pool())
-                .await?;
-
-        for row in &rows {
-            let id: String = row.try_get("id")?;
-            if let Some(eid) = exclude_consumer_id
-                && id == eid
-            {
-                continue;
+        let credential_hash = credential_value_hash(api_key);
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT consumer_id FROM consumer_credential_index \
+                 WHERE namespace = ? AND credential_type = ? AND credential_hash = ?"))
+            .bind(namespace)
+            .bind("keyauth")
+            .bind(credential_hash)
+            .fetch_optional(&self.pool())
+            .await?;
+        let is_unique = match row {
+            Some(row) => {
+                let consumer_id: String = row.try_get("consumer_id")?;
+                exclude_consumer_id == Some(consumer_id.as_str())
             }
-            let creds_str: String = row.try_get("credentials").unwrap_or_else(|e| {
-                warn!(
-                    "Failed to read credentials column for consumer {}: {}",
-                    id, e
-                );
-                String::new()
-            });
-            if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_str) {
-                let found = creds
-                    .get("keyauth")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|arr| {
-                        arr.iter().any(|obj| {
-                            obj.get("key")
-                                .and_then(|k| k.as_str())
-                                .is_some_and(|k| k == api_key)
-                        })
-                    });
-                if found {
-                    return Ok(false);
-                }
-            }
-        }
-
+            None => true,
+        };
         self.check_slow_query("check_keyauth_key_unique", start);
-        Ok(true)
+        Ok(is_unique)
     }
 
     /// Check that an mTLS identity is not already used by another consumer.
-    ///
-    /// mTLS identities are stored inside the credentials JSON blob, so there is
-    /// no database-level UNIQUE constraint — this application-level check is
-    /// the only enforcement.
-    ///
-    /// Returns `true` if the identity is unique (safe to insert/update).
     pub async fn check_mtls_identity_unique(
         &self,
         namespace: &str,
@@ -2191,45 +2298,24 @@ impl DatabaseStore {
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT id, credentials FROM consumers WHERE namespace = ?"))
-                .bind(namespace)
-                .fetch_all(&self.pool())
-                .await?;
-
-        for row in &rows {
-            let id: String = row.try_get("id")?;
-            if let Some(eid) = exclude_consumer_id
-                && id == eid
-            {
-                continue;
+        let credential_hash = credential_value_hash(mtls_identity);
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT consumer_id FROM consumer_credential_index \
+                 WHERE namespace = ? AND credential_type = ? AND credential_hash = ?"))
+            .bind(namespace)
+            .bind("mtls_auth")
+            .bind(credential_hash)
+            .fetch_optional(&self.pool())
+            .await?;
+        let is_unique = match row {
+            Some(row) => {
+                let consumer_id: String = row.try_get("consumer_id")?;
+                exclude_consumer_id == Some(consumer_id.as_str())
             }
-            let creds_str: String = row.try_get("credentials").unwrap_or_else(|e| {
-                warn!(
-                    "Failed to read credentials column for consumer {}: {}",
-                    id, e
-                );
-                String::new()
-            });
-            if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_str) {
-                let found = creds
-                    .get("mtls_auth")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|arr| {
-                        arr.iter().any(|obj| {
-                            obj.get("identity")
-                                .and_then(|i| i.as_str())
-                                .is_some_and(|i| i == mtls_identity)
-                        })
-                    });
-                if found {
-                    return Ok(false);
-                }
-            }
-        }
-
+            None => true,
+        };
         self.check_slow_query("check_mtls_identity_unique", start);
-        Ok(true)
+        Ok(is_unique)
     }
 
     /// Check if a listen_port is unique across all stream proxies.
@@ -2993,6 +3079,8 @@ impl DatabaseStore {
                 .bind(consumer.updated_at.to_rfc3339())
                 .execute(&mut *tx)
                 .await?;
+            self.insert_consumer_credential_index_tx(&mut tx, consumer)
+                .await?;
         }
 
         let count = consumers.len();
@@ -3151,8 +3239,9 @@ impl DatabaseStore {
     /// 1. proxy_plugins (junction table)
     /// 2. plugin_configs (may reference proxies)
     /// 3. proxies (may reference upstreams)
-    /// 4. consumers
-    /// 5. upstreams
+    /// 4. consumer_credential_index
+    /// 5. consumers
+    /// 6. upstreams
     pub async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
@@ -3174,6 +3263,10 @@ impl DatabaseStore {
             .execute(&mut *tx)
             .await?;
         sqlx::query(&self.q("DELETE FROM proxies WHERE namespace = ?"))
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(&self.q("DELETE FROM consumer_credential_index WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut *tx)
             .await?;
@@ -5023,6 +5116,7 @@ impl DatabaseBackend for DatabaseStore {
     async fn check_consumer_identity_unique(
         &self,
         namespace: &str,
+        consumer_id: &str,
         username: &str,
         custom_id: Option<&str>,
         exclude_consumer_id: Option<&str>,
@@ -5030,6 +5124,7 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::check_consumer_identity_unique(
             self,
             namespace,
+            consumer_id,
             username,
             custom_id,
             exclude_consumer_id,

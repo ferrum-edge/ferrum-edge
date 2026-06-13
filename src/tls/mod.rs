@@ -764,26 +764,47 @@ pub enum MeshClientAuth {
     None,
 }
 
-/// Server certificate and private key loaded once for mesh frontend TLS.
+/// Server certificate source for mesh frontend TLS.
 ///
 /// PeerAuthentication live reload is allowed to rebuild the mTLS mode and
-/// client-CA verifier, but server cert/key material remains a static
-/// operational input. Holding the parsed DER here prevents a later reload from
-/// incidentally reading changed cert/key files from disk.
+/// client-CA verifier; the server credential is either **static** operator
+/// material (parsed once — a later reload never incidentally re-reads changed
+/// cert/key files from disk; the operator owns rotation) or the
+/// **gateway-SVID-backed** source, which resolves live from the shared
+/// rotating SVID slot so a file-based SVID rotation reaches the inbound
+/// listener without a restart.
 pub struct MeshServerIdentity {
     cert_path: String,
     key_path: String,
-    cert_chain: Vec<CertificateDer<'static>>,
-    key: PrivateKeyDer<'static>,
+    source: MeshServerCertSource,
+}
+
+enum MeshServerCertSource {
+    /// Operator-supplied static material (explicit `FERRUM_FRONTEND_TLS_*`).
+    Static {
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    },
+    /// Gateway-SVID-backed: the server cert resolves per handshake from the
+    /// same `SharedSvidBundle` slot the SVID file watcher rotates, so the
+    /// inbound listener presents the CURRENT leaf, not the startup one.
+    SvidRotating {
+        bundle: crate::identity::SharedSvidBundle,
+    },
 }
 
 impl fmt::Debug for MeshServerIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let source = match &self.source {
+            MeshServerCertSource::Static { cert_chain, .. } => {
+                format!("Static(cert_chain_len={})", cert_chain.len())
+            }
+            MeshServerCertSource::SvidRotating { .. } => "SvidRotating".to_string(),
+        };
         f.debug_struct("MeshServerIdentity")
             .field("cert_path", &self.cert_path)
             .field("key_path", &self.key_path)
-            .field("cert_chain_len", &self.cert_chain.len())
-            .field("key", &"<redacted>")
+            .field("source", &source)
             .finish()
     }
 }
@@ -796,6 +817,213 @@ impl MeshServerIdentity {
     pub fn key_path(&self) -> &str {
         &self.key_path
     }
+
+    /// Whether the server credential rotates live with the gateway SVID slot.
+    /// Test-only: production code selects the source at construction and never
+    /// needs to re-interrogate it.
+    #[cfg(test)]
+    pub fn is_svid_rotating(&self) -> bool {
+        matches!(&self.source, MeshServerCertSource::SvidRotating { .. })
+    }
+
+    /// Build the rustls server-cert resolver for this identity. Static
+    /// material resolves to one pair-validated `CertifiedKey` (the same
+    /// validation `with_single_cert` performed); the SVID-backed source
+    /// resolves live from the shared rotating slot.
+    fn server_cert_resolver(
+        &self,
+        provider: &Arc<CryptoProvider>,
+    ) -> Result<Arc<dyn rustls::server::ResolvesServerCert>, anyhow::Error> {
+        match &self.source {
+            MeshServerCertSource::Static { cert_chain, key } => {
+                let certified = rustls::sign::CertifiedKey::from_der(
+                    cert_chain.clone(),
+                    key.clone_key(),
+                    provider,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "mesh server TLS cert and key do not form a valid pair: {error}"
+                    )
+                })?;
+                Ok(Arc::new(FixedServerCert(Arc::new(certified))))
+            }
+            MeshServerCertSource::SvidRotating { bundle } => Ok(Arc::new(
+                SvidServerCertResolver::new(bundle.clone(), Arc::clone(provider)),
+            )),
+        }
+    }
+}
+
+/// Trivial resolver serving one pre-validated certified key — the
+/// `with_single_cert` equivalent in resolver form, so static and
+/// SVID-rotating mesh server credentials share one ServerConfig build path.
+#[derive(Debug)]
+struct FixedServerCert(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::server::ResolvesServerCert for FixedServerCert {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
+}
+
+/// A certified key plus the pointer identity of the SVID-slot snapshot it was
+/// built from. `key: None` marks a snapshot whose material failed to build —
+/// cached so a broken rotation is warned ONCE and then fails handshakes
+/// closed, instead of re-attempting (and re-warning) on every handshake.
+struct SvidResolvedCert {
+    source: Arc<Option<crate::identity::SvidBundle>>,
+    key: Option<Arc<rustls::sign::CertifiedKey>>,
+}
+
+/// Live server-cert resolver for the gateway-SVID-backed mesh inbound
+/// identity. Per handshake (hot path) it does one `ArcSwap` load plus an
+/// `Arc::ptr_eq` against the cached snapshot; the `CertifiedKey` is rebuilt
+/// only when the SVID file watcher (or a future CA-backend rotation loop)
+/// stores a new bundle into the shared slot.
+///
+/// Failure semantics, fail-closed: an EMPTY slot or a snapshot whose material
+/// rustls rejects resolves to `None` — the handshake fails — rather than
+/// presenting a stale leaf from a previous snapshot. The previous leaf is
+/// already at most one rotation old and presenting it would mask a broken
+/// rotation pipeline until that leaf expires mid-traffic; failing immediately
+/// makes the breakage visible while the OLD process restart would have, too.
+pub struct SvidServerCertResolver {
+    bundle: crate::identity::SharedSvidBundle,
+    provider: Arc<CryptoProvider>,
+    cached: arc_swap::ArcSwap<Option<SvidResolvedCert>>,
+}
+
+impl fmt::Debug for SvidServerCertResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SvidServerCertResolver").finish()
+    }
+}
+
+impl SvidServerCertResolver {
+    pub fn new(bundle: crate::identity::SharedSvidBundle, provider: Arc<CryptoProvider>) -> Self {
+        Self {
+            bundle,
+            provider,
+            cached: arc_swap::ArcSwap::new(Arc::new(None)),
+        }
+    }
+}
+
+impl SvidServerCertResolver {
+    /// The certified key for the slot's CURRENT snapshot — the whole resolver
+    /// behavior; `resolve()` delegates here (rustls `ClientHello` carries no
+    /// information this resolver consults, and cannot be constructed in
+    /// tests).
+    fn resolve_current(&self) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let current = self.bundle.load_full();
+        if let Some(cached) = self.cached.load().as_ref()
+            && Arc::ptr_eq(&cached.source, &current)
+        {
+            return cached.key.clone();
+        }
+        // Cold path: the slot rotated (or first handshake). Rebuild and cache
+        // — including the failure case, so one bad rotation warns once.
+        let key = match current.as_ref() {
+            Some(svid) => match certified_key_from_svid_bundle(svid, &self.provider) {
+                Ok(key) => {
+                    info!(
+                        spiffe_id = %svid.spiffe_id,
+                        "Mesh inbound server identity rotated with the gateway SVID"
+                    );
+                    Some(Arc::new(key))
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Rotated gateway SVID material is unusable as the inbound \
+                         server certificate; failing inbound TLS handshakes closed \
+                         until the next rotation provides usable material"
+                    );
+                    None
+                }
+            },
+            None => {
+                warn!(
+                    "Gateway SVID slot is empty; failing inbound TLS handshakes \
+                     closed until SVID material is installed"
+                );
+                None
+            }
+        };
+        self.cached.store(Arc::new(Some(SvidResolvedCert {
+            source: current,
+            key: key.clone(),
+        })));
+        key
+    }
+}
+
+impl rustls::server::ResolvesServerCert for SvidServerCertResolver {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.resolve_current()
+    }
+}
+
+/// Build a rustls `CertifiedKey` from an SVID bundle's leaf-first DER chain
+/// and PKCS#8 key, validating that the key matches the leaf under `provider`.
+fn certified_key_from_svid_bundle(
+    bundle: &crate::identity::SvidBundle,
+    provider: &Arc<CryptoProvider>,
+) -> Result<rustls::sign::CertifiedKey, anyhow::Error> {
+    let cert_chain: Vec<CertificateDer<'static>> = bundle
+        .cert_chain_der
+        .iter()
+        .map(|der| CertificateDer::from(der.clone()))
+        .collect();
+    if cert_chain.is_empty() {
+        return Err(anyhow::anyhow!("SVID bundle carries an empty cert chain"));
+    }
+    let key = PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        bundle.private_key_pkcs8_der.clone(),
+    ));
+    rustls::sign::CertifiedKey::from_der(cert_chain, key, provider).map_err(|error| {
+        anyhow::anyhow!("SVID leaf and private key do not form a valid pair: {error}")
+    })
+}
+
+/// Build the gateway-SVID-backed mesh server identity: the inbound listener's
+/// server certificate resolves LIVE from `bundle` (the same shared slot the
+/// SVID file watcher rotates), so file-based SVID rotation reaches inbound
+/// handshakes without a restart. Fails closed at startup when the slot's
+/// current material cannot back a server certificate — a configured-but-broken
+/// identity is a real fault, exactly like the static loader's semantics.
+pub fn svid_rotating_mesh_server_identity(
+    cert_path: &str,
+    key_path: &str,
+    bundle: crate::identity::SharedSvidBundle,
+) -> Result<Arc<MeshServerIdentity>, anyhow::Error> {
+    let snapshot = bundle.load_full();
+    let svid = snapshot.as_ref().as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "gateway SVID slot holds no material to back the mesh inbound server identity"
+        )
+    })?;
+    certified_key_from_svid_bundle(svid, &default_crypto_provider())?;
+    Ok(Arc::new(MeshServerIdentity {
+        cert_path: cert_path.to_string(),
+        key_path: key_path.to_string(),
+        source: MeshServerCertSource::SvidRotating { bundle },
+    }))
+}
+
+/// The process-default rustls crypto provider (startup installs ring before
+/// any TLS work), with a ring fallback for test contexts that skip install.
+fn default_crypto_provider() -> Arc<CryptoProvider> {
+    CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()))
 }
 
 /// Borrowed client CA bundle contents paired with their display path.
@@ -840,8 +1068,7 @@ pub fn load_mesh_server_identity(
     Ok(Arc::new(MeshServerIdentity {
         cert_path: cert_material.source_id,
         key_path: key_material.source_id,
-        cert_chain,
-        key,
+        source: MeshServerCertSource::Static { cert_chain, key },
     }))
 }
 
@@ -931,7 +1158,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
                 );
                 builder
                     .with_client_cert_verifier(verifier)
-                    .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())?
+                    .with_cert_resolver(identity.server_cert_resolver(&tls_policy.crypto_provider)?)
             } else {
                 let ca_bundle = client_ca_bundle.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -983,7 +1210,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
 
                 builder
                     .with_client_cert_verifier(verifier)
-                    .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())?
+                    .with_cert_resolver(identity.server_cert_resolver(&tls_policy.crypto_provider)?)
             }
         }
         MeshClientAuth::None => {
@@ -994,129 +1221,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
             );
             builder
                 .with_no_client_auth()
-                .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())?
-        }
-    };
-
-    config.ignore_client_order = tls_policy.prefer_server_cipher_order;
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-    match rustls::crypto::ring::Ticketer::new() {
-        Ok(ticketer) => {
-            config.ticketer = ticketer;
-        }
-        Err(e) => {
-            warn!("Failed to create mesh TLS session ticket rotator: {}", e);
-        }
-    }
-    config.session_storage =
-        rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
-    config.max_early_data_size = 0;
-
-    Ok(Arc::new(config))
-}
-
-/// Build mesh TLS config using a dynamic server certificate resolver.
-///
-/// CA-backed mesh identity uses this path: the resolver presents the current
-/// SVID from a lock-free slot on every handshake, while the rest of the mesh
-/// frontend TLS posture stays identical to the static cert/key builder.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn load_mesh_tls_config_with_dynamic_identity(
-    server_cert_resolver: Arc<dyn rustls::server::ResolvesServerCert>,
-    identity_source: &str,
-    client_ca_bundle: Option<ClientCaBundleRef<'_>>,
-    client_auth: MeshClientAuth,
-    tls_policy: &TlsPolicy,
-    cert_expiry_warning_days: u64,
-    crls: &[CertificateRevocationListDer<'static>],
-    spiffe_client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
-) -> Result<Arc<ServerConfig>, anyhow::Error> {
-    if let Some(bundle) = client_ca_bundle {
-        check_cert_expiry_from_pem_bytes(
-            bundle.pem,
-            "mesh client CA bundle",
-            bundle.path,
-            cert_expiry_warning_days,
-        )?;
-    }
-
-    let builder = ServerConfig::builder_with_provider(tls_policy.crypto_provider.clone())
-        .with_protocol_versions(&tls_policy.protocol_versions)
-        .map_err(|e| anyhow::anyhow!("Failed to set TLS protocol versions: {}", e))?;
-
-    let mut config = match client_auth {
-        MeshClientAuth::Required | MeshClientAuth::Optional => {
-            if let Some(verifier) = spiffe_client_verifier {
-                info!(
-                    mesh_client_auth = ?client_auth,
-                    "Mesh TLS configuration loaded with dynamic SPIFFE server identity and \
-                     SPIFFE trust-domain-validating client verifier from {identity_source}"
-                );
-                builder
-                    .with_client_cert_verifier(verifier)
-                    .with_cert_resolver(server_cert_resolver)
-            } else {
-                let ca_bundle = client_ca_bundle.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Mesh mTLS {:?} mode requires readable client CA bundle bytes \
-                         (FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH)",
-                        client_auth
-                    )
-                })?;
-
-                let ca_certs: Vec<_> = certs(&mut &ca_bundle.pem[..])
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                let mut client_auth_roots = rustls::RootCertStore::empty();
-                let (added, _ignored) = client_auth_roots.add_parsable_certificates(ca_certs);
-                if added == 0 {
-                    return Err(anyhow::anyhow!(
-                        "No valid client CA certificates found in {}",
-                        ca_bundle.path
-                    ));
-                }
-
-                let mut verifier_builder =
-                    rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
-
-                if client_auth == MeshClientAuth::Optional {
-                    verifier_builder = verifier_builder.allow_unauthenticated();
-                }
-
-                if !crls.is_empty() {
-                    verifier_builder = verifier_builder
-                        .with_crls(crls.iter().cloned())
-                        .allow_unknown_revocation_status()
-                        .only_check_end_entity_revocation();
-                }
-
-                let verifier = verifier_builder.build().map_err(|e| {
-                    anyhow::anyhow!("Failed to build mesh client certificate verifier: {}", e)
-                })?;
-
-                info!(
-                    mesh_client_auth = ?client_auth,
-                    "Mesh TLS configuration loaded with dynamic SPIFFE server identity and {:?} \
-                     client auth from {identity_source}, client CA: {}",
-                    client_auth,
-                    ca_bundle.path,
-                );
-
-                builder
-                    .with_client_cert_verifier(verifier)
-                    .with_cert_resolver(server_cert_resolver)
-            }
-        }
-        MeshClientAuth::None => {
-            info!(
-                "Mesh TLS configuration loaded with dynamic SPIFFE server identity and without \
-                 client auth from {identity_source}"
-            );
-            builder
-                .with_no_client_auth()
-                .with_cert_resolver(server_cert_resolver)
+                .with_cert_resolver(identity.server_cert_resolver(&tls_policy.crypto_provider)?)
         }
     };
 
@@ -1494,6 +1599,118 @@ pub fn check_cert_expiry_for_validation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mint a self-signed leaf + key as SVID-bundle material for resolver
+    /// tests (chain + key are all the server credential consumes).
+    fn test_svid_bundle(cn: &str) -> crate::identity::SvidBundle {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let key_pair = rcgen::KeyPair::generate().expect("key pair");
+        let cert = params.self_signed(&key_pair).expect("self-signed leaf");
+        let trust_domain =
+            crate::identity::spiffe::TrustDomain::new("cluster.local").expect("trust domain");
+        crate::identity::SvidBundle {
+            spiffe_id: crate::identity::SpiffeId::from_parts(&trust_domain, "ns/test/sa/test")
+                .expect("spiffe id"),
+            cert_chain_der: vec![cert.der().as_ref().to_vec()],
+            private_key_pkcs8_der: key_pair.serialize_der(),
+            trust_bundles: crate::identity::TrustBundleSet::local_only(
+                crate::identity::TrustBundle {
+                    trust_domain,
+                    x509_authorities: vec![],
+                    jwt_authorities: vec![],
+                    refresh_hint_seconds: None,
+                },
+            ),
+        }
+    }
+
+    fn svid_slot(bundle: Option<crate::identity::SvidBundle>) -> crate::identity::SharedSvidBundle {
+        Arc::new(arc_swap::ArcSwap::new(Arc::new(bundle)))
+    }
+
+    fn ring_provider() -> Arc<CryptoProvider> {
+        Arc::new(rustls::crypto::ring::default_provider())
+    }
+
+    /// The resolver serves the slot's CURRENT leaf and follows a rotation:
+    /// storing a new bundle swaps the served certificate without any rebuild
+    /// of the ServerConfig.
+    #[test]
+    fn svid_server_cert_resolver_serves_and_rotates_with_the_slot() {
+        let bundle_a = test_svid_bundle("leaf-a");
+        let leaf_a = bundle_a.cert_chain_der[0].clone();
+        let slot = svid_slot(Some(bundle_a));
+        let resolver = SvidServerCertResolver::new(slot.clone(), ring_provider());
+
+        let served = resolver.resolve_current().expect("leaf A resolves");
+        assert_eq!(served.cert[0].as_ref(), leaf_a.as_slice());
+        // Cached fast path returns the same key for an unchanged slot.
+        let again = resolver.resolve_current().expect("cached leaf resolves");
+        assert!(
+            Arc::ptr_eq(&served, &again),
+            "unchanged slot must hit the cache"
+        );
+
+        let bundle_b = test_svid_bundle("leaf-b");
+        let leaf_b = bundle_b.cert_chain_der[0].clone();
+        slot.store(Arc::new(Some(bundle_b)));
+        let rotated = resolver.resolve_current().expect("leaf B resolves");
+        assert_eq!(
+            rotated.cert[0].as_ref(),
+            leaf_b.as_slice(),
+            "a slot rotation must swap the served leaf without a restart"
+        );
+    }
+
+    /// Fail-closed semantics: an empty slot and a rotated-in snapshot whose
+    /// material rustls rejects both resolve to `None` (handshakes fail) —
+    /// never a stale leaf from a previous snapshot.
+    #[test]
+    fn svid_server_cert_resolver_fails_closed_on_empty_or_unusable_material() {
+        let slot = svid_slot(None);
+        let resolver = SvidServerCertResolver::new(slot.clone(), ring_provider());
+        assert!(
+            resolver.resolve_current().is_none(),
+            "an empty slot must fail the handshake closed"
+        );
+
+        let good = test_svid_bundle("good");
+        slot.store(Arc::new(Some(good)));
+        assert!(
+            resolver.resolve_current().is_some(),
+            "good material resolves"
+        );
+
+        let mut broken = test_svid_bundle("broken");
+        broken.private_key_pkcs8_der = vec![0u8; 8];
+        slot.store(Arc::new(Some(broken)));
+        assert!(
+            resolver.resolve_current().is_none(),
+            "unusable rotated material must fail closed, not serve the previous leaf"
+        );
+        assert!(
+            resolver.resolve_current().is_none(),
+            "the poisoned snapshot stays cached (no per-handshake rebuild/warn)"
+        );
+    }
+
+    /// The SVID-rotating identity constructor validates the slot's CURRENT
+    /// material at startup (fail closed on empty/broken).
+    #[test]
+    fn svid_rotating_identity_validates_startup_material() {
+        assert!(
+            svid_rotating_mesh_server_identity("c", "k", svid_slot(None)).is_err(),
+            "an empty slot must refuse to back the inbound identity"
+        );
+        let identity =
+            svid_rotating_mesh_server_identity("c", "k", svid_slot(Some(test_svid_bundle("ok"))))
+                .expect("valid slot material backs the identity");
+        assert!(identity.is_svid_rotating());
+    }
 
     fn new_test_client_config() -> rustls::ClientConfig {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
