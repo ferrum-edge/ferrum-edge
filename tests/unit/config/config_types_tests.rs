@@ -2385,6 +2385,13 @@ fn test_regex_listen_path_valid() {
 }
 
 #[test]
+fn test_regex_listen_path_valid_literal_trailing_dollar() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", r"~/prices/\$")];
+    assert!(config.validate_regex_listen_paths().is_ok());
+}
+
+#[test]
 fn test_regex_listen_path_invalid_pattern() {
     let mut config = empty_config();
     config.proxies = vec![make_proxy("p1", "~(invalid[regex")];
@@ -2510,6 +2517,13 @@ fn test_anchor_regex_pattern_preserves_existing_end() {
     use ferrum_edge::config::types::anchor_regex_pattern;
 
     assert_eq!(anchor_regex_pattern("/users/[^/]+$"), "^(?:/users/[^/]+)$");
+}
+
+#[test]
+fn test_anchor_regex_pattern_preserves_escaped_trailing_dollar() {
+    use ferrum_edge::config::types::anchor_regex_pattern;
+
+    assert_eq!(anchor_regex_pattern(r"/prices/\$"), r"^(?:/prices/\$)$");
 }
 
 #[test]

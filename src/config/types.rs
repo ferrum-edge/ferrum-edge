@@ -1969,10 +1969,24 @@ pub fn anchor_regex_pattern(pattern: &str) -> String {
     if let Some(stripped) = core.strip_prefix('^') {
         core = stripped;
     }
-    if let Some(stripped) = core.strip_suffix('$') {
-        core = stripped;
+    if has_unescaped_trailing_dollar(core) {
+        core = &core[..core.len() - 1];
     }
     format!("^(?:{})$", core)
+}
+
+fn has_unescaped_trailing_dollar(pattern: &str) -> bool {
+    let Some(before_dollar) = pattern.strip_suffix('$') else {
+        return false;
+    };
+
+    let escaping_backslashes = before_dollar
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'\\')
+        .count();
+    escaping_backslashes % 2 == 0
 }
 
 /// Detects single-encoded (`%2F`/`%2f`) or double-encoded (`%252F`/`%252f`)

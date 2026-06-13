@@ -6072,6 +6072,7 @@ components:
               plugin_name:
                 const: transaction_log_schema
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/TransactionLogSchemaConfig"
@@ -6099,6 +6100,7 @@ components:
               plugin_name:
                 const: tcp_logging
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/TcpLoggingConfig"
@@ -6108,6 +6110,7 @@ components:
               plugin_name:
                 const: kafka_logging
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/KafkaLoggingConfig"
@@ -6117,6 +6120,7 @@ components:
               plugin_name:
                 const: ws_logging
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/WsLoggingConfig"
@@ -6135,6 +6139,7 @@ components:
               plugin_name:
                 const: jwks_auth
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/JwksAuthConfig"
@@ -6144,6 +6149,7 @@ components:
               plugin_name:
                 const: oauth2_introspection
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/Oauth2IntrospectionConfig"
@@ -6153,6 +6159,7 @@ components:
               plugin_name:
                 const: oidc_relying_party
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/OidcRelyingPartyConfig"
@@ -6189,6 +6196,7 @@ components:
               plugin_name:
                 const: ldap_auth
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/LdapAuthConfig"
@@ -6234,6 +6242,7 @@ components:
               plugin_name:
                 const: opa
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/OpaPluginConfig"
@@ -6288,6 +6297,7 @@ components:
               plugin_name:
                 const: tcp_connection_throttle
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/TcpConnectionThrottleConfig"
@@ -6351,6 +6361,7 @@ components:
               plugin_name:
                 const: mesh_route_dispatch
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/MeshRouteDispatchConfig"
@@ -6396,6 +6407,7 @@ components:
               plugin_name:
                 const: rate_limiting
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/RateLimitingConfig"
@@ -6405,6 +6417,7 @@ components:
               plugin_name:
                 const: request_size_limiting
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/RequestSizeLimitingConfig"
@@ -6423,6 +6436,7 @@ components:
               plugin_name:
                 const: response_size_limiting
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/ResponseSizeLimitingConfig"
@@ -6468,6 +6482,7 @@ components:
               plugin_name:
                 const: response_mock
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/ResponseMockConfig"
@@ -6477,6 +6492,7 @@ components:
               plugin_name:
                 const: serverless_function
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/ServerlessFunctionConfig"
@@ -6495,6 +6511,7 @@ components:
               plugin_name:
                 const: proxy_alerts
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/ProxyAlertsConfig"
@@ -6576,6 +6593,7 @@ components:
               plugin_name:
                 const: ai_federation
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/AiFederationConfig"
@@ -6585,6 +6603,7 @@ components:
               plugin_name:
                 const: mcp_gateway
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/McpGatewayConfig"
@@ -6603,6 +6622,7 @@ components:
               plugin_name:
                 const: ws_message_size_limiting
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/WsMessageSizeLimitingConfig"
@@ -6639,6 +6659,7 @@ components:
               plugin_name:
                 const: udp_logging
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/UdpLoggingConfig"
@@ -6648,6 +6669,7 @@ components:
               plugin_name:
                 const: statsd_logging
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/StatsdLoggingConfig"
@@ -6657,6 +6679,7 @@ components:
               plugin_name:
                 const: loki_logging
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/LokiLoggingConfig"
@@ -6675,6 +6698,7 @@ components:
               plugin_name:
                 const: request_mirror
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/RequestMirrorConfig"
@@ -6684,6 +6708,7 @@ components:
               plugin_name:
                 const: load_testing
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/LoadTestingConfig"
@@ -6693,6 +6718,7 @@ components:
               plugin_name:
                 const: geo_restriction
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/GeoRestrictionConfig"
@@ -6720,6 +6746,7 @@ components:
               plugin_name:
                 const: spec_expose
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/SpecExposeConfig"
