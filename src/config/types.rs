@@ -2359,47 +2359,38 @@ impl GatewayConfig {
         }
     }
 
-    /// Validate that consumer usernames and custom_ids are unique.
+    /// Validate that consumer ids, usernames, and custom_ids share one identity
+    /// namespace.
     ///
     /// In database mode the DB enforces this via UNIQUE constraints. In file
     /// mode there's no DB, so this catches duplicates at config load time
     /// and prevents the gateway from starting with ambiguous identity mappings
     /// that would cause incorrect JWKS/JWT authentication.
     pub fn validate_unique_consumer_identities(&self) -> Result<(), Vec<String>> {
-        let mut seen_usernames: HashMap<&str, &str> = HashMap::new();
-        let mut seen_custom_ids: HashMap<&str, &str> = HashMap::new();
+        let mut seen_identities: HashMap<&str, (&str, &'static str)> = HashMap::new();
         let mut duplicates = Vec::new();
 
         for consumer in &self.consumers {
-            if let Some(existing_id) = seen_usernames.insert(&consumer.username, &consumer.id) {
-                duplicates.push(format!(
-                    "Duplicate consumer username '{}' in consumer '{}' (conflicts with '{}')",
-                    consumer.username, consumer.id, existing_id
-                ));
+            for (field, value) in [
+                ("id", consumer.id.as_str()),
+                ("username", consumer.username.as_str()),
+            ] {
+                record_consumer_identity(
+                    &mut seen_identities,
+                    &mut duplicates,
+                    &consumer.id,
+                    field,
+                    value,
+                );
             }
-            if let Some(ref custom_id) = consumer.custom_id
-                && let Some(existing_id) = seen_custom_ids.insert(custom_id, &consumer.id)
-            {
-                duplicates.push(format!(
-                    "Duplicate consumer custom_id '{}' in consumer '{}' (conflicts with '{}')",
-                    custom_id, consumer.id, existing_id
-                ));
-            }
-        }
-
-        // Cross-namespace collision: a custom_id that matches another consumer's
-        // username or ID would silently overwrite in the identity index, causing
-        // incorrect JWKS/JWT authentication.
-        for consumer in &self.consumers {
-            if let Some(ref custom_id) = consumer.custom_id
-                && let Some(&owner_id) = seen_usernames.get(custom_id.as_str())
-                && owner_id != consumer.id
-            {
-                duplicates.push(format!(
-                    "Consumer '{}' custom_id '{}' collides with username of consumer '{}' \
-                     — this will cause incorrect JWKS/JWT authentication",
-                    consumer.id, custom_id, owner_id
-                ));
+            if let Some(ref custom_id) = consumer.custom_id {
+                record_consumer_identity(
+                    &mut seen_identities,
+                    &mut duplicates,
+                    &consumer.id,
+                    "custom_id",
+                    custom_id,
+                );
             }
         }
 
@@ -4021,6 +4012,45 @@ impl Consumer {
             Err(errors)
         }
     }
+}
+
+fn record_consumer_identity<'a>(
+    seen: &mut HashMap<&'a str, (&'a str, &'static str)>,
+    duplicates: &mut Vec<String>,
+    consumer_id: &'a str,
+    field: &'static str,
+    value: &'a str,
+) {
+    let Some(&(existing_id, existing_field)) = seen.get(value) else {
+        seen.insert(value, (consumer_id, field));
+        return;
+    };
+
+    if existing_id == consumer_id {
+        return;
+    }
+
+    let message = match (field, existing_field) {
+        ("id", "id") => format!(
+            "Duplicate consumer id '{}' in consumer '{}' (conflicts with '{}')",
+            value, consumer_id, existing_id
+        ),
+        ("username", "username") => format!(
+            "Duplicate consumer username '{}' in consumer '{}' (conflicts with '{}')",
+            value, consumer_id, existing_id
+        ),
+        ("custom_id", "custom_id") => format!(
+            "Duplicate consumer custom_id '{}' in consumer '{}' (conflicts with '{}')",
+            value, consumer_id, existing_id
+        ),
+        _ => format!(
+            "Consumer '{}' {} '{}' collides with {} of consumer '{}' \
+             — this will cause incorrect JWKS/JWT authentication",
+            consumer_id, field, value, existing_field, existing_id
+        ),
+    };
+
+    duplicates.push(message);
 }
 
 pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {

@@ -5529,6 +5529,11 @@ impl ProxyState {
             new_config
                 .plugin_configs
                 .retain(|pc| !removed.contains(pc.id.as_str()));
+            for proxy in &mut new_config.proxies {
+                proxy
+                    .plugins
+                    .retain(|assoc| !removed.contains(assoc.plugin_config_id.as_str()));
+            }
         }
         if !result.removed_upstream_ids.is_empty() {
             let removed: std::collections::HashSet<&str> = result
@@ -19095,6 +19100,7 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::types::PluginAssociation;
     use crate::plugins::security_headers::SecurityHeaders;
     use async_trait::async_trait;
     use http::header::HeaderValue;
@@ -23600,6 +23606,53 @@ mod tests {
         assert_eq!(
             post_attempt_config.loaded_at, pre_swap_loaded_at,
             "loaded_at must not advance when a config is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_incremental_prunes_removed_plugin_config_associations() {
+        let mut proxy = make_validation_proxy("p1", "/api");
+        proxy.plugins = vec![PluginAssociation {
+            plugin_config_id: "pc1".to_string(),
+        }];
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "pc1".to_string(),
+            plugin_name: "correlation_id".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({}),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut initial = make_validation_config(vec![proxy]);
+        initial.plugin_configs = vec![plugin];
+        let state = make_test_proxy_state(initial);
+
+        let outcome = state
+            .apply_incremental(crate::config::db_loader::IncrementalResult {
+                added_or_modified_proxies: Vec::new(),
+                removed_proxy_ids: Vec::new(),
+                added_or_modified_consumers: Vec::new(),
+                removed_consumer_ids: Vec::new(),
+                added_or_modified_plugin_configs: Vec::new(),
+                removed_plugin_config_ids: vec!["pc1".to_string()],
+                added_or_modified_upstreams: Vec::new(),
+                removed_upstream_ids: Vec::new(),
+                poll_timestamp: now,
+            })
+            .await;
+
+        assert_eq!(outcome, IncrementalApplyOutcome::Applied);
+        let loaded = state.config.load_full();
+        assert!(loaded.plugin_configs.is_empty());
+        assert!(
+            loaded.proxies[0].plugins.is_empty(),
+            "removed plugin config ids must be pruned from proxy associations"
         );
     }
 
