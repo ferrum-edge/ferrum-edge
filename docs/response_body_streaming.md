@@ -222,22 +222,33 @@ different memory/latency behavior depending on the backend protocol: an
 HTTP/3-served binary response may be buffered where the HTTP/1.1/2-served one
 streams.
 
-**WAF trade-off.** The downgrade keys off the **backend's** response
-`Content-Type`. A header-only plugin that relabels a non-inspectable type as an
-inspectable one in `after_proxy` (e.g. a `response_transformer` rewriting
-`application/octet-stream` → `application/json`) runs *after* this decision, so
-the WAF body scan — which runs only on buffered responses — is skipped for that
-relabeled response. Body-transforming plugins force buffering and are
-unaffected. If a WAF policy depends on scanning relabeled response bodies, set
-`response_body_mode: buffer` on that proxy.
+**Content-Type relabel safety.** The downgrade keys off the **backend's**
+response `Content-Type`, but it is suppressed when an active plugin reports that
+it may later modify the response `Content-Type` in `after_proxy`. Built-in
+plugins use `may_modify_response_content_type()` for their relabel cases:
+`response_transformer` covers static `Content-Type` header rules and route-level
+response-transform overrides, `sse` covers forced SSE relabeling, and `grpc_web`
+covers gRPC-Web response relabeling. As a result, a WAF-inspected response that
+starts as `application/octet-stream` and is relabeled to `application/json` by
+`response_transformer` stays buffered, so `on_final_response_body` evaluates it
+with the final client-visible headers.
+
+Custom plugins that change response `Content-Type` in `after_proxy` must also
+override `may_modify_response_content_type()`. Otherwise they can recreate the
+same backend-header downgrade gap. Operators can still force conservative
+behavior for a proxy by setting `response_body_mode: buffer`.
 
 ### Built-in Plugin Compatibility
 
-All built-in plugins work with streaming mode because they only modify response **headers**, not the body:
+Header-only response plugins remain stream-compatible. Plugins configured to
+inspect, transform, cache, or compress the response body participate in the
+buffering decision and may narrow that decision by request or response
+`Content-Type`.
 
-| Plugin | Modifies Response Body? | Requires Buffering? |
-|--------|------------------------|-------------------|
-| `response_transformer` | No (headers only) | No |
+| Plugin / configuration | Modifies Response Body? | Requires Buffering? |
+|------------------------|------------------------|-------------------|
+| `response_transformer` header-only rules | No | No |
+| `response_transformer` body rules | Yes | Yes |
 | `cors` | No (headers only) | No |
 | `stdout_logging` | No | No |
 | `http_logging` | No | No |
