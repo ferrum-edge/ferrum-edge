@@ -819,6 +819,9 @@ impl MeshServerIdentity {
     }
 
     /// Whether the server credential rotates live with the gateway SVID slot.
+    /// Test-only: production code selects the source at construction and never
+    /// needs to re-interrogate it.
+    #[cfg(test)]
     pub fn is_svid_rotating(&self) -> bool {
         matches!(&self.source, MeshServerCertSource::SvidRotating { .. })
     }
