@@ -44,6 +44,7 @@ use crate::config::types::{
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_config};
+use crate::identity::ca::{CaBackend, CertificateAuthority};
 use crate::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
     MeshLocalityLbSetting, MeshOutlierDetection, MeshRequestAuthentication, MeshSimpleLb,
@@ -71,6 +72,7 @@ const DEFAULT_DNS_TTL_SECONDS: u32 = 60;
 const DEFAULT_DNS_ENABLED: bool = false;
 const DEFAULT_DNS_MAX_CONCURRENT_QUERIES: usize = 1024;
 const DEFAULT_EGRESS_LISTEN_ADDR: &str = "0.0.0.0:15090";
+const MESH_CA_INITIAL_SVID_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
@@ -5510,7 +5512,16 @@ async fn serve_mesh_runtime(
     let inbound_mtls_mode =
         startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime)?;
     validate_egress_gateway_mtls_config(&runtime, &env_config)?;
-    let mesh_frontend_identity = load_mesh_frontend_server_identity(&env_config)?;
+    let mesh_ca_svid_slot = start_mesh_ca_backend_svid_source(
+        &proxy_state,
+        &runtime,
+        &env_config,
+        &mut mesh_background_handles,
+        shutdown_tx.subscribe(),
+    )
+    .await?;
+    let mesh_frontend_identity =
+        load_mesh_frontend_server_identity(&env_config, mesh_ca_svid_slot.as_ref())?;
     let initial_inbound_tls_snapshot = if env_config.mesh_peer_auth_live_reload_enabled {
         Some(mesh_inbound_tls_reload_snapshot(
             &env_config,
@@ -5524,14 +5535,17 @@ async fn serve_mesh_runtime(
     // material is configured — the listener then keeps operator-CA chain
     // verification. The slot is read live by the verifier and re-published on
     // slice apply so federated trust changes propagate lock-free.
-    let mesh_inbound_spiffe_slot =
-        build_mesh_inbound_spiffe_slot(&env_config, initial_applied_mesh_slice.as_deref());
+    let mesh_inbound_spiffe_slot = build_mesh_inbound_spiffe_slot(
+        &env_config,
+        initial_applied_mesh_slice.as_deref(),
+        mesh_ca_svid_slot.as_ref(),
+    );
     let frontend_tls = load_mesh_frontend_tls(
         &env_config,
         &tls_policy,
         &crls,
         inbound_mtls_mode,
-        mesh_frontend_identity.as_deref(),
+        mesh_frontend_identity.as_ref(),
         initial_inbound_tls_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.client_ca_bundle.as_ref()),
@@ -6132,8 +6146,280 @@ struct MeshInboundTlsReloadSnapshot {
     client_ca_bundle: Option<MeshInboundClientCaBundle>,
 }
 
+#[derive(Clone)]
+enum MeshFrontendServerIdentity {
+    Static(Arc<tls::MeshServerIdentity>),
+    DynamicSpiffe {
+        slot: tls::SharedBundleSlot,
+        source: &'static str,
+    },
+}
+
+impl MeshFrontendServerIdentity {
+    #[cfg(test)]
+    fn as_static(&self) -> Option<&tls::MeshServerIdentity> {
+        match self {
+            Self::Static(identity) => Some(identity.as_ref()),
+            Self::DynamicSpiffe { .. } => None,
+        }
+    }
+}
+
+fn gateway_svid_material_configured(env_config: &EnvConfig) -> bool {
+    env_config.gateway_svid_cert_path.is_some()
+        || env_config.gateway_svid_key_path.is_some()
+        || env_config.gateway_svid_trust_bundle_path.is_some()
+}
+
+fn configured_mesh_workload_spiffe_id(
+    runtime: &MeshRuntimeConfig,
+) -> Result<crate::identity::SpiffeId, anyhow::Error> {
+    let raw = runtime.workload_spiffe_id.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "FERRUM_MESH_CA_BACKEND requires FERRUM_MESH_WORKLOAD_SPIFFE_ID so the issued \
+             runtime SVID matches the local mesh workload identity"
+        )
+    })?;
+    crate::identity::SpiffeId::new(raw.to_string()).map_err(|error| {
+        anyhow::anyhow!(
+            "FERRUM_MESH_WORKLOAD_SPIFFE_ID must be a valid SPIFFE URI when \
+             FERRUM_MESH_CA_BACKEND is enabled: {error}"
+        )
+    })
+}
+
+async fn start_mesh_ca_backend_svid_source(
+    proxy_state: &ProxyState,
+    runtime: &MeshRuntimeConfig,
+    env_config: &EnvConfig,
+    mesh_background_handles: &mut Vec<JoinHandle<()>>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<Option<tls::SharedBundleSlot>, anyhow::Error> {
+    let backend = CaBackend::from_str_lossy(&env_config.mesh_ca_backend)
+        .map_err(|error| anyhow::anyhow!("Invalid FERRUM_MESH_CA_BACKEND: {error}"))?;
+    if backend == CaBackend::None {
+        return Ok(None);
+    }
+
+    if gateway_svid_material_configured(env_config) {
+        warn!(
+            backend = %backend,
+            "FERRUM_MESH_CA_BACKEND is configured, but file-based FERRUM_GATEWAY_SVID_* \
+             material is also configured; using the explicit file SVID material and not \
+             starting automatic CA-backed SVID issuance"
+        );
+        return Ok(None);
+    }
+
+    let workload_spiffe_id = configured_mesh_workload_spiffe_id(runtime)?;
+    match backend {
+        CaBackend::SpireAgent => {
+            let slot = start_spire_agent_mesh_svid_source(
+                proxy_state,
+                env_config,
+                &workload_spiffe_id,
+                mesh_background_handles,
+            )
+            .await?;
+            Ok(Some(slot))
+        }
+        CaBackend::Internal => {
+            let slot = start_internal_mesh_svid_source(
+                proxy_state,
+                env_config,
+                workload_spiffe_id,
+                mesh_background_handles,
+                shutdown_rx,
+            )
+            .await?;
+            Ok(Some(slot))
+        }
+        CaBackend::None => Ok(None),
+    }
+}
+
+async fn start_spire_agent_mesh_svid_source(
+    proxy_state: &ProxyState,
+    env_config: &EnvConfig,
+    expected_spiffe_id: &crate::identity::SpiffeId,
+    mesh_background_handles: &mut Vec<JoinHandle<()>>,
+) -> Result<tls::SharedBundleSlot, anyhow::Error> {
+    let handle = crate::identity::workload_api::SvidFetchHandle::from_slot(
+        proxy_state.gateway_svid_bundle.clone(),
+    )
+    .with_revision_tx(proxy_state.backend_svid_rotation_tx.clone());
+    let fetch_config = crate::identity::workload_api::FetchLoopConfig {
+        socket_path: env_config.mesh_spire_agent_socket.clone(),
+        ..Default::default()
+    };
+    let join =
+        crate::identity::workload_api::spawn_fetch_loop_with_handle(fetch_config, handle.clone());
+
+    if tokio::time::timeout(MESH_CA_INITIAL_SVID_TIMEOUT, handle.wait_for_first_svid())
+        .await
+        .is_err()
+    {
+        join.abort();
+        return Err(anyhow::anyhow!(
+            "timed out after {}s waiting for the initial SPIRE Workload API SVID from {}; \
+                 refusing to bind mesh listeners without runtime identity",
+            MESH_CA_INITIAL_SVID_TIMEOUT.as_secs(),
+            env_config.mesh_spire_agent_socket
+        ));
+    }
+
+    let snapshot = handle.snapshot();
+    let bundle = snapshot.as_ref().as_ref().ok_or_else(|| {
+        join.abort();
+        anyhow::anyhow!("SPIRE Workload API reported initial readiness without an SVID bundle")
+    })?;
+    if &bundle.spiffe_id != expected_spiffe_id {
+        join.abort();
+        anyhow::bail!(
+            "SPIRE Workload API returned SVID '{}' but FERRUM_MESH_WORKLOAD_SPIFFE_ID is '{}'",
+            bundle.spiffe_id,
+            expected_spiffe_id
+        );
+    }
+
+    info!(
+        spiffe_id = %bundle.spiffe_id,
+        trust_domain = %bundle.trust_domain(),
+        "Mesh CA backend loaded runtime SVID from SPIRE Workload API"
+    );
+    mesh_background_handles.push(join);
+    Ok(proxy_state.gateway_svid_bundle.clone())
+}
+
+async fn start_internal_mesh_svid_source(
+    proxy_state: &ProxyState,
+    env_config: &EnvConfig,
+    spiffe_id: crate::identity::SpiffeId,
+    mesh_background_handles: &mut Vec<JoinHandle<()>>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<tls::SharedBundleSlot, anyhow::Error> {
+    let root = crate::identity::ca::bootstrap::bootstrap_dev_root(
+        crate::identity::ca::bootstrap::BootstrapConfig::new(spiffe_id.trust_domain().clone()),
+    )
+    .map_err(|error| anyhow::anyhow!("internal mesh CA bootstrap failed: {error}"))?;
+    let ca = Arc::new(crate::identity::ca::internal::InternalCa::new(
+        crate::identity::ca::internal::InternalCaConfig {
+            root_cert_pem: root.root_cert_pem,
+            root_key_pem: root.root_key_pem,
+            trust_domain: root.trust_domain,
+            bundle_refresh_hint_secs: None,
+            default_svid_ttl_secs: env_config.mesh_cert_ttl_seconds,
+            max_svid_ttl_secs: crate::identity::ca::internal::MAX_SVID_TTL_SECS,
+        },
+    )?) as crate::identity::ca::SharedCa;
+
+    issue_and_install_mesh_ca_svid(proxy_state, ca.as_ref(), &spiffe_id, env_config, false).await?;
+    let state = proxy_state.clone();
+    let loop_env = env_config.clone();
+    mesh_background_handles.push(tokio::spawn(async move {
+        run_internal_mesh_svid_rotation_loop(state, ca, spiffe_id, loop_env, shutdown_rx).await;
+    }));
+
+    Ok(proxy_state.gateway_svid_bundle.clone())
+}
+
+async fn run_internal_mesh_svid_rotation_loop(
+    proxy_state: ProxyState,
+    ca: crate::identity::ca::SharedCa,
+    spiffe_id: crate::identity::SpiffeId,
+    env_config: EnvConfig,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let next_tick = {
+            let snapshot = proxy_state.gateway_svid_bundle.load_full();
+            snapshot
+                .as_ref()
+                .as_ref()
+                .map(|bundle| crate::identity::rotation::decide_next_tick(bundle, 0.5))
+                .unwrap_or(Duration::from_secs(1))
+        };
+
+        tokio::select! {
+            _ = tokio::time::sleep(next_tick) => {}
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return;
+                }
+                continue;
+            }
+        }
+
+        let needs_rotation = {
+            let snapshot = proxy_state.gateway_svid_bundle.load_full();
+            snapshot
+                .as_ref()
+                .as_ref()
+                .map(|bundle| crate::identity::rotation::is_due_for_rotation(bundle, 0.5))
+                .unwrap_or(true)
+        };
+        if !needs_rotation {
+            continue;
+        }
+
+        if let Err(error) =
+            issue_and_install_mesh_ca_svid(&proxy_state, ca.as_ref(), &spiffe_id, &env_config, true)
+                .await
+        {
+            crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+                &spiffe_id, "internal",
+            );
+            warn!(
+                error = %error,
+                spiffe_id = %spiffe_id,
+                "internal mesh CA SVID rotation failed; keeping current identity"
+            );
+        }
+    }
+}
+
+async fn issue_and_install_mesh_ca_svid(
+    proxy_state: &ProxyState,
+    ca: &dyn CertificateAuthority,
+    spiffe_id: &crate::identity::SpiffeId,
+    env_config: &EnvConfig,
+    publish_revision: bool,
+) -> Result<(), anyhow::Error> {
+    let signed = ca
+        .issue_svid(crate::identity::ca::IssuanceRequest::Generate {
+            spiffe_id: spiffe_id.clone(),
+            ttl_secs: env_config.mesh_cert_ttl_seconds,
+        })
+        .await?;
+    let trust_bundle = ca.trust_bundle(spiffe_id.trust_domain()).await?;
+    let bundle = crate::identity::SvidBundle {
+        spiffe_id: signed.spiffe_id,
+        cert_chain_der: signed.cert_chain_der,
+        private_key_pkcs8_der: signed.private_key_pkcs8_der,
+        trust_bundles: crate::identity::TrustBundleSet::local_only(crate::identity::TrustBundle {
+            trust_domain: trust_bundle.trust_domain.clone(),
+            x509_authorities: trust_bundle.roots_der,
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: trust_bundle.refresh_hint_secs,
+        }),
+    };
+    let installed_spiffe_id = bundle.spiffe_id.clone();
+    proxy_state.install_gateway_runtime_svid_bundle(bundle);
+    if publish_revision {
+        proxy_state
+            .backend_svid_rotation_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+    }
+    info!(
+        spiffe_id = %installed_spiffe_id,
+        svid_revision = *proxy_state.backend_svid_rotation_tx.borrow(),
+        "Mesh CA backend installed runtime SVID"
+    );
+    Ok(())
+}
+
 struct MeshInboundTlsReloadState {
-    server_identity: Option<Arc<tls::MeshServerIdentity>>,
+    server_identity: Option<MeshFrontendServerIdentity>,
     last_snapshot: Option<MeshInboundTlsReloadSnapshot>,
     /// Lock-free SVID bundle slot used to build the SPIFFE trust-domain
     /// verifier for inbound peer certs. `None` when no gateway SVID material
@@ -6167,7 +6453,21 @@ struct MeshInboundTlsReloadState {
 fn build_mesh_inbound_spiffe_slot(
     env_config: &EnvConfig,
     slice: Option<&MeshSlice>,
+    runtime_svid_slot: Option<&tls::SharedBundleSlot>,
 ) -> Option<tls::SharedBundleSlot> {
+    if let Some(slot) = runtime_svid_slot {
+        if slice
+            .and_then(|slice| slice.trust_bundles.as_ref())
+            .is_none()
+        {
+            return Some(slot.clone());
+        }
+        let snapshot = slot.load_full();
+        let mut bundle = snapshot.as_ref().clone()?;
+        merge_slice_federation_into_svid_bundle(&mut bundle, slice);
+        return Some(Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(bundle)))));
+    }
+
     let (cert_path, key_path, trust_bundle_path) = match (
         env_config.gateway_svid_cert_path.as_deref(),
         env_config.gateway_svid_key_path.as_deref(),
@@ -6290,7 +6590,12 @@ fn stage_mesh_inbound_spiffe_bundle(
     slice: &MeshSlice,
 ) -> Option<StagedSpiffeBundle> {
     let slot = slot?;
-    match build_mesh_inbound_spiffe_slot(env_config, Some(slice)) {
+    let runtime_svid_slot = if gateway_svid_material_configured(env_config) {
+        None
+    } else {
+        Some(slot)
+    };
+    match build_mesh_inbound_spiffe_slot(env_config, Some(slice), runtime_svid_slot) {
         Some(rebuilt) => Some(StagedSpiffeBundle {
             slot: slot.clone(),
             bundle: rebuilt.load_full(),
@@ -6368,18 +6673,33 @@ fn mesh_inbound_tls_reload_snapshot(
 
 fn load_mesh_frontend_server_identity(
     env_config: &EnvConfig,
-) -> Result<Option<Arc<tls::MeshServerIdentity>>, anyhow::Error> {
+    runtime_svid_slot: Option<&tls::SharedBundleSlot>,
+) -> Result<Option<MeshFrontendServerIdentity>, anyhow::Error> {
     // The explicit frontend TLS cert/key is the operator override for the
     // inbound listener's server identity.
     if let (Some(cert_path), Some(key_path)) = (
         env_config.frontend_tls_cert_path.as_deref(),
         env_config.frontend_tls_key_path.as_deref(),
     ) {
-        return Ok(Some(tls::load_mesh_server_identity(
-            cert_path,
-            key_path,
-            env_config.tls_cert_expiry_warning_days,
-        )?));
+        return Ok(Some(MeshFrontendServerIdentity::Static(
+            tls::load_mesh_server_identity(
+                cert_path,
+                key_path,
+                env_config.tls_cert_expiry_warning_days,
+            )?,
+        )));
+    }
+    if let Some(slot) = runtime_svid_slot {
+        if slot.load().is_none() {
+            return Err(anyhow::anyhow!(
+                "FERRUM_MESH_CA_BACKEND is enabled but no runtime SVID is loaded for the \
+                 mesh inbound server identity"
+            ));
+        }
+        return Ok(Some(MeshFrontendServerIdentity::DynamicSpiffe {
+            slot: slot.clone(),
+            source: "FERRUM_MESH_CA_BACKEND",
+        }));
     }
     // Otherwise fall back to the gateway SVID material as the inbound server
     // identity (issue #1523, gap #3 — "gateway SVID ≠ inbound server identity").
@@ -6417,11 +6737,13 @@ fn load_mesh_frontend_server_identity(
              fail once that leaf expires. Supply FERRUM_FRONTEND_TLS_CERT_PATH / \
              KEY_PATH with your own rotation, or restart on SVID rotation."
         );
-        return Ok(Some(tls::load_mesh_server_identity(
-            cert_path,
-            key_path,
-            env_config.tls_cert_expiry_warning_days,
-        )?));
+        return Ok(Some(MeshFrontendServerIdentity::Static(
+            tls::load_mesh_server_identity(
+                cert_path,
+                key_path,
+                env_config.tls_cert_expiry_warning_days,
+            )?,
+        )));
     }
     Ok(None)
 }
@@ -6504,7 +6826,7 @@ fn load_mesh_frontend_tls(
     tls_policy: &TlsPolicy,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
     mtls_mode: config::MtlsMode,
-    server_identity: Option<&tls::MeshServerIdentity>,
+    server_identity: Option<&MeshFrontendServerIdentity>,
     client_ca_bundle: Option<&MeshInboundClientCaBundle>,
     spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
 ) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
@@ -6588,29 +6910,46 @@ fn load_mesh_frontend_tls(
         );
     }
 
-    let mut tls_config = if let Some(bundle) = client_ca_bundle {
-        tls::load_mesh_tls_config_with_identity_and_client_ca_bytes(
-            server_identity,
-            Some(tls::ClientCaBundleRef {
-                path: bundle.path.as_str(),
-                pem: bundle.pem.as_ref(),
-            }),
-            client_auth,
-            tls_policy,
-            env_config.tls_cert_expiry_warning_days,
-            crls,
-            spiffe_verifier,
-        )
-    } else {
-        tls::load_mesh_tls_config_with_identity(
-            server_identity,
-            client_ca_bundle_path,
-            client_auth,
-            tls_policy,
-            env_config.tls_cert_expiry_warning_days,
-            crls,
-            spiffe_verifier,
-        )
+    let client_ca_bundle_ref = client_ca_bundle.map(|bundle| tls::ClientCaBundleRef {
+        path: bundle.path.as_str(),
+        pem: bundle.pem.as_ref(),
+    });
+    let mut tls_config = match server_identity {
+        MeshFrontendServerIdentity::Static(identity) => {
+            if let Some(bundle_ref) = client_ca_bundle_ref {
+                tls::load_mesh_tls_config_with_identity_and_client_ca_bytes(
+                    identity,
+                    Some(bundle_ref),
+                    client_auth,
+                    tls_policy,
+                    env_config.tls_cert_expiry_warning_days,
+                    crls,
+                    spiffe_verifier,
+                )
+            } else {
+                tls::load_mesh_tls_config_with_identity(
+                    identity,
+                    client_ca_bundle_path,
+                    client_auth,
+                    tls_policy,
+                    env_config.tls_cert_expiry_warning_days,
+                    crls,
+                    spiffe_verifier,
+                )
+            }
+        }
+        MeshFrontendServerIdentity::DynamicSpiffe { slot, source } => {
+            tls::load_mesh_tls_config_with_dynamic_identity(
+                Arc::new(tls::SpiffeServerCertResolver::new(slot.clone())),
+                source,
+                client_ca_bundle_ref,
+                client_auth,
+                tls_policy,
+                env_config.tls_cert_expiry_warning_days,
+                crls,
+                spiffe_verifier,
+            )
+        }
     }
     .map_err(|e| anyhow::anyhow!("Invalid mesh frontend TLS configuration: {}", e))?;
     tls::enable_early_data(&mut tls_config, tls_policy);
@@ -6851,7 +7190,7 @@ fn plan_mesh_inbound_tls_reload(
     runtime: &MeshRuntimeConfig,
     slice: &MeshSlice,
     mtls_mode: config::MtlsMode,
-    server_identity: Option<&tls::MeshServerIdentity>,
+    server_identity: Option<&MeshFrontendServerIdentity>,
     last_snapshot: Option<&MeshInboundTlsReloadSnapshot>,
     spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
     production: bool,
@@ -7229,7 +7568,7 @@ fn start_mesh_slice_apply_task(
                                 &runtime,
                                 slice,
                                 mtls_mode,
-                                inbound_tls_reload.server_identity.as_deref(),
+                                inbound_tls_reload.server_identity.as_ref(),
                                 inbound_tls_reload.last_snapshot.as_ref(),
                                 inbound_tls_reload.spiffe_bundle_slot.as_ref(),
                                 inbound_tls_reload.production,
@@ -14332,7 +14671,7 @@ mod tests {
         };
         let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env.clone());
         let mesh_frontend_identity =
-            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+            load_mesh_frontend_server_identity(&env, None).expect("mesh frontend identity");
         let initial_snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable)
             .expect("initial snapshot");
         let mesh_state = MeshRuntimeState::new();
@@ -14413,7 +14752,7 @@ mod tests {
         };
         let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env.clone());
         let mesh_frontend_identity =
-            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+            load_mesh_frontend_server_identity(&env, None).expect("mesh frontend identity");
         let initial_snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable)
             .expect("initial snapshot");
         let mesh_state = MeshRuntimeState::new();
@@ -14607,7 +14946,7 @@ mod tests {
             ..MeshSlice::default()
         };
         let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env.clone());
-        let identity = load_mesh_frontend_server_identity(&env).expect("server identity");
+        let identity = load_mesh_frontend_server_identity(&env, None).expect("server identity");
 
         // Production rejects the plaintext (DISABLE) downgrade: plan() is None,
         // which the apply task treats as "keep the last-good mTLS config".
@@ -14616,7 +14955,7 @@ mod tests {
             &runtime,
             &disable_slice,
             config::MtlsMode::Disable,
-            identity.as_deref(),
+            identity.as_ref(),
             None,
             None,
             true, // production
@@ -14634,7 +14973,7 @@ mod tests {
             &runtime,
             &disable_slice,
             config::MtlsMode::Disable,
-            identity.as_deref(),
+            identity.as_ref(),
             None,
             None,
             false, // dev
@@ -15131,7 +15470,7 @@ mod tests {
         // operator-CA chain verification (the pre-existing behavior).
         let env = EnvConfig::default();
         assert!(env.gateway_svid_cert_path.is_none());
-        assert!(build_mesh_inbound_spiffe_slot(&env, None).is_none());
+        assert!(build_mesh_inbound_spiffe_slot(&env, None, None).is_none());
     }
 
     #[test]
@@ -15455,14 +15794,14 @@ mod tests {
         };
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
         let mesh_frontend_identity =
-            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+            load_mesh_frontend_server_identity(&env, None).expect("mesh frontend identity");
 
         let tls_config = load_mesh_frontend_tls(
             &env,
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
-            mesh_frontend_identity.as_deref(),
+            mesh_frontend_identity.as_ref(),
             None,
             None,
         )
@@ -15512,10 +15851,16 @@ mod tests {
             gateway_svid_key_path: Some("tests/certs/server.key".to_string()),
             ..EnvConfig::default()
         };
-        let identity = load_mesh_frontend_server_identity(&env)
+        let identity = load_mesh_frontend_server_identity(&env, None)
             .expect("gateway SVID load should succeed")
             .expect("gateway SVID must back the inbound server identity");
-        assert_eq!(identity.cert_path(), "tests/certs/server.crt");
+        assert_eq!(
+            identity
+                .as_static()
+                .expect("static gateway SVID")
+                .cert_path(),
+            "tests/certs/server.crt"
+        );
 
         // Explicit frontend TLS takes precedence over the SVID fallback (a
         // broken SVID path here must be ignored because frontend TLS is set).
@@ -15526,17 +15871,85 @@ mod tests {
             gateway_svid_key_path: Some("/nonexistent/svid.key".to_string()),
             ..EnvConfig::default()
         };
-        let identity = load_mesh_frontend_server_identity(&env)
+        let identity = load_mesh_frontend_server_identity(&env, None)
             .expect("explicit frontend TLS load should succeed")
             .expect("explicit frontend TLS identity");
-        assert_eq!(identity.cert_path(), "tests/certs/server.crt");
+        assert_eq!(
+            identity
+                .as_static()
+                .expect("static explicit frontend TLS")
+                .cert_path(),
+            "tests/certs/server.crt"
+        );
 
         // Neither configured → no server identity (not an error here; the
         // fail-closed gate decides what to do with a plaintext posture).
         assert!(
-            load_mesh_frontend_server_identity(&EnvConfig::default())
+            load_mesh_frontend_server_identity(&EnvConfig::default(), None)
                 .expect("no identity is not a load error")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn load_mesh_frontend_server_identity_uses_runtime_svid_slot() {
+        let slot = populated_spiffe_slot();
+        let identity = load_mesh_frontend_server_identity(&EnvConfig::default(), Some(&slot))
+            .expect("runtime SVID identity should load")
+            .expect("runtime SVID slot should back server identity");
+        match identity {
+            MeshFrontendServerIdentity::DynamicSpiffe {
+                slot: returned_slot,
+                source,
+            } => {
+                assert!(Arc::ptr_eq(&returned_slot, &slot));
+                assert_eq!(source, "FERRUM_MESH_CA_BACKEND");
+            }
+            MeshFrontendServerIdentity::Static(_) => {
+                panic!("runtime SVID slot must select dynamic SPIFFE server identity")
+            }
+        }
+
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            ..EnvConfig::default()
+        };
+        let identity = load_mesh_frontend_server_identity(&env, Some(&slot))
+            .expect("explicit frontend TLS should load")
+            .expect("explicit frontend TLS identity");
+        assert!(
+            matches!(identity, MeshFrontendServerIdentity::Static(_)),
+            "explicit frontend TLS must take precedence over CA-backed SVID"
+        );
+    }
+
+    #[test]
+    fn load_mesh_frontend_tls_builds_with_dynamic_spiffe_identity() {
+        ensure_crypto_provider();
+        let env = EnvConfig::default();
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let slot = populated_spiffe_slot();
+        let identity = MeshFrontendServerIdentity::DynamicSpiffe {
+            slot: slot.clone(),
+            source: "test-runtime-svid",
+        };
+
+        let tls_config = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Permissive,
+            Some(&identity),
+            None,
+            Some(&slot),
+        )
+        .expect("dynamic SPIFFE identity should build TLS config")
+        .expect("TLS config present");
+
+        assert!(
+            tls_config.alpn_protocols.contains(&b"h2".to_vec()),
+            "mesh frontend TLS must advertise h2"
         );
     }
 
@@ -15626,13 +16039,13 @@ mod tests {
             ..EnvConfig::default()
         };
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
-        let identity = load_mesh_frontend_server_identity(&env).expect("server identity");
+        let identity = load_mesh_frontend_server_identity(&env, None).expect("server identity");
         let frontend_tls = load_mesh_frontend_tls(
             &env,
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
-            identity.as_deref(),
+            identity.as_ref(),
             None,
             None,
         )
@@ -15749,7 +16162,7 @@ mod tests {
         };
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
         let mesh_frontend_identity =
-            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+            load_mesh_frontend_server_identity(&env, None).expect("mesh frontend identity");
         let slot = populated_spiffe_slot();
 
         // The verifier built for this slot in PERMISSIVE must request but not
@@ -15775,7 +16188,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
-            mesh_frontend_identity.as_deref(),
+            mesh_frontend_identity.as_ref(),
             None,
             Some(&slot),
         )
@@ -15804,7 +16217,7 @@ mod tests {
         };
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
         let mesh_frontend_identity =
-            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+            load_mesh_frontend_server_identity(&env, None).expect("mesh frontend identity");
 
         assert_eq!(
             resolve_mesh_inbound_client_auth(config::MtlsMode::Permissive, true, false),
@@ -15817,7 +16230,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
-            mesh_frontend_identity.as_deref(),
+            mesh_frontend_identity.as_ref(),
             None,
             None,
         )
@@ -15845,7 +16258,7 @@ mod tests {
         };
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
         let mesh_frontend_identity =
-            load_mesh_frontend_server_identity(&env).expect("load identity");
+            load_mesh_frontend_server_identity(&env, None).expect("load identity");
 
         std::fs::write(&cert_path, b"not a cert").expect("replace cert");
         std::fs::write(&key_path, b"not a key").expect("replace key");
@@ -15855,7 +16268,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Strict,
-            mesh_frontend_identity.as_deref(),
+            mesh_frontend_identity.as_ref(),
             None,
             None,
         )
@@ -15880,7 +16293,7 @@ mod tests {
             .expect("snapshot reads CA bytes");
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
         let mesh_frontend_identity =
-            load_mesh_frontend_server_identity(&env).expect("load identity");
+            load_mesh_frontend_server_identity(&env, None).expect("load identity");
 
         std::fs::write(&ca_path, b"not a ca").expect("replace CA");
 
@@ -15889,7 +16302,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Strict,
-            mesh_frontend_identity.as_deref(),
+            mesh_frontend_identity.as_ref(),
             snapshot.client_ca_bundle.as_ref(),
             None,
         )
@@ -16102,13 +16515,13 @@ mod tests {
         };
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
         let mesh_frontend_identity =
-            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+            load_mesh_frontend_server_identity(&env, None).expect("mesh frontend identity");
         let tls_config = load_mesh_frontend_tls(
             &env,
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
-            mesh_frontend_identity.as_deref(),
+            mesh_frontend_identity.as_ref(),
             None,
             None,
         )

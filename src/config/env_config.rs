@@ -3350,17 +3350,29 @@ impl EnvConfig {
                     )?;
                 }
                 // Validate the mesh CA backend value (reject unknown strings).
-                // NOTE: the backend is parsed/validated here but is NOT yet
-                // wired to issue SVIDs into the running data plane — the
-                // identity subsystem under `src/identity` is built but not
-                // connected (`mesh_ca_backend` has no runtime consumers), so
-                // `FERRUM_MESH_CA_BACKEND` does not by itself give the mesh a
-                // workload identity. Only file-based gateway SVID material does
-                // (loaded by `load_gateway_svid_bundle`).
-                if let Err(e) =
+                let mesh_ca_backend =
                     crate::identity::ca::CaBackend::from_str_lossy(&self.mesh_ca_backend)
+                        .map_err(|e| format!("Invalid FERRUM_MESH_CA_BACKEND: {e}"))?;
+                // File-based SVID material is the explicit identity override.
+                // Blank paths were normalized to `None` at parse, so a presence
+                // check is exact.
+                let has_file_workload_identity = self.gateway_svid_cert_path.is_some()
+                    && self.gateway_svid_key_path.is_some()
+                    && self.gateway_svid_trust_bundle_path.is_some();
+                if mesh_ca_backend != crate::identity::ca::CaBackend::None
+                    && !has_file_workload_identity
                 {
-                    return Err(format!("Invalid FERRUM_MESH_CA_BACKEND: {e}"));
+                    let workload_spiffe_id = crate::config::conf_file::resolve_ferrum_var(
+                        "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                    )
+                    .filter(|value| !value.trim().is_empty());
+                    if workload_spiffe_id.is_none() {
+                        return Err(
+                            "FERRUM_MESH_CA_BACKEND requires FERRUM_MESH_WORKLOAD_SPIFFE_ID so \
+                             the issued runtime SVID matches the local mesh workload identity"
+                                .into(),
+                        );
+                    }
                 }
                 // Validate the production-mode flag value loudly — like
                 // `EnvConfig`'s bool parser — so a typo (e.g. `tru` / `yes`)
@@ -3375,14 +3387,13 @@ impl EnvConfig {
                         ));
                     }
                 }
-                // The running mesh's workload identity comes only from file-based
-                // gateway SVID material today (all three FERRUM_GATEWAY_SVID_*
-                // paths, loaded together by `load_gateway_svid_bundle`). Blank
-                // paths were normalized to `None` at parse, so a presence check
-                // is exact.
-                let has_workload_identity = self.gateway_svid_cert_path.is_some()
-                    && self.gateway_svid_key_path.is_some()
-                    && self.gateway_svid_trust_bundle_path.is_some();
+                // The running mesh's workload identity comes either from
+                // file-based gateway SVID material (all three
+                // FERRUM_GATEWAY_SVID_* paths, loaded together by
+                // `load_gateway_svid_bundle`) or an automatic CA backend wired
+                // at mesh startup (`FERRUM_MESH_CA_BACKEND=spire|internal`).
+                let has_workload_identity = has_file_workload_identity
+                    || mesh_ca_backend != crate::identity::ca::CaBackend::None;
                 // Security gate: without a workload identity the mesh can neither
                 // establish nor verify mTLS, so PeerAuthentication's PERMISSIVE
                 // default would silently accept unauthenticated plaintext. Same
@@ -3405,11 +3416,8 @@ impl EnvConfig {
                 // termination listener that would come up plaintext is fatal in
                 // production (dev warns — an explicit DISABLE, or the no-identity
                 // posture this gate already acknowledges, is intentional), while a
-                // configured-but-unloadable SVID verifier is fatal regardless of
-                // mode (a real fault, like a broken cert/key). Residual follow-up:
-                // wiring FERRUM_MESH_CA_BACKEND to issue/rotate SVIDs into the data
-                // plane (still validated-but-inert here — only file-based gateway
-                // SVID material gives identity).
+                // configured-but-unloadable SVID verifier or unavailable CA-backed
+                // initial SVID is fatal (a real fault, like a broken cert/key).
                 if !has_workload_identity {
                     if crate::identity::production_mode() {
                         // Master prod guardrail: like bootstrap_dev_root and
@@ -3419,9 +3427,9 @@ impl EnvConfig {
                             "FERRUM_MESH_PRODUCTION_MODE=true but the mesh has no workload \
                              identity: set FERRUM_GATEWAY_SVID_CERT_PATH, \
                              FERRUM_GATEWAY_SVID_KEY_PATH, and FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH \
-                             to file-based SVID material. (FERRUM_MESH_CA_BACKEND is validated but \
-                             does not yet issue SVIDs into the data plane.) Without identity the \
-                             mesh cannot establish or verify mTLS."
+                             to file-based SVID material, or configure FERRUM_MESH_CA_BACKEND with \
+                             FERRUM_MESH_WORKLOAD_SPIFFE_ID. Without identity the mesh cannot \
+                             establish or verify mTLS."
                                 .into(),
                         );
                     }
@@ -3444,10 +3452,10 @@ impl EnvConfig {
                              TRUST_BUNDLE_PATH). Without identity the mesh cannot establish or \
                              verify mTLS, so it would accept unauthenticated plaintext traffic \
                              (PeerAuthentication defaults to PERMISSIVE). Supply gateway SVID \
-                             material, or — for dev/test only — set the FERRUM_MESH_ALLOW_NO_CA=true \
-                             environment variable (not honored from ferrum.conf). \
-                             FERRUM_MESH_CA_BACKEND is validated but does not yet load an SVID into \
-                             the data plane."
+                             material, configure FERRUM_MESH_CA_BACKEND with \
+                             FERRUM_MESH_WORKLOAD_SPIFFE_ID, or — for dev/test only — set the \
+                             FERRUM_MESH_ALLOW_NO_CA=true environment variable (not honored from \
+                             ferrum.conf)."
                                 .into(),
                         );
                     }

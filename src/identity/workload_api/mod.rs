@@ -18,6 +18,9 @@ pub mod server;
 #[allow(unused_imports)]
 pub use client::{DEFAULT_WORKLOAD_API_SOCKET, WorkloadApiClient, WorkloadApiClientError};
 #[allow(unused_imports)]
-pub use fetch_loop::{FetchLoopConfig, FetchLoopError, SvidFetchHandle, spawn_fetch_loop};
+pub use fetch_loop::{
+    FetchLoopConfig, FetchLoopError, SvidFetchHandle, spawn_fetch_loop,
+    spawn_fetch_loop_with_handle,
+};
 #[allow(unused_imports)]
 pub use server::WorkloadApiService;

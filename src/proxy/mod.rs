@@ -2997,22 +2997,26 @@ impl ProxyState {
             .store(self.gateway_file_svid_bundle.load_full());
     }
 
-    fn install_gateway_file_svid_bundle(&self, file_bundle: SvidBundle) {
+    pub(crate) fn install_gateway_runtime_svid_bundle(&self, bundle: SvidBundle) {
         let _guard = self
             .gateway_svid_update_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         self.gateway_file_svid_bundle
-            .store(Arc::new(Some(file_bundle.clone())));
+            .store(Arc::new(Some(bundle.clone())));
 
-        let mut active_bundle = file_bundle;
+        let mut active_bundle = bundle;
         let trust_snapshot = self.gateway_trust_bundles.load_full();
         if let Some(trust_bundles) = trust_snapshot.as_ref() {
             active_bundle.trust_bundles = trust_bundles.clone();
         }
         self.gateway_svid_bundle
             .store(Arc::new(Some(active_bundle)));
+    }
+
+    fn install_gateway_file_svid_bundle(&self, file_bundle: SvidBundle) {
+        self.install_gateway_runtime_svid_bundle(file_bundle);
     }
 
     /// Force a gateway SVID reload from the currently configured sources.

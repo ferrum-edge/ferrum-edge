@@ -13,10 +13,11 @@
 //! - [`rotation`] — background task that renews SVIDs and hot-swaps via
 //!   `ArcSwap` for the lock-free TLS-resolver path.
 //!
-//! Phase A only **builds** these layers; nothing is wired into existing
-//! listeners yet. The TLS builders [`crate::tls::build_spiffe_inbound_config`]
-//! and [`crate::tls::build_spiffe_outbound_config`] expose ready-to-use APIs
-//! for Phase C.
+//! Mesh mode wires the Workload API / internal rotation pieces into the
+//! gateway SVID slot when `FERRUM_MESH_CA_BACKEND` is enabled. The TLS builders
+//! [`crate::tls::build_spiffe_inbound_config`] and
+//! [`crate::tls::build_spiffe_outbound_config`] remain the shared lower-level
+//! APIs for SPIFFE-aware listeners and clients.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -45,6 +45,21 @@ impl SvidFetchHandle {
         }
     }
 
+    /// Build a fetch handle around an existing SVID slot.
+    ///
+    /// Mesh mode uses this to let the SPIRE Workload API producer feed the
+    /// `ProxyState.gateway_svid_bundle` slot that outbound HBONE/mTLS pools and
+    /// inbound SVID presentation already consume.
+    pub fn from_slot(current: Arc<ArcSwap<Option<SvidBundle>>>) -> Self {
+        let has_first = current.load().is_some();
+        Self {
+            current,
+            first_ready: Arc::new(Notify::new()),
+            has_first: Arc::new(std::sync::atomic::AtomicBool::new(has_first)),
+            revision_tx: Arc::new(OnceLock::new()),
+        }
+    }
+
     /// Wire this handle to the gateway's backend SVID rotation channel.
     ///
     /// Once attached, every `install` after the first publishes a fresh
@@ -137,9 +152,17 @@ impl Default for FetchLoopConfig {
 /// (drop the returned `JoinHandle`).
 pub fn spawn_fetch_loop(config: FetchLoopConfig) -> (SvidFetchHandle, tokio::task::JoinHandle<()>) {
     let handle = SvidFetchHandle::new();
-    let task_handle = handle.clone();
-    let join = tokio::spawn(async move { fetch_loop_main(config, task_handle).await });
+    let join = spawn_fetch_loop_with_handle(config, handle.clone());
     (handle, join)
+}
+
+/// Spawn a fetch loop that writes into a caller-supplied handle.
+pub fn spawn_fetch_loop_with_handle(
+    config: FetchLoopConfig,
+    handle: SvidFetchHandle,
+) -> tokio::task::JoinHandle<()> {
+    let task_handle = handle.clone();
+    tokio::spawn(async move { fetch_loop_main(config, task_handle).await })
 }
 
 async fn fetch_loop_main(config: FetchLoopConfig, handle: SvidFetchHandle) {

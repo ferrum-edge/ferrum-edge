@@ -1016,6 +1016,128 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
     Ok(Arc::new(config))
 }
 
+/// Build mesh TLS config using a dynamic server certificate resolver.
+///
+/// CA-backed mesh identity uses this path: the resolver presents the current
+/// SVID from a lock-free slot on every handshake, while the rest of the mesh
+/// frontend TLS posture stays identical to the static cert/key builder.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_mesh_tls_config_with_dynamic_identity(
+    server_cert_resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+    identity_source: &str,
+    client_ca_bundle: Option<ClientCaBundleRef<'_>>,
+    client_auth: MeshClientAuth,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+    spiffe_client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<Arc<ServerConfig>, anyhow::Error> {
+    if let Some(bundle) = client_ca_bundle {
+        check_cert_expiry_from_pem_bytes(
+            bundle.pem,
+            "mesh client CA bundle",
+            bundle.path,
+            cert_expiry_warning_days,
+        )?;
+    }
+
+    let builder = ServerConfig::builder_with_provider(tls_policy.crypto_provider.clone())
+        .with_protocol_versions(&tls_policy.protocol_versions)
+        .map_err(|e| anyhow::anyhow!("Failed to set TLS protocol versions: {}", e))?;
+
+    let mut config = match client_auth {
+        MeshClientAuth::Required | MeshClientAuth::Optional => {
+            if let Some(verifier) = spiffe_client_verifier {
+                info!(
+                    mesh_client_auth = ?client_auth,
+                    "Mesh TLS configuration loaded with dynamic SPIFFE server identity and \
+                     SPIFFE trust-domain-validating client verifier from {identity_source}"
+                );
+                builder
+                    .with_client_cert_verifier(verifier)
+                    .with_cert_resolver(server_cert_resolver)
+            } else {
+                let ca_bundle = client_ca_bundle.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Mesh mTLS {:?} mode requires readable client CA bundle bytes \
+                         (FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH)",
+                        client_auth
+                    )
+                })?;
+
+                let ca_certs: Vec<_> = certs(&mut &ca_bundle.pem[..])
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                let mut client_auth_roots = rustls::RootCertStore::empty();
+                let (added, _ignored) = client_auth_roots.add_parsable_certificates(ca_certs);
+                if added == 0 {
+                    return Err(anyhow::anyhow!(
+                        "No valid client CA certificates found in {}",
+                        ca_bundle.path
+                    ));
+                }
+
+                let mut verifier_builder =
+                    rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+
+                if client_auth == MeshClientAuth::Optional {
+                    verifier_builder = verifier_builder.allow_unauthenticated();
+                }
+
+                if !crls.is_empty() {
+                    verifier_builder = verifier_builder
+                        .with_crls(crls.iter().cloned())
+                        .allow_unknown_revocation_status()
+                        .only_check_end_entity_revocation();
+                }
+
+                let verifier = verifier_builder.build().map_err(|e| {
+                    anyhow::anyhow!("Failed to build mesh client certificate verifier: {}", e)
+                })?;
+
+                info!(
+                    mesh_client_auth = ?client_auth,
+                    "Mesh TLS configuration loaded with dynamic SPIFFE server identity and {:?} \
+                     client auth from {identity_source}, client CA: {}",
+                    client_auth,
+                    ca_bundle.path,
+                );
+
+                builder
+                    .with_client_cert_verifier(verifier)
+                    .with_cert_resolver(server_cert_resolver)
+            }
+        }
+        MeshClientAuth::None => {
+            info!(
+                "Mesh TLS configuration loaded with dynamic SPIFFE server identity and without \
+                 client auth from {identity_source}"
+            );
+            builder
+                .with_no_client_auth()
+                .with_cert_resolver(server_cert_resolver)
+        }
+    };
+
+    config.ignore_client_order = tls_policy.prefer_server_cipher_order;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    match rustls::crypto::ring::Ticketer::new() {
+        Ok(ticketer) => {
+            config.ticketer = ticketer;
+        }
+        Err(e) => {
+            warn!("Failed to create mesh TLS session ticket rotator: {}", e);
+        }
+    }
+    config.session_storage =
+        rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
+    config.max_early_data_size = 0;
+
+    Ok(Arc::new(config))
+}
+
 /// Enable kTLS session-secret extraction on a `ServerConfig` returned by
 /// [`load_tls_config_with_client_auth`].
 ///

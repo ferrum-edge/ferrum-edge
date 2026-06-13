@@ -457,11 +457,10 @@ fn test_env_config_mesh_mode_no_ca_allowed_with_explicit_opt_out() {
 }
 
 #[test]
-fn test_env_config_mesh_mode_ca_backend_without_svid_is_refused() {
-    // A CA backend value alone (e.g. `internal`) does NOT load a runtime SVID
-    // today (it is parsed/validated but not wired to the data plane), so with
-    // no gateway SVID material and no opt-out the mesh has no identity and must
-    // fail closed.
+fn test_env_config_mesh_mode_ca_backend_requires_workload_spiffe_id() {
+    // A CA backend can now supply runtime identity, but it needs the local
+    // workload SPIFFE ID so the issued SVID matches mesh policy/materialization
+    // identity.
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
@@ -478,22 +477,22 @@ fn test_env_config_mesh_mode_ca_backend_without_svid_is_refused() {
             remove_var("FERRUM_GATEWAY_SVID_CERT_PATH");
             remove_var("FERRUM_GATEWAY_SVID_KEY_PATH");
             remove_var("FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH");
+            remove_var("FERRUM_MESH_WORKLOAD_SPIFFE_ID");
             let result = EnvConfig::from_env();
+            assert!(result.is_err());
             assert!(
-                result.is_err(),
-                "a CA backend without gateway SVID material has no runtime identity"
+                result
+                    .unwrap_err()
+                    .contains("FERRUM_MESH_WORKLOAD_SPIFFE_ID")
             );
-            assert!(result.unwrap_err().contains("FERRUM_MESH_ALLOW_NO_CA"));
         },
     );
 }
 
 #[test]
-fn test_env_config_mesh_mode_spire_without_svid_refused_in_production() {
-    // The documented production command
-    // `FERRUM_MESH_PRODUCTION_MODE=true FERRUM_MESH_CA_BACKEND=spire` must NOT
-    // start without gateway SVID material: the CA backend does not yet load an
-    // SVID into the data plane, so there is no runtime identity.
+fn test_env_config_mesh_mode_spire_backend_satisfies_production_identity_gate() {
+    // A configured SPIRE backend plus local workload identity now supplies
+    // runtime SVID material, so production mode does not require file SVID paths.
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
@@ -504,15 +503,18 @@ fn test_env_config_mesh_mode_spire_without_svid_refused_in_production() {
             ),
             ("FERRUM_MESH_CA_BACKEND", "spire"),
             ("FERRUM_MESH_PRODUCTION_MODE", "true"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/reviews",
+            ),
         ],
         || {
             remove_var("FERRUM_MESH_ALLOW_NO_CA");
             remove_var("FERRUM_GATEWAY_SVID_CERT_PATH");
             remove_var("FERRUM_GATEWAY_SVID_KEY_PATH");
             remove_var("FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH");
-            let result = EnvConfig::from_env();
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("FERRUM_MESH_PRODUCTION_MODE"));
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mode, OperatingMode::Mesh);
         },
     );
 }
@@ -614,6 +616,34 @@ fn test_env_config_mesh_mode_no_ca_with_gateway_svid_passes() {
         || {
             remove_var("FERRUM_MESH_PRODUCTION_MODE");
             remove_var("FERRUM_MESH_CA_BACKEND");
+            remove_var("FERRUM_MESH_ALLOW_NO_CA");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mode, OperatingMode::Mesh);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_gateway_svid_takes_precedence_over_ca_backend() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "spire"),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", "/tmp/ferrum-svid.crt"),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", "/tmp/ferrum-svid.key"),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                "/tmp/ferrum-svid-bundle.pem",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_MESH_WORKLOAD_SPIFFE_ID");
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
             remove_var("FERRUM_MESH_ALLOW_NO_CA");
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.mode, OperatingMode::Mesh);
