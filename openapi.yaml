@@ -8272,14 +8272,19 @@ components:
           type: object
           description: |
             Router cache stores (host, path) → proxy lookups for O(1) repeated hits.
-            Prefix and regex routes use separate cache partitions.
+            Lookups are split across two partitions: a prefix/negative partition
+            and a regex/exact partition. The regex/exact partition also holds
+            exact-path and path-parameter positive matches, so those are counted
+            under `regex_cache_entries`.
           properties:
             prefix_cache_entries:
               type: integer
               description: Current entries in the prefix route cache
             regex_cache_entries:
               type: integer
-              description: Current entries in the regex route cache
+              description: >-
+                Current entries in the regex/exact cache partition (regex,
+                exact-path, and path-parameter matches)
             prefix_eviction_count:
               type: integer
               format: int64
