@@ -3082,7 +3082,7 @@ pub fn is_security_plugin(name: &str) -> bool {
 /// These names are intentionally fail-closed during config load so upgrades
 /// cannot silently drop authentication/authorization protections.
 pub fn is_removed_security_plugin(name: &str) -> bool {
-    matches!(name, "oauth2_auth")
+    matches!(name, "oauth2_auth" | "semantic_ai_firewall")
 }
 
 pub fn available_plugins() -> Vec<&'static str> {

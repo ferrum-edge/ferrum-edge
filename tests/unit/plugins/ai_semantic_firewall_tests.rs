@@ -141,6 +141,9 @@ async fn plugin_name_priority_protocols_and_registration() {
     assert!(!ferrum_edge::plugins::is_security_plugin(
         "semantic_ai_firewall"
     ));
+    assert!(ferrum_edge::plugins::is_removed_security_plugin(
+        "semantic_ai_firewall"
+    ));
 }
 
 #[test]
