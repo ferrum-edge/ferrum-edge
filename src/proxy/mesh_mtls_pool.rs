@@ -56,6 +56,16 @@ pub const MESH_MTLS_TARGET_TAG: &str = "mesh.mtls";
 pub const MESH_MTLS_PORT_TAG: &str = "mesh.mtls_port";
 /// Istio-convention sidecar inbound mTLS port.
 pub const ISTIO_SIDECAR_INBOUND_PORT: u16 = 15006;
+/// Tag carrying the OWNING SERVICE port a multi-port Sidecar egress target
+/// serves. Stamped at materialization ONLY when the destination service
+/// declares more than one HTTP-family port; `proxy_to_backend_mesh_mtls`
+/// then rewrites the request `:authority` to `<host>:<service_port>` so the
+/// destination sidecar's inbound multi-port disambiguation can pick the
+/// right per-port loopback sibling (its `:15006` dials are direct — never
+/// NATed — so the authority is the only port channel the source controls).
+/// Single-port destinations are never stamped and keep the client authority
+/// byte-for-byte.
+pub const MESH_MTLS_AUTHORITY_PORT_TAG: &str = "mesh.mtls_authority_port";
 
 /// Multiplexed hyper H2 sender over the SVID-mTLS session. The body type is
 /// [`SizeLimitedIncoming`] so dispatch enforces `max_request_body_size_bytes`
@@ -88,6 +98,19 @@ pub fn target_mesh_mtls_port(target: &UpstreamTarget) -> u16 {
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|port| *port > 0)
         .unwrap_or(ISTIO_SIDECAR_INBOUND_PORT)
+}
+
+/// The owning service port of a multi-port Sidecar egress target, when the
+/// materializer stamped one — see [`MESH_MTLS_AUTHORITY_PORT_TAG`]. A corrupt
+/// (non-numeric / zero) tag yields `None`, which leaves the authority
+/// port-less; the destination's inbound multi-port selection then fails the
+/// request closed (502) rather than guessing, so corruption cannot misroute.
+pub fn target_mesh_mtls_authority_port(target: &UpstreamTarget) -> Option<u16> {
+    target
+        .tags
+        .get(MESH_MTLS_AUTHORITY_PORT_TAG)
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
 }
 
 /// The pinned peer identity a `mesh.mtls` target MUST declare. Unlike HBONE
@@ -360,11 +383,16 @@ impl MeshMtlsConnectionPool {
 
     /// Checkout (or create) a multiplexed H2 sender to `target_host:mtls_port`
     /// whose mTLS session is pinned to `expected_peer`. The returned sender is
-    /// a cheap clone of the pooled connection handle.
+    /// a cheap clone of the pooled connection handle. `app_port` is the
+    /// target's app (container) port — it never changes what is dialed, but it
+    /// partitions the pool so per-port siblings of a multi-port service don't
+    /// share connections (stream-cap saturation / idle pruning isolation; the
+    /// same per-app-port pool-key isolation the HBONE pool keeps).
     pub async fn get_sender(
         &self,
         proxy: &Proxy,
         target_host: &str,
+        app_port: u16,
         mtls_port: u16,
         expected_peer: &SpiffeId,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
@@ -373,6 +401,7 @@ impl MeshMtlsConnectionPool {
 
         let fast_sender = with_mesh_mtls_pool_key(
             target_host,
+            app_port,
             mtls_port,
             proxy.dns_override.as_deref(),
             fingerprint.as_ref(),
@@ -386,6 +415,7 @@ impl MeshMtlsConnectionPool {
 
         let key = with_mesh_mtls_pool_key(
             target_host,
+            app_port,
             mtls_port,
             proxy.dns_override.as_deref(),
             fingerprint.as_ref(),
@@ -732,9 +762,10 @@ impl MeshMtlsConnectionPool {
 }
 
 /// SVID-fingerprint field of a mesh mTLS pool key:
-/// `mesh-mtls|{host}|{mtls_port}|{dns_override}|{svid_fingerprint}|{peer}|pool=...`
+/// `mesh-mtls|{host}|{app_port}|{mtls_port}|{dns_override}|{svid_fingerprint}|{peer}|pool=...`
+/// — keep the index in sync with `write_mesh_mtls_pool_key`.
 fn mesh_mtls_key_svid_fingerprint(key: &str) -> Option<&str> {
-    key.split('|').nth(4)
+    key.split('|').nth(5)
 }
 
 fn prune_pool_entries(entries: &mut Vec<MeshMtlsPoolEntry>) -> usize {
@@ -773,8 +804,10 @@ fn set_tcp_keepalive(stream: &TcpStream, keepalive_seconds: u64) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn with_mesh_mtls_pool_key<R>(
     host: &str,
+    app_port: u16,
     mtls_port: u16,
     dns_override: Option<&str>,
     svid_fingerprint: &str,
@@ -787,6 +820,7 @@ fn with_mesh_mtls_pool_key<R>(
         write_mesh_mtls_pool_key(
             &mut buf,
             host,
+            app_port,
             mtls_port,
             dns_override,
             svid_fingerprint,
@@ -797,9 +831,11 @@ fn with_mesh_mtls_pool_key<R>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_mesh_mtls_pool_key(
     buf: &mut String,
     host: &str,
+    app_port: u16,
     mtls_port: u16,
     dns_override: Option<&str>,
     svid_fingerprint: &str,
@@ -809,9 +845,11 @@ fn write_mesh_mtls_pool_key(
     buf.clear();
     // The pinned peer identity is connection identity: a session verified
     // against one expected SVID must never serve a target pinning another.
+    // `app_port` mirrors the HBONE key's target-port field: per-port siblings
+    // of a multi-port service keep isolated connections.
     let _ = write!(
         buf,
-        "mesh-mtls|{host}|{mtls_port}|{}|{svid_fingerprint}|{}",
+        "mesh-mtls|{host}|{app_port}|{mtls_port}|{}|{svid_fingerprint}|{}",
         dns_override.unwrap_or_default(),
         expected_peer.as_str()
     );
@@ -898,9 +936,16 @@ mod tests {
         let peer_a = SpiffeId::new("spiffe://cluster.local/ns/default/sa/a").unwrap();
         let peer_b = SpiffeId::new("spiffe://cluster.local/ns/default/sa/b").unwrap();
         let key = |peer: &SpiffeId, fp: &str| {
-            with_mesh_mtls_pool_key("10.0.0.1", 15006, None, fp, peer, &pool_config, |key| {
-                key.to_string()
-            })
+            with_mesh_mtls_pool_key(
+                "10.0.0.1",
+                8080,
+                15006,
+                None,
+                fp,
+                peer,
+                &pool_config,
+                |key| key.to_string(),
+            )
         };
         assert_ne!(
             key(&peer_a, "fp"),
@@ -913,6 +958,29 @@ mod tests {
             "an SVID rotation must repartition the pool"
         );
         assert_eq!(key(&peer_a, "fp"), key(&peer_a, "fp"));
+    }
+
+    #[test]
+    fn pool_key_partitions_by_app_port() {
+        let pool_config = PoolConfig::default();
+        let peer = test_peer();
+        let key = |app_port: u16| {
+            with_mesh_mtls_pool_key(
+                "10.0.0.1",
+                app_port,
+                15006,
+                None,
+                "fp",
+                &peer,
+                &pool_config,
+                |key| key.to_string(),
+            )
+        };
+        assert_ne!(
+            key(8080),
+            key(9090),
+            "per-port siblings of a multi-port service must not share a session"
+        );
     }
 
     fn svid_bundle(leaf: &[u8]) -> SvidBundle {
@@ -937,6 +1005,7 @@ mod tests {
     fn key_for_fingerprint(host: &str, fingerprint: &str) -> String {
         with_mesh_mtls_pool_key(
             host,
+            8080,
             ISTIO_SIDECAR_INBOUND_PORT,
             None,
             fingerprint,

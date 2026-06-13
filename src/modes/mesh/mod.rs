@@ -763,6 +763,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // (re-keyed there to the resolved dial port). Topology-aware: Ambient emits
     // HBONE routes; Sidecar (SVID-mTLS) lands in a follow-up.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
+    materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
@@ -776,6 +777,18 @@ fn prepare_normalized_gateway_config_for_mesh(
     // consume the filtered slice directly. Closes Gap #2.
     if let Some(mesh) = config.mesh.as_deref_mut() {
         mesh.service_entries = mesh_slice.service_entries.clone();
+        // Back-project the slice's narrowed LOCAL-INBOUND service view (kept
+        // SEPARATE from the egress-narrowed `services` — never folded in, per
+        // the egress-scope security rule) so the router's inbound per-port
+        // sibling grouping and the listen-path uniqueness exemption derive
+        // sibling identity from the same view
+        // `materialize_sidecar_inbound_proxies` consumed. `Some` exactly when
+        // Sidecar narrowing resolved the local view, mirroring the
+        // materializer's `local_inbound_workloads` gate.
+        mesh.local_inbound_services = mesh_slice
+            .local_inbound_workloads
+            .is_some()
+            .then(|| mesh_slice.local_inbound_services.clone());
     }
     config.normalize_fields();
     config.resolve_upstream_tls();
@@ -1523,6 +1536,11 @@ pub(crate) fn service_http_family_ports(
 /// resource-id validation rejects ids starting with `_`, so
 /// `__mesh-outbound-*` ids exist only via mesh materialization, and both
 /// consumers key strictly off the `mesh` block the slice carried.
+///
+/// Despite the name, the struct shape is direction-agnostic:
+/// [`mesh_inbound_service_groups`] reuses it for the sidecar INBOUND per-port
+/// siblings (disambiguated by inbound orig-dst / the request authority port
+/// instead of the outbound capture's orig-dst).
 pub(crate) struct MeshOutboundServiceGroup {
     /// How many HTTP-family ports the service DECLARES — which can exceed the
     /// materialized sibling count (e.g. an unresolved named `targetPort`
@@ -1564,6 +1582,73 @@ pub(crate) fn mesh_outbound_service_groups(
         .collect()
 }
 
+/// Stream-family service ports of an in-mesh service — raw TCP, opaque TLS,
+/// and the DB protocols — with `protocol_overrides` applied: the raw-TCP
+/// egress mirror of [`service_http_family_ports`]. The two predicates
+/// PARTITION `AppProtocol` (a unit test pins this): `Unknown` deliberately
+/// stays HTTP-family (the long-standing default), and `Tls` is opaque-byte
+/// passthrough here — the captured original destination selects the
+/// destination service, no SNI parsing.
+pub(crate) fn service_tcp_stream_ports(
+    service: &crate::modes::mesh::config::MeshService,
+) -> Vec<&crate::modes::mesh::config::ServicePort> {
+    service
+        .ports
+        .iter()
+        .filter(|sp| {
+            !is_http_family_mesh_protocol(
+                service
+                    .protocol_overrides
+                    .get(&sp.port)
+                    .copied()
+                    .unwrap_or(sp.protocol),
+            )
+        })
+        .collect()
+}
+
+/// Expected per-port INBOUND sibling routes of each local service, mirroring
+/// [`mesh_outbound_service_groups`] for the sidecar inbound direction (same
+/// forward-derivation doctrine — see that helper's doc). Reads the
+/// local-inbound service view (`local_inbound_services` when Sidecar narrowing
+/// resolved it, else `services`) so it matches what
+/// `materialize_sidecar_inbound_proxies` consumed; the egress-narrowed
+/// `services` can lack the local service entirely. Over-approximates — it does
+/// not re-run local-workload resolution — which is harmless: the router only
+/// groups ids that exist as materialized proxies, the uniqueness exemption
+/// only matters for ids that exist, and operators cannot author
+/// `__mesh-inbound-*` ids (resource-id validation rejects a leading `_`).
+/// Empty outside mesh mode.
+pub(crate) fn mesh_inbound_service_groups(
+    mesh: &crate::modes::mesh::config::MeshConfig,
+) -> Vec<MeshOutboundServiceGroup> {
+    let services = mesh
+        .local_inbound_services
+        .as_deref()
+        .unwrap_or(&mesh.services);
+    services
+        .iter()
+        .filter_map(|service| {
+            let http_ports = service_http_family_ports(service);
+            if http_ports.is_empty() {
+                return None;
+            }
+            Some(MeshOutboundServiceGroup {
+                declared_http_ports: http_ports.len(),
+                siblings: http_ports
+                    .iter()
+                    .map(|sp| {
+                        (
+                            sp.port,
+                            mesh_inbound_proxy_id(&service.namespace, &service.name, sp.port),
+                        )
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
 /// Upstream id for a materialized mesh outbound route, one per HTTP-family
 /// service port (per-port upstreams keep LB counters, hash rings, passive
 /// health, and pool keys isolated per app port). Deliberately
@@ -1574,6 +1659,15 @@ pub(crate) fn mesh_outbound_service_groups(
 /// ever handed an upstream id. Parallels the east-west `__mesh-ew-upstream-` id.
 fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
     format!("__mesh-out-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
+}
+
+/// Upstream id for a materialized raw-TCP egress port, one per stream-family
+/// service port. A DISTINCT id space from [`mesh_outbound_upstream_id`] so a
+/// service exposing the same port number as both (via `protocol_overrides`
+/// skew across slices) can never conflate LB counters / passive health / DR
+/// fan-out between its HTTP and TCP lanes. Same non-route prefix rationale.
+pub(crate) fn mesh_outbound_tcp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("__mesh-out-tcp-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
 /// Materialize inbound routes for the sidecar's **local** workload so that
@@ -1590,9 +1684,14 @@ fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
 /// workload's own service FQDN (`service_name`/`namespace`) — never another
 /// service that merely shares the SPIFFE id — and targets the workload's own
 /// listening port (the app/target port, which may differ from the K8s service
-/// port). For each HTTP-family workload port, one loopback proxy is emitted.
-/// Stream (TCP) inbound and multi-port disambiguation by original destination
-/// land in later stages. The emitted proxies carry the
+/// port). One loopback proxy is emitted PER HTTP-family service port; the
+/// route table groups a multi-port service's siblings under one lowest-port
+/// representative and the request path swaps in the sibling matching the
+/// inbound connection's captured original destination (REDIRECT-captured
+/// plain inbound) or the pre-strip `Host`/`:authority` port (peer-sidecar
+/// dials), failing closed when a multi-port request carries neither signal —
+/// see `HostRouteTable::select_mesh_inbound_port_route`. Stream (TCP) inbound
+/// lands in a later stage. The emitted proxies carry the
 /// [`MESH_INBOUND_PROXY_ID_PREFIX`] so the request path keeps them off the
 /// outbound listener.
 fn materialize_sidecar_inbound_proxies(
@@ -1676,138 +1775,139 @@ fn materialize_sidecar_inbound_proxies(
                     )
                 })
                 .collect();
-            // Host-only routing can't disambiguate multiple service ports: the
-            // router strips the request port from `Host`/`:authority`, so a
-            // single `/` route on the shared service host matches traffic to
-            // EVERY service port and would silently forward it to the FIRST
-            // port's backend (e.g. `Host: reviews:90` -> the port-80 backend).
-            // That is a cross-port misroute, not the clean "unsupported"
-            // rejection callers expect. OUTBOUND multi-port disambiguation has
-            // landed (captured original destination — `SO_ORIGINAL_DST` — picks
-            // the per-port sibling), but INBOUND `:15006` dials are direct
-            // (never NATed), so the inbound side will instead disambiguate by
-            // the pre-strip `Host`/`:authority` port the egress side preserves
-            // (a later stage). Until then, fail closed: materialize NOTHING for
-            // a local service exposing more than one HTTP-family port, and
-            // warn. Operators who need a specific port routed sooner can define
-            // an explicit proxy (which this materializer yields to).
-            // Single-HTTP-port services — the common case — are unaffected.
-            if http_ports.len() > 1 {
-                warn!(
-                    service = %service.name,
-                    namespace = %service.namespace,
-                    http_ports = http_ports.len(),
-                    "Local service exposes multiple HTTP-family ports; inbound host-only routing \
-                     cannot disambiguate them yet (inbound port disambiguation lands in a later \
-                     stage). Skipping inbound materialization for this service to avoid \
-                     forwarding one port's traffic to another port's backend; define an explicit \
-                     proxy to route a specific port."
-                );
-                continue;
-            }
-            let Some(service_port) = http_ports.first() else {
-                continue;
-            };
-            // Backend = the workload's app (container) port this service port
-            // forwards to. A declared `targetPort` is Kubernetes' AUTHORITATIVE
-            // service-port→container-port binding, so honor it exclusively — no
-            // heuristic fallback: a numeric targetPort IS the container port; a
-            // named one resolves against the workload's container-port names, and
-            // an unresolved name (typo / rollout skew) SKIPS rather than guessing
-            // a different port. Only when NO targetPort is declared do we fall
-            // back to the heuristic over the signals we have, in declining order
-            // of confidence:
-            //   1. a shared port NAME — the canonical Service↔container linkage,
-            //   2. an equal port NUMBER — `targetPort` defaulting to the port,
-            //   3. the workload's sole container port — single-port pod.
-            // A workload that declares no ports defaults to the service port
-            // (Kubernetes' `targetPort`-defaults-to-`port` rule). Otherwise the
-            // target is genuinely ambiguous: skip and warn rather than misroute.
-            let backend_port = match service_port.target_port.as_ref() {
-                Some(ServiceTargetPort::Number(n)) => Some(*n),
-                Some(ServiceTargetPort::Name(name)) => workload
-                    .ports
-                    .iter()
-                    .find(|wp| wp.name.as_deref() == Some(name.as_str()))
-                    .map(|wp| wp.port),
-                None if workload.ports.is_empty() => Some(service_port.port),
-                None => workload
-                    .ports
-                    .iter()
-                    .find(|wp| wp.name.is_some() && wp.name == service_port.name)
-                    .or_else(|| {
-                        workload
-                            .ports
-                            .iter()
-                            .find(|wp| wp.port == service_port.port)
-                    })
-                    .or(match workload.ports.as_slice() {
-                        [only] => Some(only),
-                        _ => None,
-                    })
-                    .map(|wp| wp.port),
-            };
-            // Reject a 0 backend (invalid targetPort/port; config validation also
-            // rejects it for non-xDS slices) defensively rather than route to :0.
-            let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
-                warn!(
-                    service = %service.name,
-                    namespace = %service.namespace,
-                    service_port = service_port.port,
-                    target_port = ?service_port.target_port,
-                    "Cannot resolve a usable local backend port for an inbound mesh route \
-                     (no resolvable Service targetPort, and no port name/number match among \
-                     multiple container ports). Set targetPort, name the ports consistently, \
-                     or define an explicit proxy. Skipping this route."
-                );
-                continue;
-            };
-            let proxy = mesh_inbound_loopback_proxy(
-                &mesh_inbound_proxy_id(&service.namespace, &service.name, service_port.port),
-                mesh_service_host_variants(
-                    &service.name,
+            // Multi-port services materialize one loopback route PER
+            // HTTP-family service port. Host-only routing alone can't tell the
+            // ports apart (the router strips the request port from
+            // `Host`/`:authority`), so the route table groups a service's
+            // per-port siblings under one lowest-port representative and the
+            // request path swaps in the sibling matching, in priority order,
+            // (1) the connection's captured original destination — present
+            // when a sidecar-less client's dial to the app port was
+            // iptables-REDIRECTed to `:15006`, its port is the CONTAINER
+            // (target) port — or (2) the pre-strip `Host`/`:authority` port —
+            // the SERVICE port, which a peer sidecar's multi-port egress
+            // rewrites into the authority (its `:15006` dials are direct,
+            // never NATed, so orig-dst is None for them). Multi-port requests
+            // carrying neither signal fail closed (502) — see
+            // `HostRouteTable::select_mesh_inbound_port_route`. Single-port
+            // services keep their signal-free behavior. The expected sibling
+            // id set also scopes the operator-overlap scan below: a sibling
+            // must not yield to its OWN service's other siblings (they
+            // intentionally share hosts + `/`), but must keep yielding to
+            // everything else — including ANOTHER local service's inbound
+            // route on an overlapping bare-name host variant.
+            let sibling_ids: std::collections::HashSet<String> = http_ports
+                .iter()
+                .map(|sp| mesh_inbound_proxy_id(&service.namespace, &service.name, sp.port))
+                .collect();
+            for service_port in &http_ports {
+                // Backend = the workload's app (container) port this service port
+                // forwards to. A declared `targetPort` is Kubernetes' AUTHORITATIVE
+                // service-port→container-port binding, so honor it exclusively — no
+                // heuristic fallback: a numeric targetPort IS the container port; a
+                // named one resolves against the workload's container-port names, and
+                // an unresolved name (typo / rollout skew) SKIPS rather than guessing
+                // a different port. Only when NO targetPort is declared do we fall
+                // back to the heuristic over the signals we have, in declining order
+                // of confidence:
+                //   1. a shared port NAME — the canonical Service↔container linkage,
+                //   2. an equal port NUMBER — `targetPort` defaulting to the port,
+                //   3. the workload's sole container port — single-port pod.
+                // A workload that declares no ports defaults to the service port
+                // (Kubernetes' `targetPort`-defaults-to-`port` rule). Otherwise the
+                // target is genuinely ambiguous: skip and warn rather than misroute.
+                let backend_port = match service_port.target_port.as_ref() {
+                    Some(ServiceTargetPort::Number(n)) => Some(*n),
+                    Some(ServiceTargetPort::Name(name)) => workload
+                        .ports
+                        .iter()
+                        .find(|wp| wp.name.as_deref() == Some(name.as_str()))
+                        .map(|wp| wp.port),
+                    None if workload.ports.is_empty() => Some(service_port.port),
+                    None => workload
+                        .ports
+                        .iter()
+                        .find(|wp| wp.name.is_some() && wp.name == service_port.name)
+                        .or_else(|| {
+                            workload
+                                .ports
+                                .iter()
+                                .find(|wp| wp.port == service_port.port)
+                        })
+                        .or(match workload.ports.as_slice() {
+                            [only] => Some(only),
+                            _ => None,
+                        })
+                        .map(|wp| wp.port),
+                };
+                // Reject a 0 backend (invalid targetPort/port; config validation also
+                // rejects it for non-xDS slices) defensively rather than route to :0.
+                let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
+                    warn!(
+                        service = %service.name,
+                        namespace = %service.namespace,
+                        service_port = service_port.port,
+                        target_port = ?service_port.target_port,
+                        "Cannot resolve a usable local backend port for an inbound mesh route \
+                         (no resolvable Service targetPort, and no port name/number match among \
+                         multiple container ports). Set targetPort, name the ports consistently, \
+                         or define an explicit proxy. Skipping this route."
+                    );
+                    continue;
+                };
+                let proxy = mesh_inbound_loopback_proxy(
+                    &mesh_inbound_proxy_id(&service.namespace, &service.name, service_port.port),
+                    mesh_service_host_variants(
+                        &service.name,
+                        &service.namespace,
+                        &runtime.cluster_domain,
+                    ),
                     &service.namespace,
-                    &runtime.cluster_domain,
-                ),
-                &service.namespace,
-                backend_port,
-                now,
-            );
-            // Don't collide with or shadow an explicit operator proxy (e.g. the
-            // documented file-mode pre-materialization workaround) already
-            // routing this host. Our route is the greediest HTTP match for the
-            // host — a `/` prefix — and the router searches exact → prefix →
-            // regex → host-only, so it shadows any same-host regex (`~...`) or
-            // host-only (`listen_path: None`) route and collides with an equal
-            // `/` prefix. (Exact and longer-prefix operator routes still win for
-            // their own paths, so they coexist.) Only HTTP-family proxies share
-            // this routing space: stream proxies route by `listen_port` and carry
-            // empty hosts + null `listen_path` that would otherwise read as a
-            // host-only catch-all here, so skip them exactly as
-            // `validate_unique_listen_paths` does. Either way the operator wins.
-            if config.proxies.iter().any(|p| {
-                if p.id == proxy.id || p.dispatch_kind.is_stream() {
-                    return false;
-                }
-                let shadows_or_collides = p.listen_path == proxy.listen_path
-                    || p.listen_path.is_none()
-                    || p.listen_path
-                        .as_deref()
-                        .is_some_and(|lp| lp.starts_with('~'));
-                shadows_or_collides && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
-            }) {
-                debug!(
-                    proxy_id = %proxy.id,
-                    "Skipping inbound route materialization; an existing proxy already routes this host/path"
+                    backend_port,
+                    now,
                 );
-                continue;
+                // Don't collide with or shadow an explicit operator proxy (e.g. the
+                // documented file-mode pre-materialization workaround) already
+                // routing this host. Our route is the greediest HTTP match for the
+                // host — a `/` prefix — and the router searches exact → prefix →
+                // regex → host-only, so it shadows any same-host regex (`~...`) or
+                // host-only (`listen_path: None`) route and collides with an equal
+                // `/` prefix. (Exact and longer-prefix operator routes still win for
+                // their own paths, so they coexist.) Only HTTP-family proxies share
+                // this routing space: stream proxies route by `listen_port` and carry
+                // empty hosts + null `listen_path` that would otherwise read as a
+                // host-only catch-all here, so skip them exactly as
+                // `validate_unique_listen_paths` does. Either way the operator wins.
+                // This service's OWN per-port siblings are excluded (they
+                // intentionally share hosts + `/` and are grouped by the router) —
+                // but ONLY its own: another local service's inbound route on an
+                // overlapping bare-name host variant still wins first-materialized,
+                // exactly as before per-port siblings existed.
+                if config.proxies.iter().any(|p| {
+                    if sibling_ids.contains(p.id.as_str()) || p.dispatch_kind.is_stream() {
+                        return false;
+                    }
+                    let shadows_or_collides = p.listen_path == proxy.listen_path
+                        || p.listen_path.is_none()
+                        || p.listen_path
+                            .as_deref()
+                            .is_some_and(|lp| lp.starts_with('~'));
+                    shadows_or_collides
+                        && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
+                }) {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        "Skipping inbound route materialization; an existing proxy already routes this host/path"
+                    );
+                    continue;
+                }
+                if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+                    *existing = proxy;
+                } else {
+                    config.proxies.push(proxy);
+                }
+                materialized += 1;
             }
-            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
-                *existing = proxy;
-            } else {
-                config.proxies.push(proxy);
-            }
-            materialized += 1;
         }
     }
 
@@ -2047,26 +2147,17 @@ fn materialize_mesh_outbound_proxies(
         // app port. Shared predicate with the router grouping / uniqueness
         // exemption (`mesh_outbound_service_groups`) so they cannot drift.
         let http_ports = service_http_family_ports(service);
-        // Sidecar destination INBOUND multi-port still fails closed (inbound
-        // :15006 dials are direct, never NATed — disambiguation by the
-        // preserved Host port is a later stage), so per-port Sidecar egress
-        // would dial the peer only to 404 there. Keep Sidecar multi-port
-        // fail-closed AT THE SOURCE until inbound disambiguation lands;
-        // Ambient is end-to-end complete (its inbound is the transparent
-        // HBONE relay dialing the CONNECT authority's app port).
-        if transport == MeshEgressTransport::SidecarMtls && http_ports.len() > 1 {
-            warn!(
-                service = %service.name,
-                namespace = %service.namespace,
-                http_ports = http_ports.len(),
-                "In-mesh service exposes multiple HTTP-family ports; Sidecar egress stays \
-                 fail-closed until the destination sidecar's inbound port disambiguation lands \
-                 (the peer's inbound materializer still skips multi-port local services). \
-                 Skipping outbound materialization for this service; define an explicit proxy \
-                 to route a specific port."
-            );
-            continue;
-        }
+        // Sidecar multi-port egress is end-to-end complete: the destination
+        // sidecar's inbound materializer now emits per-port loopback
+        // siblings disambiguated by the request authority port, and
+        // `build_outbound_mesh_targets` stamps the owning service port on
+        // each multi-port target so dispatch rewrites the `:authority` to
+        // carry it (Ambient needs neither — its inbound is the transparent
+        // HBONE relay dialing the CONNECT authority's app port). An OLD
+        // destination sidecar (pre-disambiguation) materialized nothing for
+        // multi-port services, so new-egress traffic 404s there — fail
+        // closed, never misrouted.
+        let multi_port_service = http_ports.len() > 1;
         for service_port in &http_ports {
             let protocol = service
                 .protocol_overrides
@@ -2081,6 +2172,7 @@ fn materialize_mesh_outbound_proxies(
                 protocol,
                 &mesh_slice.workloads,
                 local_cluster,
+                multi_port_service,
             );
             if targets.is_empty() {
                 debug!(
@@ -2180,6 +2272,225 @@ fn materialize_mesh_outbound_proxies(
     }
 }
 
+/// Materialize raw-TCP egress UPSTREAMS for the stream-family
+/// (TCP/TLS/DB-protocol) service ports of in-mesh services — Ambient only.
+///
+/// Unlike HTTP-family egress, NO route proxy enters the config: a raw stream
+/// has no Host header to route by, so the request path can't use the host
+/// tiers at all. Instead the captured connection's pre-NAT original
+/// destination (`SO_ORIGINAL_DST`) is matched STRICTLY against
+/// `(cluster_ip, service_port)` by the route table's
+/// `mesh_tcp_egress_decision` (built forward from the prepared `mesh` block,
+/// same doctrine as the per-port sibling groups) and relayed through an HBONE
+/// CONNECT tunnel to the LB-selected workload's app port — HBONE is already a
+/// byte-stream tunnel, and the destination's transparent inbound relay dials
+/// the CONNECT authority, so raw TCP rides the existing transport end to end.
+/// A VIP/port pair that matches nothing falls through to the HTTP path
+/// (unchanged behavior); a declared-but-unroutable match is CLOSED — never
+/// guessed (the #1601 fail-closed rule). Port-number-only matching is
+/// deliberately NOT supported: two services may share a port number, and a
+/// captured dial to a non-mesh destination must never be tunnelled into the
+/// mesh on a port coincidence.
+///
+/// Per-topology scope: **Ambient only.** Sidecar's transport is plain
+/// mTLS-HTTP/2 to the peer's `:15006` — there is no raw-byte tunnel to ride
+/// and the destination sidecar has no stream inbound — so Sidecar
+/// stream-family ports materialize nothing (warned once per apply) and their
+/// captured dials keep failing as before. Headless / VIP-less services
+/// likewise materialize nothing routable and warn.
+fn materialize_mesh_outbound_tcp_upstreams(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    let supported = matches!(runtime.topology, MeshTopology::Ambient);
+    if !supported && runtime.topology != MeshTopology::Sidecar {
+        // Gateway topologies have their own materializers and no plaintext
+        // outbound capture listener.
+        return;
+    }
+    let local_cluster = mesh_slice
+        .multi_cluster
+        .as_ref()
+        .and_then(|mc| mc.local_cluster.as_deref());
+    let now = chrono::Utc::now();
+    let mut materialized = 0usize;
+    for service in &mesh_slice.services {
+        let tcp_ports = service_tcp_stream_ports(service);
+        if tcp_ports.is_empty() {
+            continue;
+        }
+        if !supported {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                tcp_ports = tcp_ports.len(),
+                "In-mesh service declares stream-family (TCP) ports, but raw-TCP egress is \
+                 Ambient-only (Sidecar's mTLS-HTTP transport carries no raw byte stream and \
+                 its peer inbound has no stream listener). Captured raw-TCP dials to this \
+                 service will fail; route it through an explicit stream proxy if needed."
+            );
+            continue;
+        }
+        if service.cluster_ips.is_empty() {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                tcp_ports = tcp_ports.len(),
+                "In-mesh service declares stream-family (TCP) ports but carries no cluster_ips; \
+                 raw-TCP egress maps captured original destinations to services strictly by \
+                 service VIP (a raw stream has no Host header and a bare port number is \
+                 ambiguous), so these ports cannot be egress-routed. Headless services are \
+                 expected here; otherwise populate cluster_ips."
+            );
+            continue;
+        }
+        for service_port in &tcp_ports {
+            let protocol = service
+                .protocol_overrides
+                .get(&service_port.port)
+                .copied()
+                .unwrap_or(service_port.protocol);
+            let targets = build_outbound_mesh_targets(
+                MeshEgressTransport::Hbone,
+                runtime,
+                service,
+                service_port,
+                protocol,
+                &mesh_slice.workloads,
+                local_cluster,
+                false,
+            );
+            if targets.is_empty() {
+                debug!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    service_port = service_port.port,
+                    "Skipping raw-TCP mesh service port with no reachable local-cluster workload targets"
+                );
+                continue;
+            }
+            let upstream_id =
+                mesh_outbound_tcp_upstream_id(&service.namespace, &service.name, service_port.port);
+            // FQDN-named for DestinationRule matching, exactly like the HTTP
+            // per-port upstreams (top-level connectTimeout / LB / outlier and
+            // per-port portLevelSettings fan-out all apply).
+            let service_fqdn = format!(
+                "{}.{}.svc.{}",
+                service.name,
+                service.namespace,
+                runtime.cluster_domain.trim_matches('.')
+            );
+            let upstream = mesh_outbound_route_upstream(
+                &upstream_id,
+                &service.namespace,
+                &service_fqdn,
+                targets,
+                now,
+            );
+            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+                *existing = upstream;
+            } else {
+                config.upstreams.push(upstream);
+            }
+            materialized += 1;
+        }
+    }
+
+    if materialized > 0 {
+        info!(
+            tcp_upstreams = materialized,
+            "Materialized mesh raw-TCP egress upstreams for in-mesh services (HBONE relay, \
+             selected by captured original destination against service VIPs)"
+        );
+    }
+}
+
+/// Reserved id prefix for the synthesized raw-TCP egress relay proxies. Like
+/// the upstream id, deliberately NOT under `__mesh-outbound-` so it can never
+/// be misclassified as a direction-scoped route id — these proxies never
+/// enter the route table or `config.proxies`; they exist so the HBONE pool's
+/// per-proxy pool-config / connect-budget resolution and the capability-probe
+/// key have a stable proxy identity shared between probing and dispatch.
+pub(crate) const MESH_OUTBOUND_TCP_RELAY_PROXY_ID_PREFIX: &str = "__mesh-out-tcp-relay-";
+
+/// Build the synthesized relay proxy backing one raw-TCP egress entry.
+/// DETERMINISTIC apart from timestamps: the capability registry keys off the
+/// proxy's scheme/dns/TLS fields plus the target, so the table's dispatch
+/// copy and the probe-enrollment copy (built independently) must agree —
+/// keep any field that feeds `capability_key_for_proxy_target` or
+/// `PoolConfig::for_proxy` in sync between the two call sites by sharing
+/// this builder. `BackendScheme::Tcp` keeps the plain-HTTP/h2c probes away
+/// from a raw-TCP app port (only the HBONE probe runs for it).
+pub(crate) fn mesh_outbound_tcp_relay_proxy(
+    namespace: &str,
+    name: &str,
+    port: u16,
+    upstream_id: &str,
+) -> Proxy {
+    let now = chrono::Utc::now();
+    let id = format!("{MESH_OUTBOUND_TCP_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}")
+        .replace(['/', '.'], "-");
+    Proxy {
+        name: Some(format!("mesh raw-tcp egress {id}")),
+        id,
+        namespace: namespace.to_string(),
+        hosts: Vec::new(),
+        listen_path: None,
+        backend_scheme: Some(BackendScheme::Tcp),
+        dispatch_kind: Default::default(),
+        backend_host: String::new(),
+        backend_port: 0,
+        backend_path: None,
+        strip_listen_path: false,
+        preserve_host_header: false,
+        backend_connect_timeout_ms: 5_000,
+        backend_read_timeout_ms: 30_000,
+        backend_write_timeout_ms: 30_000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: false,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: BackendTlsConfig::default(),
+        dispatch_port_overrides: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: Default::default(),
+        plugins: Vec::<PluginAssociation>::new(),
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
+        upstream_id: Some(upstream_id.to_string()),
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: ResponseBodyMode::Stream,
+        listen_port: None,
+        frontend_tls: false,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        udp_max_response_amplification_factor: None,
+        // Matches the repo's stream-proxy idle default; long-lived idle DB
+        // connections past this are closed by the relay's idle watchdog.
+        tcp_idle_timeout_seconds: Some(300),
+        allowed_methods: None,
+        allowed_ws_origins: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 /// Build transport-tagged upstream targets for an in-mesh service's workloads,
 /// for outbound (`:15001`-capture) egress materialization. Matches workloads
 /// by `WorkloadRef` SPIFFE (one-to-one by index so replicas sharing a SPIFFE id
@@ -2191,7 +2502,14 @@ fn materialize_mesh_outbound_proxies(
 /// forwards to (the HBONE CONNECT authority port / DR `port_overrides` key),
 /// not the service port. The transport's own DIAL port (15008 / 15006, or the
 /// operator's `FERRUM_MESH_EGRESS_*_PORT` override stamped as a tag) is
-/// resolved by the pools at dispatch time.
+/// resolved by the pools at dispatch time. When the service declares MULTIPLE
+/// HTTP-family ports (`multi_port_service`), Sidecar targets additionally
+/// carry [`crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG`] — the
+/// owning SERVICE port — so dispatch rewrites the request `:authority` to
+/// `<host>:<service_port>` and the destination sidecar's per-port inbound
+/// siblings can tell the ports apart (its `:15006` dials are direct, never
+/// NATed, so the authority is the only port channel the source controls).
+#[allow(clippy::too_many_arguments)]
 fn build_outbound_mesh_targets(
     transport: MeshEgressTransport,
     runtime: &MeshRuntimeConfig,
@@ -2200,6 +2518,7 @@ fn build_outbound_mesh_targets(
     protocol: AppProtocol,
     workloads: &[crate::modes::mesh::config::Workload],
     local_cluster: Option<&str>,
+    multi_port_service: bool,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
     for workload in matched_local_service_workloads(service, workloads, local_cluster) {
@@ -2256,6 +2575,16 @@ fn build_outbound_mesh_targets(
                     tags.insert(
                         crate::proxy::mesh_mtls_pool::MESH_MTLS_PORT_TAG.to_string(),
                         runtime.egress_mtls_port.to_string(),
+                    );
+                }
+                // Multi-port destination: stamp the owning service port so
+                // dispatch rewrites the `:authority` the peer's inbound
+                // per-port siblings disambiguate by. Never stamped for
+                // single-port services (their authority stays untouched).
+                if multi_port_service {
+                    tags.insert(
+                        crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG.to_string(),
+                        service_port.port.to_string(),
                     );
                 }
             }
@@ -2487,6 +2816,8 @@ fn apply_destination_rules(
     // let a DR entry authored for a DIFFERENT service port that numerically
     // equals T leak onto this upstream — each sibling upstream must carry
     // exactly its own port's policy.
+    // The raw-TCP per-port upstreams (`__mesh-out-tcp-upstream-*`) join the
+    // same map: identical owner-port semantics, distinct id space.
     let outbound_upstream_owner_port: std::collections::HashMap<String, u16> = mesh_slice
         .services
         .iter()
@@ -2499,6 +2830,12 @@ fn apply_destination_rules(
                         sp.port,
                     )
                 })
+                .chain(service_tcp_stream_ports(svc).into_iter().map(|sp| {
+                    (
+                        mesh_outbound_tcp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        sp.port,
+                    )
+                }))
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -8079,6 +8416,7 @@ mod tests {
     /// Build a single-HTTP-port service backed by the named workload's SPIFFE id.
     fn reviews_service() -> MeshService {
         MeshService {
+            cluster_ips: Vec::new(),
             name: "reviews".to_string(),
             namespace: "default".to_string(),
             ports: vec![ServicePort {
@@ -8209,6 +8547,7 @@ mod tests {
             name: Some("http".to_string()),
         }];
         let http_service = |name: &str| MeshService {
+            cluster_ips: Vec::new(),
             name: name.to_string(),
             namespace: "default".to_string(),
             ports: vec![ServicePort {
@@ -8265,6 +8604,7 @@ mod tests {
     /// Build an HTTP `MeshService` named `name` on `port`, backed by `spiffe`.
     fn http_mesh_service(name: &str, port: u16, spiffe: &str) -> MeshService {
         MeshService {
+            cluster_ips: Vec::new(),
             name: name.to_string(),
             namespace: "default".to_string(),
             ports: vec![ServicePort {
@@ -8463,12 +8803,12 @@ mod tests {
     }
 
     #[test]
-    fn mesh_outbound_sidecar_keeps_multi_port_fail_closed() {
-        // Sidecar destination INBOUND multi-port still fails closed (inbound
-        // dials are direct, never NATed), so per-port Sidecar egress would
-        // dial the peer only to 404 there. Until inbound port disambiguation
-        // lands, Sidecar multi-port services materialize NOTHING — the old
-        // source-side fail-closed behavior. Ambient (above) is per-port.
+    fn mesh_outbound_sidecar_materializes_per_port_with_authority_tag() {
+        // Sidecar multi-port egress is per-port now that the destination
+        // sidecar's inbound disambiguates by the request authority port:
+        // each per-port target carries the OWNING service port in the
+        // authority-port tag so dispatch rewrites the `:authority` the peer
+        // selects by. Single-port services (below) are never stamped.
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let mut svc = http_mesh_service("reviews", 80, spiffe);
         svc.ports.push(ServicePort {
@@ -8487,14 +8827,280 @@ mod tests {
         assert_eq!(runtime.topology, MeshTopology::Sidecar);
         let mut config = GatewayConfig::default();
         materialize_mesh_outbound_proxies(&mut config, &runtime, &slice);
-        assert!(
-            !config
-                .proxies
-                .iter()
-                .any(|p| p.id.starts_with("__mesh-outbound-")),
-            "Sidecar multi-port services must stay fail-closed at the source until \
-             inbound port disambiguation lands"
+        let mut routes: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-outbound-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        routes.sort();
+        assert_eq!(
+            routes,
+            vec![
+                "__mesh-outbound-default-reviews-80",
+                "__mesh-outbound-default-reviews-90",
+            ],
+            "Sidecar multi-port services materialize one route per HTTP-family port"
         );
+        for port in [80u16, 90] {
+            let upstream_id = format!("__mesh-out-upstream-default-reviews-{port}");
+            let upstream = config
+                .upstreams
+                .iter()
+                .find(|u| u.id == upstream_id)
+                .expect("per-port upstream");
+            assert_eq!(
+                upstream.targets[0]
+                    .tags
+                    .get(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG)
+                    .map(String::as_str),
+                Some(port.to_string().as_str()),
+                "multi-port Sidecar targets carry their owning service port for the \
+                 authority rewrite"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_outbound_sidecar_single_port_carries_no_authority_tag() {
+        // Single-port destinations keep the client authority byte-for-byte:
+        // no authority-port tag is stamped.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("reviews", "reviews", "10.0.0.1")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            ..MeshSlice::default()
+        };
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.topology, MeshTopology::Sidecar);
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &runtime, &slice);
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
+            .expect("upstream");
+        assert!(
+            !upstream.targets[0]
+                .tags
+                .contains_key(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG),
+            "single-port Sidecar targets must not rewrite the authority"
+        );
+    }
+
+    #[test]
+    fn http_and_tcp_stream_port_predicates_partition_protocols() {
+        // The two routability predicates must PARTITION AppProtocol: every
+        // protocol is claimed by exactly one of HTTP-family routing and the
+        // raw-TCP stream lane. A protocol claimed by both would double-
+        // materialize a port; one claimed by neither would silently dead-end.
+        use crate::modes::mesh::config::AppProtocol::*;
+        for protocol in [
+            Http, Http2, Grpc, Tcp, Tls, Mongo, Redis, Mysql, Postgres, Unknown,
+        ] {
+            let mut svc = http_mesh_service(
+                "partition",
+                7000,
+                "spiffe://cluster.local/ns/default/sa/partition",
+            );
+            svc.ports[0].protocol = protocol;
+            let http = service_http_family_ports(&svc).len();
+            let tcp = service_tcp_stream_ports(&svc).len();
+            assert_eq!(
+                http + tcp,
+                1,
+                "protocol {protocol:?} must be claimed by exactly one predicate                  (http={http}, tcp={tcp})"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_outbound_tcp_upstreams_materialize_for_ambient() {
+        // Ambient raw-TCP egress: one per-port upstream with HBONE-tagged,
+        // identity-pinned targets dialing the resolved targetPort — and NO
+        // route proxy (a raw stream has no Host to route by; the accept loop
+        // matches the captured original destination against the VIP table).
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        let mut svc = http_mesh_service("redis", 6379, spiffe);
+        svc.ports[0].protocol = AppProtocol::Redis;
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(6380));
+        svc.cluster_ips = vec!["10.96.0.1".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("redis", "redis", "10.0.0.7")],
+            services: vec![svc],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_tcp_upstreams(&mut config, &ambient_runtime(), &slice);
+        assert!(
+            config.proxies.is_empty(),
+            "raw-TCP egress materializes upstreams only, never route proxies"
+        );
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-tcp-upstream-default-redis-6379")
+            .expect("per-port raw-TCP upstream");
+        assert_eq!(
+            upstream.name.as_deref(),
+            Some("redis.default.svc.cluster.local"),
+            "FQDN-named so DestinationRules match"
+        );
+        let target = &upstream.targets[0];
+        assert_eq!(target.host, "10.0.0.7");
+        assert_eq!(target.port, 6380, "targets dial the resolved targetPort");
+        assert_eq!(
+            target.tags.get("mesh.hbone").map(String::as_str),
+            Some("true"),
+            "raw-TCP egress rides the HBONE transport"
+        );
+        assert_eq!(
+            target.tags.get("mesh.spiffe_id").map(String::as_str),
+            Some(spiffe),
+            "destination identity stays pinned"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_tcp_upstreams_skip_sidecar_and_vipless() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        let mut svc = http_mesh_service("redis", 6379, spiffe);
+        svc.ports[0].protocol = AppProtocol::Redis;
+        svc.cluster_ips = vec!["10.96.0.1".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("redis", "redis", "10.0.0.7")],
+            services: vec![svc],
+            ..MeshSlice::default()
+        };
+        // Sidecar topology: no raw-byte transport to the peer — nothing
+        // materializes (warned once per apply).
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.topology, MeshTopology::Sidecar);
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_tcp_upstreams(&mut config, &runtime, &slice);
+        assert!(
+            config.upstreams.is_empty(),
+            "Sidecar raw-TCP egress stays fail-closed"
+        );
+
+        // VIP-less (headless) service: original destinations cannot be mapped
+        // to it — nothing materializes.
+        let mut headless = http_mesh_service("redis", 6379, spiffe);
+        headless.ports[0].protocol = AppProtocol::Redis;
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("redis", "redis", "10.0.0.7")],
+            services: vec![headless],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_tcp_upstreams(&mut config, &ambient_runtime(), &slice);
+        assert!(
+            config.upstreams.is_empty(),
+            "a VIP-less service cannot be raw-TCP egress-routed"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_tcp_upstream_receives_port_level_dr() {
+        // DestinationRule portLevelSettings authored on the TCP SERVICE port
+        // fan onto the targets' dial port, exactly like the HTTP per-port
+        // upstreams (shared owner-port map in apply_destination_rules).
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        let mut svc = http_mesh_service("redis", 6379, spiffe);
+        svc.ports[0].protocol = AppProtocol::Redis;
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(6380));
+        svc.cluster_ips = vec!["10.96.0.1".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("redis", "redis", "10.0.0.7")],
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "redis".to_string(),
+                namespace: "default".to_string(),
+                host: "redis.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([(
+                    6379u16,
+                    MeshTrafficPolicy {
+                        connect_timeout_ms: Some(4321),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_tcp_upstreams(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-tcp-upstream-default-redis-6379")
+            .expect("raw-TCP upstream");
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&6380)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(4321),
+            "TCP-port portLevelSettings must land on the dial port"
+        );
+        assert!(
+            !upstream.port_overrides.contains_key(&6379),
+            "per-port policy must not remain under the service port"
+        );
+    }
+
+    #[test]
+    fn mesh_inbound_service_groups_prefer_local_inbound_view() {
+        // The inbound sibling groups must read the LOCAL-INBOUND service view
+        // when Sidecar narrowing resolved one: the egress-narrowed `services`
+        // can lack the local service entirely.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut local = http_mesh_service("reviews", 80, spiffe);
+        local.ports.push(ServicePort {
+            port: 90,
+            protocol: AppProtocol::Grpc,
+            name: Some("grpc".to_string()),
+            target_port: None,
+        });
+        let mesh = crate::modes::mesh::config::MeshConfig {
+            // Egress-narrowed view: the local service is absent.
+            services: vec![http_mesh_service("other", 8080, spiffe)],
+            local_inbound_services: Some(vec![local]),
+            ..crate::modes::mesh::config::MeshConfig::default()
+        };
+        let groups = mesh_inbound_service_groups(&mesh);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].declared_http_ports, 2);
+        let ids: Vec<&str> = groups[0]
+            .siblings
+            .iter()
+            .map(|(_, id)| id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "__mesh-inbound-default-reviews-80",
+                "__mesh-inbound-default-reviews-90",
+            ]
+        );
+
+        // Without narrowing (`None`), fall back to `services`.
+        let mesh = crate::modes::mesh::config::MeshConfig {
+            services: vec![http_mesh_service("other", 8080, spiffe)],
+            local_inbound_services: None,
+            ..crate::modes::mesh::config::MeshConfig::default()
+        };
+        let groups = mesh_inbound_service_groups(&mesh);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].siblings[0].1, "__mesh-inbound-default-other-8080");
     }
 
     #[test]
@@ -9381,13 +9987,11 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_inbound_proxies_skip_multi_http_port_service() {
-        // Host-only routing can't disambiguate ports yet (the router strips the
-        // request port), so a single `/` route on the shared host would forward
-        // EVERY port's traffic to the first port's backend — a cross-port
-        // misroute. Fail closed: a service exposing more than one HTTP-family
-        // port materializes NO inbound route until original-destination routing
-        // lands. Operators can define an explicit proxy for a specific port.
+    fn sidecar_inbound_proxies_materialize_per_port_for_multi_http_port_service() {
+        // A multi-port local service materializes one loopback sibling PER
+        // HTTP-family service port (disambiguated post-match by inbound
+        // orig-dst / the request authority port), each dialing its own
+        // resolved backend port.
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let runtime = MeshRuntimeConfig {
             workload_spiffe_id: Some(spiffe.to_string()),
@@ -9399,6 +10003,7 @@ mod tests {
             version: "test".to_string(),
             workloads: vec![workload("reviews", "reviews")],
             services: vec![MeshService {
+                cluster_ips: Vec::new(),
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
                 ports: vec![
@@ -9406,13 +10011,13 @@ mod tests {
                         port: 80,
                         protocol: AppProtocol::Http,
                         name: Some("http".to_string()),
-                        target_port: None,
+                        target_port: Some(ServiceTargetPort::Number(8080)),
                     },
                     ServicePort {
                         port: 90,
                         protocol: AppProtocol::Grpc,
                         name: Some("grpc".to_string()),
-                        target_port: None,
+                        target_port: Some(ServiceTargetPort::Number(9090)),
                     },
                 ],
                 workloads: vec![crate::modes::mesh::config::WorkloadRef {
@@ -9425,16 +10030,21 @@ mod tests {
 
         let config =
             gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
-        let inbound: Vec<&str> = config
+        let mut inbound: Vec<(&str, u16)> = config
             .proxies
             .iter()
             .filter(|p| p.id.starts_with("__mesh-inbound-"))
-            .map(|p| p.id.as_str())
+            .map(|p| (p.id.as_str(), p.backend_port))
             .collect();
-        assert!(
-            inbound.is_empty(),
-            "a service with >1 HTTP-family port must materialize no inbound route \
-             (fail closed against cross-port misrouting), got {inbound:?}"
+        inbound.sort();
+        assert_eq!(
+            inbound,
+            vec![
+                ("__mesh-inbound-default-reviews-80", 8080),
+                ("__mesh-inbound-default-reviews-90", 9090),
+            ],
+            "a service with >1 HTTP-family port materializes one per-port sibling, \
+             each dialing its own resolved backend (target) port"
         );
     }
 
@@ -11990,6 +12600,7 @@ mod tests {
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
             services: vec![MeshService {
+                cluster_ips: Vec::new(),
                 name: "reviews".to_string(),
                 namespace: "default".to_string(),
                 ports: vec![ServicePort {
@@ -12226,6 +12837,7 @@ mod tests {
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
             services: vec![MeshService {
+                cluster_ips: Vec::new(),
                 name: "ratings".to_string(),
                 namespace: "default".to_string(),
                 ports: Vec::new(),
@@ -12371,6 +12983,7 @@ mod tests {
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
             services: vec![MeshService {
+                cluster_ips: Vec::new(),
                 name: "ratings".to_string(),
                 namespace: "default".to_string(),
                 ports: vec![ServicePort {
@@ -12823,6 +13436,7 @@ mod tests {
                 let config = GatewayConfig {
                     mesh: Some(Box::new(MeshConfig {
                         services: vec![MeshService {
+                            cluster_ips: Vec::new(),
                             name: "reviews".to_string(),
                             namespace: "default".to_string(),
                             ports: vec![ServicePort {
@@ -12903,6 +13517,7 @@ mod tests {
                 let config = GatewayConfig {
                     mesh: Some(Box::new(MeshConfig {
                         services: vec![MeshService {
+                            cluster_ips: Vec::new(),
                             name: "pending".to_string(),
                             namespace: "default".to_string(),
                             ports: vec![ServicePort {
@@ -12963,6 +13578,7 @@ mod tests {
                     mesh: Some(Box::new(MeshConfig {
                         services: vec![
                             MeshService {
+                                cluster_ips: Vec::new(),
                                 name: "reviews".to_string(),
                                 namespace: "default".to_string(),
                                 ports: vec![ServicePort {
@@ -12980,6 +13596,7 @@ mod tests {
                                 protocol_overrides: HashMap::new(),
                             },
                             MeshService {
+                                cluster_ips: Vec::new(),
                                 name: "ratings".to_string(),
                                 namespace: "default".to_string(),
                                 ports: vec![ServicePort {
@@ -13066,6 +13683,7 @@ mod tests {
         second.addresses = vec!["10.0.0.6".to_string()];
         second.locality = Some("us-west/us-west-1/b".to_string());
         let service = MeshService {
+            cluster_ips: Vec::new(),
             name: "reviews".to_string(),
             namespace: "default".to_string(),
             ports: vec![ServicePort {
@@ -13233,6 +13851,7 @@ mod tests {
         wl.spiffe_id = spiffe.clone();
         wl.addresses = vec!["10.0.0.5".to_string()];
         let service = MeshService {
+            cluster_ips: Vec::new(),
             name: "reviews".to_string(),
             namespace: "default".to_string(),
             ports: vec![ServicePort {
@@ -13261,6 +13880,7 @@ mod tests {
         legacy.spiffe_id = spiffe.clone();
         legacy.addresses = vec!["10.0.0.5".to_string()];
         let service = MeshService {
+            cluster_ips: Vec::new(),
             name: "reviews".to_string(),
             namespace: "default".to_string(),
             ports: vec![ServicePort {
@@ -13313,6 +13933,7 @@ mod tests {
                 let config = GatewayConfig {
                     mesh: Some(Box::new(MeshConfig {
                         services: vec![MeshService {
+                            cluster_ips: Vec::new(),
                             name: "reviews".to_string(),
                             namespace: "default".to_string(),
                             ports: vec![ServicePort {
@@ -14045,6 +14666,7 @@ mod tests {
         mesh_state.install_slice(MeshSlice {
             version: "bad-slice".to_string(),
             services: vec![MeshService {
+                cluster_ips: Vec::new(),
                 name: String::new(),
                 namespace: "default".to_string(),
                 ports: Vec::new(),

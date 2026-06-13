@@ -893,6 +893,7 @@ mod tests {
 
     fn mesh_service_with_workloads(workloads: Vec<WorkloadRef>) -> MeshService {
         MeshService {
+            cluster_ips: Vec::new(),
             name: "reviews".to_string(),
             namespace: "default".to_string(),
             ports: Vec::new(),
@@ -1207,6 +1208,7 @@ mod tests {
         };
         active.mesh.as_mut().expect("mesh exists").services.push(
             crate::modes::mesh::config::MeshService {
+                cluster_ips: Vec::new(),
                 name: "stale".to_string(),
                 namespace: "ferrum".to_string(),
                 ports: Vec::new(),

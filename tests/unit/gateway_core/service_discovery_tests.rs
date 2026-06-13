@@ -96,6 +96,7 @@ fn mesh_workload(id: &str, service_name: &str, address: &str, port: u16) -> Work
 
 fn mesh_service(name: &str, spiffe_id: &str, port: u16) -> MeshService {
     MeshService {
+        cluster_ips: Vec::new(),
         name: name.to_string(),
         namespace: default_namespace(),
         ports: vec![ServicePort {

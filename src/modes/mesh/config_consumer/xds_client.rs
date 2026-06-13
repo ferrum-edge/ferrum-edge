@@ -1278,6 +1278,10 @@ fn reverse_translate(
                     .collect(),
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                // The name-only CDS/EDS reconstruction carries no Service
+                // spec, so VIPs are unknown; the Ferrum Services carrier
+                // (preferred branch above) round-trips them via serde.
+                cluster_ips: Vec::new(),
             })
             .collect()
     };
@@ -3533,6 +3537,7 @@ mod tests {
             namespace: "default".to_string(),
             version: "v1".to_string(),
             services: vec![MeshService {
+                cluster_ips: Vec::new(),
                 name: "api".to_string(),
                 namespace: "default".to_string(),
                 ports: vec![
@@ -4004,6 +4009,7 @@ mod tests {
             pod_uid: None,
         };
         let service = MeshService {
+            cluster_ips: Vec::new(),
             name: "api".to_string(),
             namespace: "default".to_string(),
             ports: vec![ServicePort {

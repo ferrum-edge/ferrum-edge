@@ -876,6 +876,9 @@ fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                // Gateway listeners are not ClusterIP services; raw-TCP
+                // egress VIP mapping does not apply to them.
+                cluster_ips: Vec::new(),
             });
             Ok::<(), K8sTranslateError>(())
         })?;

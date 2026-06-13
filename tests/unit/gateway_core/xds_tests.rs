@@ -52,6 +52,7 @@ fn mesh_config() -> MeshConfig {
     MeshConfig {
         workloads: vec![workload("api", "api"), workload("worker", "worker")],
         services: vec![MeshService {
+            cluster_ips: Vec::new(),
             name: "api".to_string(),
             namespace: "default".to_string(),
             ports: vec![ServicePort {

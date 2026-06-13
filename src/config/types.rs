@@ -2039,20 +2039,26 @@ impl GatewayConfig {
             }
         }
 
-        // Materialized mesh outbound per-port siblings of ONE service
-        // intentionally share hosts + `/`: the route table inserts a single
-        // lowest-port representative and the request path disambiguates by
-        // the captured original-destination port, so they never route
+        // Materialized mesh per-port siblings of ONE service AND ONE
+        // direction intentionally share hosts + `/`: the route table inserts
+        // a single lowest-port representative per (service, direction) and
+        // the request path disambiguates by the captured
+        // original-destination port (outbound) or by inbound orig-dst /
+        // authority port (sidecar inbound), so they never route
         // non-deterministically. Map each expected sibling id to its owning
-        // service (derived FORWARD from the mesh block by the same helper the
-        // router grouping uses — id parsing would be lossy across the
-        // `{ns}-{name}` join and could conflate distinct services); pairs
-        // owned by the same service are exempt below. Operator configs cannot
-        // reach this: resource-id validation rejects ids starting with `_`,
-        // so `__mesh-outbound-*` ids exist only via mesh materialization.
-        // Different services' routes still conflict normally. Empty (and
-        // zero-cost) outside mesh mode.
-        let mesh_outbound_sibling_owner: HashMap<String, usize> = self
+        // (direction, service) pair (derived FORWARD from the mesh block by
+        // the same helpers the router grouping uses — id parsing would be
+        // lossy across the `{ns}-{name}` join and could conflate distinct
+        // services); pairs with equal owners are exempt below. The owner key
+        // is DIRECTION-DISTINCT on purpose: an inbound and an outbound route
+        // of the same service must never legitimately coexist (the outbound
+        // materializer yields to existing inbound routes), so their
+        // coexistence is a materializer bug that should keep failing
+        // validation. Operator configs cannot reach this: resource-id
+        // validation rejects ids starting with `_`, so `__mesh-*` ids exist
+        // only via mesh materialization. Different services' routes still
+        // conflict normally. Empty (and zero-cost) outside mesh mode.
+        let mesh_sibling_owner: HashMap<String, (bool, usize)> = self
             .mesh
             .as_deref()
             .map(|mesh| {
@@ -2063,8 +2069,19 @@ impl GatewayConfig {
                         group
                             .siblings
                             .into_iter()
-                            .map(move |(_, id)| (id, service_index))
+                            .map(move |(_, id)| (id, (false, service_index)))
                     })
+                    .chain(
+                        crate::modes::mesh::mesh_inbound_service_groups(mesh)
+                            .into_iter()
+                            .enumerate()
+                            .flat_map(|(service_index, group)| {
+                                group
+                                    .siblings
+                                    .into_iter()
+                                    .map(move |(_, id)| (id, (true, service_index)))
+                            }),
+                    )
                     .collect()
             })
             .unwrap_or_default();
@@ -2076,8 +2093,8 @@ impl GatewayConfig {
             for (i, proxy_a) in group.iter().enumerate() {
                 for proxy_b in group.iter().skip(i + 1) {
                     if let (Some(owner_a), Some(owner_b)) = (
-                        mesh_outbound_sibling_owner.get(proxy_a.id.as_str()),
-                        mesh_outbound_sibling_owner.get(proxy_b.id.as_str()),
+                        mesh_sibling_owner.get(proxy_a.id.as_str()),
+                        mesh_sibling_owner.get(proxy_b.id.as_str()),
                     ) && owner_a == owner_b
                     {
                         continue;

@@ -167,6 +167,7 @@ fn create_test_mesh_config() -> GatewayConfig {
             pod_uid: None,
         }],
         services: vec![MeshService {
+            cluster_ips: Vec::new(),
             name: "api".to_string(),
             namespace: "ferrum".to_string(),
             ports: vec![ServicePort {
@@ -720,6 +721,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
     cp_config.mesh = Some(Box::new(MeshConfig {
         services: vec![
             MeshService {
+                cluster_ips: Vec::new(),
                 name: "api".to_string(),
                 namespace: "ferrum".to_string(),
                 ports: vec![ServicePort {
@@ -732,6 +734,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
                 protocol_overrides: HashMap::new(),
             },
             MeshService {
+                cluster_ips: Vec::new(),
                 name: "billing".to_string(),
                 namespace: "ferrum".to_string(),
                 ports: vec![ServicePort {

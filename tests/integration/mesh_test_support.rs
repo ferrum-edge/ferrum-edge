@@ -145,6 +145,7 @@ pub fn workload_for(
 /// workloads by SPIFFE ID.
 pub fn service_for(name: &str, namespace: &str, workloads: &[&Workload]) -> MeshService {
     MeshService {
+        cluster_ips: Vec::new(),
         name: name.to_string(),
         namespace: namespace.to_string(),
         ports: vec![ServicePort {

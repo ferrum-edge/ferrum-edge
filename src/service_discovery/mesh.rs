@@ -401,6 +401,7 @@ mod tests {
 
     fn service(name: &str, refs: Vec<&str>, ports: Vec<u16>) -> MeshService {
         MeshService {
+            cluster_ips: Vec::new(),
             name: name.to_string(),
             namespace: default_namespace(),
             ports: ports

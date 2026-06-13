@@ -96,7 +96,10 @@ fn relay_timeout_millis(milliseconds: u64) -> Option<Duration> {
     (milliseconds > 0).then(|| Duration::from_millis(milliseconds))
 }
 
-fn proxy_idle_timeout(proxy: &Proxy, env_config: &EnvConfig) -> Option<Duration> {
+// `pub(crate)`: shared with the raw-TCP mesh egress relay
+// (`proxy::mesh_tcp_egress`), which derives its copy-loop bounds from the
+// same proxy/env fields as the HBONE relay.
+pub(crate) fn proxy_idle_timeout(proxy: &Proxy, env_config: &EnvConfig) -> Option<Duration> {
     relay_timeout(
         proxy
             .tcp_idle_timeout_seconds
@@ -104,15 +107,15 @@ fn proxy_idle_timeout(proxy: &Proxy, env_config: &EnvConfig) -> Option<Duration>
     )
 }
 
-fn proxy_half_close_cap(env_config: &EnvConfig) -> Option<Duration> {
+pub(crate) fn proxy_half_close_cap(env_config: &EnvConfig) -> Option<Duration> {
     relay_timeout(env_config.tcp_half_close_max_wait_seconds)
 }
 
-fn backend_read_timeout(proxy: &Proxy) -> Option<Duration> {
+pub(crate) fn backend_read_timeout(proxy: &Proxy) -> Option<Duration> {
     relay_timeout_millis(proxy.backend_read_timeout_ms)
 }
 
-fn backend_write_timeout(proxy: &Proxy) -> Option<Duration> {
+pub(crate) fn backend_write_timeout(proxy: &Proxy) -> Option<Duration> {
     relay_timeout_millis(proxy.backend_write_timeout_ms)
 }
 

@@ -54,6 +54,7 @@ fn slice_with_one_service() -> MeshSlice {
         pod_uid: None,
     };
     let service = MeshService {
+        cluster_ips: Vec::new(),
         name: "echo".to_string(),
         namespace: "default".to_string(),
         ports: vec![ServicePort {

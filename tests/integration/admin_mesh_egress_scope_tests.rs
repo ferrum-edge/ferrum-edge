@@ -63,6 +63,7 @@ fn generate_test_token(config: &TestConfig) -> String {
 
 fn mesh_service(name: &str) -> MeshService {
     MeshService {
+        cluster_ips: Vec::new(),
         name: name.to_string(),
         namespace: "alpha".to_string(),
         ports: vec![ServicePort {

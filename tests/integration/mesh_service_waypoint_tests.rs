@@ -397,6 +397,7 @@ fn service_in_namespace(
     workloads: Vec<&str>,
 ) -> MeshService {
     MeshService {
+        cluster_ips: Vec::new(),
         name: name.to_string(),
         namespace: namespace.to_string(),
         ports: vec![ServicePort {

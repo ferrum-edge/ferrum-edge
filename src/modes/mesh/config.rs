@@ -128,6 +128,18 @@ pub struct MeshService {
     /// Per-port overrides for service-level protocol classification.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub protocol_overrides: HashMap<u16, AppProtocol>,
+    /// The service's virtual IPs (Kubernetes `spec.clusterIPs`, including
+    /// dual-stack secondaries; headless services carry none). Raw-TCP egress
+    /// maps a captured connection's `SO_ORIGINAL_DST` `(ip, port)` to a
+    /// service strictly through these — there is no Host header on a raw
+    /// stream, and a port number alone is never enough to pick a service
+    /// (two services may share one). Populated by the K8s translator from
+    /// the Service spec; file-source operators set it directly. Optional:
+    /// HTTP-family routing never consults it, and a TCP-family port on a
+    /// VIP-less service simply cannot be egress-routed (warned at
+    /// materialization, the captured connection fails as before).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cluster_ips: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1773,6 +1785,21 @@ pub struct MeshConfig {
     /// `envoy.config.core.v3.TypedExtensionConfig` payloads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_configs: Vec<crate::modes::mesh::slice::MeshExtensionConfig>,
+    /// Runtime-only back-projection of the slice's narrowed **local-inbound**
+    /// service view (`MeshSlice.local_inbound_services`), set by mesh
+    /// preparation. `Some` exactly when Sidecar narrowing resolved the local
+    /// view (mirroring `MeshSlice.local_inbound_workloads` semantics — an
+    /// empty `Some` means the local identity was ambiguous and nothing
+    /// materialized); `None` means no narrowing applied and consumers fall
+    /// back to `services`. The router's INBOUND per-port sibling grouping and
+    /// the listen-path uniqueness exemption read this so they see the same
+    /// service view `materialize_sidecar_inbound_proxies` consumed — `services`
+    /// is the EGRESS-narrowed view and can lack the local service entirely.
+    /// `serde(skip)`: never operator-settable, never serialized, and — per the
+    /// egress-scope security rule — never folded into `services` (the
+    /// outbound registry / egress scope must not widen to the local service).
+    #[serde(skip)]
+    pub local_inbound_services: Option<Vec<MeshService>>,
 }
 
 pub fn default_istio_root_namespace() -> String {
@@ -1802,6 +1829,7 @@ impl Default for MeshConfig {
             multi_cluster: None,
             outbound_traffic_policy: None,
             extension_configs: Vec::new(),
+            local_inbound_services: None,
         }
     }
 }
@@ -2049,6 +2077,15 @@ fn validate_mesh_config_internal(
                 *port,
                 &mut errors,
             );
+        }
+        for (i, vip) in svc.cluster_ips.iter().enumerate() {
+            if vip.parse::<std::net::IpAddr>().is_err() {
+                errors.push(format!(
+                    "MeshService '{}'.cluster_ips[{}]: '{}' is not a valid IP address \
+                     (headless services should omit cluster_ips, not carry 'None')",
+                    svc.name, i, vip
+                ));
+            }
         }
     }
 

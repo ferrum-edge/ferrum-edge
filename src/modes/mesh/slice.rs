@@ -2254,6 +2254,7 @@ mod tests {
 
     fn make_service_with_ports(namespace: &str, name: &str, ports: &[u16]) -> MeshService {
         MeshService {
+            cluster_ips: Vec::new(),
             name: name.into(),
             namespace: namespace.into(),
             ports: ports
@@ -4228,6 +4229,7 @@ mod tests {
         let slice = MeshSlice {
             namespace: "default".into(),
             services: vec![MeshService {
+                cluster_ips: Vec::new(),
                 name: "reviews".into(),
                 namespace: "default".into(),
                 ports: vec![crate::modes::mesh::config::ServicePort {
@@ -4257,6 +4259,7 @@ mod tests {
         let slice = MeshSlice {
             namespace: "default".into(),
             services: vec![MeshService {
+                cluster_ips: Vec::new(),
                 name: "ratings".into(),
                 namespace: "default".into(),
                 ports: Vec::new(),
@@ -4288,6 +4291,7 @@ mod tests {
             namespace: "default".into(),
             services: vec![
                 MeshService {
+                    cluster_ips: Vec::new(),
                     name: "reviews".into(),
                     namespace: "default".into(),
                     ports: vec![http_port.clone()],
@@ -4295,6 +4299,7 @@ mod tests {
                     protocol_overrides: HashMap::new(),
                 },
                 MeshService {
+                    cluster_ips: Vec::new(),
                     name: "ratings".into(),
                     namespace: "payments".into(),
                     ports: vec![http_port],
@@ -4319,6 +4324,7 @@ mod tests {
         let slice = MeshSlice {
             namespace: "default".into(),
             services: vec![MeshService {
+                cluster_ips: Vec::new(),
                 name: "Reviews".into(),
                 namespace: "Default".into(),
                 ports: vec![ServicePort {
@@ -4449,6 +4455,7 @@ mod tests {
             namespace: "default".into(),
             services: vec![
                 MeshService {
+                    cluster_ips: Vec::new(),
                     name: "zzz".into(),
                     namespace: "default".into(),
                     ports: vec![ServicePort {
@@ -4461,6 +4468,7 @@ mod tests {
                     protocol_overrides: HashMap::new(),
                 },
                 MeshService {
+                    cluster_ips: Vec::new(),
                     name: "aaa".into(),
                     namespace: "default".into(),
                     ports: vec![ServicePort {

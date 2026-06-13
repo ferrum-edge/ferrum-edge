@@ -525,6 +525,7 @@ mod tests {
         GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 services: vec![MeshService {
+                    cluster_ips: Vec::new(),
                     name: name.to_string(),
                     namespace: "ferrum".to_string(),
                     ports: vec![ServicePort {
@@ -636,6 +637,7 @@ mod tests {
         let mut mesh = MeshConfig {
             services: vec![
                 MeshService {
+                    cluster_ips: Vec::new(),
                     name: "reviews".to_string(),
                     namespace: "alpha".to_string(),
                     ports: vec![ServicePort {
@@ -648,6 +650,7 @@ mod tests {
                     protocol_overrides: std::collections::HashMap::new(),
                 },
                 MeshService {
+                    cluster_ips: Vec::new(),
                     name: "checkout".to_string(),
                     namespace: "alpha".to_string(),
                     ports: vec![ServicePort {

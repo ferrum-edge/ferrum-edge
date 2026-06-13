@@ -41,6 +41,10 @@ impl PodKey {
 #[derive(Debug)]
 struct CoreService {
     ports: Vec<ServicePort>,
+    /// `spec.clusterIPs` (fallback `spec.clusterIP`), excluding the headless
+    /// sentinel `"None"` and empty strings. Raw-TCP egress maps captured
+    /// original destinations to services through these VIPs.
+    cluster_ips: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -166,6 +170,7 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
             ports: service.ports.clone(),
             workloads,
             protocol_overrides: HashMap::new(),
+            cluster_ips: service.cluster_ips.clone(),
         });
     }
 
@@ -209,10 +214,34 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
             target_port,
         });
     }
+    // `spec.clusterIPs` carries the dual-stack VIP list; older objects may
+    // only have the singular `spec.clusterIP`. Headless services declare the
+    // literal string "None" — skip it (and empties): an absent VIP list means
+    // "not raw-TCP-egress routable", never an invalid address.
+    let mut cluster_ips: Vec<String> = object
+        .spec
+        .get("clusterIPs")
+        .and_then(Value::as_array)
+        .map(|ips| {
+            ips.iter()
+                .filter_map(Value::as_str)
+                .filter(|ip| !ip.is_empty() && *ip != "None")
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if cluster_ips.is_empty()
+        && let Some(ip) = string_field(&object.spec, "clusterIP")
+        && !ip.is_empty()
+        && ip != "None"
+    {
+        cluster_ips.push(ip.to_owned());
+    }
     acc.core.services.insert(
         key,
         CoreService {
             ports: service_ports,
+            cluster_ips,
         },
     );
     Ok(())

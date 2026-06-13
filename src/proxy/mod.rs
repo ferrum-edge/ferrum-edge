@@ -41,6 +41,7 @@ mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
 pub mod mesh_mtls_pool;
+mod mesh_tcp_egress;
 pub mod netns_capture;
 pub mod sni;
 pub mod stream_error;
@@ -3932,9 +3933,60 @@ impl ProxyState {
             &mut seen,
             &mut targets,
         );
+        Self::collect_mesh_tcp_egress_capability_targets(
+            config,
+            &upstream_map,
+            &mut seen,
+            &mut targets,
+        );
 
         self.backend_capabilities.retain_keys(&seen);
         targets
+    }
+
+    /// Enroll the raw-TCP mesh egress upstreams' targets for HBONE capability
+    /// probing. These upstreams are referenced by NO config proxy (the relay
+    /// proxy is synthesized at route-table build, never pushed into
+    /// `config.proxies`), so the proxy-driven walk above never sees them —
+    /// without this pass their records would never be probed AND
+    /// `retain_keys` would evict them, permanently failing the raw-TCP
+    /// dispatch gate closed. Probe targets are built from the SAME
+    /// deterministic relay-proxy builder the dispatch table uses, so probe
+    /// and dispatch capability keys agree by construction.
+    fn collect_mesh_tcp_egress_capability_targets(
+        config: &GatewayConfig,
+        upstream_map: &HashMap<&str, &Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        targets: &mut Vec<BackendCapabilityProbeTarget>,
+    ) {
+        let Some(mesh) = config.mesh.as_deref() else {
+            return;
+        };
+        for service in &mesh.services {
+            for sp in crate::modes::mesh::service_tcp_stream_ports(service) {
+                let upstream_id = crate::modes::mesh::mesh_outbound_tcp_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    sp.port,
+                );
+                let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                    continue;
+                };
+                let relay_proxy = crate::modes::mesh::mesh_outbound_tcp_relay_proxy(
+                    &service.namespace,
+                    &service.name,
+                    sp.port,
+                    &upstream_id,
+                );
+                for target in &upstream.targets {
+                    let probe_target =
+                        BackendCapabilityProbeTarget::from_proxy(&relay_proxy, Some(target));
+                    if seen.insert(probe_target.key.clone()) {
+                        targets.push(probe_target);
+                    }
+                }
+            }
+        }
     }
 
     fn collect_mesh_route_dispatch_capability_targets(
@@ -4080,7 +4132,11 @@ impl ProxyState {
             BackendScheme::Tcp | BackendScheme::Tcps | BackendScheme::Udp | BackendScheme::Dtls => {
             }
         }
-        if target.hbone_hint && matches!(scheme, BackendScheme::Http) {
+        // `Tcp` joins `Http` here for the raw-TCP mesh egress relay targets:
+        // their scheme keeps the plain-HTTP/h2c probes away from a raw-TCP
+        // app port (nothing above probes the Tcp arm), but HBONE support must
+        // still be proven — the probe only performs the CONNECT handshake.
+        if target.hbone_hint && matches!(scheme, BackendScheme::Http | BackendScheme::Tcp) {
             self.probe_hbone(
                 &probe_proxy,
                 probe_timeout,
@@ -8871,14 +8927,17 @@ async fn run_accept_loop(
                         }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
                         // Read the captured connection's pre-NAT original
-                        // destination ONCE per accept, only on mesh outbound
-                        // capture listeners (one getsockopt; every request on
-                        // the connection shares it). `None` everywhere else
-                        // and for non-redirected traffic — see
-                        // `socket_opts::original_dst`.
-                        let orig_dst = if mesh_direction
-                            == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
-                        {
+                        // destination ONCE per accept, only on mesh capture
+                        // listeners (one getsockopt; every request on the
+                        // connection shares it). Outbound: `:15001` REDIRECT
+                        // capture, port = the dialed SERVICE port. Inbound:
+                        // the injector also REDIRECTs a sidecar-less client's
+                        // direct dial of the app port to `:15006`, port = the
+                        // CONTAINER port (peer-sidecar dials are direct and
+                        // yield `None` per the `socket_opts::original_dst`
+                        // contract). `None` everywhere else and for
+                        // non-redirected traffic.
+                        let orig_dst = if mesh_direction.is_some() {
                             crate::socket_opts::original_dst(&stream)
                         } else {
                             None
@@ -8898,6 +8957,54 @@ async fn run_accept_loop(
                             // Track this connection for graceful drain.
                             // The guard decrements the counter on drop (all exit paths).
                             let _conn_guard = crate::overload::ConnectionGuard::new(&state.overload);
+
+                            // Raw-TCP mesh egress: a captured plaintext
+                            // outbound connection whose original destination
+                            // matches a declared (service VIP, stream-family
+                            // port) pair never reaches hyper — the raw client
+                            // (redis, mysql, ...) does not speak HTTP. Relay
+                            // it over HBONE, or close it when the pair is
+                            // mesh-owned but unroutable (never guess). All
+                            // other destinations fall through unchanged.
+                            if tls_config.is_none()
+                                && mesh_direction
+                                    == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+                                && let Some(dst) = orig_dst
+                            {
+                                let epoch = state.request_epoch.load();
+                                match epoch.route_table.mesh_tcp_egress_decision(dst).cloned() {
+                                    Some(crate::router_cache::MeshTcpEgressDecision::Relay(
+                                        entry,
+                                    )) => {
+                                        mesh_tcp_egress::handle_mesh_tcp_egress(
+                                            stream,
+                                            remote_addr,
+                                            &state,
+                                            &epoch,
+                                            &entry,
+                                            dst,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                    Some(
+                                        crate::router_cache::MeshTcpEgressDecision::CloseNotRoutable,
+                                    ) => {
+                                        // The materializer warned once per
+                                        // apply with the reason; per-connection
+                                        // logging stays at debug.
+                                        debug!(
+                                            orig_dst = %dst,
+                                            client_ip = %remote_addr.ip(),
+                                            "Captured raw-TCP dial targets a declared but \
+                                             unroutable mesh TCP port; closing"
+                                        );
+                                        drop(stream);
+                                        return;
+                                    }
+                                    None => {}
+                                }
+                            }
 
                             let result = if let Some(tls_config) = tls_config {
                                 let tls_connection_metadata = TlsConnectionMetadata {
@@ -10092,9 +10199,28 @@ async fn handle_proxy_request_inner(
     let raw_host = ctx
         .raw_header_get("host")
         .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    // One `split_request_authority` pass yields both the routing host (port
+    // stripped, as before) and the request's EXPLICIT authority port —
+    // consumed only by mesh inbound multi-port sibling selection below, where
+    // a peer sidecar's egress rewrites the authority to carry the service
+    // port. `is_valid_port` already bounded it to u16, so the parse is
+    // infallible for any authority that got this far.
+    let mut authority_port: Option<u16> = None;
     let request_host: Option<String> = match raw_host {
-        Some(h) => match normalize_request_host_for_routing(h) {
-            Some(normalized) => Some(normalized),
+        Some(h) => match split_request_authority(h) {
+            Some((host, port)) => {
+                let normalized = normalize_authority_host(host);
+                if normalized.is_empty() {
+                    warn!("Rejected request: malformed Host/authority value");
+                    record_request(&state, 400);
+                    return Ok(build_response(
+                        StatusCode::BAD_REQUEST,
+                        r#"{"error":"Request contains malformed Host or authority"}"#,
+                    ));
+                }
+                authority_port = port.and_then(|p| p.parse().ok());
+                Some(normalized)
+            }
             None => {
                 warn!("Rejected request: malformed Host/authority value");
                 record_request(&state, 400);
@@ -10175,6 +10301,60 @@ async fn handle_proxy_request_inner(
                         }
                         crate::router_cache::MeshOutboundPortSelectError::PortNotMaterialized => {
                             br#"{"error":"Original destination port is not a mesh-routable port of this service"}"#
+                        }
+                    };
+                    let reject = normalize_reject_response(
+                        StatusCode::BAD_GATEWAY,
+                        body,
+                        &EMPTY_HEADERS,
+                        request_uses_grpc_content_type,
+                    );
+                    record_status(&state, reject.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(reject));
+                }
+            }
+        }
+        other => other,
+    };
+
+    // Mesh inbound multi-port disambiguation — the inbound mirror of the
+    // outbound arm above: host routing picked the local service (one
+    // representative per service in the tiers); the captured original
+    // destination (REDIRECT-captured plain inbound, container port) or the
+    // request's explicit authority port (peer-sidecar dials, service port)
+    // now picks the per-port loopback sibling. Multi-port requests carrying
+    // neither signal — or a signal matching no materialized sibling — fail
+    // closed with 502; single-port services are untouched. The synthesized
+    // HBONE relay proxy shares the id prefix but is created post-route-miss
+    // and never matches here.
+    let route_match = match route_match {
+        Some(rm)
+            if ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+                && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id) =>
+        {
+            let representative_id = Arc::clone(&rm.proxy);
+            match epoch.route_table.select_mesh_inbound_port_route(
+                rm,
+                ctx.orig_dst.map(|addr| addr.port()),
+                authority_port,
+            ) {
+                Ok(rm) => Some(rm),
+                Err(reason) => {
+                    debug!(
+                        proxy_id = %representative_id.id,
+                        orig_dst = ?ctx.orig_dst,
+                        authority_port = ?authority_port,
+                        reason = ?reason,
+                        client_ip = %ctx.client_ip,
+                        "Mesh inbound port selection failed; rejecting inbound request"
+                    );
+                    state.request_count.fetch_add(1, Ordering::Relaxed);
+                    let body: &[u8] = match reason {
+                        crate::router_cache::MeshInboundPortSelectError::PortSignalUnavailable => {
+                            br#"{"error":"Mesh inbound destination port is ambiguous: the local service exposes multiple ports and the request carries no original destination or explicit authority port"}"#
+                        }
+                        crate::router_cache::MeshInboundPortSelectError::PortNotMaterialized => {
+                            br#"{"error":"Request port is not a mesh-routable port of the local service"}"#
                         }
                     };
                     let reject = normalize_reject_response(
@@ -16104,6 +16284,21 @@ fn normalize_authority_host(host: &str) -> String {
     normalized.to_ascii_lowercase()
 }
 
+/// The `:authority` a multi-port Sidecar egress request sends to the peer's
+/// inbound listener: the preserved client host with any client-supplied port
+/// replaced by the OWNING SERVICE port of the per-port route the captured
+/// original destination selected (the orig-dst is the dialed truth; a
+/// client's explicit Host port should agree, but the route's owning port
+/// wins when they differ). Bracketed IPv6 hosts keep their brackets. A host
+/// that fails authority parsing (it already passed routing normalization, so
+/// this is defensive) is used as-is with the port appended.
+fn mesh_mtls_request_authority(preserved_host: &str, service_port: u16) -> String {
+    let host = split_request_authority(preserved_host)
+        .map(|(host, _)| host)
+        .unwrap_or(preserved_host);
+    format!("{host}:{service_port}")
+}
+
 /// Normalize a Host/authority value for host-based routing.
 ///
 /// This removes a valid port suffix, preserves bracketed IPv6 literals, strips
@@ -17089,7 +17284,7 @@ async fn proxy_to_backend_mesh_mtls(
     let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
     let mut sender = match state
         .mesh_mtls_pool
-        .get_sender(proxy, &target.host, mtls_port, &expected_peer)
+        .get_sender(proxy, &target.host, target.port, mtls_port, &expected_peer)
         .await
     {
         Ok(sender) => sender,
@@ -17158,13 +17353,25 @@ async fn proxy_to_backend_mesh_mtls(
     // `:authority` is the routing key on the peer: its materialized inbound
     // route matches the SERVICE host, so a preserved client Host wins; without
     // preservation fall back to the dial authority (peer pod + app port),
-    // matching the HBONE inner request's Host fallback.
+    // matching the HBONE inner request's Host fallback. For a MULTI-PORT
+    // destination the materializer stamped the owning service port on the
+    // target, and the authority is rewritten to `<host>:<service_port>` —
+    // the peer's inbound `:15006` dials are direct (never NATed, no
+    // orig-dst), so the authority port is the only channel that tells its
+    // per-port inbound siblings apart. The original client Host still rides
+    // `x-forwarded-host` below. Single-port destinations carry no tag and
+    // keep the client authority byte-for-byte.
     let authority_owned;
     let authority = if proxy.preserve_host_header
         && let Some(host) = headers.get("host")
         && !host.is_empty()
     {
-        host.as_str()
+        if let Some(service_port) = mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+            authority_owned = mesh_mtls_request_authority(host, service_port);
+            authority_owned.as_str()
+        } else {
+            host.as_str()
+        }
     } else {
         authority_owned = hbone_pool::authority_for_host_port(&target.host, target.port);
         authority_owned.as_str()
@@ -23795,5 +24002,29 @@ mod tests {
 
         let mesh = ListenerTlsSource::MeshInbound;
         assert!(!mesh.requires_tls());
+    }
+
+    /// The multi-port Sidecar egress authority rewrite: any client-supplied
+    /// port is replaced by the owning service port; bracketed IPv6 hosts keep
+    /// their brackets.
+    #[test]
+    fn mesh_mtls_request_authority_replaces_port_and_keeps_ipv6_brackets() {
+        assert_eq!(
+            mesh_mtls_request_authority("reviews.default.svc.cluster.local", 9080),
+            "reviews.default.svc.cluster.local:9080"
+        );
+        assert_eq!(
+            mesh_mtls_request_authority("reviews.default.svc.cluster.local:80", 9080),
+            "reviews.default.svc.cluster.local:9080",
+            "a client-supplied port is replaced by the route's owning service port"
+        );
+        assert_eq!(
+            mesh_mtls_request_authority("[2001:db8::1]:80", 9080),
+            "[2001:db8::1]:9080"
+        );
+        assert_eq!(
+            mesh_mtls_request_authority("[2001:db8::1]", 9080),
+            "[2001:db8::1]:9080"
+        );
     }
 }

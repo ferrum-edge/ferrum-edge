@@ -181,6 +181,50 @@ pub(crate) struct HostRouteTable {
     /// destination port. Built at route-table construction; empty outside
     /// mesh mode.
     mesh_outbound_ports: HashMap<String, Arc<MeshOutboundPortGroup>>,
+    /// Mesh sidecar INBOUND per-port sibling groups, keyed by the
+    /// representative proxy id — the inbound mirror of `mesh_outbound_ports`.
+    /// After a representative matches on the inbound listener,
+    /// [`HostRouteTable::select_mesh_inbound_port_route`] swaps in the sibling
+    /// matching the connection's captured original destination port (container
+    /// port; REDIRECT-captured plain inbound) or the request's pre-strip
+    /// authority port (service port; peer-sidecar dials). Built at route-table
+    /// construction; empty outside mesh mode.
+    mesh_inbound_ports: HashMap<String, Arc<MeshInboundPortGroup>>,
+    /// Raw-TCP mesh egress lookup: strict `(service VIP, service port)` →
+    /// relay entry, consulted by the outbound capture accept loop BEFORE the
+    /// stream is handed to hyper. Built forward from the prepared `mesh`
+    /// block (stream-family ports × `cluster_ips`); empty outside mesh mode.
+    mesh_tcp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
+}
+
+/// One routable raw-TCP egress destination: the per-port upstream to
+/// LB-select a workload from, and the synthesized relay proxy whose fields
+/// drive the HBONE pool's per-proxy config, the connect budget, the copy-loop
+/// timeouts, and the capability-registry key (shared with probe enrollment —
+/// see `mesh_outbound_tcp_relay_proxy`).
+pub(crate) struct MeshTcpEgressEntry {
+    pub(crate) upstream_id: String,
+    pub(crate) relay_proxy: Arc<Proxy>,
+    /// The service FQDN (the upstream's DR-matchable name) for logging.
+    pub(crate) service_fqdn: String,
+}
+
+/// Outcome of a raw-TCP egress lookup for a captured original destination
+/// that matched a declared `(VIP, stream-family port)` pair. A captured
+/// destination matching NO pair is not represented here — it falls through
+/// to the HTTP path unchanged (it may be an HTTP service port on the same
+/// VIP, or non-mesh traffic that was never routable before).
+#[derive(Clone)]
+pub(crate) enum MeshTcpEgressDecision {
+    /// Relay the raw stream over HBONE to a workload of this entry.
+    Relay(Arc<MeshTcpEgressEntry>),
+    /// The pair is DECLARED by the slice but not routable (no upstream
+    /// materialized: no reachable local-cluster workloads, unresolved named
+    /// targetPort, or a topology without raw-TCP egress). Close the
+    /// connection — the destination is mesh-owned, so letting it fall
+    /// through to hyper would just fail confusingly later, and guessing a
+    /// different port/service is forbidden.
+    CloseNotRoutable,
 }
 
 /// Per-service group of mesh outbound per-port sibling routes
@@ -197,6 +241,47 @@ pub(crate) struct MeshOutboundPortGroup {
     /// `(service_port, route)` pairs sorted by port ascending; entry 0 is the
     /// representative present in the route tiers.
     ports: Vec<(u16, Arc<Proxy>)>,
+}
+
+/// Per-service group of mesh sidecar INBOUND per-port sibling routes
+/// (`__mesh-inbound-{ns}-{name}-{port}`), derived from the prepared config's
+/// `mesh` block by `crate::modes::mesh::mesh_inbound_service_groups` (the
+/// local-inbound service view). Each sibling routes one SERVICE port to the
+/// local app's resolved CONTAINER (target) port — `proxy.backend_port` — so
+/// selection matches captured original destinations against the container
+/// port and authority ports against the service port.
+pub(crate) struct MeshInboundPortGroup {
+    /// HTTP-family ports the local service DECLARES — may exceed `ports.len()`
+    /// when a port materialized no sibling (unresolved named `targetPort`).
+    /// Signal-less requests fail closed whenever this is > 1, even for a
+    /// partially materialized group: without a port signal, traffic meant for
+    /// a skipped port is indistinguishable from the surviving one.
+    declared_http_ports: usize,
+    /// `(service_port, route)` pairs sorted by service port ascending; entry 0
+    /// is the representative present in the route tiers.
+    ports: Vec<(u16, Arc<Proxy>)>,
+}
+
+/// Why [`HostRouteTable::select_mesh_inbound_port_route`] refused to pick a
+/// per-port sibling. Both cases fail closed at the request handler — inbound
+/// traffic is never forwarded to a port the client did not address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeshInboundPortSelectError {
+    /// The matched local service DECLARES multiple HTTP-family ports but the
+    /// request carries neither a captured original destination (the dial was
+    /// direct, e.g. a peer sidecar's `:15006` connection) nor an explicit
+    /// `Host`/`:authority` port — the addressed port cannot be determined and
+    /// must never be guessed. Applies even when only one sibling
+    /// materialized (partially materialized multi-port service).
+    PortSignalUnavailable,
+    /// A port signal was present but matches none of the service's
+    /// materialized HTTP-family siblings (orig-dst port matched no sibling's
+    /// container port, or the authority port matched no sibling's service
+    /// port). Forwarding it to a different port's backend would be a
+    /// misroute, so it is rejected — a present-but-unmatched orig-dst never
+    /// falls through to the authority port (the dialed truth outranks app
+    /// baggage).
+    PortNotMaterialized,
 }
 
 /// Why [`HostRouteTable::select_mesh_outbound_port_route`] refused to pick a
@@ -255,6 +340,81 @@ impl HostRouteTable {
                 None => Err(MeshOutboundPortSelectError::PortNotMaterialized),
             },
         }
+    }
+
+    /// Swap a matched mesh sidecar INBOUND representative route for the
+    /// sibling matching the request's port signal.
+    ///
+    /// Signals, in priority order (the first PRESENT signal decides — a
+    /// present-but-unmatched higher-priority signal fails closed rather than
+    /// falling through to a lower one):
+    /// 1. `orig_dst_port` — the captured original destination of a
+    ///    REDIRECT-captured plain inbound connection (a sidecar-less client
+    ///    dialed the app port directly and iptables redirected it to
+    ///    `:15006`). Matches the sibling's CONTAINER port
+    ///    (`proxy.backend_port`); it is the dialed truth, so it outranks the
+    ///    authority. Peer-sidecar dials are direct (never NATed) and carry
+    ///    `None`.
+    /// 2. `authority_port` — the request's pre-strip `Host`/`:authority`
+    ///    port. Matches the sibling's SERVICE port; a peer sidecar's
+    ///    multi-port egress rewrites the authority to carry it.
+    ///
+    /// Behavior matrix (see [`MeshInboundPortGroup`]):
+    /// - route not grouped → keep `current`;
+    /// - the service DECLARES exactly one HTTP-family port → keep `current`
+    ///   unconditionally (back-compat: single-port services accept bare-Host
+    ///   clients, older peers, and any explicit port today — selection adds
+    ///   no new requirement to them);
+    /// - multi-port with no signal at all →
+    ///   [`MeshInboundPortSelectError::PortSignalUnavailable`];
+    /// - multi-port with a present-but-unmatched signal →
+    ///   [`MeshInboundPortSelectError::PortNotMaterialized`].
+    pub(crate) fn select_mesh_inbound_port_route(
+        &self,
+        current: RouteMatch,
+        orig_dst_port: Option<u16>,
+        authority_port: Option<u16>,
+    ) -> Result<RouteMatch, MeshInboundPortSelectError> {
+        let Some(group) = self.mesh_inbound_ports.get(&current.proxy.id) else {
+            return Ok(current);
+        };
+        if group.declared_http_ports == 1 {
+            return Ok(current);
+        }
+        let selected = if let Some(container_port) = orig_dst_port {
+            group
+                .ports
+                .iter()
+                .find(|(_, proxy)| proxy.backend_port == container_port)
+        } else if let Some(service_port) = authority_port {
+            group.ports.iter().find(|(p, _)| *p == service_port)
+        } else {
+            return Err(MeshInboundPortSelectError::PortSignalUnavailable);
+        };
+        match selected {
+            Some((_, proxy)) => Ok(RouteMatch {
+                proxy: Arc::clone(proxy),
+                path_params: current.path_params,
+                matched_prefix_len: current.matched_prefix_len,
+            }),
+            None => Err(MeshInboundPortSelectError::PortNotMaterialized),
+        }
+    }
+
+    /// Raw-TCP egress lookup for a captured connection's pre-NAT original
+    /// destination. `None` ⇒ not a declared `(service VIP, stream-family
+    /// port)` pair: fall through to the HTTP handling path unchanged.
+    pub(crate) fn mesh_tcp_egress_decision(
+        &self,
+        orig_dst: std::net::SocketAddr,
+    ) -> Option<&MeshTcpEgressDecision> {
+        if self.mesh_tcp_egress.is_empty() {
+            return None;
+        }
+        // Canonicalized so an IPv4-mapped IPv6 capture address
+        // (`::ffff:a.b.c.d`) still matches the IPv4 VIP the slice declared.
+        self.mesh_tcp_egress
+            .get(&(orig_dst.ip().to_canonical(), orig_dst.port()))
     }
 }
 
@@ -956,9 +1116,26 @@ impl RouterCache {
         // edge) stays ungrouped and inserts normally. Empty outside mesh
         // mode (`config.mesh` is `None`).
         let mut mesh_outbound_ports: HashMap<String, Arc<MeshOutboundPortGroup>> = HashMap::new();
-        let mut mesh_outbound_skip_ids: std::collections::HashSet<String> =
+        let mut mesh_inbound_ports: HashMap<String, Arc<MeshInboundPortGroup>> = HashMap::new();
+        // Non-representative siblings of BOTH directions: reachable only via
+        // post-match port selection, never via the tiers.
+        let mut mesh_sibling_skip_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         if let Some(mesh) = config.mesh.as_deref() {
+            let group_members = |siblings: &[(u16, String)],
+                                 proxies: &HashMap<&str, &Proxy>|
+             -> Vec<(u16, Arc<Proxy>)> {
+                let mut members: Vec<(u16, Arc<Proxy>)> = siblings
+                    .iter()
+                    .filter_map(|(port, id)| {
+                        proxies
+                            .get(id.as_str())
+                            .map(|p| (*port, Arc::new((*p).clone())))
+                    })
+                    .collect();
+                members.sort_by_key(|(port, _)| *port);
+                members
+            };
             let outbound_proxies: HashMap<&str, &Proxy> = config
                 .proxies
                 .iter()
@@ -969,22 +1146,13 @@ impl RouterCache {
                 .map(|p| (p.id.as_str(), p))
                 .collect();
             for group in crate::modes::mesh::mesh_outbound_service_groups(mesh) {
-                let mut members: Vec<(u16, Arc<Proxy>)> = group
-                    .siblings
-                    .iter()
-                    .filter_map(|(port, id)| {
-                        outbound_proxies
-                            .get(id.as_str())
-                            .map(|p| (*port, Arc::new((*p).clone())))
-                    })
-                    .collect();
+                let members = group_members(&group.siblings, &outbound_proxies);
                 if members.is_empty() {
                     continue;
                 }
-                members.sort_by_key(|(port, _)| *port);
                 let representative_id = members[0].1.id.clone();
                 for (_, sibling) in members.iter().skip(1) {
-                    mesh_outbound_skip_ids.insert(sibling.id.clone());
+                    mesh_sibling_skip_ids.insert(sibling.id.clone());
                 }
                 mesh_outbound_ports.insert(
                     representative_id,
@@ -994,6 +1162,94 @@ impl RouterCache {
                     }),
                 );
             }
+            // Inbound mirror: same forward derivation, reading the
+            // local-inbound service view (`mesh_inbound_service_groups`). The
+            // synthesized HBONE relay proxy never appears in `config.proxies`,
+            // so it can never be grouped here despite sharing the id prefix.
+            let inbound_proxies: HashMap<&str, &Proxy> = config
+                .proxies
+                .iter()
+                .filter(|p| {
+                    !p.dispatch_kind.is_stream()
+                        && crate::modes::mesh::is_mesh_inbound_route_id(&p.id)
+                })
+                .map(|p| (p.id.as_str(), p))
+                .collect();
+            for group in crate::modes::mesh::mesh_inbound_service_groups(mesh) {
+                let members = group_members(&group.siblings, &inbound_proxies);
+                if members.is_empty() {
+                    continue;
+                }
+                let representative_id = members[0].1.id.clone();
+                for (_, sibling) in members.iter().skip(1) {
+                    mesh_sibling_skip_ids.insert(sibling.id.clone());
+                }
+                mesh_inbound_ports.insert(
+                    representative_id,
+                    Arc::new(MeshInboundPortGroup {
+                        declared_http_ports: group.declared_http_ports,
+                        ports: members,
+                    }),
+                );
+            }
+        }
+
+        // ── Raw-TCP egress (VIP, port) lookup ──────────────────────────────
+        // Forward-derived from the prepared `mesh` block: every declared
+        // stream-family service port × every declared service VIP. Routable
+        // when its per-port upstream materialized; otherwise the pair is
+        // mesh-owned but unroutable and the accept loop closes it (never
+        // guesses). VIPs are canonicalized so mapped-IPv6 captures match.
+        let mut mesh_tcp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision> =
+            HashMap::new();
+        if let Some(mesh) = config.mesh.as_deref() {
+            let upstream_ids: std::collections::HashSet<&str> =
+                config.upstreams.iter().map(|u| u.id.as_str()).collect();
+            for service in &mesh.services {
+                let tcp_ports = crate::modes::mesh::service_tcp_stream_ports(service);
+                if tcp_ports.is_empty() || service.cluster_ips.is_empty() {
+                    continue;
+                }
+                for sp in tcp_ports {
+                    let upstream_id = crate::modes::mesh::mesh_outbound_tcp_upstream_id(
+                        &service.namespace,
+                        &service.name,
+                        sp.port,
+                    );
+                    let decision = if upstream_ids.contains(upstream_id.as_str()) {
+                        let relay_proxy =
+                            Arc::new(crate::modes::mesh::mesh_outbound_tcp_relay_proxy(
+                                &service.namespace,
+                                &service.name,
+                                sp.port,
+                                &upstream_id,
+                            ));
+                        let service_fqdn = config
+                            .upstreams
+                            .iter()
+                            .find(|u| u.id == upstream_id)
+                            .and_then(|u| u.name.clone())
+                            .unwrap_or_else(|| format!("{}.{}", service.name, service.namespace));
+                        MeshTcpEgressDecision::Relay(Arc::new(MeshTcpEgressEntry {
+                            upstream_id,
+                            relay_proxy,
+                            service_fqdn,
+                        }))
+                    } else {
+                        MeshTcpEgressDecision::CloseNotRoutable
+                    };
+                    for vip in &service.cluster_ips {
+                        let Ok(ip) = vip.parse::<std::net::IpAddr>() else {
+                            // Config validation rejects unparseable VIPs for
+                            // operator-authored slices; skip defensively.
+                            continue;
+                        };
+                        mesh_tcp_egress
+                            .entry((ip.to_canonical(), sp.port))
+                            .or_insert_with(|| decision.clone());
+                    }
+                }
+            }
         }
 
         for proxy in config
@@ -1001,9 +1257,9 @@ impl RouterCache {
             .iter()
             .filter(|p| !p.dispatch_kind.is_stream())
         {
-            // Non-representative mesh outbound siblings are reachable only via
-            // post-match port selection, never via the tiers.
-            if mesh_outbound_skip_ids.contains(proxy.id.as_str()) {
+            // Non-representative mesh per-port siblings (both directions) are
+            // reachable only via post-match port selection, never via the tiers.
+            if mesh_sibling_skip_ids.contains(proxy.id.as_str()) {
                 continue;
             }
             let arc_proxy = Arc::new(proxy.clone());
@@ -1228,6 +1484,8 @@ impl RouterCache {
             has_regex_routes,
             has_host_only_routes,
             mesh_outbound_ports,
+            mesh_inbound_ports,
+            mesh_tcp_egress,
         }
     }
 }
@@ -1927,6 +2185,7 @@ mod tests {
             services: services
                 .iter()
                 .map(|(namespace, name, ports)| MeshService {
+                    cluster_ips: Vec::new(),
                     name: name.to_string(),
                     namespace: namespace.to_string(),
                     ports: ports
@@ -2409,5 +2668,234 @@ mod tests {
     #[test]
     fn encoded_slash_empty_path() {
         assert_eq!(normalize_encoded_slashes(""), "");
+    }
+
+    /// Multi-port INBOUND siblings: representative in the tiers, post-match
+    /// selection by inbound orig-dst (container port) with the authority
+    /// port (service port) as the fallback signal — and a present-but-
+    /// unmatched higher-priority signal failing closed, never falling
+    /// through.
+    #[test]
+    fn mesh_inbound_port_group_selects_sibling_by_signals() {
+        let mut proxies = Vec::new();
+        for (service_port, container_port) in [(80u16, 8080u16), (90, 9090)] {
+            let mut p = minimal_proxy_for_routing(
+                &format!("__mesh-inbound-default-reviews-{service_port}"),
+                "/",
+            );
+            p.hosts = vec!["reviews".to_string()];
+            p.backend_port = container_port;
+            proxies.push(p);
+        }
+        let config = GatewayConfig {
+            proxies,
+            mesh: mesh_block(&[("default", "reviews", &[80, 90])]),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        // Tiers hold exactly the lowest-service-port representative.
+        let rm = cache
+            .find_proxy(Some("reviews"), "/")
+            .expect("representative route matches by host");
+        assert_eq!(rm.proxy.id, "__mesh-inbound-default-reviews-80");
+
+        // Inbound orig-dst (container port) picks each sibling.
+        for (service_port, container_port) in [(80u16, 8080u16), (90, 9090)] {
+            let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+            let selected = table
+                .select_mesh_inbound_port_route(rm, Some(container_port), None)
+                .expect("captured container port selects its sibling");
+            assert_eq!(
+                selected.proxy.id,
+                format!("__mesh-inbound-default-reviews-{service_port}")
+            );
+        }
+
+        // Authority port (service port) picks each sibling when orig-dst is
+        // absent (the peer-sidecar direct-dial case).
+        for service_port in [80u16, 90] {
+            let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+            let selected = table
+                .select_mesh_inbound_port_route(rm, None, Some(service_port))
+                .expect("authority service port selects its sibling");
+            assert_eq!(
+                selected.proxy.id,
+                format!("__mesh-inbound-default-reviews-{service_port}")
+            );
+        }
+
+        // A present-but-unmatched orig-dst fails closed even when the
+        // authority would have matched: the dialed truth outranks app
+        // baggage and is never second-guessed.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(matches!(
+            table.select_mesh_inbound_port_route(rm, Some(7777), Some(80)),
+            Err(MeshInboundPortSelectError::PortNotMaterialized)
+        ));
+
+        // An unmatched authority with no orig-dst fails closed.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(matches!(
+            table.select_mesh_inbound_port_route(rm, None, Some(7777)),
+            Err(MeshInboundPortSelectError::PortNotMaterialized)
+        ));
+
+        // No signal at all on a multi-port group fails closed.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(matches!(
+            table.select_mesh_inbound_port_route(rm, None, None),
+            Err(MeshInboundPortSelectError::PortSignalUnavailable)
+        ));
+    }
+
+    /// Single-declared-port local services keep today's behavior
+    /// unconditionally: bare-Host clients, older peers, and any explicit
+    /// port all keep routing (selection adds no new requirement to them).
+    #[test]
+    fn mesh_inbound_single_port_group_keeps_route_unconditionally() {
+        let mut p = minimal_proxy_for_routing("__mesh-inbound-default-ratings-8080", "/");
+        p.hosts = vec!["ratings".to_string()];
+        p.backend_port = 8081;
+        let config = GatewayConfig {
+            proxies: vec![p],
+            mesh: mesh_block(&[("default", "ratings", &[8080])]),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        for (orig_dst, authority) in [(None, None), (None, Some(9999u16)), (Some(9999u16), None)] {
+            let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
+            let kept = table
+                .select_mesh_inbound_port_route(rm, orig_dst, authority)
+                .expect("single-port group never demands a signal");
+            assert_eq!(kept.proxy.id, "__mesh-inbound-default-ratings-8080");
+        }
+    }
+
+    /// A partially materialized multi-port group (one sibling skipped) still
+    /// demands a signal and never absorbs the skipped port's traffic.
+    #[test]
+    fn mesh_inbound_partial_group_still_demands_signal() {
+        let mut p = minimal_proxy_for_routing("__mesh-inbound-default-reviews-80", "/");
+        p.hosts = vec!["reviews".to_string()];
+        p.backend_port = 8080;
+        let config = GatewayConfig {
+            proxies: vec![p],
+            // The service DECLARES two HTTP ports; only one materialized.
+            mesh: mesh_block(&[("default", "reviews", &[80, 90])]),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(matches!(
+            table.select_mesh_inbound_port_route(rm, None, None),
+            Err(MeshInboundPortSelectError::PortSignalUnavailable)
+        ));
+
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            table
+                .select_mesh_inbound_port_route(rm, None, Some(80))
+                .is_ok(),
+            "the surviving sibling stays addressable by its service port"
+        );
+
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            matches!(
+                table.select_mesh_inbound_port_route(rm, None, Some(90)),
+                Err(MeshInboundPortSelectError::PortNotMaterialized)
+            ),
+            "traffic for the skipped port must not be absorbed by the survivor"
+        );
+    }
+
+    /// Raw-TCP egress lookup: strict (VIP, port) matching, mapped-IPv6
+    /// canonicalization, fail-closed for declared-but-unroutable pairs, and
+    /// fallthrough (`None`) for everything else.
+    #[test]
+    fn mesh_tcp_egress_table_routes_by_vip_and_port() {
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+        let service = MeshService {
+            name: "redis".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 6379,
+                protocol: AppProtocol::Redis,
+                name: Some("redis".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: std::collections::HashMap::new(),
+            cluster_ips: vec!["10.96.0.1".to_string()],
+        };
+        let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
+            "id": "__mesh-out-tcp-upstream-default-redis-6379",
+            "name": "redis.default.svc.cluster.local",
+            "targets": [{"host": "10.0.0.5", "port": 6379}],
+        }))
+        .expect("upstream deserializes");
+        let config = GatewayConfig {
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service.clone()],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        let decision =
+            |addr: &str| table.mesh_tcp_egress_decision(addr.parse().expect("socket addr"));
+
+        // Exact (VIP, port) match relays through the per-port upstream.
+        match decision("10.96.0.1:6379") {
+            Some(MeshTcpEgressDecision::Relay(entry)) => {
+                assert_eq!(
+                    entry.upstream_id,
+                    "__mesh-out-tcp-upstream-default-redis-6379"
+                );
+                assert_eq!(entry.service_fqdn, "redis.default.svc.cluster.local");
+                assert_eq!(
+                    entry.relay_proxy.upstream_id.as_deref(),
+                    Some("__mesh-out-tcp-upstream-default-redis-6379")
+                );
+            }
+            _ => panic!("expected Relay decision for an exact (VIP, port) match"),
+        }
+
+        // A mapped-IPv6 capture of the same IPv4 VIP still matches.
+        assert!(matches!(
+            decision("[::ffff:10.96.0.1]:6379"),
+            Some(MeshTcpEgressDecision::Relay(_))
+        ));
+
+        // Same VIP, undeclared port: fall through to the HTTP path (it may be
+        // an HTTP service port on the same VIP).
+        assert!(decision("10.96.0.1:9999").is_none());
+        // Same port, different IP: never matched by port number alone.
+        assert!(decision("10.96.0.2:6379").is_none());
+
+        // Declared pair whose upstream did NOT materialize: mesh-owned but
+        // unroutable — close, never guess.
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+        assert!(matches!(
+            table.mesh_tcp_egress_decision("10.96.0.1:6379".parse().expect("addr")),
+            Some(MeshTcpEgressDecision::CloseNotRoutable)
+        ));
     }
 }

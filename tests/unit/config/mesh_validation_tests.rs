@@ -78,6 +78,7 @@ fn workload_rejects_empty_service_name() {
 #[test]
 fn mesh_service_rejects_empty_name() {
     let svc = MeshService {
+        cluster_ips: Vec::new(),
         name: String::new(),
         namespace: "default".into(),
         ports: Vec::new(),
@@ -98,6 +99,7 @@ fn mesh_ports_reject_zero_on_core_resources() {
     wl.ports[0].port = 0;
 
     let mut service = MeshService {
+        cluster_ips: Vec::new(),
         name: "svc".into(),
         namespace: "default".into(),
         ports: vec![ServicePort {

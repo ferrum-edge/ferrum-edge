@@ -56,6 +56,7 @@ fn mesh_config_round_trips_through_serde() {
                 pod_uid: None,
             }],
             services: vec![MeshService {
+                cluster_ips: Vec::new(),
                 name: "api".into(),
                 namespace: "svc".into(),
                 ports: vec![ServicePort {

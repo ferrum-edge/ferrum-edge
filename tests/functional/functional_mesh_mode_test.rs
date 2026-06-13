@@ -37,8 +37,8 @@ use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequ
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshConfig, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication,
-    PolicyAction, PolicyScope, PrincipalMatch, ServicePort, Workload, WorkloadPort, WorkloadRef,
-    WorkloadSelector,
+    PolicyAction, PolicyScope, PrincipalMatch, ServicePort, ServiceTargetPort, Workload,
+    WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::XdsAdsServer;
@@ -258,6 +258,7 @@ fn east_west_service_slice(node_id: &str) -> MeshSlice {
             pod_uid: Some("functional-reviews-pod".to_string()),
         }],
         services: vec![MeshService {
+            cluster_ips: Vec::new(),
             name: "reviews".to_string(),
             namespace: "ferrum".to_string(),
             ports: vec![ServicePort {
@@ -1495,6 +1496,35 @@ async fn start_echo_backend() -> u16 {
     port
 }
 
+/// One-shot echo backend with a caller-chosen body, so multi-port routing
+/// assertions can tell WHICH backend served the request.
+async fn start_labeled_echo_backend(label: &'static str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind labeled echo backend");
+    let port = listener.local_addr().expect("echo backend addr").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    label.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(label.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    port
+}
+
 /// Drive a real HTTP request over mTLS into the sidecar inbound listener and
 /// return the HTTP status. Mirrors `mesh_inbound_mtls_connect`'s TLS setup
 /// (root = `ca_pem`, client SVID, server SPIFFE pin) but then sends a `GET` and
@@ -1644,6 +1674,7 @@ fn inbound_authz_slice(
         pod_uid: None,
     };
     let echo_service = MeshService {
+        cluster_ips: Vec::new(),
         name: "echo".to_string(),
         namespace: "ferrum".to_string(),
         ports: vec![ServicePort {
@@ -1853,6 +1884,166 @@ async fn functional_mesh_sidecar_inbound_denies_unauthorized_peer() {
     );
 }
 
+/// A multi-port slice for the INBOUND disambiguation keystone: the local
+/// `echo` service declares TWO HTTP service ports (8080 / 9090) whose numeric
+/// targetPorts point at two distinguishable loopback backends. The inbound
+/// materializer emits one per-port loopback sibling for each; the request
+/// path selects by the request's explicit authority port — exactly the
+/// channel a peer sidecar's multi-port egress rewrites into `:authority`.
+fn inbound_multi_port_slice(
+    node_id: &str,
+    server_spiffe: &str,
+    client_spiffe: &str,
+    backend_a_port: u16,
+    backend_b_port: u16,
+) -> MeshSlice {
+    let mut slice =
+        inbound_authz_slice(node_id, server_spiffe, client_spiffe, backend_a_port, true);
+    slice.services[0].ports = vec![
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http-a".to_string()),
+            target_port: Some(ServiceTargetPort::Number(backend_a_port)),
+        },
+        ServicePort {
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("http-b".to_string()),
+            target_port: Some(ServiceTargetPort::Number(backend_b_port)),
+        },
+    ];
+    slice
+}
+
+/// Multi-port INBOUND keystone: a peer's request carrying an explicit
+/// authority port (`Host: echo...:8080` / `:9090`) — what a multi-port-aware
+/// egress sidecar sends — reaches the matching per-port loopback backend,
+/// and a port-less request to the multi-port service fails closed (502)
+/// instead of being guessed onto one port's backend.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_inbound_multi_port_routes_by_authority_port() {
+    ensure_gateway_built().expect("gateway build");
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+    let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-inbound-multiport-{attempt}");
+        let temp = TempDir::new().expect("temp dir");
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let backend_a = start_labeled_echo_backend("backend-a").await;
+        let backend_b = start_labeled_echo_backend("backend-b").await;
+
+        let cp = start_static_mesh_cp(inbound_multi_port_slice(
+            &node_id,
+            server_spiffe,
+            client_spiffe,
+            backend_a,
+            backend_b,
+        ))
+        .await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        if !wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: inbound listener never bound\n{}",
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let get = |host: &'static str| {
+            let ca = peers.ca_pem.clone();
+            let cert = peers.client_cert_pem.clone();
+            let key = peers.client_key_pem.clone();
+            async move {
+                mesh_inbound_http_get(
+                    inbound_port,
+                    &ca,
+                    server_spiffe,
+                    Some((&cert, &key)),
+                    host,
+                    "/",
+                )
+                .await
+            }
+        };
+
+        let port_a = get("echo.ferrum.svc.cluster.local:8080").await;
+        let port_b = get("echo.ferrum.svc.cluster.local:9090").await;
+        let portless = get("echo.ferrum.svc.cluster.local").await;
+        let unmatched = get("echo.ferrum.svc.cluster.local:7777").await;
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        let (status_a, body_a) = port_a.expect("authority :8080 request");
+        assert_eq!(status_a, 200, "authority :8080 must route; {output}");
+        assert!(
+            body_a.contains("backend-a") && !body_a.contains("backend-b"),
+            "authority :8080 must reach port 8080's backend, got: {body_a:?}"
+        );
+        let (status_b, body_b) = port_b.expect("authority :9090 request");
+        assert_eq!(status_b, 200, "authority :9090 must route; {output}");
+        assert!(
+            body_b.contains("backend-b") && !body_b.contains("backend-a"),
+            "authority :9090 must reach port 9090's backend, got: {body_b:?}"
+        );
+        let (status_portless, body_portless) = portless.expect("port-less request");
+        assert_eq!(
+            status_portless, 502,
+            "a port-less request to a multi-port service must fail closed, \
+             never be guessed onto one port's backend; body: {body_portless:?}\n{output}"
+        );
+        let (status_unmatched, body_unmatched) = unmatched.expect("unmatched-port request");
+        assert_eq!(
+            status_unmatched, 502,
+            "an authority port the service does not declare must fail closed; \
+             body: {body_unmatched:?}\n{output}"
+        );
+        return;
+    }
+
+    panic!(
+        "production sidecar never bound its inbound listener after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
+    );
+}
+
 // ── Live OUTBOUND (egress) datapath: point A → point B over the mesh ─────────
 //
 // These are the egress keystones: TWO real gateways on one host. Gateway A
@@ -1975,6 +2166,7 @@ fn egress_service_slice(node_id: &str, b_spiffe: &str, backend_port: u16) -> Mes
             pod_uid: None,
         }],
         services: vec![MeshService {
+            cluster_ips: Vec::new(),
             name: "svc-b".to_string(),
             namespace: "ferrum".to_string(),
             ports: vec![ServicePort {
@@ -2480,9 +2672,8 @@ async fn functional_mesh_outbound_multi_port_without_orig_dst_fails_closed() {
             start_static_mesh_cp(multi_port_egress_slice(&node_id, b_spiffe, backend_port)).await;
         let ports = reserve_mesh_ports().await;
         let outbound_port = ports.outbound;
-        // Ambient: the only topology with per-port multi-port egress today
-        // (Sidecar multi-port stays fail-closed at materialization until the
-        // destination's inbound port disambiguation lands).
+        // Ambient arm; the Sidecar topology has its own variant below (both
+        // materialize per-port egress and demand orig-dst for multi-port).
         let mut child = spawn_mesh_gateway(
             &temp,
             MeshGatewaySpawnOptions {
@@ -2516,6 +2707,75 @@ async fn functional_mesh_outbound_multi_port_without_orig_dst_fails_closed() {
         assert_eq!(
             status, 502,
             "a multi-port service without a captured original destination must fail closed; \
+             body: {body:?}\n{output}"
+        );
+        assert!(
+            !body.contains("backend-ok"),
+            "the request must never reach a port's backend by guessing: {body:?}"
+        );
+        return;
+    }
+
+    panic!(
+        "mesh gateway never bound its outbound listener after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
+    );
+}
+
+/// Sidecar variant of the multi-port orig-dst fail-closed arm: with the
+/// destination-side inbound disambiguation landed, Sidecar multi-port egress
+/// now MATERIALIZES per-port routes — so a direct (orig-dst-less) dial gets
+/// the selection-time 502, not a no-route 404, and is never guessed onto a
+/// port's backend.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_outbound_multi_port_without_orig_dst_fails_closed() {
+    ensure_gateway_built().expect("gateway build");
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-sidecar-origdst-multiport-{attempt}");
+        let temp = TempDir::new().expect("temp dir");
+        let backend_port = start_echo_backend().await;
+        let cp =
+            start_static_mesh_cp(multi_port_egress_slice(&node_id, b_spiffe, backend_port)).await;
+        let ports = reserve_mesh_ports().await;
+        let outbound_port = ports.outbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: Vec::new(),
+            },
+        );
+
+        if !wait_for_tcp_port(outbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: outbound listener never bound\n{}",
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let result = plaintext_http_get(outbound_port, "svc-b.ferrum.svc.cluster.local", "/").await;
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        let (status, body) = result.expect("plaintext GET against the outbound listener");
+        assert_eq!(
+            status, 502,
+            "a Sidecar multi-port service without a captured original destination must fail \
+             closed at selection (the gate lift materializes its per-port routes); \
              body: {body:?}\n{output}"
         );
         assert!(

@@ -2173,6 +2173,7 @@ fn mesh_block_for_uniqueness(
         services: services
             .iter()
             .map(|(namespace, name, ports)| MeshService {
+                cluster_ips: Vec::new(),
                 name: name.to_string(),
                 namespace: namespace.to_string(),
                 ports: ports
@@ -2218,6 +2219,59 @@ fn test_unique_listen_paths_exempts_mesh_outbound_per_port_siblings() {
     assert!(
         config.validate_unique_listen_paths().is_ok(),
         "same-service per-port outbound siblings must not conflict"
+    );
+}
+
+#[test]
+fn test_unique_listen_paths_exempts_mesh_inbound_per_port_siblings() {
+    // Sidecar INBOUND per-port siblings share hosts + `/` exactly like the
+    // outbound ones (disambiguated post-match by inbound orig-dst / the
+    // request authority port) and get the same same-service exemption.
+    let mut config = empty_config();
+    config.mesh = mesh_block_for_uniqueness(&[("default", "reviews", &[80, 9080])]);
+    config.proxies = vec![
+        make_proxy_with_hosts(
+            "__mesh-inbound-default-reviews-80",
+            "/",
+            vec!["reviews.default.svc.cluster.local"],
+        ),
+        make_proxy_with_hosts(
+            "__mesh-inbound-default-reviews-9080",
+            "/",
+            vec!["reviews.default.svc.cluster.local"],
+        ),
+    ];
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "same-service per-port inbound siblings must not conflict"
+    );
+}
+
+#[test]
+fn test_unique_listen_paths_mesh_cross_direction_same_service_still_conflicts() {
+    // The owner key is DIRECTION-DISTINCT: an inbound and an outbound route
+    // of the SAME service must never legitimately coexist (the outbound
+    // materializer yields to existing inbound routes), so their coexistence
+    // is a materializer bug that must keep failing validation.
+    let mut config = empty_config();
+    config.mesh = mesh_block_for_uniqueness(&[("default", "reviews", &[80])]);
+    config.proxies = vec![
+        make_proxy_with_hosts(
+            "__mesh-inbound-default-reviews-80",
+            "/",
+            vec!["reviews.default.svc.cluster.local"],
+        ),
+        make_proxy_with_hosts(
+            "__mesh-outbound-default-reviews-80",
+            "/",
+            vec!["reviews.default.svc.cluster.local"],
+        ),
+    ];
+    let err = config.validate_unique_listen_paths().unwrap_err();
+    assert_eq!(
+        err.len(),
+        1,
+        "an inbound/outbound pair of one service must still conflict"
     );
 }
 

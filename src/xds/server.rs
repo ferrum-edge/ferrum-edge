@@ -1805,6 +1805,7 @@ mod tests {
 
     fn mesh_service(name: &str) -> MeshService {
         MeshService {
+            cluster_ips: Vec::new(),
             name: name.to_string(),
             namespace: "default".to_string(),
             ports: vec![ServicePort {
