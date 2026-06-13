@@ -154,6 +154,21 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     let validator = jsonschema::draft202012::options()
         .build(&schema)
         .expect("PluginConfig schema compiles");
+    let plugin_config =
+        |plugin_name: &str, config: Option<serde_json::Value>| -> serde_json::Value {
+            let mut value = json!({
+                "plugin_name": plugin_name,
+                "scope": "global",
+                "enabled": true
+            });
+            if let Some(config) = config {
+                value
+                    .as_object_mut()
+                    .expect("plugin config should be object")
+                    .insert("config".to_string(), config);
+            }
+            value
+        };
 
     let valid = json!({
         "plugin_name": "ws_message_size_limiting",
@@ -173,6 +188,62 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         validator.validate(&invalid).is_err(),
         "ws_message_size_limiting should require max_frame_bytes through PluginConfig"
     );
+
+    for (plugin_name, config) in [
+        ("udp_rate_limiting", json!({"datagrams_per_second": 100})),
+        (
+            "fault_injection",
+            json!({"abort": {"status_code": 503, "percentage": 5.0}}),
+        ),
+        ("ai_rate_limiter", json!({"token_limit": 100000})),
+        ("ai_request_guard", json!({"max_tokens_limit": 2048})),
+        ("ai_response_guard", json!({"require_json": true})),
+        ("ai_semantic_firewall", json!({"enabled": false})),
+        (
+            "ai_semantic_firewall",
+            json!({
+                "provider": {
+                    "type": "openai_compatible_embeddings",
+                    "endpoint": "https://embeddings.example/v1"
+                }
+            }),
+        ),
+    ] {
+        let value = plugin_config(plugin_name, Some(config));
+        assert!(
+            validator.validate(&value).is_ok(),
+            "{plugin_name} config should be valid: {value}"
+        );
+    }
+
+    for (plugin_name, config) in [
+        ("udp_rate_limiting", None),
+        ("udp_rate_limiting", Some(json!({}))),
+        ("fault_injection", None),
+        ("fault_injection", Some(json!({}))),
+        ("ai_rate_limiter", None),
+        ("ai_rate_limiter", Some(json!({}))),
+        ("ai_rate_limiter", Some(json!({"token_limit": 0}))),
+        ("ai_request_guard", None),
+        ("ai_request_guard", Some(json!({}))),
+        ("ai_request_guard", Some(json!({"allowed_models": []}))),
+        (
+            "ai_request_guard",
+            Some(json!({"require_user_field": false})),
+        ),
+        ("ai_response_guard", None),
+        ("ai_response_guard", Some(json!({}))),
+        ("ai_response_guard", Some(json!({"require_json": false}))),
+        ("ai_response_guard", Some(json!({"blocked_phrases": []}))),
+        ("ai_semantic_firewall", None),
+        ("ai_semantic_firewall", Some(json!({}))),
+    ] {
+        let value = plugin_config(plugin_name, config);
+        assert!(
+            validator.validate(&value).is_err(),
+            "{plugin_name} config should be invalid: {value}"
+        );
+    }
 
     let custom = json!({
         "plugin_name": "custom_observer",

@@ -6539,6 +6539,7 @@ components:
               plugin_name:
                 const: ai_request_guard
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/AiRequestGuardConfig"
@@ -6548,6 +6549,7 @@ components:
               plugin_name:
                 const: ai_rate_limiter
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/AiRateLimiterConfig"
@@ -6566,6 +6568,7 @@ components:
               plugin_name:
                 const: ai_semantic_firewall
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/AiSemanticFirewallConfig"
@@ -6575,6 +6578,7 @@ components:
               plugin_name:
                 const: ai_response_guard
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/AiResponseGuardConfig"
@@ -6650,6 +6654,7 @@ components:
               plugin_name:
                 const: udp_rate_limiting
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/UdpRateLimitingConfig"
@@ -6792,6 +6797,7 @@ components:
               plugin_name:
                 const: fault_injection
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/FaultInjectionConfig"
@@ -6991,12 +6997,14 @@ components:
         datagrams_per_second:
           type: integer
           format: uint64
+          minimum: 1
           description: >-
             Maximum datagrams per `window_seconds`. At least one of
             `datagrams_per_second` or `bytes_per_second` is required.
         bytes_per_second:
           type: integer
           format: uint64
+          minimum: 1
           description: >-
             Maximum bytes per `window_seconds` (sum of datagram payload sizes).
             At least one of `datagrams_per_second` or `bytes_per_second` is
@@ -13414,6 +13422,15 @@ components:
     AiSemanticFirewallConfig:
       type: object
       description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata."
+      allOf:
+        - if:
+            required: [enabled]
+            properties:
+              enabled:
+                const: false
+          then: {}
+          else:
+            required: [provider]
       properties:
         enabled:
           type: boolean
@@ -13826,6 +13843,32 @@ components:
     AiRequestGuardConfig:
       type: object
       description: "Plugin: ai_request_guard — Validates and constrains AI/LLM API requests."
+      anyOf:
+        - required: [max_tokens_limit]
+        - required: [default_max_tokens]
+        - required: [allowed_models]
+          properties:
+            allowed_models:
+              minItems: 1
+        - required: [blocked_models]
+          properties:
+            blocked_models:
+              minItems: 1
+        - required: [require_user_field]
+          properties:
+            require_user_field:
+              const: true
+        - required: [max_messages]
+        - required: [max_prompt_characters]
+        - required: [temperature_range]
+        - required: [block_system_prompts]
+          properties:
+            block_system_prompts:
+              const: true
+        - required: [required_metadata_fields]
+          properties:
+            required_metadata_fields:
+              minItems: 1
       properties:
         max_tokens_limit:
           type: integer
@@ -13882,13 +13925,16 @@ components:
     AiRateLimiterConfig:
       type: object
       description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      required: [token_limit]
       properties:
         token_limit:
           type: integer
+          minimum: 1
           default: 100000
           description: Maximum tokens allowed per window
         window_seconds:
           type: integer
+          minimum: 1
           default: 60
           description: Sliding window duration in seconds
         count_mode:
@@ -13994,6 +14040,35 @@ components:
     AiResponseGuardConfig:
       type: object
       description: "Plugin: ai_response_guard — Validates and filters AI/LLM API responses for PII, blocked content, and structural requirements."
+      anyOf:
+        - required: [pii_patterns]
+          properties:
+            pii_patterns:
+              minItems: 1
+        - required: [custom_pii_patterns]
+          properties:
+            custom_pii_patterns:
+              minItems: 1
+        - required: [blocked_phrases]
+          properties:
+            blocked_phrases:
+              minItems: 1
+        - required: [blocked_patterns]
+          properties:
+            blocked_patterns:
+              minItems: 1
+        - required: [require_json]
+          properties:
+            require_json:
+              const: true
+        - required: [required_fields]
+          properties:
+            required_fields:
+              minItems: 1
+        - required: [max_completion_length]
+          properties:
+            max_completion_length:
+              minimum: 1
       properties:
         action:
           type: string
