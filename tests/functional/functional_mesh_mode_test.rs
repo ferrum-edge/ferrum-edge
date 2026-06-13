@@ -847,8 +847,9 @@ async fn functional_mesh_mode_rejects_egress_gateway_without_mtls_material() {
         "egress_gateway without TLS material should exit non-zero; status={status:?}\n{output}"
     );
     assert!(
-        output
-            .contains("FERRUM_MESH_TOPOLOGY=egress_gateway requires FERRUM_FRONTEND_TLS_CERT_PATH"),
+        output.contains(
+            "FERRUM_MESH_TOPOLOGY=egress_gateway requires a TLS server identity for the egress mTLS listener"
+        ),
         "egress_gateway mTLS validation error missing from output\n{output}"
     );
     assert!(

@@ -1,14 +1,14 @@
 //! SPIFFE-aware rustls server / client configurations.
 //!
-//! Phase A exposes ready-to-use builders that Phase C will wire into mesh
-//! listeners. They consume the `Arc<ArcSwap<Option<SvidBundle>>>` slot
-//! produced by [`crate::identity::workload_api::fetch_loop`] /
+//! These builders back the mesh data-plane mode's dynamic SPIFFE identity:
+//! [`crate::modes::mesh`] wires them into the inbound server cert resolver,
+//! the SPIFFE peer-cert verifier, and the outbound client config for
+//! `FERRUM_MESH_CA_BACKEND`-issued (and file-gateway) SVIDs. They consume the
+//! `Arc<ArcSwap<Option<SvidBundle>>>` slot produced by
+//! [`crate::identity::workload_api::fetch_loop`] /
 //! [`crate::identity::rotation`] so cert rotation is lock-free and atomic
 //! from the rustls resolver's perspective — no listener restart, no per-
 //! request cloning of the bundle.
-//!
-//! The builders are deliberately additive: nothing in the codebase calls
-//! them yet. Phase C plugs them into the mesh data-plane mode.
 //!
 //! ## Verifier semantics
 //!
