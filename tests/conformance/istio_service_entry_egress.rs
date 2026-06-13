@@ -73,6 +73,7 @@ fn egress_runtime() -> MeshRuntimeConfig {
         workload_svid_cert_path: None,
         workload_svid_key_path: None,
         workload_svid_trust_bundle_path: None,
+        ca_backend: ferrum_edge::identity::ca::CaBackend::None,
         xds_node_cluster: "default".to_string(),
         xds_stream_channel_capacity: 32,
         xds_primary_retry_secs: 300,

@@ -46,6 +46,7 @@ fn test_runtime() -> MeshRuntimeConfig {
         workload_svid_cert_path: None,
         workload_svid_key_path: None,
         workload_svid_trust_bundle_path: None,
+        ca_backend: ferrum_edge::identity::ca::CaBackend::None,
         dns_enabled: false,
         dns_listen_addr: test_addr("127.0.0.1:15053"),
         dns_upstream_addr: test_addr("127.0.0.53:53"),

@@ -294,6 +294,9 @@ pub struct MeshRuntimeConfig {
     /// `ISTIO_MUTUAL` is projected onto an upstream.
     /// Sourced from `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH`.
     pub workload_svid_trust_bundle_path: Option<String>,
+    /// Automatic mesh CA backend used to populate the runtime SVID slot when
+    /// file-based `FERRUM_GATEWAY_SVID_*` material is absent.
+    pub ca_backend: CaBackend,
     /// Whether the transparent DNS proxy is enabled. Opt-in because it
     /// requires iptables/eBPF redirect to be useful.
     /// Sourced from `FERRUM_MESH_DNS_PROXY_ENABLED` (default false).
@@ -438,6 +441,8 @@ impl MeshRuntimeConfig {
         let workload_svid_cert_path = env_config.gateway_svid_cert_path.clone();
         let workload_svid_key_path = env_config.gateway_svid_key_path.clone();
         let workload_svid_trust_bundle_path = env_config.gateway_svid_trust_bundle_path.clone();
+        let ca_backend = CaBackend::from_str_lossy(&env_config.mesh_ca_backend)
+            .map_err(|error| format!("Invalid FERRUM_MESH_CA_BACKEND: {error}"))?;
         let xds_node_cluster = resolve_ferrum_var("FERRUM_MESH_XDS_NODE_CLUSTER")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| env_config.namespace.clone());
@@ -569,6 +574,7 @@ impl MeshRuntimeConfig {
             workload_svid_cert_path,
             workload_svid_key_path,
             workload_svid_trust_bundle_path,
+            ca_backend,
             dns_enabled,
             dns_listen_addr,
             dns_upstream_addr,
@@ -3519,7 +3525,8 @@ fn apply_traffic_policy_tls_to_upstream(
 ///   and private key from the DR.
 /// - `IstioMutual`: enable server-cert verification; project the workload's
 ///   X.509-SVID cert/key paths and trust bundle from the mesh runtime onto the
-///   slot.
+///   slot, or accept a CA-backed runtime SVID source whose material is supplied
+///   through the shared gateway SVID slot.
 ///
 /// `insecure_skip_verify=true` always wins: it forces
 /// `verify_server_cert=false` regardless of mode.
@@ -3557,24 +3564,40 @@ fn apply_traffic_policy_tls_to_backend_config(
             slot.server_ca_cert_path = tls.ca_certificates.clone();
         }
         MtlsMode::IstioMutual => {
-            let (Some(cert_path), Some(key_path)) = (
+            match (
                 runtime.workload_svid_cert_path.clone(),
                 runtime.workload_svid_key_path.clone(),
-            ) else {
-                return Err(anyhow::anyhow!(
-                    "DestinationRule ISTIO_MUTUAL for '{}' requires FERRUM_GATEWAY_SVID_CERT_PATH and FERRUM_GATEWAY_SVID_KEY_PATH",
-                    identity
-                ));
-            };
-            slot.server_ca_cert_path = runtime.workload_svid_trust_bundle_path.clone();
-            if runtime.workload_svid_trust_bundle_path.is_none() {
-                warn!(
-                    identity = %identity,
-                    "DestinationRule ISTIO_MUTUAL requested but workload SVID trust bundle path is not configured; clearing any stale CA and falling back to global/default trust"
-                );
+            ) {
+                (Some(cert_path), Some(key_path)) => {
+                    slot.server_ca_cert_path = runtime.workload_svid_trust_bundle_path.clone();
+                    if runtime.workload_svid_trust_bundle_path.is_none() {
+                        warn!(
+                            identity = %identity,
+                            "DestinationRule ISTIO_MUTUAL requested but workload SVID trust bundle path is not configured; clearing any stale CA and falling back to global/default trust"
+                        );
+                    }
+                    slot.client_cert_path = Some(cert_path);
+                    slot.client_key_path = Some(key_path);
+                }
+                _ if runtime.ca_backend != CaBackend::None => {
+                    slot.server_ca_cert_path = runtime.workload_svid_trust_bundle_path.clone();
+                    slot.client_cert_path = None;
+                    slot.client_key_path = None;
+                    if runtime.workload_svid_trust_bundle_path.is_none() {
+                        warn!(
+                            identity = %identity,
+                            ca_backend = %runtime.ca_backend,
+                            "DestinationRule ISTIO_MUTUAL uses the mesh CA-backed runtime SVID source; backend SVID trust must come from the shared gateway SVID slot"
+                        );
+                    }
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "DestinationRule ISTIO_MUTUAL for '{}' requires FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH or FERRUM_MESH_CA_BACKEND",
+                        identity
+                    ));
+                }
             }
-            slot.client_cert_path = Some(cert_path);
-            slot.client_key_path = Some(key_path);
         }
         // PeerAuthentication-side modes are rejected at translate time;
         // an in-memory slice that still carries one is a programming
@@ -5553,12 +5576,15 @@ async fn serve_mesh_runtime(
     if mesh_ca_svid_slot.is_some()
         && let Some(slice) = initial_applied_mesh_slice.as_deref()
     {
-        publish_staged_spiffe_bundle(stage_gateway_runtime_spiffe_bundle(
+        publish_staged_spiffe_bundle(
             &proxy_state,
-            mesh_ca_svid_slot.as_ref(),
-            mesh_ca_trust_overlay_slot.as_ref(),
-            slice,
-        ));
+            stage_gateway_runtime_spiffe_bundle(
+                &proxy_state,
+                mesh_ca_svid_slot.as_ref(),
+                mesh_ca_trust_overlay_slot.as_ref(),
+                slice,
+            ),
+        );
     }
     let frontend_tls = load_mesh_frontend_tls(
         &env_config,
@@ -6244,6 +6270,7 @@ async fn start_mesh_ca_backend_svid_source(
                 inbound_slot,
                 trust_overlay_slot,
                 mesh_background_handles,
+                shutdown_rx,
             )
             .await?;
             Ok(Some(slot))
@@ -6272,6 +6299,7 @@ async fn start_spire_agent_mesh_svid_source(
     inbound_slot: tls::SharedBundleSlot,
     trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mesh_background_handles: &mut Vec<JoinHandle<()>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<tls::SharedBundleSlot, anyhow::Error> {
     let handle = crate::identity::workload_api::SvidFetchHandle::from_slot(
         proxy_state.gateway_svid_bundle.clone(),
@@ -6326,7 +6354,34 @@ async fn start_spire_agent_mesh_svid_source(
         trust_domain = %bundle.trust_domain(),
         "Mesh CA backend loaded runtime SVID from SPIRE Workload API"
     );
-    mesh_background_handles.push(join);
+    let mut join = join;
+    mesh_background_handles.push(tokio::spawn(async move {
+        tokio::select! {
+            result = &mut join => {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    warn!(
+                        error = %error,
+                        "SPIRE Workload API SVID fetch task exited unexpectedly"
+                    );
+                }
+            }
+            _ = wait_for_mesh_shutdown(&mut shutdown_rx) => {
+                join.abort();
+                match join.await {
+                    Ok(()) => {}
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "SPIRE Workload API SVID fetch task failed while stopping"
+                        );
+                    }
+                }
+            }
+        }
+    }));
     Ok(inbound_slot)
 }
 
@@ -6504,8 +6559,9 @@ fn publish_runtime_svid_to_inbound_slot(
     mut bundle: crate::identity::SvidBundle,
 ) {
     let trust_overlay = trust_overlay_slot.load_full();
-    if let Some(overlay) = trust_overlay.as_ref() {
-        merge_trust_overlay_into_svid_bundle(&mut bundle, overlay);
+    match trust_overlay.as_ref() {
+        Some(overlay) => merge_trust_overlay_into_svid_bundle(&mut bundle, overlay),
+        None => retain_svid_local_trust_only(&mut bundle),
     }
     inbound_slot.store(Arc::new(Some(bundle)));
 }
@@ -6610,7 +6666,8 @@ fn build_mesh_inbound_spiffe_slot(
 /// Overlay the slice's federated (and any extra local) trust bundles onto the
 /// gateway SVID bundle so the inbound SPIFFE verifier accepts peers from
 /// federated trust domains. The SVID's own local bundle (its trust domain's
-/// roots) is preserved; federated entries from the slice are added.
+/// roots) is preserved; federated entries from the slice replace any raw
+/// federated entries already present on the SVID bundle.
 ///
 /// F3 (documented design choice): the CP-pushed slice is the SOLE authority for
 /// inbound trust domains. Unlike the backend/outbound path
@@ -6624,6 +6681,7 @@ fn merge_slice_federation_into_svid_bundle(
     bundle: &mut crate::identity::SvidBundle,
     slice: Option<&MeshSlice>,
 ) {
+    retain_svid_local_trust_only(bundle);
     let Some(slice) = slice else {
         return;
     };
@@ -6644,13 +6702,20 @@ fn merge_slice_federation_into_svid_bundle(
     merge_trust_overlay_into_svid_bundle(bundle, &runtime);
 }
 
+fn retain_svid_local_trust_only(bundle: &mut crate::identity::SvidBundle) {
+    bundle.trust_bundles.federated.clear();
+}
+
 fn merge_trust_overlay_into_svid_bundle(
     bundle: &mut crate::identity::SvidBundle,
     runtime: &crate::identity::TrustBundleSet,
 ) {
-    // Add federated bundles from the slice. The local bundle stays anchored to
-    // the gateway SVID's own trust domain (we do not let the slice override the
-    // local roots the SVID itself chains to).
+    // CP-pushed slice trust is authoritative for inbound federation. Drop raw
+    // federated bundles from the SVID source before adding accepted slice
+    // bundles. The local bundle stays anchored to the gateway SVID's own trust
+    // domain (we do not let the slice override the local roots the SVID itself
+    // chains to).
+    retain_svid_local_trust_only(bundle);
     for (trust_domain, federated) in &runtime.federated {
         bundle
             .trust_bundles
@@ -6734,25 +6799,18 @@ fn stage_gateway_runtime_spiffe_bundle(
     };
 
     let snapshot = proxy_state.gateway_file_svid_bundle.load_full();
-    let mut bundle = match snapshot.as_ref().clone() {
-        Some(bundle) => bundle,
-        None => {
-            warn!(
-                mesh_slice_version = %slice.version,
-                "Unable to stage mesh inbound SPIFFE trust overlay because no runtime SVID \
-                 bundle is loaded; keeping previous trust bundles"
-            );
-            return None;
-        }
-    };
-    if let Some(overlay) = trust_overlay.as_ref() {
-        merge_trust_overlay_into_svid_bundle(&mut bundle, overlay);
+    if snapshot.as_ref().is_none() {
+        warn!(
+            mesh_slice_version = %slice.version,
+            "Unable to stage mesh inbound SPIFFE trust overlay because no runtime SVID \
+             bundle is loaded; keeping previous trust bundles"
+        );
+        return None;
     }
     Some(StagedSpiffeBundle::RuntimeSlot {
         slot: slot.clone(),
         trust_overlay_slot: runtime_trust_overlay_slot.clone(),
         trust_overlay,
-        bundle: Arc::new(Some(bundle)),
     })
 }
 
@@ -7337,12 +7395,13 @@ enum StagedSpiffeBundle {
         bundle: Arc<Option<crate::identity::SvidBundle>>,
     },
     /// CA-backed SVID path: update the dedicated runtime inbound verifier slot
-    /// from the latest raw SVID plus the accepted slice trust overlay.
+    /// from the latest raw SVID plus the accepted slice trust overlay. The
+    /// SVID itself is intentionally not captured at staging time because a CA
+    /// rotation can complete while the candidate slice is still being planned.
     RuntimeSlot {
         slot: tls::SharedBundleSlot,
         trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
         trust_overlay: Option<crate::identity::TrustBundleSet>,
-        bundle: Arc<Option<crate::identity::SvidBundle>>,
     },
 }
 
@@ -7486,7 +7545,7 @@ async fn apply_mesh_inbound_tls_reload(
             // Listener TLS config is unchanged, but a federated trust-domain
             // change may still need publishing. Now that the proxy config was
             // accepted, store the staged SPIFFE bundle into the live slot.
-            publish_staged_spiffe_bundle(staged_spiffe);
+            publish_staged_spiffe_bundle(proxy_state, staged_spiffe);
         }
         MeshInboundTlsReloadPlan::Swap {
             snapshot,
@@ -7498,7 +7557,7 @@ async fn apply_mesh_inbound_tls_reload(
             // a rejected slice never alters inbound trust. The verifier reads
             // the slot live; the new TLS config's verifier will observe the new
             // bundle on its next handshake.
-            publish_staged_spiffe_bundle(staged_spiffe);
+            publish_staged_spiffe_bundle(proxy_state, staged_spiffe);
             proxy_state
                 .mesh_inbound_tls
                 .store(Arc::new(tls_config.clone()));
@@ -7669,7 +7728,7 @@ fn start_remote_cluster_discovery_reconcile_task(
 /// trusts (or stops trusting) peer domains for a slice the runtime rejected.
 /// The verifier holds an `Arc` to this slot and observes the new bundle on its
 /// next handshake.
-fn publish_staged_spiffe_bundle(staged: Option<StagedSpiffeBundle>) {
+fn publish_staged_spiffe_bundle(proxy_state: &ProxyState, staged: Option<StagedSpiffeBundle>) {
     match staged {
         Some(StagedSpiffeBundle::DirectSlot { slot, bundle }) => {
             slot.store(bundle);
@@ -7678,10 +7737,20 @@ fn publish_staged_spiffe_bundle(staged: Option<StagedSpiffeBundle>) {
             slot,
             trust_overlay_slot,
             trust_overlay,
-            bundle,
         }) => {
             trust_overlay_slot.store(Arc::new(trust_overlay));
-            slot.store(bundle);
+            let snapshot = proxy_state.gateway_file_svid_bundle.load_full();
+            match snapshot.as_ref().clone() {
+                Some(bundle) => {
+                    publish_runtime_svid_to_inbound_slot(&slot, &trust_overlay_slot, bundle);
+                }
+                None => {
+                    warn!(
+                        "Unable to publish mesh inbound SPIFFE trust overlay because no runtime \
+                         SVID bundle is loaded; keeping previous trust bundles"
+                    );
+                }
+            }
         }
         None => {}
     }
@@ -8810,6 +8879,7 @@ mod tests {
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
             workload_svid_trust_bundle_path: None,
+            ca_backend: CaBackend::None,
             dns_enabled: false,
             dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
             dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
@@ -8915,6 +8985,7 @@ mod tests {
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
             workload_svid_trust_bundle_path: None,
+            ca_backend: CaBackend::None,
             dns_enabled: false,
             dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
             dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
@@ -11799,6 +11870,38 @@ mod tests {
                 .contains("requires FERRUM_GATEWAY_SVID_CERT_PATH"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn dr_tls_istio_mutual_accepts_ca_backed_runtime_svid_source() {
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
+        upstream.backend_tls_client_key_path = Some("/existing/client.key".to_string());
+        upstream.backend_tls_server_ca_cert_path = Some("/stale/ca.pem".to_string());
+        upstream.backend_tls_verify_server_cert = false;
+        let runtime = MeshRuntimeConfig {
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            workload_svid_trust_bundle_path: None,
+            ca_backend: CaBackend::Internal,
+            ..test_mesh_runtime_config()
+        };
+
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::IstioMutual,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime)
+            .expect("CA-backed runtime SVID source satisfies ISTIO_MUTUAL");
+
+        assert!(upstream.backend_tls_verify_server_cert);
+        assert!(upstream.backend_tls_client_cert_path.is_none());
+        assert!(upstream.backend_tls_client_key_path.is_none());
+        assert!(upstream.backend_tls_server_ca_cert_path.is_none());
     }
 
     #[test]
@@ -15702,14 +15805,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn staged_spiffe_bundle_publishes_only_on_apply() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn staged_spiffe_bundle_publishes_only_on_apply() {
         // F4: a rebuilt inbound SPIFFE trust-bundle must NOT reach the live slot
         // until the slice is accepted. `publish_staged_spiffe_bundle` is the
         // post-accept publish step; until it runs the live slot keeps its
         // previous value, and `None` (rejected/no-slot) leaves it untouched.
         use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
 
+        let state = make_test_proxy_state(GatewayConfig::default());
         let td = TrustDomain::new("td.stage-test").unwrap();
         let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
         let original = Arc::new(Some(SvidBundle {
@@ -15726,7 +15830,7 @@ mod tests {
         let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(original.clone()));
 
         // A `None` staged bundle (rejected slice or no SVID slot) is a no-op.
-        publish_staged_spiffe_bundle(None);
+        publish_staged_spiffe_bundle(&state, None);
         assert!(
             Arc::ptr_eq(&slot.load_full(), &original),
             "publishing None must leave the live slot untouched"
@@ -15755,7 +15859,7 @@ mod tests {
         );
 
         // Publishing (post-accept) swaps the slot to the staged bundle.
-        publish_staged_spiffe_bundle(staged);
+        publish_staged_spiffe_bundle(&state, staged);
         assert!(
             Arc::ptr_eq(&slot.load_full(), &replacement),
             "publish must store the staged bundle into the live slot"
@@ -15771,18 +15875,30 @@ mod tests {
         let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
         let overlay_slot = empty_mesh_inbound_trust_overlay_slot();
         let td = TrustDomain::new("td.runtime").unwrap();
+        let stale_td = TrustDomain::new("stale.runtime").unwrap();
         let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
 
         let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
             spiffe_id: id.clone(),
             cert_chain_der: vec![vec![1, 2, 3]],
             private_key_pkcs8_der: Vec::new(),
-            trust_bundles: TrustBundleSet::local_only(TrustBundle {
-                trust_domain: td.clone(),
-                x509_authorities: local_roots,
-                jwt_authorities: Vec::new(),
-                refresh_hint_seconds: None,
-            }),
+            trust_bundles: TrustBundleSet {
+                local: TrustBundle {
+                    trust_domain: td.clone(),
+                    x509_authorities: local_roots,
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: HashMap::from([(
+                    stale_td.clone(),
+                    TrustBundle {
+                        trust_domain: stale_td.clone(),
+                        x509_authorities: vec![vec![42]],
+                        jwt_authorities: Vec::new(),
+                        refresh_hint_seconds: None,
+                    },
+                )]),
+            },
         };
 
         state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
@@ -15812,7 +15928,6 @@ mod tests {
             Some(&overlay_slot),
             &slice,
         );
-        publish_staged_spiffe_bundle(staged);
 
         state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![9]]));
         publish_runtime_svid_to_inbound_slot(
@@ -15820,6 +15935,7 @@ mod tests {
             &overlay_slot,
             svid_bundle(vec![vec![9]]),
         );
+        publish_staged_spiffe_bundle(&state, staged);
 
         let active = inbound_slot.load_full();
         let bundle = active.as_ref().as_ref().expect("inbound bundle");
@@ -15834,6 +15950,10 @@ mod tests {
                 .federated
                 .contains_key(&TrustDomain::new("partner.runtime").unwrap()),
             "accepted slice federation should remain overlaid after rotation"
+        );
+        assert!(
+            !bundle.trust_bundles.federated.contains_key(&stale_td),
+            "raw SPIRE federated roots must not remain in the inbound verifier"
         );
     }
 
