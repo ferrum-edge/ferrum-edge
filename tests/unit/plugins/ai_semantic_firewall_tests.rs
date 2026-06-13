@@ -128,13 +128,18 @@ async fn plugin_name_priority_protocols_and_registration() {
         .unwrap()
         .unwrap();
     assert_eq!(created.name(), "ai_semantic_firewall");
-    let alias = create_plugin("semantic_ai_firewall", &config)
-        .unwrap()
-        .unwrap();
-    assert_eq!(alias.name(), "ai_semantic_firewall");
+    assert!(
+        create_plugin("semantic_ai_firewall", &config)
+            .unwrap()
+            .is_none()
+    );
     assert!(ferrum_edge::plugins::available_plugins().contains(&"ai_semantic_firewall"));
+    assert!(!ferrum_edge::plugins::available_plugins().contains(&"semantic_ai_firewall"));
     assert!(ferrum_edge::plugins::is_security_plugin(
         "ai_semantic_firewall"
+    ));
+    assert!(!ferrum_edge::plugins::is_security_plugin(
+        "semantic_ai_firewall"
     ));
 }
 

@@ -24,11 +24,11 @@ Host normalization strips a valid port suffix, preserves bracketed IPv6 literals
 Before any route table scanning, the router checks two bounded caches keyed by `(host, path)`:
 
 1. **Prefix cache** — stores prefix route matches and negative (no-match) entries
-2. **Regex cache** — stores regex route matches (separate partition)
+2. **Regex/exact cache** — stores regex, exact-path, and path-param route matches (separate partition)
 
 If either cache contains an entry for the `(host, path)` pair, the result is returned immediately. This makes repeated requests O(1) regardless of how the match was originally computed.
 
-When no regex routes are configured, the regex cache check is skipped entirely via a pre-computed `has_regex_routes` flag.
+When no regex routes are configured, the route-table regex scan is skipped entirely via a pre-computed `has_regex_routes` flag. The regex/exact cache partition is still checked on cache lookup because exact-path positives are stored there too.
 
 ### Step 2: Route Table Scan (cache miss)
 
@@ -187,7 +187,7 @@ proxies:
 ### Pattern Rules
 
 - The `~` prefix signals regex mode (it is not part of the pattern)
-- Patterns are **auto-anchored for full-path matching**: `^` is prepended and `$` is appended if not already present. This means the pattern must match the **entire** request path, not just a prefix — preventing ambiguous overlaps between regex routes
+- Patterns are **auto-anchored for full-path matching**: the operator pattern is wrapped in a non-capturing group and matched as `^(?:pattern)$`. This means the pattern must match the **entire** request path, not just a prefix — preventing ambiguous overlaps between regex routes while preserving top-level alternation such as `/api|/admin`
 - To allow sub-path matching (prefix-style regex), end your pattern with `.*` (e.g., `~/api/v[0-9]+/.*`)
 - Patterns are **pre-compiled** at config load time using the Rust `regex` crate — invalid patterns are caught during config validation, not at request time
 - Named capture groups use `(?P<name>pattern)` syntax
@@ -196,7 +196,7 @@ proxies:
 
 Named captures are extracted on match and forwarded to backends and plugins:
 
-- **Request headers**: `X-Path-Param-{name}: value` (e.g., `X-Path-Param-User-Id: 42`)
+- **Request headers**: `x-path-param-{name}: value` (e.g., `x-path-param-user_id: 42`). Header names are case-insensitive, and the capture name is preserved verbatim after the prefix
 - **Plugin context**: `ctx.metadata["path_param.user_id"]`
 
 ### Path Stripping with Regex Routes
@@ -209,7 +209,7 @@ When `strip_listen_path: true`, the **matched portion** of the path is stripped 
 | `/users/42/orders/pending` | `/users/[^/]+/orders` | **No** (blocked by `$`) | — |
 | `/users/42/orders/pending` | `/users/[^/]+/orders(/.*)?` | Yes | `/` |
 
-To match a prefix and forward sub-paths, use an optional trailing group:
+To match a prefix-shaped route and strip the full dynamic match, use an optional trailing group:
 
 ```yaml
 listen_path: "~/users/[^/]+/orders(/.*)?"
@@ -218,6 +218,8 @@ backend_path: "/internal"
 # /users/42/orders → backend receives /internal/
 # /users/42/orders/pending → backend receives /internal/
 ```
+
+Because regex routes strip the whole matched range, the example above does not preserve `/pending` for the backend. If the backend needs the dynamic suffix, set `strip_listen_path: false` and let the backend consume the full request path, or model the suffix as separate routes.
 
 For exact-path proxying (the default with full-path anchoring):
 
@@ -236,21 +238,22 @@ The router uses **two separate DashMap cache partitions**:
 | Cache | Contents | Purpose |
 |-------|----------|---------|
 | **Prefix cache** | Prefix matches + negative (no-match) entries | Protect high-hit prefix entries from eviction |
-| **Regex cache** | Regex matches only | Isolate high-cardinality regex paths (e.g., `/users/{uuid}/...`) |
+| **Regex/exact cache** | Regex matches, exact-path matches, and regex path-param matches | Isolate high-cardinality regex paths (e.g., `/users/{uuid}/...`) |
 
 This separation prevents regex routes with highly variable path segments (UUIDs, timestamps) from filling the cache and evicting frequently-hit prefix route entries.
 
-Both caches are bounded (default 10,000 entries each) with ~25% random-sample eviction when full. Cache entries are invalidated surgically on config changes — only affected paths are evicted, preserving the hot 99% of cache entries.
+Both caches are bounded by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default `0`, auto-resolved to at least 10,000 entries) and use frequency-aware sample eviction when a partition reaches the threshold. Config changes rebuild the route table atomically and clear lookup caches, so stale route matches are never reused across route generations.
 
 ## Performance Characteristics
 
 | Scenario | Cost |
 |----------|------|
 | Cache hit (any route type) | O(1) DashMap lookup |
-| Prefix-only deployment (no regex routes) | Zero regex overhead (`has_regex_routes` flag skips all regex code) |
-| Cache miss, prefix match found | O(prefix routes in tier) — early exit on first match |
-| Cache miss, regex match found | O(prefix routes) + O(regex routes) — result cached for future O(1) |
+| Prefix-only deployment (no regex routes) | Regex route-table scan is skipped by `has_regex_routes` |
+| Cache miss, exact path match found | O(1) HashMap lookup within the matched host tier |
+| Cache miss, prefix match found | O(path depth) segment-boundary HashMap walk within the matched host tier |
+| Cache miss, regex match found | Prefix/exact checks plus one `RegexSet` pass for the matched host tier; captures run only for the winning regex |
 | Cache miss, no match (404) | O(all routes in all tiers) — negative entry cached for future O(1) |
-| Config reload | Route table rebuilt atomically via ArcSwap; caches surgically invalidated |
+| Config reload | Route table rebuilt atomically via ArcSwap; lookup caches cleared |
 
 All route table operations (sorting, regex compilation, host partitioning) happen at config load time, never on the request hot path. The request path uses only lock-free reads (`ArcSwap::load()`, `DashMap::get()`).

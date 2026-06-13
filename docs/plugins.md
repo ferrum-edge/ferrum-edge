@@ -4208,6 +4208,36 @@ config:
 
 ---
 
+## Mesh and Alert Plugins
+
+These plugins are registered built-ins even when they are most often generated or auto-injected by mesh mode.
+
+### `mesh_route_dispatch`
+
+Applies per-request route overrides generated from mesh/Istio routing resources. It runs in `before_proxy` after authentication and admission plugins, so policy evaluates the original public proxy identity before the backend override is applied. For WebSockets, the override selects the upgrade backend only; individual frames are not re-routed.
+
+See [Mesh VirtualService translation](mesh.md#virtualservice-translation) and [plugin execution order](plugin_execution_order.md#why-this-order-matters) for route-collapse, fault, rewrite, redirect, and HBONE behavior.
+
+### `proxy_alerts`
+
+Evaluates in-gateway anomaly rules over completed HTTP, stream, and WebSocket transactions, then sends notifications through configured channels. It is a normal operator-configurable plugin.
+
+See [Proxy Alerts](proxy_alerts.md) for rule types, channel configuration, templates, and tuning guidance.
+
+### `workload_metrics`
+
+Adds Istio/GAMMA workload identity labels to request, stream, and log metadata, and can emit mesh telemetry spans when mesh Telemetry providers are configured. Mesh mode auto-injects this plugin when workload metrics are needed, but standalone use is supported for non-mesh gateway deployments that want the same identity labels.
+
+See [Mesh Observability](mesh.md#observability) for metric names, service graph aggregation, and tracing behavior.
+
+### `__mesh_bpf_metrics`
+
+Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`.
+
+See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for emitted counters and the node-agent/process split.
+
+---
+
 ## Custom Plugins
 
 Ferrum supports drop-in custom plugins. Create a `.rs` file in the `custom_plugins/` directory, export a `create_plugin()` factory function, and rebuild — the build script auto-discovers and registers it.

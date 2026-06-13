@@ -239,46 +239,46 @@ fn test_hosts_overlap_wildcard_does_not_match_multi_level() {
 
 #[test]
 fn test_anchor_regex_pattern_empty_string() {
-    assert_eq!(anchor_regex_pattern(""), "^$");
+    assert_eq!(anchor_regex_pattern(""), "^(?:)$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_special_regex_chars() {
-    // Pattern with groups, quantifiers, alternation — should be wrapped, not altered
+    // Pattern with groups, quantifiers, alternation should be grouped, not altered.
     assert_eq!(
         anchor_regex_pattern("/api/(v1|v2)/users"),
-        "^/api/(v1|v2)/users$"
+        "^(?:/api/(v1|v2)/users)$"
     );
 }
 
 #[test]
 fn test_anchor_regex_pattern_dot_star_at_end() {
     // Operators use .* to opt out of strict end-anchoring
-    assert_eq!(anchor_regex_pattern("/api/.*"), "^/api/.*$");
+    assert_eq!(anchor_regex_pattern("/api/.*"), "^(?:/api/.*)$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_only_caret() {
     // Pattern that starts with ^ but doesn't end with $
-    assert_eq!(anchor_regex_pattern("^/foo"), "^/foo$");
+    assert_eq!(anchor_regex_pattern("^/foo"), "^(?:/foo)$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_only_dollar() {
     // Pattern that ends with $ but doesn't start with ^
-    assert_eq!(anchor_regex_pattern("/foo$"), "^/foo$");
+    assert_eq!(anchor_regex_pattern("/foo$"), "^(?:/foo)$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_dollar_inside_not_at_end() {
     // A $ in a character class is NOT an end anchor
-    assert_eq!(anchor_regex_pattern("/price/[$]"), "^/price/[$]$");
+    assert_eq!(anchor_regex_pattern("/price/[$]"), "^(?:/price/[$])$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_caret_inside_not_at_start() {
     // A ^ that isn't the first character is NOT a start anchor
-    assert_eq!(anchor_regex_pattern("/path/[^a]"), "^/path/[^a]$");
+    assert_eq!(anchor_regex_pattern("/path/[^a]"), "^(?:/path/[^a])$");
 }
 
 // ===========================================================================

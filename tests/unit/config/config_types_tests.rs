@@ -2495,28 +2495,35 @@ fn test_exact_listen_path_rejects_empty_path() {
 fn test_anchor_regex_pattern_adds_both_anchors() {
     use ferrum_edge::config::types::anchor_regex_pattern;
 
-    assert_eq!(anchor_regex_pattern("/users/[^/]+"), "^/users/[^/]+$");
+    assert_eq!(anchor_regex_pattern("/users/[^/]+"), "^(?:/users/[^/]+)$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_preserves_existing_start() {
     use ferrum_edge::config::types::anchor_regex_pattern;
 
-    assert_eq!(anchor_regex_pattern("^/users/[^/]+"), "^/users/[^/]+$");
+    assert_eq!(anchor_regex_pattern("^/users/[^/]+"), "^(?:/users/[^/]+)$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_preserves_existing_end() {
     use ferrum_edge::config::types::anchor_regex_pattern;
 
-    assert_eq!(anchor_regex_pattern("/users/[^/]+$"), "^/users/[^/]+$");
+    assert_eq!(anchor_regex_pattern("/users/[^/]+$"), "^(?:/users/[^/]+)$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_preserves_both_existing() {
     use ferrum_edge::config::types::anchor_regex_pattern;
 
-    assert_eq!(anchor_regex_pattern("^/users/[^/]+$"), "^/users/[^/]+$");
+    assert_eq!(anchor_regex_pattern("^/users/[^/]+$"), "^(?:/users/[^/]+)$");
+}
+
+#[test]
+fn test_anchor_regex_pattern_groups_top_level_alternation() {
+    use ferrum_edge::config::types::anchor_regex_pattern;
+
+    assert_eq!(anchor_regex_pattern("/api|/admin"), "^(?:/api|/admin)$");
 }
 
 #[test]
@@ -2526,7 +2533,7 @@ fn test_anchor_regex_pattern_wildcard_suffix_preserved() {
     // Operators use .* to opt out of strict end-anchoring
     assert_eq!(
         anchor_regex_pattern("/users/[^/]+/orders.*"),
-        "^/users/[^/]+/orders.*$"
+        "^(?:/users/[^/]+/orders.*)$"
     );
 }
 

@@ -1960,20 +1960,19 @@ pub fn validate_namespace(ns: &str) -> Result<(), String> {
 
 /// Auto-anchor a regex listen_path pattern for full-path matching.
 ///
-/// Prepends `^` if not already present and appends `$` if not already present,
-/// ensuring the pattern must match the entire request path rather than just a
-/// prefix. Operators who need prefix-style matching can end their pattern with
-/// `.*` to opt out of the end anchor.
+/// Wraps the operator pattern in a non-capturing group and anchors the group,
+/// ensuring alternation and other top-level regex operators still apply to the
+/// full request path. Operators who need prefix-style matching can end their
+/// pattern with `.*` to opt out of strict suffix matching.
 pub fn anchor_regex_pattern(pattern: &str) -> String {
-    let mut anchored = if pattern.starts_with('^') {
-        pattern.to_string()
-    } else {
-        format!("^{}", pattern)
-    };
-    if !anchored.ends_with('$') {
-        anchored.push('$');
+    let mut core = pattern;
+    if let Some(stripped) = core.strip_prefix('^') {
+        core = stripped;
     }
-    anchored
+    if let Some(stripped) = core.strip_suffix('$') {
+        core = stripped;
+    }
+    format!("^(?:{})$", core)
 }
 
 /// Detects single-encoded (`%2F`/`%2f`) or double-encoded (`%252F`/`%252f`)

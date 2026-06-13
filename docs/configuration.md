@@ -614,7 +614,7 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_ROUTER_CACHE_MAX_ENTRIES` | No | `0` | Router prefix/negative lookup cache size. `0` auto-scales as `max(10000, proxies × 3)` |
+| `FERRUM_ROUTER_CACHE_MAX_ENTRIES` | No | `0` | Router lookup cache threshold per partition. The prefix partition stores prefix and negative matches; the regex/exact partition stores regex, exact-path, and path-param matches. `0` auto-scales as `max(10000, proxies × 3)` |
 
 ### Overload Management
 

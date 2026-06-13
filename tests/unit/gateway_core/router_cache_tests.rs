@@ -1168,6 +1168,21 @@ fn test_regex_auto_anchor() {
 }
 
 #[test]
+fn test_regex_auto_anchor_groups_top_level_alternation() {
+    let config = test_config(vec![test_regex_proxy("alts", r"/api|/admin")]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(None, "/api");
+    assert_eq!(matched.unwrap().proxy.id, "alts");
+
+    let matched = cache.find_proxy(None, "/admin");
+    assert_eq!(matched.unwrap().proxy.id, "alts");
+
+    assert!(cache.find_proxy(None, "/api/v1").is_none());
+    assert!(cache.find_proxy(None, "/foo/admin").is_none());
+}
+
+#[test]
 fn test_regex_with_host_routing() {
     // Regex routes work with host-based routing tiers
     let mut regex_proxy = test_regex_proxy("user-api", r"/users/[^/]+");

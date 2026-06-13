@@ -6065,6 +6065,709 @@ components:
         updated_at:
           type: [string, "null"]
           format: date-time
+      allOf:
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: transaction_log_schema
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/TransactionLogSchemaConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: stdout_logging
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/StdoutLoggingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: http_logging
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/HttpLoggingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: tcp_logging
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/TcpLoggingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: kafka_logging
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/KafkaLoggingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ws_logging
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/WsLoggingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: transaction_debugger
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/TransactionDebuggerConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: jwks_auth
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/JwksAuthConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: oauth2_introspection
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/Oauth2IntrospectionConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: oidc_relying_party
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/OidcRelyingPartyConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: jwt_auth
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/JwtAuthConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: key_auth
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/KeyAuthConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: basic_auth
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/BasicAuthConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ldap_auth
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/LdapAuthConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: hmac_auth
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/HmacAuthConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: mtls_auth
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/MtlsAuthConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: spiffe_identity
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/SpiffeIdentityConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: mesh_authz
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/MeshAuthzConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: opa
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/OpaPluginConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: mesh_outbound_registry
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/MeshOutboundRegistryConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: compression
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/CompressionConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: cors
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/CorsConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: security_headers
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/SecurityHeadersConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: access_control
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/AccessControlConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: tcp_connection_throttle
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/TcpConnectionThrottleConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: adaptive_concurrency
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/AdaptiveConcurrencyConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ip_restriction
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/IpRestrictionConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: bot_detection
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/BotDetectionConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: correlation_id
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/CorrelationIdConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: request_transformer
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/RequestTransformerConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: response_transformer
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/ResponseTransformerConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: mesh_route_dispatch
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/MeshRouteDispatchConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: graphql
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/GraphqlConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: grpc_method_router
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/GrpcMethodRouterConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: grpc_deadline
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/GrpcDeadlineConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: grpc_web
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/GrpcWebConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: rate_limiting
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/RateLimitingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: request_size_limiting
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/RequestSizeLimitingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: waf
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/WafPluginConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: response_size_limiting
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/ResponseSizeLimitingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: body_validator
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/BodyValidatorConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: openapi_validator
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/OpenapiValidatorConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: request_termination
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/RequestTerminationConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: response_caching
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/ResponseCachingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: response_mock
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/ResponseMockConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: serverless_function
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/ServerlessFunctionConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: prometheus_metrics
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/PrometheusMetricsConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: proxy_alerts
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/ProxyAlertsConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: otel_tracing
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/OtelTracingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_token_metrics
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/AiTokenMetricsConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_request_guard
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/AiRequestGuardConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_rate_limiter
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/AiRateLimiterConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_prompt_shield
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/AiPromptShieldConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_semantic_firewall
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/AiSemanticFirewallConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_response_guard
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/AiResponseGuardConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_semantic_cache
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/AiSemanticCacheConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_federation
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/AiFederationConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: mcp_gateway
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/McpGatewayConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: a2a_gateway
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/A2aGatewayConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ws_message_size_limiting
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/WsMessageSizeLimitingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ws_frame_logging
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/WsFrameLoggingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ws_rate_limiting
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/WsRateLimitingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: udp_rate_limiting
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/UdpRateLimitingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: udp_logging
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/UdpLoggingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: statsd_logging
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/StatsdLoggingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: loki_logging
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/LokiLoggingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: sse
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/SseConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: request_mirror
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/RequestMirrorConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: load_testing
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/LoadTestingConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: geo_restriction
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/GeoRestrictionConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: request_deduplication
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/RequestDeduplicationConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: soap_ws_security
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/SoapWsSecurityConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: spec_expose
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/SpecExposeConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: api_chargeback
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/ApiChargebackConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: api_chargeback_sink
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/ApiChargebackSinkConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: workload_metrics
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/WorkloadMetricsConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: __mesh_bpf_metrics
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/MeshBpfMetricsConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: fault_injection
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/FaultInjectionConfig"
 
     PluginConfigCreate:
       description: Request body for creating or updating a plugin configuration.
@@ -10201,6 +10904,21 @@ components:
             Service name attached to exported spans. Defaults to the
             workload's service when omitted.
 
+    MeshBpfMetricsConfig:
+      type: object
+      description: |
+        Plugin: __mesh_bpf_metrics - reserved internal mesh NodeWaypoint
+        plugin that exposes BPF SOCK_OPS counters on the Prometheus scrape
+        surface. Mesh mode auto-injects it when BPF metrics are available;
+        operator-managed plugin configs should not create names prefixed
+        with `__`.
+      properties:
+        prefix:
+          type: string
+          pattern: "^[A-Za-z_][A-Za-z0-9_]*$"
+          default: ferrum_mesh_bpf
+          description: Prometheus metric name prefix for emitted BPF counters.
+
     SoapWsSecurityConfig:
       type: object
       description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers request bodies with SOAP content types (text/xml, application/soap+xml, application/xml). At least one security feature must be enabled. Note: signature paths verify against the wire bytes of SignedInfo / referenced elements and do not yet apply Exclusive XML Canonicalization (xml-exc-c14n#); operators integrating with IdPs that strictly canonicalize should validate end-to-end."
@@ -11761,8 +12479,7 @@ components:
               description: Final HTTP status returned when the abort fault triggers
             percentage:
               type: number
-              minimum: 0
-              exclusiveMinimum: true
+              exclusiveMinimum: 0
               maximum: 100
               description: Abort probability as a percentage
             grpc_status:
@@ -11787,8 +12504,7 @@ components:
               description: Delay duration before continuing or aborting
             percentage:
               type: number
-              minimum: 0
-              exclusiveMinimum: true
+              exclusiveMinimum: 0
               maximum: 100
               description: Delay probability as a percentage
           required: [duration_ms, percentage]

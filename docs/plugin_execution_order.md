@@ -142,7 +142,7 @@ Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_va
 
 WebSocket connections go through the normal HTTP plugin pipeline during the upgrade handshake — authentication, authorization, rate limiting, and all other HTTP phases execute before the connection is upgraded. Once the WebSocket upgrade completes, the frame-level hooks kick in.
 
-The `on_ws_frame` phase fires for every **Text**, **Binary**, and **Ping** frame in both directions:
+The `on_ws_frame` phase fires for every **Text**, **Binary**, **Ping**, and **Pong** frame in both directions:
 
 ```
 WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy → ...)
@@ -152,11 +152,11 @@ WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy �
 │  Frame Forwarding Loop              │
 │                                     │
 │  ┌───────────────────────────────┐  │
-│  │ on_ws_frame (ClientToBackend) │──┼── For each Text/Binary/Ping from client
+│  │ on_ws_frame (ClientToBackend) │──┼── For each Text/Binary/Ping/Pong from client
 │  └───────────────────────────────┘  │
 │                                     │
 │  ┌───────────────────────────────┐  │
-│  │ on_ws_frame (BackendToClient) │──┼── For each Text/Binary/Ping from backend
+│  │ on_ws_frame (BackendToClient) │──┼── For each Text/Binary/Ping/Pong from backend
 │  └───────────────────────────────┘  │
 │                                     │
 └─────────────────────────────────────┘
@@ -186,7 +186,7 @@ When no plugins on a proxy return `true` from `requires_ws_frame_hooks()`, the f
 
 ## UDP Datagram Lifecycle (`on_udp_datagram`)
 
-UDP proxies support per-datagram plugin hooks that fire before each client→backend datagram is forwarded. This is separate from the `on_stream_connect`/`on_stream_disconnect` lifecycle, which fires once per session.
+UDP proxies support per-datagram plugin hooks that fire before each client-to-backend and backend-to-client datagram is forwarded. This is separate from the `on_stream_connect`/`on_stream_disconnect` lifecycle, which fires once per session.
 
 ```
 Session Established (on_stream_connect already ran)
@@ -196,7 +196,7 @@ Session Established (on_stream_connect already ran)
 │  Datagram Forwarding Loop           │
 │                                     │
 │  ┌───────────────────────────────┐  │
-│  │ on_udp_datagram               │──── For each client→backend datagram
+│  │ on_udp_datagram               │──── For each datagram in either direction
 │  │ (returns Forward or Drop)     │
 │  └───────────────────────────────┘  │
 │                                     │
@@ -212,6 +212,10 @@ Session Established (on_stream_connect already ran)
 ### Silent Drop Semantics
 
 Unlike HTTP plugins which return status codes and response bodies, UDP datagram plugins return `UdpDatagramVerdict::Drop` to silently discard the datagram. This is standard UDP behavior — there is no error response to send.
+
+### Direction Handling
+
+`UdpDatagramContext.direction` is `ClientToBackend` for inbound datagrams and `BackendToClient` for backend responses. Built-in `udp_rate_limiting` intentionally shares one per-client window across both directions; plugins that need asymmetric policy should branch on `ctx.direction`.
 
 ### Zero-Overhead Opt-In
 

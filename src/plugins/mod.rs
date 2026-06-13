@@ -2962,7 +2962,7 @@ pub fn create_plugin_with_http_client(
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
         )?))),
-        "ai_semantic_firewall" | "semantic_ai_firewall" => Ok(Some(Arc::new(
+        "ai_semantic_firewall" => Ok(Some(Arc::new(
             ai_semantic_firewall::AiSemanticFirewall::new(config, http_client.clone())?,
         ))),
         "ai_semantic_cache" => Ok(Some(Arc::new(ai_semantic_cache::AiSemanticCache::new(
@@ -3069,7 +3069,6 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "ip_restriction"
             | "waf"
             | "ai_semantic_firewall"
-            | "semantic_ai_firewall"
             | "security_headers"
             | "openapi_validator"
             | "mcp_gateway"
