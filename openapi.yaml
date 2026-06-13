@@ -6091,6 +6091,7 @@ components:
               plugin_name:
                 const: http_logging
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/HttpLoggingConfig"
@@ -6288,6 +6289,7 @@ components:
               plugin_name:
                 const: access_control
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/AccessControlConfig"
@@ -8666,6 +8668,8 @@ components:
     HttpLoggingConfig:
       type: object
       description: "Plugin: http_logging — Sends transaction logs to an HTTP endpoint in batches."
+      required:
+        - endpoint_url
       properties:
         endpoint_url:
           type: string
@@ -12530,7 +12534,7 @@ components:
               description: Final HTTP status returned when the abort fault triggers
             percentage:
               type: number
-              minimum: 0
+              exclusiveMinimum: 0
               maximum: 100
               description: Abort probability as a percentage
             grpc_status:
@@ -12555,7 +12559,7 @@ components:
               description: Delay duration before continuing or aborting
             percentage:
               type: number
-              minimum: 0
+              exclusiveMinimum: 0
               maximum: 100
               description: Delay probability as a percentage
           required: [duration_ms, percentage]
