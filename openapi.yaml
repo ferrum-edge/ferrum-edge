@@ -6316,6 +6316,7 @@ components:
               plugin_name:
                 const: ip_restriction
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/IpRestrictionConfig"
@@ -6455,6 +6456,7 @@ components:
               plugin_name:
                 const: openapi_validator
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/OpenapiValidatorConfig"
@@ -11533,6 +11535,15 @@ components:
 
     IpRestrictionConfig:
       type: object
+      anyOf:
+        - required: [allow]
+          properties:
+            allow:
+              minItems: 1
+        - required: [deny]
+          properties:
+            deny:
+              minItems: 1
       description: >-
         Plugin: ip_restriction — IP/CIDR allow/deny enforcement. Rules are
         validated and pre-parsed at config load time; invalid IPv4/IPv6
@@ -12519,7 +12530,7 @@ components:
               description: Final HTTP status returned when the abort fault triggers
             percentage:
               type: number
-              exclusiveMinimum: 0
+              minimum: 0
               maximum: 100
               description: Abort probability as a percentage
             grpc_status:
@@ -12544,7 +12555,7 @@ components:
               description: Delay duration before continuing or aborting
             percentage:
               type: number
-              exclusiveMinimum: 0
+              minimum: 0
               maximum: 100
               description: Delay probability as a percentage
           required: [duration_ms, percentage]
@@ -12646,6 +12657,7 @@ components:
 
     OpenapiValidatorConfig:
       type: object
+      required: [operations]
       description: |
         Plugin: openapi_validator — validates request and response bodies
         against operation schemas generated from an attached OpenAPI/Swagger
