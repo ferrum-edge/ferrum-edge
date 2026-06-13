@@ -3523,10 +3523,10 @@ fn apply_traffic_policy_tls_to_upstream(
 ///   `ca_certificates`; clear any stale client cert/key.
 /// - `Mutual`: enable server-cert verification; populate CA, client cert,
 ///   and private key from the DR.
-/// - `IstioMutual`: enable server-cert verification; project the workload's
-///   X.509-SVID cert/key paths and trust bundle from the mesh runtime onto the
-///   slot, or accept a CA-backed runtime SVID source whose material is supplied
-///   through the shared gateway SVID slot.
+/// - `IstioMutual`: enable server-cert verification and project the workload's
+///   file-backed X.509-SVID cert/key paths and trust bundle from the mesh
+///   runtime onto the slot. CA-backed runtime SVIDs intentionally fail closed
+///   here until generic backend TLS can present the dynamic SVID material.
 ///
 /// `insecure_skip_verify=true` always wins: it forces
 /// `verify_server_cert=false` regardless of mode.
@@ -3580,20 +3580,14 @@ fn apply_traffic_policy_tls_to_backend_config(
                     slot.client_key_path = Some(key_path);
                 }
                 _ if runtime.ca_backend != CaBackend::None => {
-                    slot.server_ca_cert_path = runtime.workload_svid_trust_bundle_path.clone();
-                    slot.client_cert_path = None;
-                    slot.client_key_path = None;
-                    if runtime.workload_svid_trust_bundle_path.is_none() {
-                        warn!(
-                            identity = %identity,
-                            ca_backend = %runtime.ca_backend,
-                            "DestinationRule ISTIO_MUTUAL uses the mesh CA-backed runtime SVID source; backend SVID trust must come from the shared gateway SVID slot"
-                        );
-                    }
+                    return Err(anyhow::anyhow!(
+                        "DestinationRule ISTIO_MUTUAL for '{}' cannot use FERRUM_MESH_CA_BACKEND yet because generic backend TLS cannot present dynamic runtime SVID client certificates; configure FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH or use MUTUAL with explicit client cert/key paths",
+                        identity
+                    ));
                 }
                 _ => {
                     return Err(anyhow::anyhow!(
-                        "DestinationRule ISTIO_MUTUAL for '{}' requires FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH or FERRUM_MESH_CA_BACKEND",
+                        "DestinationRule ISTIO_MUTUAL for '{}' requires FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH",
                         identity
                     ));
                 }
@@ -11881,7 +11875,7 @@ mod tests {
     }
 
     #[test]
-    fn dr_tls_istio_mutual_accepts_ca_backed_runtime_svid_source() {
+    fn dr_tls_istio_mutual_rejects_ca_backed_runtime_svid_source_for_generic_backend_tls() {
         let mut upstream =
             destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
         upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
@@ -11903,13 +11897,28 @@ mod tests {
             }),
             ..MeshTrafficPolicy::default()
         };
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime)
-            .expect("CA-backed runtime SVID source satisfies ISTIO_MUTUAL");
+        let err = apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime)
+            .expect_err("CA-backed runtime SVID source must fail closed for generic backend TLS");
 
-        assert!(upstream.backend_tls_verify_server_cert);
-        assert!(upstream.backend_tls_client_cert_path.is_none());
-        assert!(upstream.backend_tls_client_key_path.is_none());
-        assert!(upstream.backend_tls_server_ca_cert_path.is_none());
+        let message = err.to_string();
+        assert!(message.contains("FERRUM_MESH_CA_BACKEND"), "got: {err}");
+        assert!(
+            message.contains("generic backend TLS cannot present dynamic runtime SVID"),
+            "got: {err}"
+        );
+        assert!(!upstream.backend_tls_verify_server_cert);
+        assert_eq!(
+            upstream.backend_tls_client_cert_path.as_deref(),
+            Some("/existing/client.pem")
+        );
+        assert_eq!(
+            upstream.backend_tls_client_key_path.as_deref(),
+            Some("/existing/client.key")
+        );
+        assert_eq!(
+            upstream.backend_tls_server_ca_cert_path.as_deref(),
+            Some("/stale/ca.pem")
+        );
     }
 
     #[test]
