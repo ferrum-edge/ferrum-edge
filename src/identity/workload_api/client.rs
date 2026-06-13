@@ -125,6 +125,7 @@ impl WorkloadApiClient {
     /// "wait for an SVID to be ready" before proceeding.
     pub async fn fetch_x509_svid_stream(
         &mut self,
+        expected_spiffe_id: Option<SpiffeId>,
     ) -> Result<
         (
             impl Stream<Item = Result<SvidBundle, WorkloadApiClientError>> + Send + 'static,
@@ -162,7 +163,7 @@ impl WorkloadApiClient {
                     debug!("Workload API server pushed an empty X509SVIDResponse — skipping");
                     continue;
                 }
-                let bundle_res = svid_response_to_bundle(msg);
+                let bundle_res = svid_response_to_bundle(msg, expected_spiffe_id.as_ref());
                 let was_ok = bundle_res.is_ok();
                 if out_tx.send(bundle_res).is_err() {
                     return;
@@ -181,7 +182,7 @@ impl WorkloadApiClient {
     /// move on. Production paths should keep the stream open and consume
     /// rotations via [`fetch_x509_svid_stream`](Self::fetch_x509_svid_stream).
     pub async fn fetch_x509_svid_once(&mut self) -> Result<SvidBundle, WorkloadApiClientError> {
-        let (mut stream, _) = self.fetch_x509_svid_stream().await?;
+        let (mut stream, _) = self.fetch_x509_svid_stream(None).await?;
         stream
             .next()
             .await
@@ -204,16 +205,32 @@ fn parse_trust_domain_key(key: &str) -> Result<TrustDomain, String> {
     TrustDomain::new(domain_str.to_string()).map_err(|e| e.to_string())
 }
 
-/// Convert one `X509SVIDResponse` into a [`SvidBundle`]. Picks the first
-/// SVID in the response (per spec, the "default identity" for the workload).
+/// Convert one `X509SVIDResponse` into a [`SvidBundle`]. When an expected
+/// SPIFFE ID is provided, select that exact SVID; otherwise pick the first SVID
+/// in the response (per spec, the "default identity" for the workload).
 fn svid_response_to_bundle(
     msg: super::proto::X509svidResponse,
+    expected_spiffe_id: Option<&SpiffeId>,
 ) -> Result<SvidBundle, WorkloadApiClientError> {
-    let first = msg
-        .svids
-        .into_iter()
-        .next()
-        .ok_or_else(|| WorkloadApiClientError::Rpc("X509SVIDResponse has no SVIDs".into()))?;
+    let first = if let Some(expected) = expected_spiffe_id {
+        let mut returned = Vec::with_capacity(msg.svids.len());
+        let selected = msg.svids.into_iter().find(|svid| {
+            returned.push(svid.spiffe_id.clone());
+            svid.spiffe_id == expected.as_str()
+        });
+        selected.ok_or_else(|| {
+            WorkloadApiClientError::Rpc(format!(
+                "X509SVIDResponse did not include configured SPIFFE ID '{}' (returned: {})",
+                expected,
+                returned.join(", ")
+            ))
+        })?
+    } else {
+        msg.svids
+            .into_iter()
+            .next()
+            .ok_or_else(|| WorkloadApiClientError::Rpc("X509SVIDResponse has no SVIDs".into()))?
+    };
 
     let spiffe_id = SpiffeId::new(first.spiffe_id.clone()).map_err(|e| {
         WorkloadApiClientError::Rpc(format!(
@@ -376,7 +393,9 @@ pub enum WorkloadApiClientError {
 
 #[cfg(test)]
 mod tests {
-    use super::split_concatenated_der;
+    use super::{split_concatenated_der, svid_response_to_bundle};
+    use crate::identity::SpiffeId;
+    use crate::identity::workload_api::proto::{X509svid, X509svidResponse};
 
     #[test]
     fn split_empty_buffer() {
@@ -407,6 +426,52 @@ mod tests {
     fn split_rejects_non_sequence_tag() {
         let blob = [0x31, 0x00];
         assert!(split_concatenated_der(&blob).is_err());
+    }
+
+    fn test_x509_svid(spiffe_id: &str, marker: u8) -> X509svid {
+        X509svid {
+            spiffe_id: spiffe_id.to_string(),
+            x509_svid: vec![0x30, 0x02, 0x04, marker],
+            x509_svid_key: vec![marker],
+            bundle: vec![0x30, 0x02, 0x04, marker],
+            hint: String::new(),
+        }
+    }
+
+    #[test]
+    fn selects_configured_spiffe_id_from_multi_svid_response() {
+        let expected = SpiffeId::new("spiffe://td/ns/default/sa/edge").unwrap();
+        let response = X509svidResponse {
+            svids: vec![
+                test_x509_svid("spiffe://td/ns/default/sa/first", 1),
+                test_x509_svid(expected.as_str(), 2),
+            ],
+            crl: Vec::new(),
+            federated_bundles: Default::default(),
+        };
+
+        let bundle = svid_response_to_bundle(response, Some(&expected)).expect("selected bundle");
+
+        assert_eq!(bundle.spiffe_id, expected);
+        assert_eq!(bundle.cert_chain_der, vec![vec![0x30, 0x02, 0x04, 2]]);
+        assert_eq!(bundle.private_key_pkcs8_der, vec![2]);
+    }
+
+    #[test]
+    fn rejects_multi_svid_response_without_configured_spiffe_id() {
+        let expected = SpiffeId::new("spiffe://td/ns/default/sa/missing").unwrap();
+        let response = X509svidResponse {
+            svids: vec![test_x509_svid("spiffe://td/ns/default/sa/first", 1)],
+            crl: Vec::new(),
+            federated_bundles: Default::default(),
+        };
+
+        let err = svid_response_to_bundle(response, Some(&expected)).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("did not include configured SPIFFE ID")
+        );
     }
 }
 

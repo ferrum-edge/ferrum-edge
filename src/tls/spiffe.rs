@@ -27,7 +27,8 @@
 use arc_swap::ArcSwap;
 use rustls::client::WantsClientCert;
 use rustls::pki_types::{
-    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
+    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
+    UnixTime,
 };
 use rustls::server::{WantsServerCert, WebPkiClientVerifier};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -188,6 +189,14 @@ impl SpiffeServerCertResolver {
     fn build_cert_key(&self) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let snapshot = self.slot.load_full();
         cached_certified_key(&self.certified_key_cache, snapshot, "server")
+    }
+
+    pub fn validate_current(&self) -> Result<(), SpiffeTlsError> {
+        let snapshot = self.slot.load_full();
+        let bundle = snapshot.as_ref().as_ref().ok_or(SpiffeTlsError::NoSvid)?;
+        certified_key_from_bundle(bundle)
+            .map(|_| ())
+            .map_err(SpiffeTlsError::BadKeyMaterial)
     }
 }
 
@@ -449,8 +458,9 @@ fn certified_key_from_bundle(bundle: &SvidBundle) -> Result<rustls::sign::Certif
         .iter()
         .map(|d| CertificateDer::from(d.clone()))
         .collect();
-    let key = PrivateKeyDer::try_from(bundle.private_key_pkcs8_der.clone())
-        .map_err(|e| format!("invalid private key: {e}"))?;
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        bundle.private_key_pkcs8_der.clone(),
+    ));
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| format!("ring sign init failed: {e}"))?;
     Ok(rustls::sign::CertifiedKey::new(chain, signing_key))

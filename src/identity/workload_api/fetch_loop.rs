@@ -18,7 +18,9 @@ use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
 use super::client::WorkloadApiClient;
-use crate::identity::SvidBundle;
+use crate::identity::{SpiffeId, SvidBundle};
+
+type SvidInstaller = Arc<dyn Fn(SvidBundle) + Send + Sync + 'static>;
 
 /// Handle returned by [`spawn_fetch_loop`]. Holds the shared `ArcSwap` and
 /// the "first SVID arrived" notifier.
@@ -33,6 +35,7 @@ pub struct SvidFetchHandle {
     first_ready: Arc<Notify>,
     has_first: Arc<std::sync::atomic::AtomicBool>,
     revision_tx: Arc<OnceLock<watch::Sender<u64>>>,
+    installer: Arc<OnceLock<SvidInstaller>>,
 }
 
 impl SvidFetchHandle {
@@ -42,6 +45,7 @@ impl SvidFetchHandle {
             first_ready: Arc::new(Notify::new()),
             has_first: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             revision_tx: Arc::new(OnceLock::new()),
+            installer: Arc::new(OnceLock::new()),
         }
     }
 
@@ -57,6 +61,7 @@ impl SvidFetchHandle {
             first_ready: Arc::new(Notify::new()),
             has_first: Arc::new(std::sync::atomic::AtomicBool::new(has_first)),
             revision_tx: Arc::new(OnceLock::new()),
+            installer: Arc::new(OnceLock::new()),
         }
     }
 
@@ -68,6 +73,22 @@ impl SvidFetchHandle {
     pub fn with_revision_tx(self, revision_tx: watch::Sender<u64>) -> Self {
         if self.revision_tx.set(revision_tx).is_err() {
             warn!("SVID fetch handle revision channel already configured; keeping existing sender");
+        }
+        self
+    }
+
+    /// Wire a cold-path installer that owns writes to `current`.
+    ///
+    /// Mesh mode uses this to publish SPIRE rotations through
+    /// `ProxyState::install_gateway_runtime_svid_bundle`, preserving CP/slice
+    /// trust overlays instead of overwriting the shared slot with the raw SPIRE
+    /// bundle.
+    pub fn with_installer<F>(self, installer: F) -> Self
+    where
+        F: Fn(SvidBundle) + Send + Sync + 'static,
+    {
+        if self.installer.set(Arc::new(installer)).is_err() {
+            warn!("SVID fetch handle installer already configured; keeping existing installer");
         }
         self
     }
@@ -106,7 +127,11 @@ impl SvidFetchHandle {
 
     fn install(&self, bundle: SvidBundle) {
         record_fetch_bundle_metrics(&bundle);
-        self.current.store(Arc::new(Some(bundle)));
+        if let Some(installer) = self.installer.get() {
+            installer(bundle);
+        } else {
+            self.current.store(Arc::new(Some(bundle)));
+        }
         let was_first = self
             .has_first
             .swap(true, std::sync::atomic::Ordering::AcqRel);
@@ -132,6 +157,8 @@ impl Default for SvidFetchHandle {
 pub struct FetchLoopConfig {
     /// Path to the SPIRE agent socket.
     pub socket_path: String,
+    /// Optional exact SPIFFE ID to select from multi-SVID Workload API responses.
+    pub expected_spiffe_id: Option<SpiffeId>,
     /// Backoff between connection attempts when the agent is unreachable.
     pub reconnect_backoff: Duration,
     /// Maximum backoff cap. Backoff doubles up to this value.
@@ -142,6 +169,7 @@ impl Default for FetchLoopConfig {
     fn default() -> Self {
         Self {
             socket_path: super::client::DEFAULT_WORKLOAD_API_SOCKET.to_string(),
+            expected_spiffe_id: None,
             reconnect_backoff: Duration::from_secs(1),
             max_reconnect_backoff: Duration::from_secs(30),
         }
@@ -169,7 +197,10 @@ async fn fetch_loop_main(config: FetchLoopConfig, handle: SvidFetchHandle) {
     let mut backoff = config.reconnect_backoff;
     loop {
         match WorkloadApiClient::connect(&config.socket_path).await {
-            Ok(mut client) => match client.fetch_x509_svid_stream().await {
+            Ok(mut client) => match client
+                .fetch_x509_svid_stream(config.expected_spiffe_id.clone())
+                .await
+            {
                 Ok((mut stream, _first_signal)) => {
                     info!(socket = %config.socket_path, "SVID fetch stream established");
                     backoff = config.reconnect_backoff;

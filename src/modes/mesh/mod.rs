@@ -5423,6 +5423,27 @@ async fn serve_mesh_runtime(
         refresh_mesh_outbound_enforcement(&proxy_state, &runtime, slice);
     }
 
+    // Resolve mTLS mode and start any CA-backed runtime SVID source before pool
+    // warmup / backend capability probes. HBONE capability probes require a
+    // gateway SVID; if the first refresh runs while the slot is empty, HBONE
+    // targets can remain Unknown until the next periodic refresh.
+    let inbound_mtls_mode =
+        startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime)?;
+    validate_egress_gateway_mtls_config(&runtime, &env_config)?;
+    let mesh_ca_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+    let mesh_ca_svid_slot = start_mesh_ca_backend_svid_source(
+        &proxy_state,
+        &runtime,
+        &env_config,
+        mesh_ca_trust_overlay_slot.clone(),
+        &mut mesh_background_handles,
+        shutdown_tx.subscribe(),
+    )
+    .await?;
+    let mesh_ca_trust_overlay_slot = mesh_ca_svid_slot
+        .as_ref()
+        .map(|_| mesh_ca_trust_overlay_slot);
+
     for host in proxy_state.plugin_cache.collect_warmup_hostnames() {
         hostnames.push((host, None, None));
     }
@@ -5505,21 +5526,10 @@ async fn serve_mesh_runtime(
         None
     };
 
-    // Resolve mTLS mode from the initial mesh slice. By default this remains a
-    // startup-only decision. When the opt-in live reload flag is enabled, the
-    // mesh accept loops read `proxy_state.mesh_inbound_tls` on every accept and
-    // slice apply may atomically swap the inbound ServerConfig.
-    let inbound_mtls_mode =
-        startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime)?;
-    validate_egress_gateway_mtls_config(&runtime, &env_config)?;
-    let mesh_ca_svid_slot = start_mesh_ca_backend_svid_source(
-        &proxy_state,
-        &runtime,
-        &env_config,
-        &mut mesh_background_handles,
-        shutdown_tx.subscribe(),
-    )
-    .await?;
+    // By default inbound mTLS remains a startup-only decision. When the opt-in
+    // live reload flag is enabled, the mesh accept loops read
+    // `proxy_state.mesh_inbound_tls` on every accept and slice apply may
+    // atomically swap the inbound ServerConfig.
     let mesh_frontend_identity =
         load_mesh_frontend_server_identity(&env_config, mesh_ca_svid_slot.as_ref())?;
     let initial_inbound_tls_snapshot = if env_config.mesh_peer_auth_live_reload_enabled {
@@ -5540,6 +5550,16 @@ async fn serve_mesh_runtime(
         initial_applied_mesh_slice.as_deref(),
         mesh_ca_svid_slot.as_ref(),
     );
+    if mesh_ca_svid_slot.is_some()
+        && let Some(slice) = initial_applied_mesh_slice.as_deref()
+    {
+        publish_staged_spiffe_bundle(stage_gateway_runtime_spiffe_bundle(
+            &proxy_state,
+            mesh_ca_svid_slot.as_ref(),
+            mesh_ca_trust_overlay_slot.as_ref(),
+            slice,
+        ));
+    }
     let frontend_tls = load_mesh_frontend_tls(
         &env_config,
         &tls_policy,
@@ -5704,6 +5724,7 @@ async fn serve_mesh_runtime(
             server_identity: mesh_frontend_identity,
             last_snapshot: initial_inbound_tls_snapshot,
             spiffe_bundle_slot: mesh_inbound_spiffe_slot,
+            runtime_trust_overlay_slot: mesh_ca_trust_overlay_slot,
             production: mesh_production_mode,
         },
         shutdown_tx.subscribe(),
@@ -6192,6 +6213,7 @@ async fn start_mesh_ca_backend_svid_source(
     proxy_state: &ProxyState,
     runtime: &MeshRuntimeConfig,
     env_config: &EnvConfig,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mesh_background_handles: &mut Vec<JoinHandle<()>>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Option<tls::SharedBundleSlot>, anyhow::Error> {
@@ -6212,12 +6234,15 @@ async fn start_mesh_ca_backend_svid_source(
     }
 
     let workload_spiffe_id = configured_mesh_workload_spiffe_id(runtime)?;
+    let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
     match backend {
         CaBackend::SpireAgent => {
             let slot = start_spire_agent_mesh_svid_source(
                 proxy_state,
                 env_config,
                 &workload_spiffe_id,
+                inbound_slot,
+                trust_overlay_slot,
                 mesh_background_handles,
             )
             .await?;
@@ -6228,6 +6253,8 @@ async fn start_mesh_ca_backend_svid_source(
                 proxy_state,
                 env_config,
                 workload_spiffe_id,
+                inbound_slot,
+                trust_overlay_slot,
                 mesh_background_handles,
                 shutdown_rx,
             )
@@ -6242,14 +6269,26 @@ async fn start_spire_agent_mesh_svid_source(
     proxy_state: &ProxyState,
     env_config: &EnvConfig,
     expected_spiffe_id: &crate::identity::SpiffeId,
+    inbound_slot: tls::SharedBundleSlot,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mesh_background_handles: &mut Vec<JoinHandle<()>>,
 ) -> Result<tls::SharedBundleSlot, anyhow::Error> {
     let handle = crate::identity::workload_api::SvidFetchHandle::from_slot(
         proxy_state.gateway_svid_bundle.clone(),
     )
-    .with_revision_tx(proxy_state.backend_svid_rotation_tx.clone());
+    .with_revision_tx(proxy_state.backend_svid_rotation_tx.clone())
+    .with_installer({
+        let state = proxy_state.clone();
+        let inbound_slot = inbound_slot.clone();
+        let trust_overlay_slot = trust_overlay_slot.clone();
+        move |bundle| {
+            state.install_gateway_runtime_svid_bundle(bundle.clone());
+            publish_runtime_svid_to_inbound_slot(&inbound_slot, &trust_overlay_slot, bundle);
+        }
+    });
     let fetch_config = crate::identity::workload_api::FetchLoopConfig {
         socket_path: env_config.mesh_spire_agent_socket.clone(),
+        expected_spiffe_id: Some(expected_spiffe_id.clone()),
         ..Default::default()
     };
     let join =
@@ -6288,13 +6327,15 @@ async fn start_spire_agent_mesh_svid_source(
         "Mesh CA backend loaded runtime SVID from SPIRE Workload API"
     );
     mesh_background_handles.push(join);
-    Ok(proxy_state.gateway_svid_bundle.clone())
+    Ok(inbound_slot)
 }
 
 async fn start_internal_mesh_svid_source(
     proxy_state: &ProxyState,
     env_config: &EnvConfig,
     spiffe_id: crate::identity::SpiffeId,
+    inbound_slot: tls::SharedBundleSlot,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mesh_background_handles: &mut Vec<JoinHandle<()>>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<tls::SharedBundleSlot, anyhow::Error> {
@@ -6313,14 +6354,34 @@ async fn start_internal_mesh_svid_source(
         },
     )?) as crate::identity::ca::SharedCa;
 
-    issue_and_install_mesh_ca_svid(proxy_state, ca.as_ref(), &spiffe_id, env_config, false).await?;
+    issue_and_install_mesh_ca_svid(
+        proxy_state,
+        ca.as_ref(),
+        &spiffe_id,
+        env_config,
+        &inbound_slot,
+        &trust_overlay_slot,
+        false,
+    )
+    .await?;
     let state = proxy_state.clone();
     let loop_env = env_config.clone();
+    let loop_inbound_slot = inbound_slot.clone();
+    let loop_trust_overlay_slot = trust_overlay_slot.clone();
     mesh_background_handles.push(tokio::spawn(async move {
-        run_internal_mesh_svid_rotation_loop(state, ca, spiffe_id, loop_env, shutdown_rx).await;
+        run_internal_mesh_svid_rotation_loop(
+            state,
+            ca,
+            spiffe_id,
+            loop_env,
+            loop_inbound_slot,
+            loop_trust_overlay_slot,
+            shutdown_rx,
+        )
+        .await;
     }));
 
-    Ok(proxy_state.gateway_svid_bundle.clone())
+    Ok(inbound_slot)
 }
 
 async fn run_internal_mesh_svid_rotation_loop(
@@ -6328,6 +6389,8 @@ async fn run_internal_mesh_svid_rotation_loop(
     ca: crate::identity::ca::SharedCa,
     spiffe_id: crate::identity::SpiffeId,
     env_config: EnvConfig,
+    inbound_slot: tls::SharedBundleSlot,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
@@ -6362,9 +6425,16 @@ async fn run_internal_mesh_svid_rotation_loop(
             continue;
         }
 
-        if let Err(error) =
-            issue_and_install_mesh_ca_svid(&proxy_state, ca.as_ref(), &spiffe_id, &env_config, true)
-                .await
+        if let Err(error) = issue_and_install_mesh_ca_svid(
+            &proxy_state,
+            ca.as_ref(),
+            &spiffe_id,
+            &env_config,
+            &inbound_slot,
+            &trust_overlay_slot,
+            true,
+        )
+        .await
         {
             crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
                 &spiffe_id, "internal",
@@ -6383,6 +6453,8 @@ async fn issue_and_install_mesh_ca_svid(
     ca: &dyn CertificateAuthority,
     spiffe_id: &crate::identity::SpiffeId,
     env_config: &EnvConfig,
+    inbound_slot: &tls::SharedBundleSlot,
+    trust_overlay_slot: &SharedMeshInboundTrustOverlaySlot,
     publish_revision: bool,
 ) -> Result<(), anyhow::Error> {
     let signed = ca
@@ -6404,7 +6476,8 @@ async fn issue_and_install_mesh_ca_svid(
         }),
     };
     let installed_spiffe_id = bundle.spiffe_id.clone();
-    proxy_state.install_gateway_runtime_svid_bundle(bundle);
+    proxy_state.install_gateway_runtime_svid_bundle(bundle.clone());
+    publish_runtime_svid_to_inbound_slot(inbound_slot, trust_overlay_slot, bundle);
     if publish_revision {
         proxy_state
             .backend_svid_rotation_tx
@@ -6416,6 +6489,25 @@ async fn issue_and_install_mesh_ca_svid(
         "Mesh CA backend installed runtime SVID"
     );
     Ok(())
+}
+
+type SharedMeshInboundTrustOverlaySlot =
+    Arc<arc_swap::ArcSwap<Option<crate::identity::TrustBundleSet>>>;
+
+fn empty_mesh_inbound_trust_overlay_slot() -> SharedMeshInboundTrustOverlaySlot {
+    Arc::new(arc_swap::ArcSwap::new(Arc::new(None)))
+}
+
+fn publish_runtime_svid_to_inbound_slot(
+    inbound_slot: &tls::SharedBundleSlot,
+    trust_overlay_slot: &SharedMeshInboundTrustOverlaySlot,
+    mut bundle: crate::identity::SvidBundle,
+) {
+    let trust_overlay = trust_overlay_slot.load_full();
+    if let Some(overlay) = trust_overlay.as_ref() {
+        merge_trust_overlay_into_svid_bundle(&mut bundle, overlay);
+    }
+    inbound_slot.store(Arc::new(Some(bundle)));
 }
 
 struct MeshInboundTlsReloadState {
@@ -6430,6 +6522,7 @@ struct MeshInboundTlsReloadState {
     /// effect without a listener restart (per the lock-free SVID slot model
     /// in `.claude/rules/tls-security.md`).
     spiffe_bundle_slot: Option<tls::SharedBundleSlot>,
+    runtime_trust_overlay_slot: Option<SharedMeshInboundTrustOverlaySlot>,
     /// `FERRUM_MESH_PRODUCTION_MODE` captured once at startup. The live-reload
     /// fail-closed gate (issue #1523) consults this instead of re-reading the
     /// environment on every slice apply: the flag is fixed for the process
@@ -6439,33 +6532,26 @@ struct MeshInboundTlsReloadState {
     production: bool,
 }
 
-/// Build the optional SPIFFE inbound trust-bundle slot from the gateway SVID
-/// file material, merging in the slice's federated trust bundles so inbound
-/// peer SANs from federated trust domains validate too. Returns `None` when no
-/// gateway SVID material is configured (the inbound listener then keeps the
-/// operator client-CA chain verification it has always used). It also returns
-/// `None` (logged) when SVID material *is* configured but fails to load — but
-/// the caller does NOT silently degrade to chain-only in that case (issue
-/// #1523): at startup a configured-but-unloadable SVID is fatal (see the F2
-/// note in the body, and `enforce_mesh_inbound_fail_closed`), and on live reload
-/// the previous trust bundle is retained. See `build_mesh_inbound_spiffe_slot`'s
-/// F2 comment for the precise per-caller disposition.
+/// Build the optional SPIFFE inbound trust-bundle slot from file-backed SVID
+/// material or a CA-backed runtime SVID slot. File material is merged with the
+/// slice's federated trust bundles immediately; runtime slots receive the
+/// accepted slice overlay through `stage_gateway_runtime_spiffe_bundle`.
+/// Returns `None` when no gateway SVID material is configured (the inbound
+/// listener then keeps the operator client-CA chain verification it has always
+/// used). It also returns `None` (logged) when file SVID material *is*
+/// configured but fails to load — but the caller does NOT silently degrade to
+/// chain-only in that case (issue #1523): at startup a configured-but-unloadable
+/// SVID is fatal (see the F2 note in the body, and
+/// `enforce_mesh_inbound_fail_closed`), and on live reload the previous trust
+/// bundle is retained. See `build_mesh_inbound_spiffe_slot`'s F2 comment for
+/// the precise per-caller disposition.
 fn build_mesh_inbound_spiffe_slot(
     env_config: &EnvConfig,
     slice: Option<&MeshSlice>,
     runtime_svid_slot: Option<&tls::SharedBundleSlot>,
 ) -> Option<tls::SharedBundleSlot> {
     if let Some(slot) = runtime_svid_slot {
-        if slice
-            .and_then(|slice| slice.trust_bundles.as_ref())
-            .is_none()
-        {
-            return Some(slot.clone());
-        }
-        let snapshot = slot.load_full();
-        let mut bundle = snapshot.as_ref().clone()?;
-        merge_slice_federation_into_svid_bundle(&mut bundle, slice);
-        return Some(Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(bundle)))));
+        return Some(slot.clone());
     }
 
     let (cert_path, key_path, trust_bundle_path) = match (
@@ -6555,15 +6641,22 @@ fn merge_slice_federation_into_svid_bundle(
             return;
         }
     };
+    merge_trust_overlay_into_svid_bundle(bundle, &runtime);
+}
+
+fn merge_trust_overlay_into_svid_bundle(
+    bundle: &mut crate::identity::SvidBundle,
+    runtime: &crate::identity::TrustBundleSet,
+) {
     // Add federated bundles from the slice. The local bundle stays anchored to
     // the gateway SVID's own trust domain (we do not let the slice override the
     // local roots the SVID itself chains to).
-    for (trust_domain, federated) in runtime.federated {
+    for (trust_domain, federated) in &runtime.federated {
         bundle
             .trust_bundles
             .federated
-            .entry(trust_domain)
-            .or_insert(federated);
+            .entry(trust_domain.clone())
+            .or_insert_with(|| federated.clone());
     }
     // If the slice's local bundle is for a different trust domain than the
     // SVID's, treat it as a federated peer trust domain so cross-trust peers
@@ -6573,7 +6666,7 @@ fn merge_slice_federation_into_svid_bundle(
             .trust_bundles
             .federated
             .entry(runtime.local.trust_domain.clone())
-            .or_insert(runtime.local);
+            .or_insert_with(|| runtime.local.clone());
     }
 }
 
@@ -6585,18 +6678,23 @@ fn merge_slice_federation_into_svid_bundle(
 /// returns `None` (logged) and the caller leaves the previous trust bundles in
 /// place — this never fails the slice.
 fn stage_mesh_inbound_spiffe_bundle(
+    proxy_state: &ProxyState,
     slot: Option<&tls::SharedBundleSlot>,
+    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
     env_config: &EnvConfig,
     slice: &MeshSlice,
 ) -> Option<StagedSpiffeBundle> {
     let slot = slot?;
-    let runtime_svid_slot = if gateway_svid_material_configured(env_config) {
-        None
-    } else {
-        Some(slot)
-    };
-    match build_mesh_inbound_spiffe_slot(env_config, Some(slice), runtime_svid_slot) {
-        Some(rebuilt) => Some(StagedSpiffeBundle {
+    if !gateway_svid_material_configured(env_config) {
+        return stage_gateway_runtime_spiffe_bundle(
+            proxy_state,
+            Some(slot),
+            runtime_trust_overlay_slot,
+            slice,
+        );
+    }
+    match build_mesh_inbound_spiffe_slot(env_config, Some(slice), None) {
+        Some(rebuilt) => Some(StagedSpiffeBundle::DirectSlot {
             slot: slot.clone(),
             bundle: rebuilt.load_full(),
         }),
@@ -6609,6 +6707,53 @@ fn stage_mesh_inbound_spiffe_bundle(
             None
         }
     }
+}
+
+fn stage_gateway_runtime_spiffe_bundle(
+    proxy_state: &ProxyState,
+    slot: Option<&tls::SharedBundleSlot>,
+    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
+    slice: &MeshSlice,
+) -> Option<StagedSpiffeBundle> {
+    let slot = slot?;
+    let runtime_trust_overlay_slot = runtime_trust_overlay_slot?;
+    let trust_overlay = match slice.trust_bundles.as_ref() {
+        Some(serialized) => match serialized.to_runtime() {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                warn!(
+                    %error,
+                    mesh_slice_version = %slice.version,
+                    "Unable to stage mesh inbound SPIFFE trust overlay from slice; \
+                     keeping previous trust bundles"
+                );
+                return None;
+            }
+        },
+        None => None,
+    };
+
+    let snapshot = proxy_state.gateway_file_svid_bundle.load_full();
+    let mut bundle = match snapshot.as_ref().clone() {
+        Some(bundle) => bundle,
+        None => {
+            warn!(
+                mesh_slice_version = %slice.version,
+                "Unable to stage mesh inbound SPIFFE trust overlay because no runtime SVID \
+                 bundle is loaded; keeping previous trust bundles"
+            );
+            return None;
+        }
+    };
+    if let Some(overlay) = trust_overlay.as_ref() {
+        merge_trust_overlay_into_svid_bundle(&mut bundle, overlay);
+    }
+    Some(StagedSpiffeBundle::RuntimeSlot {
+        slot: slot.clone(),
+        trust_overlay_slot: runtime_trust_overlay_slot.clone(),
+        trust_overlay,
+        bundle: Arc::new(Some(bundle)),
+    })
 }
 
 /// Build the inbound SPIFFE client-cert verifier for the given mTLS mode and
@@ -6939,8 +7084,14 @@ fn load_mesh_frontend_tls(
             }
         }
         MeshFrontendServerIdentity::DynamicSpiffe { slot, source } => {
+            let resolver = Arc::new(tls::SpiffeServerCertResolver::new(slot.clone()));
+            resolver.validate_current().map_err(|error| {
+                anyhow::anyhow!(
+                    "dynamic mesh SPIFFE server identity from {source} is not usable: {error}"
+                )
+            })?;
             tls::load_mesh_tls_config_with_dynamic_identity(
-                Arc::new(tls::SpiffeServerCertResolver::new(slot.clone())),
+                resolver,
                 source,
                 client_ca_bundle_ref,
                 client_auth,
@@ -7176,12 +7327,23 @@ enum MeshInboundTlsReloadPlan {
     },
 }
 
-/// A rebuilt inbound SPIFFE trust-bundle plus the live slot it should be stored
-/// into once the reload is accepted. Staging keeps the live verifier reading
-/// the previous trust bundles until the candidate proxy config is accepted.
-struct StagedSpiffeBundle {
-    slot: tls::SharedBundleSlot,
-    bundle: Arc<Option<crate::identity::SvidBundle>>,
+/// A staged inbound SPIFFE trust update. Staging keeps the live verifier
+/// reading the previous trust bundles until the candidate proxy config is
+/// accepted.
+enum StagedSpiffeBundle {
+    /// File-backed SVID path: replace the dedicated inbound verifier slot.
+    DirectSlot {
+        slot: tls::SharedBundleSlot,
+        bundle: Arc<Option<crate::identity::SvidBundle>>,
+    },
+    /// CA-backed SVID path: update the dedicated runtime inbound verifier slot
+    /// from the latest raw SVID plus the accepted slice trust overlay.
+    RuntimeSlot {
+        slot: tls::SharedBundleSlot,
+        trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
+        trust_overlay: Option<crate::identity::TrustBundleSet>,
+        bundle: Arc<Option<crate::identity::SvidBundle>>,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7193,6 +7355,7 @@ fn plan_mesh_inbound_tls_reload(
     server_identity: Option<&MeshFrontendServerIdentity>,
     last_snapshot: Option<&MeshInboundTlsReloadSnapshot>,
     spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
+    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
     production: bool,
     // Precomputed once by the apply task (topology is process-fixed) so the reload
     // path does not re-derive `runtime.listener_plan()` on every slice apply.
@@ -7218,10 +7381,15 @@ fn plan_mesh_inbound_tls_reload(
     // the candidate proxy config is accepted. The verifier reads the slot live,
     // so this still propagates federated trust-domain changes lock-free even
     // when the operator client CA bundle and mTLS mode are otherwise unchanged.
-    // Only the federated set is recomputed; the SVID local roots/cert/key stay
-    // the file-based startup inputs per the peer-auth reload invariant.
-    let staged_spiffe =
-        stage_mesh_inbound_spiffe_bundle(spiffe_bundle_slot, &proxy_state.env_config, slice);
+    // Only the accepted slice trust overlay is recomputed; the SVID cert/key
+    // and local roots stay anchored to the current file or CA runtime source.
+    let staged_spiffe = stage_mesh_inbound_spiffe_bundle(
+        proxy_state,
+        spiffe_bundle_slot,
+        runtime_trust_overlay_slot,
+        &proxy_state.env_config,
+        slice,
+    );
     if last_snapshot == Some(&next_snapshot) {
         return Some(MeshInboundTlsReloadPlan::Unchanged { staged_spiffe });
     }
@@ -7502,8 +7670,20 @@ fn start_remote_cluster_discovery_reconcile_task(
 /// The verifier holds an `Arc` to this slot and observes the new bundle on its
 /// next handshake.
 fn publish_staged_spiffe_bundle(staged: Option<StagedSpiffeBundle>) {
-    if let Some(StagedSpiffeBundle { slot, bundle }) = staged {
-        slot.store(bundle);
+    match staged {
+        Some(StagedSpiffeBundle::DirectSlot { slot, bundle }) => {
+            slot.store(bundle);
+        }
+        Some(StagedSpiffeBundle::RuntimeSlot {
+            slot,
+            trust_overlay_slot,
+            trust_overlay,
+            bundle,
+        }) => {
+            trust_overlay_slot.store(Arc::new(trust_overlay));
+            slot.store(bundle);
+        }
+        None => {}
     }
 }
 
@@ -7571,6 +7751,7 @@ fn start_mesh_slice_apply_task(
                                 inbound_tls_reload.server_identity.as_ref(),
                                 inbound_tls_reload.last_snapshot.as_ref(),
                                 inbound_tls_reload.spiffe_bundle_slot.as_ref(),
+                                inbound_tls_reload.runtime_trust_overlay_slot.as_ref(),
                                 inbound_tls_reload.production,
                                 has_termination_listener,
                             )
@@ -14629,6 +14810,7 @@ mod tests {
                 server_identity: None,
                 last_snapshot: None,
                 spiffe_bundle_slot: None,
+                runtime_trust_overlay_slot: None,
                 production: false,
             },
             shutdown_rx,
@@ -14685,6 +14867,7 @@ mod tests {
                 server_identity: mesh_frontend_identity,
                 last_snapshot: Some(initial_snapshot),
                 spiffe_bundle_slot: None,
+                runtime_trust_overlay_slot: None,
                 production: false,
             },
             shutdown_rx,
@@ -14766,6 +14949,7 @@ mod tests {
                 server_identity: mesh_frontend_identity,
                 last_snapshot: Some(initial_snapshot),
                 spiffe_bundle_slot: None,
+                runtime_trust_overlay_slot: None,
                 production: false,
             },
             shutdown_rx,
@@ -14878,6 +15062,7 @@ mod tests {
                 server_identity: None,
                 last_snapshot: Some(initial_snapshot),
                 spiffe_bundle_slot: None,
+                runtime_trust_overlay_slot: None,
                 production: false,
             },
             shutdown_rx,
@@ -14958,6 +15143,7 @@ mod tests {
             identity.as_ref(),
             None,
             None,
+            None,
             true, // production
             true, // has a TLS-terminating inbound listener (Sidecar)
         );
@@ -14974,6 +15160,7 @@ mod tests {
             &disable_slice,
             config::MtlsMode::Disable,
             identity.as_ref(),
+            None,
             None,
             None,
             false, // dev
@@ -15558,7 +15745,7 @@ mod tests {
                 refresh_hint_seconds: None,
             }),
         }));
-        let staged = Some(StagedSpiffeBundle {
+        let staged = Some(StagedSpiffeBundle::DirectSlot {
             slot: slot.clone(),
             bundle: replacement.clone(),
         });
@@ -15572,6 +15759,81 @@ mod tests {
         assert!(
             Arc::ptr_eq(&slot.load_full(), &replacement),
             "publish must store the staged bundle into the live slot"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_spiffe_overlay_preserves_fresh_ca_roots_on_rotation() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+        use base64::Engine;
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+        let td = TrustDomain::new("td.runtime").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+
+        let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
+            spiffe_id: id.clone(),
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td.clone(),
+                x509_authorities: local_roots,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        };
+
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
+        let engine = base64::engine::general_purpose::STANDARD;
+        let slice = MeshSlice {
+            version: "trust-overlay".to_string(),
+            trust_bundles: Some(config::TrustBundleSet {
+                local: config::TrustBundle {
+                    trust_domain: td.clone(),
+                    x509_authorities: vec![engine.encode(b"old-local-root")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: vec![config::TrustBundle {
+                    trust_domain: TrustDomain::new("partner.runtime").unwrap(),
+                    x509_authorities: vec![engine.encode(b"partner-root")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: Some(300),
+                }],
+            }),
+            ..MeshSlice::default()
+        };
+
+        let staged = stage_gateway_runtime_spiffe_bundle(
+            &state,
+            Some(&inbound_slot),
+            Some(&overlay_slot),
+            &slice,
+        );
+        publish_staged_spiffe_bundle(staged);
+
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![9]]));
+        publish_runtime_svid_to_inbound_slot(
+            &inbound_slot,
+            &overlay_slot,
+            svid_bundle(vec![vec![9]]),
+        );
+
+        let active = inbound_slot.load_full();
+        let bundle = active.as_ref().as_ref().expect("inbound bundle");
+        assert_eq!(
+            bundle.trust_bundles.local.x509_authorities,
+            vec![vec![9]],
+            "runtime CA local roots must come from the rotated SVID, not the stale slice overlay"
+        );
+        assert!(
+            bundle
+                .trust_bundles
+                .federated
+                .contains_key(&TrustDomain::new("partner.runtime").unwrap()),
+            "accepted slice federation should remain overlaid after rotation"
         );
     }
 
@@ -15893,7 +16155,7 @@ mod tests {
 
     #[test]
     fn load_mesh_frontend_server_identity_uses_runtime_svid_slot() {
-        let slot = populated_spiffe_slot();
+        let slot = valid_dynamic_spiffe_slot();
         let identity = load_mesh_frontend_server_identity(&EnvConfig::default(), Some(&slot))
             .expect("runtime SVID identity should load")
             .expect("runtime SVID slot should back server identity");
@@ -15929,7 +16191,7 @@ mod tests {
         ensure_crypto_provider();
         let env = EnvConfig::default();
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
-        let slot = populated_spiffe_slot();
+        let slot = valid_dynamic_spiffe_slot();
         let identity = MeshFrontendServerIdentity::DynamicSpiffe {
             slot: slot.clone(),
             source: "test-runtime-svid",
@@ -15950,6 +16212,35 @@ mod tests {
         assert!(
             tls_config.alpn_protocols.contains(&b"h2".to_vec()),
             "mesh frontend TLS must advertise h2"
+        );
+    }
+
+    #[test]
+    fn load_mesh_frontend_tls_rejects_unusable_dynamic_spiffe_identity() {
+        ensure_crypto_provider();
+        let env = EnvConfig::default();
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let slot = populated_spiffe_slot();
+        let identity = MeshFrontendServerIdentity::DynamicSpiffe {
+            slot: slot.clone(),
+            source: "test-runtime-svid",
+        };
+
+        let err = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Permissive,
+            Some(&identity),
+            None,
+            Some(&slot),
+        )
+        .expect_err("malformed dynamic SVID must fail before listener bind");
+
+        assert!(
+            err.to_string()
+                .contains("dynamic mesh SPIFFE server identity"),
+            "error should identify the dynamic SVID source, got: {err}"
         );
     }
 
@@ -16139,6 +16430,38 @@ mod tests {
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![vec![4, 5, 6]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        };
+        Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(bundle))))
+    }
+
+    fn valid_dynamic_spiffe_slot() -> tls::SharedBundleSlot {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+
+        let td = TrustDomain::new("td.dynamic-wiring").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("generate dynamic SVID key");
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        params
+            .subject_alt_names
+            .push(crate::identity::spiffe::spiffe_id_to_san(&id).expect("spiffe SAN"));
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let cert = params
+            .self_signed(&key_pair)
+            .expect("self-sign dynamic SVID");
+        let cert_chain_der = vec![cert.der().to_vec()];
+        let bundle = SvidBundle {
+            spiffe_id: id,
+            cert_chain_der: cert_chain_der.clone(),
+            private_key_pkcs8_der: key_pair.serialize_der(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td,
+                x509_authorities: cert_chain_der,
                 jwt_authorities: Vec::new(),
                 refresh_hint_seconds: None,
             }),

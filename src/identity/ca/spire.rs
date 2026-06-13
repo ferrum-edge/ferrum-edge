@@ -219,7 +219,7 @@ async fn stream_loop(
 
     loop {
         match WorkloadApiClient::connect(&socket_path).await {
-            Ok(mut client) => match client.fetch_x509_svid_stream().await {
+            Ok(mut client) => match client.fetch_x509_svid_stream(None).await {
                 Ok((mut stream, _first_signal)) => {
                     info!(socket = %socket_path, "SPIRE agent CA: stream established");
                     backoff = RECONNECT_BACKOFF_INITIAL;
