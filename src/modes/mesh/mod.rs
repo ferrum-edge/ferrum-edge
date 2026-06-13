@@ -7316,9 +7316,17 @@ fn validate_egress_gateway_mtls_config(
         return Ok(());
     }
 
-    if env_config.frontend_tls_cert_path.is_none() || env_config.frontend_tls_key_path.is_none() {
+    let has_explicit_frontend_identity =
+        env_config.frontend_tls_cert_path.is_some() && env_config.frontend_tls_key_path.is_some();
+    let has_file_svid_identity = env_config.gateway_svid_cert_path.is_some()
+        && env_config.gateway_svid_key_path.is_some()
+        && env_config.gateway_svid_trust_bundle_path.is_some();
+    let has_ca_backed_svid_identity = runtime.ca_backend != CaBackend::None;
+    let has_svid_backed_identity = has_file_svid_identity || has_ca_backed_svid_identity;
+
+    if !has_explicit_frontend_identity && !has_svid_backed_identity {
         return Err(anyhow::anyhow!(
-            "FERRUM_MESH_TOPOLOGY=egress_gateway requires FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH for the egress mTLS listener"
+            "FERRUM_MESH_TOPOLOGY=egress_gateway requires a TLS server identity for the egress mTLS listener: set FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH, configure FERRUM_GATEWAY_SVID_CERT_PATH / FERRUM_GATEWAY_SVID_KEY_PATH / FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH, or configure FERRUM_MESH_CA_BACKEND with FERRUM_MESH_WORKLOAD_SPIFFE_ID"
         ));
     }
 
@@ -7328,9 +7336,9 @@ fn validate_egress_gateway_mtls_config(
         ));
     }
 
-    if env_config.frontend_tls_client_ca_bundle_path.is_none() {
+    if env_config.frontend_tls_client_ca_bundle_path.is_none() && !has_svid_backed_identity {
         return Err(anyhow::anyhow!(
-            "FERRUM_MESH_TOPOLOGY=egress_gateway requires FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH so sidecar client certificates are verified"
+            "FERRUM_MESH_TOPOLOGY=egress_gateway requires a peer verifier for the egress mTLS listener: set FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH, configure FERRUM_GATEWAY_SVID_CERT_PATH / FERRUM_GATEWAY_SVID_KEY_PATH / FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH, or configure FERRUM_MESH_CA_BACKEND with FERRUM_MESH_WORKLOAD_SPIFFE_ID"
         ));
     }
 
@@ -16122,6 +16130,31 @@ mod tests {
         env.tls_no_verify = true;
         let err = validate_egress_gateway_mtls_config(&runtime, &env).unwrap_err();
         assert!(err.to_string().contains("FERRUM_TLS_NO_VERIFY=true"));
+    }
+
+    #[test]
+    fn egress_gateway_accepts_svid_backed_mtls_materials() {
+        let ca_runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EgressGateway,
+            ca_backend: CaBackend::SpireAgent,
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/egress".to_string()),
+            ..test_mesh_runtime_config()
+        };
+        validate_egress_gateway_mtls_config(&ca_runtime, &EnvConfig::default())
+            .expect("CA-backed runtime SVID should satisfy egress gateway mTLS validation");
+
+        let file_svid_runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EgressGateway,
+            ..test_mesh_runtime_config()
+        };
+        let file_svid_env = EnvConfig {
+            gateway_svid_cert_path: Some("tests/certs/server.crt".to_string()),
+            gateway_svid_key_path: Some("tests/certs/server.key".to_string()),
+            gateway_svid_trust_bundle_path: Some("tests/certs/ca.crt".to_string()),
+            ..EnvConfig::default()
+        };
+        validate_egress_gateway_mtls_config(&file_svid_runtime, &file_svid_env)
+            .expect("file SVID material should satisfy egress gateway mTLS validation");
     }
 
     #[test]
