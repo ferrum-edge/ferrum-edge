@@ -351,6 +351,22 @@ fn try_insert_pending_session_gate(
     }
 }
 
+/// Non-consuming check of the active-session cap. Returns `true` when the
+/// listener already holds `FERRUM_UDP_MAX_SESSIONS` active sessions, so a
+/// datagram from a new source can be dropped cheaply — before a pending gate is
+/// created, a setup task is spawned, or first-datagram policy runs — without
+/// reserving a slot. The real reservation still happens post-admission in
+/// `process_new_session_datagram` for flows that pass plugin + mesh checks.
+///
+/// This restores the active-session cap's role as a cheap flood shield for a
+/// maxed-out listener: once the slot reservation moved past admission, a
+/// spoofed-source flood against a full listener could otherwise spawn setup
+/// tasks and execute policy hooks for traffic the post-admission reservation is
+/// certain to reject.
+fn udp_active_session_cap_reached(metrics: &UdpProxyMetrics, max_sessions: usize) -> bool {
+    metrics.active_sessions.load(Ordering::Relaxed) >= max_sessions as u64
+}
+
 /// Atomically either remove the pending gate (when its queue is observed
 /// empty) or take the queued datagrams for draining. Both the empty-check +
 /// removal and the take happen under the same DashMap shard lock the recv
@@ -1579,6 +1595,20 @@ async fn process_datagram(
     };
 
     let Some(session) = existing_session else {
+        // Cheap flood shield: when the active-session cap is already full, drop a
+        // new-source datagram before creating a pending gate, spawning setup, or
+        // running first-datagram plugin + mesh checks — the post-admission
+        // `reserve_udp_session_slot` would reject it anyway. This is a
+        // non-consuming read (no slot reserved), so admitted flows still reserve
+        // their slot after passing policy. Without it, a spoofed-source flood
+        // against a maxed-out listener would spawn tasks and execute policy
+        // hooks for traffic certain to be dropped.
+        if udp_active_session_cap_reached(metrics, max_sessions) {
+            return Err(anyhow::anyhow!(
+                "UDP session limit reached ({}), dropping datagram",
+                max_sessions
+            ));
+        }
         if !try_insert_pending_session_gate(pending_sessions, client_addr, max_sessions)? {
             // Defensive: a gate appeared after the check at the top of this
             // function (not expected — the recv loop is a single task). Treat
@@ -4475,6 +4505,36 @@ backend_tls_verify_server_cert: false
             metrics.active_sessions.load(Ordering::Relaxed),
             0,
             "pending gates must not consume active session capacity before policy checks pass"
+        );
+    }
+
+    #[test]
+    fn active_session_cap_reached_short_circuits_before_pending_gate() {
+        let metrics = Arc::new(super::UdpProxyMetrics::default());
+
+        // Below the cap: capacity is available.
+        assert!(!super::udp_active_session_cap_reached(&metrics, 1));
+
+        // At the cap: a new source must be reported as over-capacity so the recv
+        // loop drops it before creating a pending gate or running policy.
+        let reservation = reserve_udp_session_slot(&metrics, 1).unwrap();
+        assert_eq!(metrics.active_sessions.load(Ordering::Relaxed), 1);
+        assert!(
+            super::udp_active_session_cap_reached(&metrics, 1),
+            "a maxed-out listener must report the active-session cap as reached"
+        );
+
+        // The check itself is non-consuming — it neither reserves nor releases.
+        assert_eq!(
+            metrics.active_sessions.load(Ordering::Relaxed),
+            1,
+            "the active-cap check must not mutate the active-session count"
+        );
+
+        drop(reservation);
+        assert!(
+            !super::udp_active_session_cap_reached(&metrics, 1),
+            "freeing the slot must reopen capacity for new sessions"
         );
     }
 
