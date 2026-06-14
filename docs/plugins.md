@@ -1302,7 +1302,7 @@ config:
 **CA Fingerprint Filtering:**
 When `allowed_ca_fingerprints_sha256` is configured, at least one certificate in the client's TLS chain must match a configured SHA-256 fingerprint. When both `allowed_issuers` and `allowed_ca_fingerprints_sha256` are configured, both constraints must pass (AND logic).
 
-On UDP+DTLS streams this filter can only evaluate the exposed client leaf certificate, because DTLS chain certificates are not available in the stream plugin context.
+On UDP+DTLS streams, `allowed_ca_fingerprints_sha256` is not usable. The filter only ever hashes the client's intermediate/CA chain certificates (the leaf is never matched against it), and the dimpl-backed DTLS path exposes only the client leaf — `tls_client_cert_chain_der` is always `None`. Configuring `allowed_ca_fingerprints_sha256` on a DTLS-fronted proxy therefore rejects **every** connection, because there are no chain certificates to match. For DTLS, restrict the issuing CA with `allowed_issuers` (which matches the leaf's issuer DN and works on the exposed leaf), and/or pin a specific client certificate with `cert_field: fingerprint_sha256` mapped to a consumer identity.
 
 Issuer-constraint rejection bodies are always emitted as valid JSON even when certificate subject fields contain quotes, newlines, or other control characters.
 
