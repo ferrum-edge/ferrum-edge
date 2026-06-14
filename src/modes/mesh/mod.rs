@@ -5510,6 +5510,64 @@ async fn serve_mesh_runtime(
     let inbound_mtls_mode =
         startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime)?;
     validate_egress_gateway_mtls_config(&runtime, &env_config)?;
+    // CA backend (`FERRUM_MESH_CA_BACKEND=spire`): fetch the gateway's own SVID
+    // from the SPIRE Agent Workload API and rotate it live into
+    // `proxy_state.gateway_svid_bundle` — the same slot the file watcher feeds
+    // and the slot `load_mesh_frontend_server_identity` (below) resolves the
+    // inbound server cert from. Runs only when no file-based gateway SVID
+    // material is configured; the two are mutually exclusive sources for the
+    // slot (enforced in `EnvConfig::validate`). Block until the first SVID is
+    // installed so the inbound listener comes up serving mTLS rather than
+    // failing closed.
+    if matches!(
+        crate::identity::ca::CaBackend::from_str_lossy(&env_config.mesh_ca_backend),
+        Ok(crate::identity::ca::CaBackend::SpireAgent)
+    ) && env_config.gateway_svid_cert_path.is_none()
+    {
+        let socket = env_config.mesh_spire_agent_socket.clone();
+        let expected = env_config.gateway_spiffe_id.clone();
+        info!(
+            socket = %socket,
+            "Mesh CA backend 'spire': fetching gateway SVID from the SPIRE Workload API"
+        );
+        let (handle, ready_rx) = proxy_state.start_gateway_svid_workload_api_task(
+            socket.clone(),
+            expected,
+            Some(shutdown_tx.subscribe()),
+        );
+        mesh_background_handles.push(handle);
+        let ready_secs = env_config.mesh_ca_backend_ready_timeout_seconds.max(1);
+        match tokio::time::timeout(Duration::from_secs(ready_secs), ready_rx).await {
+            Ok(Ok(())) => info!("Gateway SVID ready from the SPIRE Workload API"),
+            Ok(Err(_)) => {
+                // The fetch task dropped its readiness sender without signalling
+                // — only happens if it exited (e.g. shutdown) before the first
+                // SVID. Treat as fail-closed: the slot is still empty.
+                return Err(anyhow::anyhow!(
+                    "gateway SVID fetch task exited before delivering an SVID from the SPIRE \
+                     Workload API at {socket}"
+                ));
+            }
+            Err(_) => {
+                if crate::identity::production_mode() {
+                    return Err(anyhow::anyhow!(
+                        "FERRUM_MESH_CA_BACKEND=spire: no SVID from the SPIRE Workload API at \
+                         {socket} within {ready_secs}s \
+                         (FERRUM_MESH_CA_BACKEND_READY_TIMEOUT_SECONDS). Refusing to start under \
+                         FERRUM_MESH_PRODUCTION_MODE — the inbound listener would serve no \
+                         identity (fail-closed)."
+                    ));
+                }
+                warn!(
+                    socket = %socket,
+                    timeout_secs = ready_secs,
+                    "FERRUM_MESH_CA_BACKEND=spire: no SVID yet from the SPIRE Workload API; \
+                     continuing (dev) — the fetch loop keeps retrying and the inbound listener \
+                     fails closed until an SVID arrives"
+                );
+            }
+        }
+    }
     let mesh_frontend_identity =
         load_mesh_frontend_server_identity(&env_config, &proxy_state.gateway_svid_bundle)?;
     let initial_inbound_tls_snapshot = if env_config.mesh_peer_auth_live_reload_enabled {
@@ -5525,8 +5583,11 @@ async fn serve_mesh_runtime(
     // material is configured — the listener then keeps operator-CA chain
     // verification. The slot is read live by the verifier and re-published on
     // slice apply so federated trust changes propagate lock-free.
-    let mesh_inbound_spiffe_slot =
-        build_mesh_inbound_spiffe_slot(&env_config, initial_applied_mesh_slice.as_deref());
+    let mesh_inbound_spiffe_slot = build_mesh_inbound_spiffe_slot(
+        &env_config,
+        &proxy_state.gateway_svid_bundle,
+        initial_applied_mesh_slice.as_deref(),
+    );
     let frontend_tls = load_mesh_frontend_tls(
         &env_config,
         &tls_policy,
@@ -6167,54 +6228,69 @@ struct MeshInboundTlsReloadState {
 /// F2 comment for the precise per-caller disposition.
 fn build_mesh_inbound_spiffe_slot(
     env_config: &EnvConfig,
+    gateway_svid_bundle: &crate::identity::SharedSvidBundle,
     slice: Option<&MeshSlice>,
 ) -> Option<tls::SharedBundleSlot> {
-    let (cert_path, key_path, trust_bundle_path) = match (
+    let mut bundle = match (
         env_config.gateway_svid_cert_path.as_deref(),
         env_config.gateway_svid_key_path.as_deref(),
         env_config.gateway_svid_trust_bundle_path.as_deref(),
     ) {
-        (Some(cert), Some(key), Some(trust)) => (cert, key, trust),
-        _ => return None,
-    };
-
-    // F2 (accepted coupling, documented): `load_svid_bundle_from_files`
-    // validates the gateway SVID *leaf* (notBefore/notAfter, non-CA) as well as
-    // the trust-bundle CAs, so an expired/mid-rotation leaf OR a corrupt trust
-    // bundle fails the whole load and this returns `None`. The disposition is the
-    // CALLER's, and (issue #1523) it is NOT graceful chain-only at startup:
-    //   - Startup: a configured-but-unloadable gateway SVID is a hard fault. The
-    //     SAME material is loaded and validated by `load_gateway_svid_bundle` in
-    //     ProxyState construction (`new_with_bpf_metrics`), which refuses startup
-    //     *first*; `enforce_mesh_inbound_fail_closed` is the inbound-local guard
-    //     for the identical condition. So a configured SVID that fails to load —
-    //     including an expired/mid-rotation leaf — aborts startup; it does not
-    //     silently degrade to chain-only.
-    //   - Live reload: `stage_mesh_inbound_spiffe_bundle` keeps the PREVIOUS trust
-    //     bundle (the running verifier is retained, not dropped to chain-only), so
-    //     a transient mid-rotation failure does not drop inbound trust-domain
-    //     enforcement.
-    // We intentionally do not load only the trust bundle here: the gateway leaf
-    // must also be currently valid for the listener to present a usable server
-    // identity, so an expired leaf is a real fault, not a reason to half-load.
-    let mut bundle = match crate::identity::file_loader::load_svid_bundle_from_files(
-        std::path::Path::new(cert_path),
-        std::path::Path::new(key_path),
-        std::path::Path::new(trust_bundle_path),
-        env_config.gateway_spiffe_id.as_deref(),
-    ) {
-        Ok(bundle) => bundle,
-        Err(error) => {
-            // Neutral report — the caller decides the disposition: fatal at
-            // startup (also independently enforced by `load_gateway_svid_bundle`),
-            // previous-bundle-retained on live reload.
-            error!(
-                %error,
-                "Failed to load gateway SVID material for the mesh inbound SPIFFE peer \
-                 verifier (startup: fatal; live reload: previous trust bundle retained)"
-            );
-            return None;
+        (Some(cert_path), Some(key_path), Some(trust_bundle_path)) => {
+            // F2 (accepted coupling, documented): `load_svid_bundle_from_files`
+            // validates the gateway SVID *leaf* (notBefore/notAfter, non-CA) as
+            // well as the trust-bundle CAs, so an expired/mid-rotation leaf OR a
+            // corrupt trust bundle fails the whole load and this returns `None`.
+            // The disposition is the CALLER's, and (issue #1523) it is NOT
+            // graceful chain-only at startup:
+            //   - Startup: a configured-but-unloadable gateway SVID is a hard
+            //     fault. The SAME material is loaded and validated by
+            //     `load_gateway_svid_bundle` in ProxyState construction
+            //     (`new_with_bpf_metrics`), which refuses startup *first*;
+            //     `enforce_mesh_inbound_fail_closed` is the inbound-local guard
+            //     for the identical condition. So a configured SVID that fails to
+            //     load — including an expired/mid-rotation leaf — aborts startup;
+            //     it does not silently degrade to chain-only.
+            //   - Live reload: `stage_mesh_inbound_spiffe_bundle` keeps the
+            //     PREVIOUS trust bundle (the running verifier is retained, not
+            //     dropped to chain-only), so a transient mid-rotation failure does
+            //     not drop inbound trust-domain enforcement.
+            // We intentionally do not load only the trust bundle here: the gateway
+            // leaf must also be currently valid for the listener to present a
+            // usable server identity, so an expired leaf is a real fault, not a
+            // reason to half-load.
+            match crate::identity::file_loader::load_svid_bundle_from_files(
+                std::path::Path::new(cert_path),
+                std::path::Path::new(key_path),
+                std::path::Path::new(trust_bundle_path),
+                env_config.gateway_spiffe_id.as_deref(),
+            ) {
+                Ok(bundle) => bundle,
+                Err(error) => {
+                    // Neutral report — the caller decides the disposition: fatal
+                    // at startup (also independently enforced by
+                    // `load_gateway_svid_bundle`), previous-bundle-retained on
+                    // live reload.
+                    error!(
+                        %error,
+                        "Failed to load gateway SVID material for the mesh inbound SPIFFE peer \
+                         verifier (startup: fatal; live reload: previous trust bundle retained)"
+                    );
+                    return None;
+                }
+            }
         }
+        // No file-based gateway SVID material: the runtime gateway SVID slot is
+        // the identity source (e.g. the `spire` CA backend fetched the gateway's
+        // own SVID into it via the Workload API). Its `trust_bundles` carry the
+        // same trust-domain CA roots the inbound peer verifier needs, so build the
+        // verifier from the slot's current bundle. Returns `None` when the slot is
+        // empty (no identity configured at all) — preserving the prior behavior of
+        // "no SVID material ⇒ no SPIFFE verifier (chain-only fallback)".
+        _ => match gateway_svid_bundle.load_full().as_ref() {
+            Some(bundle) => bundle.clone(),
+            None => return None,
+        },
     };
 
     merge_slice_federation_into_svid_bundle(&mut bundle, slice);
@@ -6288,10 +6364,11 @@ fn merge_slice_federation_into_svid_bundle(
 fn stage_mesh_inbound_spiffe_bundle(
     slot: Option<&tls::SharedBundleSlot>,
     env_config: &EnvConfig,
+    gateway_svid_bundle: &crate::identity::SharedSvidBundle,
     slice: &MeshSlice,
 ) -> Option<StagedSpiffeBundle> {
     let slot = slot?;
-    match build_mesh_inbound_spiffe_slot(env_config, Some(slice)) {
+    match build_mesh_inbound_spiffe_slot(env_config, gateway_svid_bundle, Some(slice)) {
         Some(rebuilt) => Some(StagedSpiffeBundle {
             slot: slot.clone(),
             bundle: rebuilt.load_full(),
@@ -6415,6 +6492,28 @@ fn load_mesh_frontend_server_identity(
         return Ok(Some(tls::svid_rotating_mesh_server_identity(
             cert_path,
             key_path,
+            gateway_svid_bundle.clone(),
+        )?));
+    }
+    // No file-based gateway SVID material either, but the runtime slot may be fed
+    // by a CA backend (`FERRUM_MESH_CA_BACKEND=spire`): the Workload API fetch
+    // loop installed the gateway's own SVID into the slot before the listener
+    // binds (mesh startup blocks on the first SVID). Use the slot as the live
+    // server identity exactly like the file-backed case — it resolves live and
+    // rotates with each fetched SVID. `svid_rotating_mesh_server_identity`
+    // validates the slot's current material and fails closed if it cannot back a
+    // server certificate; the path strings here are display labels only (there is
+    // no file).
+    if gateway_svid_bundle.load_full().is_some() {
+        info!(
+            "Mesh inbound listener using the runtime CA-backend SVID (slot-fed, \
+             e.g. FERRUM_MESH_CA_BACKEND=spire) as its TLS server identity. The \
+             inbound server certificate resolves live from the gateway SVID slot \
+             and rotates with it."
+        );
+        return Ok(Some(tls::svid_rotating_mesh_server_identity(
+            "mesh-ca-backend-svid",
+            "mesh-ca-backend-svid",
             gateway_svid_bundle.clone(),
         )?));
     }
@@ -6876,8 +6975,12 @@ fn plan_mesh_inbound_tls_reload(
     // when the operator client CA bundle and mTLS mode are otherwise unchanged.
     // Only the federated set is recomputed; the SVID local roots/cert/key stay
     // the file-based startup inputs per the peer-auth reload invariant.
-    let staged_spiffe =
-        stage_mesh_inbound_spiffe_bundle(spiffe_bundle_slot, &proxy_state.env_config, slice);
+    let staged_spiffe = stage_mesh_inbound_spiffe_bundle(
+        spiffe_bundle_slot,
+        &proxy_state.env_config,
+        &proxy_state.gateway_svid_bundle,
+        slice,
+    );
     if last_snapshot == Some(&next_snapshot) {
         return Some(MeshInboundTlsReloadPlan::Unchanged { staged_spiffe });
     }
@@ -15161,11 +15264,15 @@ mod tests {
 
     #[test]
     fn mesh_inbound_spiffe_slot_absent_without_gateway_svid_config() {
-        // No gateway SVID material → no SPIFFE slot → inbound listener keeps
-        // operator-CA chain verification (the pre-existing behavior).
+        // No gateway SVID material (no file paths) AND an empty runtime slot →
+        // no SPIFFE slot → inbound listener keeps operator-CA chain verification
+        // (the pre-existing behavior). The slot fallback only builds a verifier
+        // when a CA backend (e.g. spire) has populated it.
         let env = EnvConfig::default();
         assert!(env.gateway_svid_cert_path.is_none());
-        assert!(build_mesh_inbound_spiffe_slot(&env, None).is_none());
+        let empty_slot: crate::identity::SharedSvidBundle =
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        assert!(build_mesh_inbound_spiffe_slot(&env, &empty_slot, None).is_none());
     }
 
     #[test]

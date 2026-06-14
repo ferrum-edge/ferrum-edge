@@ -457,11 +457,11 @@ fn test_env_config_mesh_mode_no_ca_allowed_with_explicit_opt_out() {
 }
 
 #[test]
-fn test_env_config_mesh_mode_ca_backend_without_svid_is_refused() {
-    // A CA backend value alone (e.g. `internal`) does NOT load a runtime SVID
-    // today (it is parsed/validated but not wired to the data plane), so with
-    // no gateway SVID material and no opt-out the mesh has no identity and must
-    // fail closed.
+fn test_env_config_mesh_mode_internal_ca_backend_without_svid_is_refused() {
+    // `internal` is parsed/validated but NOT yet wired to issue runtime SVIDs,
+    // so with no gateway SVID material it has no identity and must fail closed —
+    // now with a precise message pointing at the wired alternatives (spire / file
+    // material) rather than the generic no-identity opt-out hint.
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
@@ -478,22 +478,27 @@ fn test_env_config_mesh_mode_ca_backend_without_svid_is_refused() {
             remove_var("FERRUM_GATEWAY_SVID_CERT_PATH");
             remove_var("FERRUM_GATEWAY_SVID_KEY_PATH");
             remove_var("FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH");
-            let result = EnvConfig::from_env();
+            let err = EnvConfig::from_env()
+                .expect_err("internal CA backend without SVID material has no runtime identity");
             assert!(
-                result.is_err(),
-                "a CA backend without gateway SVID material has no runtime identity"
+                err.contains("internal") && err.contains("not yet wired"),
+                "error should explain that internal is not yet wired, got: {err}"
             );
-            assert!(result.unwrap_err().contains("FERRUM_MESH_ALLOW_NO_CA"));
+            assert!(
+                err.contains("spire") && err.contains("FERRUM_GATEWAY_SVID_CERT_PATH"),
+                "error should point at the wired alternatives, got: {err}"
+            );
         },
     );
 }
 
 #[test]
-fn test_env_config_mesh_mode_spire_without_svid_refused_in_production() {
-    // The documented production command
-    // `FERRUM_MESH_PRODUCTION_MODE=true FERRUM_MESH_CA_BACKEND=spire` must NOT
-    // start without gateway SVID material: the CA backend does not yet load an
-    // SVID into the data plane, so there is no runtime identity.
+fn test_env_config_mesh_mode_spire_without_svid_is_accepted() {
+    // `spire` IS wired: mesh startup fetches + live-rotates the gateway SVID from
+    // the SPIRE Workload API, so it provides a runtime workload identity without
+    // any FERRUM_GATEWAY_SVID_* files. Config validation therefore accepts
+    // `FERRUM_MESH_CA_BACKEND=spire` even under FERRUM_MESH_PRODUCTION_MODE=true
+    // (the runtime readiness barrier enforces the actual fetch, fail-closed).
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
@@ -510,9 +515,41 @@ fn test_env_config_mesh_mode_spire_without_svid_refused_in_production() {
             remove_var("FERRUM_GATEWAY_SVID_CERT_PATH");
             remove_var("FERRUM_GATEWAY_SVID_KEY_PATH");
             remove_var("FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH");
-            let result = EnvConfig::from_env();
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("FERRUM_MESH_PRODUCTION_MODE"));
+            let config =
+                EnvConfig::from_env().expect("spire CA backend provides a runtime identity");
+            assert_eq!(config.mode, OperatingMode::Mesh);
+            assert_eq!(config.mesh_ca_backend, "spire");
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_spire_and_file_svid_are_mutually_exclusive() {
+    // file-based gateway SVID material and the spire CA backend are two writers
+    // for the same gateway SVID slot; configuring both must fail closed.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "spire"),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", "/tmp/svid-chain.pem"),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", "/tmp/svid-key.pem"),
+            ("FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH", "/tmp/svid-ca.pem"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_ALLOW_NO_CA");
+            let err = EnvConfig::from_env().expect_err(
+                "spire + file SVID material must be rejected as a double-configured identity",
+            );
+            assert!(
+                err.contains("mutually exclusive"),
+                "error should explain the two sources are mutually exclusive, got: {err}"
+            );
         },
     );
 }

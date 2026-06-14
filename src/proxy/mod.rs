@@ -2775,7 +2775,7 @@ async fn run_gateway_svid_file_rotation_loop(
         };
 
         let spiffe_id = bundle.spiffe_id.to_string();
-        state.install_gateway_file_svid_bundle(bundle);
+        state.install_gateway_runtime_svid_bundle(bundle);
         state
             .backend_svid_rotation_tx
             .send_modify(|revision| *revision = revision.saturating_add(1));
@@ -2786,6 +2786,154 @@ async fn run_gateway_svid_file_rotation_loop(
             svid_revision = revision,
             "Gateway SVID files reloaded; backend SVID rotation published"
         );
+    }
+}
+
+/// Background task that keeps the gateway's own SVID fresh from the SPIRE Agent
+/// Workload API — the `FERRUM_MESH_CA_BACKEND=spire` runtime identity source.
+///
+/// It connects to the agent's Unix socket, consumes the streaming
+/// `FetchX509SVID` RPC, and installs each fresh bundle into the SAME
+/// `gateway_svid_bundle` slot the file watcher feeds (via
+/// [`ProxyState::install_gateway_runtime_svid_bundle`], so any CP-delivered
+/// trust override is overlaid uniformly). Because the inbound
+/// `tls::SvidServerCertResolver` and the backend pools read that one slot /
+/// subscribe to `backend_svid_rotation_tx`, a rotation is picked up with no
+/// restart — the pool keys repartition on the bumped generation for free.
+///
+/// Fail-closed: an unreachable agent, a failed RPC, or a stream/parse error
+/// leaves the slot as-is (empty at startup → inbound mTLS fails closed) and the
+/// loop reconnects with capped exponential backoff. When `expected_spiffe_id`
+/// is set (`FERRUM_GATEWAY_SPIFFE_ID`) it pins the identity: a fetched SVID
+/// whose SPIFFE ID does not match is rejected (warned, not installed, readiness
+/// not signalled) so the gateway never serves an unexpected identity.
+///
+/// `first_ready` fires once, after the first usable SVID is installed, so the
+/// startup path can block until inbound mTLS can actually serve.
+async fn run_gateway_svid_workload_api_loop(
+    state: ProxyState,
+    socket_path: String,
+    expected_spiffe_id: Option<String>,
+    mut first_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    use crate::identity::workload_api::client::WorkloadApiClient;
+    // `futures_util::StreamExt` is already in module scope; use it for
+    // `stream.next()` rather than re-importing `tokio_stream::StreamExt` (which
+    // would make the call ambiguous).
+
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    let mut backoff = INITIAL_BACKOFF;
+    // Persists across reconnects: only the very first successful install is the
+    // initial load (no traffic to drain, no generation bump); every later one —
+    // including the first after a reconnect — is a real rotation.
+    let mut installed_once = false;
+
+    loop {
+        if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+            return;
+        }
+
+        match WorkloadApiClient::connect(socket_path.clone()).await {
+            Ok(mut client) => match client.fetch_x509_svid_stream().await {
+                Ok((mut stream, _first_signal)) => {
+                    info!(socket = %socket_path, "Gateway SVID Workload API stream established");
+                    backoff = INITIAL_BACKOFF;
+                    loop {
+                        let next = if let Some(rx) = shutdown_rx.as_mut() {
+                            tokio::select! {
+                                item = stream.next() => item,
+                                changed = rx.changed() => {
+                                    if changed.is_err() || *rx.borrow() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            }
+                        } else {
+                            stream.next().await
+                        };
+                        let Some(item) = next else {
+                            // Stream ended cleanly — reconnect.
+                            break;
+                        };
+                        match item {
+                            Ok(bundle) => {
+                                if let Some(expected) = expected_spiffe_id.as_deref()
+                                    && bundle.spiffe_id.as_str() != expected
+                                {
+                                    warn!(
+                                        expected = %expected,
+                                        got = %bundle.spiffe_id,
+                                        "Workload API returned an unexpected SPIFFE ID; \
+                                         rejecting SVID (FERRUM_GATEWAY_SPIFFE_ID identity pin)"
+                                    );
+                                    continue;
+                                }
+                                let spiffe_id = bundle.spiffe_id.to_string();
+                                state.install_gateway_runtime_svid_bundle(bundle);
+                                if installed_once {
+                                    state
+                                        .backend_svid_rotation_tx
+                                        .send_modify(|r| *r = r.saturating_add(1));
+                                    let revision = *state.backend_svid_rotation_tx.borrow();
+                                    info!(
+                                        spiffe_id = %spiffe_id,
+                                        svid_revision = revision,
+                                        "Gateway SVID rotated from Workload API"
+                                    );
+                                } else {
+                                    installed_once = true;
+                                    info!(
+                                        spiffe_id = %spiffe_id,
+                                        "Gateway SVID loaded from Workload API"
+                                    );
+                                }
+                                if let Some(tx) = first_ready.take() {
+                                    let _ = tx.send(());
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "Gateway SVID Workload API stream error; reconnecting"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        socket = %socket_path,
+                        "Gateway SVID Workload API stream RPC failed; retrying"
+                    );
+                }
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    socket = %socket_path,
+                    "Failed to connect to gateway SVID Workload API agent; retrying"
+                );
+            }
+        }
+
+        if let Some(rx) = shutdown_rx.as_mut() {
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                changed = rx.changed() => {
+                    if changed.is_err() || *rx.borrow() {
+                        return;
+                    }
+                }
+            }
+        } else {
+            tokio::time::sleep(backoff).await;
+        }
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
@@ -2997,16 +3145,27 @@ impl ProxyState {
             .store(self.gateway_file_svid_bundle.load_full());
     }
 
-    fn install_gateway_file_svid_bundle(&self, file_bundle: SvidBundle) {
+    /// Install a freshly-loaded gateway SVID as the new base identity and
+    /// publish the active bundle.
+    ///
+    /// Shared by both runtime SVID sources — the file watcher
+    /// (`run_gateway_svid_file_rotation_loop`) and the CA backend's Workload
+    /// API fetch loop (`run_gateway_svid_workload_api_loop`) — so the
+    /// CP-delivered trust-bundle override (`gateway_trust_bundles`) is overlaid
+    /// uniformly regardless of where the SVID came from. The raw base bundle is
+    /// stored in `gateway_file_svid_bundle` (the revert target used by
+    /// `clear_gateway_trust_bundles`); the active slot everyone reads gets the
+    /// base with any CP trust override merged in.
+    fn install_gateway_runtime_svid_bundle(&self, bundle: SvidBundle) {
         let _guard = self
             .gateway_svid_update_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         self.gateway_file_svid_bundle
-            .store(Arc::new(Some(file_bundle.clone())));
+            .store(Arc::new(Some(bundle.clone())));
 
-        let mut active_bundle = file_bundle;
+        let mut active_bundle = bundle;
         let trust_snapshot = self.gateway_trust_bundles.load_full();
         if let Some(trust_bundles) = trust_snapshot.as_ref() {
             active_bundle.trust_bundles = trust_bundles.clone();
@@ -3041,7 +3200,7 @@ impl ProxyState {
         )
         .map_err(|error| anyhow::anyhow!("failed to reload gateway SVID sources: {error}"))?;
         let spiffe_id = bundle.spiffe_id.to_string();
-        self.install_gateway_file_svid_bundle(bundle);
+        self.install_gateway_runtime_svid_bundle(bundle);
         self.backend_svid_rotation_tx
             .send_modify(|revision| *revision = revision.saturating_add(1));
         let revision = *self.backend_svid_rotation_tx.borrow();
@@ -3350,6 +3509,36 @@ impl ProxyState {
             paths,
             shutdown_rx,
         )))
+    }
+
+    /// Spawn the CA-backend (`FERRUM_MESH_CA_BACKEND=spire`) Workload API SVID
+    /// fetch loop, feeding the gateway SVID slot.
+    ///
+    /// Returns the task handle plus a receiver that fires once the first usable
+    /// SVID has been installed, so mesh startup can block until inbound mTLS can
+    /// actually serve before binding listeners. Mesh-only; the caller is
+    /// responsible for only invoking this when `mesh_ca_backend` is `spire` and
+    /// no file-based gateway SVID material is configured (the two are mutually
+    /// exclusive sources for the slot — enforced in `EnvConfig::validate`).
+    pub fn start_gateway_svid_workload_api_task(
+        &self,
+        socket_path: String,
+        expected_spiffe_id: Option<String>,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let state = self.clone();
+        let handle = tokio::spawn(run_gateway_svid_workload_api_loop(
+            state,
+            socket_path,
+            expected_spiffe_id,
+            Some(ready_tx),
+            shutdown_rx,
+        ));
+        (handle, ready_rx)
     }
 
     /// Construct the gateway state and start the health checker.
@@ -23556,7 +23745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_gateway_file_svid_bundle_preserves_cp_trust_override_until_clear() {
+    async fn install_gateway_runtime_svid_bundle_preserves_cp_trust_override_until_clear() {
         let state = make_test_proxy_state(make_validation_config(vec![]));
         let cp_trust = test_runtime_trust_bundles("cp.local", vec![vec![4, 5, 6]]);
         let first_file_svid = test_svid_bundle(test_runtime_trust_bundles(
@@ -23568,9 +23757,9 @@ mod tests {
             vec![vec![7, 8, 9]],
         ));
 
-        state.install_gateway_file_svid_bundle(first_file_svid);
+        state.install_gateway_runtime_svid_bundle(first_file_svid);
         state.update_gateway_trust_bundles(cp_trust);
-        state.install_gateway_file_svid_bundle(rotated_file_svid);
+        state.install_gateway_runtime_svid_bundle(rotated_file_svid);
 
         {
             let loaded = state.gateway_file_svid_bundle.load_full();

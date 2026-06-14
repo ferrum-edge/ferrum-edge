@@ -26,7 +26,9 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, oneshot, watch};
-use tokio_stream::wrappers::{IntervalStream, TcpListenerStream};
+use tokio_stream::wrappers::{
+    IntervalStream, TcpListenerStream, UnboundedReceiverStream, UnixListenerStream,
+};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -35,6 +37,14 @@ use ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequest};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
+use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::{
+    SpiffeWorkloadApi, SpiffeWorkloadApiServer,
+};
+use ferrum_edge::identity::workload_api::proto::{
+    JwtBundlesRequest, JwtBundlesResponse, JwtsvidRequest, JwtsvidResponse, ValidateJwtsvidRequest,
+    ValidateJwtsvidResponse, X509BundlesRequest, X509BundlesResponse, X509svid, X509svidRequest,
+    X509svidResponse,
+};
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshConfig, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication,
     PolicyAction, PolicyScope, PrincipalMatch, ServicePort, ServiceTargetPort, Workload,
@@ -1564,6 +1574,361 @@ async fn functional_mesh_inbound_server_identity_rotates_with_svid_files() {
     panic!(
         "mesh gateway never bound its inbound listener after {RETRY_ATTEMPTS} \
          attempts\n{last_failure}"
+    );
+}
+
+/// Mint a fresh server leaf (SPIFFE URI SAN + `127.0.0.1` SAN) signed by the
+/// shared test CA, returned as `(leaf_der, pkcs8_key_der)` — the wire shape the
+/// SPIFFE Workload API streams in an `X509SVID`. A fresh key each call means a
+/// rotation produces an observably different leaf, exactly like a real agent
+/// re-issuing the workload's SVID.
+fn mint_spire_server_leaf(
+    ca_pem: &str,
+    ca_key_pem: &str,
+    server_spiffe: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    use rcgen::{
+        CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose, SanType,
+    };
+    let ca_key = KeyPair::from_pem(ca_key_pem).expect("ca key from pem");
+    let issuer = Issuer::from_ca_cert_pem(ca_pem, ca_key).expect("issuer from ca pem");
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    let id = SpiffeId::new(server_spiffe).expect("valid SPIFFE ID");
+    params
+        .subject_alt_names
+        .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        )));
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+    params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+    let cert = params.signed_by(&key, &issuer).expect("leaf cert");
+    (cert.der().as_ref().to_vec(), key.serialize_der())
+}
+
+/// DER of the first certificate in a PEM bundle — the trust anchor the Workload
+/// API ships in `X509SVID.bundle`.
+fn ca_der_from_pem(ca_pem: &str) -> Vec<u8> {
+    rustls_pemfile::certs(&mut ca_pem.as_bytes())
+        .next()
+        .expect("at least one CA cert in PEM")
+        .expect("valid CA DER")
+        .as_ref()
+        .to_vec()
+}
+
+/// Build one `X509SVIDResponse` carrying a freshly-minted leaf + key + the CA
+/// trust bundle — the single-identity default response a SPIRE agent streams.
+fn build_stub_x509_response(
+    ca_pem: &str,
+    ca_key_pem: &str,
+    server_spiffe: &str,
+) -> X509svidResponse {
+    let (leaf_der, key_der) = mint_spire_server_leaf(ca_pem, ca_key_pem, server_spiffe);
+    X509svidResponse {
+        svids: vec![X509svid {
+            spiffe_id: server_spiffe.to_string(),
+            x509_svid: leaf_der,
+            x509_svid_key: key_der,
+            bundle: ca_der_from_pem(ca_pem),
+            hint: String::new(),
+        }],
+        crl: Vec::new(),
+        federated_bundles: HashMap::new(),
+    }
+}
+
+/// Minimal in-process SPIFFE Workload API server standing in for a SPIRE agent.
+/// `FetchX509SVID` streams an initial SVID immediately and pushes a freshly
+/// re-issued one every time `rotation_tx` is bumped; the other RPCs are
+/// unimplemented (the gateway only consumes the X.509 SVID stream).
+struct StubWorkloadApi {
+    ca_pem: String,
+    ca_key_pem: String,
+    server_spiffe: String,
+    rotation_tx: watch::Sender<u64>,
+}
+
+#[tonic::async_trait]
+impl SpiffeWorkloadApi for StubWorkloadApi {
+    type FetchX509SVIDStream =
+        Pin<Box<dyn Stream<Item = Result<X509svidResponse, Status>> + Send + 'static>>;
+
+    async fn fetch_x509svid(
+        &self,
+        _request: Request<X509svidRequest>,
+    ) -> Result<Response<Self::FetchX509SVIDStream>, Status> {
+        let ca_pem = self.ca_pem.clone();
+        let ca_key_pem = self.ca_key_pem.clone();
+        let server_spiffe = self.server_spiffe.clone();
+        let mut rotation_rx = self.rotation_tx.subscribe();
+
+        let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(Ok(build_stub_x509_response(
+            &ca_pem,
+            &ca_key_pem,
+            &server_spiffe,
+        )));
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = rotation_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = tx.closed() => return,
+                }
+                if tx
+                    .send(Ok(build_stub_x509_response(
+                        &ca_pem,
+                        &ca_key_pem,
+                        &server_spiffe,
+                    )))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(UnboundedReceiverStream::new(
+            out_rx,
+        ))))
+    }
+
+    type FetchX509BundlesStream =
+        Pin<Box<dyn Stream<Item = Result<X509BundlesResponse, Status>> + Send + 'static>>;
+
+    async fn fetch_x509_bundles(
+        &self,
+        _request: Request<X509BundlesRequest>,
+    ) -> Result<Response<Self::FetchX509BundlesStream>, Status> {
+        Err(Status::unimplemented("stub: fetch_x509_bundles"))
+    }
+
+    async fn fetch_jwtsvid(
+        &self,
+        _request: Request<JwtsvidRequest>,
+    ) -> Result<Response<JwtsvidResponse>, Status> {
+        Err(Status::unimplemented("stub: fetch_jwtsvid"))
+    }
+
+    type FetchJWTBundlesStream =
+        Pin<Box<dyn Stream<Item = Result<JwtBundlesResponse, Status>> + Send + 'static>>;
+
+    async fn fetch_jwt_bundles(
+        &self,
+        _request: Request<JwtBundlesRequest>,
+    ) -> Result<Response<Self::FetchJWTBundlesStream>, Status> {
+        Err(Status::unimplemented("stub: fetch_jwt_bundles"))
+    }
+
+    async fn validate_jwtsvid(
+        &self,
+        _request: Request<ValidateJwtsvidRequest>,
+    ) -> Result<Response<ValidateJwtsvidResponse>, Status> {
+        Err(Status::unimplemented("stub: validate_jwtsvid"))
+    }
+}
+
+struct StubWorkloadApiHandle {
+    rotation_tx: watch::Sender<u64>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+}
+
+impl StubWorkloadApiHandle {
+    /// Trigger a workload SVID rotation: existing `FetchX509SVID` streams push a
+    /// freshly re-issued leaf.
+    fn rotate(&self) {
+        self.rotation_tx.send_modify(|n| *n = n.saturating_add(1));
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        match tokio::time::timeout(Duration::from_secs(2), &mut self.task).await {
+            Ok(_) => {}
+            Err(_) => {
+                self.task.abort();
+                let _ = (&mut self.task).await;
+            }
+        }
+    }
+}
+
+/// Bind the stub Workload API server to `sock_path` and serve it until shutdown.
+async fn start_stub_workload_api(
+    sock_path: PathBuf,
+    ca_pem: String,
+    ca_key_pem: String,
+    server_spiffe: String,
+) -> StubWorkloadApiHandle {
+    let (rotation_tx, _) = watch::channel(0u64);
+    let stub = StubWorkloadApi {
+        ca_pem,
+        ca_key_pem,
+        server_spiffe,
+        rotation_tx: rotation_tx.clone(),
+    };
+    let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind stub workload API UDS");
+    let incoming = UnixListenerStream::new(listener);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SpiffeWorkloadApiServer::new(stub))
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    StubWorkloadApiHandle {
+        rotation_tx,
+        shutdown_tx: Some(shutdown_tx),
+        task,
+    }
+}
+
+/// F1 §2.1 keystone: with `FERRUM_MESH_CA_BACKEND=spire` (and no file-based
+/// gateway SVID material), the gateway fetches its own SVID from the SPIRE Agent
+/// Workload API and serves it as the inbound mTLS server identity — and that
+/// identity ROTATES LIVE. Production mode is on, so the startup readiness gate
+/// is fail-closed: the gateway only binds once the first SVID has arrived.
+///
+/// A real mTLS peer (shared-CA client SVID, server SPIFFE pinned) observes the
+/// presented leaf; after the stub agent re-issues the SVID, the inbound listener
+/// starts presenting the NEW leaf with no restart — proving the spire backend
+/// feeds the same live-rotating slot the file watcher does.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_inbound_identity_from_spire_workload_api_rotates() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-spire-ca-backend-{attempt}");
+        let temp = TempDir::new().expect("temp dir");
+        let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/server";
+        let peers = generate_mesh_peer_svids(
+            temp.path(),
+            server_spiffe,
+            "spiffe://cluster.local/ns/default/sa/client",
+        );
+        // In-process SPIRE-agent stand-in on a Unix socket the gateway dials.
+        let sock_path = temp.path().join("workload-api.sock");
+        let stub = start_stub_workload_api(
+            sock_path.clone(),
+            peers.ca_pem.clone(),
+            peers.ca_key_pem.clone(),
+            server_spiffe.to_string(),
+        )
+        .await;
+        let cp = start_static_mesh_cp(strict_peer_auth_slice(&node_id)).await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_MESH_CA_BACKEND", "spire".to_string()),
+                    (
+                        "FERRUM_MESH_SPIRE_AGENT_SOCKET",
+                        sock_path.to_str().expect("sock path utf8").to_string(),
+                    ),
+                    ("FERRUM_GATEWAY_SPIFFE_ID", server_spiffe.to_string()),
+                ],
+            },
+        );
+
+        if !wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: inbound listener never bound\n{}",
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            stub.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let client_identity = (
+            peers.client_cert_pem.as_str(),
+            peers.client_key_pem.as_str(),
+        );
+        let leaf_before =
+            mesh_inbound_server_leaf(inbound_port, &peers.ca_pem, server_spiffe, client_identity)
+                .await;
+        let leaf_before = match leaf_before {
+            Ok(leaf) => leaf,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                cp.shutdown().await;
+                stub.shutdown().await;
+                panic!("spire-backed startup leaf probe failed: {e}\n{output}");
+            }
+        };
+
+        // Rotate the workload SVID at the agent; the gateway's fetch loop should
+        // install the new leaf and the inbound listener present it — no restart.
+        stub.rotate();
+
+        let mut rotated_leaf: Option<Vec<u8>> = None;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            match mesh_inbound_server_leaf(
+                inbound_port,
+                &peers.ca_pem,
+                server_spiffe,
+                client_identity,
+            )
+            .await
+            {
+                Ok(leaf) if leaf != leaf_before => {
+                    rotated_leaf = Some(leaf);
+                    break;
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+        stub.shutdown().await;
+
+        assert!(
+            rotated_leaf.is_some(),
+            "inbound listener kept presenting the startup leaf for 10s after the SPIRE \
+             Workload API rotated the SVID; the spire CA backend must feed the live-rotating \
+             gateway SVID slot\n{output}"
+        );
+        return;
+    }
+
+    panic!(
+        "mesh gateway never bound its inbound listener after {RETRY_ATTEMPTS} attempts\n{last_failure}"
     );
 }
 
