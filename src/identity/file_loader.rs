@@ -165,7 +165,7 @@ fn read_pkcs8_key_source(source_value: &str) -> Result<Vec<u8>, SpiffeTlsError> 
     Ok(key.secret_pkcs8_der().to_vec())
 }
 
-fn validate_cert_is_current(cert_der: &[u8], label: &str) -> Result<(), SpiffeTlsError> {
+pub(crate) fn validate_cert_is_current(cert_der: &[u8], label: &str) -> Result<(), SpiffeTlsError> {
     let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
         SpiffeTlsError::BadKeyMaterial(format!("{label}: failed to parse certificate DER: {e}"))
     })?;
@@ -188,7 +188,7 @@ fn validate_cert_is_current(cert_der: &[u8], label: &str) -> Result<(), SpiffeTl
     }
 }
 
-fn validate_leaf_is_not_ca(leaf_der: &[u8]) -> Result<(), SpiffeTlsError> {
+pub(crate) fn validate_leaf_is_not_ca(leaf_der: &[u8]) -> Result<(), SpiffeTlsError> {
     let (_, leaf) = X509Certificate::from_der(leaf_der).map_err(|e| {
         SpiffeTlsError::BadKeyMaterial(format!("gateway SVID leaf certificate parse failed: {e}"))
     })?;
@@ -206,7 +206,7 @@ fn validate_leaf_is_not_ca(leaf_der: &[u8]) -> Result<(), SpiffeTlsError> {
     Ok(())
 }
 
-fn verify_leaf_key_match(leaf_der: &[u8], key_der: &[u8]) -> Result<(), SpiffeTlsError> {
+pub(crate) fn verify_leaf_key_match(leaf_der: &[u8], key_der: &[u8]) -> Result<(), SpiffeTlsError> {
     let (_, leaf) = X509Certificate::from_der(leaf_der).map_err(|e| {
         SpiffeTlsError::BadKeyMaterial(format!("gateway SVID leaf certificate parse failed: {e}"))
     })?;

@@ -270,6 +270,20 @@ fn svid_response_to_bundle(
         )));
     }
 
+    // Hold the streamed SVID to the same bar as the file-based loader
+    // (`load_svid_bundle_from_sources`): the leaf must be currently valid and not
+    // a CA, and the accompanying private key must match it. A SPIRE response that
+    // is expired / not-yet-valid, a CA cert, or whose key and leaf disagree would
+    // otherwise install and then fail every mesh-mTLS handshake — and, with the
+    // CA-backed inbound identity, as the served certificate too.
+    let leaf_der = &cert_chain_der[0];
+    crate::identity::file_loader::validate_cert_is_current(leaf_der, "SVID leaf certificate")
+        .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
+    crate::identity::file_loader::validate_leaf_is_not_ca(leaf_der)
+        .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
+    crate::identity::file_loader::verify_leaf_key_match(leaf_der, &first.x509_svid_key)
+        .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
+
     let local_bundle_der = split_concatenated_der(&first.bundle)
         .map_err(|e| WorkloadApiClientError::Rpc(format!("trust bundle parse failed: {e}")))?;
 
@@ -454,10 +468,16 @@ mod tests {
     // distinguishable by their cert/key bytes.
     fn test_x509_svid(spiffe_id: &str) -> X509svid {
         use crate::identity::spiffe::spiffe_id_to_san;
-        use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+        use rcgen::{CertificateParams, DistinguishedName, IsCa, KeyPair};
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
         let mut params = CertificateParams::default();
         params.distinguished_name = DistinguishedName::new();
+        // The bundle parser now enforces the same leaf checks as the file loader
+        // (currently-valid + non-CA + key match), so the fixture must be a current,
+        // non-CA leaf.
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
         let id = SpiffeId::new(spiffe_id).expect("valid SPIFFE ID");
         params
             .subject_alt_names

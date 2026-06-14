@@ -3443,25 +3443,30 @@ fn destination_rule_matches_upstream(dr: &MeshDestinationRule, upstream: &Upstre
 /// upstream with a non-mesh target), clearing the generic client material would
 /// let that target connect with no client cert instead of failing closed.
 fn upstream_uses_mesh_transport(upstream: &Upstream) -> bool {
-    // Mesh service-discovery upstreams carry NO materialized `targets` at slice
-    // apply — `service_discovery::mesh` populates them later and stamps the
-    // HBONE / SVID-mTLS transport tags. Recognize them up front by their
-    // `service_discovery.mesh` marker; otherwise a DestinationRule `ISTIO_MUTUAL`
-    // would take the generic fail-closed branch and reject the whole slice for an
-    // upstream that will in fact present the runtime SVID over a mesh transport.
-    if upstream
+    if !upstream.targets.is_empty() {
+        // Has materialized targets: EVERY one must use a mesh transport. A single
+        // non-mesh static target means generic backend TLS still applies to it, so
+        // the CA-backed mesh-transport classification must NOT short-circuit (it
+        // would clear that target's client cert/key and dispatch it without client
+        // mTLS). This holds even for a mesh service-discovery upstream that ALSO
+        // carries static fallback targets — service discovery merges those into the
+        // LB set unchanged (Codex: check static targets before allowing CA-backed
+        // ISTIO_MUTUAL).
+        return upstream.targets.iter().all(|t| {
+            crate::proxy::hbone_pool::target_hbone_enabled(t)
+                || crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(t)
+        });
+    }
+    // No materialized targets: a mesh service-discovery upstream resolves them at
+    // runtime (`service_discovery::mesh` stamps HBONE / SVID-mTLS tags), so
+    // recognize it as mesh transport up front — otherwise a DestinationRule
+    // `ISTIO_MUTUAL` would take the generic fail-closed branch and reject the whole
+    // slice for an upstream that will present the runtime SVID over HBONE.
+    upstream
         .service_discovery
         .as_ref()
         .and_then(|sd| sd.mesh.as_ref())
         .is_some()
-    {
-        return true;
-    }
-    !upstream.targets.is_empty()
-        && upstream.targets.iter().all(|t| {
-            crate::proxy::hbone_pool::target_hbone_enabled(t)
-                || crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(t)
-        })
 }
 
 fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &str) -> bool {
@@ -12136,6 +12141,55 @@ mod tests {
         // Generic client material is cleared — identity comes from the SVID slot.
         assert_eq!(upstream.backend_tls_client_cert_path, None);
         assert_eq!(upstream.backend_tls_client_key_path, None);
+    }
+
+    #[test]
+    fn dr_tls_istio_mutual_ca_backed_rejected_for_mesh_sd_with_static_non_mesh_target() {
+        // An SD-mesh upstream that ALSO carries a static, non-mesh-tagged fallback
+        // target must NOT be classified as all-mesh: service discovery merges that
+        // static target into the LB set unchanged, so it needs generic client mTLS.
+        // CA-backed ISTIO_MUTUAL must therefore fail closed rather than clear the
+        // generic client cert/key and dispatch that target without client auth
+        // (Codex: check static targets before allowing CA-backed ISTIO_MUTUAL).
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        // Keep the default static (non-mesh-tagged) target AND mark it mesh-SD.
+        upstream.service_discovery = Some(crate::config::types::ServiceDiscoveryConfig {
+            provider: crate::config::types::SdProvider::Mesh,
+            dns_sd: None,
+            kubernetes: None,
+            consul: None,
+            mesh: Some(crate::config::types::MeshSdConfig {
+                service_name: "reviews".to_string(),
+                namespace: Some("default".to_string()),
+                port: None,
+                poll_interval_seconds: 30,
+            }),
+            default_weight: 1,
+        });
+
+        let runtime = MeshRuntimeConfig {
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            workload_svid_trust_bundle_path: Some(
+                "/var/run/secrets/ferrum/trust-bundle.pem".to_string(),
+            ),
+            ca_backend: CaBackend::Internal,
+            ..test_mesh_runtime_config()
+        };
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::IstioMutual,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+
+        assert!(
+            apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime).is_err(),
+            "CA-backed ISTIO_MUTUAL must fail closed when an SD-mesh upstream also carries a \
+             static non-mesh target"
+        );
     }
 
     #[test]
