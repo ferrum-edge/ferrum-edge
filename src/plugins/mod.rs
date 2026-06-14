@@ -3018,6 +3018,16 @@ pub fn create_plugin_with_http_client(
             Ok(Some(Arc::new(plugin)))
         }
         _ => {
+            // Reserve retired security-plugin aliases before the custom plugin
+            // registry: a custom plugin sharing a retired name (e.g.
+            // `semantic_ai_firewall`) must not silently instantiate and bypass
+            // the fail-closed handling, which only fires on `Ok(None)` in
+            // `plugin_cache::try_create_plugin`. Returning `Ok(None)` here routes
+            // the retired name to that fatal fail-closed path regardless of any
+            // custom plugin registered under the same name.
+            if is_removed_security_plugin(name) {
+                return Ok(None);
+            }
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client)?;
             if result.is_none() {

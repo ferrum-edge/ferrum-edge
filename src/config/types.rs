@@ -1972,7 +1972,23 @@ pub fn anchor_regex_pattern(pattern: &str) -> String {
     if has_unescaped_trailing_dollar(core) {
         core = &core[..core.len() - 1];
     }
-    format!("^(?:{})$", core)
+    let wrapped = format!("^(?:{})$", core);
+    // In verbose mode `(?x)`, a trailing `#` line comment in the operator
+    // pattern (e.g. `~(?x)/foo$ # exact route`) swallows the closing `)$` we
+    // append, leaving the non-capturing group unclosed so the regex no longer
+    // compiles. Only when the plain wrap fails to compile AND terminating the
+    // comment with a newline before the close makes it compile do we use the
+    // newline form. Non-verbose patterns always compile plainly, so they never
+    // get the newline (which would otherwise be a literal `\n` that breaks
+    // matching). A genuinely invalid pattern still fails both and is rejected
+    // by the caller's compile check.
+    if Regex::new(&wrapped).is_err() {
+        let newline_wrapped = format!("^(?:{}\n)$", core);
+        if Regex::new(&newline_wrapped).is_ok() {
+            return newline_wrapped;
+        }
+    }
+    wrapped
 }
 
 fn has_unescaped_trailing_dollar(pattern: &str) -> bool {

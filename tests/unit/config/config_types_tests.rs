@@ -2551,6 +2551,26 @@ fn test_anchor_regex_pattern_wildcard_suffix_preserved() {
     );
 }
 
+#[test]
+fn test_anchor_regex_pattern_verbose_mode_trailing_comment_stays_valid() {
+    use ferrum_edge::config::types::anchor_regex_pattern;
+
+    // Verbose-mode `(?x)` pattern ending in a `#` line comment: the plain
+    // `^(?:...)$` wrap would leave the group unclosed (the comment swallows the
+    // appended `)$`), so the anchorer terminates the comment with a newline
+    // before the close. anchor_regex_pattern only returns this form when it
+    // compiles, so this also confirms the result is a valid regex.
+    assert_eq!(
+        anchor_regex_pattern("(?x)/foo$ # exact route"),
+        "^(?:(?x)/foo$ # exact route\n)$"
+    );
+
+    // Non-verbose patterns are untouched — no spurious newline (which would be
+    // a literal `\n` that breaks matching).
+    assert_eq!(anchor_regex_pattern("/users/[^/]+"), "^(?:/users/[^/]+)$");
+    assert_eq!(anchor_regex_pattern("/api|/admin"), "^(?:/api|/admin)$");
+}
+
 // ---- Stream proxy validation tests ----
 
 #[test]
