@@ -1409,6 +1409,7 @@ fn validate_client_cert(
 /// flushing the final handshake flight packets (CCS+Finished). So after seeing
 /// `Connected`, we must skip one Timeout and keep draining to capture those
 /// final packets.
+#[allow(clippy::too_many_arguments)]
 async fn drain_handshake_outputs(
     dtls: &mut Dtls,
     out_buf: &mut [u8],
