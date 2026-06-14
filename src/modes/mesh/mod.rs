@@ -3443,6 +3443,20 @@ fn destination_rule_matches_upstream(dr: &MeshDestinationRule, upstream: &Upstre
 /// upstream with a non-mesh target), clearing the generic client material would
 /// let that target connect with no client cert instead of failing closed.
 fn upstream_uses_mesh_transport(upstream: &Upstream) -> bool {
+    // Mesh service-discovery upstreams carry NO materialized `targets` at slice
+    // apply — `service_discovery::mesh` populates them later and stamps the
+    // HBONE / SVID-mTLS transport tags. Recognize them up front by their
+    // `service_discovery.mesh` marker; otherwise a DestinationRule `ISTIO_MUTUAL`
+    // would take the generic fail-closed branch and reject the whole slice for an
+    // upstream that will in fact present the runtime SVID over a mesh transport.
+    if upstream
+        .service_discovery
+        .as_ref()
+        .and_then(|sd| sd.mesh.as_ref())
+        .is_some()
+    {
+        return true;
+    }
     !upstream.targets.is_empty()
         && upstream.targets.iter().all(|t| {
             crate::proxy::hbone_pool::target_hbone_enabled(t)
@@ -6362,8 +6376,8 @@ async fn start_spire_agent_mesh_svid_source(
         let inbound_slot = inbound_slot.clone();
         let trust_overlay_slot = trust_overlay_slot.clone();
         move |bundle| {
-            state.install_gateway_runtime_svid_bundle(bundle.clone());
-            publish_runtime_svid_to_inbound_slot(&inbound_slot, &trust_overlay_slot, bundle);
+            state.install_gateway_runtime_svid_bundle(bundle);
+            publish_runtime_svid_to_inbound_slot(&state, &inbound_slot, &trust_overlay_slot);
         }
     });
     let fetch_config = crate::identity::workload_api::FetchLoopConfig {
@@ -6583,8 +6597,8 @@ async fn issue_and_install_mesh_ca_svid(
         }),
     };
     let installed_spiffe_id = bundle.spiffe_id.clone();
-    proxy_state.install_gateway_runtime_svid_bundle(bundle.clone());
-    publish_runtime_svid_to_inbound_slot(inbound_slot, trust_overlay_slot, bundle);
+    proxy_state.install_gateway_runtime_svid_bundle(bundle);
+    publish_runtime_svid_to_inbound_slot(proxy_state, inbound_slot, trust_overlay_slot);
     if publish_revision {
         proxy_state
             .backend_svid_rotation_tx
@@ -6605,11 +6619,29 @@ fn empty_mesh_inbound_trust_overlay_slot() -> SharedMeshInboundTrustOverlaySlot 
     Arc::new(arc_swap::ArcSwap::new(Arc::new(None)))
 }
 
+/// Republish the inbound SPIFFE verifier slot from the CURRENT runtime SVID plus
+/// the current accepted trust overlay.
+///
+/// Both the SVID rotation install path and the slice-apply staged publish call
+/// this, so it serializes on `gateway_svid_update_lock` (the same lock
+/// `install_gateway_runtime_svid_bundle` holds) and re-reads the latest SVID from
+/// `gateway_file_svid_bundle` under that lock rather than trusting a captured
+/// snapshot. Without this, a rotation that completes between a slice apply's
+/// staging and publish could be clobbered by the older staged SVID, leaving the
+/// inbound verifier pinned to stale (possibly near-expiry) cert/key + roots.
 fn publish_runtime_svid_to_inbound_slot(
+    proxy_state: &ProxyState,
     inbound_slot: &tls::SharedBundleSlot,
     trust_overlay_slot: &SharedMeshInboundTrustOverlaySlot,
-    mut bundle: crate::identity::SvidBundle,
 ) {
+    let _guard = proxy_state
+        .gateway_svid_update_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = proxy_state.gateway_file_svid_bundle.load_full();
+    let Some(mut bundle) = snapshot.as_ref().clone() else {
+        return;
+    };
     let trust_overlay = trust_overlay_slot.load_full();
     match trust_overlay.as_ref() {
         Some(overlay) => merge_trust_overlay_into_svid_bundle(&mut bundle, overlay),
@@ -7788,19 +7820,13 @@ fn publish_staged_spiffe_bundle(proxy_state: &ProxyState, staged: Option<StagedS
             trust_overlay_slot,
             trust_overlay,
         }) => {
+            // Publish the accepted trust overlay, then republish the inbound slot
+            // from the LATEST runtime SVID under the rotation lock (a CA rotation
+            // may have landed since this slice was staged). `publish_runtime_svid_to_inbound_slot`
+            // re-reads `gateway_file_svid_bundle` itself, so a rotation cannot be
+            // clobbered by a stale staged snapshot.
             trust_overlay_slot.store(Arc::new(trust_overlay));
-            let snapshot = proxy_state.gateway_file_svid_bundle.load_full();
-            match snapshot.as_ref().clone() {
-                Some(bundle) => {
-                    publish_runtime_svid_to_inbound_slot(&slot, &trust_overlay_slot, bundle);
-                }
-                None => {
-                    warn!(
-                        "Unable to publish mesh inbound SPIFFE trust overlay because no runtime \
-                         SVID bundle is loaded; keeping previous trust bundles"
-                    );
-                }
-            }
+            publish_runtime_svid_to_inbound_slot(proxy_state, &slot, &trust_overlay_slot);
         }
         None => {}
     }
@@ -12060,6 +12086,59 @@ mod tests {
     }
 
     #[test]
+    fn dr_tls_istio_mutual_ca_backed_allowed_for_mesh_service_discovery_upstream() {
+        // A mesh service-discovery upstream resolves its targets at runtime, so
+        // `targets` is EMPTY at slice apply (`service_discovery::mesh` stamps the
+        // HBONE transport tag later). `upstream_uses_mesh_transport` must still
+        // recognize it as a mesh transport up front — otherwise a CA-backed
+        // ISTIO_MUTUAL DR takes the generic fail-closed branch and rejects the
+        // whole slice for an upstream that will present the runtime SVID over
+        // HBONE (Codex #15).
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        upstream.targets.clear(); // mesh SD resolves targets at runtime
+        upstream.service_discovery = Some(crate::config::types::ServiceDiscoveryConfig {
+            provider: crate::config::types::SdProvider::Mesh,
+            dns_sd: None,
+            kubernetes: None,
+            consul: None,
+            mesh: Some(crate::config::types::MeshSdConfig {
+                service_name: "reviews".to_string(),
+                namespace: Some("default".to_string()),
+                port: None,
+                poll_interval_seconds: 30,
+            }),
+            default_weight: 1,
+        });
+        upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
+        upstream.backend_tls_client_key_path = Some("/existing/client.key".to_string());
+
+        let runtime = MeshRuntimeConfig {
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            workload_svid_trust_bundle_path: Some(
+                "/var/run/secrets/ferrum/trust-bundle.pem".to_string(),
+            ),
+            ca_backend: CaBackend::Internal,
+            ..test_mesh_runtime_config()
+        };
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::IstioMutual,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime).expect(
+            "CA-backed ISTIO_MUTUAL is allowed for mesh service-discovery upstreams (targets resolved at runtime)",
+        );
+        // Generic client material is cleared — identity comes from the SVID slot.
+        assert_eq!(upstream.backend_tls_client_cert_path, None);
+        assert_eq!(upstream.backend_tls_client_key_path, None);
+    }
+
+    #[test]
     fn dr_tls_sni_and_sans_project_onto_upstream() {
         let mut upstream =
             destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
@@ -16088,11 +16167,7 @@ mod tests {
         );
 
         state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![9]]));
-        publish_runtime_svid_to_inbound_slot(
-            &inbound_slot,
-            &overlay_slot,
-            svid_bundle(vec![vec![9]]),
-        );
+        publish_runtime_svid_to_inbound_slot(&state, &inbound_slot, &overlay_slot);
         publish_staged_spiffe_bundle(&state, staged);
 
         let active = inbound_slot.load_full();

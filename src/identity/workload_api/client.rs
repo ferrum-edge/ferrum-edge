@@ -251,6 +251,25 @@ fn svid_response_to_bundle(
         ));
     }
 
+    // Pin the protobuf `X509SVID.spiffe_id` field to the actual leaf certificate's
+    // URI SAN. They must agree: `SvidBundle.spiffe_id` drives HBONE / source
+    // identity and the configured-workload pin, while peers authenticate against
+    // the leaf the TLS handshake presents. A response whose field matches but
+    // whose leaf SAN differs would let those two identities diverge, so reject it
+    // before the bundle is installed.
+    let leaf_spiffe_id = crate::identity::spiffe::extract_spiffe_id_from_cert(&cert_chain_der[0])
+        .map_err(|e| {
+        WorkloadApiClientError::Rpc(format!(
+            "SVID leaf certificate has no usable SPIFFE URI SAN: {e}"
+        ))
+    })?;
+    if leaf_spiffe_id != spiffe_id {
+        return Err(WorkloadApiClientError::Rpc(format!(
+            "SVID leaf certificate SPIFFE ID '{leaf_spiffe_id}' does not match the X509SVID \
+             spiffe_id field '{spiffe_id}'"
+        )));
+    }
+
     let local_bundle_der = split_concatenated_der(&first.bundle)
         .map_err(|e| WorkloadApiClientError::Rpc(format!("trust bundle parse failed: {e}")))?;
 
@@ -428,12 +447,27 @@ mod tests {
         assert!(split_concatenated_der(&blob).is_err());
     }
 
-    fn test_x509_svid(spiffe_id: &str, marker: u8) -> X509svid {
+    // Mint a real self-signed leaf carrying `spiffe_id` as a URI SAN. The bundle
+    // parser now verifies the leaf's SAN against the protobuf `spiffe_id` field
+    // (identity-divergence guard), so the fixture must be a genuine certificate,
+    // not an ASN.1 stub. Each call uses a fresh key, so distinct SVIDs are
+    // distinguishable by their cert/key bytes.
+    fn test_x509_svid(spiffe_id: &str) -> X509svid {
+        use crate::identity::spiffe::spiffe_id_to_san;
+        use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        let id = SpiffeId::new(spiffe_id).expect("valid SPIFFE ID");
+        params
+            .subject_alt_names
+            .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+        let cert = params.self_signed(&key).expect("self-signed leaf");
         X509svid {
             spiffe_id: spiffe_id.to_string(),
-            x509_svid: vec![0x30, 0x02, 0x04, marker],
-            x509_svid_key: vec![marker],
-            bundle: vec![0x30, 0x02, 0x04, marker],
+            x509_svid: cert.der().as_ref().to_vec(),
+            x509_svid_key: key.serialize_der(),
+            bundle: cert.der().as_ref().to_vec(),
             hint: String::new(),
         }
     }
@@ -441,11 +475,12 @@ mod tests {
     #[test]
     fn selects_configured_spiffe_id_from_multi_svid_response() {
         let expected = SpiffeId::new("spiffe://td/ns/default/sa/edge").unwrap();
+        let first = test_x509_svid("spiffe://td/ns/default/sa/first");
+        let wanted = test_x509_svid(expected.as_str());
+        let wanted_leaf = wanted.x509_svid.clone();
+        let wanted_key = wanted.x509_svid_key.clone();
         let response = X509svidResponse {
-            svids: vec![
-                test_x509_svid("spiffe://td/ns/default/sa/first", 1),
-                test_x509_svid(expected.as_str(), 2),
-            ],
+            svids: vec![first, wanted],
             crl: Vec::new(),
             federated_bundles: Default::default(),
         };
@@ -453,15 +488,15 @@ mod tests {
         let bundle = svid_response_to_bundle(response, Some(&expected)).expect("selected bundle");
 
         assert_eq!(bundle.spiffe_id, expected);
-        assert_eq!(bundle.cert_chain_der, vec![vec![0x30, 0x02, 0x04, 2]]);
-        assert_eq!(bundle.private_key_pkcs8_der, vec![2]);
+        assert_eq!(bundle.cert_chain_der, vec![wanted_leaf]);
+        assert_eq!(bundle.private_key_pkcs8_der, wanted_key);
     }
 
     #[test]
     fn rejects_multi_svid_response_without_configured_spiffe_id() {
         let expected = SpiffeId::new("spiffe://td/ns/default/sa/missing").unwrap();
         let response = X509svidResponse {
-            svids: vec![test_x509_svid("spiffe://td/ns/default/sa/first", 1)],
+            svids: vec![test_x509_svid("spiffe://td/ns/default/sa/first")],
             crl: Vec::new(),
             federated_bundles: Default::default(),
         };
