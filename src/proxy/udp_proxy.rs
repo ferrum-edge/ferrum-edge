@@ -170,8 +170,8 @@ type PendingSessionMap = Arc<DashMap<SocketAddr, PendingDatagramQueue, ahash::Ra
 const PENDING_SESSION_MAX_QUEUED_DATAGRAMS: usize = 16;
 
 /// Maximum total bytes queued per pending session. Together with
-/// `max_sessions` (the slot reservation taken before the gate is inserted)
-/// this bounds worst-case pending-queue memory to
+/// `FERRUM_UDP_MAX_SESSIONS` (also used to cap pending gates) this bounds
+/// worst-case pending-queue memory to
 /// `max_sessions * PENDING_SESSION_MAX_QUEUED_BYTES`, so a spoofed-source
 /// flood cannot grow memory past the same flood bound that limits sessions.
 const PENDING_SESSION_MAX_QUEUED_BYTES: usize = 16 * 1024;
@@ -326,6 +326,29 @@ fn cached_backend_dtls_config(
     let cached = Arc::new(params);
     let entry = cache.entries.entry(key).or_insert_with(|| cached.clone());
     Ok(entry.value().as_ref().clone())
+}
+
+/// Insert a pending-session gate for a new source without consuming an active
+/// session slot. The active slot is reserved only after first-datagram plugin
+/// checks and mesh destination enforcement admit the flow.
+fn try_insert_pending_session_gate(
+    pending_sessions: &PendingSessionMap,
+    client_addr: SocketAddr,
+    max_sessions: usize,
+) -> Result<bool, anyhow::Error> {
+    if pending_sessions.len() >= max_sessions {
+        return Err(anyhow::anyhow!(
+            "UDP pending session limit reached ({}), dropping datagram",
+            max_sessions
+        ));
+    }
+    match pending_sessions.entry(client_addr) {
+        dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            vacant.insert(PendingDatagramQueue::default());
+            Ok(true)
+        }
+    }
 }
 
 /// Atomically either remove the pending gate (when its queue is observed
@@ -1556,19 +1579,14 @@ async fn process_datagram(
     };
 
     let Some(session) = existing_session else {
-        let reservation = reserve_udp_session_slot(metrics, max_sessions)?;
-        match pending_sessions.entry(client_addr) {
-            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
-                // Defensive: a gate appeared after the check at the top of
-                // this function (not expected — the recv loop is a single
-                // task). Treat this datagram as a follow-up for the in-flight
-                // setup; the dropped `reservation` releases the extra slot.
-                let _ = occupied.get_mut().push_bounded(data);
-                return Ok(());
+        if !try_insert_pending_session_gate(pending_sessions, client_addr, max_sessions)? {
+            // Defensive: a gate appeared after the check at the top of this
+            // function (not expected — the recv loop is a single task). Treat
+            // this datagram as a follow-up for the in-flight setup.
+            if let Some(mut pending) = pending_sessions.get_mut(&client_addr) {
+                let _ = pending.push_bounded(data);
             }
-            dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                vacant.insert(PendingDatagramQueue::default());
-            }
+            return Ok(());
         }
         spawn_new_session_datagram(
             data.to_vec(),
@@ -1594,7 +1612,7 @@ async fn process_datagram(
             global_shutdown.cloned(),
             Arc::clone(overload),
             Arc::clone(mesh_outbound_enforcement),
-            reservation,
+            max_sessions,
         );
         return Ok(());
     };
@@ -1657,7 +1675,7 @@ fn spawn_new_session_datagram(
     overload: Arc<crate::overload::OverloadState>,
     mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
-    reservation: UdpSessionSlotReservation,
+    max_sessions: usize,
 ) {
     tokio::spawn(async move {
         // The gate removes the pending entry (dropping any queued follow-up
@@ -1693,7 +1711,7 @@ fn spawn_new_session_datagram(
             global_shutdown.as_ref(),
             &overload,
             &mesh_outbound_enforcement,
-            reservation,
+            max_sessions,
             gate,
         )
         .await;
@@ -1729,7 +1747,7 @@ async fn process_new_session_datagram(
     overload: &Arc<crate::overload::OverloadState>,
     mesh_outbound_enforcement:
         &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
-    mut reservation: UdpSessionSlotReservation,
+    max_sessions: usize,
     mut gate: PendingSessionGate,
 ) -> Result<(), anyhow::Error> {
     if sessions.contains_key(&client_addr) {
@@ -1790,6 +1808,8 @@ async fn process_new_session_datagram(
             Decision::Skip => {}
         }
     }
+
+    let mut reservation = reserve_udp_session_slot(metrics, max_sessions)?;
 
     let session = create_session(
         &epoch,
@@ -4432,6 +4452,29 @@ backend_tls_verify_server_cert: false
         assert!(
             pending.contains_key(&addr),
             "disarmed gate must not touch the map"
+        );
+    }
+
+    #[test]
+    fn pending_session_gate_limit_does_not_consume_active_session_slots() {
+        let pending = test_pending_map();
+        let metrics = Arc::new(super::UdpProxyMetrics::default());
+        let first = test_client_addr();
+        let second: SocketAddr = "127.0.0.1:40001".parse().expect("valid addr");
+
+        assert!(super::try_insert_pending_session_gate(&pending, first, 1).unwrap());
+        let err = super::try_insert_pending_session_gate(&pending, second, 1)
+            .expect_err("second pending gate should hit pending limit");
+
+        assert!(
+            err.to_string()
+                .contains("UDP pending session limit reached"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            metrics.active_sessions.load(Ordering::Relaxed),
+            0,
+            "pending gates must not consume active session capacity before policy checks pass"
         );
     }
 
