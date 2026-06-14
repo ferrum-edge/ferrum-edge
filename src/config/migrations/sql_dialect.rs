@@ -80,6 +80,22 @@ impl V001SqlBuilder {
         Ok(())
     }
 
+    pub(super) async fn ensure_consumer_credential_index(
+        &self,
+        pool: &AnyPool,
+    ) -> Result<(), anyhow::Error> {
+        self.enable_sqlite_foreign_keys(pool).await?;
+        sqlx::query(self.create_consumer_credential_index_sql())
+            .execute(pool)
+            .await?;
+        self.execute_index_sql(
+            pool,
+            "CREATE INDEX IF NOT EXISTS idx_consumer_credential_index_consumer_id ON consumer_credential_index (consumer_id)",
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn enable_sqlite_foreign_keys(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
         if self.is_sqlite() {
             sqlx::query("PRAGMA foreign_keys = ON")

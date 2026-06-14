@@ -1,6 +1,8 @@
 //! Tests for database migration runner
 
 use ferrum_edge::config::migrations::MigrationRunner;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 /// Create a single-connection SQLite in-memory pool for testing.
@@ -26,6 +28,12 @@ async fn get_index_names(pool: &sqlx::AnyPool) -> Vec<String> {
     rows.iter()
         .map(|r| r.try_get::<String, _>("name").unwrap())
         .collect()
+}
+
+fn credential_hash(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Compound and junction-table indexes created by V001.
@@ -69,6 +77,94 @@ async fn test_migration_runner_fresh_database() {
             expected,
             index_names
         );
+    }
+}
+
+#[tokio::test]
+async fn test_v001_reconciles_credential_index_for_upgraded_database() {
+    let pool = test_pool().await;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE _ferrum_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL,
+            checksum TEXT NOT NULL,
+            execution_time_ms INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO _ferrum_migrations \
+         (version, name, applied_at, checksum, execution_time_ms) VALUES (1, 'initial_schema', 'now', 'legacy', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        CREATE TABLE consumers (
+            id TEXT PRIMARY KEY,
+            namespace TEXT NOT NULL DEFAULT 'ferrum',
+            username TEXT NOT NULL,
+            custom_id TEXT,
+            credentials TEXT NOT NULL DEFAULT '{}',
+            acl_groups TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let credentials = json!({
+        "keyauth": [{ "key": "legacy-key" }],
+        "mtls_auth": [{ "identity": "spiffe://example.test/ns/default/sa/legacy" }]
+    });
+    sqlx::query(
+        "INSERT INTO consumers \
+         (id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("legacy-consumer")
+    .bind("ferrum")
+    .bind("legacy")
+    .bind(None::<String>)
+    .bind(credentials.to_string())
+    .bind("[]")
+    .bind("now")
+    .bind("now")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let applied = runner.run_pending().await.unwrap();
+    assert!(applied.is_empty());
+
+    for (credential_type, value) in [
+        ("keyauth", "legacy-key"),
+        ("mtls_auth", "spiffe://example.test/ns/default/sa/legacy"),
+    ] {
+        let consumer_id: String = sqlx::query(
+            "SELECT consumer_id FROM consumer_credential_index \
+             WHERE namespace = ? AND credential_type = ? AND credential_hash = ?",
+        )
+        .bind("ferrum")
+        .bind(credential_type)
+        .bind(credential_hash(value))
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get("consumer_id")
+        .unwrap();
+        assert_eq!(consumer_id, "legacy-consumer");
     }
 }
 

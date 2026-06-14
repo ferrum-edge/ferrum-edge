@@ -2,6 +2,8 @@ pub(crate) mod sql_dialect;
 pub mod v001_initial_schema;
 
 use chrono::Utc;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::any::AnyRow;
 use sqlx::{AnyPool, Row};
 use std::time::Instant;
@@ -186,6 +188,101 @@ impl MigrationRunner {
         }
     }
 
+    /// Return SQL with PostgreSQL bind placeholders when needed.
+    fn q(&self, sql: &str) -> String {
+        if self.db_type != "postgres" {
+            return sql.to_string();
+        }
+
+        let mut result = String::with_capacity(sql.len() + 16);
+        let mut n = 0u32;
+        for ch in sql.chars() {
+            if ch == '?' {
+                n += 1;
+                result.push('$');
+                result.push_str(&n.to_string());
+            } else {
+                result.push(ch);
+            }
+        }
+        result
+    }
+
+    fn credential_value_hash(value: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    fn indexed_credentials(
+        credentials: &str,
+    ) -> Result<Vec<(&'static str, String)>, anyhow::Error> {
+        let parsed: Value = serde_json::from_str(credentials)?;
+        let mut entries = Vec::new();
+
+        if let Some(keyauth_entries) = parsed.get("keyauth").and_then(Value::as_array) {
+            for entry in keyauth_entries {
+                if let Some(key) = entry.get("key").and_then(Value::as_str) {
+                    entries.push(("keyauth", Self::credential_value_hash(key)));
+                }
+            }
+        }
+
+        if let Some(mtls_entries) = parsed.get("mtls_auth").and_then(Value::as_array) {
+            for entry in mtls_entries {
+                if let Some(identity) = entry.get("identity").and_then(Value::as_str) {
+                    entries.push(("mtls_auth", Self::credential_value_hash(identity)));
+                }
+            }
+        }
+
+        entries.sort();
+        entries.dedup();
+        Ok(entries)
+    }
+
+    /// Ensure the credential index folded into V001 exists and is complete.
+    ///
+    /// During build-out, new core schema is still folded into V001. Existing
+    /// deployments may already have V001 recorded, so the normal pending
+    /// migration loop will skip the V001 table list. Rebuilding this derived
+    /// table on every migration run keeps upgraded SQL stores safe without
+    /// introducing a new core migration version.
+    async fn reconcile_consumer_credential_index(&self) -> Result<(), anyhow::Error> {
+        sql_dialect::V001SqlBuilder::new(&self.db_type)
+            .ensure_consumer_credential_index(&self.pool)
+            .await?;
+
+        let rows: Vec<AnyRow> = sqlx::query("SELECT id, namespace, credentials FROM consumers")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let delete_sql = self.q("DELETE FROM consumer_credential_index");
+        let insert_sql = self.q("INSERT INTO consumer_credential_index \
+             (namespace, credential_type, credential_hash, consumer_id) VALUES (?, ?, ?, ?)");
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&delete_sql).execute(&mut *tx).await?;
+
+        for row in rows {
+            let consumer_id: String = row.try_get("id")?;
+            let namespace: String = row.try_get("namespace")?;
+            let credentials: String = row.try_get("credentials")?;
+
+            for (credential_type, credential_hash) in Self::indexed_credentials(&credentials)? {
+                sqlx::query(&insert_sql)
+                    .bind(&namespace)
+                    .bind(credential_type)
+                    .bind(&credential_hash)
+                    .bind(&consumer_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Get all applied migration versions from the tracking table.
     async fn applied_versions(&self) -> Result<Vec<MigrationRecord>, anyhow::Error> {
         let rows: Vec<AnyRow> =
@@ -275,6 +372,8 @@ impl MigrationRunner {
 
             newly_applied.push(record);
         }
+
+        self.reconcile_consumer_credential_index().await?;
 
         Ok(newly_applied)
     }
