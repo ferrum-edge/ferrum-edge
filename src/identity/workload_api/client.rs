@@ -286,6 +286,17 @@ fn svid_response_to_bundle(
 
     let local_bundle_der = split_concatenated_der(&first.bundle)
         .map_err(|e| WorkloadApiClientError::Rpc(format!("trust bundle parse failed: {e}")))?;
+    // Reject an empty local trust bundle the same way the file loader does (its
+    // `read_cert_chain_source` errors on no certs). An SVID with no roots cannot
+    // verify peers, so installing it would let STRICT inbound and HBONE/mesh-mTLS
+    // handshakes fail after listeners bind rather than failing closed here.
+    if local_bundle_der.is_empty() {
+        return Err(WorkloadApiClientError::Rpc(
+            "Workload API X509SVID has an empty trust bundle (no root certificates); peers \
+             cannot be verified"
+                .into(),
+        ));
+    }
 
     let mut trust_bundles = TrustBundleSet {
         local: TrustBundle {
@@ -526,6 +537,26 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("did not include configured SPIFFE ID")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_workload_api_trust_bundle() {
+        // An SVID whose local trust bundle has no roots cannot verify peers; reject
+        // it before install, matching the file loader.
+        let expected = SpiffeId::new("spiffe://td/ns/default/sa/edge").unwrap();
+        let mut svid = test_x509_svid(expected.as_str());
+        svid.bundle = Vec::new();
+        let response = X509svidResponse {
+            svids: vec![svid],
+            crl: Vec::new(),
+            federated_bundles: Default::default(),
+        };
+
+        let err = svid_response_to_bundle(response, Some(&expected)).unwrap_err();
+        assert!(
+            err.to_string().contains("empty trust bundle"),
+            "expected empty-trust-bundle rejection, got: {err}"
         );
     }
 }
