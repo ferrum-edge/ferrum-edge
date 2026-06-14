@@ -3429,18 +3429,25 @@ fn destination_rule_matches_upstream(dr: &MeshDestinationRule, upstream: &Upstre
         || destination_rule_host_matches(&dr.host, &dr.namespace, &upstream.id)
 }
 
-/// True when this upstream's egress transport is HBONE or Sidecar mTLS, which
-/// source the client cert from the shared gateway SVID slot (gateway_svid_bundle)
-/// rather than the generic backend_tls_client_cert_path fields. For such
-/// upstreams a CA-backed dynamic SVID CAN back ISTIO_MUTUAL, so the generic
-/// "can't present a dynamic client cert" fail-closed must NOT apply.
+/// True when EVERY target of this upstream dispatches through an SVID-backed
+/// mesh transport (HBONE or Sidecar mTLS), which source the client cert from the
+/// shared gateway SVID slot (gateway_svid_bundle) rather than the generic
+/// backend_tls_client_cert_path fields. For such upstreams a CA-backed dynamic
+/// SVID CAN back ISTIO_MUTUAL, so the generic "can't present a dynamic client
+/// cert" fail-closed must NOT apply.
+///
+/// Uses the same value-aware predicates as runtime dispatch
+/// (`target_hbone_enabled` / `target_mesh_mtls_enabled`, which require a
+/// boolish-true tag value), and requires ALL targets to qualify: if any target
+/// would fall back to the generic backend (a `mesh.hbone=false` tag, or a mixed
+/// upstream with a non-mesh target), clearing the generic client material would
+/// let that target connect with no client cert instead of failing closed.
 fn upstream_uses_mesh_transport(upstream: &Upstream) -> bool {
-    upstream.targets.iter().any(|t| {
-        t.tags
-            .contains_key(crate::proxy::hbone_pool::HBONE_TARGET_TAG)
-            || t.tags
-                .contains_key(crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG)
-    })
+    !upstream.targets.is_empty()
+        && upstream.targets.iter().all(|t| {
+            crate::proxy::hbone_pool::target_hbone_enabled(t)
+                || crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(t)
+        })
 }
 
 fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &str) -> bool {

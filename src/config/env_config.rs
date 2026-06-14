@@ -3366,12 +3366,52 @@ impl EnvConfig {
                         "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
                     )
                     .filter(|value| !value.trim().is_empty());
-                    if workload_spiffe_id.is_none() {
-                        return Err(
-                            "FERRUM_MESH_CA_BACKEND requires FERRUM_MESH_WORKLOAD_SPIFFE_ID so \
-                             the issued runtime SVID matches the local mesh workload identity"
-                                .into(),
-                        );
+                    match workload_spiffe_id {
+                        None => {
+                            return Err(
+                                "FERRUM_MESH_CA_BACKEND requires FERRUM_MESH_WORKLOAD_SPIFFE_ID so \
+                                 the issued runtime SVID matches the local mesh workload identity"
+                                    .into(),
+                            );
+                        }
+                        Some(id) => {
+                            // Parse it exactly like startup's
+                            // `configured_mesh_workload_spiffe_id` so `validate`
+                            // and mesh startup agree: a non-SPIFFE value (e.g.
+                            // `not-a-spiffe-id`) must fail here, not silently pass
+                            // settings validation then abort at boot.
+                            crate::identity::SpiffeId::new(id).map_err(|e| {
+                                format!(
+                                    "FERRUM_MESH_WORKLOAD_SPIFFE_ID must be a valid SPIFFE URI when \
+                                     FERRUM_MESH_CA_BACKEND is enabled: {e}"
+                                )
+                            })?;
+                        }
+                    }
+                    // Mirror `bootstrap_dev_root`'s refusal so `validate` agrees
+                    // with startup: the internal self-signed CA only bootstraps in
+                    // non-production with FERRUM_MESH_CA_BOOTSTRAP_DEV=true. Without
+                    // this, `validate` reports OK for an internal-CA mesh that
+                    // cannot actually start.
+                    if mesh_ca_backend == crate::identity::ca::CaBackend::Internal {
+                        if crate::identity::production_mode() {
+                            return Err(
+                                "FERRUM_MESH_CA_BACKEND=internal cannot bootstrap a self-signed root \
+                                 under FERRUM_MESH_PRODUCTION_MODE=true; use file-based \
+                                 FERRUM_GATEWAY_SVID_* material or FERRUM_MESH_CA_BACKEND=spire"
+                                    .into(),
+                            );
+                        }
+                        let bootstrap_dev = std::env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV")
+                            .map(|v| v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false);
+                        if !bootstrap_dev {
+                            return Err(
+                                "FERRUM_MESH_CA_BACKEND=internal requires FERRUM_MESH_CA_BOOTSTRAP_DEV=true \
+                                 (dev/test only) to bootstrap its self-signed root"
+                                    .into(),
+                            );
+                        }
                     }
                 }
                 // Validate the production-mode flag value loudly — like
