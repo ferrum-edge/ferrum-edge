@@ -198,6 +198,8 @@ Set `frontend_tls: true` on a UDP proxy to accept DTLS-encrypted connections fro
 
 Like TCP+TLS, frontend DTLS handshakes complete before backend session creation. `on_stream_connect` plugins run after DTLS accept with client certificate context available when DTLS mTLS is enabled; handshake failures and plugin rejections do not create backend UDP or DTLS sessions.
 
+Frontend DTLS uses `dimpl`, which currently surfaces only the client leaf certificate to Ferrum. Stream plugins receive that leaf in `StreamConnectionContext.tls_client_cert_der`; `tls_client_cert_chain_der` remains `None` for DTLS even when the client sent intermediates. Configure `FERRUM_DTLS_CLIENT_CA_CERT_PATH` with the CA/intermediate certificates needed to validate client leaves.
+
 ```yaml
 proxies:
   - id: "secure-iot-frontend"

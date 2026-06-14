@@ -1264,6 +1264,8 @@ Exported spans include OTel semantic convention attributes, gateway-specific att
 
 Authenticates requests using the client's TLS/DTLS certificate, matching a configurable certificate field against consumer credentials. On TCP stream proxies, it runs in `on_stream_connect` after the frontend TLS handshake. On UDP stream proxies, it runs after the frontend DTLS handshake completes. In both cases, the client certificate is mapped to a Consumer before later stream plugins run.
 
+For UDP+DTLS frontends, the underlying DTLS library exposes only the client leaf certificate to Ferrum. Chain-based plugin inputs such as `tls_client_cert_chain_der` are therefore unavailable on DTLS streams; configure the DTLS client CA bundle with any intermediate certificates needed for handshake validation.
+
 **Priority:** 950
 
 | Parameter | Type | Default | Description |
@@ -1299,6 +1301,8 @@ config:
 
 **CA Fingerprint Filtering:**
 When `allowed_ca_fingerprints_sha256` is configured, at least one certificate in the client's TLS chain must match a configured SHA-256 fingerprint. When both `allowed_issuers` and `allowed_ca_fingerprints_sha256` are configured, both constraints must pass (AND logic).
+
+On UDP+DTLS streams this filter can only evaluate the exposed client leaf certificate, because DTLS chain certificates are not available in the stream plugin context.
 
 Issuer-constraint rejection bodies are always emitted as valid JSON even when certificate subject fields contain quotes, newlines, or other control characters.
 

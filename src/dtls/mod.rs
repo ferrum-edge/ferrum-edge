@@ -585,11 +585,13 @@ pub struct DtlsServerConn {
     app_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Signal this connection's driver task to shut down.
     shutdown_tx: mpsc::Sender<()>,
-    /// DER-encoded client certificate from the DTLS handshake (first cert in chain).
+    /// DER-encoded client leaf certificate from the DTLS handshake.
     /// Populated when the client presents a certificate during mutual DTLS authentication.
     pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
-    /// DER-encoded intermediate/CA certificates from the client's certificate chain
-    /// (all certs after the peer cert). `None` when no chain certs were sent.
+    /// Always `None` for the current dimpl-backed DTLS path: dimpl 0.6.1
+    /// exposes only the peer leaf through `Output::PeerCert`, not the
+    /// intermediate chain. The field remains for stream-plugin context parity
+    /// with TCP/TLS frontends.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     /// SNI hostname extracted from the initial DTLS ClientHello, if supplied.
     pub sni_hostname: Option<String>,
@@ -967,10 +969,9 @@ impl DtlsServer {
             let mut out_buf = vec![0u8; dtls_buf_config().output_buf_size];
             let mut next_timeout: Option<Instant> = None;
             let mut connected = false;
-            // Collect client certificate DER bytes emitted via Output::PeerCert
-            // during the DTLS handshake. The first cert is the peer cert, the
-            // rest are intermediates/CA chain certs.
-            let mut peer_cert_ders: Vec<Vec<u8>> = Vec::new();
+            // dimpl 0.6.1 emits only the peer leaf via Output::PeerCert, not
+            // the rest of the client certificate chain.
+            let mut peer_cert_der: Option<Arc<Vec<u8>>> = None;
             // Whether a client certificate was actually presented AND verified
             // against the configured client CA during the handshake. dimpl's
             // `require_client_certificate(true)` only makes the server SEND a
@@ -1129,24 +1130,12 @@ impl DtlsServer {
                             let Some(rx) = app_out_rx.take() else {
                                 continue; // Already connected — should not happen
                             };
-                            // Extract collected client certificates: first = peer cert, rest = chain
-                            let (peer_cert, chain_certs) = if peer_cert_ders.is_empty() {
-                                (None, None)
-                            } else {
-                                let peer = Arc::new(peer_cert_ders[0].clone());
-                                let chain = if peer_cert_ders.len() > 1 {
-                                    Some(Arc::new(peer_cert_ders[1..].to_vec()))
-                                } else {
-                                    None
-                                };
-                                (Some(peer), chain)
-                            };
                             let conn = DtlsServerConn {
                                 app_tx: app_in_tx.clone(),
                                 app_rx: tokio::sync::Mutex::new(rx),
                                 shutdown_tx: shutdown_tx.clone(),
-                                tls_client_cert_der: peer_cert,
-                                tls_client_cert_chain_der: chain_certs,
+                                tls_client_cert_der: peer_cert_der.clone(),
+                                tls_client_cert_chain_der: None,
                                 sni_hostname: sni_hostname.clone(),
                             };
                             if accept_tx.send((conn, peer_addr)).await.is_err() {
@@ -1163,8 +1152,9 @@ impl DtlsServer {
                                 // against the configured client CA.
                                 verified_peer_cert = true;
                             }
-                            // Store the certificate DER for plugin access after Connected
-                            peer_cert_ders.push(der.to_vec());
+                            // Store the leaf certificate DER for plugin access
+                            // after Connected.
+                            peer_cert_der = Some(Arc::new(der.to_vec()));
                         }
                         Output::ApplicationData(data)
                             if app_out_tx.send(data.to_vec()).await.is_err() =>
