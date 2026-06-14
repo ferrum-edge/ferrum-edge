@@ -2972,6 +2972,12 @@ fn apply_destination_rules(
             // below doesn't conflict with the immutable `from_upstream` read.
             let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
             let upstream_id_for_tls = upstream.id.clone();
+            // Captured owned (like `upstream_base_tls`) so the per-port
+            // `entry()` mutable borrow below does not conflict with reading the
+            // upstream's targets. Gates the ISTIO_MUTUAL CA-backed fail-closed:
+            // mesh-transport upstreams source identity from the gateway SVID
+            // slot, not the generic per-port client material.
+            let upstream_presents_dynamic_svid = upstream_uses_mesh_transport(upstream);
             for (port, port_policy) in &dr.port_level_settings {
                 // The `port_overrides` key(s) this Service-port-scoped entry
                 // must land on. A materialized per-port outbound upstream
@@ -3043,6 +3049,7 @@ fn apply_destination_rules(
                         port_tls,
                         runtime,
                         &format!("{upstream_id_for_tls}/port-{port}"),
+                        upstream_presents_dynamic_svid,
                     )
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -3270,6 +3277,11 @@ fn resolve_subset_traffic_policy_tls(
             continue;
         };
         let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
+        // Mesh-transport gate for the ISTIO_MUTUAL CA-backed fail-closed,
+        // computed once per upstream (subsets share the owning upstream's
+        // transport). Mesh-transport upstreams source identity from the
+        // gateway SVID slot, not the generic per-subset client material.
+        let upstream_presents_dynamic_svid = upstream_uses_mesh_transport(upstream);
         let mut resolved_map: HashMap<String, ResolvedSubsetTrafficPolicy> = HashMap::new();
         for subset in subsets {
             let tp = subset.traffic_policy.as_ref();
@@ -3277,8 +3289,14 @@ fn resolve_subset_traffic_policy_tls(
             let resolved_tls = if let Some(subset_tls) = tp.and_then(|tp| tp.tls.as_ref()) {
                 let identity = format!("{}/{}", upstream.id, subset.name);
                 let mut slot = upstream_base_tls.clone();
-                apply_traffic_policy_tls_to_backend_config(&mut slot, subset_tls, runtime, &identity)
-                    .map_err(|e| {
+                apply_traffic_policy_tls_to_backend_config(
+                    &mut slot,
+                    subset_tls,
+                    runtime,
+                    &identity,
+                    upstream_presents_dynamic_svid,
+                )
+                .map_err(|e| {
                         anyhow::anyhow!(
                             "DestinationRule subset trafficPolicy.tls projection failed for upstream={} subset={}: {}",
                             upstream.id,
@@ -3411,6 +3429,20 @@ fn destination_rule_matches_upstream(dr: &MeshDestinationRule, upstream: &Upstre
         || destination_rule_host_matches(&dr.host, &dr.namespace, &upstream.id)
 }
 
+/// True when this upstream's egress transport is HBONE or Sidecar mTLS, which
+/// source the client cert from the shared gateway SVID slot (gateway_svid_bundle)
+/// rather than the generic backend_tls_client_cert_path fields. For such
+/// upstreams a CA-backed dynamic SVID CAN back ISTIO_MUTUAL, so the generic
+/// "can't present a dynamic client cert" fail-closed must NOT apply.
+fn upstream_uses_mesh_transport(upstream: &Upstream) -> bool {
+    upstream.targets.iter().any(|t| {
+        t.tags
+            .contains_key(crate::proxy::hbone_pool::HBONE_TARGET_TAG)
+            || t.tags
+                .contains_key(crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG)
+    })
+}
+
 fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &str) -> bool {
     let rule_host = rule_host.trim_end_matches('.').to_ascii_lowercase();
     let candidate = candidate.trim_end_matches('.').to_ascii_lowercase();
@@ -3496,7 +3528,14 @@ fn apply_traffic_policy_tls_to_upstream(
     runtime: &MeshRuntimeConfig,
 ) -> Result<(), anyhow::Error> {
     let mut slot = BackendTlsConfig::from_upstream(upstream);
-    apply_traffic_policy_tls_to_backend_config(&mut slot, tls, runtime, &upstream.id)?;
+    let presents_dynamic_svid = upstream_uses_mesh_transport(upstream);
+    apply_traffic_policy_tls_to_backend_config(
+        &mut slot,
+        tls,
+        runtime,
+        &upstream.id,
+        presents_dynamic_svid,
+    )?;
     upstream.backend_tls_client_cert_path = slot.client_cert_path;
     upstream.backend_tls_client_key_path = slot.client_key_path;
     upstream.backend_tls_server_ca_cert_path = slot.server_ca_cert_path;
@@ -3525,8 +3564,16 @@ fn apply_traffic_policy_tls_to_upstream(
 ///   and private key from the DR.
 /// - `IstioMutual`: enable server-cert verification and project the workload's
 ///   file-backed X.509-SVID cert/key paths and trust bundle from the mesh
-///   runtime onto the slot. CA-backed runtime SVIDs intentionally fail closed
-///   here until generic backend TLS can present the dynamic SVID material.
+///   runtime onto the slot. When no file SVID paths are configured: a
+///   CA-backed runtime (`ca_backend != None`) fails closed for GENERIC backend
+///   upstreams (`presents_dynamic_svid == false`) because generic backend TLS
+///   cannot present the dynamic SVID material; for mesh-transport upstreams
+///   (`presents_dynamic_svid == true`, i.e. HBONE / Sidecar mTLS) it leaves the
+///   generic client material cleared and projects only the SVID trust bundle,
+///   because those transports source the client identity from the shared
+///   gateway SVID slot. With NO CA backend AND no file SVID there is no dynamic
+///   SVID source at all, so ISTIO_MUTUAL fails closed for EVERY upstream
+///   including mesh transports.
 ///
 /// `insecure_skip_verify=true` always wins: it forces
 /// `verify_server_cert=false` regardless of mode.
@@ -3540,6 +3587,7 @@ fn apply_traffic_policy_tls_to_backend_config(
     tls: &MeshTrafficPolicyTls,
     runtime: &MeshRuntimeConfig,
     identity: &str,
+    presents_dynamic_svid: bool,
 ) -> Result<(), anyhow::Error> {
     match tls.mode {
         MtlsMode::Disable => {
@@ -3579,13 +3627,29 @@ fn apply_traffic_policy_tls_to_backend_config(
                     slot.client_cert_path = Some(cert_path);
                     slot.client_key_path = Some(key_path);
                 }
-                _ if runtime.ca_backend != CaBackend::None => {
+                _ if runtime.ca_backend != CaBackend::None && !presents_dynamic_svid => {
                     return Err(anyhow::anyhow!(
                         "DestinationRule ISTIO_MUTUAL for '{}' cannot use FERRUM_MESH_CA_BACKEND yet because generic backend TLS cannot present dynamic runtime SVID client certificates; configure FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH or use MUTUAL with explicit client cert/key paths",
                         identity
                     ));
                 }
+                _ if runtime.ca_backend != CaBackend::None => {
+                    // Mesh transport (HBONE / Sidecar mTLS): client identity
+                    // comes from the shared gateway SVID slot
+                    // (gateway_svid_bundle), not slot.client_cert_path — the
+                    // HBONE/mTLS pools read `self.gateway_svid.load_full()`, not
+                    // the generic backend client material. A CA-backed dynamic
+                    // SVID therefore DOES back ISTIO_MUTUAL here, so leave the
+                    // generic client material cleared and project only the SVID
+                    // trust bundle for server verification.
+                    slot.client_cert_path = None;
+                    slot.client_key_path = None;
+                    slot.server_ca_cert_path = runtime.workload_svid_trust_bundle_path.clone();
+                }
                 _ => {
+                    // No file SVID and no CA backend: there is NO dynamic SVID
+                    // source at all, so even a mesh-transport upstream has no
+                    // identity to present. Fail closed for EVERY upstream.
                     return Err(anyhow::anyhow!(
                         "DestinationRule ISTIO_MUTUAL for '{}' requires FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH",
                         identity
@@ -11931,6 +11995,60 @@ mod tests {
         assert_eq!(
             upstream.backend_tls_server_ca_cert_path.as_deref(),
             Some("/stale/ca.pem")
+        );
+    }
+
+    #[test]
+    fn dr_tls_istio_mutual_ca_backed_allowed_for_mesh_transport_upstream() {
+        // A mesh-transport upstream (HBONE / Sidecar mTLS) sources its client
+        // identity from the shared gateway SVID slot (`gateway_svid_bundle`),
+        // not the generic `backend_tls_client_cert_path` fields. So a CA-backed
+        // runtime SVID (no file SVID paths) DOES back ISTIO_MUTUAL here, and the
+        // slice must NOT be rejected — unlike the generic-backend case above.
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        // Mark the target for HBONE dispatch. `upstream_uses_mesh_transport`
+        // keys off this tag (the materializer stamps it on every HBONE /
+        // Sidecar-mTLS egress target).
+        upstream.targets[0].tags.insert(
+            crate::proxy::hbone_pool::HBONE_TARGET_TAG.to_string(),
+            "true".to_string(),
+        );
+        // Pre-existing generic client material that must be cleared: identity
+        // comes from the SVID slot, not these fields.
+        upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
+        upstream.backend_tls_client_key_path = Some("/existing/client.key".to_string());
+        upstream.backend_tls_server_ca_cert_path = Some("/stale/ca.pem".to_string());
+        upstream.backend_tls_verify_server_cert = false;
+
+        let runtime = MeshRuntimeConfig {
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            workload_svid_trust_bundle_path: Some(
+                "/var/run/secrets/ferrum/trust-bundle.pem".to_string(),
+            ),
+            ca_backend: CaBackend::Internal,
+            ..test_mesh_runtime_config()
+        };
+
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::IstioMutual,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime)
+            .expect("CA-backed ISTIO_MUTUAL is allowed for mesh-transport upstreams");
+
+        // Generic client material is cleared (identity comes from the SVID slot).
+        assert_eq!(upstream.backend_tls_client_cert_path, None);
+        assert_eq!(upstream.backend_tls_client_key_path, None);
+        // Server verification is enabled and CA is the SVID trust bundle.
+        assert!(upstream.backend_tls_verify_server_cert);
+        assert_eq!(
+            upstream.backend_tls_server_ca_cert_path.as_deref(),
+            Some("/var/run/secrets/ferrum/trust-bundle.pem")
         );
     }
 
