@@ -12438,9 +12438,12 @@ async fn handle_proxy_request_inner(
                 // header in the view), but split the wire response back into
                 // HEADERS + DATA + TRAILERS when the final body is non-empty.
                 // Trailer keys the backend ALSO sent as real initial headers
-                // are tracked so the post-hook writeback never copies the
-                // header's value into the wire trailer (the view value for
-                // those keys belongs to the header, not the trailer).
+                // are tracked so post-hook writeback can distinguish the
+                // backend's split wire shape from keys that originated only as
+                // trailers. Hook updates still apply to those shadowed trailers:
+                // the merged plugin view is the policy surface, so a sanitizer
+                // that rewrites the visible key must not leave the hidden wire
+                // trailer with the backend's original value.
                 //
                 // Exception: the reserved gRPC terminal-status keys
                 // (grpc-status / grpc-message / grpc-status-details-bin) are
@@ -12656,26 +12659,21 @@ async fn handle_proxy_request_inner(
                     // from the view was removed by a hook (honor the removal,
                     // matching the pre-split behavior where trailers lived in
                     // the headers map plugins mutated); a changed value is a
-                    // hook edit. Keys shadowed by a real backend header were
-                    // never plugin-visible as trailers, so while the key is
-                    // still in the view they keep the backend's true trailer
-                    // value — but a hook that removed the key from the view
-                    // suppresses the hidden trailer too (a security plugin
-                    // stripping a sensitive key must not leak its trailer
-                    // copy on the wire).
-                    response_trailers.retain(|k, v| {
-                        if header_shadowed_trailer_keys.contains(k) {
-                            return plugin_response_headers.contains_key(k);
-                        }
-                        match plugin_response_headers.get(k) {
-                            Some(plugin_value) => {
-                                if plugin_value != v {
-                                    *v = plugin_value.clone();
-                                }
-                                true
+                    // hook edit. For keys shadowed by a real backend header,
+                    // the key's presence still controls whether the hidden
+                    // trailer remains, and any hook-updated value is copied
+                    // into the trailer as well. This preserves the historical
+                    // folded-map policy behavior: sanitizing the merged key
+                    // sanitizes every client-visible copy, while removing it
+                    // suppresses the hidden trailer too.
+                    response_trailers.retain(|k, v| match plugin_response_headers.get(k) {
+                        Some(plugin_value) => {
+                            if plugin_value != v {
+                                *v = plugin_value.clone();
                             }
-                            None => false,
+                            true
                         }
+                        None => false,
                     });
                     response_headers = plugin_response_headers;
                 }
