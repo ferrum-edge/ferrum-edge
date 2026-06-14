@@ -293,6 +293,7 @@ impl DtlsConnection {
         let mut out_buf = vec![0u8; dtls_buf_config().output_buf_size];
         let mut recv_buf = vec![0u8; 65536];
         let mut next_timeout: Option<Instant> = None;
+        let mut verified_server_cert = false;
 
         // Kick off the handshake by draining initial outputs (ClientHello + Timeout)
         drain_handshake_outputs(
@@ -303,6 +304,7 @@ impl DtlsConnection {
             &mut next_timeout,
             server_name.as_ref(),
             server_cert_verifier.as_deref(),
+            &mut verified_server_cert,
         )
         .await?;
 
@@ -358,10 +360,16 @@ impl DtlsConnection {
                 &mut next_timeout,
                 server_name.as_ref(),
                 server_cert_verifier.as_deref(),
+                &mut verified_server_cert,
             )
             .await?;
 
             if connected {
+                if server_cert_verifier.is_some() && !verified_server_cert {
+                    return Err(anyhow::anyhow!(
+                        "DTLS backend server certificate verification required but no verified server certificate was presented"
+                    ));
+                }
                 return Ok(Self::spawn_driver(dtls, socket));
             }
         }
@@ -1409,6 +1417,7 @@ async fn drain_handshake_outputs(
     next_timeout: &mut Option<Instant>,
     server_name: Option<&rustls::pki_types::ServerName<'static>>,
     server_cert_verifier: Option<&dyn rustls::client::danger::ServerCertVerifier>,
+    verified_server_cert: &mut bool,
 ) -> Result<bool, anyhow::Error> {
     let mut connected = false;
     let mut saw_timeout_after_connected = false;
@@ -1443,6 +1452,7 @@ async fn drain_handshake_outputs(
             Output::PeerCert(der) => {
                 if let (Some(server_name), Some(verifier)) = (server_name, server_cert_verifier) {
                     validate_server_cert(der, server_name, verifier)?;
+                    *verified_server_cert = true;
                 }
             }
             Output::ApplicationData(_) => {
