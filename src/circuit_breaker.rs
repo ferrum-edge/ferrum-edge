@@ -317,20 +317,20 @@ impl CircuitBreaker {
                 // threshold and closed it, or this is a stale straggler from a
                 // bygone half-open cycle that outlived a full reopen→close cycle —
                 // is processed against the CURRENT closed state, matching standard
-                // breaker semantics (e.g. sony/gobreaker): release the slot it
-                // nominally still holds (a no-op once the close cleared the count)
-                // and count the failure toward the closed-state failure_threshold.
-                // It is deliberately NOT special-cased into a reopen: a probe that
-                // observes CLOSED here cannot be distinguished from an
-                // arbitrarily-stale straggler without per-probe generation
-                // tracking, so reopening would let a long-hung straggler trip a
-                // breaker that has since recovered. The "any probe failure reopens"
-                // rule still holds while the breaker is HALF_OPEN (the arm below):
-                // a failure that observes HALF_OPEN is current-cycle by
-                // construction and reopens even if it then races a sibling close.
-                if is_half_open_probe {
-                    self.release_half_open_slot();
-                }
+                // breaker semantics (e.g. sony/gobreaker): count the failure
+                // toward the closed-state failure_threshold. It is deliberately
+                // NOT special-cased into a reopen: a probe that observes CLOSED
+                // here cannot be distinguished from an arbitrarily-stale
+                // straggler without per-probe generation tracking, so reopening
+                // would let a long-hung straggler trip a breaker that has since
+                // recovered. Do not release a slot from this CLOSED branch:
+                // CLOSED is published with count=0, and a generationless release
+                // after this snapshot could race into a later HALF_OPEN cycle and
+                // decrement a slot owned by a different probe. The "any probe
+                // failure reopens" rule still holds while the breaker is
+                // HALF_OPEN (the arm below): a failure that observes HALF_OPEN is
+                // current-cycle by construction and reopens even if it then races
+                // a sibling close.
                 let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if failures >= self.config.failure_threshold {
                     // Re-read the counter before and after the transition attempt.
@@ -426,8 +426,9 @@ impl CircuitBreaker {
     /// Release one half-open probe slot, decrementing the in-flight count while
     /// preserving the state bits and never underflowing. A no-op once the count
     /// is already 0 — e.g. the slot was cleared en masse by a concurrent
-    /// reopen/close — so a straggler from a previous half-open cycle can neither
-    /// drive the counter below 0 nor perturb the packed state.
+    /// reopen/close. Callers that observed CLOSED must not invoke this helper:
+    /// without per-probe generations, a delayed release could otherwise affect a
+    /// later HALF_OPEN cycle.
     fn release_half_open_slot(&self) {
         let _ = self
             .packed
