@@ -15286,17 +15286,19 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
 /// an upper bound on the per-request retry count, NOT Envoy's gauge. See
 /// `docs/mesh.md` "DestinationRule maxRetries semantics".
 ///
-/// **Why the SELECTED target's port, not a min across every port:** the cap
-/// must come from the port the request actually dials. Retries stay in the
-/// selected target's PORT LANE — `select_next_retry_target` resolves the next
-/// target with `select_next_target_for_port_*_from` whenever the failed
-/// target's port has a live per-port override (see
+/// **Why prefer the SELECTED target's port cap:** the cap normally comes from
+/// the port the request actually dials. Retries stay in that port's PORT LANE
+/// once the failed target's port has a live per-port override (see
 /// `retry_port_override_dispatch_port` + `LoadBalancerCache::has_port_override_state_from`),
-/// so a per-port `maxRetries` does NOT rotate across ports between attempts.
-/// The selected-port cap therefore governs the whole retry sequence. Taking the
-/// MINIMUM across every override would instead let a higher-cap port inherit an
-/// unrelated sibling port's lower cap (port 8080 cap 5 wrongly limited to 1
-/// because port 9090 has cap 1) — that is what we must NOT do.
+/// so a selected port with its own `maxRetries` governs that retry sequence.
+///
+/// Mixed-port upstreams can also start on a port with no override and then
+/// retry through the general upstream selector onto a stricter capped port. In
+/// that case there is no selected-port cap to apply up front, so use the
+/// minimum configured per-port cap as a conservative request-wide ceiling. This
+/// prevents an uncapped first target from carrying a larger stale retry budget
+/// into a later capped port, while preserving the selected-port behavior when
+/// the initial dispatch port has an explicit cap.
 ///
 /// In practice, for MESH upstreams — the only place `maxRetries` applies, since
 /// it is DestinationRule-derived — the per-port caps fan out UNIFORMLY: the
@@ -15341,9 +15343,15 @@ pub(crate) fn cap_proxy_retry_for_target(
     let Some(target) = upstream_target else {
         return proxy;
     };
-    // Cap from the SELECTED dispatch target's port override. Retries stay in
-    // this port's lane (see docstring), so this cap governs the whole sequence.
-    let Some(cap) = overrides.get(&target.port).and_then(|o| o.max_retries) else {
+    // Prefer the SELECTED dispatch target's port override. If the selected port
+    // has no cap, retries may still rotate through the full upstream onto a
+    // capped port before lane pinning begins, so conservatively pre-cap to the
+    // strictest configured per-port maxRetries value.
+    let Some(cap) = overrides
+        .get(&target.port)
+        .and_then(|o| o.max_retries)
+        .or_else(|| overrides.values().filter_map(|o| o.max_retries).min())
+    else {
         return proxy;
     };
     if existing.max_retries <= cap {
@@ -25703,6 +25711,27 @@ mod tests {
             capped.retry.as_ref().unwrap().max_retries,
             5,
             "cap must come from the SELECTED port (8080→5), not a sibling port's lower cap (9090→1)"
+        );
+    }
+
+    #[test]
+    fn cap_proxy_retry_uncapped_selected_port_uses_strictest_sibling_cap() {
+        // Initial dispatch to an uncapped/non-overridden port can retry through
+        // the full upstream selector onto a capped port before port-lane pinning
+        // begins. Pre-cap to the strictest configured sibling cap so the later
+        // capped port cannot inherit the stale larger retry budget.
+        let mut inner = (*proxy_with_max_retries_overrides(&[(9090, 1), (9443, 3)])).clone();
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 10,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
+        assert_eq!(
+            capped.retry.as_ref().unwrap().max_retries,
+            1,
+            "uncapped selected ports must not bypass a stricter sibling maxRetries cap"
         );
     }
 
