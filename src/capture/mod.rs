@@ -744,10 +744,13 @@ impl EbpfPlan {
 }
 
 /// Name of the eBPF inbound-redirect program a per-pod `tc` ingress filter
-/// attaches. Kept in lock-step with the program the node-agent's eBPF backend
-/// attaches via `EbpfBackend::attach_tc` (`src/modes/node_agent.rs`,
-/// `src/ebpf/`) so the rendered `tc` plan and the in-process attach name never
-/// diverge.
+/// attaches **in-process via Aya** (`EbpfBackend::attach_tc`). This is a *loaded
+/// program name*, NOT a shell `tc obj <file>` path — see
+/// [`tc_ebpf_commands_for_veth`] for why the rendered shell `tc` plan is inert
+/// scaffolding and the in-process Aya attach is the real attach path. Kept in
+/// lock-step with the program the node-agent's eBPF backend attaches
+/// (`src/modes/node_agent.rs`, `src/ebpf/`) so the in-process attach name and
+/// any future rendered plan never diverge.
 pub const TC_INBOUND_PROGRAM: &str = "ferrum_tc_inbound";
 
 /// How a per-pod inbound redirect is realized for one enrolled pod.
@@ -758,32 +761,62 @@ pub const TC_INBOUND_PROGRAM: &str = "ferrum_tc_inbound";
 /// in the host netns, so the `--dst-type LOCAL` discriminator the pod-netns path
 /// uses cannot single out one pod's inbound traffic there — the chain would
 /// capture every pod plus the node's own inbound. A per-pod redirect instead
-/// scopes capture to a SINGLE pod by binding it to that pod's **host-side veth**
-/// (`clsact` qdisc + an ingress `tc` filter on the veth peer): a filter bound to
-/// one interface only sees that pod's traffic, so it needs no address-type
-/// discriminator and works in the host netns.
+/// scopes capture to a SINGLE pod, either by binding an eBPF program to that
+/// pod's **host-side veth** ([`Self::TcEbpf`]) or by a pod-netns iptables
+/// REDIRECT ([`Self::PodNetnsIptables`]).
+///
+/// **Maturity (honest framing):** only [`Self::PodNetnsIptables`] is a
+/// *functional* per-pod redirect today (it renders a real, pod-scoped iptables
+/// REDIRECT). [`Self::TcEbpf`] is **plan-generation scaffolding, not yet a
+/// working redirect** — the loaded [`TC_INBOUND_PROGRAM`] returns `TC_ACT_PIPE`
+/// (its destination rewrite is a documented deferred residual), so a `tc`
+/// ingress filter running it does NOT actually redirect inbound traffic to the
+/// proxy. The shell `tc` commands this backend renders are correspondingly
+/// inert (commented, never blindly executed); the in-process Aya attach
+/// (`EbpfBackend::attach_tc`) is where the real program is loaded, but it is the
+/// same `TC_ACT_PIPE` program. Live multi-pod TC-redirect verification is a
+/// residual gated behind a redirect-capable eBPF program (a Stage-N deliverable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcRedirectBackend {
-    /// `clsact` qdisc + an ingress `tc` filter running the eBPF
-    /// [`TC_INBOUND_PROGRAM`] on the pod's host-side veth. Preferred: it is the
-    /// only per-pod-scoped option that works in the node-agent's host netns.
-    /// Requires `tc` (iproute2) + a kernel with `clsact` (>= 4.5) and the eBPF
-    /// program loaded.
+    /// **Scaffolding (not yet functional).** A `clsact` qdisc + an ingress `tc`
+    /// filter running the eBPF [`TC_INBOUND_PROGRAM`] on the pod's host-side
+    /// veth. Intended to be the only per-pod-scoped option that works in the
+    /// node-agent's host netns, but the program it would run returns
+    /// `TC_ACT_PIPE` (no redirect/rewrite yet), so this backend does NOT
+    /// currently redirect traffic — it renders inert plan scaffolding. A real
+    /// redirect needs a redirect-capable eBPF program (deferred residual).
+    /// Would require `tc` (iproute2) + a kernel with `clsact` (>= 4.5) and the
+    /// eBPF program loaded.
     TcEbpf,
-    /// Per-pod iptables REDIRECT applied INSIDE the pod's own network namespace
-    /// (where the pod IP IS `LOCAL`, so `nat PREROUTING -p tcp -j REDIRECT`
-    /// scopes correctly to that pod). The fallback when `tc`/`clsact`/eBPF is
-    /// unavailable but the node-agent can still `setns` into the pod netns and
-    /// the runtime image carries `/bin/sh` + `iptables`.
+    /// **Functional per-pod path.** A per-pod iptables REDIRECT applied INSIDE
+    /// the pod's own network namespace (where the pod IP IS `LOCAL`, so
+    /// `nat PREROUTING -p tcp -j REDIRECT` scopes correctly to that pod). Used
+    /// when the node-agent can `setns` into the pod netns and the runtime image
+    /// carries `/bin/sh` + `iptables`. The plan renders real, pod-scoped
+    /// commands; entering the pod netns to *execute* them is the wiring residual
+    /// (see [`TcRedirectPlan::pod_netns_iptables_commands`]).
     PodNetnsIptables,
 }
 
 /// A per-pod **inbound** TC redirect plan (F4.3).
 ///
-/// Mirrors [`IptablesPlan`] but is scoped to ONE pod's host-side veth instead of
-/// emitting node-global chains, closing the host-netns inbound-capture scoping
-/// gap. The proxy hot path never runs these commands; the node-agent applies the
-/// rendered commands outside the request path when it enrolls a pod.
+/// Generates per-pod-scoped inbound-redirect plans (instead of node-global
+/// chains), to close the host-netns inbound-capture scoping gap. The proxy hot
+/// path never runs these commands; the node-agent applies the rendered commands
+/// outside the request path when it enrolls a pod.
+///
+/// **Maturity (honest framing).** Two backends with different maturity:
+/// - [`TcRedirectBackend::PodNetnsIptables`] is the **functional** per-pod path:
+///   it renders a real, pod-scoped iptables REDIRECT (correct because the pod IP
+///   is `LOCAL` inside its own netns). *Executing* it requires the node-agent to
+///   `setns` into the pod netns — that wiring is the documented residual; the
+///   plan itself is correct and unit-tested.
+/// - [`TcRedirectBackend::TcEbpf`] is **plan-generation scaffolding, not a
+///   working redirect**: the eBPF [`TC_INBOUND_PROGRAM`] it would run returns
+///   `TC_ACT_PIPE` (destination rewrite deferred), so it does not actually
+///   redirect. Its rendered `tc` commands are inert (commented). A real TC
+///   redirect needs a redirect-capable eBPF program (a Stage-N residual). Live
+///   multi-pod datapath verification is likewise a residual.
 ///
 /// **Fail-closed scope (the load-bearing invariant):** a per-pod redirect MUST
 /// be scoped to exactly one pod. When neither the veth (for [`TcRedirectBackend::TcEbpf`])
@@ -799,14 +832,20 @@ pub struct TcRedirectPlan {
     /// The pod's host-side veth interface name (for [`TcRedirectBackend::TcEbpf`]).
     /// Empty for the pod-netns iptables backend.
     pub veth_iface: String,
-    /// Capture port inbound TCP is redirected to (mirror of
-    /// [`CaptureConfig::inbound_port`]).
+    /// Port inbound TCP is redirected to. For the node-agent this is the
+    /// **HBONE** listener port (`FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT`, default
+    /// 15008) — NOT the sidecar mTLS port — so captured inbound lands on the
+    /// node-waypoint HBONE listener. Threaded in by the caller via
+    /// [`TcRedirectPlan::for_pod`]'s `inbound_redirect_port`.
     pub inbound_port: u16,
-    /// `tc` setup commands (idempotent, delete-before-add). Empty for the
-    /// pod-netns iptables backend (that path renders an iptables [`Self::pod_netns_iptables_commands`]).
+    /// `tc` setup commands. **Inert scaffolding** (see [`TcRedirectBackend::TcEbpf`]):
+    /// emitted as commented `tc` lines because the program they would attach
+    /// returns `TC_ACT_PIPE`; the in-process Aya attach is the (still
+    /// non-redirecting) real attach. Empty for the pod-netns iptables backend
+    /// (that path renders an iptables [`Self::pod_netns_iptables_commands`]).
     pub setup_commands: Vec<String>,
-    /// `tc` teardown commands (best-effort, `|| true`). Empty for the
-    /// pod-netns iptables backend.
+    /// `tc` teardown commands (best-effort, `|| true`). Inert scaffolding, like
+    /// [`Self::setup_commands`]. Empty for the pod-netns iptables backend.
     pub cleanup_commands: Vec<String>,
 }
 
@@ -816,6 +855,13 @@ impl TcRedirectPlan {
     /// available so the caller fails closed (see the type doc) — it must NOT
     /// substitute the node-global iptables inbound chain.
     ///
+    /// `inbound_redirect_port` is the port captured inbound TCP is redirected to.
+    /// The node-agent MUST pass its **HBONE** listener port
+    /// (`FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT`, default 15008), NOT
+    /// `CaptureConfig::inbound_port` (the sidecar mTLS port `15006`): node-agent
+    /// inbound has to land on the node-waypoint HBONE listener, so reusing the
+    /// sidecar port would black-hole captured traffic or bypass HBONE.
+    ///
     /// `veth_iface` is the pod's host-side veth (from `veth::discover_veth_for_pod`);
     /// `pod_netns_available` is whether the node-agent can `setns` into the pod
     /// netns to install a pod-scoped iptables REDIRECT instead. `prefer_iptables`
@@ -823,11 +869,12 @@ impl TcRedirectPlan {
     /// node without `clsact`/eBPF support), but it still requires `pod_netns_available`.
     pub fn for_pod(
         config: &CaptureConfig,
+        inbound_redirect_port: u16,
         veth_iface: Option<&str>,
         pod_netns_available: bool,
         prefer_iptables: bool,
     ) -> Option<Self> {
-        let inbound_port = config.inbound_port;
+        let inbound_port = inbound_redirect_port;
         // Prefer the veth-scoped TC/eBPF backend (the only host-netns-correct
         // per-pod option) unless the caller forces iptables. A blank veth name is
         // treated as absent — an empty `-dev ` would be a malformed `tc` command.
@@ -865,63 +912,68 @@ impl TcRedirectPlan {
     /// [`IptablesPlan`]. Returns the commands for [`TcRedirectBackend::PodNetnsIptables`];
     /// empty for the TC/eBPF backend.
     ///
+    /// The REDIRECT target is [`Self::inbound_port`] — the caller-threaded HBONE
+    /// listener port for the node-agent, NOT `config.inbound_port` (the sidecar
+    /// mTLS port).
+    ///
+    /// **IPv6 honors `ip6tables_mode` like [`IptablesPlan::for_config`]:**
+    /// - `Disabled`: IPv4-only, no `ip6tables` commands.
+    /// - `Required`: `ip6tables` commands emitted bare (a missing binary is a
+    ///   hard error, matching the required posture).
+    /// - `Auto` (the default): `ip6tables` commands are wrapped in a
+    ///   self-contained `command -v ip6tables` guard so an IPv4-only pod
+    ///   netns/image without `ip6tables` SKIPS the IPv6 half instead of failing
+    ///   (the IPv4 REDIRECT still installs). This mirrors how the node-global
+    ///   fallback's auto path tolerates an absent `ip6tables`.
+    ///
     /// Inbound port exclusions are honored: each `exclude_inbound_ports` entry
     /// emits a `RETURN` BEFORE the catch-all REDIRECT (a fired REDIRECT returns
     /// from the chain, so a later RETURN would be dead — same ordering rule as
     /// [`commands_for_family`]).
+    ///
+    /// NOTE: this renders the (correct, unit-tested) commands; *entering* the pod
+    /// netns to execute them is the wiring residual documented on the type. The
+    /// `#[allow(dead_code)]` reflects that the bin does not yet call this — the
+    /// rendering is consumed by tests and the future enrollment-loop wiring.
+    #[allow(dead_code)]
     pub fn pod_netns_iptables_commands(&self, config: &CaptureConfig) -> Vec<String> {
         if self.backend != TcRedirectBackend::PodNetnsIptables {
             return Vec::new();
         }
         let mut commands = Vec::new();
-        let v6_enabled = config.ip6tables_mode != Ip6TablesMode::Disabled;
-        let binaries: &[&str] = if v6_enabled {
-            &["iptables", "ip6tables"]
-        } else {
-            &["iptables"]
-        };
-        for binary in binaries {
-            commands.push(idempotent_new_chain(binary, "nat", "FERRUM_MESH_INBOUND"));
-            for port in &config.exclude_inbound_ports {
-                commands.push(idempotent_append(
-                    binary,
-                    "nat",
-                    "FERRUM_MESH_INBOUND",
-                    &format!("-p tcp --dport {port} -j RETURN"),
-                ));
-            }
-            commands.push(idempotent_append(
-                binary,
-                "nat",
-                "FERRUM_MESH_INBOUND",
-                &format!("-p tcp -j REDIRECT --to-ports {}", config.inbound_port),
-            ));
-            commands.push(idempotent_append(
-                binary,
-                "nat",
-                "PREROUTING",
-                "-p tcp -j FERRUM_MESH_INBOUND",
-            ));
-        }
+        commands.extend(self.pod_netns_family_commands("iptables", config, false));
+        commands.extend(self.pod_netns_v6_commands(config, false));
         commands
     }
 
     /// The pod-netns iptables inbound teardown (best-effort, `|| true`), the
     /// reverse of [`Self::pod_netns_iptables_commands`]: delete the PREROUTING
     /// jump, flush, then delete the chain — for every active family. Empty for
-    /// the TC/eBPF backend.
+    /// the TC/eBPF backend. IPv6 honors `ip6tables_mode` exactly like
+    /// [`Self::pod_netns_iptables_commands`] (auto = guarded, so cleanup never
+    /// fails on an IPv4-only netns).
+    #[allow(dead_code)]
     pub fn pod_netns_iptables_cleanup(&self, config: &CaptureConfig) -> Vec<String> {
         if self.backend != TcRedirectBackend::PodNetnsIptables {
             return Vec::new();
         }
-        let v6_enabled = config.ip6tables_mode != Ip6TablesMode::Disabled;
-        let binaries: &[&str] = if v6_enabled {
-            &["iptables", "ip6tables"]
-        } else {
-            &["iptables"]
-        };
         let mut commands = Vec::new();
-        for binary in binaries {
+        commands.extend(self.pod_netns_family_commands("iptables", config, true));
+        commands.extend(self.pod_netns_v6_commands(config, true));
+        commands
+    }
+
+    /// Render the inbound chain setup (`cleanup == false`) or teardown
+    /// (`cleanup == true`) for one address family's `binary`. Shared by the v4
+    /// and v6 halves so the rule shapes never drift.
+    fn pod_netns_family_commands(
+        &self,
+        binary: &str,
+        config: &CaptureConfig,
+        cleanup: bool,
+    ) -> Vec<String> {
+        let mut commands = Vec::new();
+        if cleanup {
             commands.push(idempotent_delete(
                 binary,
                 "nat",
@@ -930,60 +982,135 @@ impl TcRedirectPlan {
             ));
             commands.push(flush_chain(binary, "nat", "FERRUM_MESH_INBOUND"));
             commands.push(delete_chain(binary, "nat", "FERRUM_MESH_INBOUND"));
+            return commands;
         }
+        commands.push(idempotent_new_chain(binary, "nat", "FERRUM_MESH_INBOUND"));
+        for port in &config.exclude_inbound_ports {
+            commands.push(idempotent_append(
+                binary,
+                "nat",
+                "FERRUM_MESH_INBOUND",
+                &format!("-p tcp --dport {port} -j RETURN"),
+            ));
+        }
+        commands.push(idempotent_append(
+            binary,
+            "nat",
+            "FERRUM_MESH_INBOUND",
+            &format!("-p tcp -j REDIRECT --to-ports {}", self.inbound_port),
+        ));
+        commands.push(idempotent_append(
+            binary,
+            "nat",
+            "PREROUTING",
+            "-p tcp -j FERRUM_MESH_INBOUND",
+        ));
         commands
+    }
+
+    /// The IPv6 (`ip6tables`) half, honoring `ip6tables_mode`: empty when
+    /// `Disabled`, bare when `Required`, and per-command `command -v ip6tables`
+    /// guarded when `Auto` (so an IPv4-only netns skips IPv6 rather than failing).
+    fn pod_netns_v6_commands(&self, config: &CaptureConfig, cleanup: bool) -> Vec<String> {
+        match config.ip6tables_mode {
+            Ip6TablesMode::Disabled => Vec::new(),
+            Ip6TablesMode::Required => self.pod_netns_family_commands("ip6tables", config, cleanup),
+            // Auto: render the v6 commands but make each self-guarding so an
+            // IPv4-only pod netns/image without `ip6tables` skips them instead of
+            // erroring. The guard probes the binary AND the nat table (a host can
+            // have the binary but a kernel without ip6 nat).
+            Ip6TablesMode::Auto => self
+                .pod_netns_family_commands("ip6tables", config, cleanup)
+                .into_iter()
+                .map(|cmd| pod_netns_ip6tables_auto_guard(&cmd))
+                .collect(),
+        }
     }
 }
 
-/// Render the `clsact` + ingress-`tc`-filter setup/cleanup for one pod's
-/// host-side veth (F4.3, [`TcRedirectBackend::TcEbpf`]).
+/// Wrap one `ip6tables` command in a self-contained availability guard for the
+/// `Auto` posture: run it only when `ip6tables` exists and its `nat` table is
+/// usable, otherwise echo a skip note. Self-contained (unlike the node-agent's
+/// `ip6tables_best_effort_wrapped_command`) because these pod-netns commands are
+/// meant to be runnable directly inside the pod netns (where the node-agent's
+/// host-netns wrapper does not apply).
+fn pod_netns_ip6tables_auto_guard(cmd: &str) -> String {
+    format!(
+        "if command -v ip6tables >/dev/null 2>&1 && ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then {cmd}; else echo \"ip6tables/nat unavailable in pod netns; skipping IPv6 inbound redirect\"; fi"
+    )
+}
+
+/// Pref (priority) of the Ferrum-owned ingress `tc` filter. Used to add/delete
+/// ONLY Ferrum's filter by exact `pref` so teardown never touches a CNI's or
+/// another agent's filter on the same qdisc (codex r1, finding #1).
+pub(crate) const TC_FERRUM_FILTER_PREF: u16 = 51820;
+
+/// Render the `clsact` + ingress-`tc`-filter setup/cleanup scaffolding for one
+/// pod's host-side veth (F4.3, [`TcRedirectBackend::TcEbpf`]).
 ///
-/// Setup is idempotent and delete-before-add:
-/// - `tc qdisc replace dev <veth> clsact` — `replace` is create-or-noop (unlike
-///   `add`, which errors `RTNETLINK: File exists` on a present qdisc), so a
-///   node-agent retry never fails on an existing qdisc.
-/// - delete-before-add the ingress BPF filter (`tc filter del ... 2>/dev/null ||
-///   true`, then `tc filter add ...`) so a re-enroll never stacks a duplicate
-///   filter (`tc` happily appends duplicates by priority otherwise).
+/// **These commands are INERT scaffolding, not a working redirect (codex r1).**
+/// Two reasons they are emitted commented-out rather than as live commands:
 ///
-/// **Family partitioning:** an ingress `clsact` BPF filter is L2 and inspects
-/// both IPv4 and IPv6 frames on the veth in ONE filter, so there is no
-/// per-family `tc` rule to partition (unlike iptables/ip6tables). The
-/// `ip6tables_mode` only controls whether a *companion* note is emitted: when
-/// IPv6 is `Disabled` the plan documents that the single filter still sees v6
-/// frames (the eBPF program is responsible for any v6 gating), so the caller is
-/// not misled into thinking a disabled-v6 posture is enforced at the `tc` layer.
-/// The returned command vectors are otherwise family-agnostic.
+/// 1. **No real redirect action (finding #5).** The eBPF [`TC_INBOUND_PROGRAM`]
+///    a `tc bpf da` filter would run returns `TC_ACT_PIPE` (its destination
+///    rewrite is a documented deferred residual), so even a successfully
+///    attached filter would NOT redirect inbound traffic to the proxy. A
+///    functional TC backend needs a redirect-capable eBPF program first.
+/// 2. **`tc obj` is an object-FILE path, not a program name (finding #2).** In
+///    the shell `tc` plan, `tc-bpf(8)` parses `obj <X>` as an ELF object-file
+///    path with `sec <S>` selecting the section — NOT a loaded program name.
+///    [`TC_INBOUND_PROGRAM`] is a *loaded program name* (used by the in-process
+///    Aya attach, [`super::TC_INBOUND_PROGRAM`]), and the real ferrum-ebpf `.o`
+///    object path is build/image-dependent (not known here). Emitting a live
+///    `obj ferrum_tc_inbound` command would just fail at runtime ("no such
+///    file"). The in-process Aya attach (`EbpfBackend::attach_tc`, by program
+///    name) is the real attach path — though it loads the same `TC_ACT_PIPE`
+///    program, so it does not redirect either, per (1).
+///
+/// The qdisc/filter SHAPES the scaffolding documents are still the
+/// non-destructive, idempotent ones a functional implementation must use
+/// (finding #1):
+/// - `tc qdisc add dev <veth> clsact` tolerating "exists" — add-if-absent, NEVER
+///   `replace`/`del` of the whole qdisc (that would drop a CNI's filters too).
+/// - delete only the **Ferrum-owned** ingress filter by exact `pref`
+///   [`TC_FERRUM_FILTER_PREF`] before re-adding it — never `tc filter del ...
+///   ingress` (which flushes ALL ingress filters on the qdisc, including a CNI's).
+///
+/// `ip6tables_mode` is informational only: an ingress `clsact` BPF filter is L2
+/// and would inspect both IPv4 and IPv6 frames in one filter, so there is no
+/// per-family `tc` rule to partition.
 fn tc_ebpf_commands_for_veth(
     veth: &str,
-    ip6tables_mode: Ip6TablesMode,
+    _ip6tables_mode: Ip6TablesMode,
 ) -> (Vec<String>, Vec<String>) {
-    // `clsact` is the qdisc that hosts an `ingress` filter hook; `replace` is
-    // create-or-update so a retry on an existing qdisc is a no-op (idempotent).
-    let qdisc_add = format!("tc qdisc replace dev {veth} clsact");
-    // delete-before-add the ingress BPF filter so a re-enroll never stacks
-    // duplicates. The delete is best-effort (`|| true`): an absent filter on a
-    // fresh veth must not abort setup.
-    let filter_del = format!("tc filter del dev {veth} ingress 2>/dev/null || true");
-    let filter_add =
-        format!("tc filter add dev {veth} ingress bpf da obj {TC_INBOUND_PROGRAM} sec classifier");
+    // Add-if-absent: `add` (NOT `replace`) so an existing qdisc — possibly
+    // carrying a CNI's filters — is never removed/re-added. Tolerate the
+    // "File exists" error so a retry on a present qdisc is a no-op.
+    let qdisc_add = format!(
+        "tc qdisc add dev {veth} clsact 2>/dev/null || true # add-if-absent; never `replace`/`del` (would drop a CNI's filters)"
+    );
+    // Delete ONLY the Ferrum-owned filter by exact pref before re-adding, so a
+    // re-enroll never stacks duplicates AND never touches another agent's filter.
+    let filter_del = format!(
+        "tc filter del dev {veth} ingress pref {TC_FERRUM_FILTER_PREF} 2>/dev/null || true # delete only the Ferrum-owned filter by pref"
+    );
+    // INERT: the obj path/section are image-dependent and the program returns
+    // TC_ACT_PIPE (no redirect). Emitted commented so it is never blindly run.
+    // The real (still non-redirecting) attach is the in-process Aya path
+    // (`EbpfBackend::attach_tc` by program name `{TC_INBOUND_PROGRAM}`).
+    let filter_add = format!(
+        "# SCAFFOLDING (inert): tc filter add dev {veth} ingress pref {TC_FERRUM_FILTER_PREF} bpf da obj <ferrum-ebpf .o path> sec classifier  # deferred: needs a redirect-capable program (current {TC_INBOUND_PROGRAM} returns TC_ACT_PIPE); use the in-process Aya attach for loading"
+    );
     let setup = vec![qdisc_add, filter_del, filter_add];
 
-    // Teardown: delete the ingress filter, then delete the clsact qdisc (which
-    // also drops any remaining ingress filters). Best-effort so a missing
-    // qdisc/filter never fails cleanup.
-    let cleanup = vec![
-        format!("tc filter del dev {veth} ingress 2>/dev/null || true"),
-        format!("tc qdisc del dev {veth} clsact 2>/dev/null || true"),
-    ];
+    // Teardown: delete ONLY the Ferrum-owned ingress filter by exact pref. Do
+    // NOT delete the clsact qdisc — it may be shared with a CNI/other agent, and
+    // dropping it would drop their filters. Best-effort so a missing filter never
+    // fails cleanup.
+    let cleanup = vec![format!(
+        "tc filter del dev {veth} ingress pref {TC_FERRUM_FILTER_PREF} 2>/dev/null || true # delete only the Ferrum-owned filter; never delete the (possibly shared) clsact qdisc"
+    )];
 
-    if ip6tables_mode == Ip6TablesMode::Disabled {
-        // Documented, not a wrong-enforcement: the single L2 BPF filter still
-        // sees IPv6 frames; v6 gating (if any) is the eBPF program's job, not the
-        // `tc` layer's. Emitting this keeps the disabled-v6 posture honest.
-        // (No extra command — the note lives in this fn's doc + the node-agent
-        // log; partitioning the filter per-family is not possible at `tc` ingress.)
-    }
     (setup, cleanup)
 }
 
@@ -4377,31 +4504,37 @@ mod tests {
     }
 
     // --- F4.3: per-pod inbound TC redirect plan ------------------------------
+    //
+    // Node-agent inbound lands on the HBONE listener, so the tests thread the
+    // HBONE port (15008) as the redirect target — NOT the sidecar mTLS 15006.
+    const TEST_HBONE_PORT: u16 = 15008;
 
     #[test]
     fn tc_plan_prefers_veth_scoped_ebpf_backend() {
         let config = CaptureConfig::explicit(15006, 15001);
-        let plan = TcRedirectPlan::for_pod(&config, Some("vethabc"), true, false)
+        let plan = TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, Some("vethabc"), true, false)
             .expect("a known veth must yield a per-pod plan");
         assert_eq!(plan.backend, TcRedirectBackend::TcEbpf);
         assert_eq!(plan.veth_iface, "vethabc");
-        assert_eq!(plan.inbound_port, 15006);
-        // clsact qdisc + the ingress BPF filter on THIS veth (pod-scoped: a
-        // filter bound to one interface only sees that pod's traffic, so no
-        // node-global chain and no addrtype discriminator).
+        // Redirect target is the threaded HBONE port, not the sidecar mTLS port.
+        assert_eq!(plan.inbound_port, TEST_HBONE_PORT);
+        // The clsact qdisc is add-if-absent (NEVER `replace`/`del`, which would
+        // drop a CNI's filters) and scoped to THIS veth.
         assert!(
             plan.setup_commands
                 .iter()
-                .any(|c| c.contains("qdisc replace dev vethabc clsact")),
-            "setup must create/replace the clsact qdisc on the pod veth: {:?}",
+                .any(|c| c.contains("qdisc add dev vethabc clsact")),
+            "setup must add-if-absent the clsact qdisc on the pod veth: {:?}",
             plan.setup_commands
         );
+        // The filter line is INERT scaffolding (the program returns TC_ACT_PIPE
+        // and `tc obj` wants a file path, not a program name), so the live filter
+        // add is emitted commented-out, NOT as a runnable command.
         assert!(
             plan.setup_commands
                 .iter()
-                .any(|c| c.contains("filter add dev vethabc ingress")
-                    && c.contains(TC_INBOUND_PROGRAM)),
-            "setup must add the ingress {TC_INBOUND_PROGRAM} filter on the pod veth: {:?}",
+                .any(|c| c.trim_start().starts_with('#') && c.contains("SCAFFOLDING")),
+            "the filter-add must be inert scaffolding (commented), not a live `tc obj` command: {:?}",
             plan.setup_commands
         );
         // No node-global mesh chains anywhere — the whole point of per-pod scoping.
@@ -4418,61 +4551,62 @@ mod tests {
     }
 
     #[test]
-    fn tc_plan_setup_is_idempotent_delete_before_add() {
+    fn tc_plan_qdisc_is_add_if_absent_not_replace() {
         let config = CaptureConfig::explicit(15006, 15001);
-        let plan = TcRedirectPlan::for_pod(&config, Some("veth0"), true, false).unwrap();
-        // `replace` (not `add`) makes the qdisc create-or-noop so a retry on an
-        // existing qdisc does not error.
+        let plan =
+            TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, Some("veth0"), true, false).unwrap();
+        // `add` (NOT `replace`/`del`) so an existing qdisc carrying a CNI's
+        // filters is never removed; the "File exists" error is tolerated.
         assert!(
             plan.setup_commands
                 .iter()
-                .any(|c| c.starts_with("tc qdisc replace ")),
-            "qdisc must use `replace` for idempotency: {:?}",
+                .any(|c| c.starts_with("tc qdisc add ") && c.contains("|| true")),
+            "qdisc must be add-if-absent for idempotency without dropping other filters: {:?}",
             plan.setup_commands
         );
-        // The filter is delete-before-add so a re-enroll never stacks duplicates.
-        let del_pos = plan
-            .setup_commands
-            .iter()
-            .position(|c| c.contains("filter del dev veth0 ingress"))
-            .expect("setup must delete the ingress filter before adding");
-        let add_pos = plan
-            .setup_commands
-            .iter()
-            .position(|c| c.contains("filter add dev veth0 ingress"))
-            .expect("setup must add the ingress filter");
         assert!(
-            del_pos < add_pos,
-            "filter delete must precede add (delete-before-add): {:?}",
+            !plan
+                .setup_commands
+                .iter()
+                .any(|c| c.contains("qdisc replace") || c.contains("qdisc del")),
+            "setup must NEVER replace/delete the whole qdisc (would drop a CNI's filters): {:?}",
             plan.setup_commands
         );
-        // The pre-add delete is best-effort so an absent filter on a fresh veth
-        // does not abort setup.
+        // The Ferrum-owned filter is deleted by exact pref before (the inert)
+        // re-add, never a blanket `filter del ... ingress` that flushes all.
+        let del = plan
+            .setup_commands
+            .iter()
+            .find(|c| c.contains("filter del dev veth0 ingress"))
+            .expect("setup must delete the Ferrum-owned filter before re-add");
         assert!(
-            plan.setup_commands[del_pos].contains("|| true"),
-            "the delete-before-add must be best-effort: {}",
-            plan.setup_commands[del_pos]
+            del.contains(&format!("pref {TC_FERRUM_FILTER_PREF}")) && del.contains("|| true"),
+            "filter delete must target only the Ferrum-owned pref and be best-effort: {del}"
         );
     }
 
     #[test]
-    fn tc_plan_cleanup_reverses_and_tolerates_missing() {
+    fn tc_plan_cleanup_deletes_only_ferrum_filter_not_qdisc() {
         let config = CaptureConfig::explicit(15006, 15001);
-        let plan = TcRedirectPlan::for_pod(&config, Some("vethX"), true, false).unwrap();
-        // Filter delete must precede qdisc delete.
-        let filter_pos = plan
-            .cleanup_commands
-            .iter()
-            .position(|c| c.contains("filter del dev vethX ingress"))
-            .expect("cleanup must delete the ingress filter");
-        let qdisc_pos = plan
-            .cleanup_commands
-            .iter()
-            .position(|c| c.contains("qdisc del dev vethX clsact"))
-            .expect("cleanup must delete the clsact qdisc");
+        let plan =
+            TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, Some("vethX"), true, false).unwrap();
+        // Cleanup deletes ONLY the Ferrum-owned ingress filter by pref and must
+        // NOT delete the (possibly shared) clsact qdisc.
         assert!(
-            filter_pos < qdisc_pos,
-            "filter delete must precede qdisc delete"
+            plan.cleanup_commands
+                .iter()
+                .any(|c| c.contains("filter del dev vethX ingress")
+                    && c.contains(&format!("pref {TC_FERRUM_FILTER_PREF}"))),
+            "cleanup must delete only the Ferrum-owned filter by pref: {:?}",
+            plan.cleanup_commands
+        );
+        assert!(
+            !plan
+                .cleanup_commands
+                .iter()
+                .any(|c| c.contains("qdisc del")),
+            "cleanup must NOT delete the (possibly shared) clsact qdisc: {:?}",
+            plan.cleanup_commands
         );
         // Every cleanup command tolerates an already-absent object.
         for c in &plan.cleanup_commands {
@@ -4485,14 +4619,20 @@ mod tests {
         let config = CaptureConfig::explicit(15006, 15001);
         // No veth, but the node-agent can enter the pod netns → pod-scoped
         // iptables REDIRECT (valid because the pod IP is LOCAL inside its netns).
-        let plan = TcRedirectPlan::for_pod(&config, None, true, false)
+        let plan = TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, None, true, false)
             .expect("pod-netns availability must yield a fallback plan");
         assert_eq!(plan.backend, TcRedirectBackend::PodNetnsIptables);
         assert!(plan.veth_iface.is_empty());
         let cmds = plan.pod_netns_iptables_commands(&config);
+        // Redirect target is the threaded HBONE port (15008), NOT 15006.
         assert!(
-            cmds.iter().any(|c| c.contains("--to-ports 15006")),
-            "pod-netns fallback must REDIRECT inbound to the capture port: {cmds:?}"
+            cmds.iter()
+                .any(|c| c.contains(&format!("--to-ports {TEST_HBONE_PORT}"))),
+            "pod-netns fallback must REDIRECT inbound to the HBONE port: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("--to-ports 15006")),
+            "pod-netns fallback must NOT redirect to the sidecar mTLS port 15006: {cmds:?}"
         );
         assert!(
             cmds.iter()
@@ -4506,12 +4646,14 @@ mod tests {
         let config = CaptureConfig::explicit(15006, 15001);
         // A node without clsact/eBPF support: force iptables despite a known veth,
         // but only when the pod netns is reachable.
-        let plan = TcRedirectPlan::for_pod(&config, Some("vethabc"), true, true).unwrap();
+        let plan =
+            TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, Some("vethabc"), true, true).unwrap();
         assert_eq!(plan.backend, TcRedirectBackend::PodNetnsIptables);
         // ...and fail closed when neither a veth-less TC handle nor the pod netns
         // is available.
         assert!(
-            TcRedirectPlan::for_pod(&config, Some("vethabc"), false, true).is_none(),
+            TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, Some("vethabc"), false, true)
+                .is_none(),
             "prefer_iptables without pod-netns access must fail closed (no node-global widening)"
         );
     }
@@ -4523,14 +4665,14 @@ mod tests {
         // pod, so the plan is None. The node-agent MUST warn + skip — never fall
         // back to the node-global iptables inbound chain (a scope-loss regression).
         assert!(
-            TcRedirectPlan::for_pod(&config, None, false, false).is_none(),
+            TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, None, false, false).is_none(),
             "no per-pod handle must fail closed"
         );
         // A blank/whitespace veth name is treated as absent (an empty `-dev `
         // would be a malformed `tc` command), so it also fails closed without
         // pod-netns access.
         assert!(
-            TcRedirectPlan::for_pod(&config, Some("   "), false, false).is_none(),
+            TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, Some("   "), false, false).is_none(),
             "blank veth must be treated as absent and fail closed"
         );
     }
@@ -4539,10 +4681,12 @@ mod tests {
     fn tc_plan_pod_netns_iptables_honors_exclude_inbound_ports_and_v6() {
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.exclude_inbound_ports = vec![22, 9000];
+        // `Required` emits bare ip6tables commands (a missing binary is a hard
+        // error in this posture).
         config.ip6tables_mode = Ip6TablesMode::Required;
-        let plan = TcRedirectPlan::for_pod(&config, None, true, false).unwrap();
+        let plan = TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, None, true, false).unwrap();
         let cmds = plan.pod_netns_iptables_commands(&config);
-        // Both families emit the chain (v6 enabled).
+        // Both families emit the chain (v6 required → bare).
         assert!(cmds.iter().any(|c| c.starts_with("iptables ")));
         assert!(cmds.iter().any(|c| c.starts_with("ip6tables ")));
         // Each excluded inbound port RETURNs BEFORE the catch-all REDIRECT (a
@@ -4554,8 +4698,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{binary} must RETURN excluded port 22"));
             let redirect_pos = cmds
                 .iter()
-                .position(|c| c.starts_with(binary) && c.contains("-j REDIRECT --to-ports 15006"))
-                .unwrap_or_else(|| panic!("{binary} must REDIRECT to the capture port"));
+                .position(|c| {
+                    c.starts_with(binary)
+                        && c.contains(&format!("-j REDIRECT --to-ports {TEST_HBONE_PORT}"))
+                })
+                .unwrap_or_else(|| panic!("{binary} must REDIRECT to the HBONE port"));
             assert!(
                 return_pos < redirect_pos,
                 "{binary}: exclude RETURN must precede the catch-all REDIRECT"
@@ -4582,14 +4729,52 @@ mod tests {
     }
 
     #[test]
+    fn tc_plan_pod_netns_iptables_auto_v6_is_guarded_not_required() {
+        // codex r1 #4: the DEFAULT `auto` posture must NOT make ip6tables
+        // required. The v6 commands are still rendered, but each is wrapped in a
+        // self-contained `command -v ip6tables` guard so an IPv4-only pod netns
+        // skips them instead of failing the whole setup.
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.ip6tables_mode = Ip6TablesMode::Auto;
+        let plan = TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, None, true, false).unwrap();
+        let cmds = plan.pod_netns_iptables_commands(&config);
+        // IPv4 still installs unconditionally.
+        assert!(
+            cmds.iter().any(|c| c.starts_with("iptables ")),
+            "auto posture must still install IPv4 unconditionally: {cmds:?}"
+        );
+        // Every ip6tables touch is behind the availability guard — no bare
+        // `ip6tables ...` command that would abort on a missing binary.
+        assert!(
+            cmds.iter().any(|c| c.contains("ip6tables")),
+            "auto posture must still render the IPv6 half (guarded): {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .filter(|c| c.contains("ip6tables"))
+                .all(|c| c.contains("command -v ip6tables")),
+            "auto posture must guard every ip6tables command, not emit it bare: {cmds:?}"
+        );
+        // Cleanup is guarded the same way.
+        let cleanup = plan.pod_netns_iptables_cleanup(&config);
+        assert!(
+            cleanup
+                .iter()
+                .filter(|c| c.contains("ip6tables"))
+                .all(|c| c.contains("command -v ip6tables")),
+            "auto-posture cleanup must guard every ip6tables command: {cleanup:?}"
+        );
+    }
+
+    #[test]
     fn tc_plan_pod_netns_iptables_v6_disabled_is_ipv4_only() {
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.ip6tables_mode = Ip6TablesMode::Disabled;
-        let plan = TcRedirectPlan::for_pod(&config, None, true, false).unwrap();
+        let plan = TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, None, true, false).unwrap();
         let cmds = plan.pod_netns_iptables_commands(&config);
         assert!(cmds.iter().any(|c| c.starts_with("iptables ")));
         assert!(
-            !cmds.iter().any(|c| c.starts_with("ip6tables ")),
+            !cmds.iter().any(|c| c.contains("ip6tables")),
             "v6-disabled posture must emit IPv4-only pod-netns rules: {cmds:?}"
         );
     }
@@ -4599,7 +4784,8 @@ mod tests {
         let config = CaptureConfig::explicit(15006, 15001);
         // The iptables accessors are no-ops for the TC/eBPF backend, and vice
         // versa (the TC plan carries its own setup/cleanup vectors).
-        let tc = TcRedirectPlan::for_pod(&config, Some("veth0"), true, false).unwrap();
+        let tc =
+            TcRedirectPlan::for_pod(&config, TEST_HBONE_PORT, Some("veth0"), true, false).unwrap();
         assert!(tc.pod_netns_iptables_commands(&config).is_empty());
         assert!(tc.pod_netns_iptables_cleanup(&config).is_empty());
         assert!(!tc.setup_commands.is_empty());

@@ -1432,21 +1432,28 @@ fn handle_pod_added(
             // F4.3: the inbound redirect MUST be scoped to this one pod. In the
             // node-agent's host netns the node-global iptables inbound chain
             // cannot single out a pod (pod IPs are FORWARDED, not LOCAL), so the
-            // per-pod TC redirect binds to this pod's host-side veth (clsact +
-            // ingress `ferrum_tc_inbound`). `TcRedirectPlan::for_pod` returns
-            // `None` when there is NO per-pod handle (no veth, and no pod-netns
-            // iptables fallback wired here yet) — we then FAIL CLOSED with a loud
-            // warn and skip this pod, rather than silently widening to node-global
-            // capture. The in-process `attach_tc` below is the realization of the
-            // selected TcEbpf backend (the rendered `tc` commands document the
-            // same shape for the runtime-image fallback path).
+            // per-pod redirect binds to this pod's host-side veth (the in-process
+            // Aya `attach_tc` below). `TcRedirectPlan::for_pod` returns `None`
+            // when there is NO per-pod handle (no veth, and no pod-netns iptables
+            // fallback wired here yet) — we then FAIL CLOSED with a loud warn and
+            // skip this pod, rather than silently widening to node-global capture.
+            //
+            // HONEST SCOPE: the selected `TcEbpf` backend is scaffolding — its
+            // program returns `TC_ACT_PIPE` (no redirect yet), so the rendered
+            // `tc` commands are inert and the in-process `attach_tc` loads a
+            // non-redirecting program (a redirect-capable eBPF program is a
+            // deferred residual). The functional per-pod path is the pod-netns
+            // iptables fallback, which renders correct commands but is not yet
+            // executed here (entering the pod netns is the wiring residual);
+            // advertise it unavailable so a veth-less pod fails closed.
+            //
+            // Redirect target: the HBONE listener port (NOT the sidecar mTLS
+            // port) — node-agent inbound must land on the node-waypoint HBONE
+            // listener.
             let tc_plan = TcRedirectPlan::for_pod(
                 &config.capture_config,
+                config.capture_contract.hbone_redirect_port,
                 veth_iface.as_deref(),
-                // The pod-netns iptables fallback (entering the pod netns to
-                // install a pod-scoped REDIRECT) is not wired into this enrollment
-                // loop; advertise it as unavailable so a veth-less pod fails
-                // closed instead of being mis-reported as scoped.
                 false,
                 false,
             );
