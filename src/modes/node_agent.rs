@@ -25,7 +25,8 @@ use crate::admin::{self, AdminState};
 use crate::capture::{
     CaptureConfig, FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
     ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION, IncludeOutboundPorts, Ip6TablesMode, IptablesPlan,
-    XTABLES_LOCK_WAIT_SECONDS, include_outbound_ports_from_annotations,
+    TC_INBOUND_PROGRAM, TcRedirectPlan, XTABLES_LOCK_WAIT_SECONDS,
+    include_outbound_ports_from_annotations,
 };
 use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 use crate::config::EnvConfig;
@@ -1428,19 +1429,45 @@ fn handle_pod_added(
             }
         }
         if attach_ok {
-            let Some(ref iface) = veth_iface else {
+            // F4.3: the inbound redirect MUST be scoped to this one pod. In the
+            // node-agent's host netns the node-global iptables inbound chain
+            // cannot single out a pod (pod IPs are FORWARDED, not LOCAL), so the
+            // per-pod TC redirect binds to this pod's host-side veth (clsact +
+            // ingress `ferrum_tc_inbound`). `TcRedirectPlan::for_pod` returns
+            // `None` when there is NO per-pod handle (no veth, and no pod-netns
+            // iptables fallback wired here yet) — we then FAIL CLOSED with a loud
+            // warn and skip this pod, rather than silently widening to node-global
+            // capture. The in-process `attach_tc` below is the realization of the
+            // selected TcEbpf backend (the rendered `tc` commands document the
+            // same shape for the runtime-image fallback path).
+            let tc_plan = TcRedirectPlan::for_pod(
+                &config.capture_config,
+                veth_iface.as_deref(),
+                // The pod-netns iptables fallback (entering the pod netns to
+                // install a pod-scoped REDIRECT) is not wired into this enrollment
+                // loop; advertise it as unavailable so a veth-less pod fails
+                // closed instead of being mis-reported as scoped.
+                false,
+                false,
+            );
+            let Some(tc_plan) = tc_plan else {
                 warn!(
                     pod_uid,
                     pod_name,
                     namespace,
-                    "Could not resolve pod veth interface, skipping attachment"
+                    "Could not scope inbound capture to this pod: no host-side veth resolved \
+                     and no per-pod fallback available. Failing CLOSED — skipping inbound \
+                     redirect for this pod rather than falling back to node-global capture \
+                     (which would capture every pod's inbound traffic). Remediation: ensure \
+                     the pod's network namespace is reachable so its veth can be discovered."
                 );
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                 return;
             };
+            let iface = tc_plan.veth_iface.as_str();
 
-            if let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound") {
+            if let Err(e) = backend.attach_tc(pod_uid, iface, TC_INBOUND_PROGRAM) {
                 warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
