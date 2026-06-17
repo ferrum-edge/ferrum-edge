@@ -1995,31 +1995,8 @@ where
             let include_v6_cleanup = true;
             let udp_capture_enabled = config.capture_config.udp_capture_enabled;
 
-            // The node-agent runs in the HOST netns, where the UDP TPROXY
-            // `addrtype --dst-type LOCAL` direction split is wrong (pod IPs are
-            // FORWARDED, not LOCAL), so `udp_tproxy_commands_for_family` emits NO
-            // UDP TPROXY rules for `host_netns`. Surface that explicitly so an
-            // operator who set FERRUM_MESH_CAPTURE_UDP_ENABLED=true on the
-            // node-agent is not silently left thinking UDP is captured: node-agent
-            // host-netns UDP capture is unsupported in this stage and eBPF does NOT
-            // cover UDP either (the connect()-cgroup hooks are TCP-only). UDP
-            // capture lives in the injector's pod-netns path; node-agent /
-            // node-waypoint UDP capture is a future stage.
-            if udp_capture_enabled && config.capture_config.host_netns {
-                warn!(
-                    "FERRUM_MESH_CAPTURE_UDP_ENABLED=true but the node-agent iptables \
-                     fallback runs in the host network namespace, where the UDP TPROXY \
-                     direction split (addrtype --dst-type LOCAL) cannot distinguish \
-                     inbound-to-pod from outbound traffic. No UDP TPROXY rules will be \
-                     installed (TCP capture is unaffected). Node-agent host-netns UDP \
-                     capture is NOT supported in this stage (the direction split is \
-                     pod-netns-only); eBPF capture does NOT cover UDP either (the \
-                     connect()-cgroup hooks are TCP-only). For UDP capture, use the \
-                     injector's pod-netns path (an iptables init container that runs in \
-                     the pod netns where the pod IP is LOCAL); node-agent / node-waypoint \
-                     UDP capture is a future stage."
-                );
-            }
+            let unsupported_host_netns_udp =
+                udp_capture_enabled && config.capture_config.host_netns;
 
             // UNCONDITIONAL pre-setup teardown of the EXACT Ferrum-owned UDP TPROXY
             // state, regardless of the CURRENT `udp_capture_enabled` flag (codex
@@ -2045,6 +2022,24 @@ where
                 warn!(
                     error = %teardown_err,
                     "Failed to tear down stale Ferrum UDP capture state before setup; continuing"
+                );
+            }
+
+            // The node-agent runs in the HOST netns, where the UDP TPROXY
+            // `addrtype --dst-type LOCAL` direction split is wrong (pod IPs are
+            // FORWARDED, not LOCAL), so `udp_tproxy_commands_for_family` emits NO
+            // UDP TPROXY rules for `host_netns`. If the operator explicitly
+            // requested UDP capture, fail closed after stale-state teardown rather
+            // than applying a TCP-only fallback plan and reporting readiness.
+            if unsupported_host_netns_udp {
+                anyhow::bail!(
+                    "FERRUM_MESH_CAPTURE_UDP_ENABLED=true is unsupported for the \
+                     node-agent iptables fallback in the host network namespace: the \
+                     UDP TPROXY direction split (addrtype --dst-type LOCAL) cannot \
+                     distinguish inbound-to-pod from outbound traffic there. Refusing \
+                     to start TCP-only capture without requested UDP capture. For UDP \
+                     capture, use the injector's pod-netns path; node-agent / \
+                     node-waypoint UDP capture is a future stage."
                 );
             }
 
@@ -2842,6 +2837,62 @@ mod tests {
             metrics.snapshot().topology_degraded_reason,
             Some("kernel_too_old"),
             "kernel-version failure should set the degraded gauge"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_fallback_iptables_udp_host_netns_fails_closed() {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.udp_capture_enabled = true;
+        capture_config.host_netns = true;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let probe = kernel_probe::KernelProbeResult {
+            kernel_release: "4.19.0".to_string(),
+            meets_version_requirement: false,
+            cgroup_v2_available: false,
+            bpf_fs_available: false,
+        };
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
+        let metrics = NodeAgentMetrics::default();
+        let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let phases_for_runner = std::sync::Arc::clone(&phases);
+
+        let result = handle_fallback_with(
+            &config,
+            &probe,
+            &metrics,
+            &shutdown_tx,
+            move |_commands, phase| {
+                let phases = std::sync::Arc::clone(&phases_for_runner);
+                async move {
+                    phases.lock().expect("phases mutex").push(phase);
+                    Ok(())
+                }
+            },
+            startup_ready.clone(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "host-netns iptables fallback must fail closed when UDP capture is requested"
+        );
+        assert!(!startup_ready.load(Ordering::Acquire));
+        assert_eq!(
+            *phases.lock().expect("phases mutex"),
+            vec!["pre-setup UDP teardown"],
+            "fallback must not apply a TCP-only setup plan after rejecting UDP capture"
         );
     }
 
