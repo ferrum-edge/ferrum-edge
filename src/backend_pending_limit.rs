@@ -59,8 +59,9 @@
 //!   by a flat `host|port` `String`, and `DashMap::get` accepts `&str` via
 //!   `String: Borrow<str>`, so a repeat request to a known destination allocates
 //!   nothing. Only the cold first request to a new destination allocates the
-//!   owned key for the `entry` insert. This satisfies the hot-path no-alloc
-//!   contract (the previous `host.to_string()` probe allocated per request).
+//!   owned key for the `entry` insert. Zero-count entries are removed on guard
+//!   drop when no concurrent acquirer is still using that counter, so wildcard
+//!   Host sprays cannot retain unbounded idle destination keys.
 //! - The counter map is a sharded [`dashmap::DashMap`] sized via
 //!   [`crate::util::sharding::pool_shard_amount`]; counters are
 //!   [`crossbeam_utils::CachePadded`] so a hot destination's count does not
@@ -159,11 +160,23 @@ impl BackendPendingLimiter {
             if let Some(existing) = self.inner.get(buf.as_str()) {
                 return existing.clone();
             }
-            // Cold path: a new destination — allocate the owned key once.
+            // Cold path: a new active destination — allocate the owned key.
+            // Idle zero-count entries are removed again when the last guard
+            // drops, preventing attacker-controlled wildcard hosts from
+            // permanently growing this process-wide map.
             self.inner
                 .entry(buf.clone())
                 .or_insert_with(|| Arc::new(CachePadded::new(AtomicU64::new(0))))
                 .clone()
+        })
+    }
+
+    fn owned_key(host: &str, port: u16) -> String {
+        PENDING_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            write_pending_key(&mut buf, host, port);
+            buf.clone()
         })
     }
 
@@ -191,8 +204,12 @@ impl BackendPendingLimiter {
         let Some(cap) = cap else {
             return Ok(None);
         };
-        let counter = self.counter_for(host, port);
         let cap_u64 = u64::from(cap);
+        if cap_u64 == 0 {
+            return Err(BackendPendingLimitExceeded { current: 0, cap: 0 });
+        }
+
+        let counter = self.counter_for(host, port);
         loop {
             let current = counter.load(Ordering::Relaxed);
             if current >= cap_u64 {
@@ -209,7 +226,13 @@ impl BackendPendingLimiter {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(Some(BackendPendingGuard { counter })),
+                Ok(_) => {
+                    return Ok(Some(BackendPendingGuard {
+                        inner: Arc::clone(&self.inner),
+                        key: Self::owned_key(host, port),
+                        counter,
+                    }));
+                }
                 Err(_) => continue,
             }
         }
@@ -229,6 +252,11 @@ impl BackendPendingLimiter {
                 .unwrap_or(0)
         })
     }
+
+    #[cfg(test)]
+    fn counter_entries(&self) -> usize {
+        self.inner.len()
+    }
 }
 
 /// RAII guard that holds one in-flight slot for a destination and releases it
@@ -238,6 +266,8 @@ impl BackendPendingLimiter {
 /// lifetime.
 #[derive(Debug)]
 pub struct BackendPendingGuard {
+    inner: Arc<DashMap<String, Arc<CachePadded<AtomicU64>>>>,
+    key: String,
     counter: Arc<CachePadded<AtomicU64>>,
 }
 
@@ -247,7 +277,14 @@ impl Drop for BackendPendingGuard {
         // silently mask a double-release / missing-acquire bug. The test suite
         // asserts the count returns to zero so any guard-lifetime regression
         // surfaces immediately.
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.counter.fetch_sub(1, Ordering::AcqRel);
+        if previous == 1 {
+            self.inner.remove_if(self.key.as_str(), |_key, counter| {
+                Arc::ptr_eq(counter, &self.counter)
+                    && Arc::strong_count(counter) == 2
+                    && counter.load(Ordering::Acquire) == 0
+            });
+        }
     }
 }
 
@@ -344,10 +381,54 @@ mod tests {
             0,
             "drop must decrement the counter exactly once"
         );
+        assert_eq!(
+            limiter.counter_entries(),
+            0,
+            "idle destination key must be removed after the last guard drops"
+        );
         let _g = limiter
             .try_acquire("h", 7777, Some(1))
             .expect("slot freed after drop")
             .expect("guard present");
+    }
+
+    #[test]
+    fn unique_idle_destinations_do_not_accumulate() {
+        let limiter = BackendPendingLimiter::new();
+        for i in 0..1_000 {
+            let host = format!("spray-{i}.example.com");
+            let guard = limiter
+                .try_acquire(&host, 80, Some(1))
+                .expect("sprayed host under cap")
+                .expect("guard present");
+            assert_eq!(limiter.counter_entries(), 1);
+            drop(guard);
+            assert_eq!(
+                limiter.counter_entries(),
+                0,
+                "dropped zero-count wildcard destination must not remain retained"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_destination_entry_stays_until_last_guard_drops() {
+        let limiter = BackendPendingLimiter::new();
+        let g1 = limiter
+            .try_acquire("shared.example.com", 80, Some(2))
+            .expect("first under cap")
+            .expect("guard present");
+        let g2 = limiter
+            .try_acquire("shared.example.com", 80, Some(2))
+            .expect("second under cap")
+            .expect("guard present");
+        assert_eq!(limiter.counter_entries(), 1);
+        drop(g1);
+        assert_eq!(limiter.counter_entries(), 1);
+        assert_eq!(limiter.current("shared.example.com", 80), 1);
+        drop(g2);
+        assert_eq!(limiter.counter_entries(), 0);
+        assert_eq!(limiter.current("shared.example.com", 80), 0);
     }
 
     #[test]
