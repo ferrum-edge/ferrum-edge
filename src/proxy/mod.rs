@@ -14410,13 +14410,23 @@ async fn handle_proxy_request_inner(
         )
         && supports_hbone_backend(&state, &proxy, upstream_target.as_deref());
     if hbone_required && !current_dispatch_hbone {
+        // #1669: a configured `retry` policy forces the mesh transport off
+        // (the retry path is reqwest-only), so it is the most common cause of
+        // this fail-closed 502. Name it in the message; admission validation
+        // (`validate_upstream_references`) now rejects retry + mesh.hbone, so
+        // this should only be reachable via a config path that skips it.
+        let retry_conflict_hint = if has_retry {
+            " (a configured 'retry' policy forces HBONE dispatch off — remove 'retry' or the mesh.hbone upstream-target tag)"
+        } else {
+            ""
+        };
         warn!(
             proxy_id = %proxy.id,
             upstream_target = ?upstream_target,
             has_retry,
             requires_request_body_buffering,
             stream_request_body,
-            "mesh.hbone=true target requires HBONE dispatch; refusing direct-backend fallback"
+            "mesh.hbone=true target requires HBONE dispatch; refusing direct-backend fallback{retry_conflict_hint}"
         );
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,
@@ -14437,13 +14447,21 @@ async fn handle_proxy_request_inner(
         )
         && supports_mesh_mtls_backend(&state, &proxy, upstream_target.as_deref());
     if mesh_mtls_required && !current_dispatch_mesh_mtls {
+        // #1669: as with HBONE above, a configured `retry` policy forces the
+        // mesh-mTLS transport off and is the most common cause of this
+        // fail-closed 502. Admission validation now rejects retry + mesh.mtls.
+        let retry_conflict_hint = if has_retry {
+            " (a configured 'retry' policy forces sidecar mTLS dispatch off — remove 'retry' or the mesh.mtls upstream-target tag)"
+        } else {
+            ""
+        };
         warn!(
             proxy_id = %proxy.id,
             upstream_target = ?upstream_target,
             has_retry,
             requires_request_body_buffering,
             stream_request_body,
-            "mesh.mtls=true target requires sidecar SVID-mTLS dispatch; refusing direct-backend fallback"
+            "mesh.mtls=true target requires sidecar SVID-mTLS dispatch; refusing direct-backend fallback{retry_conflict_hint}"
         );
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,

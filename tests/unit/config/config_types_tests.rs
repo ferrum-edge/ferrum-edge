@@ -2,8 +2,8 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, Consumer, DispatchKind, GatewayConfig,
     LocalityPreference, PluginAssociation, PluginConfig, PluginScope, Proxy,
-    ResolvedSubsetTrafficPolicy, Upstream, UpstreamPortOverride, UpstreamTarget, hosts_overlap,
-    validate_host_entry, validate_resource_id, wildcard_matches,
+    ResolvedSubsetTrafficPolicy, RetryConfig, Upstream, UpstreamPortOverride, UpstreamTarget,
+    hosts_overlap, validate_host_entry, validate_resource_id, wildcard_matches,
 };
 use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TracingProvider};
 use std::collections::HashMap;
@@ -1676,6 +1676,151 @@ fn test_upstream_references_none_ok() {
     let mut config = empty_config();
     config.proxies = vec![p1];
     assert!(config.validate_upstream_references().is_ok());
+}
+
+// ---- #1669: retry + mesh transport tag conflict ----
+
+fn engageable_retry() -> RetryConfig {
+    RetryConfig {
+        max_retries: 2,
+        retryable_status_codes: vec![503],
+        retryable_methods: vec!["GET".into()],
+        backoff: Default::default(),
+        retry_on_connect_failure: true,
+    }
+}
+
+fn mesh_tagged_upstream(id: &str, tag: &str) -> Upstream {
+    let mut u = make_upstream(id);
+    u.targets[0].tags.insert(tag.into(), "true".into());
+    u
+}
+
+#[test]
+fn test_upstream_references_rejects_retry_with_mesh_hbone_target() {
+    let u1 = mesh_tagged_upstream("mesh-up", "mesh.hbone");
+    let mut p1 = make_proxy("p1", "/api");
+    p1.upstream_id = Some("mesh-up".into());
+    p1.retry = Some(engageable_retry());
+    let mut config = empty_config();
+    config.upstreams = vec![u1];
+    config.proxies = vec![p1];
+    let err = config.validate_upstream_references().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(
+        err[0].contains("mesh.hbone"),
+        "error names the tag: {}",
+        err[0]
+    );
+    assert!(err[0].contains("retry"), "error names retry: {}", err[0]);
+}
+
+#[test]
+fn test_upstream_references_rejects_retry_with_mesh_mtls_target() {
+    let u1 = mesh_tagged_upstream("mesh-up", "mesh.mtls");
+    let mut p1 = make_proxy("p1", "/api");
+    p1.upstream_id = Some("mesh-up".into());
+    p1.retry = Some(engageable_retry());
+    let mut config = empty_config();
+    config.upstreams = vec![u1];
+    config.proxies = vec![p1];
+    let err = config.validate_upstream_references().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(
+        err[0].contains("mesh.mtls"),
+        "error names the tag: {}",
+        err[0]
+    );
+}
+
+#[test]
+fn test_upstream_references_allows_mesh_target_without_retry() {
+    // The mesh tag alone (no retry) is the normal materialized case.
+    let u1 = mesh_tagged_upstream("mesh-up", "mesh.hbone");
+    let mut p1 = make_proxy("p1", "/api");
+    p1.upstream_id = Some("mesh-up".into());
+    let mut config = empty_config();
+    config.upstreams = vec![u1];
+    config.proxies = vec![p1];
+    assert!(config.validate_upstream_references().is_ok());
+}
+
+#[test]
+fn test_upstream_references_allows_inert_retry_with_mesh_target() {
+    // A retry policy that can never engage (max_retries == 0) does not force
+    // the mesh transport off, so it is not a conflict.
+    let u1 = mesh_tagged_upstream("mesh-up", "mesh.hbone");
+    let mut p1 = make_proxy("p1", "/api");
+    p1.upstream_id = Some("mesh-up".into());
+    p1.retry = Some(RetryConfig {
+        max_retries: 0,
+        ..engageable_retry()
+    });
+    let mut config = empty_config();
+    config.upstreams = vec![u1];
+    config.proxies = vec![p1];
+    assert!(config.validate_upstream_references().is_ok());
+}
+
+#[test]
+fn test_upstream_references_allows_retry_with_untagged_target() {
+    // A retry policy against a plain (untagged) upstream is fine.
+    let u1 = make_upstream("plain-up");
+    let mut p1 = make_proxy("p1", "/api");
+    p1.upstream_id = Some("plain-up".into());
+    p1.retry = Some(engageable_retry());
+    let mut config = empty_config();
+    config.upstreams = vec![u1];
+    config.proxies = vec![p1];
+    assert!(config.validate_upstream_references().is_ok());
+}
+
+#[test]
+fn test_retry_config_can_ever_engage() {
+    // Connection-failure retries engage regardless of status/method config.
+    assert!(
+        RetryConfig {
+            max_retries: 1,
+            retryable_status_codes: vec![],
+            retryable_methods: vec![],
+            backoff: Default::default(),
+            retry_on_connect_failure: true,
+        }
+        .can_ever_engage()
+    );
+    // Status-code retries need at least one status AND one method.
+    assert!(
+        RetryConfig {
+            max_retries: 1,
+            retryable_status_codes: vec![503],
+            retryable_methods: vec!["GET".into()],
+            backoff: Default::default(),
+            retry_on_connect_failure: false,
+        }
+        .can_ever_engage()
+    );
+    // No method configured + no connect-failure retries → can never engage.
+    assert!(
+        !RetryConfig {
+            max_retries: 1,
+            retryable_status_codes: vec![503],
+            retryable_methods: vec![],
+            backoff: Default::default(),
+            retry_on_connect_failure: false,
+        }
+        .can_ever_engage()
+    );
+    // max_retries == 0 → never engages.
+    assert!(
+        !RetryConfig {
+            max_retries: 0,
+            retryable_status_codes: vec![503],
+            retryable_methods: vec!["GET".into()],
+            backoff: Default::default(),
+            retry_on_connect_failure: true,
+        }
+        .can_ever_engage()
+    );
 }
 
 // ---- priority_override validation tests ----

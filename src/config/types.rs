@@ -2860,6 +2860,18 @@ impl GatewayConfig {
     /// In file mode there's no DB, so this catches dangling references
     /// at config load time.
     pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
+        // Name the mesh transport an upstream target requires, if any. Reuses
+        // the runtime dispatch predicates so admission validation can never
+        // drift from what the proxy fail-closed guard actually enforces.
+        fn mesh_transport_required_tag(target: &UpstreamTarget) -> Option<&'static str> {
+            if crate::proxy::hbone_pool::target_hbone_enabled(target) {
+                Some(crate::proxy::hbone_pool::HBONE_TARGET_TAG)
+            } else if crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+                Some(crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG)
+            } else {
+                None
+            }
+        }
         let upstreams_by_id: HashMap<&str, &Upstream> =
             self.upstreams.iter().map(|u| (u.id.as_str(), u)).collect();
         let mut errors = Vec::new();
@@ -2878,6 +2890,28 @@ impl GatewayConfig {
                                     proxy.id, subset_name, uid
                                 ));
                             }
+                        }
+                        // #1669: a proxy that requires a mesh transport for its
+                        // backend (an upstream target tagged `mesh.hbone` /
+                        // `mesh.mtls`) must not also configure an HTTP `retry`
+                        // policy. The retry dispatch path uses a plaintext
+                        // reqwest direct-backend dial, which the mesh
+                        // fail-closed guard refuses — yielding an unconditional
+                        // 502 at runtime with no actionable diagnostic. Reject
+                        // the contradiction at admission instead.
+                        if proxy
+                            .retry
+                            .as_ref()
+                            .is_some_and(RetryConfig::can_ever_engage)
+                            && let Some(tag) = upstream
+                                .targets
+                                .iter()
+                                .find_map(mesh_transport_required_tag)
+                        {
+                            errors.push(format!(
+                                "Proxy '{}' configures a 'retry' policy but references upstream_id '{}' whose target(s) are tagged '{}' (mesh transport required). Retries dispatch over a plaintext direct backend, which is refused for mesh targets (runtime 502 Bad Gateway). Remove the 'retry' policy or the '{}' upstream-target tag.",
+                                proxy.id, uid, tag, tag
+                            ));
                         }
                     }
                     None => {
@@ -5287,6 +5321,22 @@ impl CircuitBreakerConfig {
 }
 
 impl RetryConfig {
+    /// Whether this retry policy could ever engage an HTTP retry for *some*
+    /// request method/condition — the method-agnostic counterpart to
+    /// [`crate::retry::has_effective_http_retries`], for config-admission
+    /// checks that have no concrete request method.
+    ///
+    /// True iff `max_retries > 0` AND either connection-failure retries are on,
+    /// or at least one retryable status code AND one retryable method are
+    /// configured. A policy that can never engage (e.g. `max_retries == 0`)
+    /// returns false so it is not treated as an active retry policy. Mirror
+    /// any change to `has_effective_http_retries` here.
+    pub fn can_ever_engage(&self) -> bool {
+        self.max_retries > 0
+            && (self.retry_on_connect_failure
+                || (!self.retryable_status_codes.is_empty() && !self.retryable_methods.is_empty()))
+    }
+
     /// Validate retry configuration fields.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
