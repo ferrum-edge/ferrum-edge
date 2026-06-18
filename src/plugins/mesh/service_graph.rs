@@ -113,7 +113,14 @@ pub struct ServiceGraphRegistry {
 impl Default for ServiceGraphRegistry {
     fn default() -> Self {
         Self {
-            edges: DashMap::new(),
+            // `edges.entry().or_insert_with()` is a genuine write per mesh
+            // request, so this map rides the per-request hot path and must
+            // follow the hot-path `DashMap` sharding invariant. As a
+            // process-global it cannot read `env_config.pool_shard_amount`, so
+            // it auto-derives from CPU topology via `pool_shard_amount(0)`
+            // (`next_power_of_two(max(64, num_cpus * 16))`) — same pattern as
+            // `backend_conn_limit` / `backend_pending_limit`.
+            edges: DashMap::with_shard_amount(crate::util::sharding::pool_shard_amount(0)),
             snapshot: ArcSwap::from_pointee(ServiceGraphSnapshot::default()),
             last_snapshot_unix_ms: AtomicU64::new(0),
             snapshot_worker_started: AtomicBool::new(false),

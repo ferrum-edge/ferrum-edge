@@ -741,7 +741,15 @@ const MESH_LABEL_INTERN_CAP: usize = 4096;
 /// Process-wide intern pool that turns repeated mesh-label `&str` values into a
 /// shared `Arc<str>` so [`mesh_request_key`] can clone (atomic increment)
 /// instead of heap-allocating a fresh `Arc` per field on every call.
-static MESH_LABEL_INTERN: LazyLock<DashMap<Box<str>, Arc<str>>> = LazyLock::new(DashMap::new);
+///
+/// Probed ~once per mesh-label per request, so it rides the per-request hot
+/// path and must follow the hot-path `DashMap` sharding invariant. As a
+/// process-global `LazyLock` it cannot read `env_config.pool_shard_amount`
+/// at init, so it auto-derives from CPU topology via `pool_shard_amount(0)`
+/// (`next_power_of_two(max(64, num_cpus * 16))`) rather than the env override —
+/// same pattern as `backend_conn_limit` / `backend_pending_limit`.
+static MESH_LABEL_INTERN: LazyLock<DashMap<Box<str>, Arc<str>>> =
+    LazyLock::new(|| DashMap::with_shard_amount(crate::util::sharding::pool_shard_amount(0)));
 static MESH_LABEL_INTERN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Intern a mesh label value into a shared `Arc<str>`.
