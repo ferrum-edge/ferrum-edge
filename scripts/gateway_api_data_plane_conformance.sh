@@ -86,15 +86,17 @@ deploy_control_plane() {
     --set image.pullPolicy=IfNotPresent \
     --set injector.enabled=false \
     --set ca.enabled=false \
+    --set controlPlane.enabled=true \
     --set controlPlane.rbac.create=true \
     --set controlPlane.rbac.gatewayApi=true \
     --set controlPlane.rbac.istio=false \
     --set controlPlane.rbac.meshConfig=false \
     --set controlPlane.rbac.podDiscovery=true \
-    --set controlPlane.env.FERRUM_DB_TYPE=sqlite \
-    --set-string 'controlPlane.env.FERRUM_DB_URL=sqlite:////tmp/ferrum-gateway-api-conformance.db?mode=rwc' \
-    --set controlPlane.env.FERRUM_ADMIN_JWT_SECRET="$ADMIN_SECRET" \
-    --set controlPlane.env.FERRUM_CP_DP_GRPC_JWT_SECRET="$JWT_SECRET" \
+    --set controlPlane.database.type=sqlite \
+    --set-string controlPlane.database.sqlite.path=/tmp/ferrum-gateway-api-conformance.db \
+    --set controlPlane.database.sqlite.mode=rwc \
+    --set-string controlPlane.credentials.adminJwtSecret.value="$ADMIN_SECRET" \
+    --set-string controlPlane.credentials.cpDpGrpcJwtSecret.value="$JWT_SECRET" \
     --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
     --set controlPlane.env.FERRUM_LOG_LEVEL=info \
     --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
