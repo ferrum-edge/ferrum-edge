@@ -9,6 +9,7 @@ use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 struct LegacyAuthorizePlugin;
@@ -2097,6 +2098,73 @@ fn test_priority_override_delegates_request_buffering_refinement() {
         !plugins[0].should_buffer_request_body(&ctx),
         "priority override wrapper must preserve plugin-specific GET buffering skip"
     );
+}
+
+#[tokio::test]
+async fn test_priority_override_delegates_context_response_body_transform() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "compression",
+        json!({"min_content_length": 10, "algorithms": ["gzip"]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin_config.priority_override = Some(100);
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "compression");
+    assert_eq!(plugins[0].priority(), 100);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/users".to_string(),
+    );
+
+    let mut request_headers = HashMap::new();
+    request_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    plugins[0].before_proxy(&mut ctx, &mut request_headers).await;
+    assert!(
+        !request_headers.contains_key("accept-encoding"),
+        "compression should strip Accept-Encoding before proxying"
+    );
+
+    let body = r#"{"users":[{"name":"alice","email":"alice@example.com","role":"admin"},{"name":"bob","email":"bob@example.com","role":"user"},{"name":"charlie","email":"charlie@example.com","role":"user"},{"name":"dave","email":"dave@example.com","role":"moderator"},{"name":"eve","email":"eve@example.com","role":"user"},{"name":"frank","email":"frank@example.com","role":"admin"}]}"#.as_bytes();
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    response_headers.insert("content-length".to_string(), body.len().to_string());
+
+    plugins[0]
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+
+    let compressed = plugins[0]
+        .transform_response_body_with_context(
+            &mut ctx,
+            body,
+            Some("application/json"),
+            &response_headers,
+        )
+        .await
+        .expect("priority override wrapper should forward the context-aware transform");
+
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed).unwrap();
+    assert_eq!(decompressed, body);
 }
 
 #[test]

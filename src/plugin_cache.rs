@@ -162,6 +162,17 @@ impl Plugin for PriorityOverridePlugin {
             .transform_request_body(body, content_type, request_headers)
             .await
     }
+    async fn transform_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        request_headers: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.inner
+            .transform_request_body_with_context(ctx, body, content_type, request_headers)
+            .await
+    }
     async fn on_final_request_body(
         &self,
         headers: &std::collections::HashMap<String, String>,
@@ -190,6 +201,17 @@ impl Plugin for PriorityOverridePlugin {
     ) -> Option<Vec<u8>> {
         self.inner
             .transform_response_body(body, content_type, response_headers)
+            .await
+    }
+    async fn transform_response_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.inner
+            .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await
     }
     async fn on_final_response_body(
