@@ -932,6 +932,15 @@ impl ResponseCaching {
         }
     }
 
+    fn mark_uncacheable_if_no_cached_entry(&self, predict_key: Option<&str>) {
+        let Some(predict_key) = predict_key else {
+            return;
+        };
+        if !self.cache.contains_key(predict_key) {
+            self.uncacheable_predictor.mark_uncacheable(predict_key);
+        }
+    }
+
     /// Evict expired entries when cache exceeds max_entries.
     fn evict_if_needed(&self) {
         if self.cache.len() <= self.config.max_entries {
@@ -1516,9 +1525,7 @@ impl Plugin for ResponseCaching {
             .cacheable_status_codes
             .contains(&response_status)
         {
-            if let Some(predict_key) = predict_key.as_deref() {
-                self.uncacheable_predictor.mark_uncacheable(predict_key);
-            }
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -1533,9 +1540,7 @@ impl Plugin for ResponseCaching {
 
         if directives.no_store || directives.private || directives.no_cache {
             self.invalidate_base_key(&base_key);
-            if let Some(predict_key) = predict_key.as_deref() {
-                self.uncacheable_predictor.mark_uncacheable(predict_key);
-            }
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -1554,9 +1559,7 @@ impl Plugin for ResponseCaching {
                 response_headers,
                 &lookup_headers,
             );
-            if let Some(predict_key) = predict_key.as_deref() {
-                self.uncacheable_predictor.mark_uncacheable(predict_key);
-            }
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -1565,16 +1568,12 @@ impl Plugin for ResponseCaching {
         // session cookies to other users (RFC 7234 §8).
         if response_headers.contains_key("set-cookie") {
             debug!("response_caching: skipping cache — response contains Set-Cookie header");
-            if let Some(predict_key) = predict_key.as_deref() {
-                self.uncacheable_predictor.mark_uncacheable(predict_key);
-            }
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
         if !self.shared_cache_allows_authorized_response(ctx, directives) {
-            if let Some(predict_key) = predict_key.as_deref() {
-                self.uncacheable_predictor.mark_uncacheable(predict_key);
-            }
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -1588,9 +1587,7 @@ impl Plugin for ResponseCaching {
         );
 
         if corrected_initial_age >= freshness_lifetime {
-            if let Some(predict_key) = predict_key.as_deref() {
-                self.uncacheable_predictor.mark_uncacheable(predict_key);
-            }
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -1598,9 +1595,7 @@ impl Plugin for ResponseCaching {
             Some(vary_headers) => vary_headers,
             None => {
                 self.invalidate_base_key(&base_key);
-                if let Some(predict_key) = predict_key.as_deref() {
-                    self.uncacheable_predictor.mark_uncacheable(predict_key);
-                }
+                self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
                 return PluginResult::Continue;
             }
         };
