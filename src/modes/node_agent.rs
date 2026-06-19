@@ -1679,13 +1679,16 @@ fn handle_pod_added(
         .map(|p| p.to_string_lossy().to_string());
     // Production: the kube-rs caller sets `veth_iface_override = None`; the
     // resolver first uses an explicit pod PID when available, then falls back
-    // to the resolved pod cgroup to find a live process in that pod.
+    // to the resolved pod cgroup to find a live process in that pod. Some
+    // container runtimes expose neither pod sysfs nor setns from the node-agent
+    // container, so use the host route table as a final pod-IP-scoped fallback.
     // Tests supply a synthetic name so the post-65606d87 inbound-tc invariant
     // is satisfied without a real pod PID / Linux kernel.
     let veth_iface = event
         .veth_iface_override
         .map(|s| s.to_string())
-        .or_else(|| veth::discover_veth_for_pod(event.pod_pid, cgroup_path.as_deref()));
+        .or_else(|| veth::discover_veth_for_pod(event.pod_pid, cgroup_path.as_deref()))
+        .or_else(|| pod_ip.and_then(veth::discover_veth_for_pod_ip));
 
     if let Some(mut state) = pod_states.get_mut(pod_uid) {
         let attachment_target_changed = state.cgroup_path != cgroup_path
