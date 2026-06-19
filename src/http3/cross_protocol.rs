@@ -2063,7 +2063,8 @@ where
 
             for plugin in plugins {
                 if let Some(transformed) = plugin
-                    .transform_response_body(
+                    .transform_response_body_with_context(
+                        &mut *ctx,
                         &response_body,
                         content_type_of(&response_headers),
                         &response_headers,
@@ -2859,7 +2860,8 @@ where
             // headers after reconciliation below.
             for plugin in plugins.iter() {
                 if let Some(transformed) = plugin
-                    .transform_response_body(
+                    .transform_response_body_with_context(
+                        &mut *ctx,
                         &response_body,
                         content_type_of(&plugin_response_headers),
                         &plugin_response_headers,

@@ -59,6 +59,8 @@ const DEFAULT_CONTENT_TYPES: &[&str] = &[
 const UNCOMPRESSIBLE_STATUS_CODES: &[u16] = &[204, 304];
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+const REQUEST_NO_TRANSFORM_METADATA_KEY: &str = "compression:request_no_transform";
+const RESPONSE_ALGORITHM_METADATA_KEY: &str = "compression:algorithm";
 
 struct CompressionConfig {
     /// Enabled algorithms in server-preference order (used to break q-value ties).
@@ -263,6 +265,45 @@ impl CompressionPlugin {
         match algo {
             Algorithm::Gzip => self.compress_gzip(data),
             Algorithm::Brotli => self.compress_brotli(data),
+        }
+    }
+
+    fn compress_response_body(&self, body: &[u8], encoding: &str) -> Option<Vec<u8>> {
+        let algo = match encoding {
+            "gzip" => Algorithm::Gzip,
+            "br" => Algorithm::Brotli,
+            _ => return None,
+        };
+
+        match self.compress(algo, body) {
+            Ok(compressed) => {
+                debug!(
+                    "compression: compressed response body from {} to {} bytes ({}, {:.1}% reduction)",
+                    body.len(),
+                    compressed.len(),
+                    encoding,
+                    if body.is_empty() {
+                        0.0
+                    } else {
+                        (1.0 - compressed.len() as f64 / body.len() as f64) * 100.0
+                    },
+                );
+                Some(compressed)
+            }
+            Err(e) => {
+                // `flate2`/`brotli` writing to a `Vec` is effectively
+                // infallible in practice, so this branch is unreachable in
+                // production. If it ever does fire, the response headers
+                // already commit us to a Content-Encoding that we cannot
+                // honour — the client will see a corrupt body. Log loudly
+                // so operators notice rather than silently downgrading.
+                error!(
+                    "compression: encoder failure for committed Content-Encoding '{}' — \
+                     response will be malformed: {e}",
+                    encoding
+                );
+                None
+            }
         }
     }
 
@@ -487,6 +528,31 @@ fn parse_encoding_quality(token: &str) -> (&str, f32) {
     }
 }
 
+fn request_no_transform(ctx: &RequestContext, headers: &HashMap<String, String>) -> bool {
+    ctx.metadata
+        .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
+        || ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
+        || headers_have_cache_control_directive(headers, "no-transform")
+}
+
+fn ensure_cache_control_no_transform(headers: &mut HashMap<String, String>) {
+    if headers_have_cache_control_directive(headers, "no-transform") {
+        return;
+    }
+
+    match headers.get_mut("cache-control") {
+        Some(value) if value.trim().is_empty() => {
+            *value = "no-transform".to_string();
+        }
+        Some(value) => {
+            value.push_str(", no-transform");
+        }
+        None => {
+            headers.insert("cache-control".to_string(), "no-transform".to_string());
+        }
+    }
+}
+
 #[async_trait]
 impl Plugin for CompressionPlugin {
     fn name(&self) -> &str {
@@ -510,9 +576,7 @@ impl Plugin for CompressionPlugin {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.config.decompress_request
-            && ctx.headers.contains_key("content-encoding")
-            && !headers_have_cache_control_directive(&ctx.headers, "no-transform")
+        self.config.decompress_request && ctx.headers.contains_key("content-encoding")
     }
 
     /// Buffer the request body before `before_proxy` runs so the decompression
@@ -543,7 +607,10 @@ impl Plugin for CompressionPlugin {
             && ctx.headers.contains_key("accept-encoding")
             && !ctx
                 .metadata
-                .contains_key("compression:request_no_transform")
+                .contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
+            && !ctx
+                .metadata
+                .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -604,9 +671,10 @@ impl Plugin for CompressionPlugin {
         // RFC 9111 no-transform is valid on requests too. Treat it as an opt-out
         // from gateway request/response representation changes and leave
         // Accept-Encoding/Content-Encoding intact for the origin to handle.
-        if headers_have_cache_control_directive(headers, "no-transform") {
+        if request_no_transform(ctx, headers) {
+            ensure_cache_control_no_transform(headers);
             ctx.metadata.insert(
-                "compression:request_no_transform".to_string(),
+                REQUEST_NO_TRANSFORM_METADATA_KEY.to_string(),
                 "true".to_string(),
             );
             return PluginResult::Continue;
@@ -708,7 +776,10 @@ impl Plugin for CompressionPlugin {
 
         if ctx
             .metadata
-            .contains_key("compression:request_no_transform")
+            .contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
         {
             return PluginResult::Continue;
         }
@@ -783,7 +854,7 @@ impl Plugin for CompressionPlugin {
 
         // Record the decision for transform_response_body.
         ctx.metadata.insert(
-            "compression:algorithm".to_string(),
+            RESPONSE_ALGORITHM_METADATA_KEY.to_string(),
             algorithm.content_encoding().to_string(),
         );
 
@@ -861,61 +932,48 @@ impl Plugin for CompressionPlugin {
 
     async fn transform_response_body(
         &self,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        // Compression needs the `after_proxy` decision in request metadata to
+        // distinguish a gateway-committed encoding from an origin-supplied
+        // `Content-Encoding`. Production proxy paths call the context-aware
+        // variant below.
+        None
+    }
+
+    async fn transform_response_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
         body: &[u8],
         _content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // The algorithm decision was made in `after_proxy` and recorded in
-        // the `Content-Encoding` response header. If `after_proxy` did not
-        // commit to an encoding, do nothing.
+        // request metadata. If the backend already sent Content-Encoding,
+        // leave it intact instead of double-compressing an origin-encoded body
+        // that happened to be buffered for another plugin.
         let encoding = response_headers.get("content-encoding")?;
-
-        let algo = match encoding.as_str() {
-            "gzip" => Algorithm::Gzip,
-            "br" => Algorithm::Brotli,
-            _ => return None,
-        };
-
-        // CRITICAL: once `after_proxy` set `Content-Encoding`, the response
-        // is committed to that encoding. We MUST NOT short-circuit here on
-        // body size — doing so would leave the client with a body labelled
-        // `Content-Encoding: gzip` that is actually plaintext, which every
-        // conformant client will reject as a decoding error.
-        //
-        // The minimum-length gate runs in `after_proxy` for the known-CL
-        // case. When CL is unknown (chunked / streamed responses), we
-        // accept that the rare tiny chunked body will be compressed needlessly
-        // — far cheaper than serving a malformed response.
-
-        match self.compress(algo, body) {
-            Ok(compressed) => {
-                debug!(
-                    "compression: compressed response body from {} to {} bytes ({}, {:.1}% reduction)",
-                    body.len(),
-                    compressed.len(),
-                    encoding,
-                    if body.is_empty() {
-                        0.0
-                    } else {
-                        (1.0 - compressed.len() as f64 / body.len() as f64) * 100.0
-                    },
-                );
-                Some(compressed)
-            }
-            Err(e) => {
-                // `flate2`/`brotli` writing to a `Vec` is effectively
-                // infallible in practice, so this branch is unreachable in
-                // production. If it ever does fire, the response headers
-                // already commit us to a Content-Encoding that we cannot
-                // honour — the client will see a corrupt body. Log loudly
-                // so operators notice rather than silently downgrading.
-                error!(
-                    "compression: encoder failure for committed Content-Encoding '{}' — \
-                     response will be malformed: {e}",
-                    encoding
-                );
-                None
-            }
+        if ctx
+            .metadata
+            .get(RESPONSE_ALGORITHM_METADATA_KEY)
+            .map(String::as_str)
+            != Some(encoding.as_str())
+        {
+            return None;
         }
+
+        // Once `after_proxy` set `Content-Encoding`, the response is committed
+        // to that encoding. We MUST NOT short-circuit here on body size — doing
+        // so would leave the client with a body labelled `Content-Encoding:
+        // gzip` that is actually plaintext, which every conformant client will
+        // reject as a decoding error.
+        //
+        // The minimum-length gate runs in `after_proxy` for the known-CL case.
+        // When CL is unknown (chunked / streamed responses), we accept that the
+        // rare tiny chunked body will be compressed needlessly
+        // — far cheaper than serving a malformed response.
+        self.compress_response_body(body, encoding)
     }
 }

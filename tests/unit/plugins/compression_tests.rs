@@ -20,6 +20,11 @@ fn make_ctx(accept_encoding: Option<&str>) -> RequestContext {
     ctx
 }
 
+fn mark_response_algorithm(ctx: &mut RequestContext, encoding: &str) {
+    ctx.metadata
+        .insert("compression:algorithm".to_string(), encoding.to_string());
+}
+
 // ────────────────────── Config defaults ──────────────────────
 
 #[test]
@@ -883,6 +888,8 @@ async fn test_preserves_accept_encoding_when_disabled() {
 #[tokio::test]
 async fn test_gzip_response_compression_roundtrip() {
     let plugin = make_plugin(json!({"min_content_length": 10}));
+    let mut ctx = make_ctx(None);
+    mark_response_algorithm(&mut ctx, "gzip");
 
     // Use a repetitive body large enough that gzip overhead is worthwhile
     let original = r#"{"users":[{"name":"alice","email":"alice@example.com","role":"admin"},{"name":"bob","email":"bob@example.com","role":"user"},{"name":"charlie","email":"charlie@example.com","role":"user"},{"name":"dave","email":"dave@example.com","role":"moderator"},{"name":"eve","email":"eve@example.com","role":"user"},{"name":"frank","email":"frank@example.com","role":"admin"},{"name":"grace","email":"grace@example.com","role":"user"},{"name":"heidi","email":"heidi@example.com","role":"user"}]}"#.as_bytes();
@@ -891,7 +898,12 @@ async fn test_gzip_response_compression_roundtrip() {
     resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
 
     let compressed = plugin
-        .transform_response_body(original, Some("application/json"), &resp_headers)
+        .transform_response_body_with_context(
+            &mut ctx,
+            original,
+            Some("application/json"),
+            &resp_headers,
+        )
         .await
         .expect("should compress");
 
@@ -911,6 +923,8 @@ async fn test_gzip_response_compression_roundtrip() {
 #[tokio::test]
 async fn test_brotli_response_compression_roundtrip() {
     let plugin = make_plugin(json!({"min_content_length": 10}));
+    let mut ctx = make_ctx(None);
+    mark_response_algorithm(&mut ctx, "br");
 
     let original = b"Hello, this is a test body that should be compressed with brotli encoding!";
 
@@ -918,7 +932,12 @@ async fn test_brotli_response_compression_roundtrip() {
     resp_headers.insert("content-encoding".to_string(), "br".to_string());
 
     let compressed = plugin
-        .transform_response_body(original, Some("text/html"), &resp_headers)
+        .transform_response_body_with_context(
+            &mut ctx,
+            original,
+            Some("text/html"),
+            &resp_headers,
+        )
         .await
         .expect("should compress");
 
@@ -942,6 +961,8 @@ async fn test_brotli_response_compression_roundtrip() {
 #[tokio::test]
 async fn test_compresses_tiny_body_when_committed_in_transform() {
     let plugin = make_plugin(json!({"min_content_length": 256}));
+    let mut ctx = make_ctx(None);
+    mark_response_algorithm(&mut ctx, "gzip");
 
     let tiny_body = b"small";
 
@@ -949,7 +970,12 @@ async fn test_compresses_tiny_body_when_committed_in_transform() {
     resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
 
     let result = plugin
-        .transform_response_body(tiny_body, Some("application/json"), &resp_headers)
+        .transform_response_body_with_context(
+            &mut ctx,
+            tiny_body,
+            Some("application/json"),
+            &resp_headers,
+        )
         .await
         .expect("once Content-Encoding is set, transform must compress regardless of size");
 
@@ -967,6 +993,8 @@ async fn test_compresses_tiny_body_when_committed_in_transform() {
 #[tokio::test]
 async fn test_transform_response_body_compresses_when_encoding_already_committed() {
     let plugin = make_plugin(json!({"min_content_length": 10}));
+    let mut ctx = make_ctx(None);
+    mark_response_algorithm(&mut ctx, "gzip");
 
     let mut resp_headers = HashMap::new();
     resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
@@ -974,7 +1002,12 @@ async fn test_transform_response_body_compresses_when_encoding_already_committed
 
     let original = b"compressible body";
     let compressed = plugin
-        .transform_response_body(original, Some("application/json"), &resp_headers)
+        .transform_response_body_with_context(
+            &mut ctx,
+            original,
+            Some("application/json"),
+            &resp_headers,
+        )
         .await
         .expect("committed Content-Encoding must produce an encoded body");
 
@@ -989,6 +1022,30 @@ async fn test_transform_response_body_compresses_when_encoding_already_committed
         .read_to_end(&mut decompressed)
         .expect("output must be valid gzip");
     assert_eq!(decompressed, original);
+}
+
+#[tokio::test]
+async fn test_transform_response_body_skips_origin_encoding_without_commit_metadata() {
+    let plugin = make_plugin(json!({"min_content_length": 10}));
+    let mut ctx = make_ctx(None);
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    resp_headers.insert("cache-control".to_string(), "no-transform".to_string());
+
+    let result = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"origin encoded body",
+            Some("application/json"),
+            &resp_headers,
+        )
+        .await;
+
+    assert!(
+        result.is_none(),
+        "origin Content-Encoding must not trigger a second compression pass"
+    );
 }
 
 #[tokio::test]
@@ -1009,7 +1066,12 @@ async fn test_after_proxy_skips_when_content_length_below_min() {
 
     // With no Content-Encoding committed, transform leaves the body alone.
     let result = plugin
-        .transform_response_body(b"small body", Some("application/json"), &resp_headers)
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"small body",
+            Some("application/json"),
+            &resp_headers,
+        )
         .await;
     assert!(result.is_none());
 }
@@ -1230,7 +1292,12 @@ async fn test_full_response_compression_lifecycle_gzip() {
     // transform_response_body: compress
     let body = br#"{"users":[{"name":"alice","email":"alice@example.com","role":"admin"},{"name":"bob","email":"bob@example.com","role":"user"},{"name":"charlie","email":"charlie@example.com","role":"user"},{"name":"dave","email":"dave@example.com","role":"moderator"},{"name":"eve","email":"eve@example.com","role":"user"},{"name":"frank","email":"frank@example.com","role":"admin"},{"name":"grace","email":"grace@example.com","role":"user"},{"name":"heidi","email":"heidi@example.com","role":"user"}]}"#;
     let compressed = plugin
-        .transform_response_body(body, Some("application/json"), &resp_headers)
+        .transform_response_body_with_context(
+            &mut ctx,
+            body,
+            Some("application/json"),
+            &resp_headers,
+        )
         .await
         .expect("should compress");
     assert!(compressed.len() < body.len());
@@ -1269,7 +1336,10 @@ fn test_should_buffer_only_when_content_encoding_present() {
             .insert("cache-control".to_string(), "no-transform".to_string());
         ctx
     };
-    assert!(!plugin.should_buffer_request_body(&ctx_no_transform));
+    assert!(
+        plugin.should_buffer_request_body(&ctx_no_transform),
+        "request bodies still buffer so no-transform can preserve headers and body together"
+    );
 }
 
 // ────────────────────── Algorithm-only config ──────────────────────
@@ -1633,6 +1703,50 @@ async fn test_request_cache_control_no_transform_preserves_compressed_request_bo
     assert!(
         transformed.is_none(),
         "Cache-Control: no-transform must leave the compressed request body intact"
+    );
+}
+
+#[tokio::test]
+async fn test_original_request_no_transform_marker_restores_header_and_preserves_body() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = b"request body that would normally decompress";
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    ctx.metadata
+        .insert("ferrum:no_transform_request".to_string(), "true".to_string());
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        ctx.metadata
+            .contains_key("compression:request_no_transform")
+    );
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert!(headers.contains_key("content-length"));
+    assert_eq!(
+        headers.get("cache-control").map(String::as_str),
+        Some("no-transform"),
+        "compression restores the original directive if an earlier hook removed it"
+    );
+
+    let transformed = plugin
+        .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
+        .await;
+    assert!(
+        transformed.is_none(),
+        "original Cache-Control: no-transform must leave the compressed request body intact"
     );
 }
 

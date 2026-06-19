@@ -114,7 +114,9 @@ use crate::tls::TlsPolicy;
 use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::backend::BackendTlsConfigBuilder;
 use crate::tls::source::{CertSource, MaterialKind};
-use crate::util::http_headers::headers_have_cache_control_directive;
+use crate::util::http_headers::{
+    cache_control_has_directive, headers_have_cache_control_directive,
+};
 
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
@@ -167,6 +169,25 @@ pub(crate) const RANGE_RESPONSE_METADATA_KEY: &str = "ferrum:range_response";
 /// no-transform directive even if an earlier response header transformer removes
 /// or renames `Cache-Control` before compression's own `after_proxy` hook.
 pub(crate) const NO_TRANSFORM_RESPONSE_METADATA_KEY: &str = "ferrum:no_transform_response";
+
+/// Marker recorded in `ctx.metadata` when the ORIGINAL client request carried
+/// `Cache-Control: no-transform`, captured before any `before_proxy` hook can
+/// mutate request headers. Compression reads this to preserve the client's
+/// no-transform directive even if an earlier request header transformer removes
+/// or renames `Cache-Control` before compression's own `before_proxy` hook.
+pub(crate) const NO_TRANSFORM_REQUEST_METADATA_KEY: &str = "ferrum:no_transform_request";
+
+pub(crate) fn stamp_original_request_metadata(ctx: &mut RequestContext) {
+    let raw_has_no_transform = ctx
+        .raw_header_values("cache-control")
+        .any(|value| cache_control_has_directive(value, "no-transform"));
+    if raw_has_no_transform || headers_have_cache_control_directive(&ctx.headers, "no-transform") {
+        ctx.metadata.insert(
+            NO_TRANSFORM_REQUEST_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+}
 
 pub(crate) fn stamp_original_response_metadata(
     ctx: &mut RequestContext,
@@ -11399,6 +11420,7 @@ async fn handle_proxy_request_inner(
     // contiguous allocation (HeaderMap's internal Vec) — much cheaper than
     // N individual String allocations from the previous eager conversion.
     ctx.set_raw_headers(req.headers().clone());
+    stamp_original_request_metadata(&mut ctx);
 
     // Validate URL length (path + query string)
     if state.max_url_length_bytes > 0 {
@@ -14154,7 +14176,8 @@ async fn handle_proxy_request_inner(
                     let ct_ref = content_type.as_deref();
                     for plugin in plugins.iter() {
                         if let Some(transformed) = plugin
-                            .transform_response_body(
+                            .transform_response_body_with_context(
+                                &mut ctx,
                                 &response_body,
                                 ct_ref,
                                 &plugin_response_headers,
@@ -15361,7 +15384,12 @@ async fn handle_proxy_request_inner(
         let ct_ref = content_type.as_deref();
         for plugin in plugins.iter() {
             if let Some(transformed) = plugin
-                .transform_response_body(data, ct_ref, &response_headers)
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    data,
+                    ct_ref,
+                    &response_headers,
+                )
                 .await
             {
                 // Update Content-Length to reflect the new body size

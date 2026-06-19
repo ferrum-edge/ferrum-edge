@@ -887,6 +887,7 @@ async fn handle_h3_request(
 
     // Store raw headers for deferred materialization.
     ctx.set_raw_headers(req.headers().clone());
+    crate::proxy::stamp_original_request_metadata(&mut ctx);
 
     // Validate URL length (path + query string)
     if state.max_url_length_bytes > 0 {
@@ -3912,7 +3913,12 @@ async fn handle_h3_request(
             let ct_ref = content_type.as_deref();
             for plugin in plugins.iter() {
                 if let Some(transformed) = plugin
-                    .transform_response_body(&response_body, ct_ref, &response_headers)
+                    .transform_response_body_with_context(
+                        &mut ctx,
+                        &response_body,
+                        ct_ref,
+                        &response_headers,
+                    )
                     .await
                 {
                     response_headers

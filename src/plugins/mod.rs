@@ -2585,6 +2585,23 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Context-aware variant of `transform_response_body`.
+    ///
+    /// Existing plugins can keep overriding `transform_response_body`. Plugins
+    /// that need to use decisions or metadata from earlier response hooks can
+    /// override this method and the proxy will call it when a mutable request
+    /// context is available.
+    async fn transform_response_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.transform_response_body(body, content_type, response_headers)
+            .await
+    }
+
     /// Called after all `transform_response_body` hooks on buffered responses.
     ///
     /// Use this hook when the plugin must inspect or act on the final
