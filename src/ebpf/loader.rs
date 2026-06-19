@@ -75,6 +75,7 @@ pub struct AyaEbpfBackend {
     /// implicitly when `Ebpf` is dropped, but holding the id lets future
     /// callers detach explicitly if needed).
     sock_ops_link_id: Option<SockOpsLinkId>,
+    orig_dst_maps_pinned: bool,
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -85,6 +86,7 @@ impl AyaEbpfBackend {
             maps: None,
             pod_links: HashMap::new(),
             sock_ops_link_id: None,
+            orig_dst_maps_pinned: false,
         }
     }
 
@@ -181,17 +183,19 @@ impl EbpfBackend for AyaEbpfBackend {
 
         // GAP-1b: pin the original-destination maps so the node-waypoint
         // mesh-proxy can open them by path through the orig-dst bridge.
-        // Best-effort: a pin failure (older ELF without the maps, bpffs
-        // issue) only costs node-waypoint source-identity resolution — the
-        // resolver fails closed on unknown cookies — so capture itself still
-        // works. Mirrors the SOCK_OPS pin's non-fatal contract.
-        if let Err(e) = pin_orig_dst_maps(&mut bpf) {
-            warn!(
-                error = %e,
-                "Failed to pin original-destination maps; node-waypoint source-identity \
-                 resolution will be unavailable (unknown cookies fail closed)"
-            );
-        }
+        // A pin failure is captured here and rejected by startup readiness in
+        // NodeWaypoint mode, where source identity is required for policy scope.
+        self.orig_dst_maps_pinned = match pin_orig_dst_maps(&mut bpf) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to pin original-destination maps; node-waypoint source-identity \
+                     resolution will be unavailable until startup readiness rejects this topology"
+                );
+                false
+            }
+        };
 
         self.bpf = Some(bpf);
 
@@ -394,11 +398,15 @@ impl EbpfBackend for AyaEbpfBackend {
         if self.bpf.is_none() {
             return Err("BPF programs are not loaded".to_string());
         }
-        if self.maps.is_none() {
+        let Some(maps) = self.maps.as_ref() else {
             return Err("BPF maps are not initialized".to_string());
-        }
+        };
+        maps.validate_required(require_sock_ops)?;
         if require_sock_ops && self.sock_ops_link_id.is_none() {
             return Err("SOCK_OPS identity bridge is not attached".to_string());
+        }
+        if require_sock_ops && !self.orig_dst_maps_pinned {
+            return Err("original-destination identity maps are not pinned".to_string());
         }
         Ok(())
     }
@@ -406,6 +414,7 @@ impl EbpfBackend for AyaEbpfBackend {
     fn cleanup_all(&mut self) -> Result<(), String> {
         self.pod_links.clear();
         self.sock_ops_link_id = None;
+        self.orig_dst_maps_pinned = false;
         self.maps = None;
         self.bpf = None;
         // Best-effort: unpin the SOCK_OPS and orig-dst maps so a stale pin

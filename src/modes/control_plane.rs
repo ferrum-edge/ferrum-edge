@@ -1887,14 +1887,9 @@ async fn wait_for_cp_listeners_until_shutdown_or_exit(
         return;
     }
 
-    let shutdown_on_panic = {
-        let shutdown_tx = shutdown_tx.clone();
-        move || {
-            let _ = shutdown_tx.send(true);
-        }
-    };
+    let listener_shutdown_tx = shutdown_tx.clone();
     let mut listener_monitor = tokio::spawn(async move {
-        crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
+        monitor_cp_listener_handles_until_exit(listener_handles, listener_shutdown_tx).await
     });
     tokio::select! {
         result = &mut listener_monitor => {
@@ -1911,6 +1906,30 @@ async fn wait_for_cp_listeners_until_shutdown_or_exit(
                 }
             }
         }
+    }
+}
+
+async fn monitor_cp_listener_handles_until_exit(
+    listener_handles: Vec<tokio::task::JoinHandle<()>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> Result<(), tokio::task::JoinError> {
+    let (first_result, _idx, remaining) = futures_util::future::select_all(listener_handles).await;
+    info!("CP listener task exited; triggering control-plane shutdown");
+    let _ = shutdown_tx.send(true);
+
+    let shutdown_on_panic = {
+        let shutdown_tx = shutdown_tx.clone();
+        move || {
+            let _ = shutdown_tx.send(true);
+        }
+    };
+    let remaining_result =
+        crate::modes::file::await_listener_handles(remaining, shutdown_on_panic).await;
+
+    match (first_result, remaining_result) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Ok(()), Ok(())) => Ok(()),
     }
 }
 
@@ -2409,5 +2428,37 @@ mod tests {
             .await
             .expect("CP listener wait should complete after shutdown")
             .expect("CP listener wait task should not panic");
+    }
+
+    #[tokio::test]
+    async fn cp_listener_exit_triggers_shutdown_and_drains_siblings() {
+        let (shutdown_tx, mut observed_shutdown) = tokio::sync::watch::channel(false);
+
+        let grpc = tokio::spawn(async {});
+
+        let mut admin_http_rx = shutdown_tx.subscribe();
+        let admin_http = tokio::spawn(async move {
+            while !*admin_http_rx.borrow() {
+                if admin_http_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        wait_for_cp_listeners_until_shutdown_or_exit(
+            vec![admin_http, grpc],
+            shutdown_tx,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        observed_shutdown
+            .changed()
+            .await
+            .expect("listener exit should send shutdown");
+        assert!(
+            *observed_shutdown.borrow(),
+            "CP listener exit must flip the shared shutdown watch"
+        );
     }
 }

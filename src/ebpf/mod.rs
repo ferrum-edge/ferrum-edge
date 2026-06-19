@@ -580,6 +580,8 @@ pub struct MockEbpfBackend {
     pub detached_pods: Vec<String>,
     pub cleaned_up: bool,
     pub fail_update_capture_config: bool,
+    pub fail_update_pod_ip: bool,
+    pub fail_remove_pod_ip: bool,
     pub fail_attach_sock_ops: bool,
     pub sock_ops_attached_cgroup_root: Option<String>,
     /// When non-zero, the next N `update_workload_identity` calls return an
@@ -636,11 +638,17 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn update_pod_ip(&mut self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String> {
+        if self.fail_update_pod_ip {
+            return Err(format!("injected pod IP update failure for {ip}"));
+        }
         self.pod_ips.insert(ip, info.clone());
         Ok(())
     }
 
     fn remove_pod_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
+        if self.fail_remove_pod_ip {
+            return Err(format!("injected pod IP remove failure for {ip}"));
+        }
         self.pod_ips.remove(&ip);
         Ok(())
     }

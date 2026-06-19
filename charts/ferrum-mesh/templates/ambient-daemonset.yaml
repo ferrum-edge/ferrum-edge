@@ -4,6 +4,10 @@
 {{- $ambientEnv := default dict .Values.ambient.env -}}
 {{- $ambientTopology := replace "-" "_" (lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY"))) -}}
 {{- $nodeWaypointRegistryEnabled := eq $ambientTopology "node_waypoint" -}}
+{{- $nodeWaypointRegistryMountPath := toString .Values.nodeAgent.podRegistryDir -}}
+{{- if hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" -}}
+{{- $nodeWaypointRegistryMountPath = toString (index $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR") -}}
+{{- end -}}
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
 {{- $ambientAdminPort := "9000" -}}
@@ -103,7 +107,7 @@ spec:
               mountPath: {{ .Values.nodeAgent.cgroupRoot }}
               readOnly: true
             - name: node-waypoint-pod-registry
-              mountPath: {{ .Values.nodeAgent.podRegistryDir }}
+              mountPath: {{ $nodeWaypointRegistryMountPath }}
           {{- end }}
       {{- if $nodeWaypointRegistryEnabled }}
       volumes:

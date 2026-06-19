@@ -108,6 +108,29 @@ render_chart_assertions() {
     grep -nE 'kind: DaemonSet|name: ferrum-mesh-ambient|capabilities:|add:|- SYS_ADMIN|- SYS_PTRACE' <<<"$rendered" >&2 || true
     exit 1
   fi
+  local ambient_registry_override="/var/run/ferrum/custom-node-waypoint-pods"
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set image.repository="$IMAGE_REPOSITORY" \
+    --set image.tag="$IMAGE_TAG" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR=$ambient_registry_override" \
+    --set-string "ambient.env.FERRUM_ADMIN_HTTP_PORT=$AMBIENT_ADMIN_PORT" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
+    --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
+  if ! grep -q "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" <<<"$rendered" ||
+    ! grep -q "value: \"$ambient_registry_override\"" <<<"$rendered" ||
+    ! grep -q "mountPath: $ambient_registry_override" <<<"$rendered" ||
+    ! grep -q "path: $NODE_WAYPOINT_REGISTRY_DIR" <<<"$rendered"; then
+    echo "NodeWaypoint eBPF render did not mount the shared registry at the ambient override path" >&2
+    grep -nE 'node-waypoint-pod-registry|FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR|hostPath|mountPath|path:' <<<"$rendered" >&2 || true
+    exit 1
+  fi
   if ! grep -q "FERRUM_ADMIN_HTTP_PORT" <<<"$rendered" ||
     ! grep -q "value: \"$AMBIENT_ADMIN_PORT\"" <<<"$rendered" ||
     ! grep -q "value: \"$NODE_AGENT_ADMIN_PORT\"" <<<"$rendered"; then
@@ -660,24 +683,32 @@ wait_for_node_waypoint_marker_removed() {
 
 mesh_drift_ready() {
   local file="$1"
-  python3 - "$file" <<'PY'
+  local expected_namespace="$2"
+  python3 - "$file" "$expected_namespace" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as fh:
     data = json.load(fh)
 
+expected_namespace = sys.argv[2]
 slice_view = data.get("slice") or {}
 resources = slice_view.get("resources") or {}
+# MeshSubscribe slices are node-local; each ambient proxy must see its local
+# source/destination workloads plus the policy objects needed to enforce them.
 expected = {
-    "workloads": 4,
+    "workloads": 2,
     "services": 2,
-    "mesh_policies": 3,
+    "mesh_policies": 1,
     "peer_authentications": 1,
 }
 errors = []
 if not slice_view.get("last_received_at"):
     errors.append("missing slice.last_received_at")
+if slice_view.get("namespace") != expected_namespace:
+    errors.append(f"slice.namespace={slice_view.get('namespace')!r}, expected {expected_namespace!r}")
+if slice_view.get("source_protocol") != "native":
+    errors.append(f"slice.source_protocol={slice_view.get('source_protocol')!r}, expected 'native'")
 for key, minimum in expected.items():
     actual = resources.get(key, 0)
     if actual < minimum:
@@ -727,7 +758,7 @@ wait_for_ambient_mesh_slice() {
       done
       kill "$pf_pid" 2>/dev/null || true
       wait "$pf_pid" 2>/dev/null || true
-      if [[ "$fetched" == "true" ]] && mesh_drift_ready "$drift_file" >"$check_file" 2>&1; then
+      if [[ "$fetched" == "true" ]] && mesh_drift_ready "$drift_file" "$WORKLOAD_NS" >"$check_file" 2>&1; then
         ready=$((ready + 1))
       else
         cat "$check_file.curl" >"$check_file" 2>/dev/null || true
