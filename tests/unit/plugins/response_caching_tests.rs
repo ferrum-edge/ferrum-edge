@@ -330,7 +330,15 @@ async fn test_age_increases_during_cache_residency_without_sleep() {
     resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
     resp_headers.insert("age".to_string(), "10".to_string());
 
-    cache_response(&plugin, "GET", "/api/resident", 200, &resp_headers, b"cached").await;
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/resident",
+        200,
+        &resp_headers,
+        b"cached",
+    )
+    .await;
     plugin.advance_clock_for_tests(std::time::Duration::from_secs(5));
 
     let mut ctx = make_ctx("GET", "/api/resident");
@@ -350,7 +358,15 @@ async fn test_upstream_age_near_freshness_expires_after_residency() {
     resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
     resp_headers.insert("age".to_string(), "59".to_string());
 
-    cache_response(&plugin, "GET", "/api/nearly-stale", 200, &resp_headers, b"cached").await;
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/nearly-stale",
+        200,
+        &resp_headers,
+        b"cached",
+    )
+    .await;
 
     let mut fresh_ctx = make_ctx("GET", "/api/nearly-stale");
     let mut fresh_headers = HashMap::new();
@@ -363,7 +379,9 @@ async fn test_upstream_age_near_freshness_expires_after_residency() {
 
     let mut stale_ctx = make_ctx("GET", "/api/nearly-stale");
     let mut stale_headers = HashMap::new();
-    let result = plugin.before_proxy(&mut stale_ctx, &mut stale_headers).await;
+    let result = plugin
+        .before_proxy(&mut stale_ctx, &mut stale_headers)
+        .await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(stale_ctx.metadata.get("cache_status").unwrap(), "MISS");
 }
@@ -474,13 +492,24 @@ async fn test_old_date_reduces_remaining_freshness() {
     resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
     resp_headers.insert("date".to_string(), http_date_seconds_ago(120));
 
-    cache_response(&plugin, "GET", "/api/old-date", 200, &resp_headers, b"stale").await;
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/old-date",
+        200,
+        &resp_headers,
+        b"stale",
+    )
+    .await;
 
     let mut ctx = make_ctx("GET", "/api/old-date");
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(ctx.metadata.get("cache_status").unwrap(), "PREDICTED-BYPASS");
+    assert_eq!(
+        ctx.metadata.get("cache_status").unwrap(),
+        "PREDICTED-BYPASS"
+    );
 }
 
 #[tokio::test]
@@ -490,7 +519,15 @@ async fn test_malformed_age_does_not_panic_or_prevent_fresh_hit() {
     resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
     resp_headers.insert("age".to_string(), "not-a-number".to_string());
 
-    cache_response(&plugin, "GET", "/api/malformed-age", 200, &resp_headers, b"cached").await;
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/malformed-age",
+        200,
+        &resp_headers,
+        b"cached",
+    )
+    .await;
 
     let mut ctx = make_ctx("GET", "/api/malformed-age");
     let mut headers = HashMap::new();
@@ -508,13 +545,24 @@ async fn test_overflowing_age_does_not_wrap_to_fresh() {
     resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
     resp_headers.insert("age".to_string(), format!("{}0", u64::MAX));
 
-    cache_response(&plugin, "GET", "/api/overflow-age", 200, &resp_headers, b"stale").await;
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/overflow-age",
+        200,
+        &resp_headers,
+        b"stale",
+    )
+    .await;
 
     let mut ctx = make_ctx("GET", "/api/overflow-age");
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(ctx.metadata.get("cache_status").unwrap(), "PREDICTED-BYPASS");
+    assert_eq!(
+        ctx.metadata.get("cache_status").unwrap(),
+        "PREDICTED-BYPASS"
+    );
 }
 
 // === Cache-Control: s-maxage takes precedence ===
@@ -561,7 +609,15 @@ async fn test_s_maxage_freshness_accounts_for_age() {
     );
     resp_headers.insert("age".to_string(), "30".to_string());
 
-    cache_response(&plugin, "GET", "/api/s-maxage-age", 200, &resp_headers, b"cached").await;
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/s-maxage-age",
+        200,
+        &resp_headers,
+        b"cached",
+    )
+    .await;
     plugin.advance_clock_for_tests(std::time::Duration::from_secs(20));
 
     let mut ctx = make_ctx("GET", "/api/s-maxage-age");
@@ -583,7 +639,15 @@ async fn test_fallback_ttl_freshness_accounts_for_age() {
     let mut resp_headers = HashMap::new();
     resp_headers.insert("age".to_string(), "25".to_string());
 
-    cache_response(&plugin, "GET", "/api/fallback-age", 200, &resp_headers, b"cached").await;
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/fallback-age",
+        200,
+        &resp_headers,
+        b"cached",
+    )
+    .await;
 
     let mut fresh_ctx = make_ctx("GET", "/api/fallback-age");
     let mut fresh_headers = HashMap::new();
@@ -596,7 +660,9 @@ async fn test_fallback_ttl_freshness_accounts_for_age() {
 
     let mut stale_ctx = make_ctx("GET", "/api/fallback-age");
     let mut stale_headers = HashMap::new();
-    let result = plugin.before_proxy(&mut stale_ctx, &mut stale_headers).await;
+    let result = plugin
+        .before_proxy(&mut stale_ctx, &mut stale_headers)
+        .await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(stale_ctx.metadata.get("cache_status").unwrap(), "MISS");
 }

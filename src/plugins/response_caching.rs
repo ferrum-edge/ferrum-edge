@@ -151,15 +151,12 @@ fn merge_vary_header(vary_headers: &mut Vec<String>, header: &str) -> bool {
 }
 
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
-    headers
-        .get(name)
-        .map(String::as_str)
-        .or_else(|| {
-            headers
-                .iter()
-                .find(|(header, _)| header.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.as_str())
-        })
+    headers.get(name).map(String::as_str).or_else(|| {
+        headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    })
 }
 
 fn vary_index_prune_slack(cache_len: usize) -> usize {
@@ -298,7 +295,11 @@ fn duration_from_nanos_u128(nanos: u128) -> Duration {
 }
 
 fn duration_from_monotonic_nanos_str(value: &str) -> Option<Duration> {
-    value.trim().parse::<u128>().ok().map(duration_from_nanos_u128)
+    value
+        .trim()
+        .parse::<u128>()
+        .ok()
+        .map(duration_from_nanos_u128)
 }
 
 fn parse_age_header(value: &str) -> Option<Duration> {
