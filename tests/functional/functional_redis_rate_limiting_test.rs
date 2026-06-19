@@ -345,9 +345,6 @@ async fn start_blocking_counting_backend_on(
             let hits = Arc::clone(&hits);
             let release = Arc::clone(&release);
             tokio::spawn(async move {
-                hits.fetch_add(1, Ordering::SeqCst);
-                release.notified().await;
-
                 let (reader, mut writer) = tokio::io::split(stream);
                 let mut buf_reader = tokio::io::BufReader::new(reader);
                 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -372,6 +369,9 @@ async fn start_blocking_counting_backend_on(
                     let mut body_buf = vec![0u8; content_length];
                     let _ = buf_reader.read_exact(&mut body_buf).await;
                 }
+
+                hits.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
 
                 let body = json!({
                     "request_line": request_line.trim(),
