@@ -341,11 +341,15 @@ fn listener_reference_status(
     gateway: &K8sObject,
     listener: &Value,
 ) -> ListenerReferenceStatus {
-    let Some(certificate_refs) = listener
+    let certificate_refs = listener
         .get("tls")
         .and_then(|tls| tls.get("certificateRefs"))
-        .and_then(Value::as_array)
-    else {
+        .and_then(Value::as_array);
+    if listener_is_terminating_tls(listener) && certificate_refs.is_none_or(|refs| refs.is_empty())
+    {
+        return ListenerReferenceStatus::INVALID_CERTIFICATE_REF;
+    }
+    let Some(certificate_refs) = certificate_refs else {
         return ListenerReferenceStatus::RESOLVED;
     };
 
@@ -1140,7 +1144,7 @@ fn route_status(
     let (accepted, resolved_refs, programmed, accepted_reason, resolved_refs_reason, message) =
         match result {
             Ok(translation) => {
-                let programmed = route_programmed(object, &translation.config);
+                let programmed = route_programmed(objects, object, &translation.config);
                 let unresolved_refs_reason = route_unresolved_backend_ref_reason(objects, object);
                 let resolved_refs = unresolved_refs_reason.is_none();
                 let resolved_refs_reason = unresolved_refs_reason.unwrap_or("ResolvedRefs");
@@ -1900,7 +1904,11 @@ fn gateway_programmed(object: &K8sObject, config: &crate::config::types::Gateway
     })
 }
 
-fn route_programmed(object: &K8sObject, config: &crate::config::types::GatewayConfig) -> bool {
+fn route_programmed(
+    objects: &[K8sObject],
+    object: &K8sObject,
+    config: &crate::config::types::GatewayConfig,
+) -> bool {
     if matches!(object.kind.as_str(), "TCPRoute" | "TLSRoute") {
         let prefix = format!(
             "{}-",
@@ -1911,14 +1919,9 @@ fn route_programmed(object: &K8sObject, config: &crate::config::types::GatewayCo
                 "",
             )
         );
+        let listener_ports = l4_route_parent_listener_ports(objects, object);
         return config.proxies.iter().any(|proxy| {
-            let Some(remainder) = proxy.id.strip_prefix(&prefix) else {
-                return false;
-            };
-            remainder
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_digit())
+            l4_route_proxy_matches(&proxy.id, proxy.listen_port, &prefix, &listener_ports)
         });
     }
 
@@ -1953,6 +1956,53 @@ fn route_programmed(object: &K8sObject, config: &crate::config::types::GatewayCo
             .first()
             .is_some_and(|byte| byte.is_ascii_digit())
     })
+}
+
+fn l4_route_proxy_matches(
+    proxy_id: &str,
+    proxy_listen_port: Option<u16>,
+    prefix: &str,
+    listener_ports: &std::collections::HashSet<u16>,
+) -> bool {
+    let Some(remainder) = proxy_id.strip_prefix(prefix) else {
+        return false;
+    };
+    if !remainder
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    proxy_listen_port.is_some_and(|port| listener_ports.contains(&port))
+}
+
+fn l4_route_parent_listener_ports(objects: &[K8sObject], route: &K8sObject) -> HashSet<u16> {
+    let mut ports = HashSet::new();
+    for parent_ref in route_parent_refs(route) {
+        if !parent_ref_targets_managed_gateway(objects, route, &parent_ref) {
+            continue;
+        }
+        for gateway in objects.iter().filter(|object| {
+            object.kind == "Gateway" && parent_ref_targets_gateway(route, &parent_ref, object)
+        }) {
+            let Some(listeners) = gateway.spec.get("listeners").and_then(Value::as_array) else {
+                continue;
+            };
+            for listener in listeners {
+                if !parent_ref_matches_listener(&parent_ref, listener) {
+                    continue;
+                }
+                let Some(port) = listener.get("port").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if let Ok(port) = u16::try_from(port) {
+                    ports.insert(port);
+                }
+            }
+        }
+    }
+    ports
 }
 
 fn route_unresolved_backend_ref_reason(
@@ -2977,6 +3027,39 @@ mod tests {
     }
 
     #[test]
+    fn gateway_listener_without_certificate_refs_reports_invalid() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {}
+                }]
+            }),
+        );
+
+        let updates = plan_status_updates(&[gateway_class, gateway], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listener = listener_status_by_name(
+            gateway_update.status["listeners"].as_array().unwrap(),
+            "https",
+        );
+        let conditions = listener["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "False");
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("InvalidCertificateRef")
+        );
+        assert_condition(conditions, "Programmed", "False");
+    }
+
+    #[test]
     fn gateway_listener_status_reports_multiple_certificate_refs_unsupported() {
         let gateway_class = ferrum_gateway_class();
         let gateway = object(
@@ -3579,6 +3662,47 @@ mod tests {
         assert_condition(conditions, "Accepted", "True");
         assert_condition(conditions, "ResolvedRefs", "True");
         assert_condition(conditions, "Programmed", "True");
+    }
+
+    #[test]
+    fn tcp_route_status_requires_materialized_l4_port_to_match_gateway_listener() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tcp",
+                    "port": 15432,
+                    "protocol": "TCP",
+                    "allowedRoutes": {"kinds": [{"kind": "TCPRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TCPRoute",
+            "db",
+            json!({
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "TCPRoute", "db");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Programmed", "False");
+        assert_eq!(
+            find_condition(conditions, "Programmed")["reason"].as_str(),
+            Some("NoRules")
+        );
     }
 
     #[test]

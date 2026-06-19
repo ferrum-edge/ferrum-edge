@@ -411,14 +411,15 @@ fn listener_frontend_tls_sources(
     object: &K8sObject,
     listener: &Value,
 ) -> Option<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    for reference in listener
+    let certificate_refs = listener
         .get("tls")
         .and_then(|tls| tls.get("certificateRefs"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+        .and_then(Value::as_array)?;
+    if certificate_refs.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for reference in certificate_refs {
         out.push(gateway_tls_secret_ref(acc, object, reference)?);
     }
     Some(out)
@@ -3354,6 +3355,35 @@ mod tests {
 
         let result = translate_k8s_objects(&[gateway, valid], options())
             .expect("translation should leave unresolved TLS unmaterialized");
+
+        assert_eq!(result.config.frontend_tls_cert_path, None);
+        assert_eq!(result.config.frontend_tls_key_path, None);
+        assert!(result.config.frontend_tls_namespace_sources.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unresolved TLS certificateRef"))
+        );
+    }
+
+    #[test]
+    fn gateway_https_listener_without_certificate_refs_fails_closed() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {}
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway], options())
+            .expect("translation should leave listener TLS unmaterialized");
 
         assert_eq!(result.config.frontend_tls_cert_path, None);
         assert_eq!(result.config.frontend_tls_key_path, None);
