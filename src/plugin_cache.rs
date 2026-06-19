@@ -357,25 +357,24 @@ impl Plugin for PriorityOverridePlugin {
     }
 }
 
-/// Try to create a plugin, logging validation errors. Applies
-/// `priority_override` from the plugin config when set.
+/// Try to create a plugin and apply `priority_override` from the plugin config.
 ///
-/// For security-critical plugins (auth, access_control, ip_restriction),
-/// validation errors are propagated as `Err` so the gateway can refuse to start.
-/// For non-security plugins, validation errors are logged and the plugin is skipped.
+/// Enabled plugin configs are load-bearing configuration: unknown plugin names
+/// and validation failures reject the whole cache generation instead of
+/// publishing a weakened cache with that plugin silently omitted.
 fn try_create_plugin(
     pc: &PluginConfig,
     http_client: &PluginHttpClient,
-) -> Result<Option<Arc<dyn Plugin>>, String> {
+) -> Result<Arc<dyn Plugin>, String> {
     match create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone()) {
         Ok(Some(plugin)) => {
             if let Some(priority) = pc.priority_override {
-                Ok(Some(Arc::new(PriorityOverridePlugin {
+                Ok(Arc::new(PriorityOverridePlugin {
                     inner: plugin,
                     priority,
-                })))
+                }))
             } else {
-                Ok(Some(plugin))
+                Ok(plugin)
             }
         }
         Ok(None) => {
@@ -387,30 +386,28 @@ fn try_create_plugin(
                 error!("FATAL: {}", msg);
                 Err(msg)
             } else {
-                warn!(
-                    "Unknown plugin '{}' (plugin_config_id={}), skipping",
-                    pc.plugin_name, pc.id
+                let msg = format!(
+                    "Unknown enabled plugin '{}' (plugin_config_id={}, scope={:?}, proxy_id={})",
+                    pc.plugin_name,
+                    pc.id,
+                    pc.scope,
+                    pc.proxy_id.as_deref().unwrap_or("<none>")
                 );
-                Ok(None)
+                error!("Config rejected: {}", msg);
+                Err(msg)
             }
         }
         Err(e) => {
-            if crate::plugins::is_security_plugin(&pc.plugin_name) {
-                error!(
-                    "FATAL: Security plugin '{}' (plugin_config_id={}) config validation failed: {}",
-                    pc.plugin_name, pc.id, e
-                );
-                Err(format!(
-                    "Security plugin '{}' (plugin_config_id={}) config validation failed: {}",
-                    pc.plugin_name, pc.id, e
-                ))
-            } else {
-                error!(
-                    "Plugin '{}' (plugin_config_id={}) config validation failed: {} — skipping",
-                    pc.plugin_name, pc.id, e
-                );
-                Ok(None)
-            }
+            let msg = format!(
+                "Plugin '{}' (plugin_config_id={}, scope={:?}, proxy_id={}) config validation failed: {}",
+                pc.plugin_name,
+                pc.id,
+                pc.scope,
+                pc.proxy_id.as_deref().unwrap_or("<none>"),
+                e
+            );
+            error!("Config rejected: {}", msg);
+            Err(msg)
         }
     }
 }
@@ -957,7 +954,7 @@ impl PluginCache {
     /// Old plugin instances (including rate limiter state) are dropped
     /// only after all in-flight requests using them complete.
     ///
-    /// Returns `Err` if a security-critical plugin fails validation.
+    /// Returns `Err` if any enabled plugin config cannot be resolved or fails validation.
     pub fn rebuild(&self, config: &GatewayConfig) -> Result<(), String> {
         let inner = self.build_inner_with_existing_client(config)?;
 
@@ -978,8 +975,8 @@ impl PluginCache {
     ///
     /// Also rebuilds global plugins if `rebuild_globals` is true (i.e., a
     /// global-scoped plugin config was added/modified/removed).
-    /// Returns `Err` if a security-critical plugin fails validation during
-    /// incremental update, matching the behavior of `rebuild()`.
+    /// Returns `Err` if any enabled plugin config cannot be resolved or fails
+    /// validation during incremental update, matching the behavior of `rebuild()`.
     pub(crate) fn build_delta_inner(
         &self,
         current: &PluginCacheInner,
@@ -988,7 +985,7 @@ impl PluginCache {
         removed_proxy_ids: &[String],
         rebuild_globals: bool,
     ) -> Result<Arc<PluginCacheInner>, String> {
-        let mut security_errors: Vec<String> = Vec::new();
+        let mut plugin_errors: Vec<String> = Vec::new();
 
         // Rebuild globals if any global plugin config changed
         let new_globals = if rebuild_globals {
@@ -998,7 +995,7 @@ impl PluginCache {
             // proxy plugins can resolve `schema_ref` against the new state
             // via the reload thread's staging-visibility. The bracket is
             // left OPEN here — commit/abort runs once the rest of the
-            // delta build has succeeded or failed (see security_errors
+            // delta build has succeeded or failed (see plugin_errors
             // handling below), so the registry stays atomically tied to
             // the PluginCache that gets swapped in.
             //
@@ -1016,11 +1013,10 @@ impl PluginCache {
                     continue;
                 }
                 match try_create_plugin(pc, &self.http_client) {
-                    Ok(Some(plugin)) => global_plugins.push(plugin),
-                    Ok(None) => {}
+                    Ok(plugin) => global_plugins.push(plugin),
                     Err(e) => {
                         error!("Config reload: {}", e);
-                        security_errors.push(e);
+                        plugin_errors.push(e);
                     }
                 }
             }
@@ -1034,11 +1030,10 @@ impl PluginCache {
                 }
                 if pc.scope == PluginScope::Global {
                     match try_create_plugin(pc, &self.http_client) {
-                        Ok(Some(plugin)) => global_plugins.push(plugin),
-                        Ok(None) => {}
+                        Ok(plugin) => global_plugins.push(plugin),
                         Err(e) => {
                             error!("Config reload: {}", e);
-                            security_errors.push(e);
+                            plugin_errors.push(e);
                         }
                     }
                 }
@@ -1128,7 +1123,7 @@ impl PluginCache {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin(pc, &self.http_client) {
-                            Ok(Some(plugin)) => {
+                            Ok(plugin) => {
                                 // Detect when an auto-emitted plugin instance
                                 // (Istio VirtualService translator helpers) is
                                 // about to shadow an operator-configured global
@@ -1163,10 +1158,9 @@ impl PluginCache {
                                 });
                                 merged.push(plugin);
                             }
-                            Ok(None) => {}
                             Err(e) => {
-                                error!("Config reload: {}", e);
-                                security_errors.push(e);
+                                error!(proxy_id = %proxy.id, "Config reload: {}", e);
+                                plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e));
                             }
                         }
                     }
@@ -1185,7 +1179,7 @@ impl PluginCache {
                         merged.push(plugin);
                     } else {
                         match try_create_plugin(pc, &self.http_client) {
-                            Ok(Some(plugin)) => {
+                            Ok(plugin) => {
                                 group_plugin_instances.insert(
                                     pc.id.clone(),
                                     ProxyGroupPluginInstance {
@@ -1200,10 +1194,14 @@ impl PluginCache {
                                 });
                                 merged.push(plugin);
                             }
-                            Ok(None) => {}
                             Err(e) => {
-                                error!("Config reload: {}", e);
-                                security_errors.push(e);
+                                error!(
+                                    proxy_id = %proxy.id,
+                                    plugin_config_id = %pc.id,
+                                    "Config reload: {}",
+                                    e
+                                );
+                                plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e));
                             }
                         }
                     }
@@ -1242,17 +1240,20 @@ impl PluginCache {
             }
         }
 
-        // Reject the delta if any security plugin failed validation.
+        // Reject the delta if any enabled plugin failed validation or could
+        // not be resolved. The staged generation has not been published, so
+        // callers keep serving the last known-good cache.
         // When `rebuild_globals` was true, we opened a registry reload
         // bracket above — abort it so the process-global named-schema
         // registry doesn't get mutated by a config that's being rejected.
-        if !security_errors.is_empty() {
+        if !plugin_errors.is_empty() {
             if rebuild_globals {
                 crate::plugins::utils::log_schema::registry::abort_reload();
             }
             return Err(format!(
-                "Config reload rejected: {} security plugin(s) failed validation",
-                security_errors.len()
+                "Config reload rejected: {} plugin config(s) failed validation: {}",
+                plugin_errors.len(),
+                plugin_errors.join("; ")
             ));
         }
 
@@ -1535,8 +1536,8 @@ impl PluginCache {
         let mut proxy_scoped_configs: HashMap<&str, Vec<&crate::config::types::PluginConfig>> =
             HashMap::new();
 
-        // Collect all security plugin errors to report before bailing
-        let mut security_errors: Vec<String> = Vec::new();
+        // Collect all enabled-plugin construction errors to report before bailing.
+        let mut plugin_errors: Vec<String> = Vec::new();
 
         // Pre-index proxy_group-scoped plugin configs by config ID for shared
         // instance creation. A single ProxyGroup plugin instance is shared across
@@ -1562,9 +1563,8 @@ impl PluginCache {
                 continue;
             }
             match try_create_plugin(pc, http_client) {
-                Ok(Some(plugin)) => global_plugins.push(plugin),
-                Ok(None) => {}
-                Err(e) => security_errors.push(e),
+                Ok(plugin) => global_plugins.push(plugin),
+                Err(e) => plugin_errors.push(e),
             }
         }
 
@@ -1579,9 +1579,8 @@ impl PluginCache {
             }
             if pc.scope == PluginScope::Global {
                 match try_create_plugin(pc, http_client) {
-                    Ok(Some(plugin)) => global_plugins.push(plugin),
-                    Ok(None) => {}
-                    Err(e) => security_errors.push(e),
+                    Ok(plugin) => global_plugins.push(plugin),
+                    Err(e) => plugin_errors.push(e),
                 }
             } else if pc.scope == PluginScope::Proxy
                 && let Some(ref proxy_id) = pc.proxy_id
@@ -1631,7 +1630,7 @@ impl PluginCache {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin(pc, http_client) {
-                            Ok(Some(plugin)) => {
+                            Ok(plugin) => {
                                 // Remove only GLOBAL plugins of the same name —
                                 // other proxy-scoped instances are preserved,
                                 // allowing multiple instances of the same plugin type.
@@ -1642,8 +1641,7 @@ impl PluginCache {
                                 });
                                 merged.push(plugin);
                             }
-                            Ok(None) => {}
-                            Err(e) => security_errors.push(e),
+                            Err(e) => plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e)),
                         }
                     }
                 }
@@ -1664,7 +1662,7 @@ impl PluginCache {
                     } else {
                         // First proxy to reference this group plugin — create the instance
                         match try_create_plugin(pc, http_client) {
-                            Ok(Some(plugin)) => {
+                            Ok(plugin) => {
                                 group_plugin_instances.insert(
                                     pc.id.clone(),
                                     ProxyGroupPluginInstance {
@@ -1679,8 +1677,7 @@ impl PluginCache {
                                 });
                                 merged.push(plugin);
                             }
-                            Ok(None) => {}
-                            Err(e) => security_errors.push(e),
+                            Err(e) => plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e)),
                         }
                     }
                 }
@@ -1704,20 +1701,21 @@ impl PluginCache {
             proxy_map.insert(proxy.id.clone(), Arc::new(merged));
         }
 
-        // If any security plugins failed validation, refuse to build the cache.
+        // If any enabled plugin failed validation or could not be resolved,
+        // refuse to build the cache.
         // Abort the named-schema reload bracket so the process-global registry
         // is NOT mutated by a config that's being rejected — otherwise the
         // live PluginCache stays on the old plugins while the registry
         // already reflects the rejected reload's schemas.
-        if !security_errors.is_empty() {
+        if !plugin_errors.is_empty() {
             crate::plugins::utils::log_schema::registry::abort_reload();
-            for err in &security_errors {
+            for err in &plugin_errors {
                 error!("{}", err);
             }
             return Err(format!(
-                "Gateway startup aborted: {} security plugin(s) failed config validation: {}",
-                security_errors.len(),
-                security_errors.join("; ")
+                "Gateway startup aborted: {} plugin config(s) failed validation: {}",
+                plugin_errors.len(),
+                plugin_errors.join("; ")
             ));
         }
 

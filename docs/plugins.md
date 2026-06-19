@@ -2539,7 +2539,7 @@ config:
       value: "escaped"
 ```
 
-**Operations and required fields** — validated at plugin load time; malformed rules reject the plugin config with a 400 (admin API) or fail startup (file mode) / warn (DB mode):
+**Operations and required fields** — validated at plugin load time; malformed rules reject the plugin config with a 400 (admin API), fail startup in file mode, or reject the new DB/CP reload snapshot while the gateway keeps serving the prior good config:
 
 | Operation | Required fields | Notes |
 |-----------|-----------------|-------|
