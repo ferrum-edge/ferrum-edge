@@ -18793,22 +18793,18 @@ mod tests {
     }
 
     #[test]
-    fn mesh_proxy_update_acceptance_distinguishes_no_delta_from_rejection() {
-        let previous = chrono::Utc::now();
-        let candidate = previous + chrono::Duration::milliseconds(1);
+    fn mesh_proxy_update_outcome_distinguishes_no_delta_from_rejection() {
+        assert!(proxy::ConfigApplyOutcome::Applied.accepted());
+        assert!(proxy::ConfigApplyOutcome::Applied.applied());
 
-        assert!(mesh_proxy_update_was_accepted(
-            true, previous, previous, candidate
-        ));
-        assert!(mesh_proxy_update_was_accepted(
-            false, previous, candidate, candidate
-        ));
-        assert!(!mesh_proxy_update_was_accepted(
-            false, previous, previous, candidate
-        ));
-        assert!(!mesh_proxy_update_was_accepted(
-            false, previous, previous, previous
-        ));
+        assert!(proxy::ConfigApplyOutcome::Unchanged.accepted());
+        assert!(!proxy::ConfigApplyOutcome::Unchanged.applied());
+
+        let rejected = proxy::ConfigApplyOutcome::Rejected {
+            errors: vec!["invalid candidate".to_string()],
+        };
+        assert!(!rejected.accepted());
+        assert!(!rejected.applied());
     }
 
     #[tokio::test(flavor = "current_thread")]
