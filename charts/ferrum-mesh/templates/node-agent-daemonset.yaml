@@ -76,6 +76,7 @@ spec:
       serviceAccountName: ferrum-node-agent
       hostPID: true
       hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       securityContext:
         seccompProfile:
           {{- toYaml $seccompProfile | nindent 10 }}

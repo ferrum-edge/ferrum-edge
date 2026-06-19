@@ -82,6 +82,11 @@ render_chart_assertions() {
     grep -nE 'node-waypoint-pod-registry|FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR|hostPath|mountPath' <<<"$rendered" >&2 || true
     exit 1
   fi
+  if [[ "$(grep -c "dnsPolicy: ClusterFirstWithHostNet" <<<"$rendered" || true)" -lt 2 ]]; then
+    echo "NodeWaypoint eBPF render did not set ClusterFirstWithHostNet on host-network daemonsets" >&2
+    grep -nE 'kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|hostNetwork:|dnsPolicy:' <<<"$rendered" >&2 || true
+    exit 1
+  fi
   if ! grep -q -- '- SYS_ADMIN' <<<"$rendered"; then
     echo "NodeWaypoint eBPF render did not grant SYS_ADMIN required for pod-netns setns/veth discovery" >&2
     grep -nE 'capabilities:|add:|- SYS_ADMIN|- BPF|- NET_ADMIN|- PERFMON' <<<"$rendered" >&2 || true

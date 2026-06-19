@@ -42,6 +42,7 @@ spec:
     spec:
       serviceAccountName: ferrum-mesh
       hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: ferrum-edge
           image: {{ $ambientImage | quote }}
