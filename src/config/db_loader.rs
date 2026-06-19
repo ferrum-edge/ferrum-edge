@@ -1117,7 +1117,9 @@ impl DatabaseStore {
             ..Default::default()
         };
 
-        ValidationPipeline::new(&mut config).normalize_fields().run()?;
+        ValidationPipeline::new(&mut config)
+            .normalize_fields()
+            .run()?;
         Self::reject_invalid_gateway_plugin_references("load_full_config", &config)?;
 
         ValidationPipeline::new(&mut config)
