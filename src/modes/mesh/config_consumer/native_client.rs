@@ -12,7 +12,7 @@ use super::common::{
 };
 use crate::grpc::dp_client::{
     DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, check_cp_version_compatibility,
-    generate_dp_jwt_with_issuer,
+    generate_dp_jwt_with_issuer_and_namespace,
 };
 use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
 use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
@@ -210,8 +210,12 @@ async fn connect_mesh_subscribe(
     }
 
     let channel = endpoint.connect().await?;
-    let auth_token =
-        generate_dp_jwt_with_issuer(jwt_secret.as_str(), &config.node_id, jwt_secret.issuer())?;
+    let auth_token = generate_dp_jwt_with_issuer_and_namespace(
+        jwt_secret.as_str(),
+        &config.node_id,
+        jwt_secret.issuer(),
+        Some(&config.namespace),
+    )?;
     let token: MetadataValue<_> = format!("Bearer {auth_token}").parse()?;
 
     #[allow(clippy::result_large_err)]

@@ -11,10 +11,10 @@ use tonic::Status;
 
 /// Namespaces a DP ConfigSync JWT bearer is authorised to subscribe to.
 ///
-/// The `ns` claim is optional for back-compat with operator-minted tokens
-/// that predate multi-namespace CPs. Carriers:
-/// - `None` — token has no `ns` claim; the CP falls back to its scope check
-///   (current behavior) unless `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`.
+/// The `ns` claim is optional only for back-compat with single-namespace CPs.
+/// Multi-namespace CP scopes require it automatically. Carriers:
+/// - `None` — token has no `ns` claim; only accepted by single-namespace CPs
+///   when `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=false`.
 /// - `Some(set)` — the bearer may only subscribe to the listed namespaces.
 ///
 /// Tokens may carry the claim as either a single string (`"ns": "prod"`) or
@@ -43,9 +43,21 @@ impl AllowedNamespaces {
             None => false,
         }
     }
+
+    /// Return the only authorised namespace when the claim is present and
+    /// contains exactly one namespace. Protocols without an explicit namespace
+    /// request use this to avoid guessing tenant identity from node metadata.
+    pub fn sole_namespace(&self) -> Option<&str> {
+        let set = self.0.as_ref()?;
+        if set.len() == 1 {
+            set.iter().next().map(String::as_str)
+        } else {
+            None
+        }
+    }
 }
 
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, dead_code)]
 pub(crate) fn verify_grpc_jwt_metadata(
     metadata: &tonic::metadata::MetadataMap,
     jwt_secret: &str,
@@ -79,7 +91,7 @@ pub(crate) fn verify_grpc_jwt_metadata_with_claims(
 
     let token_data = decode::<Value>(token, &key, &validation)
         .map_err(|err| Status::unauthenticated(format!("Invalid token: {err}")))?;
-    Ok(extract_ns_claim(&token_data.claims))
+    extract_ns_claim(&token_data.claims)
 }
 
 fn required_grpc_claims() -> HashSet<String> {
@@ -94,38 +106,50 @@ fn required_grpc_claims() -> HashSet<String> {
 /// - `"ns": "production"` — single-namespace claim, single-element set
 /// - `"ns": ["production","staging"]` — multi-namespace claim
 ///
-/// Non-string array entries are silently dropped (e.g. `"ns": [1, "prod"]`
-/// yields `{"prod"}`). Non-string, non-array values (`"ns": 42`) reset to
-/// `None` so the CP treats them as "no claim" and falls back to the
-/// scope-only path — safer than rejecting the token entirely, which could
-/// blackhole a fleet during a half-rolled-out claim change.
-fn extract_ns_claim(claims: &Value) -> AllowedNamespaces {
+/// Invalid shapes are rejected rather than downgraded to "no claim"; treating
+/// a malformed tenant claim as absent would let an ambiguous token fall back
+/// to legacy scope-only authorization on multi-namespace CPs.
+#[allow(clippy::result_large_err)]
+fn extract_ns_claim(claims: &Value) -> Result<AllowedNamespaces, Status> {
     let raw = match claims.get("ns") {
         Some(v) => v,
-        None => return AllowedNamespaces::empty(),
+        None => return Ok(AllowedNamespaces::empty()),
     };
 
     if let Some(s) = raw.as_str() {
         let trimmed = s.trim();
         if trimmed.is_empty() {
-            return AllowedNamespaces::empty();
+            return Err(Status::unauthenticated(
+                "JWT `ns` claim must not be an empty string",
+            ));
         }
         let mut set = HashSet::new();
         set.insert(trimmed.to_string());
-        return AllowedNamespaces(Some(set));
+        return Ok(AllowedNamespaces(Some(set)));
     }
 
     if let Some(arr) = raw.as_array() {
-        let set: HashSet<String> = arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        return AllowedNamespaces(Some(set));
+        let mut set = HashSet::new();
+        for value in arr {
+            let Some(raw) = value.as_str() else {
+                return Err(Status::unauthenticated(
+                    "JWT `ns` array claim must contain only strings",
+                ));
+            };
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(Status::unauthenticated(
+                    "JWT `ns` array claim must not contain empty strings",
+                ));
+            }
+            set.insert(trimmed.to_string());
+        }
+        return Ok(AllowedNamespaces(Some(set)));
     }
 
-    AllowedNamespaces::empty()
+    Err(Status::unauthenticated(
+        "JWT `ns` claim must be a string or an array of strings",
+    ))
 }
 
 #[cfg(test)]
@@ -136,22 +160,26 @@ mod tests {
     #[test]
     fn ns_claim_absent_yields_empty() {
         let claims = json!({ "sub": "node-a", "iss": "ferrum-edge-cp-dp" });
-        assert_eq!(extract_ns_claim(&claims), AllowedNamespaces::empty());
+        assert_eq!(
+            extract_ns_claim(&claims).expect("absent claim is valid"),
+            AllowedNamespaces::empty()
+        );
     }
 
     #[test]
     fn ns_claim_string_normalised_to_single_element_set() {
         let claims = json!({ "ns": "production" });
-        let allowed = extract_ns_claim(&claims);
+        let allowed = extract_ns_claim(&claims).expect("string claim is valid");
         assert!(allowed.is_present());
         assert!(allowed.allows("production"));
         assert!(!allowed.allows("staging"));
+        assert_eq!(allowed.sole_namespace(), Some("production"));
     }
 
     #[test]
     fn ns_claim_array_normalised_to_set() {
         let claims = json!({ "ns": ["prod", "staging", "prod"] });
-        let allowed = extract_ns_claim(&claims);
+        let allowed = extract_ns_claim(&claims).expect("array claim is valid");
         let inner = allowed.0.expect("set should be present");
         assert_eq!(inner.len(), 2);
         assert!(inner.contains("prod"));
@@ -159,9 +187,9 @@ mod tests {
     }
 
     #[test]
-    fn ns_claim_empty_string_treated_as_missing() {
+    fn ns_claim_empty_string_rejected() {
         let claims = json!({ "ns": "  " });
-        assert_eq!(extract_ns_claim(&claims), AllowedNamespaces::empty());
+        assert!(extract_ns_claim(&claims).is_err());
     }
 
     #[test]
@@ -171,27 +199,21 @@ mod tests {
         // nothing. The CP rejects every namespace; we keep semantics
         // distinct from the missing-claim case.
         let claims = json!({ "ns": [] });
-        let allowed = extract_ns_claim(&claims);
+        let allowed = extract_ns_claim(&claims).expect("empty array is valid");
         assert!(allowed.is_present());
         assert!(!allowed.allows("prod"));
+        assert_eq!(allowed.sole_namespace(), None);
     }
 
     #[test]
-    fn ns_claim_array_filters_non_strings_silently() {
+    fn ns_claim_array_rejects_non_strings() {
         let claims = json!({ "ns": [1, "prod", null, "staging"] });
-        let allowed = extract_ns_claim(&claims);
-        let inner = allowed.0.expect("set should be present");
-        assert_eq!(inner.len(), 2);
-        assert!(inner.contains("prod"));
-        assert!(inner.contains("staging"));
+        assert!(extract_ns_claim(&claims).is_err());
     }
 
     #[test]
-    fn ns_claim_non_string_non_array_treated_as_missing() {
-        // Operator misconfigured the claim type (e.g. number). Fall back to
-        // "no claim" so the CP applies its scope-only check — safer than
-        // wholesale token rejection mid-rollout.
+    fn ns_claim_non_string_non_array_rejected() {
         let claims = json!({ "ns": 42 });
-        assert_eq!(extract_ns_claim(&claims), AllowedNamespaces::empty());
+        assert!(extract_ns_claim(&claims).is_err());
     }
 }

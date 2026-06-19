@@ -1696,7 +1696,7 @@ async fn fetch_remote_slice_endpoints(
     tls_config: Option<&DpGrpcTlsConfig>,
     request_timeout: Duration,
 ) -> Result<RemoteClusterEndpoints, String> {
-    use crate::grpc::dp_client::generate_dp_jwt_with_issuer;
+    use crate::grpc::dp_client::generate_dp_jwt_with_issuer_and_namespace;
     use crate::grpc::proto::MeshSubscribeRequest;
     use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
     use crate::modes::mesh::config_consumer::common::tonic_tls_config;
@@ -1723,9 +1723,13 @@ async fn fetch_remote_slice_endpoints(
             .connect()
             .await
             .map_err(|e| format!("connect to remote CP: {e}"))?;
-        let auth_token =
-            generate_dp_jwt_with_issuer(jwt_secret.as_str(), node_id, jwt_secret.issuer())
-                .map_err(|e| format!("mint remote CP JWT: {e}"))?;
+        let auth_token = generate_dp_jwt_with_issuer_and_namespace(
+            jwt_secret.as_str(),
+            node_id,
+            jwt_secret.issuer(),
+            Some(namespace),
+        )
+        .map_err(|e| format!("mint remote CP JWT: {e}"))?;
         let token: MetadataValue<_> = format!("Bearer {auth_token}")
             .parse()
             .map_err(|e| format!("build auth metadata: {e}"))?;

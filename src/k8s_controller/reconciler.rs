@@ -12,10 +12,9 @@ use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
     translate_k8s_objects_with_filter,
 };
-use crate::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
+use crate::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry, NamespaceBroadcasts};
 use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::grpc::mesh_server::{MeshConfigBroadcast, MeshGrpcServer};
-use crate::grpc::proto::ConfigUpdate;
 use crate::identity::spiffe::TrustDomain;
 use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_updates};
 use crate::k8s_controller::metrics::ControllerMetrics;
@@ -43,7 +42,8 @@ pub struct ReconcilerConfig {
 }
 
 pub struct ReconcileBroadcasters {
-    pub update_tx: broadcast::Sender<ConfigUpdate>,
+    pub broadcasts: Arc<NamespaceBroadcasts>,
+    pub cp_scope: CpScope,
     pub dp_registry: Arc<DpNodeRegistry>,
     pub mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     pub mesh_registry: Arc<MeshNodeRegistry>,
@@ -127,7 +127,8 @@ async fn run_reconcile_loop(
         Arc::clone(&store_set),
         ReconcileContext {
             config_arc: Arc::clone(&config_arc),
-            update_tx: broadcasters.update_tx.clone(),
+            broadcasts: Arc::clone(&broadcasters.broadcasts),
+            cp_scope: broadcasters.cp_scope.clone(),
             dp_registry: Arc::clone(&broadcasters.dp_registry),
             mesh_update_tx: broadcasters.mesh_update_tx.clone(),
             mesh_registry: Arc::clone(&broadcasters.mesh_registry),
@@ -161,7 +162,8 @@ async fn run_reconcile_loop(
                     Arc::clone(&store_set),
                     ReconcileContext {
                         config_arc: Arc::clone(&config_arc),
-                        update_tx: broadcasters.update_tx.clone(),
+                        broadcasts: Arc::clone(&broadcasters.broadcasts),
+                        cp_scope: broadcasters.cp_scope.clone(),
                         dp_registry: Arc::clone(&broadcasters.dp_registry),
                         mesh_update_tx: broadcasters.mesh_update_tx.clone(),
                         mesh_registry: Arc::clone(&broadcasters.mesh_registry),
@@ -190,7 +192,8 @@ async fn run_reconcile_loop(
                     Arc::clone(&store_set),
                     ReconcileContext {
                         config_arc: Arc::clone(&config_arc),
-                        update_tx: broadcasters.update_tx.clone(),
+                        broadcasts: Arc::clone(&broadcasters.broadcasts),
+                        cp_scope: broadcasters.cp_scope.clone(),
                         dp_registry: Arc::clone(&broadcasters.dp_registry),
                         mesh_update_tx: broadcasters.mesh_update_tx.clone(),
                         mesh_registry: Arc::clone(&broadcasters.mesh_registry),
@@ -367,7 +370,8 @@ async fn wait_for_initial_store_readiness_with_timeout(
 /// values once per reconcile is cheap relative to the reconciliation work.
 struct ReconcileContext {
     config_arc: Arc<ArcSwap<GatewayConfig>>,
-    update_tx: broadcast::Sender<ConfigUpdate>,
+    broadcasts: Arc<NamespaceBroadcasts>,
+    cp_scope: CpScope,
     dp_registry: Arc<DpNodeRegistry>,
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: Arc<MeshNodeRegistry>,
@@ -385,6 +389,57 @@ struct ReconcileContext {
     /// a no-op when None — every other code path stays unchanged.
     istio_status_writer: Option<IstioStatusWriter>,
     metrics: Arc<ControllerMetrics>,
+}
+
+fn namespaces_for_broadcast(
+    config: &GatewayConfig,
+    fallback_namespace: &str,
+    cp_scope: &CpScope,
+    broadcasts: &NamespaceBroadcasts,
+) -> Vec<String> {
+    let mut namespaces = BTreeSet::new();
+    namespaces.extend(config.known_namespaces.iter().cloned());
+    namespaces.extend(config.proxies.iter().map(|p| p.namespace.clone()));
+    namespaces.extend(config.consumers.iter().map(|c| c.namespace.clone()));
+    namespaces.extend(config.plugin_configs.iter().map(|pc| pc.namespace.clone()));
+    namespaces.extend(config.upstreams.iter().map(|u| u.namespace.clone()));
+    if let Some(mesh) = config.mesh.as_ref() {
+        namespaces.extend(mesh.workloads.iter().map(|w| w.namespace.clone()));
+        namespaces.extend(mesh.services.iter().map(|s| s.namespace.clone()));
+        namespaces.extend(mesh.mesh_policies.iter().map(|p| p.namespace.clone()));
+        namespaces.extend(
+            mesh.peer_authentications
+                .iter()
+                .map(|p| p.namespace.clone()),
+        );
+        namespaces.extend(mesh.service_entries.iter().map(|e| e.namespace.clone()));
+        namespaces.extend(
+            mesh.request_authentications
+                .iter()
+                .map(|r| r.namespace.clone()),
+        );
+        namespaces.extend(mesh.telemetry_resources.iter().map(|t| t.namespace.clone()));
+        namespaces.extend(mesh.destination_rules.iter().map(|d| d.namespace.clone()));
+        namespaces.extend(mesh.proxy_configs.iter().map(|p| p.namespace.clone()));
+        namespaces.extend(mesh.sidecars.iter().map(|s| s.namespace.clone()));
+        namespaces.extend(mesh.waypoint_bindings.iter().map(|w| w.namespace.clone()));
+    }
+    match cp_scope {
+        CpScope::Single(namespace) => {
+            namespaces.insert(namespace.clone());
+        }
+        CpScope::Set(scope_namespaces) => {
+            namespaces.extend(scope_namespaces.iter().cloned());
+        }
+        CpScope::All => {
+            namespaces.extend(broadcasts.namespaces());
+        }
+    }
+    namespaces.retain(|namespace| !namespace.trim().is_empty());
+    if namespaces.is_empty() {
+        namespaces.insert(fallback_namespace.to_string());
+    }
+    namespaces.into_iter().collect()
 }
 
 async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx: ReconcileContext) {
@@ -457,7 +512,20 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     };
 
     // Notify DPs and mesh subscribers of the config change.
-    CpGrpcServer::broadcast_update_with_registry(&ctx.update_tx, &new_config, &ctx.dp_registry);
+    for namespace in namespaces_for_broadcast(
+        &new_config,
+        &ctx.namespace,
+        &ctx.cp_scope,
+        ctx.broadcasts.as_ref(),
+    ) {
+        CpGrpcServer::broadcast_namespace_update(
+            ctx.broadcasts.as_ref(),
+            &namespace,
+            &new_config,
+            &ctx.dp_registry,
+            &ctx.cp_scope,
+        );
+    }
     MeshGrpcServer::broadcast_full_with_registry(
         &ctx.mesh_update_tx,
         new_config.clone(),
@@ -821,13 +889,13 @@ mod tests {
     use crate::identity::spiffe::SpiffeId;
     use crate::k8s_controller::resource_store::CrdResourceStore;
     use crate::modes::mesh::config::{
-        MeshConfig, MeshService, Workload, WorkloadRef, WorkloadSelector,
+        MeshConfig, MeshPolicy, MeshService, PolicyScope, Workload, WorkloadRef, WorkloadSelector,
     };
     use chrono::{Duration as ChronoDuration, Utc};
     use kube::api::ApiResource;
     use kube::runtime::reflector;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn plugin_config(id: &str, config: Value) -> PluginConfig {
         PluginConfig {
@@ -870,6 +938,65 @@ mod tests {
             }]
         }))
         .expect("test upstream should deserialize")
+    }
+
+    fn root_policy_only_config() -> GatewayConfig {
+        GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                istio_root_namespace: "istio-system".to_string(),
+                mesh_policies: vec![MeshPolicy {
+                    name: "root-authz".to_string(),
+                    namespace: "istio-system".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    rules: Vec::new(),
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn broadcast_namespaces_include_explicit_cp_scope_namespaces() {
+        let mut scope = HashSet::new();
+        scope.insert("tenant-a".to_string());
+        scope.insert("tenant-b".to_string());
+        let broadcasts = NamespaceBroadcasts::new(4);
+
+        let namespaces = namespaces_for_broadcast(
+            &root_policy_only_config(),
+            "fallback",
+            &CpScope::Set(scope),
+            &broadcasts,
+        );
+
+        assert!(namespaces.iter().any(|namespace| namespace == "tenant-a"));
+        assert!(namespaces.iter().any(|namespace| namespace == "tenant-b"));
+        assert!(
+            namespaces
+                .iter()
+                .any(|namespace| namespace == "istio-system")
+        );
+    }
+
+    #[test]
+    fn broadcast_namespaces_include_all_scope_subscribed_namespaces() {
+        let broadcasts = NamespaceBroadcasts::new(4);
+        let _ = broadcasts.sender_for("tenant-a");
+
+        let namespaces = namespaces_for_broadcast(
+            &root_policy_only_config(),
+            "fallback",
+            &CpScope::All,
+            &broadcasts,
+        );
+
+        assert!(namespaces.iter().any(|namespace| namespace == "tenant-a"));
+        assert!(
+            namespaces
+                .iter()
+                .any(|namespace| namespace == "istio-system")
+        );
     }
 
     fn mesh_workload(service_account: &str) -> Workload {

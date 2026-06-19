@@ -20,10 +20,9 @@ use tokio::sync::{broadcast, watch};
 use tracing::{error, info};
 
 use crate::config::types::GatewayConfig;
-use crate::grpc::cp_server::DpNodeRegistry;
+use crate::grpc::cp_server::{CpScope, DpNodeRegistry, NamespaceBroadcasts};
 use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::grpc::mesh_server::MeshConfigBroadcast;
-use crate::grpc::proto::ConfigUpdate;
 use istio_status::IstioStatusWriter;
 use metrics::ControllerMetrics;
 use reconciler::{ReconcileBroadcasters, ReconcilerConfig, spawn_reconcile_loop};
@@ -75,10 +74,12 @@ impl K8sControllerHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_k8s_controller(
     controller_config: K8sControllerConfig,
     config_arc: Arc<ArcSwap<GatewayConfig>>,
-    update_tx: broadcast::Sender<ConfigUpdate>,
+    broadcasts: Arc<NamespaceBroadcasts>,
+    cp_scope: CpScope,
     dp_registry: Arc<DpNodeRegistry>,
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: Arc<MeshNodeRegistry>,
@@ -149,7 +150,8 @@ pub async fn start_k8s_controller(
         store_set.clone(),
         config_arc,
         ReconcileBroadcasters {
-            update_tx,
+            broadcasts,
+            cp_scope,
             dp_registry,
             mesh_update_tx,
             mesh_registry,

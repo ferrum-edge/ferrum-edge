@@ -27,18 +27,18 @@
 //! Multi-namespace CPs (MESH-T2-A): a single CP can serve DPs across many
 //! namespaces. The scope is controlled by [`CpScope`] (built from
 //! `FERRUM_CP_NAMESPACES`), and per-namespace broadcast channels guarantee a
-//! DP only receives deltas for its own namespace. JWT tokens may carry an
-//! `ns` claim (single string or array) that pins which namespaces the bearer
-//! is authorised to subscribe to. When `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`
-//! is `true`, tokens without an `ns` claim are rejected entirely; otherwise
-//! the CP falls back to the scope-only check for back-compat. See
+//! DP only receives deltas for its own namespace. JWT tokens carry an `ns`
+//! claim (single string or array) that pins which namespaces the bearer is
+//! authorised to subscribe to. `Set` and `All` scopes require this claim
+//! automatically; `Single` scope preserves the legacy no-claim path unless
+//! `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`. See
 //! `docs/cp_namespace_tenancy.md` for the operator guide.
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -53,6 +53,11 @@ use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
 use crate::FERRUM_VERSION;
 use crate::config::types::{GatewayConfig, default_namespace};
+use crate::modes::mesh::config::{
+    MeshConfig, MeshSidecar, MeshSidecarEgress, PeerAuthentication, PolicyScope,
+    SidecarHostPattern, WorkloadSelector, service_entry_exported_to_namespace,
+};
+use crate::modes::mesh::slice::MeshSliceRequest;
 
 /// What set of namespaces a CP instance is authorised to serve.
 ///
@@ -74,8 +79,8 @@ pub enum CpScope {
     /// advertises a namespace not in the set is rejected.
     Set(HashSet<String>),
     /// Cluster-wide CP serving every namespace present in the database. The
-    /// scope check is a no-op; only the per-token JWT `ns` claim (when
-    /// `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`) bounds what each DP sees.
+    /// scope check is a no-op; the per-token JWT `ns` claim bounds what each
+    /// DP sees.
     All,
 }
 
@@ -116,6 +121,17 @@ impl CpScope {
             CpScope::Set(set) => set.contains(namespace),
             CpScope::All => true,
         }
+    }
+
+    /// Multi-namespace scopes must not rely on the legacy "shared bearer
+    /// authorises every namespace in CP scope" behavior.
+    pub fn requires_namespace_claim_by_default(&self) -> bool {
+        matches!(self, CpScope::Set(_) | CpScope::All)
+    }
+
+    /// True when callers must require a JWT `ns` claim for this scope.
+    pub fn namespace_claim_required(&self, require_ns_claim: bool) -> bool {
+        require_ns_claim || self.requires_namespace_claim_by_default()
     }
 
     /// Returns the explicit namespace list the CP loads from the database.
@@ -348,8 +364,8 @@ pub struct CpGrpcServer {
     /// Which namespaces this CP is authorised to serve. See [`CpScope`].
     scope: CpScope,
     /// When `true`, every inbound JWT must carry an `ns` claim and the
-    /// requested namespace must be in it. When `false` (default), tokens
-    /// without an `ns` claim fall back to the scope-only check.
+    /// requested namespace must be in it. `Set` and `All` scopes enforce the
+    /// same rule automatically even when this flag is `false`.
     require_ns_claim: bool,
 }
 
@@ -471,40 +487,114 @@ impl CpGrpcServer {
         allowed: &AllowedNamespaces,
         dp_namespace: &str,
     ) -> Result<broadcast::Sender<ConfigUpdate>, Status> {
-        // Reject empty DP namespace strings — they cannot match either the
-        // CP scope or any plausible claim.
-        if dp_namespace.is_empty() {
+        Self::authorise_namespace_for_scope(
+            &self.scope,
+            self.require_ns_claim,
+            allowed,
+            dp_namespace,
+        )?;
+        Ok(self.broadcasts.sender_for(dp_namespace))
+    }
+
+    /// Shared tenant authorisation for every CP-facing configuration surface.
+    /// Missing claims are accepted only for genuinely single-namespace CPs
+    /// unless the operator opted into strict claims there as well.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn authorise_namespace_for_scope(
+        scope: &CpScope,
+        require_ns_claim: bool,
+        allowed: &AllowedNamespaces,
+        namespace: &str,
+    ) -> Result<(), Status> {
+        if namespace.is_empty() {
             return Err(Status::failed_precondition(
-                "DP did not advertise a namespace in the Subscribe request",
+                "DP did not advertise a namespace",
             ));
         }
 
-        // 1) JWT claim presence policy.
-        if self.require_ns_claim && !allowed.is_present() {
+        if scope.namespace_claim_required(require_ns_claim) && !allowed.is_present() {
+            if require_ns_claim && !scope.requires_namespace_claim_by_default() {
+                return Err(Status::permission_denied(
+                    "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true on this CP: the JWT must include an `ns` claim listing the namespaces this DP may subscribe to",
+                ));
+            }
             return Err(Status::permission_denied(
-                "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true on this CP: the JWT must \
-                 include an `ns` claim listing the namespaces this DP may subscribe to",
+                "Multi-namespace CP scope requires the JWT to include an `ns` claim listing the namespaces this DP may subscribe to",
             ));
         }
 
-        // 2) JWT claim authorisation (if present).
-        if allowed.is_present() && !allowed.allows(dp_namespace) {
+        if allowed.is_present() && !allowed.allows(namespace) {
             return Err(Status::permission_denied(format!(
-                "JWT `ns` claim does not authorise namespace '{dp_namespace}'; \
+                "JWT `ns` claim does not authorise namespace '{namespace}'; \
                  the bearer can only subscribe to the namespaces listed in its token"
             )));
         }
 
-        // 3) CP scope authorisation.
-        if !self.scope.includes(dp_namespace) {
+        if !scope.includes(namespace) {
             return Err(Status::failed_precondition(format!(
-                "CP scope ({}) does not include DP namespace '{dp_namespace}'. \
+                "CP scope ({}) does not include DP namespace '{namespace}'. \
                  Add it to FERRUM_CP_NAMESPACES (or use `*` for cluster-wide).",
-                self.scope.describe()
+                scope.describe()
             )));
         }
 
-        Ok(self.broadcasts.sender_for(dp_namespace))
+        Ok(())
+    }
+
+    /// Resolve the tenant namespace for stream protocols that do not carry an
+    /// explicit namespace request (xDS ADS). Multi-namespace scopes require a
+    /// single-namespace claim; a multi-namespace claim is ambiguous and fails
+    /// closed instead of letting node metadata choose the tenant.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn resolve_stream_namespace_for_scope(
+        scope: &CpScope,
+        require_ns_claim: bool,
+        allowed: &AllowedNamespaces,
+    ) -> Result<String, Status> {
+        if !scope.namespace_claim_required(require_ns_claim)
+            && !allowed.is_present()
+            && let CpScope::Single(namespace) = scope
+        {
+            return Ok(namespace.clone());
+        }
+
+        if scope.namespace_claim_required(require_ns_claim) && !allowed.is_present() {
+            return Err(Status::permission_denied(
+                "Multi-namespace CP scope requires xDS JWTs to include a single `ns` claim",
+            ));
+        }
+
+        if let CpScope::Single(namespace) = scope {
+            Self::authorise_namespace_for_scope(scope, require_ns_claim, allowed, namespace)?;
+            return Ok(namespace.clone());
+        }
+
+        let Some(namespace) = allowed.sole_namespace() else {
+            return Err(Status::permission_denied(
+                "xDS requires a JWT `ns` claim containing exactly one namespace",
+            ));
+        };
+        Self::authorise_namespace_for_scope(scope, require_ns_claim, allowed, namespace)?;
+        Ok(namespace.to_string())
+    }
+
+    pub(crate) fn audit_tenant_subscription(
+        surface: &'static str,
+        node_id: &str,
+        namespace: &str,
+        result: &'static str,
+        reason: &str,
+    ) {
+        match result {
+            "success" => info!(
+                audit.event = "tenant_subscription",
+                surface, node_id, namespace, result, "Tenant subscription accepted"
+            ),
+            _ => warn!(
+                audit.event = "tenant_subscription",
+                surface, node_id, namespace, result, reason, "Tenant subscription rejected"
+            ),
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -587,15 +677,382 @@ impl CpGrpcServer {
     /// reaches the broadcast wire — the DP-side defense-in-depth filter in
     /// `dp_client::filter_config_to_namespace` is a redundant backstop, not
     /// the primary boundary.
-    fn filter_config_to_namespace(config: &GatewayConfig, namespace: &str) -> GatewayConfig {
+    pub(crate) fn filter_config_to_namespace(
+        config: &GatewayConfig,
+        namespace: &str,
+    ) -> GatewayConfig {
         let mut filtered = config.clone();
-        filtered.proxies.retain(|p| p.namespace == namespace);
-        filtered.consumers.retain(|c| c.namespace == namespace);
+        Self::filter_non_mesh_config_to_namespace(&mut filtered, namespace);
+        if let Some(mesh) = filtered.mesh.as_mut() {
+            Self::filter_mesh_config_to_namespace(mesh, namespace);
+        }
         filtered
-            .plugin_configs
-            .retain(|pc| pc.namespace == namespace);
-        filtered.upstreams.retain(|u| u.namespace == namespace);
+    }
+
+    fn filter_non_mesh_config_to_namespace(config: &mut GatewayConfig, namespace: &str) {
+        config.proxies.retain(|p| p.namespace == namespace);
+        config.consumers.retain(|c| c.namespace == namespace);
+        config.plugin_configs.retain(|pc| pc.namespace == namespace);
+        config.upstreams.retain(|u| u.namespace == namespace);
+        config.known_namespaces = vec![namespace.to_string()];
+    }
+
+    pub(crate) fn filter_config_to_mesh_request_for_scope(
+        config: &GatewayConfig,
+        request: &MeshSliceRequest,
+        scope: &CpScope,
+    ) -> GatewayConfig {
+        let mut filtered = config.clone();
+        Self::filter_non_mesh_config_to_namespace(&mut filtered, &request.namespace);
+        if let Some(mesh) = filtered.mesh.as_mut() {
+            Self::filter_mesh_config_to_request(mesh, request, true, Some(scope));
+        }
+        if scope.requires_namespace_claim_by_default() {
+            Self::clear_unpartitioned_trust_material(&mut filtered);
+        }
         filtered
+    }
+
+    fn filter_mesh_config_to_namespace(mesh: &mut MeshConfig, namespace: &str) {
+        let request = MeshSliceRequest {
+            namespace: namespace.to_string(),
+            ..MeshSliceRequest::default()
+        };
+        Self::filter_mesh_config_to_request(mesh, &request, false, None);
+    }
+
+    fn filter_mesh_config_to_request(
+        mesh: &mut MeshConfig,
+        request: &MeshSliceRequest,
+        allow_cross_namespace_mesh_visibility: bool,
+        scope: Option<&CpScope>,
+    ) {
+        let namespace = request.namespace.as_str();
+        let mut visible_namespaces =
+            Self::mesh_visible_namespaces(mesh, request, allow_cross_namespace_mesh_visibility);
+        Self::constrain_visible_namespaces_to_scope(&mut visible_namespaces, scope);
+        let istio_root_namespace = mesh.istio_root_namespace.clone();
+
+        mesh.workloads
+            .retain(|workload| visible_namespaces.contains(&workload.namespace));
+        let workload_ids: HashSet<_> = mesh
+            .workloads
+            .iter()
+            .map(|workload| workload.spiffe_id.clone())
+            .collect();
+        mesh.services.retain_mut(|service| {
+            visible_namespaces.contains(&service.namespace) && {
+                service
+                    .workloads
+                    .retain(|workload| workload_ids.contains(&workload.spiffe_id));
+                true
+            }
+        });
+        mesh.mesh_policies.retain(|policy| {
+            Self::policy_scope_can_apply_to_namespace(
+                &policy.namespace,
+                &policy.scope,
+                namespace,
+                &istio_root_namespace,
+            )
+        });
+        mesh.peer_authentications.retain(|policy| {
+            Self::peer_auth_can_apply_to_namespace(policy, namespace, &istio_root_namespace)
+        });
+        mesh.service_entries.retain(|entry| {
+            if !Self::namespace_allowed_by_scope(&entry.namespace, scope) {
+                return false;
+            }
+            if allow_cross_namespace_mesh_visibility {
+                service_entry_exported_to_namespace(entry, namespace)
+            } else {
+                entry.namespace == namespace
+            }
+        });
+        mesh.request_authentications.retain(|resource| {
+            Self::policy_scope_can_apply_to_namespace(
+                &resource.namespace,
+                &resource.scope,
+                namespace,
+                &istio_root_namespace,
+            )
+        });
+        mesh.telemetry_resources.retain(|resource| {
+            Self::policy_scope_can_apply_to_namespace(
+                &resource.namespace,
+                &resource.scope,
+                namespace,
+                &istio_root_namespace,
+            )
+        });
+        mesh.destination_rules
+            .retain(|rule| visible_namespaces.contains(&rule.namespace));
+        mesh.proxy_configs.retain(|config| {
+            Self::policy_scope_can_apply_to_namespace(
+                &config.namespace,
+                &config.scope,
+                namespace,
+                &istio_root_namespace,
+            )
+        });
+        mesh.sidecars.retain(|sidecar| {
+            sidecar.namespace == namespace || sidecar.namespace == istio_root_namespace
+        });
+        let requested_waypoint = request
+            .waypoint_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty());
+        mesh.waypoint_bindings.retain_mut(|binding| {
+            if binding.namespace != namespace {
+                return false;
+            }
+            if allow_cross_namespace_mesh_visibility && let Some(waypoint) = requested_waypoint {
+                return binding.name == waypoint;
+            }
+            {
+                binding
+                    .services
+                    .retain(|service| service.namespace == namespace);
+                true
+            }
+        });
+        if let Some(multi_cluster) = mesh.multi_cluster.as_mut() {
+            multi_cluster
+                .east_west_gateways
+                .retain(|gateway| gateway.namespace == namespace);
+        }
+        if let Some(local_services) = mesh.local_inbound_services.as_mut() {
+            local_services.retain(|service| service.namespace == namespace);
+        }
+        mesh.local_inbound_tcp_routes
+            .retain(|route| route.namespace == namespace);
+        mesh.extension_configs
+            .retain(|extension| visible_namespaces.contains(&extension.namespace));
+    }
+
+    pub(crate) fn filter_config_to_namespace_for_scope(
+        config: &GatewayConfig,
+        namespace: &str,
+        scope: &CpScope,
+    ) -> GatewayConfig {
+        let mut filtered = Self::filter_config_to_namespace(config, namespace);
+        if scope.requires_namespace_claim_by_default() {
+            Self::clear_unpartitioned_trust_material(&mut filtered);
+        }
+        filtered
+    }
+
+    fn mesh_visible_namespaces(
+        mesh: &MeshConfig,
+        request: &MeshSliceRequest,
+        allow_cross_namespace_mesh_visibility: bool,
+    ) -> BTreeSet<String> {
+        let mut namespaces = BTreeSet::new();
+        namespaces.insert(request.namespace.clone());
+        if !allow_cross_namespace_mesh_visibility {
+            return namespaces;
+        }
+        Self::add_waypoint_visible_namespaces(mesh, request, &mut namespaces);
+        if request.enforce_sidecar_egress || request.sidecar_egress_dry_run {
+            Self::add_sidecar_visible_namespaces(mesh, request, &mut namespaces);
+        }
+        namespaces
+    }
+
+    fn add_waypoint_visible_namespaces(
+        mesh: &MeshConfig,
+        request: &MeshSliceRequest,
+        namespaces: &mut BTreeSet<String>,
+    ) {
+        let Some(waypoint_name) = request
+            .waypoint_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        else {
+            return;
+        };
+        if let Some(binding) = mesh
+            .waypoint_bindings
+            .iter()
+            .find(|binding| binding.name == waypoint_name && binding.namespace == request.namespace)
+        {
+            namespaces.extend(
+                binding
+                    .services
+                    .iter()
+                    .map(|service| service.namespace.clone()),
+            );
+        }
+    }
+
+    fn add_sidecar_visible_namespaces(
+        mesh: &MeshConfig,
+        request: &MeshSliceRequest,
+        namespaces: &mut BTreeSet<String>,
+    ) {
+        let all_resource_namespaces = Self::mesh_resource_namespaces(mesh);
+        for sidecar in &mesh.sidecars {
+            if !Self::sidecar_can_apply_to_request_namespace(
+                sidecar,
+                &request.namespace,
+                &mesh.istio_root_namespace,
+            ) {
+                continue;
+            }
+            let sidecar_namespace = Self::sidecar_host_match_namespace(
+                sidecar,
+                &request.namespace,
+                &mesh.istio_root_namespace,
+            );
+            for egress in &sidecar.egress {
+                Self::add_namespaces_from_sidecar_egress(
+                    egress,
+                    sidecar_namespace,
+                    namespaces,
+                    &all_resource_namespaces,
+                );
+            }
+        }
+    }
+
+    fn sidecar_can_apply_to_request_namespace(
+        sidecar: &MeshSidecar,
+        request_namespace: &str,
+        root_namespace: &str,
+    ) -> bool {
+        let selector_can_apply = sidecar.workload_selector.as_ref().is_none_or(|selector| {
+            Self::selector_can_apply_to_namespace(selector, request_namespace)
+        });
+        selector_can_apply
+            && (sidecar.namespace == request_namespace
+                || (!root_namespace.is_empty() && sidecar.namespace == root_namespace))
+    }
+
+    fn sidecar_host_match_namespace<'a>(
+        sidecar: &'a MeshSidecar,
+        request_namespace: &'a str,
+        root_namespace: &str,
+    ) -> &'a str {
+        if !root_namespace.is_empty()
+            && sidecar.namespace == root_namespace
+            && sidecar.namespace != request_namespace
+        {
+            request_namespace
+        } else {
+            sidecar.namespace.as_str()
+        }
+    }
+
+    fn add_namespaces_from_sidecar_egress(
+        egress: &MeshSidecarEgress,
+        sidecar_namespace: &str,
+        namespaces: &mut BTreeSet<String>,
+        all_resource_namespaces: &BTreeSet<String>,
+    ) {
+        for host in &egress.hosts {
+            match MeshSidecarEgress::parse_host_pattern(host) {
+                SidecarHostPattern::AllowAll | SidecarHostPattern::AnyNamespaceHost { .. } => {
+                    namespaces.extend(all_resource_namespaces.iter().cloned());
+                }
+                SidecarHostPattern::SameNamespaceHost { .. }
+                | SidecarHostPattern::SameNamespaceHostBare { .. } => {
+                    namespaces.insert(sidecar_namespace.to_string());
+                }
+                SidecarHostPattern::NamespaceWildcard { namespace }
+                | SidecarHostPattern::NamespaceHost { namespace, .. } => {
+                    namespaces.insert(namespace.to_string());
+                }
+            }
+        }
+    }
+
+    fn mesh_resource_namespaces(mesh: &MeshConfig) -> BTreeSet<String> {
+        let mut namespaces = BTreeSet::new();
+        namespaces.extend(mesh.workloads.iter().map(|w| w.namespace.clone()));
+        namespaces.extend(mesh.services.iter().map(|s| s.namespace.clone()));
+        namespaces.extend(mesh.destination_rules.iter().map(|d| d.namespace.clone()));
+        namespaces.extend(mesh.extension_configs.iter().map(|e| e.namespace.clone()));
+        namespaces.retain(|namespace| !namespace.trim().is_empty());
+        namespaces
+    }
+
+    fn constrain_visible_namespaces_to_scope(
+        namespaces: &mut BTreeSet<String>,
+        scope: Option<&CpScope>,
+    ) {
+        namespaces.retain(|namespace| Self::namespace_allowed_by_scope(namespace, scope));
+    }
+
+    fn namespace_allowed_by_scope(namespace: &str, scope: Option<&CpScope>) -> bool {
+        match scope {
+            Some(CpScope::Set(scope_namespaces)) => scope_namespaces.contains(namespace),
+            _ => true,
+        }
+    }
+
+    fn policy_scope_can_apply_to_namespace(
+        owner_namespace: &str,
+        scope: &PolicyScope,
+        namespace: &str,
+        root_namespace: &str,
+    ) -> bool {
+        if !Self::resource_owner_can_apply_to_namespace(owner_namespace, namespace, root_namespace)
+        {
+            return false;
+        }
+        match scope {
+            PolicyScope::MeshWide => true,
+            PolicyScope::Namespace {
+                namespace: policy_namespace,
+            } => policy_namespace == namespace,
+            PolicyScope::WorkloadSelector { selector } => {
+                Self::selector_can_apply_to_namespace(selector, namespace)
+            }
+        }
+    }
+
+    fn peer_auth_can_apply_to_namespace(
+        policy: &PeerAuthentication,
+        namespace: &str,
+        root_namespace: &str,
+    ) -> bool {
+        if let Some(scope) = &policy.scope {
+            return Self::policy_scope_can_apply_to_namespace(
+                &policy.namespace,
+                scope,
+                namespace,
+                root_namespace,
+            );
+        }
+
+        policy.namespace == namespace
+            && policy
+                .selector
+                .as_ref()
+                .is_none_or(|selector| Self::selector_can_apply_to_namespace(selector, namespace))
+    }
+
+    fn selector_can_apply_to_namespace(selector: &WorkloadSelector, namespace: &str) -> bool {
+        selector
+            .namespace
+            .as_deref()
+            .is_none_or(|selector_namespace| selector_namespace == namespace)
+    }
+
+    fn resource_owner_can_apply_to_namespace(
+        owner_namespace: &str,
+        namespace: &str,
+        root_namespace: &str,
+    ) -> bool {
+        owner_namespace == namespace
+            || (!root_namespace.is_empty() && owner_namespace == root_namespace)
+    }
+
+    fn clear_unpartitioned_trust_material(config: &mut GatewayConfig) {
+        config.trust_bundles = None;
+        if let Some(mesh) = config.mesh.as_mut() {
+            mesh.trust_bundles = None;
+        }
     }
 
     /// Broadcast a full config snapshot to all DPs in `namespace`.
@@ -610,11 +1067,12 @@ impl CpGrpcServer {
         namespace: &str,
         config: &GatewayConfig,
         registry: &DpNodeRegistry,
+        scope: &CpScope,
     ) {
         let Some(tx) = broadcasts.try_sender_for(namespace) else {
             return;
         };
-        let filtered = Self::filter_config_to_namespace(config, namespace);
+        let filtered = Self::filter_config_to_namespace_for_scope(config, namespace, scope);
         Self::broadcast_update(&tx, &filtered);
         registry.touch_namespace(namespace);
     }
@@ -629,9 +1087,15 @@ impl CpGrpcServer {
         version: &str,
         registry: &DpNodeRegistry,
         trust_bundles: Option<&crate::modes::mesh::config::TrustBundleSet>,
+        scope: &CpScope,
     ) {
         let Some(tx) = broadcasts.try_sender_for(namespace) else {
             return;
+        };
+        let trust_bundles = if scope.requires_namespace_claim_by_default() {
+            None
+        } else {
+            trust_bundles
         };
         Self::broadcast_delta_with_trust_bundles(&tx, result, version, trust_bundles);
         registry.touch_namespace(namespace);
@@ -642,6 +1106,7 @@ impl CpGrpcServer {
     /// Back-compat helper for single-namespace deployments. Multi-namespace
     /// callers must use [`Self::broadcast_namespace_update`] so each DP only
     /// receives its own namespace.
+    #[allow(dead_code)]
     pub fn broadcast_update_with_registry(
         tx: &broadcast::Sender<ConfigUpdate>,
         config: &GatewayConfig,
@@ -894,7 +1359,20 @@ impl ConfigSync for CpGrpcServer {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let allowed = self.verify_jwt_metadata(request.metadata())?;
+        let allowed = match self.verify_jwt_metadata(request.metadata()) {
+            Ok(allowed) => allowed,
+            Err(status) => {
+                let req = request.get_ref();
+                Self::audit_tenant_subscription(
+                    "ConfigSync.Subscribe",
+                    &req.node_id,
+                    &req.namespace,
+                    "failure",
+                    status.message(),
+                );
+                return Err(status);
+            }
+        };
 
         let inner = request.into_inner();
         let node_id = inner.node_id;
@@ -907,7 +1385,26 @@ impl ConfigSync for CpGrpcServer {
         // check. The returned sender is the per-namespace broadcast channel
         // — DPs in different namespaces are guaranteed to receive only their
         // own slice.
-        let namespace_tx = self.authorise_namespace(&allowed, &dp_namespace)?;
+        let namespace_tx = match self.authorise_namespace(&allowed, &dp_namespace) {
+            Ok(tx) => tx,
+            Err(status) => {
+                Self::audit_tenant_subscription(
+                    "ConfigSync.Subscribe",
+                    &node_id,
+                    &dp_namespace,
+                    "failure",
+                    status.message(),
+                );
+                return Err(status);
+            }
+        };
+        Self::audit_tenant_subscription(
+            "ConfigSync.Subscribe",
+            &node_id,
+            &dp_namespace,
+            "success",
+            "",
+        );
 
         info!(
             "DP node '{}' (v{}) subscribed for config updates (namespace='{}', scope={})",
@@ -935,12 +1432,13 @@ impl ConfigSync for CpGrpcServer {
         // Send initial full config — filtered to the DP's namespace so the
         // initial snapshot matches the per-namespace broadcast stream.
         let config = self.config.load_full();
-        let filtered = Self::filter_config_to_namespace(config.as_ref(), &dp_namespace);
+        let filtered =
+            Self::filter_config_to_namespace_for_scope(config.as_ref(), &dp_namespace, &self.scope);
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
             error!("Failed to serialize config in subscribe: {}", e);
             Status::internal("Failed to serialize configuration")
         })?;
-        let trust_bundles_json = Self::trust_bundles_json(config.trust_bundles.as_deref())
+        let trust_bundles_json = Self::trust_bundles_json(filtered.trust_bundles.as_deref())
             .map_err(|e| {
                 error!(
                     "Failed to serialize gateway trust bundles in subscribe: {}",
@@ -959,6 +1457,7 @@ impl ConfigSync for CpGrpcServer {
 
         let config_for_recovery = self.config.clone();
         let recovery_namespace = dp_namespace.clone();
+        let recovery_scope = self.scope.clone();
         let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
             Ok(update) => Some(Ok(update)),
             Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
@@ -970,11 +1469,15 @@ impl ConfigSync for CpGrpcServer {
                 // from missed deltas without re-leaking other namespaces'
                 // config.
                 let current = config_for_recovery.load_full();
-                let filtered = Self::filter_config_to_namespace(current.as_ref(), &recovery_namespace);
+                let filtered = Self::filter_config_to_namespace_for_scope(
+                    current.as_ref(),
+                    &recovery_namespace,
+                    &recovery_scope,
+                );
                 match Self::config_json_for_dp(&filtered) {
                     Ok(config_json) => {
                         let trust_bundles_json = match Self::trust_bundles_json(
-                            current.trust_bundles.as_deref(),
+                            filtered.trust_bundles.as_deref(),
                         ) {
                             Ok(json) => json,
                             Err(e) => {
@@ -1020,7 +1523,20 @@ impl ConfigSync for CpGrpcServer {
         &self,
         request: Request<FullConfigRequest>,
     ) -> Result<Response<FullConfigResponse>, Status> {
-        let allowed = self.verify_jwt_metadata(request.metadata())?;
+        let allowed = match self.verify_jwt_metadata(request.metadata()) {
+            Ok(allowed) => allowed,
+            Err(status) => {
+                let req = request.get_ref();
+                Self::audit_tenant_subscription(
+                    "ConfigSync.GetFullConfig",
+                    &req.node_id,
+                    &req.namespace,
+                    "failure",
+                    status.message(),
+                );
+                return Err(status);
+            }
+        };
 
         let req = request.get_ref();
         let dp_version = &req.ferrum_version;
@@ -1028,7 +1544,23 @@ impl ConfigSync for CpGrpcServer {
         // Same cross-namespace guard as `Subscribe` — without it
         // `GetFullConfig` would leak the wrong namespace's snapshot. We
         // discard the returned sender; `GetFullConfig` is unary.
-        let _ = self.authorise_namespace(&allowed, &req.namespace)?;
+        if let Err(status) = self.authorise_namespace(&allowed, &req.namespace) {
+            Self::audit_tenant_subscription(
+                "ConfigSync.GetFullConfig",
+                &req.node_id,
+                &req.namespace,
+                "failure",
+                status.message(),
+            );
+            return Err(status);
+        }
+        Self::audit_tenant_subscription(
+            "ConfigSync.GetFullConfig",
+            &req.node_id,
+            &req.namespace,
+            "success",
+            "",
+        );
 
         info!(
             "DP '{}' (v{}) requested full config (namespace='{}')",
@@ -1036,12 +1568,16 @@ impl ConfigSync for CpGrpcServer {
         );
 
         let config = self.config.load_full();
-        let filtered = Self::filter_config_to_namespace(config.as_ref(), &req.namespace);
+        let filtered = Self::filter_config_to_namespace_for_scope(
+            config.as_ref(),
+            &req.namespace,
+            &self.scope,
+        );
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
             error!("Failed to serialize config in get_full_config: {}", e);
             Status::internal("Failed to serialize configuration")
         })?;
-        let trust_bundles_json = Self::trust_bundles_json(config.trust_bundles.as_deref())
+        let trust_bundles_json = Self::trust_bundles_json(filtered.trust_bundles.as_deref())
             .map_err(|e| {
                 error!(
                     "Failed to serialize gateway trust bundles in get_full_config: {}",
@@ -1380,21 +1916,28 @@ mod tests {
     // ── Set scope: only allowed namespaces accepted ────────────────────────
 
     #[test]
-    fn set_scope_accepts_listed_namespaces() {
+    fn set_scope_rejects_missing_claim_by_default() {
         let mut set = HashSet::new();
         set.insert("prod".to_string());
         set.insert("staging".to_string());
         let server = cp_with_scope(CpScope::Set(set), false);
-        assert!(
-            server
-                .authorise_namespace(&AllowedNamespaces::empty(), "prod")
-                .is_ok()
-        );
-        assert!(
-            server
-                .authorise_namespace(&AllowedNamespaces::empty(), "staging")
-                .is_ok()
-        );
+        let err = server
+            .authorise_namespace(&AllowedNamespaces::empty(), "prod")
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("Multi-namespace"));
+    }
+
+    #[test]
+    fn set_scope_accepts_listed_namespace_with_claim() {
+        let mut set = HashSet::new();
+        set.insert("prod".to_string());
+        set.insert("staging".to_string());
+        let server = cp_with_scope(CpScope::Set(set), false);
+        let mut allowed = HashSet::new();
+        allowed.insert("prod".to_string());
+        let allowed = AllowedNamespaces(Some(allowed));
+        assert!(server.authorise_namespace(&allowed, "prod").is_ok());
     }
 
     #[test]
@@ -1403,9 +1946,10 @@ mod tests {
         set.insert("prod".to_string());
         set.insert("staging".to_string());
         let server = cp_with_scope(CpScope::Set(set), false);
-        let err = server
-            .authorise_namespace(&AllowedNamespaces::empty(), "dev")
-            .unwrap_err();
+        let mut allowed = HashSet::new();
+        allowed.insert("dev".to_string());
+        let allowed = AllowedNamespaces(Some(allowed));
+        let err = server.authorise_namespace(&allowed, "dev").unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("dev"));
     }
@@ -1413,13 +1957,55 @@ mod tests {
     // ── All scope: any namespace accepted, claim still respected ──────────
 
     #[test]
-    fn all_scope_accepts_any_namespace_without_claim() {
+    fn all_scope_rejects_missing_claim_by_default() {
         let server = cp_with_scope(CpScope::All, false);
-        assert!(
-            server
-                .authorise_namespace(&AllowedNamespaces::empty(), "any-ns")
-                .is_ok()
-        );
+        let err = server
+            .authorise_namespace(&AllowedNamespaces::empty(), "any-ns")
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn all_scope_accepts_any_namespace_with_claim() {
+        let server = cp_with_scope(CpScope::All, false);
+        let mut allowed = HashSet::new();
+        allowed.insert("any-ns".to_string());
+        let allowed = AllowedNamespaces(Some(allowed));
+        assert!(server.authorise_namespace(&allowed, "any-ns").is_ok());
+    }
+
+    #[test]
+    fn single_scope_xds_accepts_array_claim_containing_scope_namespace() {
+        let mut set = HashSet::new();
+        set.insert("prod".to_string());
+        set.insert("staging".to_string());
+        let allowed = AllowedNamespaces(Some(set));
+
+        let namespace = CpGrpcServer::resolve_stream_namespace_for_scope(
+            &CpScope::Single("prod".to_string()),
+            false,
+            &allowed,
+        )
+        .expect("single-scope xDS should resolve to the configured namespace");
+
+        assert_eq!(namespace, "prod");
+    }
+
+    #[test]
+    fn single_scope_xds_rejects_array_claim_missing_scope_namespace() {
+        let mut set = HashSet::new();
+        set.insert("staging".to_string());
+        set.insert("dev".to_string());
+        let allowed = AllowedNamespaces(Some(set));
+
+        let err = CpGrpcServer::resolve_stream_namespace_for_scope(
+            &CpScope::Single("prod".to_string()),
+            false,
+            &allowed,
+        )
+        .expect_err("claim that omits the single scope namespace must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     // ── JWT claim authorisation ────────────────────────────────────────────
@@ -1545,5 +2131,455 @@ mod tests {
         assert_eq!(filtered.proxies.len(), 1);
         assert_eq!(filtered.proxies[0].namespace, "ns-a");
         assert_eq!(filtered.proxies[0].id, "p-a");
+    }
+
+    #[test]
+    fn namespace_filter_preserves_mesh_wide_root_namespace_policies() {
+        use crate::modes::mesh::config::{
+            MeshRequestAuthentication, MeshTelemetryConfig, MeshTelemetryResource, MtlsMode,
+        };
+
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                istio_root_namespace: "istio-system".to_string(),
+                mesh_policies: vec![
+                    crate::modes::mesh::config::MeshPolicy {
+                        name: "root-authz".to_string(),
+                        namespace: "istio-system".to_string(),
+                        scope: PolicyScope::MeshWide,
+                        rules: Vec::new(),
+                    },
+                    crate::modes::mesh::config::MeshPolicy {
+                        name: "other-authz".to_string(),
+                        namespace: "ns-b".to_string(),
+                        scope: PolicyScope::Namespace {
+                            namespace: "ns-b".to_string(),
+                        },
+                        rules: Vec::new(),
+                    },
+                    crate::modes::mesh::config::MeshPolicy {
+                        name: "foreign-mesh-wide".to_string(),
+                        namespace: "ns-b".to_string(),
+                        scope: PolicyScope::MeshWide,
+                        rules: Vec::new(),
+                    },
+                ],
+                peer_authentications: vec![PeerAuthentication {
+                    name: "root-peer".to_string(),
+                    namespace: "istio-system".to_string(),
+                    scope: Some(PolicyScope::MeshWide),
+                    selector: None,
+                    mtls_mode: MtlsMode::Strict,
+                    port_overrides: Default::default(),
+                }],
+                request_authentications: vec![MeshRequestAuthentication {
+                    name: "root-ra".to_string(),
+                    namespace: "istio-system".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    jwt_rules: Vec::new(),
+                }],
+                telemetry_resources: vec![MeshTelemetryResource {
+                    name: "root-telemetry".to_string(),
+                    namespace: "istio-system".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    config: MeshTelemetryConfig::default(),
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let filtered = CpGrpcServer::filter_config_to_namespace(&config, "ns-a");
+        let mesh = filtered.mesh.expect("mesh should remain");
+
+        assert_eq!(mesh.mesh_policies.len(), 1);
+        assert_eq!(mesh.mesh_policies[0].name, "root-authz");
+        assert_eq!(mesh.peer_authentications.len(), 1);
+        assert_eq!(mesh.request_authentications.len(), 1);
+        assert_eq!(mesh.telemetry_resources.len(), 1);
+    }
+
+    #[test]
+    fn namespace_filter_keeps_namespaced_extension_configs_in_multi_scope() {
+        use crate::modes::mesh::slice::MeshExtensionConfig;
+
+        let mut set = HashSet::new();
+        set.insert("ns-a".to_string());
+        set.insert("ns-b".to_string());
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                extension_configs: vec![
+                    MeshExtensionConfig {
+                        name: "ext-a".to_string(),
+                        namespace: "ns-a".to_string(),
+                        type_url: "type.googleapis.com/ferrum.ext.A".to_string(),
+                        value: b"a".to_vec(),
+                    },
+                    MeshExtensionConfig {
+                        name: "ext-b".to_string(),
+                        namespace: "ns-b".to_string(),
+                        type_url: "type.googleapis.com/ferrum.ext.B".to_string(),
+                        value: b"b".to_vec(),
+                    },
+                ],
+                ..MeshConfig::default()
+            })),
+            trust_bundles: Some(Box::new(test_trust_bundles())),
+            ..GatewayConfig::default()
+        };
+
+        let filtered =
+            CpGrpcServer::filter_config_to_namespace_for_scope(&config, "ns-a", &CpScope::Set(set));
+        let mesh = filtered.mesh.expect("mesh should remain");
+
+        assert!(filtered.trust_bundles.is_none());
+        assert_eq!(mesh.extension_configs.len(), 1);
+        assert_eq!(mesh.extension_configs[0].name, "ext-a");
+    }
+
+    #[test]
+    fn mesh_request_filter_preserves_exported_service_entries() {
+        use crate::modes::mesh::config::{Resolution, ServiceEntry, ServiceEntryLocation};
+
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                service_entries: vec![
+                    ServiceEntry {
+                        name: "shared-api".to_string(),
+                        namespace: "shared".to_string(),
+                        hosts: vec!["shared.example.com".to_string()],
+                        endpoints: Vec::new(),
+                        resolution: Resolution::Dns,
+                        location: ServiceEntryLocation::MeshExternal,
+                        ports: Vec::new(),
+                        export_to: vec!["ns-a".to_string()],
+                        workload_selector: None,
+                    },
+                    ServiceEntry {
+                        name: "private-api".to_string(),
+                        namespace: "ns-b".to_string(),
+                        hosts: vec!["private.example.com".to_string()],
+                        endpoints: Vec::new(),
+                        resolution: Resolution::Dns,
+                        location: ServiceEntryLocation::MeshExternal,
+                        ports: Vec::new(),
+                        export_to: Vec::new(),
+                        workload_selector: None,
+                    },
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let request = MeshSliceRequest {
+            namespace: "ns-a".to_string(),
+            ..MeshSliceRequest::default()
+        };
+
+        let mesh_config = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request,
+            &CpScope::Single("ns-a".to_string()),
+        );
+        let strict_config = CpGrpcServer::filter_config_to_namespace(&config, "ns-a");
+
+        let mesh = mesh_config
+            .mesh
+            .expect("mesh request view should retain mesh");
+        assert_eq!(mesh.service_entries.len(), 1);
+        assert_eq!(mesh.service_entries[0].name, "shared-api");
+        assert!(
+            strict_config
+                .mesh
+                .expect("strict view should retain mesh")
+                .service_entries
+                .is_empty(),
+            "ConfigSync namespace filtering must not serialize foreign ServiceEntries"
+        );
+
+        let mut ns_a_only = HashSet::new();
+        ns_a_only.insert("ns-a".to_string());
+        let scoped_config = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request,
+            &CpScope::Set(ns_a_only),
+        );
+        assert!(
+            scoped_config
+                .mesh
+                .expect("mesh request view should retain mesh")
+                .service_entries
+                .is_empty(),
+            "explicit Set scope must not serialize exported ServiceEntries owned by namespaces outside FERRUM_CP_NAMESPACES"
+        );
+    }
+
+    #[test]
+    fn mesh_request_filter_preserves_waypoint_bound_cross_namespace_services() {
+        use crate::modes::mesh::config::{
+            AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
+        };
+
+        let service = MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: Default::default(),
+            cluster_ips: Vec::new(),
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service],
+                waypoint_bindings: vec![MeshWaypointBinding {
+                    name: "waypoint".to_string(),
+                    namespace: "infra".to_string(),
+                    waypoint_for: "service".to_string(),
+                    services: vec![MeshWaypointServiceRef {
+                        namespace: "default".to_string(),
+                        name: "reviews".to_string(),
+                    }],
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let request = MeshSliceRequest {
+            namespace: "infra".to_string(),
+            waypoint_name: Some("waypoint".to_string()),
+            ..MeshSliceRequest::default()
+        };
+
+        let mesh_config = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request,
+            &CpScope::Single("infra".to_string()),
+        );
+        let strict_config = CpGrpcServer::filter_config_to_namespace(&config, "infra");
+
+        let mesh = mesh_config
+            .mesh
+            .expect("mesh request view should retain mesh");
+        assert_eq!(mesh.services.len(), 1);
+        assert_eq!(mesh.services[0].namespace, "default");
+        assert_eq!(mesh.services[0].name, "reviews");
+        assert_eq!(mesh.waypoint_bindings.len(), 1);
+        assert_eq!(mesh.waypoint_bindings[0].services.len(), 1);
+        assert_eq!(mesh.waypoint_bindings[0].services[0].namespace, "default");
+        assert!(
+            strict_config
+                .mesh
+                .expect("strict view should retain mesh")
+                .services
+                .is_empty(),
+            "ConfigSync namespace filtering must not serialize foreign services"
+        );
+    }
+
+    #[test]
+    fn mesh_request_filter_preserves_sidecar_admitted_cross_namespace_services() {
+        use crate::modes::mesh::config::{
+            AppProtocol, MeshDestinationRule, MeshService, MeshSidecar, MeshSidecarEgress,
+            ServicePort,
+        };
+        use crate::modes::mesh::slice::MeshSlice;
+
+        let service = |namespace: &str, name: &str| MeshService {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            ports: vec![ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: Default::default(),
+            cluster_ips: Vec::new(),
+        };
+        let destination_rule = |namespace: &str, name: &str, host: &str| MeshDestinationRule {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            host: host.to_string(),
+            traffic_policy: None,
+            port_level_settings: Default::default(),
+            subsets: Vec::new(),
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                sidecars: vec![MeshSidecar {
+                    name: "beta-egress".to_string(),
+                    namespace: "alpha".to_string(),
+                    workload_selector: None,
+                    egress_inherits_defaults: false,
+                    egress: vec![MeshSidecarEgress {
+                        hosts: vec!["beta/*".to_string()],
+                        port: None,
+                    }],
+                    ingress_declared: false,
+                    ingress: Vec::new(),
+                }],
+                services: vec![
+                    service("alpha", "reviews"),
+                    service("beta", "checkout"),
+                    service("gamma", "payments"),
+                ],
+                destination_rules: vec![
+                    destination_rule("alpha", "alpha-reviews-dr", "reviews"),
+                    destination_rule("beta", "beta-checkout-dr", "checkout"),
+                    destination_rule("gamma", "gamma-payments-dr", "payments"),
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let request = MeshSliceRequest {
+            namespace: "alpha".to_string(),
+            enforce_sidecar_egress: true,
+            ..MeshSliceRequest::default()
+        };
+
+        let filtered = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request,
+            &CpScope::Single("alpha".to_string()),
+        );
+        let mesh = filtered.mesh.as_ref().expect("mesh should remain");
+
+        assert!(
+            mesh.services
+                .iter()
+                .any(|service| service.namespace == "beta" && service.name == "checkout"),
+            "sidecar-admitted beta service must survive the prefilter"
+        );
+        assert!(
+            !mesh
+                .services
+                .iter()
+                .any(|service| service.namespace == "gamma"),
+            "unadmitted gamma service must still be dropped before slicing"
+        );
+        assert!(
+            mesh.destination_rules
+                .iter()
+                .any(|rule| rule.name == "beta-checkout-dr"),
+            "sidecar-admitted beta DestinationRule must survive the prefilter"
+        );
+        assert!(
+            !mesh
+                .destination_rules
+                .iter()
+                .any(|rule| rule.name == "gamma-payments-dr"),
+            "unadmitted gamma DestinationRule must still be dropped before slicing"
+        );
+
+        let mut alpha_only_scope = HashSet::new();
+        alpha_only_scope.insert("alpha".to_string());
+        let alpha_only = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request,
+            &CpScope::Set(alpha_only_scope),
+        );
+        let alpha_only_mesh = alpha_only.mesh.as_ref().expect("mesh should remain");
+        assert!(
+            !alpha_only_mesh
+                .services
+                .iter()
+                .any(|service| service.namespace == "beta"),
+            "explicit Set scope must not serialize sidecar-visible namespaces outside FERRUM_CP_NAMESPACES"
+        );
+        assert!(
+            !alpha_only_mesh
+                .destination_rules
+                .iter()
+                .any(|rule| rule.namespace == "beta"),
+            "explicit Set scope must not serialize sidecar-visible DestinationRules outside FERRUM_CP_NAMESPACES"
+        );
+
+        let slice = MeshSlice::from_gateway_config(&filtered, request);
+        assert_eq!(slice.services.len(), 1);
+        assert_eq!(slice.services[0].namespace, "beta");
+        assert_eq!(slice.services[0].name, "checkout");
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "beta-checkout-dr");
+    }
+
+    #[test]
+    fn multi_scope_filter_preserves_namespace_scoped_multicluster_config() {
+        use crate::modes::mesh::config::{EastWestGateway, MultiClusterConfig, RemoteCluster};
+
+        let mut set = HashSet::new();
+        set.insert("ns-a".to_string());
+        set.insert("ns-b".to_string());
+        let config = GatewayConfig {
+            trust_bundles: Some(Box::new(test_trust_bundles())),
+            mesh: Some(Box::new(MeshConfig {
+                trust_bundles: Some(test_trust_bundles()),
+                multi_cluster: Some(MultiClusterConfig {
+                    local_cluster: Some("local".to_string()),
+                    federation_endpoint: Some("https://federation.example.test".to_string()),
+                    remote_clusters: vec![RemoteCluster {
+                        name: "remote".to_string(),
+                        trust_domain: crate::identity::TrustDomain::new("remote.test")
+                            .expect("test trust domain should be valid"),
+                        network: Some("remote-net".to_string()),
+                        control_plane_url: Some("https://remote-cp.example.test".to_string()),
+                        federation_endpoint: Some("https://remote-fed.example.test".to_string()),
+                    }],
+                    east_west_gateways: vec![
+                        EastWestGateway {
+                            name: "ewa".to_string(),
+                            namespace: "ns-a".to_string(),
+                            host: "ewa.example.test".to_string(),
+                            port: 15443,
+                            sni_hosts: vec!["*.ns-a.remote.test".to_string()],
+                            trust_domain: Some(
+                                crate::identity::TrustDomain::new("ns-a.test")
+                                    .expect("test trust domain should be valid"),
+                            ),
+                            network: Some("net-a".to_string()),
+                        },
+                        EastWestGateway {
+                            name: "ewb".to_string(),
+                            namespace: "ns-b".to_string(),
+                            host: "ewb.example.test".to_string(),
+                            port: 15443,
+                            sni_hosts: vec!["*.ns-b.remote.test".to_string()],
+                            trust_domain: None,
+                            network: Some("net-b".to_string()),
+                        },
+                    ],
+                }),
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let request = MeshSliceRequest {
+            namespace: "ns-a".to_string(),
+            ..MeshSliceRequest::default()
+        };
+
+        let filtered = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request,
+            &CpScope::Set(set),
+        );
+        let mesh = filtered.mesh.expect("mesh should remain");
+        let multi_cluster = mesh
+            .multi_cluster
+            .expect("namespace-scoped multicluster metadata should remain");
+
+        assert!(filtered.trust_bundles.is_none());
+        assert!(mesh.trust_bundles.is_none());
+        assert_eq!(multi_cluster.local_cluster.as_deref(), Some("local"));
+        assert_eq!(multi_cluster.remote_clusters.len(), 1);
+        assert_eq!(multi_cluster.east_west_gateways.len(), 1);
+        assert_eq!(multi_cluster.east_west_gateways[0].namespace, "ns-a");
+        assert_eq!(multi_cluster.east_west_gateways[0].name, "ewa");
     }
 }

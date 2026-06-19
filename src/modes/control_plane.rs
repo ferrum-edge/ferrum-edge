@@ -736,9 +736,9 @@ pub async fn run(
     // subscribe AND which namespaces the polling loop loads from the DB.
     let cp_scope = CpScope::from_env(&env_config.cp_namespaces, &env_config.namespace);
     info!("CP mode: serving {}", cp_scope.describe());
-    if env_config.cp_require_namespace_claim {
+    if cp_scope.namespace_claim_required(env_config.cp_require_namespace_claim) {
         info!(
-            "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true — DP ConfigSync JWTs without an `ns` claim will be rejected"
+            "CP namespace authorization requires JWT `ns` claims for ConfigSync, MeshConfigSync, and xDS streams"
         );
     }
 
@@ -803,6 +803,8 @@ pub async fn run(
             .registry(mesh_registry.clone())
             .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
             .namespace(env_config.namespace.clone())
+            .scope(cp_scope.clone())
+            .require_ns_claim(env_config.cp_require_namespace_claim)
             .sidecar_enforced(env_config.mesh_sidecar_enforced)
             .sidecar_enforced_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .sidecar_identity_narrowing(env_config.mesh_sidecar_identity_narrowing)
@@ -823,6 +825,9 @@ pub async fn run(
             .with_sidecar_enforcement_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .with_sidecar_identity_narrowing(env_config.mesh_sidecar_identity_narrowing)
             .with_cluster_domain(env_config.k8s_cluster_domain.clone())
+            .with_scope(cp_scope.clone())
+            .with_require_namespace_claim(env_config.cp_require_namespace_claim)
+            .with_namespace_broadcasts(broadcasts.clone())
             .with_max_streams_per_node(env_config.xds_max_streams_per_node),
         )
     } else {
@@ -1173,7 +1178,8 @@ pub async fn run(
         match crate::k8s_controller::start_k8s_controller(
             controller_config,
             config_arc.clone(),
-            update_tx.clone(),
+            broadcasts.clone(),
+            cp_scope.clone(),
             dp_registry.clone(),
             mesh_update_tx.clone(),
             mesh_registry.clone(),
@@ -1398,6 +1404,7 @@ pub async fn run(
                                         ns,
                                         &new_config,
                                         &dp_registry_poll,
+                                        &poll_scope,
                                     );
                                 }
                                 MeshGrpcServer::broadcast_full_with_registry(
@@ -1502,6 +1509,7 @@ pub async fn run(
                                                 &version,
                                                 &dp_registry_poll,
                                                 source_trust_bundles.as_deref(),
+                                                &poll_scope,
                                             );
                                         }
                                         last_gateway_trust_bundles =
@@ -1663,6 +1671,7 @@ pub async fn run(
                                         &version,
                                         &dp_registry_poll,
                                         trust_bundles_for_broadcast,
+                                        &poll_scope,
                                     );
                                 }
                                 if trust_bundles_changed {
@@ -1702,6 +1711,7 @@ pub async fn run(
                                                 ns,
                                                 &new_config,
                                                 &dp_registry_poll,
+                                                &poll_scope,
                                             );
                                         }
                                         MeshGrpcServer::broadcast_full_with_registry(&mesh_update_tx, new_config_arc, &mesh_registry_poll);
@@ -1731,6 +1741,7 @@ pub async fn run(
                                                                 ns,
                                                                 &new_config,
                                                                 &dp_registry_poll,
+                                                                &poll_scope,
                                                             );
                                                         }
                                                         MeshGrpcServer::broadcast_full_with_registry(&mesh_update_tx, new_config_arc, &mesh_registry_poll);
