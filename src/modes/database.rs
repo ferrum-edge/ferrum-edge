@@ -2,7 +2,7 @@
 //!
 //! Lifecycle:
 //! 1. Connect to the primary DB (with failover URL retry)
-//! 2. Optionally connect a read replica for polling (reduces primary load)
+//! 2. Optionally connect a read replica for admin read offload
 //! 3. Load full config from DB (falls back to on-disk JSON backup if DB is unreachable)
 //! 4. Build all caches (router, plugin, consumer, load balancer, circuit breaker)
 //! 5. Start proxy + admin listeners
@@ -161,14 +161,19 @@ pub async fn run(
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
 
-            // Connect read replica for config polling (reduces primary load)
+            // Connect read replica for admin-only read offload. Runtime
+            // config polling remains primary-consistent.
             if let Some(ref replica_url) = effective_replica_url {
                 match store.connect_read_replica(replica_url).await {
-                    Ok(()) => info!("Read replica connected for config polling"),
-                    Err(e) => warn!(
-                        "Read replica connection failed, polling will use primary: {}",
-                        e
-                    ),
+                    Ok(()) => info!("Read replica connected for admin reads"),
+                    Err(e) => {
+                        let safe_error = db_backend::redact_error_text(&e, &[replica_url]);
+                        warn!(
+                            "Read replica connection failed for {}; admin reads will use primary until reconnect succeeds: {}",
+                            db_backend::redact_url(replica_url),
+                            safe_error
+                        );
+                    }
                 }
             }
             Box::new(store)
@@ -1070,34 +1075,54 @@ pub async fn run(
                         }
                     }
 
-                    // Check if the read replica FQDN now resolves to different IPs
-                    if let Some(ref replica_hostname) = replica_hostname
-                        && let Some(ref replica_url) = replica_url_for_reconnect
-                        && let Ok(ips) = dns_cache_for_poll.resolve_all(replica_hostname, None, None).await
-                    {
-                        let needs_reconnect = match &last_replica_ips {
-                            Some(prev) => {
-                                let mut prev_sorted = prev.clone();
-                                prev_sorted.sort();
-                                let mut cur_sorted = ips.clone();
-                                cur_sorted.sort();
-                                prev_sorted != cur_sorted
-                            }
-                            None => false,
-                        };
-                        if needs_reconnect {
-                            info!(
-                                "Read replica DNS changed for '{}': {:?} -> {:?}, reconnecting replica pool",
-                                replica_hostname, last_replica_ips.as_deref().unwrap_or(&[]), ips
-                            );
+                    if let Some(ref replica_url) = replica_url_for_reconnect {
+                        if !db_poll.read_replica_available() {
                             if let Err(e) = db_poll.reconnect_read_replica(replica_url).await {
-                                error!(
-                                    "Failed to reconnect read replica pool after DNS change for '{}': {}",
-                                    replica_hostname, e
+                                let safe_error =
+                                    db_backend::redact_error_text(e.as_ref(), &[replica_url]);
+                                warn!(
+                                    "Read replica unavailable; admin-read replica reconnect attempt failed for {}: {}",
+                                    db_backend::redact_url(replica_url),
+                                    safe_error
                                 );
                             }
+                        } else if let Some(ref replica_hostname) = replica_hostname
+                            && let Ok(ips) = dns_cache_for_poll
+                                .resolve_all(replica_hostname, None, None)
+                                .await
+                        {
+                            let needs_reconnect = match &last_replica_ips {
+                                Some(prev) => {
+                                    let mut prev_sorted = prev.clone();
+                                    prev_sorted.sort();
+                                    let mut cur_sorted = ips.clone();
+                                    cur_sorted.sort();
+                                    prev_sorted != cur_sorted
+                                }
+                                None => false,
+                            };
+                            if needs_reconnect {
+                                info!(
+                                    "Read replica DNS changed for '{}': {:?} -> {:?}, reconnecting admin-read replica pool",
+                                    replica_hostname, last_replica_ips.as_deref().unwrap_or(&[]), ips
+                                );
+                                if let Err(e) =
+                                    db_poll.reconnect_read_replica(replica_url).await
+                                {
+                                    let safe_error = db_backend::redact_error_text(
+                                        e.as_ref(),
+                                        &[replica_url],
+                                    );
+                                    error!(
+                                        "Failed to reconnect admin-read replica pool after DNS change for '{}' ({}): {}",
+                                        replica_hostname,
+                                        db_backend::redact_url(replica_url),
+                                        safe_error
+                                    );
+                                }
+                            }
+                            last_replica_ips = Some(ips);
                         }
-                        last_replica_ips = Some(ips);
                     }
 
                     if force_full_reload {
@@ -1123,7 +1148,7 @@ pub async fn run(
                             }
                             Err(e) => {
                                 error!(
-                                    "Failed full config reload after DB DNS reconnect; keeping existing config and retrying: {}",
+                                    "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying: {}",
                                     e
                                 );
                                 db_available_poll.store(false, Ordering::Relaxed);
@@ -1215,7 +1240,7 @@ pub async fn run(
                             }
                             Err(e) => {
                                 warn!(
-                                    "Incremental poll failed, falling back to full reload: {}",
+                                    "Authoritative primary incremental poll failed, falling back to full reload: {}",
                                     e
                                 );
                                 // Fallback to full config load
@@ -1262,7 +1287,7 @@ pub async fn run(
                                                     Err(e3) => {
                                                         db_available_poll.store(false, Ordering::Relaxed);
                                                         warn!(
-                                                            "Failover reload also failed (using cached): {}",
+                                                            "Authoritative primary failover reload also failed (using cached): {}",
                                                             e3
                                                         );
                                                     }
@@ -1271,7 +1296,7 @@ pub async fn run(
                                             Err(_) => {
                                                 db_available_poll.store(false, Ordering::Relaxed);
                                                 warn!(
-                                                    "Full config reload also failed (using cached): {}",
+                                                    "Authoritative primary full config reload also failed (using cached): {}",
                                                     e2
                                                 );
                                             }
@@ -1317,7 +1342,7 @@ pub async fn run(
                             Err(e) => {
                                 db_available_poll.store(false, Ordering::Relaxed);
                                 warn!(
-                                    "Failed to reload config from database (using cached): {}",
+                                    "Authoritative primary full config reload failed (using cached): {}",
                                     e
                                 );
                             }

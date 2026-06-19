@@ -235,7 +235,7 @@ The admin `/status` (and `/health`) endpoint includes database connection pool s
 | `active` | Connections currently in use |
 | `max_connections` | Configured maximum (`FERRUM_DB_POOL_MAX_CONNECTIONS`) |
 | `min_connections` | Configured minimum idle (`FERRUM_DB_POOL_MIN_CONNECTIONS`) |
-| `read_replica` | Present only when `FERRUM_DB_READ_REPLICA_URL` is configured |
+| `read_replica` | Present only when the configured SQL admin-read replica pool is currently active |
 
 **MongoDB**: Pool stats are not available (the MongoDB driver manages pooling internally). The `pool` field is omitted from the response.
 

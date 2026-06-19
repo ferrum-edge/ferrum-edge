@@ -46,7 +46,10 @@ mod inner {
     use mongodb::bson::{
         Binary, Bson, DateTime as BsonDateTime, Document, doc, spec::BinarySubtype,
     };
-    use mongodb::options::{ClientOptions, FindOptions, IndexOptions, Tls, TlsOptions};
+    use mongodb::options::{
+        ClientOptions, FindOptions, IndexOptions, ReadPreference, SelectionCriteria, Tls,
+        TlsOptions,
+    };
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -363,6 +366,13 @@ mod inner {
             tls_insecure: bool,
         ) -> Result<(Client, Database, bool), anyhow::Error> {
             let mut client_options = ClientOptions::parse(mongo_url).await?;
+            if client_options.selection_criteria.is_some() {
+                warn!(
+                    "MongoDB readPreference from FERRUM_DB_URL is ignored; authoritative config reads use primary"
+                );
+            }
+            client_options.selection_criteria =
+                Some(SelectionCriteria::ReadPreference(ReadPreference::Primary));
 
             if let Some(name) = &settings.app_name {
                 client_options.app_name = Some(name.clone());
@@ -2641,9 +2651,9 @@ mod inner {
         }
 
         async fn reconnect_read_replica(&self, _replica_url: &str) -> Result<(), anyhow::Error> {
-            // MongoDB driver handles read preference routing internally via
-            // the connection string (e.g., ?readPreference=secondaryPreferred).
-            // No separate replica pool needed.
+            // MongoDB uses one authoritative client and forces primary reads
+            // for the config store. There is no separate admin-read replica
+            // pool to reconnect.
             Ok(())
         }
 

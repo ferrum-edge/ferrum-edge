@@ -132,7 +132,7 @@ pub struct DbPoolStats {
     pub max_connections: u32,
     /// Minimum configured idle connections (`FERRUM_DB_POOL_MIN_CONNECTIONS`).
     pub min_connections: u32,
-    /// Read replica pool stats, if a replica is configured.
+    /// Read replica pool stats, if a configured admin-read replica is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_replica: Option<Box<DbPoolStatsInner>>,
 }
@@ -181,6 +181,11 @@ pub trait DatabaseBackend: Send + Sync {
 
     /// Returns true if a read replica is configured.
     fn has_read_replica(&self) -> bool;
+
+    /// Returns true if a configured read replica currently has an active pool.
+    fn read_replica_available(&self) -> bool {
+        self.has_read_replica()
+    }
 
     /// Return connection pool statistics for observability.
     ///
@@ -434,7 +439,7 @@ pub trait DatabaseBackend: Send + Sync {
     /// database TLS parameters derived from `FERRUM_DB_TLS_MODE`.
     async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error>;
 
-    /// Atomically replace the read replica pool with a freshly connected one.
+    /// Atomically replace the admin-read replica pool with a freshly connected one.
     async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error>;
 
     /// Try to reconnect to any available database URL (primary first, then failover).
@@ -689,6 +694,15 @@ pub fn redact_url(url: &str) -> String {
         }
         Err(_) => redact_mongodb_multi_host_url(url).unwrap_or_else(|| "<invalid-url>".to_string()),
     }
+}
+
+/// Redact configured database URLs if a driver error includes them verbatim.
+pub fn redact_error_text(error: &dyn std::fmt::Display, urls: &[&str]) -> String {
+    let mut text = error.to_string();
+    for url in urls {
+        text = text.replace(url, &redact_url(url));
+    }
+    text
 }
 
 fn extract_mongodb_multi_host_hostname(db_url: &str) -> Option<String> {
