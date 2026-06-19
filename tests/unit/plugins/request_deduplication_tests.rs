@@ -1057,7 +1057,10 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
         "POST".to_string(),
         "/api".to_string(),
     );
-    assert!(!plugin.should_buffer_request_body(&keyless_without_declared_body));
+    assert!(
+        plugin.should_buffer_request_body(&keyless_without_declared_body),
+        "applicable body-capable requests must prebuffer before an earlier plugin can add the key"
+    );
 
     let mut keyless_declared_body = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -1094,6 +1097,21 @@ async fn test_transformed_idempotency_header_can_fingerprint_prebuffered_body() 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(ctx.metadata.contains_key(DEDUP_FINGERPRINT_METADATA));
+}
+
+#[tokio::test]
+async fn test_transformed_idempotency_header_buffers_implicit_http2_body() {
+    let plugin = make_plugin(json!({}));
+
+    let ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "HTTP/2 and HTTP/3 POST bodies may arrive without length or transfer headers"
+    );
 }
 
 #[tokio::test]
@@ -1221,7 +1239,7 @@ async fn test_reused_key_different_route_affecting_header_returns_409() {
 }
 
 #[tokio::test]
-async fn test_reused_key_different_synthetic_headers_replays() {
+async fn test_reused_key_different_client_trace_headers_conflicts() {
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -1251,6 +1269,66 @@ async fn test_reused_key_different_synthetic_headers_replays() {
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
     assert!(matches!(result, PluginResult::RejectBinary { .. }));
+}
+
+#[tokio::test]
+async fn test_scoped_credential_rotation_replays_cached_response() {
+    let plugin = make_plugin(json!({}));
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    first_ctx.authenticated_identity = Some("consumer-1".to_string());
+    let mut first_headers = keyed_headers("credential-rotation-key", "api.example", 11);
+    first_headers.insert("authorization".to_string(), "Bearer old-token".to_string());
+    first_headers.insert("cookie".to_string(), "session=old".to_string());
+    first_headers.insert("x-api-key".to_string(), "old-api-key".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    second_ctx.authenticated_identity = Some("consumer-1".to_string());
+    let mut second_headers = keyed_headers("credential-rotation-key", "api.example", 11);
+    second_headers.insert("authorization".to_string(), "Bearer new-token".to_string());
+    second_headers.insert("cookie".to_string(), "session=new".to_string());
+    second_headers.insert("x-api-key".to_string(), "new-api-key".to_string());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert!(matches!(result, PluginResult::RejectBinary { .. }));
+}
+
+#[tokio::test]
+async fn test_unscoped_credentials_remain_in_fingerprint() {
+    let plugin = make_plugin(json!({
+        "scope_by_consumer": false
+    }));
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    first_ctx.authenticated_identity = Some("consumer-1".to_string());
+    let mut first_headers = keyed_headers("unscoped-credential-key", "api.example", 11);
+    first_headers.insert("authorization".to_string(), "Bearer old-token".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    second_ctx.authenticated_identity = Some("consumer-1".to_string());
+    let mut second_headers = keyed_headers("unscoped-credential-key", "api.example", 11);
+    second_headers.insert("authorization".to_string(), "Bearer new-token".to_string());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert_fingerprint_conflict(result);
 }
 
 #[tokio::test]
@@ -1333,6 +1411,43 @@ async fn test_reused_key_equivalent_gzip_body_replays() {
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
     assert!(matches!(result, PluginResult::RejectBinary { .. }));
+}
+
+#[tokio::test]
+async fn test_large_gzip_body_uses_wire_fingerprint_fallback() {
+    let plugin = make_plugin(json!({}));
+    let logical_body = vec![b'a'; 1024 * 1024 + 1];
+    let compressed_body = gzip_body(&logical_body);
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/orders".to_string(),
+    );
+    first_ctx.request_body_bytes = Some(Bytes::from(compressed_body.clone()));
+    let mut first_headers =
+        keyed_headers("large-gzip-body-key", "api.example", compressed_body.len());
+    first_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/orders".to_string(),
+    );
+    second_ctx.request_body_bytes = Some(Bytes::from(logical_body));
+    let mut second_headers = keyed_headers("large-gzip-body-key", "api.example", 1024 * 1024 + 1);
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert_fingerprint_conflict(result);
 }
 
 #[tokio::test]

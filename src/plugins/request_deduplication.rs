@@ -22,7 +22,6 @@ use dashmap::mapref::entry::Entry;
 use http::{HeaderName, Method};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::LazyLock;
@@ -57,7 +56,7 @@ const DEDUP_REDIS_LOCK_TOKEN_METADATA: &str = "_dedup_redis_lock_token";
 const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v2";
 const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
 const REDIS_INFLIGHT_KEY_COMPONENT: &str = "inflight";
-const MAX_CANONICAL_DECODED_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CANONICAL_DECODED_BODY_BYTES: usize = 1024 * 1024;
 const HOP_BY_HOP_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "connection",
     "content-encoding",
@@ -69,12 +68,14 @@ const HOP_BY_HOP_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
-const SYNTHETIC_FINGERPRINT_EXCLUSIONS: &[&str] = &[
-    "traceparent",
-    "tracestate",
-    "x-request-id",
-    "x-correlation-id",
-    "correlation-id",
+const SCOPED_CREDENTIAL_FINGERPRINT_EXCLUSIONS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "x-forwarded-authorization",
 ];
 
 /// Monotonic seconds since process start. Immune to wall-clock steps, matching
@@ -326,7 +327,9 @@ impl RequestDeduplication {
             "query",
             ctx.raw_query_string().unwrap_or("").as_bytes(),
         );
-        for (header_name, value) in request_headers_for_fingerprint(headers, &self.header_name) {
+        for (header_name, value) in
+            request_headers_for_fingerprint(headers, &self.header_name, self.scope_by_consumer)
+        {
             hash_framed(&mut hasher, "header_name", header_name.as_bytes());
             hash_framed(&mut hasher, "header_value", value.as_bytes());
         }
@@ -875,6 +878,7 @@ fn canonical_authority(headers: &HashMap<String, String>) -> String {
 fn request_headers_for_fingerprint<'a>(
     headers: &'a HashMap<String, String>,
     idempotency_header: &str,
+    scope_by_consumer: bool,
 ) -> Vec<(String, &'a str)> {
     let mut values = Vec::new();
     for (name, value) in headers {
@@ -885,9 +889,10 @@ fn request_headers_for_fingerprint<'a>(
             || HOP_BY_HOP_FINGERPRINT_EXCLUSIONS
                 .iter()
                 .any(|excluded| normalized == *excluded)
-            || SYNTHETIC_FINGERPRINT_EXCLUSIONS
-                .iter()
-                .any(|excluded| normalized == *excluded)
+            || (scope_by_consumer
+                && SCOPED_CREDENTIAL_FINGERPRINT_EXCLUSIONS
+                    .iter()
+                    .any(|excluded| normalized == *excluded))
         {
             continue;
         }
@@ -923,9 +928,13 @@ fn supported_fingerprint_body_encoding(value: &str) -> Option<&'static str> {
     }
 }
 
-fn read_decoded_body_with_limit(reader: &mut dyn Read, algo_name: &str) -> Result<Vec<u8>, String> {
-    let mut output = Vec::with_capacity(8192);
+fn decoded_body_digest_with_limit(
+    reader: &mut dyn Read,
+    algo_name: &str,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
+    let mut decoded_len = 0usize;
     loop {
         let n = reader
             .read(&mut buf)
@@ -933,54 +942,15 @@ fn read_decoded_body_with_limit(reader: &mut dyn Read, algo_name: &str) -> Resul
         if n == 0 {
             break;
         }
-        output.extend_from_slice(&buf[..n]);
-        if output.len() > MAX_CANONICAL_DECODED_BODY_BYTES {
+        decoded_len = decoded_len.saturating_add(n);
+        if decoded_len > MAX_CANONICAL_DECODED_BODY_BYTES {
             return Err(format!(
                 "{algo_name} decompressed body exceeds fingerprint limit"
             ));
         }
+        hasher.update(&buf[..n]);
     }
-    Ok(output)
-}
-
-fn canonical_body_for_fingerprint<'a>(
-    headers: &HashMap<String, String>,
-    body: &'a [u8],
-) -> (Cow<'a, [u8]>, Option<String>) {
-    let Some(content_encoding) = header_value_case_insensitive(headers, "content-encoding") else {
-        return (Cow::Borrowed(body), None);
-    };
-    let Some(encoding) = supported_fingerprint_body_encoding(content_encoding) else {
-        return (
-            Cow::Borrowed(body),
-            Some(content_encoding.trim().to_string()),
-        );
-    };
-
-    let decoded = match encoding {
-        "gzip" => {
-            let mut decoder = flate2::read::MultiGzDecoder::new(body);
-            read_decoded_body_with_limit(&mut decoder, "gzip")
-        }
-        "br" => {
-            let mut decoder = brotli::Decompressor::new(body, 4096);
-            read_decoded_body_with_limit(&mut decoder, "brotli")
-        }
-        _ => {
-            return (
-                Cow::Borrowed(body),
-                Some(content_encoding.trim().to_string()),
-            );
-        }
-    };
-
-    match decoded {
-        Ok(decoded) => (Cow::Owned(decoded), None),
-        Err(_) => (
-            Cow::Borrowed(body),
-            Some(content_encoding.trim().to_string()),
-        ),
-    }
+    Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
 fn request_body_digest(
@@ -1002,11 +972,29 @@ fn request_body_digest(
         None => &[],
     };
 
-    let (body, uncached_encoding) = canonical_body_for_fingerprint(headers, body);
+    if let Some(content_encoding) = header_value_case_insensitive(headers, "content-encoding")
+        && let Some(encoding) = supported_fingerprint_body_encoding(content_encoding)
+    {
+        let decoded = match encoding {
+            "gzip" => {
+                let mut decoder = flate2::read::MultiGzDecoder::new(body);
+                decoded_body_digest_with_limit(&mut decoder, "gzip")
+            }
+            "br" => {
+                let mut decoder = brotli::Decompressor::new(body, 4096);
+                decoded_body_digest_with_limit(&mut decoder, "brotli")
+            }
+            _ => Err("unsupported body encoding".to_string()),
+        };
+        if let Ok(digest) = decoded {
+            return Ok(digest);
+        }
+    }
+
     let mut hasher = Sha256::new();
-    hasher.update(body.as_ref());
-    if let Some(encoding) = uncached_encoding {
-        hash_framed(&mut hasher, "content_encoding", encoding.as_bytes());
+    hasher.update(body);
+    if let Some(encoding) = header_value_case_insensitive(headers, "content-encoding") {
+        hash_framed(&mut hasher, "content_encoding", encoding.trim().as_bytes());
     }
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
@@ -1175,8 +1163,7 @@ impl Plugin for RequestDeduplication {
         self.applicable_methods
             .iter()
             .any(|method| method.eq_ignore_ascii_case(&ctx.method))
-            && (header_value_case_insensitive(&ctx.headers, &self.header_name).is_some()
-                || request_declares_body(&ctx.headers))
+            && crate::proxy::request_may_have_body(&ctx.method, &ctx.headers)
     }
 
     async fn before_proxy(
