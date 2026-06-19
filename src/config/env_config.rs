@@ -957,6 +957,18 @@ pub struct EnvConfig {
     /// mesh-wide Istio resources such as root-namespace Sidecar defaults.
     /// Default: "istio-system".
     pub k8s_istio_root_namespace: String,
+    /// Namespace of the routable Ferrum Gateway API data-plane Service used
+    /// to gate Gateway `Programmed=True` on serving endpoint readiness.
+    /// Unset preserves legacy controller-only readiness behavior.
+    pub gateway_api_data_plane_service_namespace: Option<String>,
+    /// Name of the routable Ferrum Gateway API data-plane Service used to
+    /// gate Gateway `Programmed=True` on serving endpoint readiness.
+    /// Unset preserves legacy controller-only readiness behavior.
+    pub gateway_api_data_plane_service_name: Option<String>,
+    /// Address published into `Gateway.status.addresses[]` for Gateway API
+    /// request-path conformance clients. Unset leaves status addresses
+    /// untouched.
+    pub gateway_api_status_address: Option<String>,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -1763,6 +1775,9 @@ impl Default for EnvConfig {
             k8s_trust_domain: "cluster.local".to_string(),
             k8s_cluster_domain: "cluster.local".to_string(),
             k8s_istio_root_namespace: "istio-system".to_string(),
+            gateway_api_data_plane_service_namespace: None,
+            gateway_api_data_plane_service_name: None,
+            gateway_api_status_address: None,
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -2116,6 +2131,9 @@ impl EnvConfig {
             k8s_trust_domain: String = "FERRUM_K8S_TRUST_DOMAIN" => "cluster.local".to_string();
             k8s_cluster_domain: String = "FERRUM_K8S_CLUSTER_DOMAIN" => "cluster.local".to_string();
             k8s_istio_root_namespace: String = "FERRUM_K8S_ISTIO_ROOT_NAMESPACE" => "istio-system".to_string();
+            gateway_api_data_plane_service_namespace: Option<String> = "FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAMESPACE";
+            gateway_api_data_plane_service_name: Option<String> = "FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAME";
+            gateway_api_status_address: Option<String> = "FERRUM_GATEWAY_API_STATUS_ADDRESS";
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -2715,6 +2733,9 @@ impl EnvConfig {
             k8s_trust_domain,
             k8s_cluster_domain,
             k8s_istio_root_namespace,
+            gateway_api_data_plane_service_namespace,
+            gateway_api_data_plane_service_name,
+            gateway_api_status_address,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,

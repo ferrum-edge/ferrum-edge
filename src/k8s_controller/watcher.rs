@@ -215,6 +215,24 @@ pub const K8S_CORE_RESOURCES: &[CoreResourceSpec] = &[
     },
 ];
 
+pub const K8S_NAMESPACE_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
+    group: "",
+    version: "v1",
+    kind: "Namespace",
+    plural: "namespaces",
+    namespaced: false,
+    field_selector: None,
+}];
+
+pub const GATEWAY_API_CORE_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
+    group: "",
+    version: "v1",
+    kind: "Secret",
+    plural: "secrets",
+    namespaced: true,
+    field_selector: None,
+}];
+
 pub const K8S_NODE_LOCALITY_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
     group: "",
     version: "v1",
@@ -508,6 +526,18 @@ pub async fn start_crd_watchers(
         core_watch_plan.extend(
             selected_core_resources(selection.watch_node_locality)
                 .into_iter()
+                .map(|resource| (resource, namespaces.clone())),
+        );
+    }
+    if selection.watch_gateway_api {
+        core_watch_plan.extend(
+            K8S_NAMESPACE_RESOURCES
+                .iter()
+                .map(|resource| (resource, Vec::new())),
+        );
+        core_watch_plan.extend(
+            GATEWAY_API_CORE_RESOURCES
+                .iter()
                 .map(|resource| (resource, namespaces.clone())),
         );
     }
@@ -806,6 +836,17 @@ mod tests {
 
         assert!(!gateway_class.namespaced);
         assert_eq!(gateway_class.plural, "gatewayclasses");
+    }
+
+    #[test]
+    fn gateway_api_core_resources_include_secrets_for_certificate_refs() {
+        let secret = GATEWAY_API_CORE_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == "Secret")
+            .expect("Secret watcher spec");
+
+        assert!(secret.namespaced);
+        assert_eq!(secret.plural, "secrets");
     }
 
     #[test]

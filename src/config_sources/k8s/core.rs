@@ -78,11 +78,14 @@ struct CoreEndpoint {
 }
 
 pub(super) fn is_core_resource_kind(kind: &str) -> bool {
-    matches!(kind, "Pod" | "Service" | "EndpointSlice" | "Node")
+    matches!(
+        kind,
+        "Pod" | "Service" | "EndpointSlice" | "Node" | "Namespace" | "Secret"
+    )
 }
 
 pub(super) fn is_cluster_scoped_core_resource_kind(kind: &str) -> bool {
-    matches!(kind, "Node")
+    matches!(kind, "Node" | "Namespace")
 }
 
 pub(super) fn collect(

@@ -18,6 +18,11 @@ rules:
       - tcproutes
       - referencegrants
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources:
+      - namespaces
+      - secrets
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       - gatewayclasses/status

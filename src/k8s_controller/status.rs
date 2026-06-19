@@ -21,6 +21,23 @@ pub struct GatewayApiStatusUpdate {
     pub namespace: String,
     pub name: String,
     pub status: Value,
+    pub patch_gateway_addresses: bool,
+    pub patch_gateway_listeners: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayApiStatusContext {
+    pub data_plane_ready: bool,
+    pub status_address: Option<String>,
+}
+
+impl Default for GatewayApiStatusContext {
+    fn default() -> Self {
+        Self {
+            data_plane_ready: true,
+            status_address: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -127,6 +144,20 @@ pub fn plan_gateway_api_status_updates(
     options: K8sTranslationOptions,
     route_conflicts: &[GatewayApiRouteConflict],
 ) -> Vec<GatewayApiStatusUpdate> {
+    plan_gateway_api_status_updates_with_context(
+        objects,
+        options,
+        route_conflicts,
+        GatewayApiStatusContext::default(),
+    )
+}
+
+pub fn plan_gateway_api_status_updates_with_context(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    route_conflicts: &[GatewayApiRouteConflict],
+    status_context: GatewayApiStatusContext,
+) -> Vec<GatewayApiStatusUpdate> {
     objects
         .iter()
         .filter(|object| is_status_kind(&object.kind))
@@ -164,6 +195,7 @@ pub fn plan_gateway_api_status_updates(
                 objects,
                 object,
                 options.clone(),
+                &status_context,
                 &object_conflicts,
                 &route_keys,
                 &managed_parent_refs,
@@ -177,6 +209,9 @@ pub fn plan_gateway_api_status_updates(
                 namespace: object.metadata.namespace.clone(),
                 name: object.metadata.name.clone(),
                 status,
+                patch_gateway_addresses: object.kind == "Gateway"
+                    && status_context.status_address.is_some(),
+                patch_gateway_listeners: object.kind == "Gateway",
             })
         })
         .collect()
@@ -186,6 +221,7 @@ fn desired_status_for_object(
     objects: &[K8sObject],
     object: &K8sObject,
     options: K8sTranslationOptions,
+    status_context: &GatewayApiStatusContext,
     route_conflicts: &[&GatewayApiRouteConflict],
     route_keys: &[GatewayApiRouteConflictKey],
     managed_parent_refs: &[Value],
@@ -197,12 +233,15 @@ fn desired_status_for_object(
     let result = translate_k8s_objects_with_filter(objects, options, |candidate| {
         same_resource(candidate, object)
             || candidate.kind == "ReferenceGrant"
+            || candidate.kind == "Gateway"
+            || candidate.kind == "Namespace"
             || candidate.kind == "Service"
     });
 
     match object.kind.as_str() {
-        "Gateway" => gateway_status(object, result.as_ref()),
+        "Gateway" => gateway_status(objects, object, result.as_ref(), status_context),
         "HTTPRoute" | "GRPCRoute" => route_status(
+            objects,
             object,
             result.as_ref(),
             managed_parent_refs,
@@ -238,21 +277,215 @@ fn gateway_class_status(object: &K8sObject) -> Value {
     status
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ListenerReferenceStatus {
+    resolved: bool,
+    reason: &'static str,
+    message: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct ListenerRouteKindStatus {
+    protocol_supported: bool,
+    route_kinds_valid: bool,
+    supported_kinds: Vec<Value>,
+}
+
+impl ListenerReferenceStatus {
+    const RESOLVED: Self = Self {
+        resolved: true,
+        reason: "ResolvedRefs",
+        message: "All listener references accepted by Ferrum",
+    };
+
+    const REF_NOT_PERMITTED: Self = Self {
+        resolved: false,
+        reason: "RefNotPermitted",
+        message: "Ferrum could not resolve this listener because a cross-namespace reference is not permitted",
+    };
+
+    const INVALID_CERTIFICATE_REF: Self = Self {
+        resolved: false,
+        reason: "InvalidCertificateRef",
+        message: "Ferrum could not resolve this listener certificateRef",
+    };
+}
+
+fn gateway_reference_status(objects: &[K8sObject], gateway: &K8sObject) -> ListenerReferenceStatus {
+    gateway
+        .spec
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|listener| listener_reference_status(objects, gateway, listener))
+        .find(|status| !status.resolved)
+        .unwrap_or(ListenerReferenceStatus::RESOLVED)
+}
+
+fn listener_reference_status(
+    objects: &[K8sObject],
+    gateway: &K8sObject,
+    listener: &Value,
+) -> ListenerReferenceStatus {
+    let Some(certificate_refs) = listener
+        .get("tls")
+        .and_then(|tls| tls.get("certificateRefs"))
+        .and_then(Value::as_array)
+    else {
+        return ListenerReferenceStatus::RESOLVED;
+    };
+
+    for certificate_ref in certificate_refs {
+        let group = certificate_ref
+            .get("group")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let kind = certificate_ref
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("Secret");
+        let Some(name) = certificate_ref.get("name").and_then(Value::as_str) else {
+            return ListenerReferenceStatus::INVALID_CERTIFICATE_REF;
+        };
+        if !group.is_empty() || kind != "Secret" {
+            return ListenerReferenceStatus::INVALID_CERTIFICATE_REF;
+        }
+        let namespace = certificate_ref
+            .get("namespace")
+            .and_then(Value::as_str)
+            .unwrap_or(&gateway.metadata.namespace);
+        if namespace != gateway.metadata.namespace
+            && !reference_grant_allows_secret(objects, &gateway.metadata.namespace, namespace, name)
+        {
+            return ListenerReferenceStatus::REF_NOT_PERMITTED;
+        }
+        let Some(secret) = objects.iter().find(|object| {
+            object.kind == "Secret"
+                && object.metadata.namespace == namespace
+                && object.metadata.name == name
+        }) else {
+            return ListenerReferenceStatus::INVALID_CERTIFICATE_REF;
+        };
+        if !secret_is_valid_tls_certificate(secret) {
+            return ListenerReferenceStatus::INVALID_CERTIFICATE_REF;
+        }
+    }
+
+    ListenerReferenceStatus::RESOLVED
+}
+
+fn reference_grant_allows_secret(
+    objects: &[K8sObject],
+    from_namespace: &str,
+    to_namespace: &str,
+    secret_name: &str,
+) -> bool {
+    objects
+        .iter()
+        .filter(|object| {
+            object.kind == "ReferenceGrant" && object.metadata.namespace == to_namespace
+        })
+        .any(|grant| {
+            reference_grant_has_from(grant, from_namespace)
+                && reference_grant_has_secret_to(grant, secret_name)
+        })
+}
+
+fn reference_grant_has_from(grant: &K8sObject, from_namespace: &str) -> bool {
+    grant
+        .spec
+        .get("from")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|from| {
+            from.get("group")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                == "gateway.networking.k8s.io"
+                && from.get("kind").and_then(Value::as_str) == Some("Gateway")
+                && from.get("namespace").and_then(Value::as_str) == Some(from_namespace)
+        })
+}
+
+fn reference_grant_has_secret_to(grant: &K8sObject, secret_name: &str) -> bool {
+    grant
+        .spec
+        .get("to")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|to| {
+            to.get("group").and_then(Value::as_str).unwrap_or_default() == ""
+                && to.get("kind").and_then(Value::as_str) == Some("Secret")
+                && to
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| name == secret_name)
+        })
+}
+
+fn secret_is_valid_tls_certificate(secret: &K8sObject) -> bool {
+    if secret.spec.get("type").and_then(Value::as_str) != Some("kubernetes.io/tls") {
+        return false;
+    }
+    let Some(data) = secret.spec.get("data").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(cert) = data.get("tls.crt").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(key) = data.get("tls.key").and_then(Value::as_str) else {
+        return false;
+    };
+    secret_data_decodes_to_certificate_pem(cert) && secret_data_decodes_to_private_key_pem(key)
+}
+
+fn secret_data_decodes_to_certificate_pem(value: &str) -> bool {
+    secret_data_decodes_to_utf8(value, |pem| pem.contains("-----BEGIN CERTIFICATE-----"))
+}
+
+fn secret_data_decodes_to_private_key_pem(value: &str) -> bool {
+    secret_data_decodes_to_utf8(value, |pem| {
+        pem.contains("-----BEGIN ") && pem.contains("PRIVATE KEY-----")
+    })
+}
+
+fn secret_data_decodes_to_utf8(value: &str, predicate: impl FnOnce(&str) -> bool) -> bool {
+    use base64::Engine as _;
+
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(value) else {
+        return false;
+    };
+    let Ok(pem) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    predicate(pem)
+}
+
 fn gateway_status(
+    objects: &[K8sObject],
     object: &K8sObject,
     result: Result<&crate::config_sources::k8s::K8sTranslation, &K8sTranslateError>,
+    status_context: &GatewayApiStatusContext,
 ) -> Value {
-    let (accepted, programmed, message) = match result {
-        Ok(translation) => (
-            true,
-            gateway_programmed(object, &translation.config),
-            "Ferrum accepted this Gateway".to_string(),
-        ),
-        Err(error) => (
-            false,
-            false,
-            format!("Ferrum rejected this Gateway: {error}"),
-        ),
+    let references = gateway_reference_status(objects, object);
+    let (accepted, materialized, resolved_refs, programmed, message) = match result {
+        Ok(translation) => {
+            let materialized = gateway_programmed(object, &translation.config);
+            (
+                true,
+                materialized,
+                references.resolved,
+                materialized && status_context.data_plane_ready && references.resolved,
+                "Ferrum accepted this Gateway".to_string(),
+            )
+        }
+        Err(error) => {
+            let message = format!("Ferrum rejected this Gateway: {error}");
+            (false, false, false, false, message)
+        }
     };
 
     let conditions = vec![
@@ -268,14 +501,18 @@ fn gateway_status(
             object,
             &object.status,
             "ResolvedRefs",
-            accepted,
-            if accepted {
+            accepted && resolved_refs,
+            if accepted && resolved_refs {
                 "ResolvedRefs"
+            } else if accepted {
+                references.reason
             } else {
                 "TranslationFailed"
             },
-            if accepted {
+            if accepted && resolved_refs {
                 "All Gateway references accepted by Ferrum"
+            } else if accepted {
+                references.message
             } else {
                 &message
             },
@@ -287,6 +524,10 @@ fn gateway_status(
             programmed,
             if programmed {
                 "Programmed"
+            } else if accepted && materialized && !resolved_refs {
+                references.reason
+            } else if accepted && materialized {
+                "DataPlaneNotReady"
             } else if accepted {
                 "NoListeners"
             } else {
@@ -294,6 +535,10 @@ fn gateway_status(
             },
             if programmed {
                 "Ferrum programmed this Gateway"
+            } else if accepted && materialized && !resolved_refs {
+                references.message
+            } else if accepted && materialized {
+                "Ferrum accepted this Gateway, but the serving Ferrum data plane is not ready"
             } else if accepted {
                 "Ferrum accepted this Gateway but found no materialized listeners"
             } else {
@@ -316,7 +561,373 @@ fn gateway_status(
         &["Accepted", "ResolvedRefs", "Programmed", "Conflicted"],
         conditions,
     );
+    if let Some(address) = status_context.status_address.as_deref() {
+        ensure_status_object(&mut status).insert(
+            "addresses".to_string(),
+            Value::Array(vec![gateway_status_address(address)]),
+        );
+    }
+    ensure_status_object(&mut status).insert(
+        "listeners".to_string(),
+        Value::Array(gateway_listener_statuses(
+            objects, object, accepted, programmed,
+        )),
+    );
     status
+}
+
+fn gateway_status_address(address: &str) -> Value {
+    let address_type = if address.parse::<std::net::IpAddr>().is_ok() {
+        "IPAddress"
+    } else {
+        "Hostname"
+    };
+    json!({
+        "type": address_type,
+        "value": address,
+    })
+}
+
+fn gateway_listener_statuses(
+    objects: &[K8sObject],
+    gateway: &K8sObject,
+    gateway_accepted: bool,
+    gateway_programmed: bool,
+) -> Vec<Value> {
+    gateway
+        .spec
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|listener| {
+            let references = listener_reference_status(objects, gateway, listener);
+            let listener_name = listener
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("listener");
+            let protocol = listener
+                .get("protocol")
+                .and_then(Value::as_str)
+                .unwrap_or("HTTP");
+            let route_kinds = listener_route_kind_status(protocol, listener);
+            let accepted = gateway_accepted && route_kinds.protocol_supported;
+            let resolved_refs = accepted && references.resolved && route_kinds.route_kinds_valid;
+            let unresolved_reason = if !route_kinds.route_kinds_valid {
+                "InvalidRouteKinds"
+            } else {
+                references.reason
+            };
+            let unresolved_message = if !route_kinds.route_kinds_valid {
+                "Listener allowedRoutes.kinds contains route kinds Ferrum does not support for this listener protocol"
+            } else {
+                references.message
+            };
+            let conditions = vec![
+                condition(
+                    gateway,
+                    &gateway.status,
+                    "Accepted",
+                    accepted,
+                    if accepted {
+                        "Accepted"
+                    } else {
+                        "UnsupportedProtocol"
+                    },
+                    if accepted {
+                        "Ferrum accepted this listener"
+                    } else {
+                        "Ferrum does not support this listener protocol"
+                    },
+                ),
+                condition(
+                    gateway,
+                    &gateway.status,
+                    "ResolvedRefs",
+                    resolved_refs,
+                    if resolved_refs {
+                        "ResolvedRefs"
+                    } else if accepted {
+                        unresolved_reason
+                    } else {
+                        "UnsupportedProtocol"
+                    },
+                    if resolved_refs {
+                        "All listener references accepted by Ferrum"
+                    } else if accepted {
+                        unresolved_message
+                    } else {
+                        "Ferrum could not resolve this listener"
+                    },
+                ),
+                condition(
+                    gateway,
+                    &gateway.status,
+                    "Programmed",
+                    gateway_programmed && resolved_refs,
+                    if gateway_programmed && resolved_refs {
+                        "Programmed"
+                    } else if accepted && !resolved_refs {
+                        unresolved_reason
+                    } else if accepted {
+                        "DataPlaneNotReady"
+                    } else {
+                        "UnsupportedProtocol"
+                    },
+                    if gateway_programmed && resolved_refs {
+                        "Ferrum programmed this listener"
+                    } else if accepted && !resolved_refs {
+                        unresolved_message
+                    } else if accepted {
+                        "Ferrum accepted this listener, but the serving Ferrum data plane is not ready"
+                    } else {
+                        "Ferrum did not program this listener"
+                    },
+                ),
+                condition(
+                    gateway,
+                    &gateway.status,
+                    "Conflicted",
+                    false,
+                    "NoConflicts",
+                    "No Gateway API listener conflicts detected by Ferrum",
+                ),
+            ];
+            json!({
+                "name": listener_name,
+                "attachedRoutes": attached_route_count(objects, gateway, listener),
+                "supportedKinds": route_kinds.supported_kinds,
+                "conditions": conditions,
+            })
+        })
+        .collect()
+}
+
+fn listener_route_kind_status(protocol: &str, listener: &Value) -> ListenerRouteKindStatus {
+    let Some(protocol_kind) = listener_protocol_route_kind(protocol) else {
+        return ListenerRouteKindStatus {
+            protocol_supported: false,
+            route_kinds_valid: false,
+            supported_kinds: Vec::new(),
+        };
+    };
+
+    let protocol_supported_kind = route_group_kind(protocol_kind);
+    let Some(kinds) = listener
+        .get("allowedRoutes")
+        .and_then(|allowed_routes| allowed_routes.get("kinds"))
+        .and_then(Value::as_array)
+    else {
+        return ListenerRouteKindStatus {
+            protocol_supported: true,
+            route_kinds_valid: true,
+            supported_kinds: vec![protocol_supported_kind],
+        };
+    };
+
+    let mut route_kinds_valid = true;
+    let mut saw_supported = false;
+    for kind in kinds {
+        if listener_allowed_route_kind_matches_protocol(kind, protocol_kind) {
+            saw_supported = true;
+        } else {
+            route_kinds_valid = false;
+        }
+    }
+
+    ListenerRouteKindStatus {
+        protocol_supported: true,
+        route_kinds_valid,
+        supported_kinds: if saw_supported {
+            vec![protocol_supported_kind]
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+fn listener_protocol_route_kind(protocol: &str) -> Option<&'static str> {
+    let kind = match protocol.to_ascii_uppercase().as_str() {
+        "HTTP" | "HTTPS" => "HTTPRoute",
+        "GRPC" | "GRPCS" => "GRPCRoute",
+        "TCP" => "TCPRoute",
+        "TLS" => "TLSRoute",
+        _ => return None,
+    };
+    Some(kind)
+}
+
+fn route_group_kind(kind: &str) -> Value {
+    json!({
+        "group": "gateway.networking.k8s.io",
+        "kind": kind,
+    })
+}
+
+fn listener_allowed_route_kind_matches_protocol(kind: &Value, protocol_kind: &str) -> bool {
+    let group = kind
+        .get("group")
+        .and_then(Value::as_str)
+        .unwrap_or("gateway.networking.k8s.io");
+    let Some(kind) = kind.get("kind").and_then(Value::as_str) else {
+        return false;
+    };
+    group == "gateway.networking.k8s.io" && kind == protocol_kind
+}
+
+fn attached_route_count(objects: &[K8sObject], gateway: &K8sObject, listener: &Value) -> usize {
+    objects
+        .iter()
+        .filter(|object| matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute"))
+        .filter(|route| {
+            route_parent_refs(route).into_iter().any(|parent_ref| {
+                parent_ref_targets_gateway(route, &parent_ref, gateway)
+                    && parent_ref_matches_listener(&parent_ref, listener)
+                    && route_allowed_by_listener(objects, route, gateway, listener)
+                    && route_kind_allowed_by_listener(route, listener)
+                    && route_intersects_listener_hostname(route, listener)
+            })
+        })
+        .count()
+}
+
+fn route_kind_allowed_by_listener(route: &K8sObject, listener: &Value) -> bool {
+    let Some(protocol_kind) = listener_protocol_route_kind(
+        listener
+            .get("protocol")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    ) else {
+        return false;
+    };
+    if protocol_kind != route.kind {
+        return false;
+    }
+    let Some(kinds) = listener
+        .get("allowedRoutes")
+        .and_then(|allowed_routes| allowed_routes.get("kinds"))
+        .and_then(Value::as_array)
+    else {
+        return true;
+    };
+    kinds
+        .iter()
+        .any(|kind| listener_allowed_route_kind_matches_protocol(kind, protocol_kind))
+}
+
+fn route_allowed_by_listener(
+    objects: &[K8sObject],
+    route: &K8sObject,
+    gateway: &K8sObject,
+    listener: &Value,
+) -> bool {
+    let Some(namespaces) = listener
+        .get("allowedRoutes")
+        .and_then(|allowed_routes| allowed_routes.get("namespaces"))
+    else {
+        return route.metadata.namespace == gateway.metadata.namespace;
+    };
+    match namespaces
+        .get("from")
+        .and_then(Value::as_str)
+        .unwrap_or("Same")
+    {
+        "All" => true,
+        "Selector" => namespace_matches_selector(objects, &route.metadata.namespace, namespaces),
+        _ => route.metadata.namespace == gateway.metadata.namespace,
+    }
+}
+
+fn namespace_matches_selector(objects: &[K8sObject], namespace: &str, namespaces: &Value) -> bool {
+    let Some(match_labels) = namespaces
+        .get("selector")
+        .and_then(|selector| selector.get("matchLabels"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(namespace_object) = objects
+        .iter()
+        .find(|object| object.kind == "Namespace" && object.metadata.name == namespace)
+    else {
+        return false;
+    };
+    match_labels.iter().all(|(key, value)| {
+        value.as_str().is_some_and(|expected| {
+            namespace_object
+                .metadata
+                .labels
+                .get(key)
+                .is_some_and(|actual| actual == expected)
+        })
+    })
+}
+
+fn route_intersects_listener_hostname(route: &K8sObject, listener: &Value) -> bool {
+    let Some(listener_hostname) = listener
+        .get("hostname")
+        .and_then(Value::as_str)
+        .map(normalize_hostname)
+    else {
+        return true;
+    };
+    route_hostnames(route).into_iter().any(|route_hostname| {
+        hostnames_intersect(route_hostname.as_str(), listener_hostname.as_str())
+    })
+}
+
+fn route_hostnames(route: &K8sObject) -> Vec<String> {
+    let hostnames: Vec<String> = route
+        .spec
+        .get("hostnames")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(normalize_hostname)
+        .collect();
+    if hostnames.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        hostnames
+    }
+}
+
+fn normalize_hostname(hostname: &str) -> String {
+    hostname.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn hostnames_intersect(route_hostname: &str, listener_hostname: &str) -> bool {
+    if route_hostname == "*" || listener_hostname == "*" {
+        return true;
+    }
+    match (
+        wildcard_hostname_suffix(route_hostname),
+        wildcard_hostname_suffix(listener_hostname),
+    ) {
+        (None, None) => route_hostname == listener_hostname,
+        (Some(route_suffix), None) => hostname_matches_wildcard(listener_hostname, route_suffix),
+        (None, Some(listener_suffix)) => hostname_matches_wildcard(route_hostname, listener_suffix),
+        (Some(route_suffix), Some(listener_suffix)) => {
+            route_suffix == listener_suffix
+                || suffix_is_within(route_suffix, listener_suffix)
+                || suffix_is_within(listener_suffix, route_suffix)
+        }
+    }
+}
+
+fn wildcard_hostname_suffix(hostname: &str) -> Option<&str> {
+    hostname.strip_prefix("*.")
+}
+
+fn hostname_matches_wildcard(hostname: &str, suffix: &str) -> bool {
+    hostname != suffix && suffix_is_within(hostname, suffix)
+}
+
+fn suffix_is_within(hostname: &str, suffix: &str) -> bool {
+    hostname
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 fn route_conflict_message(conflict: &GatewayApiRouteConflict) -> String {
@@ -363,6 +974,7 @@ fn merge_status_conditions(status: &mut Value, owned_types: &[&str], desired: Ve
 }
 
 fn route_status(
+    objects: &[K8sObject],
     object: &K8sObject,
     result: Result<&crate::config_sources::k8s::K8sTranslation, &K8sTranslateError>,
     managed_parent_refs: &[Value],
@@ -389,12 +1001,13 @@ fn route_status(
             }
             Err(error) => {
                 if error_is_reference_resolution(error) {
+                    let resolved_refs_reason = reference_resolution_reason(error);
                     (
                         true,
                         false,
                         false,
                         "Accepted",
-                        "RefNotPermitted",
+                        resolved_refs_reason,
                         format!(
                             "Ferrum accepted this route but could not resolve all backendRefs: {error}"
                         ),
@@ -405,6 +1018,15 @@ fn route_status(
                         true,
                         false,
                         "NotAllowedByListeners",
+                        "ResolvedRefs",
+                        format!("Ferrum rejected this route attachment: {error}"),
+                    )
+                } else if error_is_parent_ref_no_matching(error) {
+                    (
+                        false,
+                        true,
+                        false,
+                        "NoMatchingParent",
                         "ResolvedRefs",
                         format!("Ferrum rejected this route attachment: {error}"),
                     )
@@ -447,22 +1069,45 @@ fn route_status(
         let conflict_message = parent_conflicts
             .first()
             .map(|conflict| route_conflict_message(conflict));
-        let accepted_for_parent = accepted && !all_parent_matches_conflicted;
+        let no_matching_parent =
+            accepted && !route_parent_ref_has_matching_parent(objects, object, parent_ref);
+        let no_matching_listener_hostname = accepted
+            && !no_matching_parent
+            && !route_parent_ref_has_matching_listener(objects, object, parent_ref);
+        let accepted_for_parent = accepted
+            && !all_parent_matches_conflicted
+            && !no_matching_parent
+            && !no_matching_listener_hostname;
         let accepted_reason = if all_parent_matches_conflicted {
             "Conflicted"
+        } else if no_matching_parent {
+            "NoMatchingParent"
+        } else if no_matching_listener_hostname {
+            "NoMatchingListenerHostname"
         } else {
             accepted_reason
         };
         let accepted_message = if all_parent_matches_conflicted {
             conflict_message.as_deref().unwrap_or(&message)
+        } else if no_matching_parent {
+            "Ferrum rejected this route attachment because no matching parent listener was found"
+        } else if no_matching_listener_hostname {
+            "Ferrum rejected this route attachment because no matching listener hostname was found"
         } else {
             &message
         };
-        let programmed_for_parent = programmed && !all_parent_matches_conflicted;
+        let programmed_for_parent = programmed
+            && !all_parent_matches_conflicted
+            && !no_matching_parent
+            && !no_matching_listener_hostname;
         let programmed_reason = if programmed_for_parent {
             "Programmed"
         } else if all_parent_matches_conflicted {
             "Conflicted"
+        } else if no_matching_parent {
+            "NoMatchingParent"
+        } else if no_matching_listener_hostname {
+            "NoMatchingListenerHostname"
         } else if !resolved_refs {
             resolved_refs_reason
         } else if accepted_for_parent {
@@ -474,6 +1119,8 @@ fn route_status(
             "Ferrum programmed this route"
         } else if all_parent_matches_conflicted {
             conflict_message.as_deref().unwrap_or(&message)
+        } else if no_matching_listener_hostname {
+            "Ferrum did not program this route because no matching listener hostname was found"
         } else {
             &message
         };
@@ -554,6 +1201,18 @@ fn status_patch_for_update(update: &GatewayApiStatusUpdate, live_status: Option<
             };
             let merged_conditions = merge_condition_entries(condition_source, desired_conditions);
             status_patch.insert("conditions".to_string(), Value::Array(merged_conditions));
+            if update.kind == "Gateway" {
+                if update.patch_gateway_addresses
+                    && let Some(addresses) = update.status.get("addresses").cloned()
+                {
+                    status_patch.insert("addresses".to_string(), addresses);
+                }
+                if update.patch_gateway_listeners
+                    && let Some(listeners) = update.status.get("listeners").cloned()
+                {
+                    status_patch.insert("listeners".to_string(), listeners);
+                }
+            }
         }
         "HTTPRoute" | "GRPCRoute" => {
             status_patch.insert(
@@ -894,6 +1553,139 @@ fn parent_ref_targets_managed_gateway(
     })
 }
 
+fn parent_ref_targets_gateway(route: &K8sObject, parent_ref: &Value, gateway: &K8sObject) -> bool {
+    let group = parent_ref
+        .get("group")
+        .and_then(Value::as_str)
+        .unwrap_or("gateway.networking.k8s.io");
+    let kind = parent_ref
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("Gateway");
+    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    if group != "gateway.networking.k8s.io" || kind != "Gateway" {
+        return false;
+    }
+    let namespace = parent_ref
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(&route.metadata.namespace);
+    namespace == gateway.metadata.namespace && name == gateway.metadata.name
+}
+
+fn route_parent_ref_has_matching_listener(
+    objects: &[K8sObject],
+    route: &K8sObject,
+    parent_ref: &Value,
+) -> bool {
+    let Some(gateway) = objects.iter().find(|object| {
+        object.kind == "Gateway" && parent_ref_targets_gateway(route, parent_ref, object)
+    }) else {
+        return true;
+    };
+    gateway
+        .spec
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|listener| {
+            route_kind_allowed_by_listener(route, listener)
+                && parent_ref_matches_listener(parent_ref, listener)
+                && route_allowed_by_listener(objects, route, gateway, listener)
+                && route_intersects_listener_hostname(route, listener)
+        })
+}
+
+fn route_parent_ref_has_matching_parent(
+    objects: &[K8sObject],
+    route: &K8sObject,
+    parent_ref: &Value,
+) -> bool {
+    let Some(gateway) = objects.iter().find(|object| {
+        object.kind == "Gateway" && parent_ref_targets_gateway(route, parent_ref, object)
+    }) else {
+        return false;
+    };
+    gateway
+        .spec
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|listener| {
+            route_kind_allowed_by_listener(route, listener)
+                && parent_ref_matches_listener(parent_ref, listener)
+                && route_allowed_by_listener(objects, route, gateway, listener)
+        })
+}
+
+fn parent_ref_matches_listener(parent_ref: &Value, listener: &Value) -> bool {
+    if let Some(section_name) = parent_ref.get("sectionName").and_then(Value::as_str) {
+        let listener_name = listener
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("listener");
+        if section_name != listener_name {
+            return false;
+        }
+    }
+    if let Some(parent_port) = parent_ref.get("port").and_then(Value::as_u64)
+        && listener.get("port").and_then(Value::as_u64) != Some(parent_port)
+    {
+        return false;
+    }
+    true
+}
+
+pub fn gateway_api_data_plane_service_ready(
+    objects: &[K8sObject],
+    namespace: &str,
+    name: &str,
+) -> bool {
+    objects.iter().any(|object| {
+        object.kind == "EndpointSlice"
+            && object.metadata.namespace == namespace
+            && object
+                .metadata
+                .labels
+                .get("kubernetes.io/service-name")
+                .is_some_and(|service_name| service_name == name)
+            && endpoint_slice_has_ready_endpoint(object)
+    })
+}
+
+fn endpoint_slice_has_ready_endpoint(object: &K8sObject) -> bool {
+    object
+        .spec
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(endpoint_ready)
+}
+
+fn endpoint_ready(endpoint: &Value) -> bool {
+    let Some(conditions) = endpoint.get("conditions") else {
+        return true;
+    };
+    if conditions
+        .get("terminating")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let ready = conditions.get("ready").and_then(Value::as_bool);
+    let serving = conditions
+        .get("serving")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| ready.unwrap_or(true));
+    ready.unwrap_or(true) && serving
+}
+
 fn route_parent_ref_key(route: &K8sObject, parent_ref: &Value) -> String {
     let group = parent_ref
         .get("group")
@@ -969,9 +1761,6 @@ fn route_programmed(object: &K8sObject, config: &crate::config::types::GatewayCo
         )
     );
     config.proxies.iter().any(|proxy| {
-        if proxy.namespace != object.metadata.namespace {
-            return false;
-        }
         let Some(remainder) = proxy.id.strip_prefix(&prefix) else {
             return false;
         };
@@ -985,9 +1774,27 @@ fn route_programmed(object: &K8sObject, config: &crate::config::types::GatewayCo
 fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
     match error {
         K8sTranslateError::InvalidResource { message, .. } => {
-            message.contains("ReferenceGrant") || message.contains("only core Service")
+            message.contains("ReferenceGrant")
+                || message.contains("only core Service")
+                || message.contains("backendRef Service")
         }
         K8sTranslateError::Unsupported(_) => false,
+    }
+}
+
+fn reference_resolution_reason(error: &K8sTranslateError) -> &'static str {
+    match error {
+        K8sTranslateError::InvalidResource { message, .. }
+            if message.contains("backendRef Service") =>
+        {
+            "BackendNotFound"
+        }
+        K8sTranslateError::InvalidResource { message, .. }
+            if message.contains("only core Service") =>
+        {
+            "InvalidKind"
+        }
+        _ => "RefNotPermitted",
     }
 }
 
@@ -995,7 +1802,17 @@ fn error_is_parent_ref_not_allowed(error: &K8sTranslateError) -> bool {
     match error {
         K8sTranslateError::InvalidResource { message, .. } => {
             message.contains("parentRef.namespace")
-                && message.contains("only same-namespace Gateway attachments are accepted")
+                && message.contains("not permitted by the target Gateway listener")
+        }
+        K8sTranslateError::Unsupported(_) => false,
+    }
+}
+
+fn error_is_parent_ref_no_matching(error: &K8sTranslateError) -> bool {
+    match error {
+        K8sTranslateError::InvalidResource { message, .. } => {
+            message.contains("parentRef")
+                && message.contains("does not match any known Gateway listener")
         }
         K8sTranslateError::Unsupported(_) => false,
     }
@@ -1062,6 +1879,15 @@ mod tests {
     ) -> Vec<GatewayApiStatusUpdate> {
         let conflicts = gateway_api_route_conflicts(objects, &options);
         plan_gateway_api_status_updates(objects, options, &conflicts)
+    }
+
+    fn plan_status_updates_with_context(
+        objects: &[K8sObject],
+        options: K8sTranslationOptions,
+        status_context: GatewayApiStatusContext,
+    ) -> Vec<GatewayApiStatusUpdate> {
+        let conflicts = gateway_api_route_conflicts(objects, &options);
+        plan_gateway_api_status_updates_with_context(objects, options, &conflicts, status_context)
     }
 
     fn object(kind: &str, name: &str, spec: Value) -> K8sObject {
@@ -1134,6 +1960,8 @@ mod tests {
                 namespace: "default".to_string(),
                 name: "example".to_string(),
                 status: json!({}),
+                patch_gateway_addresses: false,
+                patch_gateway_listeners: false,
             };
 
             let resource = api_resource_for_update(&update)
@@ -1257,6 +2085,380 @@ mod tests {
         assert_condition(conditions, "ResolvedRefs", "True");
         assert_condition(conditions, "Programmed", "True");
         assert_condition(conditions, "Conflicted", "False");
+    }
+
+    #[test]
+    fn gateway_status_waits_for_ready_data_plane_before_programmed_true() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+
+        let updates = plan_status_updates_with_context(
+            &[gateway_class, gateway],
+            options(),
+            GatewayApiStatusContext {
+                data_plane_ready: false,
+                status_address: Some("127.0.0.1".to_string()),
+            },
+        );
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let conditions = gateway_update.status["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Programmed", "False");
+        assert_eq!(
+            find_condition(conditions, "Programmed")["reason"].as_str(),
+            Some("DataPlaneNotReady")
+        );
+        assert_eq!(
+            gateway_update.status["addresses"],
+            json!([{"type": "IPAddress", "value": "127.0.0.1"}])
+        );
+    }
+
+    #[test]
+    fn gateway_listener_status_reports_invalid_route_kinds() {
+        let gateway_class = ferrum_gateway_class();
+        let only_invalid = object(
+            "Gateway",
+            "gateway-only-invalid-route-kind",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": { "from": "All" },
+                        "kinds": [{ "kind": "InvalidRoute" }]
+                    }
+                }]
+            }),
+        );
+        let mixed = object(
+            "Gateway",
+            "gateway-supported-and-invalid-route-kind",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": { "from": "All" },
+                        "kinds": [{ "kind": "InvalidRoute" }, { "kind": "HTTPRoute" }]
+                    }
+                }]
+            }),
+        );
+
+        let updates = plan_status_updates(&[gateway_class, only_invalid, mixed], options());
+
+        let only_invalid_update =
+            update_for(&updates, "Gateway", "gateway-only-invalid-route-kind");
+        let only_invalid_listener = listener_status_by_name(
+            only_invalid_update.status["listeners"].as_array().unwrap(),
+            "http",
+        );
+        assert_eq!(
+            only_invalid_listener["supportedKinds"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let conditions = only_invalid_listener["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "False");
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("InvalidRouteKinds")
+        );
+
+        let mixed_update = update_for(
+            &updates,
+            "Gateway",
+            "gateway-supported-and-invalid-route-kind",
+        );
+        let mixed_listener =
+            listener_status_by_name(mixed_update.status["listeners"].as_array().unwrap(), "http");
+        assert_eq!(
+            mixed_listener["supportedKinds"],
+            json!([{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"}])
+        );
+        let conditions = mixed_listener["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "False");
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("InvalidRouteKinds")
+        );
+    }
+
+    #[test]
+    fn gateway_listener_attached_routes_require_hostname_intersection() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "httproute-hostname-intersection",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "listener-1",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "very.specific.com",
+                        "allowedRoutes": { "namespaces": { "from": "Same" } }
+                    },
+                    {
+                        "name": "listener-2",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "*.wildcard.io",
+                        "allowedRoutes": { "namespaces": { "from": "Same" } }
+                    },
+                    {
+                        "name": "listener-3",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "*.anotherwildcard.io",
+                        "allowedRoutes": { "namespaces": { "from": "Same" } }
+                    }
+                ]
+            }),
+        );
+        let routes = [
+            object(
+                "HTTPRoute",
+                "specific-host-matches-listener-specific-host",
+                json!({
+                    "parentRefs": [{"name": "httproute-hostname-intersection"}],
+                    "hostnames": [
+                        "non.matching.com",
+                        "*.nonmatchingwildcard.io",
+                        "very.specific.com"
+                    ],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/s1"}}],
+                        "backendRefs": [{"name": "infra-backend-v1", "port": 8080}]
+                    }]
+                }),
+            ),
+            object(
+                "HTTPRoute",
+                "specific-host-matches-listener-wildcard-host",
+                json!({
+                    "parentRefs": [{"name": "httproute-hostname-intersection"}],
+                    "hostnames": [
+                        "non.matching.com",
+                        "wildcard.io",
+                        "foo.wildcard.io",
+                        "bar.wildcard.io",
+                        "foo.bar.wildcard.io"
+                    ],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/s2"}}],
+                        "backendRefs": [{"name": "infra-backend-v2", "port": 8080}]
+                    }]
+                }),
+            ),
+            object(
+                "HTTPRoute",
+                "wildcard-host-matches-listener-specific-host",
+                json!({
+                    "parentRefs": [{"name": "httproute-hostname-intersection"}],
+                    "hostnames": ["non.matching.com", "*.specific.com"],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/s3"}}],
+                        "backendRefs": [{"name": "infra-backend-v3", "port": 8080}]
+                    }]
+                }),
+            ),
+            object(
+                "HTTPRoute",
+                "wildcard-host-matches-listener-wildcard-host",
+                json!({
+                    "parentRefs": [{"name": "httproute-hostname-intersection"}],
+                    "hostnames": ["*.anotherwildcard.io"],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/s4"}}],
+                        "backendRefs": [{"name": "infra-backend-v1", "port": 8080}]
+                    }]
+                }),
+            ),
+            object(
+                "HTTPRoute",
+                "no-intersecting-hosts",
+                json!({
+                    "parentRefs": [{"name": "httproute-hostname-intersection"}],
+                    "hostnames": ["specific.but.wrong.com", "wildcard.io"],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/s5"}}],
+                        "backendRefs": [{"name": "infra-backend-v2", "port": 8080}]
+                    }]
+                }),
+            ),
+        ];
+        let mut objects = vec![gateway_class, gateway];
+        objects.extend(routes);
+
+        let updates = plan_status_updates(&objects, options());
+
+        let gateway_update = update_for(&updates, "Gateway", "httproute-hostname-intersection");
+        let listeners = gateway_update.status["listeners"].as_array().unwrap();
+        assert_eq!(
+            listener_status_by_name(listeners, "listener-1")["attachedRoutes"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            listener_status_by_name(listeners, "listener-2")["attachedRoutes"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            listener_status_by_name(listeners, "listener-3")["attachedRoutes"].as_u64(),
+            Some(1)
+        );
+
+        let route_update = update_for(&updates, "HTTPRoute", "no-intersecting-hosts");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "False");
+        assert_eq!(
+            find_condition(conditions, "Accepted")["reason"].as_str(),
+            Some("NoMatchingListenerHostname")
+        );
+        assert_condition(conditions, "Programmed", "False");
+    }
+
+    #[test]
+    fn gateway_listener_certificate_ref_requires_reference_grant_for_cross_namespace_secret() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {
+                        "certificateRefs": [{
+                            "group": "",
+                            "kind": "Secret",
+                            "name": "certificate",
+                            "namespace": "backend"
+                        }]
+                    }
+                }]
+            }),
+        );
+        let secret = tls_secret("certificate", "backend", true);
+
+        let updates = plan_status_updates(
+            &[gateway_class.clone(), gateway.clone(), secret.clone()],
+            options().with_source_namespaces(vec!["default".to_string(), "backend".to_string()]),
+        );
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listener = listener_status_by_name(
+            gateway_update.status["listeners"].as_array().unwrap(),
+            "https",
+        );
+        let conditions = listener["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "False");
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("RefNotPermitted")
+        );
+        assert_condition(conditions, "Programmed", "False");
+
+        let grant = reference_grant_for_gateway_secret("default", "backend", "certificate");
+        let updates = plan_status_updates(
+            &[gateway_class, gateway, secret, grant],
+            options().with_source_namespaces(vec!["default".to_string(), "backend".to_string()]),
+        );
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listener = listener_status_by_name(
+            gateway_update.status["listeners"].as_array().unwrap(),
+            "https",
+        );
+        let conditions = listener["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Programmed", "True");
+    }
+
+    #[test]
+    fn gateway_listener_certificate_ref_reports_invalid_for_missing_or_malformed_secret() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {
+                        "certificateRefs": [{
+                            "name": "malformed-certificate"
+                        }]
+                    }
+                }]
+            }),
+        );
+        let malformed = tls_secret("malformed-certificate", "default", false);
+
+        let updates = plan_status_updates(&[gateway_class, gateway, malformed], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listener = listener_status_by_name(
+            gateway_update.status["listeners"].as_array().unwrap(),
+            "https",
+        );
+        let conditions = listener["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "False");
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("InvalidCertificateRef")
+        );
+        assert_condition(conditions, "Programmed", "False");
+    }
+
+    #[test]
+    fn gateway_api_data_plane_service_ready_requires_ready_endpoint_slice_endpoint() {
+        let mut endpoint_slice = object(
+            "EndpointSlice",
+            "ferrum-dp-abc",
+            json!({
+                "endpoints": [{
+                    "conditions": {"ready": true}
+                }]
+            }),
+        );
+        endpoint_slice.metadata.namespace = "ferrum".to_string();
+        endpoint_slice.metadata.labels.insert(
+            "kubernetes.io/service-name".to_string(),
+            "ferrum-gateway".to_string(),
+        );
+
+        assert!(gateway_api_data_plane_service_ready(
+            &[endpoint_slice.clone()],
+            "ferrum",
+            "ferrum-gateway"
+        ));
+
+        endpoint_slice.spec = json!({
+            "endpoints": [{
+                "conditions": {"ready": false}
+            }]
+        });
+        assert!(!gateway_api_data_plane_service_ready(
+            &[endpoint_slice],
+            "ferrum",
+            "ferrum-gateway"
+        ));
     }
 
     #[test]
@@ -1417,6 +2619,64 @@ mod tests {
     }
 
     #[test]
+    fn route_status_reports_no_matching_parent_for_missing_section_name() {
+        let route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge", "sectionName": "http1"}],
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "False");
+        assert_eq!(
+            find_condition(conditions, "Accepted")["reason"].as_str(),
+            Some("NoMatchingParent")
+        );
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Programmed", "False");
+    }
+
+    #[test]
+    fn route_status_reports_no_matching_parent_for_missing_parent_ref_port() {
+        let route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge", "port": 81}],
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "False");
+        assert_eq!(
+            find_condition(conditions, "Accepted")["reason"].as_str(),
+            Some("NoMatchingParent")
+        );
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Programmed", "False");
+    }
+
+    #[test]
     fn route_status_reports_unresolved_cross_namespace_backend_ref() {
         let route = object(
             "HTTPRoute",
@@ -1530,7 +2790,7 @@ mod tests {
         assert_condition(conditions, "ResolvedRefs", "False");
         assert_eq!(
             find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
-            Some("RefNotPermitted")
+            Some("InvalidKind")
         );
     }
 
@@ -2111,6 +3371,8 @@ mod tests {
                     "lastTransitionTime": "2026-02-01T00:00:00Z"
                 }]
             }),
+            patch_gateway_addresses: false,
+            patch_gateway_listeners: false,
         };
         let live_status = json!({
             "addresses": [{"type": "IPAddress", "value": "10.0.0.10"}],
@@ -2156,6 +3418,8 @@ mod tests {
                     }
                 ]
             }),
+            patch_gateway_addresses: false,
+            patch_gateway_listeners: false,
         };
         let live_status = json!({
             "parents": [
@@ -2204,5 +3468,64 @@ mod tests {
             .iter()
             .find(|condition| condition["type"].as_str() == Some(condition_type))
             .unwrap_or_else(|| panic!("missing condition {condition_type}"))
+    }
+
+    fn listener_status_by_name<'a>(listeners: &'a [Value], name: &str) -> &'a Value {
+        listeners
+            .iter()
+            .find(|listener| listener["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("missing listener status {name}"))
+    }
+
+    fn tls_secret(name: &str, namespace: &str, valid: bool) -> K8sObject {
+        use base64::Engine as _;
+
+        let (cert, key) = if valid {
+            (
+                "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+                "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n",
+            )
+        } else {
+            ("Hello world", "Hello world")
+        };
+        let mut secret = object(
+            "Secret",
+            name,
+            json!({
+                "type": "kubernetes.io/tls",
+                "data": {
+                    "tls.crt": base64::engine::general_purpose::STANDARD.encode(cert),
+                    "tls.key": base64::engine::general_purpose::STANDARD.encode(key),
+                }
+            }),
+        );
+        secret.api_version = "v1".to_string();
+        secret.metadata.namespace = namespace.to_string();
+        secret
+    }
+
+    fn reference_grant_for_gateway_secret(
+        from_namespace: &str,
+        to_namespace: &str,
+        secret_name: &str,
+    ) -> K8sObject {
+        let mut grant = object(
+            "ReferenceGrant",
+            "allow-gateway-secret",
+            json!({
+                "from": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "namespace": from_namespace
+                }],
+                "to": [{
+                    "group": "",
+                    "kind": "Secret",
+                    "name": secret_name
+                }]
+            }),
+        );
+        grant.metadata.namespace = to_namespace.to_string();
+        grant
     }
 }

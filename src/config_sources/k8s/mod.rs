@@ -288,6 +288,29 @@ impl K8sServiceKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GatewayApiListenerKey {
+    pub namespace: String,
+    pub gateway: String,
+    pub listener: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum GatewayApiAllowedRoutesNamespaces {
+    #[default]
+    Same,
+    All,
+    Selector(HashMap<String, String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct GatewayApiListenerPolicy {
+    pub namespaces: GatewayApiAllowedRoutesNamespaces,
+    pub hostname: Option<String>,
+    pub port: Option<u64>,
+    pub route_kinds: HashSet<String>,
+}
+
 pub(crate) struct K8sAccumulator {
     pub options: K8sTranslationOptions,
     pub config: GatewayConfig,
@@ -308,6 +331,9 @@ pub(crate) struct K8sAccumulator {
     explicit_workload_services: HashSet<K8sServiceKey>,
     explicit_service_entries: HashSet<K8sServiceKey>,
     pub(crate) gateway_api_conflict_losers: HashMap<K8sResourceKey, Vec<GatewayApiRouteConflict>>,
+    pub(crate) gateway_api_listener_policies:
+        HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
+    pub(crate) namespace_labels: HashMap<String, HashMap<String, String>>,
     /// Flat copy of the Gateway API route conflicts computed over the
     /// translator's filtered object set. Reused by the status writer so
     /// invalid routes (which the translator skips) cannot push a valid
@@ -335,6 +361,8 @@ impl K8sAccumulator {
             explicit_workload_services: HashSet::new(),
             explicit_service_entries: HashSet::new(),
             gateway_api_conflict_losers: HashMap::new(),
+            gateway_api_listener_policies: HashMap::new(),
+            namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
         }
     }
@@ -355,8 +383,26 @@ impl K8sAccumulator {
             .copied()
     }
 
+    pub(crate) fn service_exists(&self, namespace: &str, service: &str) -> bool {
+        self.service_port_names
+            .get(namespace)
+            .is_some_and(|services| services.contains_key(service))
+    }
+
+    pub(crate) fn has_observed_services(&self) -> bool {
+        !self.service_port_names.is_empty()
+    }
+
     fn observe_namespace(&mut self, namespace: &str) {
         self.known_namespaces.insert(namespace.to_string());
+    }
+
+    pub(crate) fn record_namespace_labels(
+        &mut self,
+        namespace: String,
+        labels: HashMap<String, String>,
+    ) {
+        self.namespace_labels.insert(namespace, labels);
     }
 
     fn record_explicit_workload_service(&mut self, key: K8sServiceKey) {
@@ -549,6 +595,13 @@ where
         observe_object_namespace(&mut acc, object);
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
+        } else if object.kind == "Namespace" {
+            acc.record_namespace_labels(
+                object.metadata.name.clone(),
+                object.metadata.labels.clone(),
+            );
+        } else if object.kind == "Gateway" {
+            gateway_api::collect_gateway_listener_policy(&mut acc, object)?;
         } else if object.kind == "Service" {
             collect_service(&mut acc, object)?;
             if acc.options.pod_discovery_enabled {

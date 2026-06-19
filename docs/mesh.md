@@ -2524,6 +2524,9 @@ These configure the in-cluster Istio / Gateway API translation controller and na
 | `FERRUM_K8S_POD_DISCOVERY_ENABLED` | auto (true in-pod, false outside) | Watch Pod/Service/EndpointSlice/Node for native service-registry discovery |
 | `FERRUM_K8S_WATCH_ISTIO_CRDS` | `true` | Watch and translate Istio CRDs (and write `status.conditions[]`) |
 | `FERRUM_K8S_WATCH_GATEWAY_API_CRDS` | `true` | Watch and translate Gateway API CRDs (GatewayClass/Gateway/HTTPRoute/GRPCRoute) and write their status |
+| `FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAMESPACE` | (none) | Namespace of the routable Ferrum data-plane Service used to gate Gateway API `Gateway.status.conditions[Programmed]` |
+| `FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAME` | (none) | Name of the routable Ferrum data-plane Service used to gate Gateway API `Gateway.status.conditions[Programmed]` |
+| `FERRUM_GATEWAY_API_STATUS_ADDRESS` | (none) | Optional address advertised in `Gateway.status.addresses` |
 | `FERRUM_K8S_WATCH_MESH_CONFIG` | `true` | Watch the `istio` ConfigMap (MeshConfig) so name-only Telemetry providers resolve |
 | `FERRUM_K8S_WATCH_NAMESPACES` | (CP scope) | Comma-separated namespace watch scope; unset falls back to the CP namespace scope |
 | `FERRUM_K8S_ISTIO_ROOT_NAMESPACE` | `istio-system` | Root namespace for mesh-wide (selector-less) Istio resources |

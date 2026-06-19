@@ -10,6 +10,7 @@ use crate::modes::mesh::config::{
 };
 
 use super::{
+    GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerPolicy,
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sAccumulator, K8sObject, K8sResourceKey,
     K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
     RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
@@ -170,6 +171,66 @@ pub(super) fn collect_reference_grant(
         }
     }
     Ok(())
+}
+
+pub(super) fn collect_gateway_listener_policy(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) -> Result<(), K8sTranslateError> {
+    let Some(listeners) = object.spec.get("listeners").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for listener in listeners {
+        let listener_name = string_field(listener, "name").unwrap_or("listener");
+        let policy = GatewayApiListenerPolicy {
+            namespaces: allowed_route_namespaces(listener),
+            hostname: string_field(listener, "hostname").map(normalize_gateway_hostname),
+            port: listener.get("port").and_then(Value::as_u64),
+            route_kinds: listener_allowed_route_kinds(listener),
+        };
+        acc.gateway_api_listener_policies.insert(
+            GatewayApiListenerKey {
+                namespace: object.metadata.namespace.clone(),
+                gateway: object.metadata.name.clone(),
+                listener: listener_name.to_string(),
+            },
+            policy,
+        );
+    }
+    Ok(())
+}
+
+fn allowed_route_namespaces(listener: &Value) -> GatewayApiAllowedRoutesNamespaces {
+    let Some(namespaces) = listener
+        .get("allowedRoutes")
+        .and_then(|allowed_routes| allowed_routes.get("namespaces"))
+    else {
+        return GatewayApiAllowedRoutesNamespaces::Same;
+    };
+    match string_field(namespaces, "from").unwrap_or("Same") {
+        "All" => GatewayApiAllowedRoutesNamespaces::All,
+        "Selector" => GatewayApiAllowedRoutesNamespaces::Selector(selector_match_labels(
+            namespaces.get("selector"),
+        )),
+        _ => GatewayApiAllowedRoutesNamespaces::Same,
+    }
+}
+
+fn selector_match_labels(selector: Option<&Value>) -> HashMap<String, String> {
+    selector
+        .and_then(|selector| selector.get("matchLabels"))
+        .and_then(Value::as_object)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|label_value| (key.clone(), label_value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// True when this Gateway is a GAMMA Waypoint Gateway (gatewayClassName is
@@ -904,24 +965,23 @@ fn ensure_route_parent_refs_allowed(
         }
         let parent_namespace =
             string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
-        if parent_namespace != object.metadata.namespace {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "{} parentRef.namespace '{}' is not permitted; only same-namespace Gateway attachments are accepted",
-                    object.kind, parent_namespace
-                ),
-            ));
-        }
-
-        if let Some(section_name) = string_field(parent_ref, "sectionName")
-            && !gateway_has_listener(acc, parent_namespace, section_name)
+        if parent_ref_selector_requires_listener_match(parent_ref)
+            && gateway_parent_ref_listener_match(acc, parent_namespace, parent_ref) == Some(false)
         {
             return Err(invalid_resource(
                 object,
                 format!(
-                    "{} parentRef.sectionName '{}' does not match any known Gateway listener in namespace '{}'",
-                    object.kind, section_name, parent_namespace
+                    "{} parentRef does not match any known Gateway listener in namespace '{}'",
+                    object.kind, parent_namespace
+                ),
+            ));
+        }
+        if !route_namespace_allowed_by_listener(acc, object, parent_namespace, parent_ref) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{} parentRef.namespace '{}' is not permitted by the target Gateway listener",
+                    object.kind, parent_namespace
                 ),
             ));
         }
@@ -930,10 +990,258 @@ fn ensure_route_parent_refs_allowed(
     Ok(())
 }
 
-fn gateway_has_listener(acc: &K8sAccumulator, namespace: &str, listener_name: &str) -> bool {
-    acc.mesh.services.iter().any(|service| {
-        service.namespace == namespace && service.name.ends_with(&format!("-{listener_name}"))
-    })
+fn parent_ref_selector_requires_listener_match(parent_ref: &Value) -> bool {
+    parent_ref.get("sectionName").is_some() || parent_ref.get("port").is_some()
+}
+
+fn gateway_parent_ref_listener_match(
+    acc: &K8sAccumulator,
+    parent_namespace: &str,
+    parent_ref: &Value,
+) -> Option<bool> {
+    let parent_gateway = string_field(parent_ref, "name").unwrap_or("*");
+    let mut saw_gateway = false;
+    for (key, policy) in &acc.gateway_api_listener_policies {
+        if key.namespace != parent_namespace || key.gateway != parent_gateway {
+            continue;
+        }
+        saw_gateway = true;
+        if parent_ref_matches_listener_policy(parent_ref, key, policy) {
+            return Some(true);
+        }
+    }
+    saw_gateway.then_some(false)
+}
+
+fn route_namespace_allowed_by_listener(
+    acc: &K8sAccumulator,
+    route: &K8sObject,
+    parent_namespace: &str,
+    parent_ref: &Value,
+) -> bool {
+    if let Some(listener_name) = string_field(parent_ref, "sectionName") {
+        let Some(policy) = acc
+            .gateway_api_listener_policies
+            .get(&GatewayApiListenerKey {
+                namespace: parent_namespace.to_string(),
+                gateway: string_field(parent_ref, "name").unwrap_or("*").to_string(),
+                listener: listener_name.to_string(),
+            })
+        else {
+            return route.metadata.namespace == parent_namespace;
+        };
+        return route_listener_policy_allows_route(acc, route, parent_namespace, policy);
+    }
+    let parent_gateway = string_field(parent_ref, "name").unwrap_or("*");
+    let mut saw_listener = false;
+    for (key, policy) in &acc.gateway_api_listener_policies {
+        if key.namespace == parent_namespace && key.gateway == parent_gateway {
+            saw_listener = true;
+            if route_listener_policy_allows_route(acc, route, parent_namespace, policy) {
+                return true;
+            }
+        }
+    }
+    !saw_listener && route.metadata.namespace == parent_namespace
+}
+
+fn route_listener_policy_allows_route(
+    acc: &K8sAccumulator,
+    route: &K8sObject,
+    parent_namespace: &str,
+    policy: &GatewayApiListenerPolicy,
+) -> bool {
+    policy.route_kinds.contains(route.kind.as_str())
+        && route_namespace_matches_policy(acc, route, parent_namespace, policy)
+}
+
+fn route_namespace_matches_policy(
+    acc: &K8sAccumulator,
+    route: &K8sObject,
+    parent_namespace: &str,
+    policy: &GatewayApiListenerPolicy,
+) -> bool {
+    match &policy.namespaces {
+        GatewayApiAllowedRoutesNamespaces::Same => route.metadata.namespace == parent_namespace,
+        GatewayApiAllowedRoutesNamespaces::All => true,
+        GatewayApiAllowedRoutesNamespaces::Selector(match_labels) => acc
+            .namespace_labels
+            .get(&route.metadata.namespace)
+            .is_some_and(|labels| {
+                match_labels
+                    .iter()
+                    .all(|(key, value)| labels.get(key) == Some(value))
+            }),
+    }
+}
+
+fn route_materialization_namespace(object: &K8sObject, acc: &K8sAccumulator) -> String {
+    object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|parent_ref| {
+            let parent_kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+            let parent_group =
+                string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+            if parent_kind != "Gateway" || parent_group != "gateway.networking.k8s.io" {
+                return None;
+            }
+            let parent_namespace =
+                string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+            if route_namespace_allowed_by_listener(acc, object, parent_namespace, parent_ref) {
+                Some(parent_namespace.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| object.metadata.namespace.clone())
+}
+
+fn route_effective_hostnames(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    requested_hostnames: &[String],
+) -> Option<Vec<String>> {
+    let route_hostnames = hostnames_for_listener_intersection(requested_hostnames);
+    let mut saw_matching_listener = false;
+    let mut effective = Vec::new();
+
+    for parent_ref in object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io")
+            != "gateway.networking.k8s.io"
+            || string_field(parent_ref, "kind").unwrap_or("Gateway") != "Gateway"
+        {
+            continue;
+        }
+        let Some(gateway_name) = string_field(parent_ref, "name") else {
+            continue;
+        };
+        let gateway_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            if key.namespace != gateway_namespace
+                || key.gateway != gateway_name
+                || !parent_ref_matches_listener_policy(parent_ref, key, policy)
+                || !policy.route_kinds.contains(object.kind.as_str())
+                || !route_namespace_matches_policy(acc, object, gateway_namespace, policy)
+            {
+                continue;
+            }
+            saw_matching_listener = true;
+            let listener_hostname = policy.hostname.as_deref().unwrap_or("*");
+            for route_hostname in &route_hostnames {
+                if let Some(hostname) =
+                    intersect_hostnames(route_hostname.as_str(), listener_hostname)
+                {
+                    effective.push(hostname);
+                }
+            }
+        }
+    }
+
+    if !saw_matching_listener {
+        return Some(requested_hostnames.to_vec());
+    }
+    if effective.iter().any(|hostname| hostname == "*") {
+        return Some(Vec::new());
+    }
+    effective.sort();
+    effective.dedup();
+    if effective.is_empty() {
+        None
+    } else {
+        Some(effective)
+    }
+}
+
+fn parent_ref_matches_listener_policy(
+    parent_ref: &Value,
+    key: &GatewayApiListenerKey,
+    policy: &GatewayApiListenerPolicy,
+) -> bool {
+    if let Some(section_name) = string_field(parent_ref, "sectionName")
+        && section_name != key.listener
+    {
+        return false;
+    }
+    if let Some(parent_port) = parent_ref.get("port").and_then(Value::as_u64)
+        && policy.port != Some(parent_port)
+    {
+        return false;
+    }
+    true
+}
+
+fn hostnames_for_listener_intersection(requested_hostnames: &[String]) -> Vec<String> {
+    if requested_hostnames.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        requested_hostnames.to_vec()
+    }
+}
+
+fn conflict_hostnames_for_proxy_hosts(proxy_hosts: &[String]) -> Vec<String> {
+    if proxy_hosts.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        proxy_hosts.to_vec()
+    }
+}
+
+fn normalize_gateway_hostname(hostname: &str) -> String {
+    hostname.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn intersect_hostnames(route_hostname: &str, listener_hostname: &str) -> Option<String> {
+    if route_hostname == "*" {
+        return Some(listener_hostname.to_string());
+    }
+    if listener_hostname == "*" {
+        return Some(route_hostname.to_string());
+    }
+    match (
+        wildcard_hostname_suffix(route_hostname),
+        wildcard_hostname_suffix(listener_hostname),
+    ) {
+        (None, None) => (route_hostname == listener_hostname).then(|| route_hostname.to_string()),
+        (Some(route_suffix), None) => hostname_matches_wildcard(listener_hostname, route_suffix)
+            .then(|| listener_hostname.to_string()),
+        (None, Some(listener_suffix)) => hostname_matches_wildcard(route_hostname, listener_suffix)
+            .then(|| route_hostname.to_string()),
+        (Some(route_suffix), Some(listener_suffix)) => {
+            if route_suffix == listener_suffix || suffix_is_within(route_suffix, listener_suffix) {
+                Some(route_hostname.to_string())
+            } else if suffix_is_within(listener_suffix, route_suffix) {
+                Some(listener_hostname.to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn wildcard_hostname_suffix(hostname: &str) -> Option<&str> {
+    hostname.strip_prefix("*.")
+}
+
+fn hostname_matches_wildcard(hostname: &str, suffix: &str) -> bool {
+    hostname != suffix && suffix_is_within(hostname, suffix)
+}
+
+fn suffix_is_within(hostname: &str, suffix: &str) -> bool {
+    hostname
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 type HttpRouteResources = (Vec<Proxy>, Vec<PluginConfig>);
@@ -943,13 +1251,17 @@ fn http_route_resources(
     acc: &mut K8sAccumulator,
 ) -> Result<HttpRouteResources, K8sTranslateError> {
     ensure_route_parent_refs_allowed(object, acc)?;
-    let hostnames: Vec<String> = string_array(&object.spec, "hostnames")
+    let requested_hostnames: Vec<String> = string_array(&object.spec, "hostnames")
         .into_iter()
-        .map(|hostname| hostname.to_ascii_lowercase())
+        .map(|hostname| normalize_gateway_hostname(&hostname))
         .collect();
-    let conflict_hostnames = route_hostnames(object);
+    let Some(hostnames) = route_effective_hostnames(object, acc, &requested_hostnames) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let conflict_hostnames = conflict_hostnames_for_proxy_hosts(&hostnames);
     let parent_refs = route_parent_ref_keys(object);
     let route_family = object.kind.to_ascii_lowercase();
+    let config_namespace = route_materialization_namespace(object, acc);
     let losing_conflict_keys: HashSet<GatewayApiRouteConflictKey> = acc
         .gateway_api_conflict_losers
         .get(&K8sResourceKey::from_object(object))
@@ -1010,11 +1322,8 @@ fn http_route_resources(
                 &object.metadata.name,
                 &route_suffix,
             );
-            let upstream = upstream_for_route(
-                upstream_id.clone(),
-                object.metadata.namespace.clone(),
-                backends,
-            );
+            let upstream =
+                upstream_for_route(upstream_id.clone(), config_namespace.clone(), backends);
             (String::new(), 0, Some(upstream_id), Some(upstream))
         };
 
@@ -1064,7 +1373,7 @@ fn http_route_resources(
                 );
                 let mut proxy = proxy_for_route(RouteProxySpec {
                     id: proxy_id.clone(),
-                    namespace: object.metadata.namespace.clone(),
+                    namespace: config_namespace.clone(),
                     hosts: host_scope.proxy_hosts,
                     listen_path: Some(listen_path.clone()),
                     strip_listen_path: false,
@@ -1100,7 +1409,7 @@ fn http_route_resources(
                     );
                     if let Some(mut plugin) = mesh_route_dispatch_plugin_from_rules(
                         &proxy_id,
-                        &object.metadata.namespace,
+                        &config_namespace,
                         rules,
                         !has_path_only_match,
                     ) {
@@ -1488,6 +1797,15 @@ fn route_backends(
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
         let backend_namespace =
             checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
+        if acc.has_observed_services() && !acc.service_exists(&backend_namespace, backend_name) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{} backendRef Service '{}' was not found in namespace '{}'",
+                    object.kind, backend_name, backend_namespace
+                ),
+            ));
+        }
         let backend_port =
             optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?.unwrap_or(
                 if object.kind == "GRPCRoute" {
@@ -1709,6 +2027,43 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
     }
 }
 
+fn listener_route_kind(protocol: Option<&str>) -> Option<&'static str> {
+    match protocol.unwrap_or_default().to_ascii_uppercase().as_str() {
+        "HTTP" | "HTTPS" => Some("HTTPRoute"),
+        "GRPC" | "GRPCS" => Some("GRPCRoute"),
+        "TCP" => Some("TCPRoute"),
+        "TLS" => Some("TLSRoute"),
+        _ => None,
+    }
+}
+
+fn listener_allowed_route_kinds(listener: &Value) -> HashSet<String> {
+    let Some(protocol_kind) = listener_route_kind(string_field(listener, "protocol")) else {
+        return HashSet::new();
+    };
+    let protocol_kind = protocol_kind.to_string();
+    let Some(kinds) = listener
+        .get("allowedRoutes")
+        .and_then(|allowed_routes| allowed_routes.get("kinds"))
+        .and_then(Value::as_array)
+    else {
+        return HashSet::from([protocol_kind]);
+    };
+    kinds
+        .iter()
+        .filter(|kind| listener_allowed_route_kind_matches_protocol(kind, &protocol_kind))
+        .map(|_| protocol_kind.clone())
+        .collect()
+}
+
+fn listener_allowed_route_kind_matches_protocol(kind: &Value, protocol_kind: &str) -> bool {
+    let group = string_field(kind, "group").unwrap_or("gateway.networking.k8s.io");
+    let Some(kind) = string_field(kind, "kind") else {
+        return false;
+    };
+    group == "gateway.networking.k8s.io" && kind == protocol_kind
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1795,6 +2150,141 @@ mod tests {
         );
         assert!(!result.config.proxies[0].strip_listen_path);
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn http_route_proxy_hosts_are_limited_to_gateway_listener_hostname_intersections() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "specific",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "very.specific.com"
+                    },
+                    {
+                        "name": "wildcard",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "*.wildcard.io"
+                    }
+                ]
+            }),
+        );
+        let exact_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "specific"}],
+                "hostnames": [
+                    "non.matching.com",
+                    "*.nonmatchingwildcard.io",
+                    "very.specific.com"
+                ],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/s1"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+        let wildcard_listener_route = {
+            let mut route = object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "parentRefs": [{"name": "sample", "sectionName": "wildcard"}],
+                    "hostnames": ["wildcard.io", "foo.wildcard.io"],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/s2"}}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            );
+            route.metadata.name = "wildcard-listener".to_string();
+            route
+        };
+        let wildcard_route_specific_listener = {
+            let mut route = object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "parentRefs": [{"name": "sample", "sectionName": "specific"}],
+                    "hostnames": ["*.specific.com"],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/s3"}}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            );
+            route.metadata.name = "wildcard-route".to_string();
+            route
+        };
+        let omitted_route_hostname = {
+            let mut route = object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "parentRefs": [{"name": "sample", "sectionName": "specific"}],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/s4"}}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            );
+            route.metadata.name = "omitted-hostname".to_string();
+            route
+        };
+
+        let result = translate_k8s_objects(
+            &[
+                gateway,
+                exact_route,
+                wildcard_listener_route,
+                wildcard_route_specific_listener,
+                omitted_route_hostname,
+            ],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_proxy_hosts(&result.config.proxies, "/s1", &["very.specific.com"]);
+        assert_proxy_hosts(&result.config.proxies, "/s2", &["foo.wildcard.io"]);
+        assert_proxy_hosts(&result.config.proxies, "/s3", &["very.specific.com"]);
+        assert_proxy_hosts(&result.config.proxies, "/s4", &["very.specific.com"]);
+    }
+
+    #[test]
+    fn http_route_without_gateway_listener_hostname_intersection_materializes_no_proxy() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "specific",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": "very.specific.com"
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "specific"}],
+                "hostnames": ["specific.but.wrong.com", "wildcard.io"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/s5"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway, route], options())
+            .expect("translation should skip the non-intersecting route");
+
+        assert!(
+            result.config.proxies.is_empty(),
+            "route with no listener hostname intersection must fail closed"
+        );
     }
 
     #[test]
@@ -2509,7 +2999,8 @@ mod tests {
     }
 
     #[test]
-    fn http_route_rejects_cross_namespace_gateway_parent_ref() {
+    fn http_route_rejects_cross_namespace_gateway_parent_ref_when_listener_does_not_allow_route_namespace()
+     {
         let err = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
@@ -2530,7 +3021,132 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("only same-namespace Gateway attachments are accepted")
+                .contains("not permitted by the target Gateway listener")
+        );
+    }
+
+    #[test]
+    fn http_route_accepts_cross_namespace_gateway_parent_ref_when_listener_allows_route_namespace()
+    {
+        let gateway = object_in_namespace(
+            "Gateway",
+            "platform",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"}
+                    }
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "namespace": "platform",
+                    "sectionName": "web"
+                }],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                    "backendRefs": [{"name": "admin", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[gateway, route],
+            options().with_source_namespaces(vec!["default".to_string(), "platform".to_string()]),
+        )
+        .expect("listener allowed cross-namespace parentRef");
+
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_path.as_deref() == Some("/admin"))
+            .expect("route proxy materialized");
+        assert_eq!(proxy.namespace, "platform");
+        assert_eq!(proxy.backend_host, "admin.default.svc.cluster.local");
+    }
+
+    #[test]
+    fn http_route_rejects_parent_ref_when_listener_allowed_kinds_exclude_http_route() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"},
+                        "kinds": [{"kind": "GRPCRoute"}]
+                    }
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "sectionName": "web"
+                }],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                    "backendRefs": [{"name": "admin", "port": 8080}]
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(&[gateway, route], options())
+            .expect_err("listener allowedRoutes.kinds should exclude HTTPRoute");
+
+        assert!(
+            err.to_string()
+                .contains("not permitted by the target Gateway listener")
+        );
+    }
+
+    #[test]
+    fn http_route_rejects_parent_ref_when_port_does_not_match_listener() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 80,
+                    "protocol": "HTTP"
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "port": 81
+                }],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                    "backendRefs": [{"name": "admin", "port": 8080}]
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(&[gateway, route], options())
+            .expect_err("parentRef port should match a Gateway listener");
+
+        assert!(
+            err.to_string()
+                .contains("does not match any known Gateway listener")
         );
     }
 
@@ -3401,6 +4017,20 @@ mod tests {
         assert_eq!(
             result.config.proxies[0].backend_host,
             "db.default.svc.corp.example"
+        );
+    }
+
+    fn assert_proxy_hosts(proxies: &[Proxy], listen_path: &str, expected_hosts: &[&str]) {
+        let proxy = proxies
+            .iter()
+            .find(|proxy| proxy.listen_path.as_deref() == Some(listen_path))
+            .unwrap_or_else(|| panic!("missing proxy for {listen_path}"));
+        assert_eq!(
+            proxy.hosts,
+            expected_hosts
+                .iter()
+                .map(|host| host.to_string())
+                .collect::<Vec<_>>()
         );
     }
 }
