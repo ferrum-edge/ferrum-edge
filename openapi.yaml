@@ -13416,7 +13416,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, query, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
       properties:
         ttl_seconds:
           type: integer
@@ -13468,7 +13468,7 @@ components:
         cache_key_include_query:
           type: boolean
           default: true
-          description: Include sorted query parameters in the cache key
+          description: Include the exact raw query string in the cache key as a SHA-256 hash. The query string is not parsed, sorted, percent-decoded, or normalized.
         cache_key_include_consumer:
           type: boolean
           default: false

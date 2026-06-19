@@ -76,6 +76,19 @@ fn cache_key_identity_part(identity: &str) -> String {
     part
 }
 
+/// Render the exact raw query string as a bounded cache-key part.
+///
+/// The raw query is hashed as received, without parsing, sorting,
+/// percent-decoding, or normalizing, so duplicate keys, pair order,
+/// percent-encoding, and bare/empty values remain distinct.
+fn cache_key_query_part(raw_query: &str) -> String {
+    let digest = sha256_hex(raw_query);
+    let mut part = String::with_capacity(2 + digest.len());
+    part.push_str("q-");
+    part.push_str(&digest);
+    part
+}
+
 /// Request headers whose presence makes a cacheable response automatically vary
 /// by that header.
 ///
@@ -539,25 +552,13 @@ impl ResponseCaching {
             .map(|h| cache_key_host_part(h))
             .unwrap_or_default();
 
-        let mut query_part = String::new();
-        if self.config.cache_key_include_query && !ctx.query_params.is_empty() {
-            let mut params: Vec<(&String, &String)> = ctx.query_params.iter().collect();
-            params.sort_by_key(|(k, _)| k.as_str());
-            for (index, (key, value)) in params.iter().enumerate() {
-                if index > 0 {
-                    query_part.push('&');
-                }
-                // Encode as length-prefixed fields to avoid delimiter
-                // ambiguity after query percent-decoding.
-                query_part.push_str(&key.len().to_string());
-                query_part.push(':');
-                query_part.push_str(key);
-                query_part.push('=');
-                query_part.push_str(&value.len().to_string());
-                query_part.push(':');
-                query_part.push_str(value);
-            }
-        }
+        let query_part = if self.config.cache_key_include_query {
+            ctx.raw_query_string()
+                .map(cache_key_query_part)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         // Bind the cache entry to the authenticated principal whenever the
         // request is authenticated by ANY mechanism — a gateway Consumer
@@ -1041,7 +1042,7 @@ impl ResponseCaching {
 
 /// Check if a cache key's path segment matches the invalidation path.
 ///
-/// Cache key format: `proxy_id:host_hash:method:path:query:consumer[:vary...]`.
+/// Cache key format: `proxy_id:host_hash:method:path:query_hash:consumer[:vary...]`.
 /// The `path` segment has any `:` percent-encoded (see
 /// [`encode_path_for_cache_key`]) so it cannot be confused with a structural
 /// delimiter. Returns true if the cached path equals the encoded `target_path`

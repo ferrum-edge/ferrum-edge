@@ -34,10 +34,17 @@ fn make_ctx(method: &str, path: &str) -> RequestContext {
 }
 
 fn make_ctx_with_query(method: &str, path: &str, query: &[(&str, &str)]) -> RequestContext {
+    let raw_query = query
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    make_ctx_with_raw_query(method, path, &raw_query)
+}
+
+fn make_ctx_with_raw_query(method: &str, path: &str, raw_query: &str) -> RequestContext {
     let mut ctx = make_ctx(method, path);
-    for (k, v) in query {
-        ctx.query_params.insert(k.to_string(), v.to_string());
-    }
+    ctx.set_raw_query_string(raw_query.to_string());
     ctx
 }
 
@@ -190,11 +197,10 @@ async fn test_cache_miss_first_request() {
 }
 
 #[tokio::test]
-async fn test_query_cache_key_avoids_decoded_delimiter_collision() {
+async fn test_query_cache_key_avoids_raw_delimiter_collision() {
     let plugin = default_plugin();
 
-    // Decoded map for `?a=1%26b=2`
-    let mut attacker_ctx = make_ctx_with_query("GET", "/api/data", &[("a", "1&b=2")]);
+    let mut attacker_ctx = make_ctx_with_raw_query("GET", "/api/data", "a=1%26b=2");
     let mut attacker_headers = HashMap::new();
     let attacker_result = plugin
         .before_proxy(&mut attacker_ctx, &mut attacker_headers)
@@ -206,8 +212,7 @@ async fn test_query_cache_key_avoids_decoded_delimiter_collision() {
         .expect("cache key should be stored")
         .clone();
 
-    // Decoded map for `?a=1&b=2`
-    let mut victim_ctx = make_ctx_with_query("GET", "/api/data", &[("a", "1"), ("b", "2")]);
+    let mut victim_ctx = make_ctx_with_raw_query("GET", "/api/data", "a=1&b=2");
     let mut victim_headers = HashMap::new();
     let victim_result = plugin
         .before_proxy(&mut victim_ctx, &mut victim_headers)
@@ -220,6 +225,40 @@ async fn test_query_cache_key_avoids_decoded_delimiter_collision() {
         .clone();
 
     assert_ne!(attacker_key, victim_key);
+}
+
+async fn base_cache_key_for_raw_query(plugin: &ResponseCaching, raw_query: &str) -> String {
+    let mut ctx = make_ctx_with_raw_query("GET", "/api/data", raw_query);
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    ctx.metadata
+        .get("cache_base_key")
+        .expect("cache key should be stored")
+        .clone()
+}
+
+#[tokio::test]
+async fn test_raw_query_cache_key_preserves_exact_semantics() {
+    let plugin = default_plugin();
+
+    let duplicate_pair = base_cache_key_for_raw_query(&plugin, "a=1&a=2").await;
+    let single_pair = base_cache_key_for_raw_query(&plugin, "a=2").await;
+    assert_ne!(duplicate_pair, single_pair);
+
+    let reordered_pair = base_cache_key_for_raw_query(&plugin, "a=2&a=1").await;
+    assert_ne!(duplicate_pair, reordered_pair);
+
+    let percent_encoded = base_cache_key_for_raw_query(&plugin, "%61=1").await;
+    let plain = base_cache_key_for_raw_query(&plugin, "a=1").await;
+    assert_ne!(percent_encoded, plain);
+
+    let bare_flag = base_cache_key_for_raw_query(&plugin, "flag").await;
+    let empty_flag = base_cache_key_for_raw_query(&plugin, "flag=").await;
+    assert_ne!(bare_flag, empty_flag);
+
+    let same_again = base_cache_key_for_raw_query(&plugin, "a=1&a=2").await;
+    assert_eq!(duplicate_pair, same_again);
 }
 
 // === Cache hit on second request ===
@@ -1271,7 +1310,7 @@ async fn test_consumer_keyed_caching_uses_authenticated_identity_fallback() {
 // === Query string caching ===
 
 #[tokio::test]
-async fn test_different_query_params_different_cache() {
+async fn test_different_raw_queries_different_cache() {
     let plugin = default_plugin();
 
     // Cache response for ?page=1
