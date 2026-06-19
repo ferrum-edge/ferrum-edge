@@ -321,7 +321,7 @@ async fn test_cache_hit_replaces_stored_age_with_current_age() {
     let (_, _, headers) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
     let age = cached_age(&headers);
     assert!(
-        age >= 10 && age < 60,
+        (10..60).contains(&age),
         "expected current Age to include upstream Age and remain fresh, got {age}"
     );
 }
@@ -658,7 +658,7 @@ async fn test_s_maxage_freshness_accounts_for_age() {
     let (_, _, headers) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
     let age = cached_age(&headers);
     assert!(
-        age >= 50 && age < 60,
+        (50..60).contains(&age),
         "s-maxage should define freshness while Age still advances, got {age}"
     );
 }
@@ -1187,7 +1187,7 @@ async fn test_if_none_match_returns_304_from_cache() {
     assert_eq!(headers.get("etag"), Some(&r#"W/"abc123""#.to_string()));
     let age = cached_age(&headers);
     assert!(
-        age >= 9 && age < 60,
+        (9..60).contains(&age),
         "local 304 should include current Age, got {age}"
     );
     assert_eq!(
