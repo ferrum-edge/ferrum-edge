@@ -617,7 +617,7 @@ pub fn gateway_api_route_conflicts(
     objects: &[K8sObject],
     options: &K8sTranslationOptions,
 ) -> Vec<GatewayApiRouteConflict> {
-    gateway_api::route_conflicts(objects, options)
+    gateway_api::route_conflicts(objects, options, None)
 }
 
 pub fn gateway_api_route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
@@ -680,7 +680,8 @@ where
         }
     }
 
-    let gateway_api_route_conflicts = gateway_api::route_conflicts(&included_objects, &acc.options);
+    let gateway_api_route_conflicts =
+        gateway_api::route_conflicts(&included_objects, &acc.options, Some(&acc));
     for conflict in &gateway_api_route_conflicts {
         let skipped_reason = if conflict.loser.kind == "GRPCRoute"
             && conflict.key.match_signature == "{}"
@@ -1019,6 +1020,7 @@ pub(crate) struct RouteProxySpec {
     pub hosts: Vec<String>,
     pub listen_path: Option<String>,
     pub strip_listen_path: bool,
+    pub preserve_host_header: bool,
     pub backend_host: String,
     pub backend_port: u16,
     pub upstream_id: Option<String>,
@@ -1042,7 +1044,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         backend_port: spec.backend_port,
         backend_path: None,
         strip_listen_path: spec.strip_listen_path,
-        preserve_host_header: false,
+        preserve_host_header: spec.preserve_host_header,
         backend_connect_timeout_ms: 30_000,
         backend_read_timeout_ms: spec.backend_read_timeout_ms.unwrap_or(30_000),
         backend_write_timeout_ms: 30_000,

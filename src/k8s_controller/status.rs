@@ -162,7 +162,10 @@ pub fn plan_gateway_api_status_updates_with_context(
         .iter()
         .filter(|object| is_status_kind(&object.kind))
         .filter_map(|object| {
-            let managed_parent_refs = if matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute") {
+            let managed_parent_refs = if matches!(
+                object.kind.as_str(),
+                "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
+            ) {
                 managed_route_parent_refs(objects, object)
             } else {
                 Vec::new()
@@ -183,7 +186,10 @@ pub fn plan_gateway_api_status_updates_with_context(
                             || managed_parent_ref_keys.contains(&conflict.key.parent_ref))
                 })
                 .collect();
-            let route_keys = if matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute") {
+            let route_keys = if matches!(
+                object.kind.as_str(),
+                "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
+            ) {
                 gateway_api_route_conflict_keys(object)
                     .into_iter()
                     .filter(|key| managed_parent_ref_keys.contains(&key.parent_ref))
@@ -240,7 +246,7 @@ fn desired_status_for_object(
 
     match object.kind.as_str() {
         "Gateway" => gateway_status(objects, object, result.as_ref(), status_context),
-        "HTTPRoute" | "GRPCRoute" => route_status(
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => route_status(
             objects,
             object,
             result.as_ref(),
@@ -543,25 +549,29 @@ fn secret_is_valid_tls_certificate(secret: &K8sObject) -> bool {
 }
 
 fn secret_data_decodes_to_certificate_pem(value: &str) -> bool {
-    secret_data_decodes_to_utf8(value, |pem| pem.contains("-----BEGIN CERTIFICATE-----"))
-}
-
-fn secret_data_decodes_to_private_key_pem(value: &str) -> bool {
-    secret_data_decodes_to_utf8(value, |pem| {
-        pem.contains("-----BEGIN ") && pem.contains("PRIVATE KEY-----")
+    secret_data_decodes_to_bytes(value, |bytes| {
+        let mut reader = std::io::Cursor::new(bytes);
+        let Ok(certs) = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() else {
+            return false;
+        };
+        !certs.is_empty()
     })
 }
 
-fn secret_data_decodes_to_utf8(value: &str, predicate: impl FnOnce(&str) -> bool) -> bool {
+fn secret_data_decodes_to_private_key_pem(value: &str) -> bool {
+    secret_data_decodes_to_bytes(value, |bytes| {
+        let mut reader = std::io::Cursor::new(bytes);
+        rustls_pemfile::private_key(&mut reader).is_ok_and(|key| key.is_some())
+    })
+}
+
+fn secret_data_decodes_to_bytes(value: &str, predicate: impl FnOnce(&[u8]) -> bool) -> bool {
     use base64::Engine as _;
 
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(value) else {
         return false;
     };
-    let Ok(pem) = std::str::from_utf8(&bytes) else {
-        return false;
-    };
-    predicate(pem)
+    predicate(&bytes)
 }
 
 fn gateway_status(
@@ -889,7 +899,12 @@ fn listener_allowed_route_kind_matches_protocol(kind: &Value, protocol_kind: &st
 fn attached_route_count(objects: &[K8sObject], gateway: &K8sObject, listener: &Value) -> usize {
     objects
         .iter()
-        .filter(|object| matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute"))
+        .filter(|object| {
+            matches!(
+                object.kind.as_str(),
+                "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
+            )
+        })
         .filter(|route| {
             route_parent_refs(route).into_iter().any(|parent_ref| {
                 parent_ref_targets_gateway(route, &parent_ref, gateway)
@@ -1370,7 +1385,7 @@ fn status_patch_for_update(update: &GatewayApiStatusUpdate, live_status: Option<
                 }
             }
         }
-        "HTTPRoute" | "GRPCRoute" => {
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
             status_patch.insert(
                 "parents".to_string(),
                 Value::Array(merge_parent_statuses(
@@ -1653,7 +1668,7 @@ fn status_target_is_managed_by_ferrum(
     match object.kind.as_str() {
         "GatewayClass" => gateway_class_is_managed_by_ferrum(object),
         "Gateway" => gateway_is_managed_by_ferrum(objects, object),
-        "HTTPRoute" | "GRPCRoute" => {
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
             !managed_parent_refs.is_empty() || has_ferrum_parent_status(&object.status)
         }
         _ => false,
@@ -2135,7 +2150,10 @@ fn same_resource(left: &K8sObject, right: &K8sObject) -> bool {
 }
 
 fn is_status_kind(kind: &str) -> bool {
-    matches!(kind, "GatewayClass" | "Gateway" | "HTTPRoute" | "GRPCRoute")
+    matches!(
+        kind,
+        "GatewayClass" | "Gateway" | "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
+    )
 }
 
 fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResource> {
@@ -2145,6 +2163,8 @@ fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResourc
         ("Gateway", "v1" | "v1beta1") => "gateways",
         ("HTTPRoute", "v1" | "v1beta1") => "httproutes",
         ("GRPCRoute", "v1") => "grpcroutes",
+        ("TCPRoute", "v1alpha2") => "tcproutes",
+        ("TLSRoute", "v1alpha2") => "tlsroutes",
         _ => return None,
     };
 
@@ -4025,8 +4045,8 @@ mod tests {
 
         let (cert, key) = if valid {
             (
-                "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
-                "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n",
+                include_str!("../../tests/certs/server.crt"),
+                include_str!("../../tests/certs/server.key"),
             )
         } else {
             ("Hello world", "Hello world")

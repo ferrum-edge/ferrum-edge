@@ -2675,18 +2675,24 @@ impl GatewayConfig {
     pub fn validate_unique_listen_paths(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        // Split proxies into two buckets: those with an explicit listen_path and
-        // host-only proxies. Only proxies in the same bucket AND the same path
-        // (for the path bucket) can conflict.
-        let mut by_path: HashMap<&str, Vec<&Proxy>> = HashMap::new();
-        let mut host_only: Vec<&Proxy> = Vec::new();
+        // Split proxies into namespace-scoped buckets: those with an explicit
+        // listen_path and host-only proxies. Only proxies in the same namespace,
+        // the same bucket, AND the same path (for the path bucket) can conflict.
+        let mut by_path: HashMap<(&str, &str), Vec<&Proxy>> = HashMap::new();
+        let mut host_only: HashMap<&str, Vec<&Proxy>> = HashMap::new();
         for proxy in &self.proxies {
             if proxy.dispatch_kind.is_stream() {
                 continue;
             }
             match proxy.listen_path.as_deref() {
-                Some(path) => by_path.entry(path).or_default().push(proxy),
-                None => host_only.push(proxy),
+                Some(path) => by_path
+                    .entry((proxy.namespace.as_str(), path))
+                    .or_default()
+                    .push(proxy),
+                None => host_only
+                    .entry(proxy.namespace.as_str())
+                    .or_default()
+                    .push(proxy),
             }
         }
 
@@ -2752,7 +2758,7 @@ impl GatewayConfig {
             })
             .unwrap_or_default();
 
-        for (path, group) in &by_path {
+        for ((_, path), group) in &by_path {
             if group.len() < 2 {
                 continue;
             }
@@ -2782,13 +2788,15 @@ impl GatewayConfig {
             }
         }
 
-        for (i, proxy_a) in host_only.iter().enumerate() {
-            for proxy_b in host_only.iter().skip(i + 1) {
-                if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
-                    errors.push(format!(
-                        "Overlapping host-only proxies '{}' and '{}' — each host can route to at most one host-only proxy",
-                        proxy_b.id, proxy_a.id
-                    ));
+        for group in host_only.values() {
+            for (i, proxy_a) in group.iter().enumerate() {
+                for proxy_b in group.iter().skip(i + 1) {
+                    if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
+                        errors.push(format!(
+                            "Overlapping host-only proxies '{}' and '{}' — each host can route to at most one host-only proxy",
+                            proxy_b.id, proxy_a.id
+                        ));
+                    }
                 }
             }
         }

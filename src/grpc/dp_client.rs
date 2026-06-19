@@ -356,6 +356,12 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         .map(|reload| *reload.revision_rx.borrow())
         .unwrap_or(0);
     let cp_frontend_tls_materialized = Arc::new(AtomicBool::new(false));
+    let frontend_tls_restore_slot: Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>> =
+        Arc::new(ArcSwap::new(Arc::new(
+            frontend_tls_slot
+                .as_ref()
+                .and_then(|slot| slot.load_full().as_ref().clone()),
+        )));
 
     loop {
         if let Some(ref rx) = shutdown_rx
@@ -441,6 +447,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     is_primary,
                     frontend_tls_slot.as_ref(),
                     cp_frontend_tls_materialized.clone(),
+                    frontend_tls_restore_slot.clone(),
                 ) => res,
                 _ = tokio::time::sleep(Duration::from_secs(primary_retry_secs)) => {
                     info!(
@@ -477,6 +484,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     is_primary,
                     frontend_tls_slot.as_ref(),
                     cp_frontend_tls_materialized.clone(),
+                    frontend_tls_restore_slot.clone(),
                 ) => res,
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
                     info!("{} gRPC TLS source changed; reconnecting CP stream", tls_reload.as_ref().map(|reload| reload.label).unwrap_or("DP"));
@@ -707,7 +715,9 @@ fn apply_gateway_trust_bundle_update(
 
 enum FrontendTlsSnapshotUpdate {
     Unchanged,
-    Clear,
+    Clear {
+        restore_tls_config: Option<Arc<rustls::ServerConfig>>,
+    },
     Replace {
         tls_config: Arc<rustls::ServerConfig>,
         cert_source: String,
@@ -719,6 +729,7 @@ fn stage_frontend_tls_snapshot(
     proxy_state: &ProxyState,
     frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
     cp_frontend_tls_materialized: &AtomicBool,
+    frontend_tls_restore_slot: &ArcSwap<Option<Arc<rustls::ServerConfig>>>,
 ) -> Result<FrontendTlsSnapshotUpdate, anyhow::Error> {
     match (
         config.frontend_tls_cert_path.as_deref(),
@@ -726,7 +737,9 @@ fn stage_frontend_tls_snapshot(
     ) {
         (None, None) => {
             if cp_frontend_tls_materialized.load(Ordering::Acquire) {
-                Ok(FrontendTlsSnapshotUpdate::Clear)
+                Ok(FrontendTlsSnapshotUpdate::Clear {
+                    restore_tls_config: frontend_tls_restore_slot.load_full().as_ref().clone(),
+                })
             } else {
                 Ok(FrontendTlsSnapshotUpdate::Unchanged)
             }
@@ -742,6 +755,11 @@ fn stage_frontend_tls_snapshot(
                     "frontend TLS material was provided by CP but this DP did not start an HTTPS listener"
                 );
             };
+            if !cp_frontend_tls_materialized.load(Ordering::Acquire)
+                && let Some(slot) = frontend_tls_slot
+            {
+                frontend_tls_restore_slot.store(slot.load_full());
+            }
             let Some(tls_policy) = proxy_state.tls_policy.as_deref() else {
                 anyhow::bail!(
                     "frontend TLS material was provided by CP but this DP has no TLS policy"
@@ -792,15 +810,19 @@ async fn commit_frontend_tls_snapshot(
 ) {
     match update {
         FrontendTlsSnapshotUpdate::Unchanged => {}
-        FrontendTlsSnapshotUpdate::Clear => {
+        FrontendTlsSnapshotUpdate::Clear { restore_tls_config } => {
             if let Some(slot) = frontend_tls_slot {
                 let had_tls = slot.load_full().as_ref().is_some();
-                slot.store(Arc::new(None));
+                slot.store(Arc::new(restore_tls_config.clone()));
                 proxy_state
                     .stream_listener_manager
-                    .set_frontend_tls_config(None)
+                    .set_frontend_tls_config(restore_tls_config.clone())
                     .await;
-                if had_tls {
+                if restore_tls_config.is_some() {
+                    info!(
+                        "Restored operator frontend TLS material after clearing CP-delivered Gateway frontend TLS"
+                    );
+                } else if had_tls {
                     info!("Cleared CP-delivered Gateway frontend TLS material");
                 }
             }
@@ -876,6 +898,11 @@ pub async fn connect_and_subscribe_with_startup_ready(
         is_primary,
         frontend_tls_slot,
         Arc::new(AtomicBool::new(false)),
+        Arc::new(ArcSwap::new(Arc::new(
+            frontend_tls_slot
+                .map(|slot| slot.load_full().as_ref().clone())
+                .unwrap_or(None),
+        ))),
     )
     .await
 }
@@ -893,6 +920,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     is_primary: bool,
     frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
     cp_frontend_tls_materialized: Arc<AtomicBool>,
+    frontend_tls_restore_slot: Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
 ) -> Result<(), anyhow::Error> {
     let mut endpoint =
         Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
@@ -1101,6 +1129,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             proxy_state,
                             frontend_tls_slot,
                             cp_frontend_tls_materialized.as_ref(),
+                            frontend_tls_restore_slot.as_ref(),
                         ) {
                             Ok(update) => update,
                             Err(error) => {

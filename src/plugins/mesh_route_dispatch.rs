@@ -381,12 +381,6 @@ fn validate_and_normalize_redirect(
     rule_idx: usize,
     redirect: &mut RouteRedirectConfig,
 ) -> Result<(), String> {
-    if redirect.is_empty() {
-        return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].redirect must set at least one of \
-             'uri' / 'authority' / 'port' / 'scheme' so the redirect target differs from the request"
-        ));
-    }
     if !(300..=399).contains(&redirect.redirect_code) {
         return Err(format!(
             "mesh_route_dispatch.rules[{rule_idx}].redirect.redirect_code must be 300-399, got {}",
@@ -1103,10 +1097,9 @@ impl RouteRewriteConfig {
 /// rule matches, the plugin short-circuits the dispatch chain with a redirect
 /// response (3xx + `Location`) and the request never reaches a backend.
 ///
-/// At least one of `uri` / `authority` / `port` / `scheme` must be present so
-/// the redirect target differs from the request; an empty redirect is rejected
-/// at config-load time. `redirect_code` defaults to 301 and is constrained to
-/// the 3xx range.
+/// If `uri` / `authority` / `port` / `scheme` are all unset, the redirect keeps
+/// the original request URL and only changes the status code. `redirect_code`
+/// defaults to 301 and is constrained to the 3xx range.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RouteRedirectConfig {
     /// Replacement path for the `Location` header. When unset, the request's
@@ -1136,15 +1129,6 @@ pub struct RouteRedirectConfig {
 
 fn default_redirect_code() -> u16 {
     301
-}
-
-impl RouteRedirectConfig {
-    fn is_empty(&self) -> bool {
-        self.uri.is_none()
-            && self.authority.is_none()
-            && self.port.is_none()
-            && self.scheme.is_none()
-    }
 }
 
 #[derive(Debug)]
@@ -5362,13 +5346,31 @@ mod tests {
         assert!(err.contains("rewrite must set at least one"), "got: {err}");
     }
 
-    #[test]
-    fn rejects_empty_redirect() {
-        let err = MeshRouteDispatch::new(&json!({
-            "rules": [{"match": {"methods": ["GET"]}, "redirect": {}}]
+    #[tokio::test]
+    async fn redirect_status_only_preserves_request_url() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{"match": {"methods": ["GET"]}, "redirect": {"redirect_code": 302}}]
         }))
-        .unwrap_err();
-        assert!(err.contains("redirect must set at least one"), "got: {err}");
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/keep/me");
+        ctx.set_raw_query_string("token=abc".to_string());
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+        let mut headers = HashMap::from([("host".to_string(), "site.example.com".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 302);
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://site.example.com/keep/me?token=abc")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
     }
 
     #[test]

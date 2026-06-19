@@ -2870,6 +2870,21 @@ fn test_unique_listen_paths_same_path_overlapping_hosts() {
     assert!(err[0].contains("Overlapping"));
 }
 
+#[test]
+fn test_unique_listen_paths_allows_same_host_path_in_different_namespaces() {
+    let mut tenant_a = make_proxy_with_hosts("p1", "/api", vec!["api.example.com"]);
+    tenant_a.namespace = "tenant-a".to_string();
+    let mut tenant_b = make_proxy_with_hosts("p2", "/api", vec!["api.example.com"]);
+    tenant_b.namespace = "tenant-b".to_string();
+    let mut config = empty_config();
+    config.proxies = vec![tenant_a, tenant_b];
+
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "proxy listen_path uniqueness is namespace-scoped"
+    );
+}
+
 /// Mesh block for the sibling-exemption tests: one service per entry,
 /// `(namespace, name, declared HTTP ports)`. The validator derives sibling
 /// identity forward from this, exactly like the router grouping.

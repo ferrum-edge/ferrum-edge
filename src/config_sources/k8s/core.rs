@@ -451,25 +451,29 @@ fn secret_object_is_valid_tls_certificate(secret: &K8sObject) -> bool {
 }
 
 fn secret_data_decodes_to_certificate_pem(value: &str) -> bool {
-    secret_data_decodes_to_utf8(value, |pem| pem.contains("-----BEGIN CERTIFICATE-----"))
-}
-
-fn secret_data_decodes_to_private_key_pem(value: &str) -> bool {
-    secret_data_decodes_to_utf8(value, |pem| {
-        pem.contains("-----BEGIN ") && pem.contains("PRIVATE KEY-----")
+    secret_data_decodes_to_bytes(value, |bytes| {
+        let mut reader = std::io::Cursor::new(bytes);
+        let Ok(certs) = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() else {
+            return false;
+        };
+        !certs.is_empty()
     })
 }
 
-fn secret_data_decodes_to_utf8(value: &str, predicate: impl FnOnce(&str) -> bool) -> bool {
+fn secret_data_decodes_to_private_key_pem(value: &str) -> bool {
+    secret_data_decodes_to_bytes(value, |bytes| {
+        let mut reader = std::io::Cursor::new(bytes);
+        rustls_pemfile::private_key(&mut reader).is_ok_and(|key| key.is_some())
+    })
+}
+
+fn secret_data_decodes_to_bytes(value: &str, predicate: impl FnOnce(&[u8]) -> bool) -> bool {
     use base64::Engine as _;
 
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(value) else {
         return false;
     };
-    let Ok(pem) = std::str::from_utf8(&bytes) else {
-        return false;
-    };
-    predicate(pem)
+    predicate(&bytes)
 }
 
 pub(super) fn endpoint_route_backends_for_service(

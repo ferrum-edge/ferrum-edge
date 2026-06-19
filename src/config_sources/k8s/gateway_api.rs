@@ -546,6 +546,7 @@ fn metadata_key<'a>(object: &'a K8sObject, key: &str) -> Option<&'a str> {
 pub(crate) fn route_conflicts(
     objects: &[K8sObject],
     options: &K8sTranslationOptions,
+    acc: Option<&K8sAccumulator>,
 ) -> Vec<GatewayApiRouteConflict> {
     let mut candidates_by_key: HashMap<
         GatewayApiRouteConflictKey,
@@ -563,7 +564,7 @@ pub(crate) fn route_conflicts(
             .creation_timestamp
             .as_deref()
             .and_then(parse_k8s_timestamp);
-        for key in route_conflict_keys(object) {
+        for key in route_conflict_keys_for_acc(object, acc) {
             candidates_by_key
                 .entry(key)
                 .or_default()
@@ -597,7 +598,20 @@ pub(crate) fn route_conflicts(
 }
 
 pub(crate) fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
-    let hostnames = route_hostnames(object);
+    route_conflict_keys_for_acc(object, None)
+}
+
+fn route_conflict_keys_for_acc(
+    object: &K8sObject,
+    acc: Option<&K8sAccumulator>,
+) -> Vec<GatewayApiRouteConflictKey> {
+    let requested_hostnames = route_hostnames(object);
+    let hostnames = acc
+        .and_then(|acc| {
+            route_effective_hostnames(object, acc, &requested_hostnames, None)
+                .map(|hostnames| conflict_hostnames_for_proxy_hosts(&hostnames))
+        })
+        .unwrap_or_else(|| requested_hostnames.clone());
     let parent_refs = route_parent_ref_keys(object);
     let route_family = object.kind.to_ascii_lowercase();
     let mut keys = Vec::new();
@@ -926,6 +940,7 @@ fn replace_proxy_default_route(existing: &mut Proxy, proxy: &Proxy) {
     existing.backend_host.clone_from(&proxy.backend_host);
     existing.backend_port = proxy.backend_port;
     existing.upstream_id.clone_from(&proxy.upstream_id);
+    existing.preserve_host_header = proxy.preserve_host_header;
     existing.retry.clone_from(&proxy.retry);
     existing.backend_read_timeout_ms = proxy.backend_read_timeout_ms;
 }
@@ -1099,26 +1114,40 @@ fn route_hostnames(object: &K8sObject) -> Vec<String> {
 }
 
 fn route_parent_ref_keys(object: &K8sObject) -> Vec<String> {
+    route_parent_ref_keys_for_namespace(object, None)
+}
+
+fn route_parent_ref_keys_for_namespace(
+    object: &K8sObject,
+    namespace_filter: Option<&str>,
+) -> Vec<String> {
     let mut refs: Vec<String> = object
         .spec
         .get("parentRefs")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|parent| {
+        .filter_map(|parent| {
             let group = string_field(parent, "group").unwrap_or("gateway.networking.k8s.io");
             let kind = string_field(parent, "kind").unwrap_or("Gateway");
             let namespace = string_field(parent, "namespace").unwrap_or(&object.metadata.namespace);
+            if namespace_filter.is_some_and(|filter| namespace != filter) {
+                return None;
+            }
             let name = string_field(parent, "name").unwrap_or("*");
             let section = string_field(parent, "sectionName").unwrap_or("*");
             let port = parent
                 .get("port")
                 .and_then(Value::as_u64)
                 .map_or_else(|| "*".to_string(), |port| port.to_string());
-            format!("{group}/{kind}/{namespace}/{name}/{section}/{port}")
+            Some(format!(
+                "{group}/{kind}/{namespace}/{name}/{section}/{port}"
+            ))
         })
         .collect();
-    if refs.is_empty() {
+    if refs.is_empty()
+        && namespace_filter.is_none_or(|namespace| namespace == object.metadata.namespace)
+    {
         refs.push(format!(
             "gateway.networking.k8s.io/Gateway/{}/{}/*/*",
             object.metadata.namespace, "*"
@@ -1566,7 +1595,6 @@ fn http_route_resources(
         .into_iter()
         .map(|hostname| normalize_gateway_hostname(&hostname))
         .collect();
-    let parent_refs = route_parent_ref_keys(object);
     let route_family = object.kind.to_ascii_lowercase();
     let config_namespaces = route_materialization_namespaces(object, acc);
     let losing_conflict_keys: HashSet<GatewayApiRouteConflictKey> = acc
@@ -1580,6 +1608,10 @@ fn http_route_resources(
     let mut plugins = Vec::new();
 
     for config_namespace in &config_namespaces {
+        let parent_refs = route_parent_ref_keys_for_namespace(object, Some(config_namespace));
+        if parent_refs.is_empty() {
+            continue;
+        }
         let Some(hostnames) = route_effective_hostnames(
             object,
             acc,
@@ -1721,6 +1753,7 @@ fn http_route_resources(
                         hosts: host_scope.proxy_hosts,
                         listen_path: Some(listen_path.clone()),
                         strip_listen_path: false,
+                        preserve_host_header: true,
                         backend_host: backend_host.clone(),
                         backend_port,
                         upstream_id: upstream_id.clone(),
@@ -2234,9 +2267,6 @@ fn gateway_request_redirect_value(
         };
         out.insert("redirect_code".to_string(), serde_json::json!(status_code));
 
-        if out.keys().all(|key| key == "redirect_code") {
-            return Ok(None);
-        }
         return Ok(Some(Value::Object(out)));
     }
 
@@ -2331,7 +2361,7 @@ fn invalid_backend_fault_value_with_percentage(
         "abort": {
             "status_code": 500,
             "percentage": percentage,
-            "body": body,
+            "body": serde_json::json!({"error": body}).to_string(),
         }
     })
 }
@@ -2720,6 +2750,7 @@ fn l4_route_proxies(
             hosts: string_array(&object.spec, "hostnames"),
             listen_path: None,
             strip_listen_path: false,
+            preserve_host_header: false,
             backend_host: service_dns_name(
                 backend_name,
                 &backend_namespace,
@@ -2965,8 +2996,8 @@ mod tests {
 
         let (cert, key) = if valid {
             (
-                "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
-                "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n",
+                include_str!("../../../tests/certs/server.crt"),
+                include_str!("../../../tests/certs/server.key"),
             )
         } else {
             ("Hello world", "Hello world")
@@ -3274,7 +3305,11 @@ mod tests {
         let abort = &plugin.config["rules"][0]["fault"]["abort"];
         assert_eq!(abort["status_code"], 500);
         assert_eq!(abort["percentage"], 100.0);
-        assert_eq!(abort["body"].as_str(), Some(expected_body));
+        let body = abort["body"]
+            .as_str()
+            .expect("fault body should be a string");
+        let body: Value = serde_json::from_str(body).expect("fault body should be valid JSON");
+        assert_eq!(body["error"].as_str(), Some(expected_body));
     }
 
     #[test]
@@ -3535,6 +3570,87 @@ mod tests {
             warning.contains("api-new")
                 && warning.contains("parent=gateway.networking.k8s.io/Gateway/default/edge-a/*/*")
                 && warning.contains("winner is default/api-old")
+        }));
+    }
+
+    #[test]
+    fn conflicting_http_route_materializes_surviving_parent_namespace() {
+        let mut gateway_a = object(
+            "Gateway",
+            serde_json::json!({
+                "listeners": [{"name": "http", "port": 80, "protocol": "HTTP"}]
+            }),
+        );
+        gateway_a.metadata.name = "edge-a".to_string();
+
+        let mut gateway_b = gateway_a.clone();
+        gateway_b.metadata.name = "edge-b".to_string();
+        gateway_b.metadata.namespace = "other".to_string();
+        gateway_b.spec["listeners"][0]["allowedRoutes"] =
+            serde_json::json!({"namespaces": {"from": "All"}});
+
+        let mut winner = route_with_name_and_created_at("api-old", "2026-01-01T00:00:00Z");
+        winner.spec["parentRefs"] = serde_json::json!([{"name": "edge-a"}]);
+
+        let mut loser = route_with_name_and_created_at("api-new", "2026-01-02T00:00:00Z");
+        loser.spec["parentRefs"] = serde_json::json!([
+            {"name": "edge-a"},
+            {"name": "edge-b", "namespace": "other"}
+        ]);
+
+        let result = translate_k8s_objects(
+            &[gateway_a, gateway_b, loser, winner],
+            options().with_source_namespaces(vec!["default".to_string(), "other".to_string()]),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.namespace == "default"
+                && proxy.id.contains("api-old")
+                && proxy.listen_path.as_deref() == Some("/api")
+        }));
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.namespace == "other"
+                && proxy.id.contains("api-new")
+                && proxy.listen_path.as_deref() == Some("/api")
+        }));
+        assert!(result.config.validate_unique_listen_paths().is_ok());
+    }
+
+    #[test]
+    fn http_route_conflicts_use_listener_hostname_intersection() {
+        let mut gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "listeners": [{
+                    "name": "api",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": "api.example.com"
+                }]
+            }),
+        );
+        gateway.metadata.name = "edge".to_string();
+        let mut wildcard = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+        wildcard.spec["hostnames"] = serde_json::json!(["*.example.com"]);
+        wildcard.spec["parentRefs"] = serde_json::json!([{"name": "edge", "sectionName": "api"}]);
+
+        let mut exact = route_with_name_and_created_at("api-b", "2026-01-02T00:00:00Z");
+        exact.spec["hostnames"] = serde_json::json!(["api.example.com"]);
+        exact.spec["parentRefs"] = serde_json::json!([{"name": "edge", "sectionName": "api"}]);
+
+        let result =
+            translate_k8s_objects(&[gateway, exact, wildcard], options()).expect("translation");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(
+            result.config.proxies[0].id.contains("api-a"),
+            "older route should win after both routes intersect the same listener hostname"
+        );
+        assert!(result.warnings.iter().any(|warning| {
+            warning.contains("api-b")
+                && warning.contains("host=api.example.com")
+                && warning.contains("winner is default/api-a")
         }));
     }
 
@@ -3968,6 +4084,10 @@ mod tests {
         assert_eq!(
             result.config.proxies[0].upstream_id.as_deref(),
             Some(result.config.upstreams[0].id.as_str())
+        );
+        assert!(
+            result.config.proxies[0].preserve_host_header,
+            "Gateway API HTTPRoute backends must see the original request Host"
         );
         assert_eq!(result.config.upstreams[0].targets.len(), 2);
         assert_eq!(result.config.upstreams[0].targets[0].weight, 90);
@@ -4571,6 +4691,42 @@ mod tests {
         assert!(
             redirect.get("authority").is_none(),
             "scheme-derived port must still preserve the request host at the DP"
+        );
+    }
+
+    #[test]
+    fn http_route_status_only_request_redirect_materializes_dispatch_redirect() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/redirect"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {"statusCode": 301}
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("status-only redirect route should materialize");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["redirect_code"], 301);
+        assert!(
+            redirect
+                .as_object()
+                .is_some_and(|object| object.keys().all(|key| key == "redirect_code")),
+            "status-only redirect must preserve request URL at the DP"
         );
     }
 
@@ -5567,8 +5723,9 @@ mod tests {
         let abort = &dispatch.config["rules"][0]["fault"]["abort"];
         assert_eq!(abort["status_code"], 500);
         assert_eq!(abort["percentage"], 25.0);
+        let body: Value = serde_json::from_str(abort["body"].as_str().unwrap()).unwrap();
         assert_eq!(
-            abort["body"].as_str(),
+            body["error"].as_str(),
             Some("Gateway API backendRef is not permitted by ReferenceGrant")
         );
     }
