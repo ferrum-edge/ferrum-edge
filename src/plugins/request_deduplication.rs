@@ -261,7 +261,11 @@ impl RequestDeduplication {
             hash_framed(&mut hasher, "principal", identity.as_bytes());
         }
         if let Some(peer_spiffe_id) = ctx.peer_spiffe_id.as_ref() {
-            hash_framed(&mut hasher, "peer_spiffe_id", peer_spiffe_id.as_str().as_bytes());
+            hash_framed(
+                &mut hasher,
+                "peer_spiffe_id",
+                peer_spiffe_id.as_str().as_bytes(),
+            );
         }
         hash_framed(&mut hasher, "idempotency_key", idempotency_value.as_bytes());
 
@@ -742,11 +746,7 @@ fn request_headers_for_fingerprint<'a>(
         }
         values.push((normalized, value.as_str()));
     }
-    values.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.cmp(right.1))
-    });
+    values.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
     values
 }
 
