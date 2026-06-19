@@ -2410,6 +2410,20 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin may add a strong `ETag` response
+    /// validator in a later `after_proxy` hook.
+    ///
+    /// Compression uses this to avoid transforming a representation before a
+    /// later response-header plugin attaches a strong validator for the
+    /// untransformed bytes.
+    fn may_add_response_strong_etag(
+        &self,
+        _ctx: &RequestContext,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
     /// Applies this plugin's deterministic `after_proxy` response-header
     /// mutations to a simulated header map.
     ///
@@ -2434,6 +2448,26 @@ pub trait Plugin: Send + Sync {
     /// consumer because it must not commit `Content-Encoding` before a later
     /// hook marks the final representation `Cache-Control: no-transform`.
     fn needs_later_response_cache_control_no_transform(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin reads `ferrum:later_strong_etag_response`
+    /// from request metadata before committing response headers.
+    ///
+    /// Compression is the built-in consumer because it must not commit
+    /// `Content-Encoding` before a later hook attaches a strong `ETag`.
+    fn needs_later_response_strong_etag(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin can release response body buffering if a
+    /// later hook will add a strong `ETag`.
+    fn should_release_response_body_for_later_strong_etag(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
         false
     }
 

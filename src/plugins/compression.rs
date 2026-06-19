@@ -16,7 +16,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use tracing::{debug, error, warn};
 
-use crate::util::http_headers::headers_have_cache_control_directive;
+use crate::util::http_headers::{headers_have_cache_control_directive, headers_have_strong_etag};
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -69,7 +69,6 @@ struct CompressionConfig {
     // -- Response compression --
     min_content_length: usize,
     content_types: Vec<String>,
-    disable_on_etag: bool,
     /// Remove `Accept-Encoding` from the backend request so the backend always
     /// sends an uncompressed response for us to compress.
     remove_accept_encoding: bool,
@@ -131,7 +130,12 @@ impl CompressionPlugin {
 
         let min_content_length = optional_usize(config, "min_content_length")?.unwrap_or(256);
 
-        let disable_on_etag = optional_bool(config, "disable_on_etag")?.unwrap_or(false);
+        if config.get("disable_on_etag").is_some() {
+            return Err(
+                "compression: 'disable_on_etag' has been removed; strong ETag responses are always preserved"
+                    .to_string(),
+            );
+        }
 
         let remove_accept_encoding =
             optional_bool(config, "remove_accept_encoding")?.unwrap_or(true);
@@ -176,7 +180,6 @@ impl CompressionPlugin {
                 algorithms,
                 min_content_length,
                 content_types,
-                disable_on_etag,
                 remove_accept_encoding,
                 decompress_request,
                 max_decompressed_request_size,
@@ -647,7 +650,11 @@ impl Plugin for CompressionPlugin {
             || ctx
                 .metadata
                 .contains_key(crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::STRONG_ETAG_RESPONSE_METADATA_KEY)
             || headers_have_cache_control_directive(response_headers, "no-transform")
+            || headers_have_strong_etag(response_headers)
         {
             return false;
         }
@@ -669,7 +676,11 @@ impl Plugin for CompressionPlugin {
             || ctx
                 .metadata
                 .contains_key(crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::STRONG_ETAG_RESPONSE_METADATA_KEY)
             || headers_have_cache_control_directive(response_headers, "no-transform")
+            || headers_have_strong_etag(response_headers)
     }
 
     fn should_release_response_body_for_later_no_transform(
@@ -682,6 +693,19 @@ impl Plugin for CompressionPlugin {
     }
 
     fn needs_later_response_cache_control_no_transform(&self) -> bool {
+        true
+    }
+
+    fn should_release_response_body_for_later_strong_etag(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        true
+    }
+
+    fn needs_later_response_strong_etag(&self) -> bool {
         true
     }
 
@@ -849,13 +873,23 @@ impl Plugin for CompressionPlugin {
             return PluginResult::Continue;
         }
 
-        // Skip if response already has Content-Encoding (don't double-compress).
-        if response_headers.contains_key("content-encoding") {
+        // Strong ETags validate the exact selected representation. Compressing
+        // the body changes the representation bytes, so the gateway must not
+        // retain a strong origin validator. Weak validators are explicitly
+        // representation-variant tolerant and remain eligible.
+        if ctx
+            .metadata
+            .contains_key(crate::proxy::STRONG_ETAG_RESPONSE_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::LATER_STRONG_ETAG_RESPONSE_METADATA_KEY)
+            || headers_have_strong_etag(response_headers)
+        {
             return PluginResult::Continue;
         }
 
-        // Skip if ETag present and disable_on_etag is set.
-        if self.config.disable_on_etag && response_headers.contains_key("etag") {
+        // Skip if response already has Content-Encoding (don't double-compress).
+        if response_headers.contains_key("content-encoding") {
             return PluginResult::Continue;
         }
 

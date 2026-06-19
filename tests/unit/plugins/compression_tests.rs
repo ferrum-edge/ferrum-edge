@@ -78,6 +78,17 @@ fn test_invalid_bool_config_rejected() {
 }
 
 #[test]
+fn test_removed_disable_on_etag_config_rejected() {
+    let err = CompressionPlugin::new(&json!({"disable_on_etag": false}))
+        .err()
+        .expect("removed ETag config must be rejected");
+    assert!(
+        err.contains("disable_on_etag") && err.contains("removed"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn test_invalid_content_types_config_rejected() {
     let err = CompressionPlugin::new(&json!({"content_types": ["text/plain", 42]}))
         .err()
@@ -555,6 +566,64 @@ fn test_response_buffering_skips_no_transform_response_via_metadata_marker() {
 }
 
 #[test]
+fn test_response_buffering_skips_strong_etag() {
+    let plugin = make_plugin(json!({}));
+    let ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    headers.insert("etag".to_string(), "\"abc123\"".to_string());
+
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
+
+    headers.insert("etag".to_string(), "W/\"abc123\"".to_string());
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
+
+    headers.insert("etag".to_string(), "w/\"abc123\"".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
+
+    headers.insert("etag".to_string(), "W/ \"abc123\"".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
+}
+
+#[test]
+fn test_response_buffering_skips_strong_etag_via_metadata_marker() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    ctx.metadata.insert(
+        "ferrum:strong_etag_response".to_string(),
+        "true".to_string(),
+    );
+
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "1000".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
+}
+
+#[test]
 fn test_response_buffering_skips_range_responses() {
     // A range response with a compressible content-type must not be pinned onto
     // the buffered path: `after_proxy` will skip compressing it, so buffering
@@ -762,8 +831,8 @@ async fn test_skips_below_min_content_length() {
 }
 
 #[tokio::test]
-async fn test_skips_etag_when_disable_on_etag() {
-    let plugin = make_plugin(json!({"disable_on_etag": true}));
+async fn test_strong_etag_disables_compression() {
+    let plugin = make_plugin(json!({}));
     let mut ctx = make_ctx(Some("gzip"));
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -774,12 +843,16 @@ async fn test_skips_etag_when_disable_on_etag() {
     resp_headers.insert("etag".to_string(), "\"abc123\"".to_string());
 
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
     assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
+    assert_eq!(resp_headers.get("etag").unwrap(), "\"abc123\"");
 }
 
 #[tokio::test]
-async fn test_allows_etag_when_disable_on_etag_false() {
-    let plugin = make_plugin(json!({"disable_on_etag": false}));
+async fn test_mixed_case_strong_etag_disables_compression() {
+    let plugin = make_plugin(json!({}));
     let mut ctx = make_ctx(Some("gzip"));
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -787,10 +860,113 @@ async fn test_allows_etag_when_disable_on_etag_false() {
     let mut resp_headers = HashMap::new();
     resp_headers.insert("content-type".to_string(), "application/json".to_string());
     resp_headers.insert("content-length".to_string(), "1000".to_string());
-    resp_headers.insert("etag".to_string(), "\"abc123\"".to_string());
+    resp_headers.insert("ETag".to_string(), "\"abc123\"".to_string());
 
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
+    assert_eq!(resp_headers.get("ETag").unwrap(), "\"abc123\"");
+}
+
+#[tokio::test]
+async fn test_weak_etag_remains_eligible_for_compression() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("etag".to_string(), "W/\"abc123\"".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
     assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+    assert_eq!(resp_headers.get("etag").unwrap(), "W/\"abc123\"");
+}
+
+#[tokio::test]
+async fn test_malformed_etag_is_preserved_like_strong_etag() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("etag".to_string(), "not-a-valid-weak-etag".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
+}
+
+#[tokio::test]
+async fn test_lowercase_weak_etag_prefix_is_preserved_like_malformed_etag() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("etag".to_string(), "w/\"abc123\"".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
+    assert_eq!(resp_headers.get("etag").unwrap(), "w/\"abc123\"");
+}
+
+#[tokio::test]
+async fn test_whitespace_after_weak_etag_prefix_is_preserved_like_malformed_etag() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("etag".to_string(), "W/ \"abc123\"".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
+    assert_eq!(resp_headers.get("etag").unwrap(), "W/ \"abc123\"");
+}
+
+#[tokio::test]
+async fn test_original_strong_etag_marker_disables_compression_when_header_removed() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    ctx.metadata.insert(
+        "ferrum:strong_etag_response".to_string(),
+        "true".to_string(),
+    );
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
 }
 
 #[tokio::test]

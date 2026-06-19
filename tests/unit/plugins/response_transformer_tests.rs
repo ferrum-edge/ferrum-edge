@@ -821,6 +821,66 @@ fn test_response_transformer_no_transform_preflight_reports_conservative_capabil
     assert!(remove_then_add.may_add_response_cache_control_no_transform(&ctx, &headers));
 }
 
+#[test]
+fn test_response_transformer_strong_etag_preflight_reports_conservative_capability() {
+    let ctx = make_ctx();
+    let headers = HashMap::from([("etag".to_string(), "W/\"weak\"".to_string())]);
+    let add_strong = ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "add",
+            "target": "header",
+            "key": "ETag",
+            "value": "\"strong\""
+        }]
+    }))
+    .unwrap();
+    assert!(add_strong.may_add_response_strong_etag(&ctx, &headers));
+
+    let add_weak = ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "add",
+            "target": "header",
+            "key": "ETag",
+            "value": "W/\"weak\""
+        }]
+    }))
+    .unwrap();
+    assert!(!add_weak.may_add_response_strong_etag(&ctx, &headers));
+
+    let add_malformed_weak = ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "add",
+            "target": "header",
+            "key": "ETag",
+            "value": "w/\"weak\""
+        }]
+    }))
+    .unwrap();
+    assert!(add_malformed_weak.may_add_response_strong_etag(&ctx, &headers));
+
+    let add_spaced_weak = ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "add",
+            "target": "header",
+            "key": "ETag",
+            "value": "W/ \"weak\""
+        }]
+    }))
+    .unwrap();
+    assert!(add_spaced_weak.may_add_response_strong_etag(&ctx, &headers));
+
+    let rename_to_etag = ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "rename",
+            "target": "header",
+            "key": "X-Origin-Etag",
+            "new_key": "ETag"
+        }]
+    }))
+    .unwrap();
+    assert!(rename_to_etag.may_add_response_strong_etag(&ctx, &headers));
+}
+
 // ── Route-level transform overrides (`apply_route_overrides`) ──────────────
 
 use ferrum_edge::plugins::utils::route_header_transform::{

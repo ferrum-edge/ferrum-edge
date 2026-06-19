@@ -12088,7 +12088,7 @@ components:
 
     CompressionConfig:
       type: object
-      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Honors request/response Cache-Control: no-transform by leaving payloads and representation headers unchanged."
+      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Honors request/response Cache-Control: no-transform by leaving payloads and representation headers unchanged, and preserves strong ETag validators by skipping compression."
       properties:
         algorithms:
           type: array
@@ -12107,10 +12107,6 @@ components:
           items:
             type: string
           description: "Content-type whitelist. Defaults to 10 common text/application types"
-        disable_on_etag:
-          type: boolean
-          default: false
-          description: "Skip compression when the response has an ETag header"
         remove_accept_encoding:
           type: boolean
           default: true

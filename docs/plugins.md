@@ -2638,7 +2638,6 @@ On-the-fly response compression and request decompression. Negotiates the best a
 | `algorithms` | String[] | `["gzip", "br"]` | Enabled algorithms in server preference order (used to break q-value ties). Accepts `"gzip"`, `"br"`, or `"brotli"` (alias for `"br"`). Unknown values, non-string entries, or non-array configs are rejected at plugin load — typos surface immediately rather than producing a partially-functional plugin. An empty array is also rejected |
 | `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes). Only enforced when Content-Length is known at `after_proxy` time — chunked / streamed bodies that bypass the size gate are still compressed once `Content-Encoding` is committed (returning uncompressed bytes with a compressed-encoding header would be malformed) |
 | `content_types` | String[] | 10 defaults | Content-type whitelist (see below) |
-| `disable_on_etag` | bool | `false` | Skip compression when the response has an ETag header |
 | `remove_accept_encoding` | bool | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed |
 | `gzip_level` | u64 | `6` | Gzip compression level (1=fastest, 9=best) |
 | `brotli_quality` | u64 | `4` | Brotli quality (0=fastest, 11=best) |
@@ -2658,7 +2657,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 3. Response is a range response (`206`, `Content-Range`, or an internal range marker)
 4. Response has `Cache-Control: no-transform`
 5. Response already has `Content-Encoding` (no double-compression)
-6. `disable_on_etag` is true and response has an `ETag` header
+6. Response has a strong `ETag` validator. Weak validators (`W/"..."`) remain eligible for compression
 7. Response `Content-Type` is not in the whitelist
 8. Response `Content-Length` is below `min_content_length`
 9. Client did not send `Accept-Encoding` with a supported algorithm
@@ -2670,6 +2669,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 - Forces response body buffering on proxies where this plugin is enabled
 - Request decompression removes `Content-Encoding` and `Content-Length` from the forwarded request headers
 - Requests with `Cache-Control: no-transform` bypass gateway compression/decompression and keep request representation headers intact
+- Strong origin `ETag` validators are preserved by skipping compression; weak ETags can be forwarded with compressed variants
 
 ```yaml
 config:

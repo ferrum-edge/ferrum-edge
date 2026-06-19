@@ -2121,6 +2121,7 @@ async fn test_priority_override_delegates_context_response_body_transform() {
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "compression");
     assert_eq!(plugins[0].priority(), 100);
+    assert!(plugins[0].needs_later_response_strong_etag());
 
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -2142,6 +2143,10 @@ async fn test_priority_override_delegates_context_response_body_transform() {
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
     response_headers.insert("content-length".to_string(), body.len().to_string());
+    assert!(
+        plugins[0]
+            .should_release_response_body_for_later_strong_etag(&ctx, 200, &response_headers,)
+    );
 
     plugins[0]
         .after_proxy(&mut ctx, 200, &mut response_headers)
@@ -2189,7 +2194,7 @@ fn test_priority_override_delegates_response_header_refinement_hooks() {
     let mut security_config = make_plugin_config_with_json(
         "sh1",
         "security_headers",
-        json!({"set": {"Cache-Control": "no-transform"}}),
+        json!({"set": {"Cache-Control": "no-transform", "ETag": "\"late\""}}),
         PluginScope::Proxy,
         Some("p1"),
     );
@@ -2213,6 +2218,7 @@ fn test_priority_override_delegates_response_header_refinement_hooks() {
     assert!(plugins[0].may_modify_response_content_type(&ctx, Some("application/octet-stream")));
     assert_eq!(plugins[1].name(), "security_headers");
     assert!(plugins[1].may_add_response_cache_control_no_transform(&ctx, &response_headers));
+    assert!(plugins[1].may_add_response_strong_etag(&ctx, &response_headers));
 }
 
 #[test]

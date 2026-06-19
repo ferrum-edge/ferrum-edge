@@ -131,6 +131,14 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .may_add_response_cache_control_no_transform(ctx, response_headers)
     }
+    fn may_add_response_strong_etag(
+        &self,
+        ctx: &RequestContext,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        self.inner
+            .may_add_response_strong_etag(ctx, response_headers)
+    }
     fn simulate_after_proxy_response_headers(
         &self,
         ctx: &mut RequestContext,
@@ -141,6 +149,9 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn needs_later_response_cache_control_no_transform(&self) -> bool {
         self.inner.needs_later_response_cache_control_no_transform()
+    }
+    fn needs_later_response_strong_etag(&self) -> bool {
+        self.inner.needs_later_response_strong_etag()
     }
     fn applies_after_proxy_on_reject(&self) -> bool {
         self.inner.applies_after_proxy_on_reject()
@@ -172,6 +183,19 @@ impl Plugin for PriorityOverridePlugin {
     ) -> bool {
         self.inner
             .should_release_response_body_for_later_no_transform(
+                ctx,
+                response_status,
+                response_headers,
+            )
+    }
+    fn should_release_response_body_for_later_strong_etag(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        self.inner
+            .should_release_response_body_for_later_strong_etag(
                 ctx,
                 response_status,
                 response_headers,
