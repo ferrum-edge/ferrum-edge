@@ -118,7 +118,7 @@ fn topology_node_waypoint() {
         feature = "NodeWaypoint topology",
         status = Status::Supported,
         maturity = Maturity::Experimental,
-        notes = "One HBONE listener serves multiple node-local pods; per-pod policy scoping. Experimental: GAP-2M cookie bridge is IPv4-only and the full capture datapath is live-datapath-unverified (CI compile/load-tested only).",
+        notes = "One HBONE listener serves multiple node-local pods; per-pod policy scoping. Experimental: IPv4 datapath is live-gated by the node-waypoint-ebpf-live workflow; IPv6 capture fails closed until the end-to-end path is completed.",
     );
     assert_topology_apply_succeeds(MeshTopology::NodeWaypoint);
 }

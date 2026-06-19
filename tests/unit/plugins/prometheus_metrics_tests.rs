@@ -288,10 +288,27 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
         output.contains("# TYPE ferrum_node_agent_pod_annotation_updates_failed_total counter")
     );
     assert!(output.contains("ferrum_node_agent_pod_annotation_updates_failed_total 4"));
+    assert!(output.contains("# TYPE ferrum_node_agent_capture_state gauge"));
+    assert!(output.contains("ferrum_node_agent_capture_state{state=\"starting\"} 1"));
+    assert!(output.contains("ferrum_node_agent_capture_state{state=\"ready\"} 0"));
     // Nominal topology: gauge emitted as 0 with reason=none so dashboards
     // can always pin the expected value.
     assert!(output.contains("# TYPE ferrum_mesh_node_topology_degraded gauge"));
     assert!(output.contains("ferrum_mesh_node_topology_degraded{reason=\"none\"} 0"));
+}
+
+#[tokio::test]
+async fn test_registry_renders_node_agent_capture_state_condition() {
+    let registry = MetricsRegistry::new();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    metrics.set_capture_state(ferrum_edge::ebpf::NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED);
+
+    registry.set_node_agent_metrics(metrics);
+    let output = registry.render_uncached();
+
+    assert!(output.contains("ferrum_node_agent_capture_state{state=\"partially_attached\"} 1"));
+    assert!(output.contains("ferrum_node_agent_capture_state{state=\"ready\"} 0"));
+    assert!(output.contains("ferrum_node_agent_capture_state{state=\"unavailable\"} 0"));
 }
 
 #[tokio::test]

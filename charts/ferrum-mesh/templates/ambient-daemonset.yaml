@@ -1,4 +1,26 @@
 {{- if .Values.ambient.enabled }}
+{{- $ambientImageRepository := toString .Values.image.repository -}}
+{{- $ambientImageTag := toString .Values.image.tag -}}
+{{- $ambientEnv := default dict .Values.ambient.env -}}
+{{- $ambientTopology := toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY") -}}
+{{- $nodeWaypointRegistryEnabled := eq (lower $ambientTopology) "node_waypoint" -}}
+{{- $nodeAgentProxyMode := lower (toString .Values.nodeAgent.proxyMode) -}}
+{{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
+{{- if $nodeWaypointRegistryEnabled -}}
+{{- if not .Values.nodeAgent.enabled -}}
+{{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.enabled=true" -}}
+{{- end -}}
+{{- if ne $nodeAgentProxyMode "node_waypoint" -}}
+{{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.proxyMode=node_waypoint" -}}
+{{- end -}}
+{{- if ne $nodeAgentCaptureMode "ebpf" -}}
+{{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.captureMode=ebpf" -}}
+{{- end -}}
+{{- end -}}
+{{- if and (or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq (lower $ambientTopology) "node_waypoint")) (not (hasSuffix "-ebpf" $ambientImageTag)) -}}
+{{- $ambientImageTag = printf "%s-ebpf" $ambientImageTag -}}
+{{- end -}}
+{{- $ambientImage := printf "%s:%s" $ambientImageRepository $ambientImageTag -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -22,7 +44,7 @@ spec:
       hostNetwork: true
       containers:
         - name: ferrum-edge
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ $ambientImage | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
           securityContext:
@@ -40,8 +62,24 @@ spec:
           env:
             - name: FERRUM_MESH_CAPTURE_MODE
               value: {{ .Values.ambient.captureMode | quote }}
-            {{- range $name, $value := .Values.ambient.env }}
+            {{- if and $nodeWaypointRegistryEnabled (not (hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR")) }}
+            - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
+              value: {{ .Values.nodeAgent.podRegistryDir | quote }}
+            {{- end }}
+            {{- range $name, $value := $ambientEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
+          {{- if $nodeWaypointRegistryEnabled }}
+          volumeMounts:
+            - name: node-waypoint-pod-registry
+              mountPath: {{ .Values.nodeAgent.podRegistryDir }}
+          {{- end }}
+      {{- if $nodeWaypointRegistryEnabled }}
+      volumes:
+        - name: node-waypoint-pod-registry
+          hostPath:
+            path: {{ .Values.nodeAgent.podRegistryDir }}
+            type: DirectoryOrCreate
+      {{- end }}
 {{- end }}

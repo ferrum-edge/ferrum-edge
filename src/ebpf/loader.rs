@@ -390,6 +390,19 @@ impl EbpfBackend for AyaEbpfBackend {
         Ok(())
     }
 
+    fn validate_startup_ready(&self, require_sock_ops: bool) -> Result<(), String> {
+        if self.bpf.is_none() {
+            return Err("BPF programs are not loaded".to_string());
+        }
+        if self.maps.is_none() {
+            return Err("BPF maps are not initialized".to_string());
+        }
+        if require_sock_ops && self.sock_ops_link_id.is_none() {
+            return Err("SOCK_OPS identity bridge is not attached".to_string());
+        }
+        Ok(())
+    }
+
     fn cleanup_all(&mut self) -> Result<(), String> {
         self.pod_links.clear();
         self.sock_ops_link_id = None;

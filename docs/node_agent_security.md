@@ -104,7 +104,7 @@ capability traces to a specific kernel API used by the code.
 | `CAP_BPF` | Loading BPF programs and creating BPF maps. Available on kernel **≥ 5.8** — split out of `CAP_SYS_ADMIN`. | `bpf(BPF_PROG_LOAD)`, `bpf(BPF_MAP_CREATE)`, `bpf(BPF_*_ELEM)` | `EbpfLoader::load()` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); map updates in [`src/ebpf/maps.rs`](../src/ebpf/maps.rs) |
 | `CAP_NET_ADMIN` | Attaching BPF programs to cgroups (`BPF_PROG_ATTACH` for `BPF_CGROUP_INET_*`/`BPF_CGROUP_SOCK_OPS` types); attaching tc classifiers; managing host veth qdiscs; iptables/ip6tables NAT rules on the fallback path. | `bpf(BPF_PROG_ATTACH)` for cgroup hooks; `tc` netlink (`RTM_NEWTFILTER`); `iptables-restore`/`ip6tables` syscalls. | `attach_cgroup`, `attach_tc`, `attach_sock_ops` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); `execute_iptables_commands` in [`src/modes/node_agent.rs`](../src/modes/node_agent.rs) |
 | `CAP_PERFMON` | Reading BPF program / map info from the kernel (BTF, prog info, map info) on kernel **≥ 5.8**. Split out of `CAP_SYS_ADMIN`. | `bpf(BPF_OBJ_GET_INFO_BY_FD)`, `bpf(BPF_BTF_LOAD)` | `aya::Ebpf::load` BTF resolution; map iteration in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs) |
-| `CAP_SYS_ADMIN` | **Kernel-backcompat only.** On kernel **< 5.8**, `CAP_BPF` and `CAP_PERFMON` do not exist and `CAP_SYS_ADMIN` covers both. The probe in [`src/ebpf/kernel_probe.rs`](../src/ebpf/kernel_probe.rs) accepts kernel ≥ 5.7, so the chart keeps `CAP_SYS_ADMIN` for that one-minor window of 5.7.x. Operators running modern kernels (5.8+) can drop `SYS_ADMIN` via `nodeAgent.security.dropCapSysAdmin=true`. | All of the above | Same as `CAP_BPF` / `CAP_PERFMON` |
+| `CAP_SYS_ADMIN` | Kernel-backcompat for BPF on kernel **< 5.8**. Also required in `node_waypoint` mode on every supported kernel because the agent enters pod network namespaces with `setns()` to resolve host-side veth peers before tc attachment. The chart drops `SYS_ADMIN` for `local_pod` mode on modern kernels but always adds it for `nodeAgent.proxyMode=node_waypoint`. | Older-kernel BPF operations; `setns(CLONE_NEWNET)` for pod-netns veth discovery. | Same as `CAP_BPF` / `CAP_PERFMON`; `discover_host_veth_for_pod` in [`src/ebpf/veth.rs`](../src/ebpf/veth.rs) |
 
 ### Capabilities deliberately NOT requested
 
@@ -208,7 +208,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: ferrum-edge
-          image: ferrumedge/ferrum-edge:0.9.0
+          image: ferrumedge/ferrum-edge:0.9.0-ebpf
           args: ["run"]
           securityContext:
             # Root is required inside the container for BPF cgroup attach;
@@ -224,7 +224,7 @@ spec:
                 - BPF              # kernel >= 5.8; covered by SYS_ADMIN on older
                 - NET_ADMIN        # cgroup/tc attach, iptables fallback
                 - PERFMON          # kernel >= 5.8 BPF info/BTF
-                - SYS_ADMIN        # kernel < 5.8 backcompat; drop on 5.8+
+                - SYS_ADMIN        # required by node_waypoint setns/veth discovery
           volumeMounts:
             - name: bpf-fs
               mountPath: /sys/fs/bpf
@@ -238,6 +238,10 @@ spec:
           env:
             - name: FERRUM_MODE
               value: "node_agent"
+            - name: FERRUM_MESH_CAPTURE_MODE
+              value: "ebpf"
+            - name: FERRUM_NODE_AGENT_PROXY_MODE
+              value: "node_waypoint"
             - name: FERRUM_NODE_AGENT_NODE_NAME
               valueFrom:
                 fieldRef:

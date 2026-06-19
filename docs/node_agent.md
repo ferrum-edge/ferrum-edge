@@ -10,7 +10,7 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 
 | Surface | Name / default | Purpose |
 |---|---|---|
-| Proxy mode | `FERRUM_NODE_AGENT_PROXY_MODE=local_pod` | Selects the capture topology. `local_pod` redirects to the co-located pod proxy. `node_waypoint` drives the sidecarless node-waypoint datapath: per-pod in-netns capture listeners, the GAP-2M socket-cookie bridge, and the pod registry (see below). Implemented; live-datapath-unverified. |
+| Proxy mode | `FERRUM_NODE_AGENT_PROXY_MODE=local_pod` | Selects the capture topology. `local_pod` redirects to the co-located pod proxy. `node_waypoint` drives the sidecarless node-waypoint datapath: per-pod in-netns capture listeners, the GAP-2M socket-cookie bridge, and the pod registry (see below). The remote `node-waypoint-ebpf-live` workflow gates the IPv4 datapath; IPv6 fails closed until end-to-end capture is completed. |
 | Admin listener | `FERRUM_NODE_AGENT_ADMIN_ENABLED=false` | Opts in to the read-only admin listener for node-agent metrics/health. When enabled, `FERRUM_ADMIN_HTTP_PORT` controls the port and the listener defaults to loopback unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set. |
 | Outbound capture port | `15001` | The port written into the BPF capture config map and used by cgroup connect hooks when rewriting outbound sockets. |
 | HBONE redirect port | `FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT=15008` | The HBONE listener/redirect port carried in the same BPF config map for sidecarless topologies. Must match the mesh proxy HBONE listener (`15008` today). Node-agent startup automatically adds this port to outbound capture exclusions. |
@@ -50,7 +50,8 @@ When node-agent mode starts its admin listener, `/metrics` includes:
 | `ferrum_node_agent_attach_errors_total` | BPF attachment or map update failures. |
 | `ferrum_node_agent_pod_annotation_updates_applied_total` | Mid-life `includeOutboundPorts` annotation changes successfully re-applied to the BPF map (excludes initial enrollment, excludes diff-skipped Modified events). |
 | `ferrum_node_agent_pod_annotation_updates_failed_total` | Mid-life `includeOutboundPorts` annotation changes that failed to re-apply (annotation parse error or BPF map write error). The pod retains its previous policy. Cgroup-id-unavailable retries (Pod object reached the watcher before kubelet finished creating the cgroup) are not counted here — they are retried on the next Apply event. |
-| `ferrum_mesh_node_topology_degraded{reason}` | Gauge. `1` with `reason` ∈ {`kernel_too_old`,`cgroup_v1`,`bpffs_missing`} when the node detects eBPF prerequisites are missing, or `reason="ebpf_feature_disabled"` when the kernel supports eBPF but this binary was built without `--features ebpf` and fell back to the mock backend (NO capture occurs). `0` with `reason="none"` when the eBPF capture path is nominal. Cardinality is bounded per node (a single series at a time). Set once at startup after the kernel probe / backend selection runs. |
+| `ferrum_node_agent_capture_state{state}` | Gauge. Exactly one state is `1`: `starting`, `ready`, `unavailable`, `partially_attached`, `identity_bridge_unavailable`, or `node_global_fallback`. Readiness is only reported after startup BPF maps/programs are loaded and, in NodeWaypoint mode, the SOCK_OPS identity bridge is attached. |
+| `ferrum_mesh_node_topology_degraded{reason}` | Gauge. `1` with `reason` ∈ {`kernel_too_old`,`cgroup_v1`,`bpffs_missing`,`ebpf_feature_disabled`,`capture_mode_not_ebpf`,`capture_unavailable`,`node_waypoint_sock_ops_unavailable`} when startup cannot provide the requested eBPF topology. `0` with `reason="none"` when the eBPF capture path is nominal. Cardinality is bounded per node (a single series at a time). |
 
 ## eBPF build and capture (how to build the capture image)
 
@@ -68,9 +69,12 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   `Dockerfile.release` with `--features cloud-secrets`. That Dockerfile has
 >   **no `ebpf-builder` stage, no compiled ELF, and does not set
 >   `FERRUM_NODE_AGENT_BPF_ELF_PATH`** — so this node-agent always selects the
->   mock backend: it attaches nothing, captures nothing, sets
->   `ferrum_mesh_node_topology_degraded{reason="ebpf_feature_disabled"}=1`, and
->   logs a loud startup warning. The default image is unchanged.
+>   mock backend. In `FERRUM_MODE=node_agent` with
+>   `FERRUM_MESH_CAPTURE_MODE=ebpf`, startup refuses that backend, sets
+>   `ferrum_mesh_node_topology_degraded{reason="ebpf_feature_disabled"}=1` and
+>   `ferrum_node_agent_capture_state{state="unavailable"}=1`, then exits. The
+>   default binary can still run non-capture modes, but it cannot report Ready
+>   for an enabled eBPF node-agent topology.
 > - **`-ebpf` (real capture, Linux-only).**
 >   `ferrumedge/ferrum-edge:<tag>-ebpf` /
 >   `ghcr.io/ferrum-edge/ferrum-edge:<tag>-ebpf` are built **from source** by
@@ -83,6 +87,9 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   [`docs/node_agent_security.md`](node_agent_security.md): on kernel ≥ 5.8
 >   `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`; on the 5.7.x window `CAP_SYS_ADMIN`
 >   (+ `CAP_NET_ADMIN`), because `CAP_BPF`/`CAP_PERFMON` did not exist until 5.8.
+>   `node_waypoint` mode additionally requires `CAP_SYS_ADMIN` on all supported
+>   kernels because enrollment enters pod network namespaces with `setns()` to
+>   resolve host-side veth peers before attaching inbound tc programs.
 >   On a node that fails the kernel/cgroup/bpffs probe the `-ebpf` pod does **not**
 >   silently degrade to the mock backend: `run()` hands off to `handle_fallback`,
 >   whose default `FERRUM_NODE_AGENT_FALLBACK_MODE=fail` returns an error and the
@@ -121,9 +128,10 @@ binary are produced by the root `Dockerfile` (also exercised by the
 - The main binary must be built with `--build-arg FEATURES=cloud-secrets,ebpf`
   to compile in the aya loader. A root-`Dockerfile` image built with the
   **default** `FEATURES=cloud-secrets` (no `ebpf`) still builds and runs and
-  ships the ELF, but — lacking the aya loader — falls back to the same mock
-  backend as the release image (gauge + loud startup warning, no capture). The
-  mock backend is the explicit, observable fallback — never a silent no-op.
+  ships the ELF, but — lacking the aya loader — would otherwise select the same
+  mock backend as the release image. Enabled eBPF node-agent mode rejects that
+  backend before readiness, sets the degraded/capture-state metrics, and exits
+  instead of silently reporting Ready.
 
 **Non-eBPF builds stay working.** Local `cargo build`/`cargo test` on any
 platform compile the mock backend and the no-op orig-dst bridge stub. The
@@ -150,25 +158,26 @@ pipeline:
    mirrors each cookie→identity record into the `NodeWaypointIdentityResolver`
    (`record_orig_dst4`/`record_orig_dst6`).
 
-> **Caveat — IPv4 landed (live-datapath-unverified); IPv6 fails closed.** The
+> **Caveat — IPv4 live-gated; IPv6 fails closed.** The
 > connect-side vs accept-side cookie mismatch — the bridge mirrors records keyed
 > by the **connect-side** socket cookie, but the proxy accept path resolves by
 > the **accepted** socket's cookie — is now bridged by the kernel `sock_ops`
-> program (GAP-2M): at active-established it re-keys the IPv4 record by
-> `(netns cookie, connection 4-tuple)`, and at passive-established it re-stamps
-> it under the accept-side cookie, so `resolve_stream` matches the mirrored
+> program (GAP-2M): at active-established it re-keys the IPv4 or IPv6 record by
+> `(netns cookie, connection tuple)`, and at passive-established it re-stamps it
+> under the accept-side cookie, so `resolve_stream` matches the mirrored
 > record. Pod-UID resolution (`identities_by_pod_uid`) is also wired — the
 > resolver lazily enrolls `pod_uid`→identity by hash-joining the slice's
 > `workload_spiffe_hash`→SPIFFE index against the eBPF-stamped record. If two
 > SPIFFE IDs collide on that truncated hash, the proxy marks the hash unusable
-> and fails closed instead of picking either identity. Two
-> caveats remain: **(1) IPv4 only** — aya's IPv6 `sock_ops` ctx accessors trip
-> the verifier, so IPv6 (and the v6 half of dual-stack) accepts get no
-> accept-side record and stay fail-closed; **(2)** the full
-> connect→capture→accept datapath is CI compile- and load/attach-tested but
-> **not yet verified on a live multi-pod node**. On any tuple/byte-order
-> mismatch (or an IPv6 accept) no accept-side record is written and the accept
-> path resolves no identity (fail-closed, never misattributed).
+> and fails closed instead of picking either identity. The remaining blocker is
+> not the accept-side cookie bridge; it is the end-to-end IPv6 capture path. The
+> NodeWaypoint in-netns listener is IPv4-loopback only today, and the node-agent
+> sets `ipv6_outbound_deny` so captured IPv6 egress fails closed in `connect6`
+> before admission. The full IPv4 connect→capture→accept datapath is now gated by
+> the Docker/kind `node-waypoint-ebpf-live` GitHub Actions workflow, which runs
+> on a two-worker Linux cluster and collects BPF link/map evidence. On any
+> tuple/byte-order/enrollment miss no accept-side record is written and the
+> accept path resolves no identity (fail-closed, never misattributed).
 
 The bridge polls (the orig-dst maps are LRU hash maps, not ringbufs), ages out
 cookies the kernel evicted, retries with backoff if the mesh-proxy starts
@@ -177,16 +186,12 @@ before the node-agent pins the maps, and re-opens on a pin-inode change
 that no capture runs and returns — the resolver stays empty and every
 node-waypoint accept fails closed.
 
-> **Remaining verification step.** The userspace bridge, BPF map declarations,
-> identity stamping, ABI types, Docker build wiring, and all non-kernel tests
-> are implemented and pass. End-to-end kernel verification (load the ELF on a
-> live ≥5.7 node and confirm `connect()` populates `FERRUM_ORIG_DST*` with a
-> real `pod_uid`) requires a Linux node with the BPF toolchain and could not be
-> run in the development environment; run the `ebpf-builder` Docker stage and a
-> node-waypoint smoke deploy on a real kernel to close it out. That smoke test
-> validates capture + connect-side stamping only — accept-path source-identity
-> resolution additionally requires the GAP-2M cookie correlation described in
-> the staging caveat above.
+> **Remote verification.** The userspace bridge, BPF map declarations, identity
+> stamping, ABI types, Docker build wiring, and non-kernel tests are covered by
+> the regular suite. End-to-end kernel verification runs in the
+> `node-waypoint-ebpf-live` workflow: it builds the `-ebpf` image, loads it into
+> a disposable dual-stack kind cluster, validates BPF attachments/maps, and
+> exercises same-node and cross-node policy-scoped traffic.
 
 ## Pod registry for in-netns capture listeners (node-waypoint)
 
@@ -202,6 +207,17 @@ maps:
 |---|---|---|
 | Pod registry dir | `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` (default `/run/ferrum/node-waypoint-pods`) | One file per enrolled pod. File **name** = pod UID; file **contents** = the pod cgroup path. |
 
+Helm sets `nodeAgent.podRegistryDir` to that default and, when
+`nodeAgent.proxyMode=node_waypoint`, mounts it as the same writable hostPath in
+both the node-agent and ambient DaemonSets. If operators override the path,
+both processes must see the same host directory; a container-local directory
+lets both pods report Ready while no in-netns capture listener is attached for
+workloads. The chart rejects incomplete NodeWaypoint topologies at render time:
+ambient `FERRUM_MESH_TOPOLOGY=node_waypoint` requires
+`nodeAgent.enabled=true`, `nodeAgent.captureMode=ebpf`, and
+`nodeAgent.proxyMode=node_waypoint`, and node-agent `proxyMode=node_waypoint`
+requires the matching ambient proxy.
+
 The node-agent **writes** a pod's registry file on enrollment and **removes**
 it on teardown. The mesh proxy's `NetnsCaptureManager` polls this directory and
 reconciles one in-netns listener per pod (opening on add, closing on removal).
@@ -215,16 +231,17 @@ newly started workloads cannot open direct IPv4 egress connections that bypass
 connections may be refused, but they fail closed instead of bypassing policy.
 The inbound `getpeername4`/`getpeername6` programs are also attached during
 enrollment. `connect6` is attached immediately as a **fail-closed IPv6 denier**:
-the in-netns listener and GAP-2M bridge are IPv4-only, so the node-agent sets
-the `ipv6_outbound_deny` capture-config flag and `connect6` returns `EPERM` for
+the in-netns listener is IPv4-only, so the node-agent sets the
+`ipv6_outbound_deny` capture-config flag and `connect6` returns `EPERM` for
 captured IPv6 instead of redirecting it (or letting it bypass `mesh_authz`).
 Excluded v6 (CIDR/port excludes) still flows. The proxy may write
 `<registry_dir>/.ready/<pod_uid>` once it has opened that pod's in-netns
 listener for observability and stale-listener cleanup; the `.ready` subdir is a
 dotfile and is skipped by the pod-discovery scan.
 
-This is Linux-only and, like the rest of the in-netns datapath, is
-implemented but live-datapath-unverified (it needs a live multi-pod node).
+This is Linux-only and, like the rest of the in-netns datapath, is gated by the
+remote `node-waypoint-ebpf-live` workflow because it needs a live multi-pod
+node.
 
 ## Kernel Fallback
 
@@ -234,7 +251,7 @@ The node agent probes the kernel once at startup (see `KernelProbeResult::suppor
 2. cgroup v2 mounted at `FERRUM_NODE_AGENT_CGROUP_ROOT` (default `/sys/fs/cgroup`).
 3. bpffs mounted at `FERRUM_NODE_AGENT_BPF_FS_PATH` (default `/sys/fs/bpf`).
 
-If any prerequisite is missing, the node agent fails fast by default. It logs the first-failing prerequisite as `degradation_reason`, sets the `ferrum_mesh_node_topology_degraded{reason="<...>"}` gauge to `1` during startup, and exits. `FERRUM_NODE_AGENT_FALLBACK_MODE` controls the behaviour:
+If any prerequisite is missing, the node agent fails fast by default. It logs the first-failing prerequisite as `degradation_reason`, sets `ferrum_mesh_node_topology_degraded{reason="<...>"}` to `1`, sets `ferrum_node_agent_capture_state{state="unavailable"}` to `1`, and exits. `FERRUM_NODE_AGENT_FALLBACK_MODE` controls the behaviour:
 
 | Value | Behaviour |
 |---|---|
@@ -247,7 +264,7 @@ Suggested remediations by reason label:
 |---|---|
 | `kernel_too_old` | Upgrade the node to a kernel >= 5.7. Most modern distributions (RHEL 9 / Ubuntu 22.04 / Debian 12 / Amazon Linux 2023) already satisfy this. |
 | `cgroup_v1` | Mount the unified cgroup v2 hierarchy (`systemd.unified_cgroup_hierarchy=1` on systemd hosts). cgroup_sockaddr BPF programs require cgroup v2 and cannot attach to the v1 hierarchy. |
-| `bpffs_missing` | Mount `bpffs` at the configured `FERRUM_NODE_AGENT_BPF_FS_PATH`: `mount -t bpf bpffs /sys/fs/bpf`. The DaemonSet manifest in `charts/ferrum-node-agent/` mounts this automatically when configured. |
+| `bpffs_missing` | Mount `bpffs` at the configured `FERRUM_NODE_AGENT_BPF_FS_PATH`: `mount -t bpf bpffs /sys/fs/bpf`. The DaemonSet manifest in `charts/ferrum-mesh/` mounts this automatically when configured. |
 
 ### Mixed-kernel clusters
 

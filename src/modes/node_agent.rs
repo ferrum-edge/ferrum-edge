@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::capture::{
-    CaptureConfig, FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
+    CaptureConfig, CaptureMode, FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
     ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION, IncludeOutboundPorts, Ip6TablesMode, IptablesPlan,
     XTABLES_LOCK_WAIT_SECONDS, include_outbound_ports_from_annotations,
 };
@@ -38,7 +38,10 @@ use crate::ebpf::pod_watcher::{self, EnrollmentDecision};
 use crate::ebpf::veth;
 use crate::ebpf::{
     CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, INCLUDE_PORTS_MAX,
-    IncludePortsPolicy, NodeAgentMetrics, NodeAgentProxyMode, PodAttachmentState, PodInfo,
+    IncludePortsPolicy, NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE,
+    NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK, NODE_AGENT_CAPTURE_STATE_READY,
+    NODE_AGENT_CAPTURE_STATE_UNAVAILABLE, NodeAgentMetrics, NodeAgentProxyMode, PodAttachmentState,
+    PodInfo,
 };
 use crate::modes::node_agent_cni_server::{
     self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
@@ -240,7 +243,7 @@ pub async fn run(
         )
         .await
     } else {
-        let backend = create_backend(&metrics);
+        let backend = create_backend(&config, &metrics)?;
         run_with_backend(
             backend,
             &config,
@@ -410,31 +413,30 @@ fn decide_admin_bind_address(
     Ok(std::net::SocketAddr::new(configured_ip, port))
 }
 
-fn create_backend(metrics: &Arc<NodeAgentMetrics>) -> Box<dyn EbpfBackend> {
+fn create_backend(
+    config: &NodeAgentConfig,
+    metrics: &Arc<NodeAgentMetrics>,
+) -> Result<Box<dyn EbpfBackend>, anyhow::Error> {
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     {
-        let _ = metrics;
-        Box::new(crate::ebpf::AyaEbpfBackend::new())
+        let _ = (config, metrics);
+        Ok(Box::new(crate::ebpf::AyaEbpfBackend::new()))
     }
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     {
         // The kernel probe said this node CAN run eBPF capture, but THIS
         // binary was built without the `ebpf` feature (or for a non-Linux
-        // target), so the mock backend attaches nothing. Capture does not
-        // happen. Surface this loudly and set the degraded gauge so the
-        // condition is observable instead of silently no-op'ing as if the
-        // node were healthy. This is the explicit fallback the build-out
-        // policy allows, not a recommended production posture.
+        // target), so the mock backend would attach nothing. Refuse startup
+        // and set observable degraded state instead of silently no-op'ing as
+        // if the node were healthy.
+        let _ = config;
         metrics.set_topology_degraded("ebpf_feature_disabled");
-        warn!(
-            "Node-agent is using the MOCK eBPF backend: NO traffic capture occurs. \
-             The kernel supports eBPF, but this binary was built without `--features ebpf` \
-             (or for a non-Linux target). Pods will NOT be redirected through the mesh proxy. \
-             Set ferrum_mesh_node_topology_degraded{{reason=\"ebpf_feature_disabled\"}}=1. \
-             Rebuild with --features ebpf (Linux) and use the node-agent image that ships \
-             the ferrum-ebpf ELF to enable capture."
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        anyhow::bail!(
+            "node-agent eBPF capture requires a Linux binary built with --features ebpf. \
+             This binary would select the mock backend, which attaches nothing and captures \
+             no traffic. Use the -ebpf image variant or rebuild with FEATURES=cloud-secrets,ebpf."
         );
-        Box::new(crate::ebpf::MockEbpfBackend::default())
     }
 }
 
@@ -1803,7 +1805,7 @@ fn handle_pod_added(
         for prog in programs {
             if let Err(e) = backend.attach_cgroup(pod_uid, cgroup, prog) {
                 warn!(pod_uid, program = prog, error = %e, "Failed to attach cgroup program");
-                metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                metrics.record_attach_error();
                 attach_ok = false;
                 break;
             }
@@ -1816,7 +1818,7 @@ fn handle_pod_added(
                     namespace,
                     "Could not resolve pod veth interface, skipping attachment"
                 );
-                metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                metrics.record_attach_error();
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                 remember_failed_pod_enrollment(
                     &state_key,
@@ -1828,7 +1830,7 @@ fn handle_pod_added(
 
             if let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound") {
                 warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
-                metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                metrics.record_attach_error();
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                 remember_failed_pod_enrollment(
                     &state_key,
@@ -1844,7 +1846,7 @@ fn handle_pod_added(
                 };
                 if let Err(e) = backend.update_pod_ip(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
-                    metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                    metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                     remember_failed_pod_enrollment(
                         &state_key,
@@ -1874,7 +1876,7 @@ fn handle_pod_added(
             pod_uid,
             pod_name, "Could not resolve cgroup path, skipping attachment"
         );
-        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+        metrics.record_attach_error();
         remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
         return;
     }
@@ -1916,7 +1918,7 @@ fn reconcile_existing_pod_ip(
     };
     if let Err(e) = backend.update_pod_ip(new_ip, &info) {
         warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IP map for existing pod");
-        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+        metrics.record_attach_error();
         return None;
     }
     let old_ip = state.pod_ip;
@@ -1954,7 +1956,7 @@ fn remove_pod_ip_if_unowned(
     }
     if let Err(e) = backend.remove_pod_ip(ip) {
         warn!(pod_uid, %ip, error = %e, removal_reason, "Failed to remove pod IP from map");
-        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+        metrics.record_attach_error();
     }
 }
 
@@ -2420,6 +2422,7 @@ where
     // caller that probes more capability bits than the helper checks).
     let reason = probe.degradation_reason().unwrap_or("unknown");
     metrics.set_topology_degraded(reason);
+    metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
 
     match config.fallback_mode {
         FallbackMode::Iptables => {
@@ -2506,6 +2509,7 @@ where
                 }
                 return Err(setup_err);
             }
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK);
             startup_ready.store(true, Ordering::Release);
 
             info!("Iptables fallback rules applied, awaiting shutdown signal");
@@ -2715,29 +2719,56 @@ fn initialize_backend(
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
 ) -> Result<(), anyhow::Error> {
-    backend.load_programs().map_err(anyhow::Error::msg)?;
-    backend
-        .update_capture_config(&config.capture_contract.bpf_capture_config())
-        .map_err(anyhow::Error::msg)?;
+    if config.capture_config.mode != CaptureMode::Ebpf {
+        metrics.set_topology_degraded("capture_mode_not_ebpf");
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        anyhow::bail!(
+            "node_agent mode requires FERRUM_MESH_CAPTURE_MODE=ebpf for the managed capture backend; \
+             got {:?}. Use the explicit injector path or set FERRUM_NODE_AGENT_FALLBACK_MODE=iptables \
+             only for explicit node-global fallback on unsupported kernels.",
+            config.capture_config.mode
+        );
+    }
 
-    if let Some(uid) = config.capture_config.proxy_uid {
-        backend.update_bypass_uid(uid).map_err(anyhow::Error::msg)?;
+    if let Err(e) = backend.load_programs() {
+        metrics.set_topology_degraded("capture_unavailable");
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        return Err(anyhow::Error::msg(e));
+    }
+    if let Err(e) = backend.update_capture_config(&config.capture_contract.bpf_capture_config()) {
+        metrics.set_topology_degraded("capture_unavailable");
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        return Err(anyhow::Error::msg(e));
+    }
+
+    if let Some(uid) = config.capture_config.proxy_uid
+        && let Err(e) = backend.update_bypass_uid(uid)
+    {
+        metrics.set_topology_degraded("capture_unavailable");
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        return Err(anyhow::Error::msg(e));
     }
 
     for cidr in &config.capture_config.include_cidrs {
-        backend
-            .update_cidr_include(cidr)
-            .map_err(anyhow::Error::msg)?;
+        if let Err(e) = backend.update_cidr_include(cidr) {
+            metrics.set_topology_degraded("capture_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+            return Err(anyhow::Error::msg(e));
+        }
     }
     for cidr in &config.capture_config.exclude_cidrs {
-        backend
-            .update_cidr_exclude(cidr)
-            .map_err(anyhow::Error::msg)?;
+        if let Err(e) = backend.update_cidr_exclude(cidr) {
+            metrics.set_topology_degraded("capture_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+            return Err(anyhow::Error::msg(e));
+        }
     }
     for port in &config.capture_config.exclude_ports {
-        backend
-            .update_port_exclude(*port)
-            .map_err(anyhow::Error::msg)?;
+        if let Err(e) = backend.update_port_exclude(*port) {
+            metrics.set_topology_degraded("capture_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+            return Err(anyhow::Error::msg(e));
+        }
     }
     // Per-pod `includeOutboundPorts` narrowing is applied later in
     // `handle_pod_added` via `apply_include_outbound_ports` because the
@@ -2746,29 +2777,48 @@ fn initialize_backend(
     // node-global shape (CIDR includes/excludes, port excludes, proxy
     // UID bypass).
 
-    if config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint {
+    let require_sock_ops = config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint;
+    if require_sock_ops {
         // SOCK_OPS at the cgroup root carries BOTH TCP-layer telemetry AND the
         // GAP-2M accept-side cookie bridge that node-waypoint per-pod identity
         // resolution depends on. A failure here is therefore not merely lost
         // counters: with no accept-side cookie stamping, every node-waypoint
         // connection resolves `UnknownCookie` and scoped authz fails closed.
         // Surface it as topology degradation (gauge + error) — not a quiet
-        // telemetry warning — so operators see identity resolution is down even
-        // though cgroup/tc capture continues.
+        // telemetry warning — and refuse readiness so operators see identity
+        // resolution is down before traffic is admitted.
         if let Err(e) = backend.attach_sock_ops(&config.cgroup_root) {
             metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE);
             error!(
                 cgroup_root = %config.cgroup_root,
                 error = %e,
                 "Failed to attach SOCK_OPS in node-waypoint mode: the GAP-2M accept-side \
-                 cookie bridge is not running, so per-pod source-identity resolution is \
-                 disabled and scoped node-waypoint authz will fail closed (TCP-layer \
-                 telemetry is also lost). cgroup/tc capture continues. Set \
+                 cookie bridge is not running, so per-pod source-identity resolution would \
+                 be disabled and scoped node-waypoint authz would fail closed (TCP-layer \
+                 telemetry is also lost). Refusing startup so /health cannot report Ready \
+                 for a partially attached node-waypoint topology. Set \
                  ferrum_mesh_node_topology_degraded{{reason=\"node_waypoint_sock_ops_unavailable\"}}=1."
+            );
+            anyhow::bail!(
+                "node-waypoint eBPF capture requires the SOCK_OPS identity bridge to attach; \
+                 source workload identity resolution would be unavailable: {e}"
             );
         }
     }
 
+    if let Err(e) = backend.validate_startup_ready(require_sock_ops) {
+        if require_sock_ops && e.contains("SOCK_OPS") {
+            metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE);
+        } else {
+            metrics.set_topology_degraded("capture_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        }
+        anyhow::bail!("node-agent eBPF startup validation failed: {e}");
+    }
+
+    metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
     info!("BPF programs loaded and maps initialized");
     Ok(())
 }
@@ -2947,7 +2997,8 @@ mod tests {
         };
 
         let mut backend = MockEbpfBackend::default();
-        initialize_backend(&mut backend, &config, &NodeAgentMetrics::default()).unwrap();
+        let metrics = NodeAgentMetrics::default();
+        initialize_backend(&mut backend, &config, &metrics).unwrap();
 
         assert!(backend.programs_loaded);
         assert_eq!(backend.bypass_uids, vec![1337]);
@@ -2959,13 +3010,19 @@ mod tests {
             Some(config.capture_contract.bpf_capture_config())
         );
         assert!(backend.sock_ops_attached_cgroup_root.is_none());
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY
+        );
     }
 
     #[test]
     fn initialize_backend_attaches_sock_ops_for_node_waypoint() {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
         let mut config = NodeAgentConfig {
             node_name: "test-node".to_string(),
-            capture_config: CaptureConfig::explicit(15006, 15001),
+            capture_config,
             cgroup_root: "/sys/fs/cgroup".to_string(),
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
@@ -2977,19 +3034,26 @@ mod tests {
         config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
 
         let mut backend = MockEbpfBackend::default();
-        initialize_backend(&mut backend, &config, &NodeAgentMetrics::default()).unwrap();
+        let metrics = NodeAgentMetrics::default();
+        initialize_backend(&mut backend, &config, &metrics).unwrap();
 
         assert_eq!(
             backend.sock_ops_attached_cgroup_root.as_deref(),
             Some("/sys/fs/cgroup")
         );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY
+        );
     }
 
     #[test]
     fn initialize_backend_node_waypoint_sock_ops_failure_marks_degraded() {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
         let mut config = NodeAgentConfig {
             node_name: "test-node".to_string(),
-            capture_config: CaptureConfig::explicit(15006, 15001),
+            capture_config,
             cgroup_root: "/sys/fs/cgroup".to_string(),
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
@@ -3005,23 +3069,28 @@ mod tests {
         };
         let metrics = NodeAgentMetrics::default();
 
-        // Init still succeeds — cgroup/tc capture is unaffected — but the
-        // SOCK_OPS failure (which carries the GAP-2M identity bridge) must
-        // surface as topology degradation, not a silent telemetry warning.
-        initialize_backend(&mut backend, &config, &metrics).unwrap();
+        let err = initialize_backend(&mut backend, &config, &metrics)
+            .expect_err("missing identity bridge must fail startup");
 
         assert!(backend.sock_ops_attached_cgroup_root.is_none());
+        assert!(err.to_string().contains("SOCK_OPS identity bridge"));
         assert_eq!(
             metrics.snapshot().topology_degraded_reason,
             Some("node_waypoint_sock_ops_unavailable")
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE
         );
     }
 
     #[test]
     fn initialize_backend_capture_config_failure_is_fatal() {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
-            capture_config: CaptureConfig::explicit(15006, 15001),
+            capture_config,
             cgroup_root: "/sys/fs/cgroup".to_string(),
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
@@ -3035,12 +3104,17 @@ mod tests {
             ..MockEbpfBackend::default()
         };
 
-        let err = initialize_backend(&mut backend, &config, &NodeAgentMetrics::default())
+        let metrics = NodeAgentMetrics::default();
+        let err = initialize_backend(&mut backend, &config, &metrics)
             .expect_err("capture-config failure should abort initialization");
 
         assert!(err.to_string().contains("capture config update failed"));
         assert!(backend.programs_loaded);
         assert!(backend.capture_config.is_none());
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_UNAVAILABLE
+        );
     }
 
     #[test]
@@ -3290,6 +3364,11 @@ mod tests {
             Some("kernel_too_old"),
             "kernel-version failure should set the degraded gauge"
         );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK,
+            "explicit iptables fallback should be observable as node-global fallback"
+        );
     }
 
     #[tokio::test]
@@ -3344,6 +3423,10 @@ mod tests {
         assert!(result.is_err());
         assert!(!startup_ready.load(Ordering::Acquire));
         assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_UNAVAILABLE
+        );
+        assert_eq!(
             *phases.lock().expect("phases mutex"),
             // The unconditional pre-setup UDP teardown (codex r4) always runs
             // first to reap stale UDP state from a prior UDP-enabled run, before
@@ -3363,6 +3446,10 @@ mod tests {
         assert_eq!(
             metrics.snapshot().topology_degraded_reason,
             Some("kernel_too_old"),
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_UNAVAILABLE,
         );
     }
 
@@ -5570,6 +5657,10 @@ mod tests {
             metrics.snapshot().topology_degraded_reason,
             Some("cgroup_v1"),
         );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK,
+        );
     }
 
     #[tokio::test]
@@ -6740,16 +6831,37 @@ mod tests {
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     #[test]
     fn create_backend_sets_degraded_gauge_without_ebpf_feature() {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
         let metrics = Arc::new(NodeAgentMetrics::default());
         assert_eq!(metrics.snapshot().topology_degraded_reason, None);
 
-        let _backend = create_backend(&metrics);
+        let err = match create_backend(&config, &metrics) {
+            Ok(_) => panic!("mock backend must not start for enabled eBPF capture"),
+            Err(err) => err,
+        };
 
         assert_eq!(
             metrics.snapshot().topology_degraded_reason,
             Some("ebpf_feature_disabled"),
             "mock-backend fallback must mark the node topology degraded"
         );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_UNAVAILABLE
+        );
+        assert!(err.to_string().contains("--features ebpf"));
     }
 
     /// GAP-1b: the workload identity the node-agent writes to
