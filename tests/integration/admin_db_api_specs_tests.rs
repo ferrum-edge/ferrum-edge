@@ -2756,15 +2756,16 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         .await
         .expect("initial submit failed");
 
-    // Create a global plugin and associate it with the proxy manually (simulating
-    // an operator adding a shared plugin after spec creation via direct admin API).
-    let global_plugin_id = uid("global-plugin");
-    let global_plugin = PluginConfig {
-        id: global_plugin_id.clone(),
+    // Create a proxy-group plugin and associate it with the proxy manually
+    // (simulating an operator adding a shared plugin after spec creation via
+    // direct admin API).
+    let manual_plugin_id = uid("proxy-group-plugin");
+    let manual_plugin = PluginConfig {
+        id: manual_plugin_id.clone(),
         namespace: ns.to_string(),
         plugin_name: "cors".to_string(),
         config: serde_json::json!({}),
-        scope: PluginScope::Global,
+        scope: PluginScope::ProxyGroup,
         proxy_id: None,
         enabled: true,
         priority_override: None,
@@ -2773,9 +2774,9 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         updated_at: chrono::Utc::now(),
     };
     store
-        .create_plugin_config(&global_plugin)
+        .create_plugin_config(&manual_plugin)
         .await
-        .expect("create global plugin failed");
+        .expect("create proxy-group plugin failed");
 
     // Add the junction row manually (direct DB update to proxy.plugins).
     let proxy_with_manual = {
@@ -2785,7 +2786,7 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
             .expect("get_proxy failed")
             .expect("proxy must exist");
         p.plugins.push(PluginAssociation {
-            plugin_config_id: global_plugin_id.clone(),
+            plugin_config_id: manual_plugin_id.clone(),
         });
         p
     };
@@ -2817,17 +2818,17 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         .await
         .expect("replace failed");
 
-    // The global plugin itself must still exist (not deleted).
-    let global_row = store
-        .get_plugin_config(&global_plugin_id)
+    // The proxy-group plugin itself must still exist (not deleted).
+    let manual_row = store
+        .get_plugin_config(&manual_plugin_id)
         .await
         .expect("get_plugin_config failed");
     assert!(
-        global_row.is_some(),
-        "global plugin must still exist after replace"
+        manual_row.is_some(),
+        "proxy-group plugin must still exist after replace"
     );
 
-    // The proxy's plugin associations must include the global plugin.
+    // The proxy's plugin associations must include the manual proxy-group plugin.
     let proxy_after = store
         .get_proxy(&proxy_id)
         .await
@@ -2839,8 +2840,8 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         .map(|a| a.plugin_config_id.as_str())
         .collect();
     assert!(
-        plugin_ids.contains(&global_plugin_id.as_str()),
-        "manual global plugin association must be preserved after replace; \
+        plugin_ids.contains(&manual_plugin_id.as_str()),
+        "manual proxy-group plugin association must be preserved after replace; \
          proxy.plugins = {:?}",
         plugin_ids
     );
