@@ -2444,26 +2444,41 @@ fn reject_result_to_backend_response(
     }
 }
 
-/// Outcome of [`ProxyState::apply_incremental`].
+/// Outcome of applying a candidate gateway configuration.
 ///
-/// The DB polling loop in `src/modes/database.rs` distinguishes these states
-/// to decide whether to advance `last_poll_at` (the `since` cursor for the
-/// next incremental query). Empty results and applied changes both mean the
-/// poll completed safely and the cursor must move forward; rejected updates
-/// must leave the cursor untouched so the next poll re-fetches the same rows
-/// and gets another chance to apply them. Without that, a row whose
-/// `updated_at` falls outside the 1-second `since_safe` margin would silently
-/// disappear from the gateway's view of the DB, leaving permanent
-/// divergence between DB state and in-memory config until a full reload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IncrementalApplyOutcome {
-    /// Changes were applied to in-memory config.
+/// `Applied` and `Unchanged` both mean the candidate was accepted. `Rejected`
+/// means validation/building failed and callers must keep their previous
+/// bookkeeping (poll cursor, known-ID sets, staged side effects) unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigApplyOutcome {
+    /// Changes were published to in-memory config.
     Applied,
-    /// `IncrementalResult` was empty — nothing to apply, no error.
-    NoChanges,
-    /// Validation rejected the patched config; in-memory config unchanged.
-    /// Callers tracking a `since` cursor MUST NOT advance it on this outcome.
-    Rejected,
+    /// Candidate was valid and equivalent to the active runtime config.
+    Unchanged,
+    /// Validation or cache construction rejected the candidate.
+    Rejected { errors: Vec<String> },
+}
+
+impl ConfigApplyOutcome {
+    #[inline]
+    pub fn accepted(&self) -> bool {
+        matches!(self, Self::Applied | Self::Unchanged)
+    }
+
+    #[inline]
+    pub fn applied(&self) -> bool {
+        matches!(self, Self::Applied)
+    }
+
+    fn rejected(errors: Vec<String>) -> Self {
+        Self::Rejected { errors }
+    }
+
+    fn rejected_one(error: impl Into<String>) -> Self {
+        Self::Rejected {
+            errors: vec![error.into()],
+        }
+    }
 }
 
 /// Shared state for the proxy engine.
@@ -5819,8 +5834,8 @@ impl ProxyState {
         self.config.store(Arc::clone(&published.config));
     }
 
-    /// Update the proxy configuration. Returns `true` if changes were applied.
-    pub fn update_config(&self, mut new_config: GatewayConfig) -> bool {
+    /// Update the proxy configuration.
+    pub fn update_config(&self, mut new_config: GatewayConfig) -> ConfigApplyOutcome {
         use crate::config_delta::ConfigDelta;
 
         // Normalize hostnames (ASCII-lowercase) and pre-compute each
@@ -5848,7 +5863,7 @@ impl ProxyState {
             for msg in &errors {
                 error!("Config reload rejected: {}", msg);
             }
-            return false;
+            return ConfigApplyOutcome::rejected(errors);
         }
 
         let old_config = self.config.load_full();
@@ -5866,11 +5881,12 @@ impl ProxyState {
             {
                 Ok(inner) => inner,
                 Err(e) => {
+                    let message = format!("security plugin validation failed: {e}");
                     error!(
                         "Config reload rejected — security plugin validation failed: {}",
                         e
                     );
-                    return false;
+                    return ConfigApplyOutcome::rejected_one(message);
                 }
             };
             let consumer_inner = ConsumerIndex::build_inner(&new_config.consumers);
@@ -5893,10 +5909,11 @@ impl ProxyState {
                 },
             ) {
                 Ok(Some(epoch)) => epoch,
-                Ok(None) => return false,
+                Ok(None) => return ConfigApplyOutcome::Unchanged,
                 Err(e) => {
+                    let message = e.to_string();
                     error!("Config reload rejected: {}", e);
-                    return false;
+                    return ConfigApplyOutcome::rejected_one(message);
                 }
             };
             PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
@@ -5963,12 +5980,12 @@ impl ProxyState {
             info!(
                 "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
             );
-            return true;
+            return ConfigApplyOutcome::Applied;
         }
 
         // Both empty — nothing to do
         if old_is_empty && new_is_empty {
-            return false;
+            return ConfigApplyOutcome::Unchanged;
         }
 
         let mut applied_delta = None;
@@ -6052,17 +6069,18 @@ impl ProxyState {
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
             Ok(None) => {
-                debug!("Config poll: no changes detected, skipping update");
+                debug!("Config poll: candidate valid but unchanged, skipping update");
                 // Still update loaded_at timestamp
                 self.config.store(Arc::new(new_config));
-                return false;
+                return ConfigApplyOutcome::Unchanged;
             }
             Err(e) => {
+                let message = format!("security plugin validation failed: {e}");
                 error!(
                     "Config reload rejected — security plugin validation failed: {}",
                     e
                 );
-                return false;
+                return ConfigApplyOutcome::rejected_one(message);
             }
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
@@ -6077,7 +6095,7 @@ impl ProxyState {
         // `applied_delta` is `None` here).
         let Some(delta) = applied_delta else {
             debug!("Config update: mesh-only change republished (caches reused)");
-            return true;
+            return ConfigApplyOutcome::Applied;
         };
         let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
 
@@ -6251,7 +6269,7 @@ impl ProxyState {
                 .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
         }
 
-        true
+        ConfigApplyOutcome::Applied
     }
 
     /// Start service discovery background tasks for all upstreams in the config.
@@ -6271,16 +6289,16 @@ impl ProxyState {
     /// directly from the DB layer's `load_incremental_config()`. This avoids
     /// loading and diffing the full config on every poll cycle.
     ///
-    /// Returns an [`IncrementalApplyOutcome`] so callers can distinguish
-    /// "nothing to do" (`NoChanges`) from "changes were rejected by validation"
+    /// Returns a [`ConfigApplyOutcome`] so callers can distinguish accepted
+    /// no-op candidates (`Unchanged`) from validation/build rejections
     /// (`Rejected`). The DB poller relies on this to avoid advancing
     /// `last_poll_at` on rejection — see `src/modes/database.rs`.
     pub async fn apply_incremental(
         &self,
         result: crate::config::db_loader::IncrementalResult,
-    ) -> IncrementalApplyOutcome {
+    ) -> ConfigApplyOutcome {
         if result.is_empty() {
-            return IncrementalApplyOutcome::NoChanges;
+            return ConfigApplyOutcome::Unchanged;
         }
 
         // Patch the stored GatewayConfig: clone current, apply mutations, store.
@@ -6425,7 +6443,7 @@ impl ProxyState {
             for msg in &errors {
                 error!("Incremental config rejected: {}", msg);
             }
-            return IncrementalApplyOutcome::Rejected;
+            return ConfigApplyOutcome::rejected(errors);
         }
 
         let mut applied_delta = None;
@@ -6455,13 +6473,14 @@ impl ProxyState {
         );
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
-            Ok(None) => return IncrementalApplyOutcome::NoChanges,
+            Ok(None) => return ConfigApplyOutcome::Unchanged,
             Err(e) => {
+                let message = format!("security plugin validation failed: {e}");
                 error!(
                     "Incremental config rejected — security plugin validation failed: {}",
                     e
                 );
-                return IncrementalApplyOutcome::Rejected;
+                return ConfigApplyOutcome::rejected_one(message);
             }
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
@@ -6636,7 +6655,7 @@ impl ProxyState {
                 .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
         }
 
-        IncrementalApplyOutcome::Applied
+        ConfigApplyOutcome::Applied
     }
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
@@ -27053,9 +27072,10 @@ mod tests {
         bad.upstream_id = Some("does-not-exist".to_string());
         let bad_config = make_validation_config(vec![bad]);
 
+        let outcome = state.update_config(bad_config);
         assert!(
-            !state.update_config(bad_config),
-            "update_config must return false when validation rejects the new config"
+            matches!(outcome, ConfigApplyOutcome::Rejected { .. }),
+            "update_config must reject invalid config; got {outcome:?}"
         );
 
         let post_attempt_config = state.config.load_full();
@@ -27107,7 +27127,7 @@ mod tests {
             })
             .await;
 
-        assert_eq!(outcome, IncrementalApplyOutcome::Applied);
+        assert_eq!(outcome, ConfigApplyOutcome::Applied);
         let loaded = state.config.load_full();
         assert!(loaded.plugin_configs.is_empty());
         assert!(
@@ -27122,10 +27142,8 @@ mod tests {
         let good = make_validation_proxy("p1", "/api");
         let good_config = make_validation_config(vec![good]);
 
-        assert!(
-            state.update_config(good_config),
-            "update_config must return true for a valid initial config"
-        );
+        let outcome = state.update_config(good_config);
+        assert_eq!(outcome, ConfigApplyOutcome::Applied);
 
         let post = state.config.load_full();
         assert_eq!(
@@ -27179,7 +27197,10 @@ mod tests {
         config_v1.mesh = Some(Box::new(mesh_v1));
 
         let state = make_test_proxy_state(GatewayConfig::default());
-        assert!(state.update_config(config_v1), "initial apply succeeds");
+        assert!(
+            state.update_config(config_v1).applied(),
+            "initial apply succeeds"
+        );
         let epoch_v1 = state.request_epoch.load();
         assert_eq!(
             epoch_v1
@@ -27203,7 +27224,7 @@ mod tests {
         config_v2.mesh = Some(Box::new(mesh_v2));
 
         assert!(
-            state.update_config(config_v2),
+            state.update_config(config_v2).applied(),
             "a mesh-only change must report applied=true (epoch republished)"
         );
         let epoch_v2 = state.request_epoch.load();
@@ -27224,14 +27245,15 @@ mod tests {
 
         // Re-applying an equivalent config (same cloned proxy, same mesh) must
         // NOT republish: the epoch pointer is unchanged and update_config
-        // returns false.
+        // returns `Unchanged`.
         let mut mesh_again = MeshConfig::default();
         mesh_again.workloads.push(remote_workload("10.2.0.1"));
         mesh_again.workloads.push(remote_workload("10.2.0.2"));
         let mut config_v2_again = make_validation_config(vec![proxy]);
         config_v2_again.mesh = Some(Box::new(mesh_again));
-        assert!(
-            !state.update_config(config_v2_again),
+        assert_eq!(
+            state.update_config(config_v2_again),
+            ConfigApplyOutcome::Unchanged,
             "an identical mesh + proxy config is a genuine no-op"
         );
         assert!(

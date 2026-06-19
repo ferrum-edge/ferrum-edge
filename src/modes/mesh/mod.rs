@@ -9850,8 +9850,6 @@ async fn apply_mesh_slice_generation(
     ) {
         Ok(mut config) => {
             let previous_config = proxy_state.config.load_full();
-            let previous_loaded_at = previous_config.loaded_at;
-            let candidate_loaded_at = config.loaded_at;
             // Materialized mesh upstreams are rebuilt with fresh per-apply
             // timestamps every slice apply (the materializers stamp `Utc::now()`
             // and `project_mesh_source_locality` re-bumps when it stamps the
@@ -9897,14 +9895,9 @@ async fn apply_mesh_slice_generation(
             // that window can enter the new plugin chain without a peer
             // principal; mesh authz still fails closed for identity-required
             // policy until the slot swaps.
-            let applied = proxy_state.update_config(config);
-            let current_loaded_at = proxy_state.config.load_full().loaded_at;
-            let accepted = mesh_proxy_update_was_accepted(
-                applied,
-                previous_loaded_at,
-                current_loaded_at,
-                candidate_loaded_at,
-            );
+            let outcome = proxy_state.update_config(config);
+            let applied = outcome.applied();
+            let accepted = outcome.accepted();
             // Publish the node-waypoint resolver snapshot the instant the proxy
             // config is accepted — before recording the apply result or
             // reloading TLS — so the window where the new config is live but the
@@ -10140,15 +10133,6 @@ fn record_mesh_slice_apply_result(
         mesh_state.record_applied_slice(slice);
         *last_applied_slice = Some(Arc::new(slice.clone()));
     }
-}
-
-fn mesh_proxy_update_was_accepted(
-    applied: bool,
-    previous_loaded_at: chrono::DateTime<chrono::Utc>,
-    current_loaded_at: chrono::DateTime<chrono::Utc>,
-    candidate_loaded_at: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    applied || (current_loaded_at == candidate_loaded_at && current_loaded_at != previous_loaded_at)
 }
 
 struct MeshBackgroundTasks {

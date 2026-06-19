@@ -26,7 +26,7 @@ use tokio::sync::watch;
 use tonic::metadata::MetadataValue;
 use tonic::transport::channel::ClientTlsConfig;
 use tonic::transport::{Certificate, Channel, Identity};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
@@ -36,7 +36,7 @@ use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
 use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
 use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
-use crate::proxy::{IncrementalApplyOutcome, ProxyState};
+use crate::proxy::{ConfigApplyOutcome, ProxyState};
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::backoff::{BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs};
 
@@ -937,34 +937,45 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             );
                             continue;
                         }
-                        proxy_state.update_config(config);
-                        apply_gateway_trust_bundle_update(proxy_state, gateway_trust_bundle_update);
-                        update_state_config_received(connection_state);
-                        if !initial_snapshot_applied {
-                            proxy_state
-                                .stream_listener_manager
-                                .wait_until_started(Duration::from_secs(10))
-                                .await?;
-                            // Block DP readiness on the first capability
-                            // classification. Without this the `/health`
-                            // endpoint would flip to ready while the
-                            // registry is still empty, so an L4 LB could
-                            // route traffic to an H3-only HTTPS backend
-                            // and the cross-protocol bridge would 502
-                            // until the background refresh landed.
-                            // Subsequent CP snapshots don't take this
-                            // path — `update_config` already spawns a
-                            // coalesced background refresh for them.
-                            proxy_state.refresh_backend_capabilities().await;
-                            if let Some(ref startup_ready) = startup_ready {
-                                startup_ready.store(true, Ordering::Release);
+                        match proxy_state.update_config(config) {
+                            ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
+                                apply_gateway_trust_bundle_update(
+                                    proxy_state,
+                                    gateway_trust_bundle_update,
+                                );
+                                update_state_config_received(connection_state);
+                                if !initial_snapshot_applied {
+                                    proxy_state
+                                        .stream_listener_manager
+                                        .wait_until_started(Duration::from_secs(10))
+                                        .await?;
+                                    // Block DP readiness on the first capability
+                                    // classification. Without this the `/health`
+                                    // endpoint would flip to ready while the
+                                    // registry is still empty, so an L4 LB could
+                                    // route traffic to an H3-only HTTPS backend
+                                    // and the cross-protocol bridge would 502
+                                    // until the background refresh landed.
+                                    // Subsequent CP snapshots don't take this
+                                    // path — `update_config` already spawns a
+                                    // coalesced background refresh for them.
+                                    proxy_state.refresh_backend_capabilities().await;
+                                    if let Some(ref startup_ready) = startup_ready {
+                                        startup_ready.store(true, Ordering::Release);
+                                    }
+                                    initial_snapshot_applied = true;
+                                    info!(
+                                        "DP startup complete; backend capabilities classified; /health now reports ready"
+                                    );
+                                }
+                                info!("Full configuration snapshot accepted from CP");
                             }
-                            initial_snapshot_applied = true;
-                            info!(
-                                "DP startup complete; backend capabilities classified; /health now reports ready"
-                            );
+                            ConfigApplyOutcome::Rejected { .. } => {
+                                error!(
+                                    "Full configuration snapshot rejected during apply; keeping previous config"
+                                );
+                            }
                         }
-                        info!("Full configuration snapshot applied from CP");
                     }
                     Err(e) => {
                         error!("Failed to parse full config update: {}", e);
@@ -1031,7 +1042,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
                         let update_version = update.version;
 
                         match proxy_state.apply_incremental(result).await {
-                            IncrementalApplyOutcome::Applied => {
+                            ConfigApplyOutcome::Applied => {
                                 apply_gateway_trust_bundle_update(
                                     proxy_state,
                                     gateway_trust_bundle_update,
@@ -1039,13 +1050,18 @@ pub async fn connect_and_subscribe_with_startup_ready(
                                 update_state_config_received(connection_state);
                                 info!("Incremental config delta applied from CP");
                             }
-                            IncrementalApplyOutcome::NoChanges => {
+                            ConfigApplyOutcome::Unchanged => {
                                 if apply_gateway_trust_bundle_update(
                                     proxy_state,
                                     gateway_trust_bundle_update,
                                 ) {
                                     update_state_config_received(connection_state);
                                     info!("Gateway trust bundle update applied from CP");
+                                    continue;
+                                }
+                                if !was_empty {
+                                    update_state_config_received(connection_state);
+                                    debug!("Incremental config delta from CP was valid but unchanged");
                                     continue;
                                 }
                                 // Empty delta — preserve original behavior of not
@@ -1058,7 +1074,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
                                     );
                                 }
                             }
-                            IncrementalApplyOutcome::Rejected => {
+                            ConfigApplyOutcome::Rejected { .. } => {
                                 if apply_gateway_trust_bundle_update(
                                     proxy_state,
                                     gateway_trust_bundle_update,

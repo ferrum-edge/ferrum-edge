@@ -492,8 +492,19 @@ pub async fn run(
                         info!("SIGHUP received, reloading configuration...");
                         match file_loader::reload_config_from_file(&config_path_owned, reload_cert_expiry_warning_days, &reload_backend_allow_ips, &reload_namespace) {
                             Ok(new_config) => {
-                                proxy_state_reload.update_config(new_config);
-                                info!("Configuration reloaded successfully");
+                                match proxy_state_reload.update_config(new_config) {
+                                    proxy::ConfigApplyOutcome::Applied => {
+                                        info!("Configuration reloaded successfully");
+                                    }
+                                    proxy::ConfigApplyOutcome::Unchanged => {
+                                        info!("Configuration reload valid but unchanged");
+                                    }
+                                    proxy::ConfigApplyOutcome::Rejected { .. } => {
+                                        error!(
+                                            "Configuration reload rejected, keeping previous config"
+                                        );
+                                    }
+                                }
                             }
                             Err(e) => {
                                 error!(

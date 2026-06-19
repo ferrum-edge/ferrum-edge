@@ -946,30 +946,20 @@ pub async fn run(
                     if force_full_reload {
                         match db_poll.load_full_config(&poll_namespace).await {
                             Ok(new_config) => {
-                                if proxy_state_poll.update_config(new_config) {
-                                    let published_config = proxy_state_poll.current_config();
-                                    // Keep known ID sets and incremental cursor consistent with
-                                    // the published database snapshot.
-                                    let (
-                                        next_known_proxy_ids,
-                                        next_known_consumer_ids,
-                                        next_known_plugin_config_ids,
-                                        next_known_upstream_ids,
-                                    ) = db_backend::extract_known_ids(&published_config);
-                                    known_proxy_ids = next_known_proxy_ids;
-                                    known_consumer_ids = next_known_consumer_ids;
-                                    known_plugin_config_ids = next_known_plugin_config_ids;
-                                    known_upstream_ids = next_known_upstream_ids;
-                                    last_poll_at = Some(published_config.loaded_at);
+                                let outcome = proxy_state_poll.update_config(new_config);
+                                if commit_full_reload_poll_state(
+                                    "after DB DNS reconnect",
+                                    outcome,
+                                    &proxy_state_poll,
+                                    &mut known_proxy_ids,
+                                    &mut known_consumer_ids,
+                                    &mut known_plugin_config_ids,
+                                    &mut known_upstream_ids,
+                                    &mut last_poll_at,
+                                ) {
                                     force_full_reload = false;
                                     db_available_poll.store(true, Ordering::Relaxed);
                                     debug!("Full config reload complete after DB DNS reconnect");
-                                } else {
-                                    warn!(
-                                        "Full config reload after DB DNS reconnect was rejected; \
-                                         keeping existing config and retrying"
-                                    );
-                                    db_available_poll.store(false, Ordering::Relaxed);
                                 }
                             }
                             Err(e) => {
@@ -1023,7 +1013,7 @@ pub async fn run(
                                 let removed_upstream_ids = result.removed_upstream_ids.clone();
 
                                 match proxy_state_poll.apply_incremental(result).await {
-                                    proxy::IncrementalApplyOutcome::Applied => {
+                                    proxy::ConfigApplyOutcome::Applied => {
                                         // Update known IDs only after successful apply to keep them
                                         // in sync with actual proxy state.
                                         update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
@@ -1033,12 +1023,13 @@ pub async fn run(
                                         debug!("Incremental config reload complete");
                                         last_poll_at = Some(poll_ts);
                                     }
-                                    proxy::IncrementalApplyOutcome::NoChanges => {
+                                    proxy::ConfigApplyOutcome::Unchanged => {
                                         // Nothing to apply this cycle. Advance the cursor
                                         // so the next poll only fetches truly newer rows.
                                         last_poll_at = Some(poll_ts);
+                                        debug!("Incremental config poll valid but unchanged");
                                     }
-                                    proxy::IncrementalApplyOutcome::Rejected => {
+                                    proxy::ConfigApplyOutcome::Rejected { .. } => {
                                         // Validation rejected the patched config (e.g. security
                                         // plugin / unique listen-path). Leave `last_poll_at`
                                         // unchanged so the next poll re-fetches the same rows
@@ -1072,15 +1063,17 @@ pub async fn run(
                                 match db_poll.load_full_config(&poll_namespace).await {
                                     Ok(new_config) => {
                                         db_available_poll.store(true, Ordering::Relaxed);
-                                        let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
-                                        known_proxy_ids = p;
-                                        known_consumer_ids = c;
-                                        known_plugin_config_ids = pc;
-                                        known_upstream_ids = u;
-                                        last_poll_at = Some(new_config.loaded_at);
-                                        if proxy_state_poll.update_config(new_config) {
-                                            info!("Configuration reloaded from database (full fallback)");
-                                        }
+                                        let outcome = proxy_state_poll.update_config(new_config);
+                                        commit_full_reload_poll_state(
+                                            "full fallback",
+                                            outcome,
+                                            &proxy_state_poll,
+                                            &mut known_proxy_ids,
+                                            &mut known_consumer_ids,
+                                            &mut known_plugin_config_ids,
+                                            &mut known_upstream_ids,
+                                            &mut last_poll_at,
+                                        );
                                     }
                                     Err(e2) => {
                                         // Both incremental and full reload failed —
@@ -1091,15 +1084,17 @@ pub async fn run(
                                                 match db_poll.load_full_config(&poll_namespace).await {
                                                     Ok(new_config) => {
                                                         db_available_poll.store(true, Ordering::Relaxed);
-                                                        let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
-                                                        known_proxy_ids = p;
-                                                        known_consumer_ids = c;
-                                                        known_plugin_config_ids = pc;
-                                                        known_upstream_ids = u;
-                                                        last_poll_at = Some(new_config.loaded_at);
-                                                        if proxy_state_poll.update_config(new_config) {
-                                                            info!("Configuration reloaded from database (failover)");
-                                                        }
+                                                        let outcome = proxy_state_poll.update_config(new_config);
+                                                        commit_full_reload_poll_state(
+                                                            "failover",
+                                                            outcome,
+                                                            &proxy_state_poll,
+                                                            &mut known_proxy_ids,
+                                                            &mut known_consumer_ids,
+                                                            &mut known_plugin_config_ids,
+                                                            &mut known_upstream_ids,
+                                                            &mut last_poll_at,
+                                                        );
                                                     }
                                                     Err(e3) => {
                                                         db_available_poll.store(false, Ordering::Relaxed);
@@ -1142,15 +1137,17 @@ pub async fn run(
                                         db_available_poll.store(false, Ordering::Relaxed);
                                     }
                                 }
-                                let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
-                                known_proxy_ids = p;
-                                known_consumer_ids = c;
-                                known_plugin_config_ids = pc;
-                                known_upstream_ids = u;
-                                last_poll_at = Some(new_config.loaded_at);
-                                if proxy_state_poll.update_config(new_config) {
-                                    info!("Configuration reloaded from database");
-                                }
+                                let outcome = proxy_state_poll.update_config(new_config);
+                                commit_full_reload_poll_state(
+                                    "initial full poll",
+                                    outcome,
+                                    &proxy_state_poll,
+                                    &mut known_proxy_ids,
+                                    &mut known_consumer_ids,
+                                    &mut known_plugin_config_ids,
+                                    &mut known_upstream_ids,
+                                    &mut last_poll_at,
+                                );
                             }
                             Err(e) => {
                                 db_available_poll.store(false, Ordering::Relaxed);
@@ -1244,6 +1241,59 @@ pub async fn run(
     Ok(())
 }
 
+fn commit_full_reload_poll_state(
+    context: &str,
+    outcome: proxy::ConfigApplyOutcome,
+    proxy_state: &ProxyState,
+    known_proxy_ids: &mut HashSet<String>,
+    known_consumer_ids: &mut HashSet<String>,
+    known_plugin_config_ids: &mut HashSet<String>,
+    known_upstream_ids: &mut HashSet<String>,
+    last_poll_at: &mut Option<DateTime<Utc>>,
+) -> bool {
+    match outcome {
+        proxy::ConfigApplyOutcome::Applied => {
+            let published_config = proxy_state.current_config();
+            let (
+                next_known_proxy_ids,
+                next_known_consumer_ids,
+                next_known_plugin_config_ids,
+                next_known_upstream_ids,
+            ) = db_backend::extract_known_ids(&published_config);
+            *known_proxy_ids = next_known_proxy_ids;
+            *known_consumer_ids = next_known_consumer_ids;
+            *known_plugin_config_ids = next_known_plugin_config_ids;
+            *known_upstream_ids = next_known_upstream_ids;
+            *last_poll_at = Some(published_config.loaded_at);
+            info!("Configuration applied from database ({})", context);
+            true
+        }
+        proxy::ConfigApplyOutcome::Unchanged => {
+            let published_config = proxy_state.current_config();
+            let (
+                next_known_proxy_ids,
+                next_known_consumer_ids,
+                next_known_plugin_config_ids,
+                next_known_upstream_ids,
+            ) = db_backend::extract_known_ids(&published_config);
+            *known_proxy_ids = next_known_proxy_ids;
+            *known_consumer_ids = next_known_consumer_ids;
+            *known_plugin_config_ids = next_known_plugin_config_ids;
+            *known_upstream_ids = next_known_upstream_ids;
+            *last_poll_at = Some(published_config.loaded_at);
+            debug!("Database configuration valid but unchanged ({})", context);
+            true
+        }
+        proxy::ConfigApplyOutcome::Rejected { .. } => {
+            warn!(
+                "Database configuration candidate rejected ({}); keeping previous runtime config, poll cursor, and known ID sets",
+                context
+            );
+            false
+        }
+    }
+}
+
 /// Update a known ID set by adding new IDs and removing deleted ones.
 fn update_known_ids(known: &mut HashSet<String>, added: &Vec<String>, removed: &[String]) {
     for id in removed {
@@ -1257,6 +1307,83 @@ fn update_known_ids(known: &mut HashSet<String>, added: &Vec<String>, removed: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_proxy_state_for_poll_tests() -> ProxyState {
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let env_config = EnvConfig::default();
+        let (state, _health_check_handles) =
+            ProxyState::new(Default::default(), dns_cache, env_config, None, None)
+                .expect("default proxy state should build");
+        state
+    }
+
+    #[test]
+    fn full_reload_unchanged_commits_cursor_and_known_ids() {
+        let state = empty_proxy_state_for_poll_tests();
+        let previous_poll_at = Utc::now() - chrono::Duration::seconds(60);
+        let mut last_poll_at = Some(previous_poll_at);
+        let mut known_proxy_ids: HashSet<String> = HashSet::from(["stale-proxy".to_string()]);
+        let mut known_consumer_ids: HashSet<String> =
+            HashSet::from(["stale-consumer".to_string()]);
+        let mut known_plugin_config_ids: HashSet<String> =
+            HashSet::from(["stale-plugin".to_string()]);
+        let mut known_upstream_ids: HashSet<String> =
+            HashSet::from(["stale-upstream".to_string()]);
+
+        let accepted = commit_full_reload_poll_state(
+            "test unchanged",
+            proxy::ConfigApplyOutcome::Unchanged,
+            &state,
+            &mut known_proxy_ids,
+            &mut known_consumer_ids,
+            &mut known_plugin_config_ids,
+            &mut known_upstream_ids,
+            &mut last_poll_at,
+        );
+
+        assert!(accepted);
+        assert!(known_proxy_ids.is_empty());
+        assert!(known_consumer_ids.is_empty());
+        assert!(known_plugin_config_ids.is_empty());
+        assert!(known_upstream_ids.is_empty());
+        assert_eq!(last_poll_at, Some(state.current_config().loaded_at));
+        assert_ne!(last_poll_at, Some(previous_poll_at));
+    }
+
+    #[test]
+    fn full_reload_rejected_preserves_cursor_and_known_ids() {
+        let state = empty_proxy_state_for_poll_tests();
+        let previous_poll_at = Utc::now() - chrono::Duration::seconds(60);
+        let mut last_poll_at = Some(previous_poll_at);
+        let mut known_proxy_ids: HashSet<String> = HashSet::from(["proxy-a".to_string()]);
+        let mut known_consumer_ids: HashSet<String> =
+            HashSet::from(["consumer-a".to_string()]);
+        let mut known_plugin_config_ids: HashSet<String> = HashSet::from(["plugin-a".to_string()]);
+        let mut known_upstream_ids: HashSet<String> = HashSet::from(["upstream-a".to_string()]);
+
+        let accepted = commit_full_reload_poll_state(
+            "test rejected",
+            proxy::ConfigApplyOutcome::Rejected {
+                errors: vec!["invalid candidate".to_string()],
+            },
+            &state,
+            &mut known_proxy_ids,
+            &mut known_consumer_ids,
+            &mut known_plugin_config_ids,
+            &mut known_upstream_ids,
+            &mut last_poll_at,
+        );
+
+        assert!(!accepted);
+        assert_eq!(known_proxy_ids, HashSet::from(["proxy-a".to_string()]));
+        assert_eq!(known_consumer_ids, HashSet::from(["consumer-a".to_string()]));
+        assert_eq!(
+            known_plugin_config_ids,
+            HashSet::from(["plugin-a".to_string()])
+        );
+        assert_eq!(known_upstream_ids, HashSet::from(["upstream-a".to_string()]));
+        assert_eq!(last_poll_at, Some(previous_poll_at));
+    }
 
     #[test]
     fn update_known_ids_adds_and_removes() {
