@@ -36,7 +36,7 @@ use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
@@ -920,7 +920,7 @@ impl DatabaseStore {
         }
 
         let target_ids: HashSet<&str> = proxy_ids.iter().map(String::as_str).collect();
-        let mut associations = HashMap::new();
+        let mut associations: ProxyPluginAssociations = HashMap::new();
         let pool = if use_primary {
             self.pool()
         } else {
