@@ -300,7 +300,28 @@ pub(crate) enum GatewayApiAllowedRoutesNamespaces {
     #[default]
     Same,
     All,
-    Selector(HashMap<String, String>),
+    Selector(GatewayApiNamespaceSelector),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct GatewayApiNamespaceSelector {
+    pub match_labels: HashMap<String, String>,
+    pub match_expressions: Vec<GatewayApiNamespaceSelectorExpression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatewayApiNamespaceSelectorExpression {
+    pub key: String,
+    pub operator: GatewayApiNamespaceSelectorOperator,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GatewayApiNamespaceSelectorOperator {
+    In,
+    NotIn,
+    Exists,
+    DoesNotExist,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -423,6 +444,7 @@ impl K8sAccumulator {
         self.explicit_service_entries.insert(key);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_reference_grant(
         &mut self,
         from_namespace: String,
@@ -444,6 +466,7 @@ impl K8sAccumulator {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reference_grant_allows(
         &self,
         from_namespace: &str,
@@ -607,17 +630,19 @@ where
     let mut acc = K8sAccumulator::new(options);
 
     for object in &included_objects {
+        if object.kind == "Namespace" {
+            acc.record_namespace_labels(
+                object.metadata.name.clone(),
+                object.metadata.labels.clone(),
+            );
+            continue;
+        }
         if !includes_object_namespace(&acc.options, object) {
             continue;
         }
         observe_object_namespace(&mut acc, object);
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
-        } else if object.kind == "Namespace" {
-            acc.record_namespace_labels(
-                object.metadata.name.clone(),
-                object.metadata.labels.clone(),
-            );
         } else if object.kind == "Gateway" {
             gateway_api::collect_gateway_listener_policy(&mut acc, object)?;
         } else if object.kind == "Service" {
@@ -666,6 +691,9 @@ where
     acc.gateway_api_route_conflicts = gateway_api_route_conflicts;
 
     for object in &included_objects {
+        if object.kind == "Namespace" {
+            continue;
+        }
         if !includes_object_namespace(&acc.options, object) {
             continue;
         }

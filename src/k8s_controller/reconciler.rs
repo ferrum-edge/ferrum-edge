@@ -741,6 +741,8 @@ const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] = &[
     "istio-vs-mirror-",
     "istio-vs-mrd-",
     "istio-vs-rt-",
+    "__istio_vs_req_xform_",
+    "__istio_vs_resp_xform_",
 ];
 
 fn managed_k8s_namespaces(
@@ -789,6 +791,9 @@ fn merge_k8s_translation(
     merged
         .plugin_configs
         .extend(k8s_config.plugin_configs.clone());
+    merged.frontend_tls_cert_path = k8s_config.frontend_tls_cert_path.clone();
+    merged.frontend_tls_key_path = k8s_config.frontend_tls_key_path.clone();
+    merged.frontend_tls_source_namespace = k8s_config.frontend_tls_source_namespace.clone();
 
     let mut namespaces: BTreeSet<String> = merged.known_namespaces.iter().cloned().collect();
     namespaces.extend(k8s_config.known_namespaces.iter().cloned());
@@ -814,6 +819,9 @@ fn stable_config_value(config: &GatewayConfig) -> Value {
         "plugin_configs": &config.plugin_configs,
         "upstreams": &config.upstreams,
         "known_namespaces": &config.known_namespaces,
+        "frontend_tls_cert_path": &config.frontend_tls_cert_path,
+        "frontend_tls_key_path": &config.frontend_tls_key_path,
+        "frontend_tls_source_namespace": &config.frontend_tls_source_namespace,
         "mesh": &config.mesh,
     });
     strip_volatile_timestamps(&mut value);

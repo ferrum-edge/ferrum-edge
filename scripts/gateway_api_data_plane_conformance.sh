@@ -436,7 +436,6 @@ spec:
     - name: http
       port: 80
       protocol: HTTP
-      hostname: "*.blackbox.example"
       allowedRoutes:
         namespaces:
           from: Selector

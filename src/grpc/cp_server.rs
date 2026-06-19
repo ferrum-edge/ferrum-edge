@@ -60,26 +60,15 @@ use crate::modes::mesh::config::{
 use crate::modes::mesh::slice::MeshSliceRequest;
 
 fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) {
-    let cert_namespace = config
-        .frontend_tls_cert_path
+    if config
+        .frontend_tls_source_namespace
         .as_deref()
-        .and_then(k8s_source_namespace);
-    let key_namespace = config
-        .frontend_tls_key_path
-        .as_deref()
-        .and_then(k8s_source_namespace);
-    let foreign = [cert_namespace, key_namespace]
-        .into_iter()
-        .flatten()
-        .any(|source_namespace| source_namespace != namespace);
-    if foreign {
+        .is_some_and(|source_namespace| source_namespace != namespace)
+    {
         config.frontend_tls_cert_path = None;
         config.frontend_tls_key_path = None;
+        config.frontend_tls_source_namespace = None;
     }
-}
-
-fn k8s_source_namespace(source: &str) -> Option<&str> {
-    source.strip_prefix("k8s://")?.split('/').next()
 }
 
 /// What set of namespaces a CP instance is authorised to serve.
@@ -2608,7 +2597,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_filter_strips_cross_namespace_frontend_tls_sources() {
+    fn namespace_filter_keeps_granted_cross_namespace_frontend_tls_secret_sources() {
         use crate::config::types::*;
 
         let config = GatewayConfig {
@@ -2616,11 +2605,37 @@ mod tests {
             loaded_at: Utc::now(),
             frontend_tls_cert_path: Some("k8s://ns-b/gateway-cert#tls.crt".to_string()),
             frontend_tls_key_path: Some("k8s://ns-b/gateway-cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("ns-a".to_string()),
+            ..Default::default()
+        };
+
+        let filtered = CpGrpcServer::filter_config_to_namespace(&config, "ns-a");
+        assert_eq!(
+            filtered.frontend_tls_cert_path.as_deref(),
+            Some("k8s://ns-b/gateway-cert#tls.crt")
+        );
+        assert_eq!(
+            filtered.frontend_tls_key_path.as_deref(),
+            Some("k8s://ns-b/gateway-cert#tls.key")
+        );
+    }
+
+    #[test]
+    fn namespace_filter_strips_foreign_gateway_frontend_tls_sources() {
+        use crate::config::types::*;
+
+        let config = GatewayConfig {
+            version: CURRENT_CONFIG_VERSION.to_string(),
+            loaded_at: Utc::now(),
+            frontend_tls_cert_path: Some("k8s://ns-b/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://ns-b/gateway-cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("ns-b".to_string()),
             ..Default::default()
         };
 
         let filtered = CpGrpcServer::filter_config_to_namespace(&config, "ns-a");
         assert_eq!(filtered.frontend_tls_cert_path, None);
         assert_eq!(filtered.frontend_tls_key_path, None);
+        assert_eq!(filtered.frontend_tls_source_namespace, None);
     }
 }

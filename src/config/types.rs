@@ -2214,6 +2214,14 @@ pub struct GatewayConfig {
     /// `frontend_tls_cert_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontend_tls_key_path: Option<String>,
+    /// Namespace of the Gateway that materialized `frontend_tls_*`.
+    ///
+    /// The Secret itself can be cross-namespace when authorized by
+    /// ReferenceGrant, so CP/DP namespace filtering must use this owner
+    /// namespace instead of inferring ownership from a `k8s://secret-ns/...`
+    /// source URI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_tls_source_namespace: Option<String>,
     /// Gateway-consumable mesh trust material delivered by CPs to DPs.
     ///
     /// This mirrors the mesh config trust-bundle shape, but sits at the

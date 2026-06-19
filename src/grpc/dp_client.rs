@@ -711,7 +711,7 @@ async fn apply_frontend_tls_snapshot(
         config.frontend_tls_cert_path.as_deref(),
         config.frontend_tls_key_path.as_deref(),
     ) {
-        (None, None) => return Ok(()),
+        (None, None) => Ok(()),
         (Some(_), None) | (None, Some(_)) => {
             anyhow::bail!(
                 "frontend TLS config must include both frontend_tls_cert_path and frontend_tls_key_path"
@@ -1245,27 +1245,16 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
 }
 
 fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) -> bool {
-    let cert_namespace = config
-        .frontend_tls_cert_path
+    let foreign = config
+        .frontend_tls_source_namespace
         .as_deref()
-        .and_then(k8s_source_namespace);
-    let key_namespace = config
-        .frontend_tls_key_path
-        .as_deref()
-        .and_then(k8s_source_namespace);
-    let foreign = [cert_namespace, key_namespace]
-        .into_iter()
-        .flatten()
-        .any(|source_namespace| source_namespace != namespace);
+        .is_some_and(|source_namespace| source_namespace != namespace);
     if foreign {
         config.frontend_tls_cert_path = None;
         config.frontend_tls_key_path = None;
+        config.frontend_tls_source_namespace = None;
     }
     foreign
-}
-
-fn k8s_source_namespace(source: &str) -> Option<&str> {
-    source.strip_prefix("k8s://")?.split('/').next()
 }
 
 /// Defense-in-depth filter for incremental deltas. Applied to
@@ -1478,6 +1467,7 @@ mod tests {
             known_namespaces: Vec::new(),
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
+            frontend_tls_source_namespace: None,
             trust_bundles: None,
             mesh: None,
         };
@@ -1507,6 +1497,7 @@ mod tests {
             known_namespaces: Vec::new(),
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
+            frontend_tls_source_namespace: None,
             trust_bundles: None,
             mesh: None,
         };
@@ -1515,38 +1506,41 @@ mod tests {
     }
 
     #[test]
-    fn filter_config_clears_foreign_frontend_tls_sources() {
+    fn filter_config_clears_foreign_gateway_frontend_tls_sources() {
         let mut cfg = GatewayConfig {
             version: "1".to_string(),
             loaded_at: Utc::now(),
             frontend_tls_cert_path: Some("k8s://staging/gateway-cert#tls.crt".to_string()),
             frontend_tls_key_path: Some("k8s://staging/gateway-cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("staging".to_string()),
             ..Default::default()
         };
 
         assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 1);
         assert_eq!(cfg.frontend_tls_cert_path, None);
         assert_eq!(cfg.frontend_tls_key_path, None);
+        assert_eq!(cfg.frontend_tls_source_namespace, None);
     }
 
     #[test]
-    fn filter_config_keeps_matching_frontend_tls_sources() {
+    fn filter_config_keeps_matching_gateway_frontend_tls_sources() {
         let mut cfg = GatewayConfig {
             version: "1".to_string(),
             loaded_at: Utc::now(),
-            frontend_tls_cert_path: Some("k8s://production/gateway-cert#tls.crt".to_string()),
-            frontend_tls_key_path: Some("k8s://production/gateway-cert#tls.key".to_string()),
+            frontend_tls_cert_path: Some("k8s://secrets/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://secrets/gateway-cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("production".to_string()),
             ..Default::default()
         };
 
         assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
         assert_eq!(
             cfg.frontend_tls_cert_path.as_deref(),
-            Some("k8s://production/gateway-cert#tls.crt")
+            Some("k8s://secrets/gateway-cert#tls.crt")
         );
         assert_eq!(
             cfg.frontend_tls_key_path.as_deref(),
-            Some("k8s://production/gateway-cert#tls.key")
+            Some("k8s://secrets/gateway-cert#tls.key")
         );
     }
 

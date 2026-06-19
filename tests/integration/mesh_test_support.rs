@@ -438,6 +438,9 @@ pub fn gateway_config_with_mesh(
         plugin_configs: Vec::new(),
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
+        frontend_tls_source_namespace: None,
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
     }

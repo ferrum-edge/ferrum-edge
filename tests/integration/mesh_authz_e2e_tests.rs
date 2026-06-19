@@ -92,6 +92,9 @@ fn build_mesh_authz_for_workload(
         plugin_configs: Vec::new(),
         loaded_at: chrono::Utc::now(),
         known_namespaces: Vec::new(),
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
+        frontend_tls_source_namespace: None,
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
     };
@@ -1315,6 +1318,9 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         plugin_configs: Vec::new(),
         loaded_at: chrono::Utc::now(),
         known_namespaces: Vec::new(),
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
+        frontend_tls_source_namespace: None,
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
     };

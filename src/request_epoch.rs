@@ -190,6 +190,7 @@ mod tests {
             known_namespaces: Vec::new(),
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
+            frontend_tls_source_namespace: None,
             trust_bundles: None,
             mesh: None,
         }

@@ -247,12 +247,21 @@ pub async fn run(
             "Frontend TLS live reload enabled for DP proxy HTTPS (H1/H2) and HTTP/3"
         );
     }
-    let proxy_frontend_tls_slot = tls_config.as_ref().map(|cfg| {
-        proxy_frontend_reload_handles
-            .as_ref()
-            .and_then(|handles| handles.slot.clone())
-            .unwrap_or_else(|| tls::frontend_tls_slot_with(cfg.clone()))
-    });
+    let proxy_frontend_tls_slot = if env_config.proxy_https_port != 0 {
+        Some(
+            tls_config
+                .as_ref()
+                .map(|cfg| {
+                    proxy_frontend_reload_handles
+                        .as_ref()
+                        .and_then(|handles| handles.slot.clone())
+                        .unwrap_or_else(|| tls::frontend_tls_slot_with(cfg.clone()))
+                })
+                .unwrap_or_else(tls::empty_frontend_tls_slot),
+        )
+    } else {
+        None
+    };
 
     // Set TLS config on stream listener manager for TCP proxies with frontend_tls.
     if let Some(ref tls_cfg) = tls_config {
@@ -318,42 +327,32 @@ pub async fn run(
         info!("FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled");
     }
 
-    // HTTPS listener (only if TLS is configured)
-    if let Some(tls_config) = tls_config.clone() {
+    // HTTPS listener. DP mode may receive Gateway-managed TLS material after
+    // startup, so keep the listener and shared TLS slot live even when no
+    // bootstrap frontend cert/key was configured.
+    if let Some(tls_slot) = proxy_frontend_tls_slot.clone() {
         let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
         let https_state = proxy_state.clone();
         let https_shutdown = shutdown_tx.subscribe();
         let (https_started_tx, https_started_rx) = tokio::sync::oneshot::channel();
-        let tls_slot = proxy_frontend_tls_slot.clone();
         let https_handle = tokio::spawn(async move {
             info!("Starting HTTPS proxy listener on {}", https_addr);
-            let result = if let Some(slot) = tls_slot {
-                proxy::start_proxy_listener_with_dynamic_tls_and_signal(
-                    https_addr,
-                    https_state,
-                    https_shutdown,
-                    slot,
-                    Some(https_started_tx),
-                )
-                .await
-            } else {
-                proxy::start_proxy_listener_with_tls_and_signal(
-                    https_addr,
-                    https_state,
-                    https_shutdown,
-                    Some(tls_config),
-                    Some(https_started_tx),
-                )
-                .await
-            };
-            if let Err(e) = result {
+            if let Err(e) = proxy::start_proxy_listener_with_dynamic_tls_and_signal(
+                https_addr,
+                https_state,
+                https_shutdown,
+                tls_slot,
+                Some(https_started_tx),
+            )
+            .await
+            {
                 error!("HTTPS proxy listener error: {}", e);
             }
         });
         handles.push(https_handle);
         startup_signals.push(("HTTPS proxy listener".to_string(), https_started_rx));
     } else {
-        info!("TLS not configured - HTTPS listener disabled");
+        info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTPS proxy listener disabled");
     }
 
     // HTTP/3 (QUIC) listener (only if enabled and TLS is configured)

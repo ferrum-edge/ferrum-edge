@@ -401,6 +401,11 @@ fn validate_and_normalize_redirect(
         }
         reject_crlf(rule_idx, "redirect.uri", uri)?;
     }
+    if let Some(prefix) = redirect.match_prefix.as_deref()
+        && prefix.is_empty()
+    {
+        redirect.match_prefix = None;
+    }
     if let Some(authority) = redirect.authority.as_mut() {
         if authority.is_empty() {
             return Err(format!(
@@ -1102,6 +1107,10 @@ pub struct RouteRedirectConfig {
     /// own path is preserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    /// When set, only this matched request-path prefix is replaced by `uri`
+    /// and the remainder of the original request path is preserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_prefix: Option<String>,
     /// Replacement authority (host[:port]) for the `Location` header. When
     /// unset, the request's own `Host` / `:authority` is preserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1706,7 +1715,11 @@ fn build_redirect_response(
             .or_else(|| headers.get(":authority"))
             .map(String::as_str)
     });
-    let path = redirect.uri.as_deref().unwrap_or(ctx.path.as_str());
+    let path = redirect
+        .uri
+        .as_deref()
+        .map(|uri| rewrite_request_path(&ctx.path, uri, redirect.match_prefix.as_deref()))
+        .unwrap_or_else(|| ctx.path.clone());
 
     // Istio/Envoy preserve the original request query string on redirect by
     // default (Envoy `RedirectAction.strip_query` defaults to `false`), unless
@@ -5081,6 +5094,35 @@ mod tests {
         }
         // A redirect must not leave a route override behind.
         assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_match_prefix_preserves_path_suffix() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "redirect": {
+                    "uri": "/new",
+                    "match_prefix": "/old",
+                    "authority": "elsewhere.example.com",
+                    "redirect_code": 302
+                }
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/old/item");
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+        let mut headers = HashMap::new();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://elsewhere.example.com/new/item")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
     }
 
     #[tokio::test]
