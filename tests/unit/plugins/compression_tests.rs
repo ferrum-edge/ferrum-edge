@@ -397,7 +397,10 @@ async fn test_request_cache_control_no_transform_disables_gateway_compression() 
 
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    assert!(ctx.metadata.contains_key("compression:request_no_transform"));
+    assert!(
+        ctx.metadata
+            .contains_key("compression:request_no_transform")
+    );
     assert!(!ctx.metadata.contains_key("compression:accept_encoding"));
     assert_eq!(headers.get("accept-encoding").unwrap(), "gzip");
 
@@ -1573,7 +1576,10 @@ async fn test_request_cache_control_no_transform_preserves_compressed_request_bo
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx.metadata.contains_key("compression:request_no_transform"));
+    assert!(
+        ctx.metadata
+            .contains_key("compression:request_no_transform")
+    );
     assert_eq!(
         headers.get("content-encoding").map(String::as_str),
         Some("gzip")

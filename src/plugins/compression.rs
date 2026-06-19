@@ -586,7 +586,9 @@ impl Plugin for CompressionPlugin {
         // we support — there's nothing to compress.
         !self.config.algorithms.is_empty()
             && ctx.headers.contains_key("accept-encoding")
-            && !ctx.metadata.contains_key("compression:request_no_transform")
+            && !ctx
+                .metadata
+                .contains_key("compression:request_no_transform")
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -745,7 +747,10 @@ impl Plugin for CompressionPlugin {
             return PluginResult::Continue;
         }
 
-        if ctx.metadata.contains_key("compression:request_no_transform") {
+        if ctx
+            .metadata
+            .contains_key("compression:request_no_transform")
+        {
             return PluginResult::Continue;
         }
 
