@@ -170,6 +170,12 @@ pub(crate) const RANGE_RESPONSE_METADATA_KEY: &str = "ferrum:range_response";
 /// or renames `Cache-Control` before compression's own `after_proxy` hook.
 pub(crate) const NO_TRANSFORM_RESPONSE_METADATA_KEY: &str = "ferrum:no_transform_response";
 
+/// Transient marker set while running `after_proxy` hooks when a later hook may
+/// add `Cache-Control: no-transform`. Compression reads this before committing
+/// `Content-Encoding`, then `run_after_proxy_hooks` clears it before returning.
+pub(crate) const LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY: &str =
+    "ferrum:later_no_transform_response";
+
 /// Marker recorded in `ctx.metadata` when the ORIGINAL client request carried
 /// `Cache-Control: no-transform`, captured before any `before_proxy` hook can
 /// mutate request headers. Compression reads this to preserve the client's
@@ -962,6 +968,21 @@ pub(crate) fn refine_stream_response_for_content_type(
         return false;
     };
     let content_type = response_headers.get("content-type").map(String::as_str);
+    let mut saw_active_buffering_plugin = false;
+    let all_active_plugins_can_release_before_content_type_rewrite = plugins
+        .iter()
+        .filter(|plugin| plugin.should_buffer_response_body(ctx))
+        .all(|plugin| {
+            saw_active_buffering_plugin = true;
+            plugin.should_release_response_body_before_content_type_rewrite(
+                ctx,
+                response_status,
+                response_headers,
+            )
+        });
+    if saw_active_buffering_plugin && all_active_plugins_can_release_before_content_type_rewrite {
+        return true;
+    }
     if plugins
         .iter()
         .any(|plugin| plugin.may_modify_response_content_type(ctx, content_type))
@@ -10827,7 +10848,20 @@ pub(crate) async fn run_after_proxy_hooks(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
 ) -> Option<AfterProxyReject> {
-    for plugin in plugins.iter() {
+    for (index, plugin) in plugins.iter().enumerate() {
+        if plugins[index + 1..]
+            .iter()
+            .any(|later| later.may_add_response_cache_control_no_transform(ctx, response_headers))
+        {
+            ctx.metadata.insert(
+                LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
+        } else {
+            ctx.metadata
+                .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
+        }
+
         match plugin
             .after_proxy(ctx, response_status, response_headers)
             .await
@@ -10845,6 +10879,8 @@ pub(crate) async fn run_after_proxy_hooks(
                     plugin.name(),
                     status_code,
                 );
+                ctx.metadata
+                    .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
                 apply_after_proxy_hooks_to_rejection(plugins, ctx, status_code, &mut headers).await;
                 return Some(AfterProxyReject {
                     status_code,
@@ -10855,6 +10891,8 @@ pub(crate) async fn run_after_proxy_hooks(
         }
     }
 
+    ctx.metadata
+        .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
     None
 }
 
@@ -21712,6 +21750,7 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 mod tests {
     use super::*;
     use crate::config::types::{LoadBalancerAlgorithm, PluginAssociation};
+    use crate::plugins::compression::CompressionPlugin;
     use crate::plugins::security_headers::SecurityHeaders;
     use async_trait::async_trait;
     use http::header::HeaderValue;
@@ -22648,6 +22687,49 @@ mod tests {
         );
         assert_eq!(body, br#"{"error":"blocked"}"#);
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn run_after_proxy_hooks_prevents_compression_before_late_no_transform_header() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(
+                CompressionPlugin::new(&json!({"min_content_length": 10, "algorithms": ["gzip"]}))
+                    .unwrap(),
+            ),
+            Arc::new(
+                SecurityHeaders::new(&json!({
+                    "set": {"Cache-Control": "no-transform"}
+                }))
+                .unwrap(),
+            ),
+        ];
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/body".into());
+        ctx.headers
+            .insert("accept-encoding".to_string(), "gzip".to_string());
+        let mut response_headers = HashMap::from([
+            (
+                "content-type".to_string(),
+                "application/json".to_string(),
+            ),
+            ("content-length".to_string(), "5000".to_string()),
+        ]);
+
+        let reject = run_after_proxy_hooks(&plugins, &mut ctx, 200, &mut response_headers).await;
+
+        assert!(reject.is_none());
+        assert_eq!(
+            response_headers.get("cache-control").map(String::as_str),
+            Some("no-transform")
+        );
+        assert!(
+            !response_headers.contains_key("content-encoding"),
+            "compression must not commit an encoding before a later no-transform hook"
+        );
+        assert!(!ctx.metadata.contains_key("compression:algorithm"));
+        assert!(
+            !ctx.metadata
+                .contains_key(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY)
+        );
     }
 
     #[tokio::test]
@@ -24451,6 +24533,69 @@ mod tests {
             Some(&ctx),
             200,
             &binary_headers,
+        ));
+
+        let mut compression_ctx = ctx.clone();
+        compression_ctx
+            .headers
+            .insert("accept-encoding".to_string(), "gzip".to_string());
+        let no_transform_headers = HashMap::from([
+            (
+                "content-type".to_string(),
+                "application/json".to_string(),
+            ),
+            (
+                "cache-control".to_string(),
+                "no-transform".to_string(),
+            ),
+        ]);
+        let compression_relabel_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(CompressionPlugin::new(&json!({})).unwrap()),
+            Arc::new(
+                crate::plugins::response_transformer::ResponseTransformer::new(&json!({
+                    "rules": [{
+                        "operation": "update",
+                        "target": "header",
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    }]
+                }))
+                .expect("response transformer config should be valid"),
+            ),
+        ];
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &compression_relabel_plugins,
+            Some(&compression_ctx),
+            200,
+            &no_transform_headers,
+        ));
+
+        let inspected_no_transform_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(CompressionPlugin::new(&json!({})).unwrap()),
+            Arc::new(ContentTypeBufferPlugin {
+                buffer_content_type: "application/json",
+            }),
+            Arc::new(
+                crate::plugins::response_transformer::ResponseTransformer::new(&json!({
+                    "rules": [{
+                        "operation": "update",
+                        "target": "header",
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    }]
+                }))
+                .expect("response transformer config should be valid"),
+            ),
+        ];
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &inspected_no_transform_plugins,
+            Some(&compression_ctx),
+            200,
+            &no_transform_headers,
         ));
 
         let mut route_ctx = ctx.clone();

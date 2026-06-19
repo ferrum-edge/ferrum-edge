@@ -2396,6 +2396,20 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin may add a `Cache-Control:
+    /// no-transform` response directive in a later `after_proxy` hook.
+    ///
+    /// Compression uses this to avoid committing `Content-Encoding` before a
+    /// later response-header plugin marks the final representation as
+    /// no-transform.
+    fn may_add_response_cache_control_no_transform(
+        &self,
+        _ctx: &RequestContext,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin should also run its `after_proxy`
     /// header decoration logic for gateway-generated rejection responses.
     ///
@@ -2431,6 +2445,23 @@ pub trait Plugin: Send + Sync {
     /// or header-sensitive response plugins.
     fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
+    }
+
+    /// Returns `true` when a plugin that otherwise buffers this response can
+    /// release it before the proxy applies the conservative content-type relabel
+    /// guard.
+    ///
+    /// Only use this for response-header invariants that make buffering
+    /// unnecessary independent of the final `Content-Type` (for example range
+    /// or `Cache-Control: no-transform` responses for compression). Returning
+    /// `false` keeps the existing content-type guard behavior.
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
     }
 
     /// Content-type-aware refinement of [`should_buffer_response_body`].

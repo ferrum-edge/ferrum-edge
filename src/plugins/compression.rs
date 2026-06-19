@@ -576,7 +576,12 @@ impl Plugin for CompressionPlugin {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.config.decompress_request && ctx.headers.contains_key("content-encoding")
+        self.config.decompress_request
+            && ctx.headers.contains_key("content-encoding")
+            && !ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
+            && !ctx
+                .metadata
+                .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
     }
 
     /// Buffer the request body before `before_proxy` runs so the decompression
@@ -648,6 +653,23 @@ impl Plugin for CompressionPlugin {
         }
         self.should_buffer_response_body(ctx)
             && content_type.is_some_and(|ct| self.is_compressible_content_type(ct))
+    }
+
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        response_status == 206
+            || response_headers.contains_key("content-range")
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::RANGE_RESPONSE_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY)
+            || headers_have_cache_control_directive(response_headers, "no-transform")
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {
@@ -806,6 +828,9 @@ impl Plugin for CompressionPlugin {
         if ctx
             .metadata
             .contains_key(crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY)
             || headers_have_cache_control_directive(response_headers, "no-transform")
         {
             return PluginResult::Continue;

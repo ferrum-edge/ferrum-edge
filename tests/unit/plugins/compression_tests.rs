@@ -1747,6 +1747,24 @@ async fn test_original_request_no_transform_marker_restores_header_and_preserves
     );
 }
 
+#[test]
+fn test_original_request_no_transform_marker_skips_request_body_buffering() {
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let mut ctx = make_request_ctx_with_body("gzip", b"buffered gzip body");
+
+    assert!(plugin.should_buffer_request_body(&ctx));
+
+    ctx.metadata.insert(
+        "ferrum:no_transform_request".to_string(),
+        "true".to_string(),
+    );
+
+    assert!(
+        !plugin.should_buffer_request_body(&ctx),
+        "stamped request no-transform must keep compressed uploads streaming"
+    );
+}
+
 /// #59: a double-compressed body whose decompressed payload is ITSELF valid
 /// gzip (e.g. a client uploading a `.gz` file with `Content-Encoding: gzip`)
 /// must be accepted — the gateway decodes exactly one transport layer and must

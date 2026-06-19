@@ -15,6 +15,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::util::http_headers::cache_control_has_directive;
+
 use super::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
 
 #[derive(Debug)]
@@ -123,6 +125,18 @@ impl Plugin for SecurityHeaders {
     ) -> PluginResult {
         self.apply(response_headers);
         PluginResult::Continue
+    }
+
+    fn may_add_response_cache_control_no_transform(
+        &self,
+        _ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.set.iter().any(|(name, value)| {
+            name == "cache-control"
+                && cache_control_has_directive(value, "no-transform")
+                && (self.override_existing || find_header_ci(response_headers, name).is_none())
+        })
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {

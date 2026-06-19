@@ -2170,6 +2170,58 @@ async fn test_priority_override_delegates_context_response_body_transform() {
 }
 
 #[test]
+fn test_priority_override_delegates_response_header_refinement_hooks() {
+    let mut transformer_config = make_plugin_config_with_json(
+        "rt1",
+        "response_transformer",
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "Content-Type",
+                "value": "application/json"
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    transformer_config.priority_override = Some(100);
+    let mut security_config = make_plugin_config_with_json(
+        "sh1",
+        "security_headers",
+        json!({"set": {"Cache-Control": "no-transform"}}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    security_config.priority_override = Some(200);
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt1", "sh1"])],
+        vec![transformer_config, security_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+    let ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/users".to_string(),
+    );
+    let response_headers = HashMap::new();
+
+    assert_eq!(plugins.len(), 2);
+    assert_eq!(plugins[0].name(), "response_transformer");
+    assert!(plugins[0].may_modify_response_content_type(
+        &ctx,
+        Some("application/octet-stream")
+    ));
+    assert_eq!(plugins[1].name(), "security_headers");
+    assert!(plugins[1].may_add_response_cache_control_no_transform(
+        &ctx,
+        &response_headers
+    ));
+}
+
+#[test]
 fn test_multiple_same_type_with_different_plugins_mixed() {
     // Two stdout_logging + one cors on the same proxy — all three should be present
     let config = make_config(
