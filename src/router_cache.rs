@@ -8,8 +8,8 @@
 //! Caches (host, path) → proxy lookups in a bounded DashMap for O(1) repeated hits.
 //! Regex route matches use a separate cache partition to prevent high-cardinality
 //! regex paths (e.g., UUID segments) from evicting prefix route cache entries.
-//! Route table rebuilds happen atomically via ArcSwap when config changes —
-//! never on the hot request path.
+//! Route table rebuilds publish the table and its cache-validation generation as
+//! one ArcSwap snapshot when config changes — never on the hot request path.
 
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
@@ -247,6 +247,11 @@ pub(crate) struct HostRouteTable {
     // warning where the only consumer is `#[cfg(not(linux))]`-compiled out.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     mesh_udp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
+}
+
+pub(crate) struct RouteSnapshot {
+    table: Arc<HostRouteTable>,
+    generation: u64,
 }
 
 /// One routable raw-TCP egress destination: the per-port upstream to
@@ -780,8 +785,8 @@ impl CountMinSketch {
 /// high-cardinality regex paths (e.g., `/users/{uuid}/...`) cannot evict
 /// frequently-hit prefix route cache entries.
 pub struct RouterCache {
-    /// Pre-computed host-based route index.
-    route_table: ArcSwap<HostRouteTable>,
+    /// Pre-computed host-based route index and its cache-validation generation.
+    route_snapshot: ArcSwap<RouteSnapshot>,
     /// Bounded cache for prefix route lookups: "host\0path" → matched proxy.
     /// `proxy: None` entries represent negative cache (no route matched from any tier).
     prefix_cache: DashMap<String, PrefixCacheEntry>,
@@ -825,10 +830,6 @@ pub struct RouterCache {
     /// Frequency sketch shared by both cache partitions.
     /// Tracks access frequency for frequency-aware eviction (least-frequent-of-sample).
     frequency_sketch: CountMinSketch,
-    /// Route-table generation for standalone wrapper users. RequestEpoch hot
-    /// paths pass their own route_generation into lookup so LB-only epochs do
-    /// not invalidate route cache entries.
-    route_generation: AtomicU64,
 }
 
 impl RouterCache {
@@ -872,7 +873,7 @@ impl RouterCache {
         } else {
             max_cache_entries
         };
-        let table = Self::build_route_table(config);
+        let table = Arc::new(Self::build_route_table(config));
         // Sketch width: 2x cache capacity, clamped to [1024, 65536], power of two.
         let sketch_width = (max_cache_entries * 2).clamp(1024, 65536);
         // Age after cache_capacity * 4 increments to adapt to workload changes.
@@ -886,7 +887,10 @@ impl RouterCache {
         // num_cpus * 16))` — see `crate::util::sharding`.
         let shards = crate::util::sharding::pool_shard_amount(pool_shard_amount);
         Self {
-            route_table: ArcSwap::new(Arc::new(table)),
+            route_snapshot: ArcSwap::new(Arc::new(RouteSnapshot {
+                table,
+                generation: 1,
+            })),
             prefix_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries, shards),
             regex_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries / 4 + 1, shards),
             max_cache_entries,
@@ -903,7 +907,6 @@ impl RouterCache {
             prefix_eviction_reservoir: ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY),
             regex_eviction_reservoir: ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY),
             frequency_sketch: CountMinSketch::new(sketch_width, age_threshold),
-            route_generation: AtomicU64::new(1),
         }
     }
 
@@ -916,10 +919,11 @@ impl RouterCache {
         table: Arc<HostRouteTable>,
         route_generation: u64,
     ) {
-        self.route_table.store(table);
-        let previous_generation = self
-            .route_generation
-            .swap(route_generation, Ordering::Release);
+        let previous_generation = self.route_snapshot.load().generation;
+        self.route_snapshot.store(Arc::new(RouteSnapshot {
+            table,
+            generation: route_generation,
+        }));
         if previous_generation != route_generation {
             self.clear_lookup_caches();
         }
@@ -1067,9 +1071,8 @@ impl RouterCache {
     /// Prefix and regex matches use separate cache partitions.
     #[allow(dead_code)] // Library/test API; request hot paths use find_proxy_in_snapshot().
     pub fn find_proxy(&self, host: Option<&str>, path: &str) -> Option<RouteMatch> {
-        let generation = self.route_generation.load(Ordering::Acquire);
-        let table = self.route_table.load();
-        self.find_proxy_in_snapshot(&table, generation, host, path)
+        let snapshot = self.route_snapshot.load();
+        self.find_proxy_in_snapshot(&snapshot.table, snapshot.generation, host, path)
     }
 
     pub(crate) fn find_proxy_in_snapshot(
@@ -1363,10 +1366,31 @@ impl RouterCache {
         self.cache_shard_amount
     }
 
+    #[cfg(test)]
+    fn route_table_for_tests(&self) -> Arc<HostRouteTable> {
+        let snapshot = self.route_snapshot.load();
+        Arc::clone(&snapshot.table)
+    }
+
+    #[cfg(test)]
+    fn route_snapshot_for_tests(&self) -> Arc<RouteSnapshot> {
+        self.route_snapshot.load_full()
+    }
+
+    #[cfg(test)]
+    fn publish_route_snapshot_without_clearing_for_tests(
+        &self,
+        table: Arc<HostRouteTable>,
+        generation: u64,
+    ) {
+        self.route_snapshot.store(Arc::new(RouteSnapshot { table, generation }));
+    }
+
     /// Number of routes in the pre-sorted route table (for testing).
     #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn route_count(&self) -> usize {
-        let table = self.route_table.load();
+        let snapshot = self.route_snapshot.load();
+        let table = &snapshot.table;
         let exact_count: usize = table.exact_hosts.values().map(|v| v.path_index.len()).sum();
         let exact_path_count: usize = table
             .exact_hosts_exact_paths
@@ -3445,7 +3469,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // Outbound listener: the outbound route is served.
         let outb = cache
@@ -3485,7 +3509,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
         assert_eq!(
             cache
                 .resolve_route_excluding_wrong_direction(
@@ -3560,7 +3584,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // The tiers hold exactly the lowest-port representative — including on
         // a cached second lookup (selection is post-cache, per request).
@@ -3611,7 +3635,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
         let kept = table
@@ -3653,7 +3677,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
         assert!(
@@ -3693,7 +3717,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let rm = cache.find_proxy(Some("oddball"), "/").expect("route");
         let kept = table
@@ -3731,7 +3755,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
         assert!(
@@ -3924,6 +3948,117 @@ mod tests {
     }
 
     #[test]
+    fn standalone_route_snapshot_publishes_table_and_generation_together() {
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old", "/api")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&old_config, 100);
+
+        let old = cache
+            .find_proxy(None, "/api/resource")
+            .expect("old route should match");
+        assert_eq!(old.proxy.id, "old");
+        assert_eq!(cache.route_snapshot_for_tests().generation, 1);
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new", "/api")],
+            ..GatewayConfig::default()
+        };
+        cache.store_route_table_snapshot(RouterCache::build_route_table_snapshot(&new_config), 2);
+
+        let snapshot = cache.route_snapshot_for_tests();
+        assert_eq!(snapshot.generation, 2);
+        let new = cache
+            .find_proxy_in_snapshot(&snapshot.table, snapshot.generation, None, "/api/resource")
+            .expect("new route should match through the published snapshot");
+        assert_eq!(new.proxy.id, "new");
+    }
+
+    #[test]
+    fn standalone_lookup_rejects_stale_cache_after_snapshot_publication() {
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old", "/api")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&old_config, 100);
+
+        let old = cache
+            .find_proxy(None, "/api/resource")
+            .expect("old route should match");
+        assert_eq!(old.proxy.id, "old");
+        assert_eq!(cache.cache_len(), 1);
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new", "/api")],
+            ..GatewayConfig::default()
+        };
+        cache.publish_route_snapshot_without_clearing_for_tests(
+            RouterCache::build_route_table_snapshot(&new_config),
+            2,
+        );
+        assert_eq!(
+            cache.cache_len(),
+            1,
+            "old generation cache entry should still be resident before reload clearing"
+        );
+
+        let new = cache
+            .find_proxy(None, "/api/resource")
+            .expect("new route should match despite stale resident cache entry");
+        assert_eq!(new.proxy.id, "new");
+        let snapshot = cache.route_snapshot_for_tests();
+        assert_eq!(snapshot.generation, 2);
+    }
+
+    #[test]
+    fn standalone_lookup_during_reload_observes_one_complete_route_snapshot() {
+        use std::sync::{Barrier, mpsc};
+
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old", "/api")],
+            ..GatewayConfig::default()
+        };
+        let cache = Arc::new(RouterCache::new(&old_config, 100));
+        let old = cache
+            .find_proxy(None, "/api/resource")
+            .expect("old route should match before reload");
+        assert_eq!(old.proxy.id, "old");
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new", "/api")],
+            ..GatewayConfig::default()
+        };
+        let new_table = RouterCache::build_route_table_snapshot(&new_config);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel();
+        let reader_cache = Arc::clone(&cache);
+        let reader_barrier = Arc::clone(&barrier);
+        let reader = std::thread::spawn(move || {
+            reader_barrier.wait();
+            let observed = reader_cache
+                .find_proxy(None, "/api/resource")
+                .map(|route_match| route_match.proxy.id.clone());
+            tx.send(observed).expect("send observed route");
+        });
+
+        barrier.wait();
+        cache.store_route_table_snapshot(new_table, 2);
+        let observed = rx.recv().expect("receive observed route");
+        reader.join().expect("reader thread should not panic");
+
+        assert!(
+            matches!(observed.as_deref(), Some("old") | Some("new")),
+            "lookup must observe either the complete old snapshot or the complete new snapshot, got {observed:?}"
+        );
+        let after = cache
+            .find_proxy(None, "/api/resource")
+            .expect("route should match after reload");
+        assert_eq!(after.proxy.id, "new");
+    }
+
+    #[test]
     fn new_resolves_zero_max_entries_to_auto_floor() {
         // 5 proxies × 3 = 15, well below the 10_000 floor — must clamp up.
         let config = config_with_n_proxies(5);
@@ -4061,7 +4196,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // Tiers hold exactly the lowest-service-port representative.
         let rm = cache
@@ -4136,7 +4271,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         for (orig_dst, authority) in [(None, None), (None, Some(9999u16)), (Some(9999u16), None)] {
             let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
@@ -4196,7 +4331,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // Lowest listener port is the tier representative.
         let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
@@ -4261,7 +4396,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // No port signal at all: falls through to the sole listener AND stamps
         // the declared listener port for authz.
@@ -4358,7 +4493,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // No port signal: with two DECLARED listeners and one resolved, the group
         // is ambiguous → fail closed (NOT a fall-through to the survivor).
@@ -4408,7 +4543,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // No signal → keep (back-compat), and NO ingress authz port (service
         // default authorizes on the backend port).
@@ -4444,7 +4579,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
         assert!(matches!(
@@ -4504,7 +4639,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let decision =
             |addr: &str| table.mesh_tcp_egress_decision(addr.parse().expect("socket addr"));
@@ -4547,7 +4682,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
         assert!(matches!(
             table.mesh_tcp_egress_decision("10.96.0.1:6379".parse().expect("addr")),
             Some(MeshTcpEgressDecision::CloseNotRoutable)
@@ -4576,7 +4711,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let entry = table
             .mesh_tcp_inbound_entry("10.0.0.7:6380".parse().unwrap())
@@ -4635,7 +4770,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
         let decision =
             |addr: &str| table.mesh_udp_egress_decision(addr.parse().expect("socket addr"));
 
@@ -4664,7 +4799,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
         assert!(matches!(
             table.mesh_udp_egress_decision("10.96.0.10:53".parse().expect("addr")),
             Some(MeshTcpEgressDecision::CloseNotRoutable)
@@ -4747,7 +4882,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let bywl = |addr: &str| {
             table.mesh_tcp_egress_by_workload_decision(addr.parse().expect("socket addr"))
@@ -4793,7 +4928,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
         assert!(matches!(
             table.mesh_tcp_egress_by_workload_decision("10.0.0.7:6380".parse().unwrap()),
             Some(MeshTcpEgressDecision::CloseNotRoutable)
