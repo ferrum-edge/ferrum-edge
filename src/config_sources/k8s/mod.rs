@@ -9,6 +9,7 @@ mod gateway_api;
 mod istio;
 mod mesh_config;
 
+pub(crate) use core::secret_object_is_valid_tls_certificate;
 // Shared with the Istio status writer (`crate::k8s_controller::istio_status`) so
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.

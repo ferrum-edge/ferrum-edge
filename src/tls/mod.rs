@@ -70,6 +70,33 @@ pub fn shared_crl_list(crls: CrlList) -> SharedCrlList {
     Arc::new(arc_swap::ArcSwap::new(crls))
 }
 
+/// Build a throwaway server config used only to bind listeners that must start
+/// disabled until dynamic frontend TLS material arrives.
+pub(crate) fn temporary_disabled_listener_tls_config() -> Result<Arc<ServerConfig>, anyhow::Error> {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+    let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
+    let cert = params.self_signed(&key_pair)?;
+
+    let cert_pem = cert.pem();
+    let mut cert_reader = cert_pem.as_bytes();
+    let certs: Vec<_> = certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    let key_pem = key_pair.serialize_pem();
+    let mut key_reader = key_pem.as_bytes();
+    let key = private_key(&mut key_reader)?
+        .ok_or_else(|| anyhow::anyhow!("temporary listener TLS key was not generated"))?;
+
+    Ok(Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| anyhow::anyhow!("failed to apply default TLS versions: {error}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|error| anyhow::anyhow!("temporary listener TLS config is invalid: {error}"))?,
+    ))
+}
+
 /// Accept a frontend TLS stream, optionally bounding the handshake duration.
 ///
 /// The HTTP header read timeout starts only after TLS negotiation succeeds, so

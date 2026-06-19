@@ -33,6 +33,8 @@ rules:
       - gateways/status
       - httproutes/status
       - grpcroutes/status
+      - tlsroutes/status
+      - tcproutes/status
     # The status writer reads live status before merge-patching so it can
     # preserve non-Ferrum conditions. Newer kube-rs SSA paths may fall
     # back to `update status` after a 409 conflict, and the Gateway API

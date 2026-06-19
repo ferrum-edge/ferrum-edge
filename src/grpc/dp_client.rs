@@ -134,6 +134,25 @@ pub struct DpGrpcTlsReload {
     pub revision_rx: watch::Receiver<u64>,
 }
 
+#[derive(Clone)]
+pub struct DpFrontendTlsRuntime {
+    pub listener_slot: crate::tls::SharedFrontendTls,
+    pub restore_source_slot: Option<crate::tls::SharedFrontendTls>,
+    pub h3_revision_tx: Option<watch::Sender<u64>>,
+    pub cp_materialized: Arc<AtomicBool>,
+}
+
+impl DpFrontendTlsRuntime {
+    pub fn new(listener_slot: crate::tls::SharedFrontendTls) -> Self {
+        Self {
+            listener_slot,
+            restore_source_slot: None,
+            h3_revision_tx: None,
+            cp_materialized: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 /// Build the DP/mesh gRPC TLS client config from shared env settings.
 pub fn build_dp_grpc_tls_config(
     env_config: &EnvConfig,
@@ -316,7 +335,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     namespace: String,
     primary_retry_secs: u64,
     connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
-    frontend_tls_slot: Option<crate::tls::SharedFrontendTls>,
+    frontend_tls_runtime: Option<DpFrontendTlsRuntime>,
 ) {
     if cp_urls.is_empty() {
         error!("No CP URLs configured — cannot start DP client");
@@ -355,7 +374,13 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         .as_ref()
         .map(|reload| *reload.revision_rx.borrow())
         .unwrap_or(0);
-    let cp_frontend_tls_materialized = Arc::new(AtomicBool::new(false));
+    let frontend_tls_slot = frontend_tls_runtime
+        .as_ref()
+        .map(|runtime| runtime.listener_slot.clone());
+    let cp_frontend_tls_materialized = frontend_tls_runtime
+        .as_ref()
+        .map(|runtime| runtime.cp_materialized.clone())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let frontend_tls_restore_slot: Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>> =
         Arc::new(ArcSwap::new(Arc::new(
             frontend_tls_slot
@@ -446,6 +471,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     connection_state.as_ref(),
                     is_primary,
                     frontend_tls_slot.as_ref(),
+                    frontend_tls_runtime.as_ref(),
                     cp_frontend_tls_materialized.clone(),
                     frontend_tls_restore_slot.clone(),
                 ) => res,
@@ -483,6 +509,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     connection_state.as_ref(),
                     is_primary,
                     frontend_tls_slot.as_ref(),
+                    frontend_tls_runtime.as_ref(),
                     cp_frontend_tls_materialized.clone(),
                     frontend_tls_restore_slot.clone(),
                 ) => res,
@@ -728,6 +755,7 @@ fn stage_frontend_tls_snapshot(
     config: &GatewayConfig,
     proxy_state: &ProxyState,
     frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+    frontend_tls_runtime: Option<&DpFrontendTlsRuntime>,
     cp_frontend_tls_materialized: &AtomicBool,
     frontend_tls_restore_slot: &ArcSwap<Option<Arc<rustls::ServerConfig>>>,
 ) -> Result<FrontendTlsSnapshotUpdate, anyhow::Error> {
@@ -738,7 +766,10 @@ fn stage_frontend_tls_snapshot(
         (None, None) => {
             if cp_frontend_tls_materialized.load(Ordering::Acquire) {
                 Ok(FrontendTlsSnapshotUpdate::Clear {
-                    restore_tls_config: frontend_tls_restore_slot.load_full().as_ref().clone(),
+                    restore_tls_config: frontend_tls_runtime
+                        .and_then(|runtime| runtime.restore_source_slot.as_ref())
+                        .and_then(|slot| slot.load_full().as_ref().clone())
+                        .or_else(|| frontend_tls_restore_slot.load_full().as_ref().clone()),
                 })
             } else {
                 Ok(FrontendTlsSnapshotUpdate::Unchanged)
@@ -806,6 +837,7 @@ async fn commit_frontend_tls_snapshot(
     update: FrontendTlsSnapshotUpdate,
     proxy_state: &ProxyState,
     frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+    frontend_tls_runtime: Option<&DpFrontendTlsRuntime>,
     cp_frontend_tls_materialized: &AtomicBool,
 ) {
     match update {
@@ -825,6 +857,7 @@ async fn commit_frontend_tls_snapshot(
                 } else if had_tls {
                     info!("Cleared CP-delivered Gateway frontend TLS material");
                 }
+                bump_frontend_tls_revision(frontend_tls_runtime);
             }
             cp_frontend_tls_materialized.store(false, Ordering::Release);
         }
@@ -839,12 +872,21 @@ async fn commit_frontend_tls_snapshot(
                     .set_frontend_tls_config(Some(tls_config))
                     .await;
                 cp_frontend_tls_materialized.store(true, Ordering::Release);
+                bump_frontend_tls_revision(frontend_tls_runtime);
                 info!(
                     cert_source = %cert_source,
                     "Applied CP-delivered Gateway frontend TLS material"
                 );
             }
         }
+    }
+}
+
+fn bump_frontend_tls_revision(frontend_tls_runtime: Option<&DpFrontendTlsRuntime>) {
+    if let Some(revision_tx) =
+        frontend_tls_runtime.and_then(|runtime| runtime.h3_revision_tx.as_ref())
+    {
+        revision_tx.send_modify(|revision| *revision = revision.saturating_add(1));
     }
 }
 
@@ -886,6 +928,8 @@ pub async fn connect_and_subscribe_with_startup_ready(
     is_primary: bool,
     frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
 ) -> Result<(), anyhow::Error> {
+    let frontend_tls_runtime =
+        frontend_tls_slot.map(|slot| DpFrontendTlsRuntime::new(slot.clone()));
     connect_and_subscribe_with_startup_ready_inner(
         cp_url,
         jwt_secret,
@@ -897,6 +941,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
         connection_state,
         is_primary,
         frontend_tls_slot,
+        frontend_tls_runtime.as_ref(),
         Arc::new(AtomicBool::new(false)),
         Arc::new(ArcSwap::new(Arc::new(
             frontend_tls_slot
@@ -919,6 +964,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
     is_primary: bool,
     frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+    frontend_tls_runtime: Option<&DpFrontendTlsRuntime>,
     cp_frontend_tls_materialized: Arc<AtomicBool>,
     frontend_tls_restore_slot: Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
 ) -> Result<(), anyhow::Error> {
@@ -1128,6 +1174,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             &config,
                             proxy_state,
                             frontend_tls_slot,
+                            frontend_tls_runtime,
                             cp_frontend_tls_materialized.as_ref(),
                             frontend_tls_restore_slot.as_ref(),
                         ) {
@@ -1146,6 +1193,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     frontend_tls_update,
                                     proxy_state,
                                     frontend_tls_slot,
+                                    frontend_tls_runtime,
                                     cp_frontend_tls_materialized.as_ref(),
                                 )
                                 .await;
@@ -1465,6 +1513,9 @@ mod tests {
     //! `tests/integration/cp_dp_grpc_tests.rs` via
     //! `test_dp_filters_cross_namespace_resources_from_snapshot`.
     use super::*;
+    use crate::config::EnvConfig;
+    use crate::dns::{DnsCache, DnsConfig};
+    use crate::proxy::ProxyState;
     use crate::util::backoff::jittered_backoff_with_entropy;
     use chrono::Utc;
     use serde_json::json;
@@ -1502,6 +1553,64 @@ mod tests {
             jittered_backoff_with_entropy(0, 0),
             Duration::from_millis(100)
         );
+    }
+
+    fn minimal_proxy_state() -> ProxyState {
+        ProxyState::new(
+            GatewayConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            EnvConfig::default(),
+            None,
+            None,
+        )
+        .expect("minimal ProxyState should construct")
+        .0
+    }
+
+    #[tokio::test]
+    async fn commit_frontend_tls_snapshot_notifies_h3_reload_revision() {
+        let proxy_state = minimal_proxy_state();
+        let listener_slot = crate::tls::empty_frontend_tls_slot();
+        let (revision_tx, revision_rx) = watch::channel(0_u64);
+        let runtime = DpFrontendTlsRuntime {
+            listener_slot: listener_slot.clone(),
+            restore_source_slot: None,
+            h3_revision_tx: Some(revision_tx),
+            cp_materialized: Arc::new(AtomicBool::new(false)),
+        };
+        let tls_config =
+            crate::tls::temporary_disabled_listener_tls_config().expect("test TLS config");
+
+        commit_frontend_tls_snapshot(
+            FrontendTlsSnapshotUpdate::Replace {
+                tls_config,
+                cert_source: "test-cert".to_string(),
+            },
+            &proxy_state,
+            Some(&listener_slot),
+            Some(&runtime),
+            runtime.cp_materialized.as_ref(),
+        )
+        .await;
+
+        assert_eq!(*revision_rx.borrow(), 1);
+        assert!(runtime.cp_materialized.load(Ordering::Acquire));
+        assert!(listener_slot.load_full().as_ref().is_some());
+
+        commit_frontend_tls_snapshot(
+            FrontendTlsSnapshotUpdate::Clear {
+                restore_tls_config: None,
+            },
+            &proxy_state,
+            Some(&listener_slot),
+            Some(&runtime),
+            runtime.cp_materialized.as_ref(),
+        )
+        .await;
+
+        assert_eq!(*revision_rx.borrow(), 2);
+        assert!(!runtime.cp_materialized.load(Ordering::Acquire));
+        assert!(listener_slot.load_full().as_ref().is_none());
     }
 
     fn test_config_trust_bundles(x509_authorities: Vec<String>) -> ConfigTrustBundleSet {

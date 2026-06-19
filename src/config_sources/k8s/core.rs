@@ -434,7 +434,7 @@ fn secret_tls_material_digest_for_object(secret: &K8sObject) -> Option<String> {
     Some(hex::encode(digest.finalize()))
 }
 
-fn secret_object_is_valid_tls_certificate(secret: &K8sObject) -> bool {
+pub(crate) fn secret_object_is_valid_tls_certificate(secret: &K8sObject) -> bool {
     if secret.spec.get("type").and_then(Value::as_str) != Some("kubernetes.io/tls") {
         return false;
     }
@@ -447,31 +447,49 @@ fn secret_object_is_valid_tls_certificate(secret: &K8sObject) -> bool {
     let Some(key) = data.get("tls.key").and_then(Value::as_str) else {
         return false;
     };
-    secret_data_decodes_to_certificate_pem(cert) && secret_data_decodes_to_private_key_pem(key)
+    secret_data_decodes_to_valid_tls_pair(cert, key)
 }
 
-fn secret_data_decodes_to_certificate_pem(value: &str) -> bool {
+fn secret_data_decodes_to_valid_tls_pair(cert_value: &str, key_value: &str) -> bool {
+    let Some(certs) = secret_data_decodes_to_certificate_chain(cert_value) else {
+        return false;
+    };
+    let Some(key) = secret_data_decodes_to_private_key(key_value) else {
+        return false;
+    };
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    rustls::sign::CertifiedKey::from_der(certs, key, &provider).is_ok()
+}
+
+fn secret_data_decodes_to_certificate_chain(
+    value: &str,
+) -> Option<Vec<rustls::pki_types::CertificateDer<'static>>> {
     secret_data_decodes_to_bytes(value, |bytes| {
         let mut reader = std::io::Cursor::new(bytes);
         let Ok(certs) = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() else {
-            return false;
+            return None;
         };
-        !certs.is_empty()
+        (!certs.is_empty()).then_some(certs)
     })
 }
 
-fn secret_data_decodes_to_private_key_pem(value: &str) -> bool {
+fn secret_data_decodes_to_private_key(
+    value: &str,
+) -> Option<rustls::pki_types::PrivateKeyDer<'static>> {
     secret_data_decodes_to_bytes(value, |bytes| {
         let mut reader = std::io::Cursor::new(bytes);
-        rustls_pemfile::private_key(&mut reader).is_ok_and(|key| key.is_some())
+        rustls_pemfile::private_key(&mut reader).ok().flatten()
     })
 }
 
-fn secret_data_decodes_to_bytes(value: &str, predicate: impl FnOnce(&[u8]) -> bool) -> bool {
+fn secret_data_decodes_to_bytes<T>(
+    value: &str,
+    predicate: impl FnOnce(&[u8]) -> Option<T>,
+) -> Option<T> {
     use base64::Engine as _;
 
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(value) else {
-        return false;
+        return None;
     };
     predicate(&bytes)
 }

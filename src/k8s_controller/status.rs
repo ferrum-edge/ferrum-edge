@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::config_sources::k8s::{
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject, K8sResourceKey,
     K8sTranslateError, K8sTranslationOptions, gateway_api_route_conflict_keys_with_context,
-    resource_id, translate_k8s_objects_with_filter,
+    resource_id, secret_object_is_valid_tls_certificate, translate_k8s_objects_with_filter,
 };
 
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
@@ -239,6 +239,7 @@ fn desired_status_for_object(
     let result = translate_k8s_objects_with_filter(objects, options, |candidate| {
         same_resource(candidate, object)
             || candidate.kind == "ReferenceGrant"
+            || candidate.kind == "GatewayClass"
             || candidate.kind == "Gateway"
             || candidate.kind == "Namespace"
             || candidate.kind == "Service"
@@ -379,7 +380,7 @@ fn listener_reference_status(
         }) else {
             return ListenerReferenceStatus::INVALID_CERTIFICATE_REF;
         };
-        if !secret_is_valid_tls_certificate(secret) {
+        if !secret_object_is_valid_tls_certificate(secret) {
             return ListenerReferenceStatus::INVALID_CERTIFICATE_REF;
         }
     }
@@ -475,7 +476,7 @@ fn listener_tls_certificate_ref_identities(
                     && object.metadata.namespace == namespace
                     && object.metadata.name == name
             })?;
-            secret_is_valid_tls_certificate(secret)
+            secret_object_is_valid_tls_certificate(secret)
                 .then(|| (namespace.to_string(), name.to_string()))
         })
         .collect()
@@ -530,48 +531,6 @@ fn reference_grant_has_secret_to(grant: &K8sObject, secret_name: &str) -> bool {
                     .and_then(Value::as_str)
                     .is_none_or(|name| name == secret_name)
         })
-}
-
-fn secret_is_valid_tls_certificate(secret: &K8sObject) -> bool {
-    if secret.spec.get("type").and_then(Value::as_str) != Some("kubernetes.io/tls") {
-        return false;
-    }
-    let Some(data) = secret.spec.get("data").and_then(Value::as_object) else {
-        return false;
-    };
-    let Some(cert) = data.get("tls.crt").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(key) = data.get("tls.key").and_then(Value::as_str) else {
-        return false;
-    };
-    secret_data_decodes_to_certificate_pem(cert) && secret_data_decodes_to_private_key_pem(key)
-}
-
-fn secret_data_decodes_to_certificate_pem(value: &str) -> bool {
-    secret_data_decodes_to_bytes(value, |bytes| {
-        let mut reader = std::io::Cursor::new(bytes);
-        let Ok(certs) = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() else {
-            return false;
-        };
-        !certs.is_empty()
-    })
-}
-
-fn secret_data_decodes_to_private_key_pem(value: &str) -> bool {
-    secret_data_decodes_to_bytes(value, |bytes| {
-        let mut reader = std::io::Cursor::new(bytes);
-        rustls_pemfile::private_key(&mut reader).is_ok_and(|key| key.is_some())
-    })
-}
-
-fn secret_data_decodes_to_bytes(value: &str, predicate: impl FnOnce(&[u8]) -> bool) -> bool {
-    use base64::Engine as _;
-
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(value) else {
-        return false;
-    };
-    predicate(&bytes)
 }
 
 fn gateway_status(
@@ -2428,6 +2387,30 @@ mod tests {
     }
 
     #[test]
+    fn gateway_status_honors_custom_ferrum_gateway_class_name() {
+        let gateway_class = object(
+            "GatewayClass",
+            "edge-class",
+            json!({ "controllerName": FERRUM_GATEWAY_CONTROLLER_NAME }),
+        );
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "edge-class",
+                "listeners": [{"name": "http", "port": 80, "protocol": "HTTP"}]
+            }),
+        );
+
+        let updates = plan_status_updates(&[gateway_class, gateway], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let conditions = gateway_update.status["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "Programmed", "True");
+    }
+
+    #[test]
     fn gateway_listener_status_preserves_unchanged_listener_condition_transition_time() {
         let gateway_class = ferrum_gateway_class();
         let mut gateway = ferrum_gateway("edge");
@@ -2889,7 +2872,41 @@ mod tests {
         );
         let malformed = tls_secret("malformed-certificate", "default", false);
 
-        let updates = plan_status_updates(&[gateway_class, gateway, malformed], options());
+        let updates = plan_status_updates(&[gateway_class.clone(), gateway.clone()], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listener = listener_status_by_name(
+            gateway_update.status["listeners"].as_array().unwrap(),
+            "https",
+        );
+        let conditions = listener["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "False");
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("InvalidCertificateRef")
+        );
+        assert_condition(conditions, "Programmed", "False");
+
+        let updates = plan_status_updates(
+            &[gateway_class.clone(), gateway.clone(), malformed],
+            options(),
+        );
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listener = listener_status_by_name(
+            gateway_update.status["listeners"].as_array().unwrap(),
+            "https",
+        );
+        let conditions = listener["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "False");
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("InvalidCertificateRef")
+        );
+        assert_condition(conditions, "Programmed", "False");
+
+        let mismatched = tls_secret_with_mismatched_key("malformed-certificate", "default");
+        let updates = plan_status_updates(&[gateway_class, gateway, mismatched], options());
 
         let gateway_update = update_for(&updates, "Gateway", "edge");
         let listener = listener_status_by_name(
@@ -4099,6 +4116,17 @@ mod tests {
         );
         secret.api_version = "v1".to_string();
         secret.metadata.namespace = namespace.to_string();
+        secret
+    }
+
+    fn tls_secret_with_mismatched_key(name: &str, namespace: &str) -> K8sObject {
+        use base64::Engine as _;
+
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let mut secret = tls_secret(name, namespace, true);
+        secret.spec["data"]["tls.key"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(key_pair.serialize_pem()));
         secret
     }
 

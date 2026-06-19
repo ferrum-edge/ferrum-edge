@@ -1981,17 +1981,18 @@ fn http_route_dispatch_rules_for_proxy(
     let has_route_actions = !request_transform.is_empty() || redirect.is_some() || fault.is_some();
     let Some(matches) = rule.get("matches").and_then(Value::as_array) else {
         if has_route_actions {
+            let default_match = gateway_api_default_path_prefix_match();
             return (
                 vec![gateway_api_dispatch_route_rule(
                     object,
-                    Value::Object(serde_json::Map::new()),
+                    default_match.clone(),
                     rule_index,
                     0,
                     route_destination,
                     request_transform,
                     redirect,
                     fault,
-                    &Value::Object(serde_json::Map::new()),
+                    &default_match,
                 )],
                 true,
             );
@@ -2000,17 +2001,18 @@ fn http_route_dispatch_rules_for_proxy(
     };
     if matches.is_empty() {
         if has_route_actions {
+            let default_match = gateway_api_default_path_prefix_match();
             return (
                 vec![gateway_api_dispatch_route_rule(
                     object,
-                    Value::Object(serde_json::Map::new()),
+                    default_match.clone(),
                     rule_index,
                     0,
                     route_destination,
                     request_transform,
                     redirect,
                     fault,
-                    &Value::Object(serde_json::Map::new()),
+                    &default_match,
                 )],
                 true,
             );
@@ -2117,6 +2119,10 @@ fn http_route_dispatch_rules_for_proxy(
     }
 
     (rules, has_path_only_match)
+}
+
+fn gateway_api_default_path_prefix_match() -> Value {
+    serde_json::json!({"path": {"type": "PathPrefix", "value": "/"}})
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3058,6 +3064,18 @@ mod tests {
         secret
     }
 
+    fn tls_secret_with_mismatched_key(name: &str, namespace: &str) -> K8sObject {
+        use base64::Engine as _;
+
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let mut secret = tls_secret(name, namespace, true);
+        secret.spec["data"]["tls.key"] = serde_json::json!(
+            base64::engine::general_purpose::STANDARD.encode(key_pair.serialize_pem())
+        );
+        secret
+    }
+
     #[test]
     fn gateway_https_listener_certificate_ref_sets_frontend_tls_sources() {
         let gateway = object(
@@ -3252,10 +3270,16 @@ mod tests {
         assert_eq!(missing_secret.config.frontend_tls_cert_path, None);
         assert_eq!(missing_secret.config.frontend_tls_key_path, None);
 
-        let malformed_secret =
-            translate_k8s_objects(&[gateway, malformed], options()).expect("translation succeeds");
+        let malformed_secret = translate_k8s_objects(&[gateway.clone(), malformed], options())
+            .expect("translation succeeds");
         assert_eq!(malformed_secret.config.frontend_tls_cert_path, None);
         assert_eq!(malformed_secret.config.frontend_tls_key_path, None);
+
+        let mismatched = tls_secret_with_mismatched_key("gateway-cert", "default");
+        let mismatched_secret =
+            translate_k8s_objects(&[gateway, mismatched], options()).expect("translation succeeds");
+        assert_eq!(mismatched_secret.config.frontend_tls_cert_path, None);
+        assert_eq!(mismatched_secret.config.frontend_tls_key_path, None);
     }
 
     #[test]
@@ -5119,6 +5143,40 @@ mod tests {
         let redirect = &dispatch.config["rules"][0]["redirect"];
         assert_eq!(redirect["uri"], "/new");
         assert_eq!(redirect["match_prefix"], "/old");
+    }
+
+    #[test]
+    fn http_route_replace_prefix_redirect_defaults_missing_match_to_root_prefix() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "path": {
+                                    "type": "ReplacePrefixMatch",
+                                    "replacePrefixMatch": "/new"
+                                }
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("default-match prefix redirect route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["uri"], "/new");
+        assert_eq!(redirect["match_prefix"], "/");
     }
 
     #[test]

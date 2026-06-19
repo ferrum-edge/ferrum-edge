@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -247,21 +247,38 @@ pub async fn run(
             "Frontend TLS live reload enabled for DP proxy HTTPS (H1/H2) and HTTP/3"
         );
     }
+    let operator_frontend_tls_slot = tls_config.as_ref().map(|cfg| {
+        proxy_frontend_reload_handles
+            .as_ref()
+            .and_then(|handles| handles.slot.clone())
+            .unwrap_or_else(|| tls::frontend_tls_slot_with(cfg.clone()))
+    });
     let proxy_frontend_tls_slot = if env_config.proxy_https_port != 0 {
         Some(
-            tls_config
+            operator_frontend_tls_slot
                 .as_ref()
-                .map(|cfg| {
-                    proxy_frontend_reload_handles
-                        .as_ref()
-                        .and_then(|handles| handles.slot.clone())
-                        .unwrap_or_else(|| tls::frontend_tls_slot_with(cfg.clone()))
+                .map(|slot| {
+                    Arc::new(arc_swap::ArcSwap::new(Arc::new(
+                        slot.load_full().as_ref().clone(),
+                    )))
                 })
                 .unwrap_or_else(tls::empty_frontend_tls_slot),
         )
     } else {
         None
     };
+    let (proxy_frontend_tls_revision_tx, proxy_frontend_tls_revision_rx) =
+        tokio::sync::watch::channel(0_u64);
+    let cp_frontend_tls_materialized = Arc::new(AtomicBool::new(false));
+    let dp_frontend_tls_runtime =
+        proxy_frontend_tls_slot
+            .clone()
+            .map(|slot| crate::grpc::dp_client::DpFrontendTlsRuntime {
+                listener_slot: slot,
+                restore_source_slot: operator_frontend_tls_slot.clone(),
+                h3_revision_tx: Some(proxy_frontend_tls_revision_tx.clone()),
+                cp_materialized: cp_frontend_tls_materialized.clone(),
+            });
 
     // Set TLS config on stream listener manager for TCP proxies with frontend_tls.
     if let Some(ref tls_cfg) = tls_config {
@@ -300,6 +317,48 @@ pub async fn run(
     // Start separate listeners for HTTP and HTTPS
     let mut handles = Vec::new();
     let mut startup_signals = Vec::new();
+
+    if let (Some(listener_slot), Some(operator_slot), Some(mut operator_revision_rx)) = (
+        proxy_frontend_tls_slot.clone(),
+        operator_frontend_tls_slot.clone(),
+        proxy_frontend_reload_handles
+            .as_ref()
+            .and_then(|handles| handles.revision_rx.clone()),
+    ) {
+        let cp_materialized = cp_frontend_tls_materialized.clone();
+        let revision_tx = proxy_frontend_tls_revision_tx.clone();
+        let mut bridge_shutdown = shutdown_tx.subscribe();
+        let bridge_proxy_state = proxy_state.clone();
+        let bridge_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = operator_revision_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        if cp_materialized.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        let operator_tls = operator_slot.load_full().as_ref().clone();
+                        listener_slot.store(Arc::new(operator_tls.clone()));
+                        bridge_proxy_state
+                            .stream_listener_manager
+                            .set_frontend_tls_config(operator_tls)
+                            .await;
+                        revision_tx.send_modify(|revision| {
+                            *revision = revision.saturating_add(1);
+                        });
+                    }
+                    _ = bridge_shutdown.changed() => {
+                        if *bridge_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        handles.push(bridge_handle);
+    }
 
     // HTTP listener (disabled when port is 0)
     if env_config.proxy_http_port != 0 {
@@ -355,9 +414,22 @@ pub async fn run(
         info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTPS proxy listener disabled");
     }
 
-    // HTTP/3 (QUIC) listener (only if enabled and TLS is configured)
+    // HTTP/3 (QUIC) listener. DP mode may receive Gateway-managed TLS after
+    // startup, so a HTTPS-enabled DP can bind H3 with a temporary disabled
+    // config and wait for the CP-owned TLS slot to receive material.
     if env_config.enable_http3 {
-        if let Some(tls_config) = tls_config.clone() {
+        if env_config.proxy_https_port == 0 {
+            info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTP/3 proxy listener disabled");
+        } else if let Some(tls_config) = tls_config
+            .clone()
+            .map(Ok)
+            .or_else(|| {
+                proxy_frontend_tls_slot
+                    .as_ref()
+                    .map(|_| tls::temporary_disabled_listener_tls_config())
+            })
+            .transpose()?
+        {
             let h3_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
             let h3_state = proxy_state.clone();
             let h3_shutdown = shutdown_tx.subscribe();
@@ -366,9 +438,12 @@ pub async fn run(
             let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
             let h3_client_crls = crls.clone();
             let (h3_started_tx, h3_started_rx) = tokio::sync::oneshot::channel();
-            let h3_reload = crate::modes::tls_reload::build_h3_frontend_tls_reload(
-                proxy_frontend_reload_handles.as_ref(),
-            );
+            let h3_reload = proxy_frontend_tls_slot.clone().map(|tls_slot| {
+                crate::http3::server::Http3FrontendTlsReload {
+                    tls_slot,
+                    revision_rx: proxy_frontend_tls_revision_rx.clone(),
+                }
+            });
             let h3_handle = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
                 if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
@@ -393,13 +468,13 @@ pub async fn run(
             handles.push(h3_handle);
             startup_signals.push(("HTTP/3 proxy listener".to_string(), h3_started_rx));
         } else {
-            error!("HTTP/3 requires TLS configuration - HTTP/3 listener disabled");
+            info!("HTTP/3 disabled: HTTPS listener disabled");
         }
     }
 
-    if env_config.proxy_http_port == 0 && tls_config.is_none() {
+    if env_config.proxy_http_port == 0 && proxy_frontend_tls_slot.is_none() {
         warn!(
-            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and no TLS configured. Only stream proxies (TCP/UDP) will serve traffic."
+            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and FERRUM_PROXY_HTTPS_PORT=0. Only stream proxies (TCP/UDP) will serve traffic."
         );
     }
 
@@ -576,7 +651,7 @@ pub async fn run(
     let dp_namespace = env_config.namespace.clone();
     let dp_primary_retry_secs = env_config.dp_cp_failover_primary_retry_secs;
     let dp_conn_state = cp_connection_state.clone();
-    let dp_frontend_tls_slot = proxy_frontend_tls_slot.clone();
+    let dp_frontend_tls_runtime = dp_frontend_tls_runtime.clone();
     let dp_client_handle = tokio::spawn(async move {
         crate::grpc::dp_client::start_dp_client_with_shutdown_and_startup_ready(
             cp_urls,
@@ -589,7 +664,7 @@ pub async fn run(
             dp_namespace,
             dp_primary_retry_secs,
             Some(dp_conn_state),
-            dp_frontend_tls_slot,
+            dp_frontend_tls_runtime,
         )
         .await;
     });
