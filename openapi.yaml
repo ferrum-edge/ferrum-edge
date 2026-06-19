@@ -13416,13 +13416,13 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
       properties:
         ttl_seconds:
           type: integer
           format: uint64
           default: 300
-          description: "Default TTL in seconds when the backend response has no max-age/s-maxage. Backend cache-control directives take precedence when respect_cache_control is true."
+          description: "Default freshness lifetime in seconds when the backend response has no max-age/s-maxage. Backend cache-control directives take precedence when respect_cache_control is true. Upstream Age and Date still reduce remaining freshness."
         max_entries:
           type: integer
           format: uint64
@@ -13476,7 +13476,7 @@ components:
         add_cache_status_header:
           type: boolean
           default: true
-          description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses"
+          description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses. Cache hits also emit a current Age header."
         invalidate_on_unsafe_methods:
           type: boolean
           default: true

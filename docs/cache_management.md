@@ -172,7 +172,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** `max_entries` (in plugin config JSON).
 
-**Cleanup mechanism:** TTL-based expiration. When the cache exceeds `max_entries`, expired entries are evicted first, then oldest entries are removed to bring the count below the limit.
+**Cleanup mechanism:** Freshness-based expiration (`ttl_seconds` fallback plus backend `Cache-Control`, `Age`, and `Date`). Cache hits emit a current `Age` header. When the cache exceeds `max_entries`, expired entries are evicted first, then oldest entries are removed to bring the count below the limit.
 
 ### AI Semantic Cache
 

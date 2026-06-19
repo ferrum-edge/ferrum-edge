@@ -2979,7 +2979,7 @@ Caches final client-visible HTTP responses in gateway memory. The cache key incl
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `ttl_seconds` | u64 | `300` | Default TTL when the backend response does not provide cache freshness headers |
+| `ttl_seconds` | u64 | `300` | Default freshness lifetime when the backend response does not provide `max-age` or `s-maxage`; upstream `Age` and `Date` still reduce remaining freshness |
 | `max_entries` | u64 | `10000` | Maximum number of in-memory cache entries before eviction |
 | `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body |
 | `max_total_size_bytes` | u64 | `104857600` | Maximum total in-memory cache size across all entries |
@@ -2996,7 +2996,8 @@ Caches final client-visible HTTP responses in gateway memory. The cache key incl
 Behavior:
 - The plugin caches the final post-transform response body and headers, so cached hits include `response_transformer` output rather than the raw backend payload.
 - Backend `Vary` is honored automatically. If the origin returns `Vary: Accept-Encoding`, compressed and uncompressed representations are cached separately.
-- Conditional requests are served from cache. Matching `If-None-Match` or `If-Modified-Since` requests return `304 Not Modified` directly from the edge cache when a fresh cached validator exists.
+- Freshness uses the response's corrected initial age plus cache residency time. Backend `Age` and valid `Date` headers are incorporated, `s-maxage` takes precedence over `max-age`, and cache hits replace any stored `Age` value with the current age.
+- Conditional requests are served from cache. Matching `If-None-Match` or `If-Modified-Since` requests return `304 Not Modified` directly from the edge cache when a fresh cached validator exists, including a current `Age` header.
 - Authenticated requests are always partitioned by hashed effective identity. Setting `cache_key_include_consumer: true` also permits caching authenticated responses that do not explicitly opt into shared caching and partitions unauthenticated requests under `_anon`.
 - When `cache_key_include_query` is enabled, the raw query string is hashed byte-for-byte without parsing, sorting, percent-decoding, or normalizing, so duplicate parameters, parameter order, percent-encoded names, bare flags, and empty values remain distinct.
 - Requests carrying `Authorization`, `Proxy-Authorization`, or `Cookie` are keyed by hashed header values for cacheable responses so distinct credentials or sessions cannot share one cached entry.
