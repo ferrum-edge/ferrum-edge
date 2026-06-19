@@ -420,14 +420,50 @@ fn comma_header_contains_token(value: &str, token: &str) -> bool {
 }
 
 fn cache_control_has_directive(value: &str, directive: &str) -> bool {
-    value.split(',').any(|part| {
-        let part = part.trim();
-        let directive_name = part
-            .split_once('=')
-            .map(|(name, _)| name.trim())
-            .unwrap_or(part);
-        directive_name.eq_ignore_ascii_case(directive)
-    })
+    let mut segment_start = 0;
+    let mut in_quote = false;
+    let mut escaped = false;
+
+    for (idx, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quote && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quote = !in_quote;
+            continue;
+        }
+        if ch == ',' && !in_quote {
+            if cache_control_segment_has_directive(&value[segment_start..idx], directive) {
+                return true;
+            }
+            segment_start = idx + ch.len_utf8();
+        }
+    }
+
+    cache_control_segment_has_directive(&value[segment_start..], directive)
+}
+
+fn cache_control_segment_has_directive(segment: &str, directive: &str) -> bool {
+    let segment = segment.trim();
+    let directive_name = segment
+        .split_once('=')
+        .map(|(name, _)| name.trim())
+        .unwrap_or(segment);
+    directive_name.eq_ignore_ascii_case(directive)
+}
+
+fn headers_have_cache_control_directive(
+    headers: &HashMap<String, String>,
+    directive: &str,
+) -> bool {
+    headers
+        .get("cache-control")
+        .is_some_and(|value| cache_control_has_directive(value, directive))
 }
 
 /// Read from `reader` into a `Vec`, enforcing a maximum decompressed size.
@@ -519,7 +555,9 @@ impl Plugin for CompressionPlugin {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.config.decompress_request && ctx.headers.contains_key("content-encoding")
+        self.config.decompress_request
+            && ctx.headers.contains_key("content-encoding")
+            && !headers_have_cache_control_directive(&ctx.headers, "no-transform")
     }
 
     /// Buffer the request body before `before_proxy` runs so the decompression
@@ -546,7 +584,9 @@ impl Plugin for CompressionPlugin {
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // Skip response buffering when the client doesn't accept any encoding
         // we support — there's nothing to compress.
-        !self.config.algorithms.is_empty() && ctx.headers.contains_key("accept-encoding")
+        !self.config.algorithms.is_empty()
+            && ctx.headers.contains_key("accept-encoding")
+            && !ctx.metadata.contains_key("compression:request_no_transform")
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -580,12 +620,6 @@ impl Plugin for CompressionPlugin {
         {
             return false;
         }
-        if response_headers
-            .get("cache-control")
-            .is_some_and(|value| cache_control_has_directive(value, "no-transform"))
-        {
-            return false;
-        }
         self.should_buffer_response_body(ctx)
             && content_type.is_some_and(|ct| self.is_compressible_content_type(ct))
     }
@@ -605,6 +639,17 @@ impl Plugin for CompressionPlugin {
         // decompression (wasted CPU; with a crafted gzip-bomb payload, bounded by
         // `max_decompressed_request_size` but still unnecessary work).
         headers.remove("x-ferrum-original-content-encoding");
+
+        // RFC 9111 no-transform is valid on requests too. Treat it as an opt-out
+        // from gateway request/response representation changes and leave
+        // Accept-Encoding/Content-Encoding intact for the origin to handle.
+        if headers_have_cache_control_directive(headers, "no-transform") {
+            ctx.metadata.insert(
+                "compression:request_no_transform".to_string(),
+                "true".to_string(),
+            );
+            return PluginResult::Continue;
+        }
 
         // Save original Accept-Encoding before we potentially strip it.
         // Read from `headers` param — ctx.headers may be empty when the handler
@@ -700,6 +745,10 @@ impl Plugin for CompressionPlugin {
             return PluginResult::Continue;
         }
 
+        if ctx.metadata.contains_key("compression:request_no_transform") {
+            return PluginResult::Continue;
+        }
+
         // Range responses carry byte offsets for the original representation.
         // Compressing them changes those byte positions and corrupts range
         // semantics, even if a backend sends Content-Range with a non-206
@@ -721,10 +770,7 @@ impl Plugin for CompressionPlugin {
 
         // RFC 9111 no-transform forbids an intermediary from transforming the
         // payload representation, including content-coding compression.
-        if response_headers
-            .get("cache-control")
-            .is_some_and(|value| cache_control_has_directive(value, "no-transform"))
-        {
+        if headers_have_cache_control_directive(response_headers, "no-transform") {
             return PluginResult::Continue;
         }
 
@@ -807,6 +853,10 @@ impl Plugin for CompressionPlugin {
             return None;
         }
 
+        if headers_have_cache_control_directive(request_headers, "no-transform") {
+            return None;
+        }
+
         // Check Content-Encoding to decide how to decompress. The original
         // header was removed in before_proxy and saved under the private key
         // x-ferrum-original-content-encoding so the backend doesn't see it.
@@ -855,13 +905,6 @@ impl Plugin for CompressionPlugin {
             "br" => Algorithm::Brotli,
             _ => return None,
         };
-
-        if response_headers
-            .get("cache-control")
-            .is_some_and(|value| cache_control_has_directive(value, "no-transform"))
-        {
-            return None;
-        }
 
         // CRITICAL: once `after_proxy` set `Content-Encoding`, the response
         // is committed to that encoding. We MUST NOT short-circuit here on

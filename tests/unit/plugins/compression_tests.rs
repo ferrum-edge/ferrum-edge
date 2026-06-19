@@ -367,6 +367,55 @@ async fn test_cache_control_substring_no_transform_does_not_disable_compression(
     assert!(!resp_headers.contains_key("content-length"));
 }
 
+#[tokio::test]
+async fn test_cache_control_quoted_no_transform_argument_does_not_disable_compression() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert(
+        "cache-control".to_string(),
+        r#"private="set-cookie, no-transform, authorization""#.to_string(),
+    );
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+    assert!(!resp_headers.contains_key("content-length"));
+}
+
+#[tokio::test]
+async fn test_request_cache_control_no_transform_disables_gateway_compression() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(None);
+    let mut headers = HashMap::new();
+    headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    headers.insert("cache-control".to_string(), "no-transform".to_string());
+
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(ctx.metadata.contains_key("compression:request_no_transform"));
+    assert!(!ctx.metadata.contains_key("compression:accept_encoding"));
+    assert_eq!(headers.get("accept-encoding").unwrap(), "gzip");
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &resp_headers
+    ));
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
+}
+
 #[test]
 fn test_response_buffering_is_narrowed_by_content_type() {
     let plugin = make_plugin(json!({}));
@@ -408,7 +457,7 @@ fn test_response_buffering_is_narrowed_by_content_type() {
 }
 
 #[test]
-fn test_response_buffering_skips_cache_control_no_transform() {
+fn test_response_buffering_keeps_cache_control_no_transform_eligible() {
     let plugin = make_plugin(json!({}));
     let ctx = make_ctx(Some("gzip"));
     let mut headers = HashMap::new();
@@ -417,7 +466,7 @@ fn test_response_buffering_skips_cache_control_no_transform() {
         "public, no-transform".to_string(),
     );
 
-    assert!(!plugin.should_buffer_response_body_for_content_type(
+    assert!(plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("application/json"),
         200,
@@ -872,24 +921,30 @@ async fn test_compresses_tiny_body_when_committed_in_transform() {
 }
 
 #[tokio::test]
-async fn test_transform_response_body_rechecks_no_transform_before_compressing() {
+async fn test_transform_response_body_compresses_when_encoding_already_committed() {
     let plugin = make_plugin(json!({"min_content_length": 10}));
 
     let mut resp_headers = HashMap::new();
     resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
     resp_headers.insert("cache-control".to_string(), "no-transform".to_string());
 
-    let result = plugin
-        .transform_response_body(
-            b"compressible body",
-            Some("application/json"),
-            &resp_headers,
-        )
-        .await;
+    let original = b"compressible body";
+    let compressed = plugin
+        .transform_response_body(original, Some("application/json"), &resp_headers)
+        .await
+        .expect("committed Content-Encoding must produce an encoded body");
 
-    assert!(result.is_none());
     assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
     assert_eq!(resp_headers.get("cache-control").unwrap(), "no-transform");
+
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .expect("output must be valid gzip");
+    assert_eq!(decompressed, original);
 }
 
 #[tokio::test]
@@ -1161,6 +1216,16 @@ fn test_should_buffer_only_when_content_encoding_present() {
 
     let ctx_without_ce = make_ctx(None);
     assert!(!plugin.should_buffer_request_body(&ctx_without_ce));
+
+    let ctx_no_transform = {
+        let mut ctx = make_ctx(None);
+        ctx.headers
+            .insert("content-encoding".to_string(), "gzip".to_string());
+        ctx.headers
+            .insert("cache-control".to_string(), "no-transform".to_string());
+        ctx
+    };
+    assert!(!plugin.should_buffer_request_body(&ctx_no_transform));
 }
 
 // ────────────────────── Algorithm-only config ──────────────────────
@@ -1486,6 +1551,41 @@ async fn test_valid_gzip_request_body_is_accepted_and_headers_stripped() {
             .get("compression:request_encoding")
             .map(String::as_str),
         Some("gzip")
+    );
+}
+
+#[tokio::test]
+async fn test_request_cache_control_no_transform_preserves_compressed_request_body() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = b"request body that would normally decompress";
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+    headers.insert("cache-control".to_string(), "no-transform".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key("compression:request_no_transform"));
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert!(headers.contains_key("content-length"));
+
+    let transformed = plugin
+        .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
+        .await;
+    assert!(
+        transformed.is_none(),
+        "Cache-Control: no-transform must leave the compressed request body intact"
     );
 }
 
