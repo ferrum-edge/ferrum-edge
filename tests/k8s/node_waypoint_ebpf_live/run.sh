@@ -195,6 +195,17 @@ render_chart_assertions() {
     exit 1
   fi
 
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.admin.enabled=true \
+    --set-string nodeAgent.admin.port=0)"
+  if grep -q "readinessProbe:" <<<"$rendered"; then
+    echo "Node-agent render emitted a readiness probe for disabled admin port 0" >&2
+    grep -nE 'readinessProbe:|FERRUM_ADMIN_HTTP_PORT|value: "?0"?' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
@@ -424,16 +435,19 @@ collect_bpf_evidence() {
       else
         kubectl debug "node/$node" -n "$MESH_NS" --image="$BPFTOOL_IMAGE" --quiet -- \
           sh -eu -c '
-            if command -v nsenter >/dev/null 2>&1; then
-              nsenter -t 1 -m -n bpftool prog show
-              nsenter -t 1 -m -n bpftool link show
-              nsenter -t 1 -m -n bpftool map show
-              nsenter -t 1 -m -n find /sys/fs/bpf/ferrum -maxdepth 1 -type f -print 2>/dev/null || true
+            if ! command -v bpftool >/dev/null 2>&1; then
+              echo "bpftool missing from debug image" >&2
+              exit 127
+            fi
+            bpftool prog show
+            bpftool link show
+            bpftool map show
+            if [ -d /host/sys/fs/bpf/ferrum ]; then
+              find /host/sys/fs/bpf/ferrum -maxdepth 1 -type f -print 2>/dev/null | sed "s#^/host##" || true
+            elif command -v nsenter >/dev/null 2>&1; then
+              nsenter -t 1 -m -n sh -eu -c "find /sys/fs/bpf/ferrum -maxdepth 1 -type f -print 2>/dev/null || true"
             else
-              chroot /host bpftool prog show
-              chroot /host bpftool link show
-              chroot /host bpftool map show
-              chroot /host find /sys/fs/bpf/ferrum -maxdepth 1 -type f -print 2>/dev/null || true
+              find /sys/fs/bpf/ferrum -maxdepth 1 -type f -print 2>/dev/null || true
             fi
           ' >"$tmp" 2>&1
       fi
@@ -816,12 +830,26 @@ expect_allowed() {
   local from="$1"
   local label="$2"
   local url="$3"
-  local code
-  code="$(curl_from "$from" "$url")"
-  if [[ "$code" != "200" ]]; then
-    echo "expected allow for $label from $from to $url, got HTTP $code" >&2
-    exit 1
-  fi
+  local code="" status=1 err
+  err="$(mktemp)"
+  for attempt in $(seq 1 8); do
+    set +e
+    code="$(curl_from "$from" "$url" 2>"$err")"
+    status=$?
+    set -e
+    if [[ "$status" -eq 0 && "$code" == "200" ]]; then
+      rm -f "$err"
+      return
+    fi
+    if [[ "$status" -eq 0 ]]; then
+      break
+    fi
+    sleep 1
+  done
+  echo "expected allow for $label from $from to $url, got HTTP ${code:-curl-exit-$status}" >&2
+  cat "$err" >&2 || true
+  rm -f "$err"
+  exit 1
 }
 
 expect_blocked() {

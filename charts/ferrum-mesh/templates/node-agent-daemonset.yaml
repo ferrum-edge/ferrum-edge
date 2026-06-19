@@ -228,7 +228,7 @@ spec:
             {{- end }}
           resources:
             {{- toYaml .Values.nodeAgent.resources | nindent 12 }}
-          {{- if .Values.nodeAgent.admin.enabled }}
+          {{- if and .Values.nodeAgent.admin.enabled (ne (toString .Values.nodeAgent.admin.port) "0") }}
           readinessProbe:
             exec:
               command:

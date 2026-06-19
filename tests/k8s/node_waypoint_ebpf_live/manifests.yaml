@@ -101,6 +101,13 @@ spec:
           image: python:3.12-alpine
           ports:
             - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
           command:
             - python
             - -u
@@ -158,6 +165,13 @@ spec:
           image: python:3.12-alpine
           ports:
             - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
           command:
             - python
             - -u
