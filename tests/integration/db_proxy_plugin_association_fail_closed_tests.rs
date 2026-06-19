@@ -305,3 +305,41 @@ async fn admin_proxy_reads_reject_incomplete_cross_namespace_associations() {
     assert!(list_message.contains("plugin-other"));
     assert!(!list_message.contains("X-Secret-Key"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_proxy_reads_reject_global_plugin_associations() {
+    let (store, _temp_dir) = sqlite_store().await;
+    seed_proxy_with_plugin(&store).await;
+
+    let ts = Utc::now().to_rfc3339();
+    let pool = store.pool();
+    sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
+         VALUES (?, 'ferrum', 'key_auth', ?, 'global', ?, 1, ?, ?)",
+    )
+    .bind("plugin-global")
+    .bind(r#"{"key_location":"header:X-Global-Key"}"#)
+    .bind(Option::<String>::None)
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&pool)
+    .await
+    .expect("global plugin insert must succeed");
+    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
+        .bind("proxy-1")
+        .bind("plugin-global")
+        .execute(&pool)
+        .await
+        .expect("global association insert must succeed");
+
+    let get_message = error_text(store.get_proxy("proxy-1").await);
+    assert_association_error_context(&get_message, "get_proxy");
+    assert!(get_message.contains("plugin-global"));
+    assert!(!get_message.contains("X-Global-Key"));
+
+    let list_message = error_text(store.list_proxies_paginated("ferrum", 25, 0).await);
+    assert_association_error_context(&list_message, "list_proxies_paginated");
+    assert!(list_message.contains("plugin-global"));
+    assert!(!list_message.contains("X-Global-Key"));
+}

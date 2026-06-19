@@ -1038,7 +1038,13 @@ impl DatabaseStore {
             } else {
                 match plugin_refs.get(assoc.plugin_config_id.as_str()) {
                     Some(plugin) => match plugin.scope {
-                        PluginScope::Global | PluginScope::ProxyGroup => {}
+                        PluginScope::Global => {
+                            errors.push(format!(
+                                "Proxy '{}' references global plugin_config '{}'",
+                                proxy_id, plugin.id
+                            ));
+                        }
+                        PluginScope::ProxyGroup => {}
                         PluginScope::Proxy => {
                             if plugin.proxy_id.as_deref() != Some(proxy_id) {
                                 errors.push(format!(
