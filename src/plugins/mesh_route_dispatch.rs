@@ -1594,7 +1594,7 @@ impl Plugin for MeshRouteDispatch {
             return PluginResult::Reject {
                 status_code: 404,
                 body: "no route matched mesh_route_dispatch predicates".to_string(),
-                headers: HashMap::new(),
+                headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
             };
         }
         PluginResult::Continue
@@ -1745,8 +1745,9 @@ fn build_redirect_response(
         None => format!("{path}{query_suffix}"),
     };
 
-    let mut reject_headers = HashMap::with_capacity(1);
+    let mut reject_headers = HashMap::with_capacity(2);
     reject_headers.insert("location".to_string(), location);
+    reject_headers.insert("content-type".to_string(), "text/plain".to_string());
     PluginResult::Reject {
         status_code: redirect.redirect_code,
         body: String::new(),
@@ -2589,10 +2590,16 @@ mod tests {
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         match result {
             PluginResult::Reject {
-                status_code, body, ..
+                status_code,
+                body,
+                headers,
             } => {
                 assert_eq!(status_code, 404);
                 assert!(body.contains("no route matched"), "got: {body}");
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some("text/plain")
+                );
             }
             other => panic!("expected Reject 404, got {other:?}"),
         }
@@ -5131,6 +5138,10 @@ mod tests {
                 assert_eq!(
                     headers.get("location").map(String::as_str),
                     Some("https://elsewhere.example.com/new")
+                );
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some("text/plain")
                 );
             }
             other => panic!("expected redirect Reject, got {other:?}"),

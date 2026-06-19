@@ -7,8 +7,8 @@ use tracing::warn;
 
 use crate::config_sources::k8s::{
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject, K8sResourceKey,
-    K8sTranslateError, K8sTranslationOptions, gateway_api_route_conflict_keys, resource_id,
-    translate_k8s_objects_with_filter,
+    K8sTranslateError, K8sTranslationOptions, gateway_api_route_conflict_keys_with_context,
+    resource_id, translate_k8s_objects_with_filter,
 };
 
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
@@ -190,7 +190,7 @@ pub fn plan_gateway_api_status_updates_with_context(
                 object.kind.as_str(),
                 "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
             ) {
-                gateway_api_route_conflict_keys(object)
+                gateway_api_route_conflict_keys_with_context(objects, &options, object)
                     .into_iter()
                     .filter(|key| managed_parent_ref_keys.contains(&key.parent_ref))
                     .collect()
@@ -3474,6 +3474,41 @@ mod tests {
             .iter()
             .find(|update| update.name == "api-b")
             .expect("newer route status");
+        let parents = newer_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+
+        assert_condition(conditions, "Accepted", "False");
+        assert_condition(conditions, "Programmed", "False");
+        assert_condition(conditions, "Conflicted", "True");
+        assert_eq!(
+            find_condition(conditions, "Accepted")["reason"].as_str(),
+            Some("Conflicted")
+        );
+    }
+
+    #[test]
+    fn hostless_route_conflict_status_uses_listener_intersected_hostname() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": "api.example.com"
+                }]
+            }),
+        );
+        let mut older = route_with_created_at("api-a", "2026-01-01T00:00:00Z");
+        older.spec.as_object_mut().unwrap().remove("hostnames");
+        let mut newer = route_with_created_at("api-b", "2026-01-02T00:00:00Z");
+        newer.spec.as_object_mut().unwrap().remove("hostnames");
+
+        let updates = plan_status_updates(&[gateway_class, gateway, newer, older], options());
+        let newer_update = update_for(&updates, "HTTPRoute", "api-b");
         let parents = newer_update.status["parents"].as_array().unwrap();
         let conditions = parents[0]["conditions"].as_array().unwrap();
 

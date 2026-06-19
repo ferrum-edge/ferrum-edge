@@ -41,6 +41,7 @@ use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::MeshConfig;
 
 const MAX_FAULT_DELAY_MS: u64 = 3_600_000;
+const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct K8sMetadata {
@@ -355,6 +356,7 @@ pub(crate) struct K8sAccumulator {
     pub(crate) gateway_api_conflict_losers: HashMap<K8sResourceKey, Vec<GatewayApiRouteConflict>>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
+    gateway_api_gateway_classes: HashMap<String, bool>,
     pub(crate) namespace_labels: HashMap<String, HashMap<String, String>>,
     /// Flat copy of the Gateway API route conflicts computed over the
     /// translator's filtered object set. Reused by the status writer so
@@ -385,6 +387,7 @@ impl K8sAccumulator {
             explicit_service_entries: HashSet::new(),
             gateway_api_conflict_losers: HashMap::new(),
             gateway_api_listener_policies: HashMap::new(),
+            gateway_api_gateway_classes: HashMap::new(),
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
         }
@@ -451,6 +454,23 @@ impl K8sAccumulator {
         labels: HashMap<String, String>,
     ) {
         self.namespace_labels.insert(namespace, labels);
+    }
+
+    pub(crate) fn record_gateway_class(&mut self, object: &K8sObject) {
+        let managed = object.spec.get("controllerName").and_then(Value::as_str)
+            == Some(FERRUM_GATEWAY_CONTROLLER_NAME);
+        self.gateway_api_gateway_classes
+            .insert(object.metadata.name.clone(), managed);
+    }
+
+    pub(crate) fn gateway_is_managed_by_ferrum(&self, object: &K8sObject) -> bool {
+        let Some(class_name) = object.spec.get("gatewayClassName").and_then(Value::as_str) else {
+            return false;
+        };
+        self.gateway_api_gateway_classes
+            .get(class_name)
+            .copied()
+            .unwrap_or_else(|| class_name == "ferrum")
     }
 
     fn record_explicit_workload_service(&mut self, key: K8sServiceKey) {
@@ -617,11 +637,44 @@ pub fn gateway_api_route_conflicts(
     objects: &[K8sObject],
     options: &K8sTranslationOptions,
 ) -> Vec<GatewayApiRouteConflict> {
-    gateway_api::route_conflicts(objects, options, None)
+    let mut acc = K8sAccumulator::new(options.clone());
+    collect_gateway_api_status_context(objects, &mut acc);
+    gateway_api::route_conflicts(objects, options, Some(&acc))
 }
 
 pub fn gateway_api_route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
     gateway_api::route_conflict_keys(object)
+}
+
+pub fn gateway_api_route_conflict_keys_with_context(
+    objects: &[K8sObject],
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> Vec<GatewayApiRouteConflictKey> {
+    let mut acc = K8sAccumulator::new(options.clone());
+    collect_gateway_api_status_context(objects, &mut acc);
+    gateway_api::route_conflict_keys_for_acc(object, Some(&acc))
+}
+
+fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumulator) {
+    for object in objects {
+        if object.kind == "Namespace" {
+            acc.record_namespace_labels(
+                object.metadata.name.clone(),
+                object.metadata.labels.clone(),
+            );
+        } else if object.kind == "GatewayClass" {
+            acc.record_gateway_class(object);
+        }
+    }
+    for object in objects {
+        if object.kind == "Gateway"
+            && includes_object_namespace(&acc.options, object)
+            && acc.gateway_is_managed_by_ferrum(object)
+        {
+            let _ = gateway_api::collect_gateway_listener_policy(acc, object);
+        }
+    }
 }
 
 pub(crate) fn translate_k8s_objects_with_filter<F>(
@@ -652,6 +705,13 @@ where
                 object.metadata.name.clone(),
                 object.metadata.labels.clone(),
             );
+        } else if object.kind == "GatewayClass" {
+            acc.record_gateway_class(object);
+        }
+    }
+
+    for object in &included_objects {
+        if object.kind == "Namespace" || object.kind == "GatewayClass" {
             continue;
         }
         if !includes_object_namespace(&acc.options, object) {
@@ -660,7 +720,7 @@ where
         observe_object_namespace(&mut acc, object);
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
-        } else if object.kind == "Gateway" {
+        } else if object.kind == "Gateway" && acc.gateway_is_managed_by_ferrum(object) {
             gateway_api::collect_gateway_listener_policy(&mut acc, object)?;
         } else if object.kind == "Service" {
             collect_service(&mut acc, object)?;
@@ -745,12 +805,6 @@ where
             continue;
         }
 
-        // GatewayClass is watched for ownership/status decisions by the
-        // controller, but it does not materialize proxy config directly.
-        if object.kind == "GatewayClass" {
-            continue;
-        }
-
         if istio::translate(&mut acc, object)? || gateway_api::translate(&mut acc, object)? {
             continue;
         }
@@ -770,6 +824,7 @@ where
 
 fn includes_object_namespace(options: &K8sTranslationOptions, object: &K8sObject) -> bool {
     options.includes_namespace(&object.metadata.namespace)
+        || object.kind == "GatewayClass"
         || mesh_config::is_root_namespace_config_map(options, object)
         || (options.pod_discovery_enabled
             && core::is_cluster_scoped_core_resource_kind(&object.kind))

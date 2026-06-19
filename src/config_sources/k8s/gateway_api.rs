@@ -132,9 +132,11 @@ pub(super) fn translate(
             if is_waypoint_gateway(object) {
                 add_waypoint_binding(acc, object);
             }
-            materialize_gateway_frontend_tls(acc, object);
-            for service in mesh_services_from_gateway(object)? {
-                acc.mesh.services.push(service);
+            if acc.gateway_is_managed_by_ferrum(object) {
+                materialize_gateway_frontend_tls(acc, object);
+                for service in mesh_services_from_gateway(object)? {
+                    acc.mesh.services.push(service);
+                }
             }
             Ok(true)
         }
@@ -629,7 +631,7 @@ pub(crate) fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConf
     route_conflict_keys_for_acc(object, None)
 }
 
-fn route_conflict_keys_for_acc(
+pub(crate) fn route_conflict_keys_for_acc(
     object: &K8sObject,
     acc: Option<&K8sAccumulator>,
 ) -> Vec<GatewayApiRouteConflictKey> {
@@ -1855,6 +1857,17 @@ fn route_host_scopes_for_path(
     losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
 ) -> Vec<RouteHostScope> {
     if losing_conflict_keys.is_empty() {
+        if conflict_hostnames.len() > 1 {
+            return conflict_hostnames
+                .iter()
+                .enumerate()
+                .map(|(index, hostname)| RouteHostScope {
+                    proxy_hosts: proxy_hosts_for_conflict_hostname(spec_hostnames, hostname),
+                    conflict_hostname: hostname.clone(),
+                    suffix: Some(format!("host{index}")),
+                })
+                .collect();
+        }
         return vec![RouteHostScope {
             proxy_hosts: spec_hostnames.to_vec(),
             conflict_hostname: conflict_hostnames
@@ -2250,18 +2263,12 @@ fn gateway_request_redirect_value(
         let authority = redirect
             .get("hostname")
             .and_then(Value::as_str)
-            .and_then(|host| {
-                if host.is_empty() {
-                    None
-                } else if let Some(port) = redirect_port {
-                    Some(format!("{host}:{port}"))
-                } else {
-                    Some(host.to_string())
-                }
-            });
+            .filter(|host| !host.is_empty())
+            .map(ToOwned::to_owned);
         if let Some(authority) = authority {
             out.insert("authority".to_string(), Value::String(authority));
-        } else if let Some(port) = redirect_port {
+        }
+        if let Some(port) = redirect_port {
             out.insert("port".to_string(), serde_json::json!(port));
         }
 
@@ -2368,7 +2375,12 @@ fn gateway_redirect_value_for_match(redirect: &Value, match_entry: &Value) -> Va
 
 fn gateway_match_path_prefix(match_entry: &Value) -> Option<&str> {
     let path = match_entry.get("path")?.as_object()?;
-    if path.get("type").and_then(Value::as_str) != Some("PathPrefix") {
+    if path
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("PathPrefix")
+        != "PathPrefix"
+    {
         return None;
     }
     path.get("value").and_then(Value::as_str)
@@ -3158,6 +3170,64 @@ mod tests {
     }
 
     #[test]
+    fn gateway_frontend_tls_ignores_gateway_owned_by_other_controller() {
+        let mut other_class = object(
+            "GatewayClass",
+            serde_json::json!({"controllerName": "example.com/other-controller"}),
+        );
+        other_class.metadata.name = "other".to_string();
+        other_class.metadata.namespace.clear();
+
+        let other_gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "other",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "other-cert"}]}
+                }]
+            }),
+        );
+        let ferrum_gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "ferrum-cert"}]}
+                }]
+            }),
+        );
+        let other_cert = tls_secret("other-cert", "default", true);
+        let ferrum_cert = tls_secret("ferrum-cert", "default", true);
+
+        let result = translate_k8s_objects(
+            &[
+                other_class,
+                other_gateway,
+                other_cert,
+                ferrum_gateway,
+                ferrum_cert,
+            ],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            result
+                .config
+                .frontend_tls_cert_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://default/ferrum-cert#tls.crt?sha256=")),
+            "only Ferrum-owned Gateways should materialize frontend TLS"
+        );
+    }
+
+    #[test]
     fn gateway_https_listener_certificate_ref_requires_observed_valid_secret() {
         let gateway = object(
             "Gateway",
@@ -3675,6 +3745,7 @@ mod tests {
         let mut gateway_a = object(
             "Gateway",
             serde_json::json!({
+                "gatewayClassName": "ferrum",
                 "listeners": [{"name": "http", "port": 80, "protocol": "HTTP"}]
             }),
         );
@@ -3719,6 +3790,7 @@ mod tests {
         let mut gateway = object(
             "Gateway",
             serde_json::json!({
+                "gatewayClassName": "ferrum",
                 "listeners": [{
                     "name": "api",
                     "port": 80,
@@ -3748,6 +3820,31 @@ mod tests {
             warning.contains("api-b")
                 && warning.contains("host=api.example.com")
                 && warning.contains("winner is default/api-a")
+        }));
+    }
+
+    #[test]
+    fn http_route_listener_exact_and_wildcard_hosts_validate_together() {
+        let mut exact = route_with_name_and_created_at("backend-v2", "2026-01-01T00:00:00Z");
+        exact.spec["hostnames"] = serde_json::json!(["foo.bar.com"]);
+
+        let mut wildcard = route_with_name_and_created_at("backend-v3", "2026-01-01T00:00:01Z");
+        wildcard.spec["hostnames"] = serde_json::json!(["*.bar.com"]);
+
+        let result = translate_k8s_objects(&[exact, wildcard], options()).expect("translation");
+
+        assert_eq!(result.config.proxies.len(), 2);
+        assert!(
+            result.config.validate_unique_listen_paths().is_ok(),
+            "exact host and wildcard host routes on one path are resolved by router host precedence"
+        );
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.listen_path.as_deref() == Some("/api")
+                && proxy.hosts == vec!["foo.bar.com".to_string()]
+        }));
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.listen_path.as_deref() == Some("/api")
+                && proxy.hosts == vec!["*.bar.com".to_string()]
         }));
     }
 
@@ -3822,6 +3919,91 @@ mod tests {
         assert!(
             rules[1]["destination"]["backend_port"].as_u64() == Some(8081),
             "POST route must keep its own backend destination"
+        );
+    }
+
+    #[test]
+    fn http_route_matching_across_routes_splits_host_subsets_before_merging() {
+        let mut part1 = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["example.com", "example.net"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+                    "backendRefs": [{"name": "backend-v1", "port": 8080}]
+                }]
+            }),
+        );
+        part1.metadata.name = "matching-part1".to_string();
+        part1.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+
+        let mut part2 = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [
+                        {"path": {"type": "PathPrefix", "value": "/v2"}},
+                        {"headers": [{"name": "Version", "value": "two"}]}
+                    ],
+                    "backendRefs": [{"name": "backend-v2", "port": 8081}]
+                }]
+            }),
+        );
+        part2.metadata.name = "matching-part2".to_string();
+        part2.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result = translate_k8s_objects(&[part1, part2], options()).expect("translation");
+
+        assert!(
+            result.config.validate_unique_listen_paths().is_ok(),
+            "Gateway API routes with overlapping host subsets must not produce duplicate host/path proxies"
+        );
+        let example_com_root = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| {
+                proxy.listen_path.as_deref() == Some("/")
+                    && proxy.hosts == vec!["example.com".to_string()]
+            })
+            .expect("example.com root proxy");
+        let example_net_root = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| {
+                proxy.listen_path.as_deref() == Some("/")
+                    && proxy.hosts == vec!["example.net".to_string()]
+            })
+            .expect("example.net root proxy");
+        assert_eq!(example_com_root.backend_port, 8080);
+        assert_eq!(example_net_root.backend_port, 8080);
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.plugin_name == "mesh_route_dispatch"
+                    && plugin.proxy_id.as_deref() == Some(example_com_root.id.as_str())
+            })
+            .expect("example.com root proxy should carry the Version=two override");
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0]["match"]["headers"]["version"].as_str(),
+            Some("two")
+        );
+        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(8081));
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .all(|plugin| { plugin.proxy_id.as_deref() != Some(example_net_root.id.as_str()) }),
+            "example.net fallback must not inherit the example.com-only header override"
         );
     }
 
@@ -4792,6 +4974,41 @@ mod tests {
     }
 
     #[test]
+    fn http_route_request_redirect_hostname_keeps_default_port_structured() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/secure"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "hostname": "example.org",
+                                "scheme": "https",
+                                "statusCode": 301
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("redirect-only route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["authority"], "example.org");
+        assert_eq!(redirect["scheme"], "https");
+        assert_eq!(redirect["port"], 443);
+    }
+
+    #[test]
     fn http_route_status_only_request_redirect_materializes_dispatch_redirect() {
         let result = translate_k8s_objects(
             &[object(
@@ -4867,6 +5084,41 @@ mod tests {
             ),
             "private translator marker must not reach DP config"
         );
+    }
+
+    #[test]
+    fn http_route_replace_prefix_redirect_defaults_match_path_type_to_prefix() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"value": "/old"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "path": {
+                                    "type": "ReplacePrefixMatch",
+                                    "replacePrefixMatch": "/new"
+                                }
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("prefix redirect route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["uri"], "/new");
+        assert_eq!(redirect["match_prefix"], "/old");
     }
 
     #[test]
@@ -5706,6 +5958,7 @@ mod tests {
             &[object(
                 "Gateway",
                 serde_json::json!({
+                    "gatewayClassName": "ferrum",
                     "listeners": [{"name": "http", "port": 70000, "protocol": "HTTP"}]
                 }),
             )],

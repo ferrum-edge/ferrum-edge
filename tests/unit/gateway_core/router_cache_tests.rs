@@ -608,7 +608,7 @@ fn test_wildcard_does_not_match_base_domain() {
 }
 
 #[test]
-fn test_wildcard_does_not_match_multi_level() {
+fn test_wildcard_matches_multi_level() {
     let config = test_config(vec![test_proxy_with_hosts(
         "wildcard",
         "/",
@@ -616,9 +616,9 @@ fn test_wildcard_does_not_match_multi_level() {
     )]);
     let cache = RouterCache::new(&config, 100);
 
-    // *.example.com should NOT match a.b.example.com (multi-level)
+    // *.example.com matches any subdomain below example.com.
     let matched = cache.find_proxy(Some("a.b.example.com"), "/");
-    assert!(matched.is_none());
+    assert!(matched.is_some());
 }
 
 #[test]

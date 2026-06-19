@@ -1768,7 +1768,7 @@ pub struct Proxy {
     pub namespace: String,
     /// Optional list of hostnames this proxy matches on.
     /// Empty means match all hosts (catch-all).
-    /// Supports exact hostnames and single-level wildcard prefixes (e.g., "*.example.com").
+    /// Supports exact hostnames and DNS suffix wildcard prefixes (e.g., "*.example.com").
     /// For HTTP-family proxies, either `hosts` or `listen_path` must be set
     /// (both may be set together).
     #[serde(default)]
@@ -2785,7 +2785,7 @@ impl GatewayConfig {
                     {
                         continue;
                     }
-                    if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
+                    if ambiguous_path_host_overlap(&proxy_a.hosts, &proxy_b.hosts) {
                         if proxy_a.hosts.is_empty() && proxy_b.hosts.is_empty() {
                             errors.push(format!(
                                 "Duplicate listen_path '{}' found in proxy '{}' (conflicts with '{}')",
@@ -3799,7 +3799,7 @@ fn default_udp_idle_timeout() -> u64 {
 ///
 /// Valid formats:
 /// - Exact hostname: `api.example.com` (lowercase, no scheme/port/path)
-/// - Wildcard: `*.example.com` (single-level wildcard prefix)
+/// - Wildcard: `*.example.com` (DNS suffix wildcard prefix)
 pub fn validate_host_entry(host: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("host entry must not be empty".to_string());
@@ -3910,6 +3910,38 @@ pub fn hosts_overlap(a: &[String], b: &[String]) -> bool {
     // Check wildcard-to-exact and wildcard-to-wildcard overlaps
     for host_a in a {
         for host_b in b {
+            if wildcard_matches(host_a, host_b) || wildcard_matches(host_b, host_a) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn ambiguous_path_host_overlap(a: &[String], b: &[String]) -> bool {
+    // Empty = catch-all. The catch-all tier sits behind exact and wildcard
+    // routes, but two same-path catch-all/specific routes are still ambiguous
+    // for configuration ownership and should fail closed.
+    if a.is_empty() || b.is_empty() {
+        return true;
+    }
+
+    let a_set: HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
+    let b_set: HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    if a_set.intersection(&b_set).next().is_some() {
+        return true;
+    }
+
+    for host_a in a {
+        for host_b in b {
+            let wildcard_a = host_a.starts_with("*.");
+            let wildcard_b = host_b.starts_with("*.");
+            if wildcard_a != wildcard_b {
+                // Exact-host routes are checked before wildcard-host routes in
+                // RouterCache, so this overlap is deterministic.
+                continue;
+            }
             if wildcard_matches(host_a, host_b) || wildcard_matches(host_b, host_a) {
                 return true;
             }
@@ -6530,24 +6562,17 @@ pub(crate) fn json_depth(value: &serde_json::Value) -> usize {
 }
 
 /// Check if a wildcard pattern matches a hostname.
-/// `*.example.com` matches `foo.example.com` but not `example.com` or `a.b.example.com`.
+/// `*.example.com` matches any DNS name below `example.com`, including
+/// `foo.example.com` and `a.b.example.com`, but not `example.com` itself.
 pub fn wildcard_matches(pattern: &str, hostname: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("*.") {
         // Don't match the base domain itself
         if hostname == suffix {
             return false;
         }
-        // Must end with .suffix and have exactly one label before it
-        if let Some(prefix) = hostname.strip_suffix(suffix) {
-            // prefix should be "something." with no additional dots
-            if prefix.ends_with('.')
-                && !prefix[..prefix.len() - 1].is_empty()
-                && !prefix[..prefix.len() - 1].contains('.')
-            {
-                return true;
-            }
-        }
-        false
+        hostname
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
     } else {
         pattern == hostname
     }

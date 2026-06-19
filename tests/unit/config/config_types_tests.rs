@@ -2788,8 +2788,8 @@ fn test_wildcard_does_not_match_base_domain() {
 }
 
 #[test]
-fn test_wildcard_does_not_match_multi_level() {
-    assert!(!wildcard_matches("*.example.com", "a.b.example.com"));
+fn test_wildcard_matches_multi_level() {
+    assert!(wildcard_matches("*.example.com", "a.b.example.com"));
 }
 
 #[test]
@@ -3082,6 +3082,20 @@ fn test_unique_listen_paths_catchall_vs_specific_host() {
     ];
     let err = config.validate_unique_listen_paths().unwrap_err();
     assert_eq!(err.len(), 1);
+}
+
+#[test]
+fn test_unique_listen_paths_allows_exact_host_over_wildcard_same_path() {
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy_with_hosts("exact", "/api", vec!["foo.example.com"]),
+        make_proxy_with_hosts("wildcard", "/api", vec!["*.example.com"]),
+    ];
+
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "router checks exact host routes before wildcard routes, so this overlap is deterministic"
+    );
 }
 
 #[test]

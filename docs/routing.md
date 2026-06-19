@@ -98,6 +98,9 @@ proxies:
     listen_path: "~/users/(?P<user_id>[^/]+)/orders"
 ```
 
+Host wildcards are DNS suffix matches: `*.example.com` matches `other.example.com`
+and `deep.other.example.com`, but not `example.com` itself.
+
 | Request Host | Request Path | Matched Proxy | Reason |
 |---|---|---|---|
 | `api.example.com` | `/api/v1/users` | `exact-api` | Exact host + longest prefix `/api/v1` |
