@@ -2,7 +2,10 @@
 
 use super::plugin_utils::create_test_proxy;
 use chrono::Utc;
-use ferrum_edge::_test_support::clone_log_metadata;
+use ferrum_edge::_test_support::{
+    advance_response_caching_clock_for_test, clone_log_metadata,
+    response_caching_current_total_size_for_test,
+};
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::ResponseCaching;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -339,7 +342,7 @@ async fn test_age_increases_during_cache_residency_without_sleep() {
         b"cached",
     )
     .await;
-    plugin.advance_clock_for_tests(std::time::Duration::from_secs(5));
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(5));
 
     let mut ctx = make_ctx("GET", "/api/resident");
     let mut headers = HashMap::new();
@@ -375,7 +378,7 @@ async fn test_upstream_age_near_freshness_expires_after_residency() {
         .await;
     assert!(is_reject(&fresh_result));
 
-    plugin.advance_clock_for_tests(std::time::Duration::from_secs(2));
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(2));
 
     let mut stale_ctx = make_ctx("GET", "/api/nearly-stale");
     let mut stale_headers = HashMap::new();
@@ -618,7 +621,7 @@ async fn test_s_maxage_freshness_accounts_for_age() {
         b"cached",
     )
     .await;
-    plugin.advance_clock_for_tests(std::time::Duration::from_secs(20));
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(20));
 
     let mut ctx = make_ctx("GET", "/api/s-maxage-age");
     let mut headers = HashMap::new();
@@ -656,7 +659,7 @@ async fn test_fallback_ttl_freshness_accounts_for_age() {
         .await;
     assert!(is_reject(&fresh_result));
 
-    plugin.advance_clock_for_tests(std::time::Duration::from_secs(6));
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(6));
 
     let mut stale_ctx = make_ctx("GET", "/api/fallback-age");
     let mut stale_headers = HashMap::new();
@@ -956,6 +959,58 @@ async fn test_vary_wildcard_not_cached() {
 }
 
 #[tokio::test]
+async fn test_stale_on_arrival_does_not_evict_other_vary_variants() {
+    let plugin = default_plugin();
+    let path = "/api/stale-vary";
+
+    let mut gzip_ctx = make_ctx("GET", path);
+    let mut gzip_headers = HashMap::new();
+    gzip_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut gzip_ctx, &mut gzip_headers).await,
+        PluginResult::Continue
+    ));
+    let mut gzip_response_headers = HashMap::new();
+    gzip_response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    gzip_response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+    plugin
+        .after_proxy(&mut gzip_ctx, 200, &mut gzip_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut gzip_ctx, 200, &gzip_response_headers, b"gzip")
+        .await;
+
+    let mut br_ctx = make_ctx("GET", path);
+    let mut br_headers = HashMap::new();
+    br_headers.insert("accept-encoding".to_string(), "br".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut br_ctx, &mut br_headers).await,
+        PluginResult::Continue
+    ));
+    let mut br_response_headers = HashMap::new();
+    br_response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    br_response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+    br_response_headers.insert("age".to_string(), "61".to_string());
+    plugin
+        .after_proxy(&mut br_ctx, 200, &mut br_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut br_ctx, 200, &br_response_headers, b"br")
+        .await;
+
+    let mut gzip_hit_ctx = make_ctx("GET", path);
+    let mut gzip_hit_headers = HashMap::new();
+    gzip_hit_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    let (status, body, _) = expect_reject(
+        plugin
+            .before_proxy(&mut gzip_hit_ctx, &mut gzip_hit_headers)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, b"gzip");
+}
+
+#[tokio::test]
 async fn test_if_none_match_returns_304_from_cache() {
     let plugin = default_plugin();
     let mut response_headers = HashMap::new();
@@ -972,7 +1027,7 @@ async fn test_if_none_match_returns_304_from_cache() {
         b"cached-body",
     )
     .await;
-    plugin.advance_clock_for_tests(std::time::Duration::from_secs(5));
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(5));
 
     let mut ctx = make_ctx("GET", "/api/data");
     ctx.headers
@@ -2263,7 +2318,7 @@ async fn test_concurrent_stores_keep_size_bounded_and_non_wrapping() {
 
     // The accountant must never have wrapped: a wrapped usize would be a vast
     // value far above any small multiple of the cap.
-    let total = plugin.current_total_size_for_tests();
+    let total = response_caching_current_total_size_for_test(&plugin);
     assert!(
         total <= 4096 * 8,
         "total_size drifted/overshot unexpectedly: {total}"

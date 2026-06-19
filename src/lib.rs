@@ -340,6 +340,19 @@ pub mod _test_support {
         crate::plugins::response_caching::parse_http_date(value)
     }
 
+    pub fn advance_response_caching_clock_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+        duration: std::time::Duration,
+    ) {
+        plugin.advance_clock_for_tests(duration);
+    }
+
+    pub fn response_caching_current_total_size_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> usize {
+        plugin.current_total_size_for_tests()
+    }
+
     /// Apply `response_caching`'s underflow-safe cache-size subtraction to a
     /// standalone counter so tests can prove a drift larger than the current
     /// total saturates at `0` instead of wrapping to `usize::MAX`.

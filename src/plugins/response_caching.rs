@@ -584,20 +584,17 @@ impl ResponseCaching {
     ///
     /// Exposed for tests so they can assert the size accounting never
     /// underflow-wraps under concurrent stores/invalidations (finding #62).
-    #[doc(hidden)]
     #[allow(dead_code)]
-    pub fn current_total_size_for_tests(&self) -> usize {
+    pub(crate) fn current_total_size_for_tests(&self) -> usize {
         self.total_size.load(Ordering::Relaxed)
     }
 
     /// Advance this plugin instance's clock without sleeping.
     ///
-    /// This is intentionally available to external tests under `tests/unit/`
-    /// so cache freshness and Age arithmetic can be validated deterministically
-    /// without pausing the runtime.
-    #[doc(hidden)]
+    /// Routed through `_test_support` so external tests can validate cache
+    /// freshness and Age arithmetic deterministically without pausing the runtime.
     #[allow(dead_code)]
-    pub fn advance_clock_for_tests(&self, duration: Duration) {
+    pub(crate) fn advance_clock_for_tests(&self, duration: Duration) {
         let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         let _ =
             self.clock_offset_nanos
@@ -1530,7 +1527,6 @@ impl Plugin for ResponseCaching {
         );
 
         if freshness_lifetime.is_zero() || corrected_initial_age >= freshness_lifetime {
-            self.invalidate_base_key(&base_key);
             self.uncacheable_predictor.mark_uncacheable(&predict_key);
             return PluginResult::Continue;
         }
