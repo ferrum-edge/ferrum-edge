@@ -62,6 +62,13 @@ const HOP_BY_HOP_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
+const SYNTHETIC_FINGERPRINT_EXCLUSIONS: &[&str] = &[
+    "traceparent",
+    "tracestate",
+    "x-request-id",
+    "x-correlation-id",
+    "correlation-id",
+];
 
 /// Monotonic seconds since process start. Immune to wall-clock steps, matching
 /// the `Instant`-based entry expiry.
@@ -733,6 +740,7 @@ fn request_headers_for_fingerprint<'a>(
     idempotency_header: &str,
 ) -> Vec<(String, &'a str)> {
     let mut values = Vec::new();
+    let connection_listed = crate::proxy::headers::parse_connection_listed_from_str_map(headers);
     for (name, value) in headers {
         let normalized = name.to_ascii_lowercase();
         if normalized == ":authority"
@@ -741,6 +749,12 @@ fn request_headers_for_fingerprint<'a>(
             || HOP_BY_HOP_FINGERPRINT_EXCLUSIONS
                 .iter()
                 .any(|excluded| normalized == *excluded)
+            || SYNTHETIC_FINGERPRINT_EXCLUSIONS
+                .iter()
+                .any(|excluded| normalized == *excluded)
+            || connection_listed
+                .iter()
+                .any(|listed| normalized == listed.as_str())
         {
             continue;
         }
@@ -953,8 +967,6 @@ impl Plugin for RequestDeduplication {
         self.applicable_methods
             .iter()
             .any(|method| method.eq_ignore_ascii_case(&ctx.method))
-            && (header_value_case_insensitive(&ctx.headers, &self.header_name).is_some()
-                || request_declares_body(&ctx.headers))
     }
 
     async fn before_proxy(

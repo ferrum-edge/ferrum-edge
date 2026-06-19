@@ -1047,7 +1047,7 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
         "POST".to_string(),
         "/api".to_string(),
     );
-    assert!(!plugin.should_buffer_request_body(&keyless_without_declared_body));
+    assert!(plugin.should_buffer_request_body(&keyless_without_declared_body));
 
     let mut keyless_declared_body = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -1078,6 +1078,25 @@ async fn test_generated_key_after_buffer_decision_can_fingerprint_declared_body(
     );
     ctx.headers
         .insert("content-length".to_string(), "2".to_string());
+    assert!(plugin.should_buffer_request_body(&ctx));
+
+    ctx.request_body_bytes = Some(Bytes::from_static(b"{}"));
+    let mut headers = ctx.headers.clone();
+    headers.insert("idempotency-key".to_string(), "generated-key".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key(DEDUP_KEY_METADATA));
+}
+
+#[tokio::test]
+async fn test_generated_key_after_buffer_decision_can_fingerprint_h2_body_without_length() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/orders".to_string(),
+    );
     assert!(plugin.should_buffer_request_body(&ctx));
 
     ctx.request_body_bytes = Some(Bytes::from_static(b"{}"));
@@ -1195,6 +1214,62 @@ async fn test_reused_key_different_route_affecting_header_returns_409() {
         &mut second_headers,
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_synthetic_headers_replays() {
+    let plugin = make_plugin(json!({}));
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("synthetic-key", "api.example", 11);
+    first_headers.insert(
+        "traceparent".to_string(),
+        "00-11111111111111111111111111111111-2222222222222222-01".to_string(),
+    );
+    first_headers.insert("x-request-id".to_string(), "request-a".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("synthetic-key", "api.example", 11);
+    second_headers.insert(
+        "traceparent".to_string(),
+        "00-33333333333333333333333333333333-4444444444444444-01".to_string(),
+    );
+    second_headers.insert("x-request-id".to_string(), "request-b".to_string());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert!(matches!(result, PluginResult::RejectBinary { .. }));
+}
+
+#[tokio::test]
+async fn test_reused_key_different_connection_listed_header_replays() {
+    let plugin = make_plugin(json!({}));
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("connection-key", "api.example", 11);
+    first_headers.insert("connection".to_string(), "x-debug-route".to_string());
+    first_headers.insert("x-debug-route".to_string(), "blue".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("connection-key", "api.example", 11);
+    second_headers.insert("connection".to_string(), "x-debug-route".to_string());
+    second_headers.insert("x-debug-route".to_string(), "green".to_string());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert!(matches!(result, PluginResult::RejectBinary { .. }));
 }
 
 #[tokio::test]
