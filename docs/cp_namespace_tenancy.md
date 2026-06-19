@@ -21,7 +21,7 @@ when neither new env var is set.
 | Variable | Default | Description |
 |---|---|---|
 | `FERRUM_CP_NAMESPACES` | unset | Scope. Empty/unset = back-compat single namespace (`FERRUM_NAMESPACE`). `*` = cluster-wide CP (discovers namespaces dynamically). CSV (`prod,staging`) = explicit set. |
-| `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` | `false` | When `true`, every DP `ConfigSync.Subscribe` JWT must carry an `ns` claim authorising the subscribe namespace; tokens without it are rejected. |
+| `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` | `false` | When `true`, every DP `ConfigSync.Subscribe` and mesh `MeshConfigSync.MeshSubscribe` JWT must carry an `ns` claim authorising the subscribe namespace; tokens without it are rejected. |
 
 Both vars live in `[cp_dp]` of `ferrum.conf` next to
 `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`. The scope is also surfaced in the
@@ -82,8 +82,9 @@ to 32) to keep the per-namespace channel small.
 
 ## JWT tenancy claim
 
-DP `ConfigSync.Subscribe` JWTs may carry an optional `ns` claim that pins
-which namespaces the bearer is authorised to subscribe to. The claim accepts:
+DP `ConfigSync.Subscribe` and mesh `MeshConfigSync.MeshSubscribe` JWTs may
+carry an optional `ns` claim that pins which namespaces the bearer is
+authorised to subscribe to. The claim accepts:
 
 - a single string: `"ns": "prod"`
 - an array of strings: `"ns": ["prod","staging"]`
@@ -109,11 +110,12 @@ The CP authorisation order is:
    single-namespace mode), reject with `FAILED_PRECONDITION`.
 
 Self-minted DP tokens (the `connect_and_subscribe` path in
-`src/grpc/dp_client.rs`) embed a single-string `ns` claim from the DP's own
-`FERRUM_NAMESPACE`, so DPs continue to work out of the box even when the
-CP runs with `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`. Operator-minted
-tokens that should grant access to multiple namespaces should embed the
-claim as an array.
+`src/grpc/dp_client.rs`) and native mesh-client tokens
+(`src/modes/mesh/config_consumer/native_client.rs`) embed a single-string
+`ns` claim from the process' own `FERRUM_NAMESPACE`, so data planes and mesh
+nodes continue to work out of the box even when the CP runs with
+`FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`. Operator-minted tokens that should
+grant access to multiple namespaces should embed the claim as an array.
 
 ## Migration steps
 
@@ -146,11 +148,11 @@ claim as an array.
 
 ## What is out of scope for T2-A
 
-- xDS ADS and `MeshConfigSync` continue to use the legacy single-namespace
-  path (they consume the CP-wide `broadcast::Sender<ConfigUpdate>` that
-  `CpGrpcServerBuilder::build` returns for back-compat). Multi-namespace
-  support and `ns`-claim enforcement for those surfaces is tracked
-  separately.
+- xDS ADS continues to use the legacy single-namespace path. Native
+  `MeshConfigSync.MeshSubscribe` shares the ConfigSync CP-scope and `ns`
+  claim admission gates, but still uses one CP-wide mesh update channel and
+  computes each subscriber's namespace slice from the current config shadow.
+  xDS multi-namespace support is tracked separately.
 - Per-namespace gateway trust bundles. The CP currently loads
   `load_gateway_trust_bundles` from `FERRUM_NAMESPACE` only; multi-tenant
   CPs share the same trust material across all served namespaces. Splitting

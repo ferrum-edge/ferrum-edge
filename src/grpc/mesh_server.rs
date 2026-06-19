@@ -14,8 +14,8 @@ use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
-use super::auth::verify_grpc_jwt_metadata;
-use super::cp_server::{CpGrpcServer, DEFAULT_CP_DP_JWT_ISSUER};
+use super::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
+use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
 use super::mesh_registry::{MeshNodeInfo, MeshNodeRegistry};
 use super::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use super::proto::{MeshConfigUpdate, MeshSubscribeRequest};
@@ -74,7 +74,8 @@ pub struct MeshGrpcServer {
     expected_issuer: String,
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     registry: Arc<MeshNodeRegistry>,
-    namespace: String,
+    scope: CpScope,
+    require_ns_claim: bool,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced`. Threaded through every
     /// per-subscriber slice request so DP-facing slices honor the operator's
     /// rollout decision. Default `false` preserves existing CP behavior.
@@ -95,7 +96,8 @@ pub struct MeshGrpcServerBuilder {
     channel_capacity: usize,
     registry: Arc<MeshNodeRegistry>,
     expected_issuer: String,
-    namespace: String,
+    scope: CpScope,
+    require_ns_claim: bool,
     sidecar_enforced: bool,
     sidecar_enforced_dry_run: bool,
     sidecar_identity_narrowing: bool,
@@ -110,7 +112,8 @@ impl MeshGrpcServerBuilder {
             channel_capacity: 128,
             registry: Arc::new(MeshNodeRegistry::new()),
             expected_issuer: DEFAULT_CP_DP_JWT_ISSUER.to_string(),
-            namespace: default_namespace(),
+            scope: CpScope::Single(default_namespace()),
+            require_ns_claim: false,
             sidecar_enforced: false,
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
@@ -134,7 +137,17 @@ impl MeshGrpcServerBuilder {
     }
 
     pub fn namespace(mut self, namespace: String) -> Self {
-        self.namespace = namespace;
+        self.scope = CpScope::Single(namespace);
+        self
+    }
+
+    pub fn scope(mut self, scope: CpScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    pub fn require_ns_claim(mut self, require_ns_claim: bool) -> Self {
+        self.require_ns_claim = require_ns_claim;
         self
     }
 
@@ -168,7 +181,8 @@ impl MeshGrpcServerBuilder {
                 expected_issuer: self.expected_issuer,
                 mesh_update_tx: tx,
                 registry: self.registry,
-                namespace: self.namespace,
+                scope: self.scope,
+                require_ns_claim: self.require_ns_claim,
                 sidecar_enforced: self.sidecar_enforced,
                 sidecar_enforced_dry_run: self.sidecar_enforced_dry_run,
                 sidecar_identity_narrowing: self.sidecar_identity_narrowing,
@@ -234,21 +248,48 @@ impl MeshGrpcServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn check_namespace(&self, mesh_namespace: &str) -> Result<(), Status> {
-        if mesh_namespace != self.namespace {
-            return Err(Status::failed_precondition(format!(
-                "Mesh namespace '{}' does not match CP namespace '{}'. \
-                 A single CP serves a single namespace; deploy a separate CP \
-                 instance per namespace.",
-                mesh_namespace, self.namespace
+    fn authorise_namespace(
+        &self,
+        allowed: &AllowedNamespaces,
+        mesh_namespace: &str,
+    ) -> Result<(), Status> {
+        if mesh_namespace.is_empty() {
+            return Err(Status::failed_precondition(
+                "MeshSubscribe request did not advertise a namespace",
+            ));
+        }
+
+        if self.require_ns_claim && !allowed.is_present() {
+            return Err(Status::permission_denied(
+                "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true on this CP: the JWT must \
+                 include an `ns` claim listing the namespaces this mesh node may subscribe to",
+            ));
+        }
+
+        if allowed.is_present() && !allowed.allows(mesh_namespace) {
+            return Err(Status::permission_denied(format!(
+                "JWT `ns` claim does not authorise mesh namespace '{mesh_namespace}'; \
+                 the bearer can only subscribe to the namespaces listed in its token"
             )));
         }
+
+        if !self.scope.includes(mesh_namespace) {
+            return Err(Status::failed_precondition(format!(
+                "CP scope ({}) does not include mesh namespace '{mesh_namespace}'. \
+                 Add it to FERRUM_CP_NAMESPACES (or use `*` for cluster-wide).",
+                self.scope.describe()
+            )));
+        }
+
         Ok(())
     }
 
     #[allow(clippy::result_large_err)]
-    fn verify_jwt_metadata(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
-        verify_grpc_jwt_metadata(metadata, &self.jwt_secret, &self.expected_issuer)
+    fn verify_jwt_metadata(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<AllowedNamespaces, Status> {
+        verify_grpc_jwt_metadata_with_claims(metadata, &self.jwt_secret, &self.expected_issuer)
     }
 
     #[allow(clippy::result_large_err)]
@@ -350,11 +391,11 @@ impl MeshConfigSync for MeshGrpcServer {
         &self,
         request: Request<MeshSubscribeRequest>,
     ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
-        self.verify_jwt_metadata(request.metadata())?;
+        let allowed = self.verify_jwt_metadata(request.metadata())?;
 
         let inner = request.into_inner();
         CpGrpcServer::check_version_compatibility(&inner.ferrum_version)?;
-        self.check_namespace(&inner.namespace)?;
+        self.authorise_namespace(&allowed, &inner.namespace)?;
         if inner.node_id.is_empty() {
             return Err(Status::invalid_argument(
                 "MeshSubscribe node_id is required",
@@ -516,6 +557,7 @@ mod tests {
     use crate::config::db_loader::IncrementalResult;
     use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
     use chrono::{TimeZone, Utc};
+    use std::collections::HashSet;
 
     fn mesh_config_with_service(version_second: u32) -> GatewayConfig {
         mesh_config_with_named_service("api", version_second)
@@ -544,6 +586,63 @@ mod tests {
                 .unwrap(),
             ..GatewayConfig::default()
         }
+    }
+
+    fn mesh_server_with_scope(scope: CpScope, require_ns_claim: bool) -> MeshGrpcServer {
+        let cfg = Arc::new(ArcSwap::new(Arc::new(GatewayConfig::default())));
+        let (server, _tx) = MeshGrpcServer::builder(cfg, "test-secret".to_string())
+            .scope(scope)
+            .require_ns_claim(require_ns_claim)
+            .build();
+        server
+    }
+
+    #[test]
+    fn mesh_subscribe_all_scope_accepts_workload_namespace_without_claim() {
+        let server = mesh_server_with_scope(CpScope::All, false);
+
+        assert!(
+            server
+                .authorise_namespace(&AllowedNamespaces::empty(), "ferrum-ebpf-live")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn mesh_subscribe_single_scope_rejects_other_namespace() {
+        let server = mesh_server_with_scope(CpScope::Single("ferrum".to_string()), false);
+        let err = server
+            .authorise_namespace(&AllowedNamespaces::empty(), "ferrum-ebpf-live")
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("ferrum-ebpf-live"));
+        assert!(err.message().contains("ferrum"));
+    }
+
+    #[test]
+    fn mesh_subscribe_require_claim_rejects_missing_claim() {
+        let server = mesh_server_with_scope(CpScope::All, true);
+        let err = server
+            .authorise_namespace(&AllowedNamespaces::empty(), "ferrum-ebpf-live")
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("FERRUM_CP_REQUIRE_NAMESPACE_CLAIM"));
+    }
+
+    #[test]
+    fn mesh_subscribe_claim_must_allow_requested_namespace() {
+        let server = mesh_server_with_scope(CpScope::All, false);
+        let mut namespaces = HashSet::new();
+        namespaces.insert("prod".to_string());
+        let allowed = AllowedNamespaces(Some(namespaces));
+        let err = server
+            .authorise_namespace(&allowed, "ferrum-ebpf-live")
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("ferrum-ebpf-live"));
     }
 
     #[test]

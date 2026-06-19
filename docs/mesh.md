@@ -1973,7 +1973,7 @@ rule`/`ip route` plumbing — no extra capability is needed.
 The `MeshConfigSync.MeshSubscribe` streaming RPC is served by `MeshGrpcServer` in `src/grpc/mesh_server.rs`. It runs on the Control Plane alongside the regular `ConfigSync` service.
 
 - **JWT authentication** on every subscribe request.
-- **Namespace validation**: a single CP serves a single namespace. Mesh nodes requesting a different namespace are rejected with `FAILED_PRECONDITION`.
+- **Namespace validation**: the requested mesh namespace must be covered by the CP scope (`FERRUM_CP_NAMESPACES`, or `FERRUM_NAMESPACE` in single-namespace mode). When `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`, the mesh node JWT must also carry an `ns` claim authorising that namespace. Requests outside the CP scope fail with `FAILED_PRECONDITION`; claim mismatches fail with `PERMISSION_DENIED`.
 - **Version compatibility**: the CP validates the mesh node's Ferrum version for protocol compatibility.
 - **Initial snapshot**: on subscribe, the CP loads the current `GatewayConfig`, computes a `MeshSlice` for the subscriber's identity (node ID, namespace, SPIFFE ID, labels), and sends it as the first update.
 - **Delta vs full**: subsequent config changes are broadcast via tokio `broadcast` channel (capacity `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`). The server computes `content_eq()` to suppress no-op updates. Lagging subscribers automatically receive a full snapshot.

@@ -115,6 +115,22 @@ render_chart_assertions() {
     grep -nE "name: ferrum-mesh-(ambient|node-agent)|FERRUM_ADMIN_HTTP_PORT|value: \"?(9000|$AMBIENT_ADMIN_PORT|$NODE_AGENT_ADMIN_PORT)\"?" <<<"$rendered" >&2 || true
     exit 1
   fi
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set image.repository="$IMAGE_REPOSITORY" \
+    --set image.tag="$IMAGE_TAG" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_NAMESPACE=$WORKLOAD_NS" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint)"
+  if ! grep -A1 "name: FERRUM_NAMESPACE" <<<"$rendered" | grep -q "value: \"$WORKLOAD_NS\""; then
+    echo "NodeWaypoint eBPF render did not preserve an explicit workload namespace subscription" >&2
+    grep -nE 'FERRUM_NAMESPACE|FERRUM_MESH_TOPOLOGY' <<<"$rendered" >&2 || true
+    exit 1
+  fi
   if [[ "$(grep -c "name: bpf-fs" <<<"$rendered" || true)" -lt 4 ]] ||
     [[ "$(grep -c "name: cgroup" <<<"$rendered" || true)" -lt 4 ]]; then
     echo "NodeWaypoint eBPF render did not mount host bpffs and cgroup roots for both proxy and node-agent" >&2
@@ -262,6 +278,7 @@ install_ferrum() {
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
     --set-string "ambient.env.FERRUM_DP_CP_GRPC_URLS=http://ferrum-mesh-control-plane.$MESH_NS.svc.cluster.local:50051" \
     --set ambient.env.FERRUM_CP_DP_GRPC_JWT_SECRET=ferrum-edge-node-waypoint-live-grpc-secret \
+    --set-string "ambient.env.FERRUM_NAMESPACE=$WORKLOAD_NS" \
     --set-string "ambient.env.FERRUM_ADMIN_HTTP_PORT=$AMBIENT_ADMIN_PORT" \
     --set-string "ambient.env.FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET" \
     --set-string "ambient.env.FERRUM_ADMIN_JWT_ISSUER=$ADMIN_JWT_ISSUER" \
