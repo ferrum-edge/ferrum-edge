@@ -85,10 +85,7 @@ fn may_add_no_transform_accounts_for_removed_cache_control() {
         "set": { "Cache-Control": "no-transform" }
     }))
     .unwrap();
-    assert!(!no_remove.may_add_response_cache_control_no_transform(
-        &ctx,
-        &headers
-    ));
+    assert!(!no_remove.may_add_response_cache_control_no_transform(&ctx, &headers));
 
     let remove_then_set = SecurityHeaders::new(&json!({
         "override_existing": false,
@@ -96,16 +93,10 @@ fn may_add_no_transform_accounts_for_removed_cache_control() {
         "set": { "Cache-Control": "no-transform" }
     }))
     .unwrap();
-    assert!(remove_then_set.may_add_response_cache_control_no_transform(
-        &ctx,
-        &headers
-    ));
+    assert!(remove_then_set.may_add_response_cache_control_no_transform(&ctx, &headers));
 
     headers.insert("cache-control".to_string(), "private".to_string());
-    assert!(remove_then_set.may_add_response_cache_control_no_transform(
-        &ctx,
-        &headers
-    ));
+    assert!(remove_then_set.may_add_response_cache_control_no_transform(&ctx, &headers));
 }
 
 #[tokio::test]

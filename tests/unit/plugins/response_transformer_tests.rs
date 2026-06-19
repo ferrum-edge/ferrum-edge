@@ -800,10 +800,7 @@ fn test_response_transformer_no_transform_preflight_simulates_rule_order() {
         }]
     }))
     .unwrap();
-    assert!(!no_remove.may_add_response_cache_control_no_transform(
-        &ctx,
-        &headers
-    ));
+    assert!(!no_remove.may_add_response_cache_control_no_transform(&ctx, &headers));
 
     let remove_then_add = ResponseTransformer::new(&json!({
         "rules": [
@@ -821,10 +818,7 @@ fn test_response_transformer_no_transform_preflight_simulates_rule_order() {
         ]
     }))
     .unwrap();
-    assert!(remove_then_add.may_add_response_cache_control_no_transform(
-        &ctx,
-        &headers
-    ));
+    assert!(remove_then_add.may_add_response_cache_control_no_transform(&ctx, &headers));
 }
 
 // ── Route-level transform overrides (`apply_route_overrides`) ──────────────
