@@ -2143,7 +2143,7 @@ config:
 
 ### `request_deduplication`
 
-Prevents duplicate API calls by tracking idempotency keys. When a request arrives with an idempotency key header and the same key was seen within the configured TTL, the plugin returns the cached response instead of forwarding to the backend.
+Prevents duplicate API calls by tracking idempotency keys. When a request arrives with an idempotency key header and the same logical request was completed within the configured TTL, the plugin returns the cached response instead of forwarding to the backend.
 
 **Priority:** 2750
 
@@ -2167,14 +2167,18 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `redis_password` | String (optional) | — | Redis password |
 
 **Behavior:**
-- On cache hit: returns the cached response with `X-Idempotent-Replayed: true` header
-- Concurrent duplicates: returns `409 Conflict` when a request with the same key is already in-flight
+- Logical idempotency keys are scoped by proxy, authenticated identity when `scope_by_consumer: true`, and the idempotency header value. The stored key is a framed SHA-256 digest, not a delimiter-joined raw string
+- Request fingerprints bind the logical key to the HTTP method, authority/host, exact path, raw query string, selected representation headers (`Content-Type`, `Content-Encoding`, `Content-Language`), and a SHA-256 request-body digest. Raw request bodies, credentials, cookies, identities, and idempotency values are not stored in keys or fingerprints
+- On cache hit with the same fingerprint: returns the cached response with `X-Idempotent-Replayed: true` header
+- Reusing the same logical idempotency key for a different fingerprint returns `409 Conflict`
+- Concurrent duplicates with the same fingerprint return `409 Conflict` while the first request is still in-flight
+- If a request declares a body but the body bytes are unavailable for fingerprinting, the request is rejected with 400 instead of being deduplicated unsafely
 - Stale in-flight markers (request died after `before_proxy` but before `on_final_response_body` — e.g., backend timeout, downstream plugin reject, dropped connection) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
 - LRU eviction under `max_entries` pressure only evicts completed entries. Active (non-stale) in-flight markers are never evicted — evicting a live marker would release the in-flight lock while the original request is still executing. As a result, `max_entries` can be temporarily exceeded if the cache is saturated with active in-flight work; correctness is preferred over the memory cap
 - GET/HEAD/OPTIONS/DELETE requests are ignored unless explicitly added to `applicable_methods`
 - `scope_by_consumer: true` isolates keys per authenticated identity so different consumers can use the same idempotency key independently
 
-**Centralized mode** (`sync_mode: "redis"`): Uses the shared `RedisRateLimitClient` infrastructure for centralized deduplication across multiple gateway instances. Automatic local fallback when Redis is unreachable. Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
+**Centralized mode** (`sync_mode: "redis"`): Uses the shared `RedisRateLimitClient` infrastructure for centralized deduplication across multiple gateway instances. Redis values include the request fingerprint and are not backward-compatible with pre-fingerprint serialized values. Automatic local fallback is used when Redis is unreachable. Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
 
 ```yaml
 plugin_name: request_deduplication

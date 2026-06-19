@@ -21,6 +21,7 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use http::{HeaderName, Method};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -49,6 +50,11 @@ const CLEANUP_INTERVAL_SECS: u64 = 30;
 const CLEANUP_NEVER: u64 = u64::MAX;
 
 const DEDUP_KEY_METADATA: &str = "_dedup_key";
+const DEDUP_FINGERPRINT_METADATA: &str = "_dedup_fingerprint";
+const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v2";
+const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
+const FINGERPRINT_HEADERS: &[&str] =
+    &["content-type", "content-encoding", "content-language"];
 
 /// Monotonic seconds since process start. Immune to wall-clock steps, matching
 /// the `Instant`-based entry expiry.
@@ -102,16 +108,31 @@ struct CachedResponse {
 enum DeduplicationEntry {
     /// Request is currently being processed. `started_at` allows stale-marker
     /// detection so abandoned in-flight entries don't permanently block retries.
-    InFlight { started_at: Instant },
+    InFlight {
+        started_at: Instant,
+        fingerprint: String,
+    },
     /// Response has been cached.
     Completed {
         cached: CachedResponse,
         sequence: u64,
+        fingerprint: String,
     },
 }
 
 enum LocalDeduplicationAction {
     Fresh,
+    Replay(CachedResponse),
+    Conflict(DeduplicationConflict),
+}
+
+enum DeduplicationConflict {
+    InFlight,
+    FingerprintMismatch,
+}
+
+enum RedisDeduplicationAction {
+    Miss,
     Replay(CachedResponse),
     Conflict,
 }
@@ -212,7 +233,11 @@ impl RequestDeduplication {
         })
     }
 
-    /// Build the deduplication key from the request context and idempotency value.
+    /// Build the logical deduplication key from unambiguous framed fields.
+    ///
+    /// The returned key intentionally contains only a versioned digest so
+    /// Redis keys and request metadata never expose idempotency values or
+    /// authenticated identities.
     fn build_key(&self, ctx: &RequestContext, idempotency_value: &str) -> String {
         let proxy_id = ctx
             .matched_proxy
@@ -220,52 +245,125 @@ impl RequestDeduplication {
             .map(|p| p.id.as_str())
             .unwrap_or("_");
 
+        let mut hasher = Sha256::new();
+        hash_framed(
+            &mut hasher,
+            "version",
+            DEDUP_LOGICAL_KEY_VERSION.as_bytes(),
+        );
+        hash_framed(&mut hasher, "proxy_id", proxy_id.as_bytes());
         if self.scope_by_consumer
             && let Some(identity) = ctx.effective_identity()
         {
-            let mut key = String::with_capacity(
-                proxy_id.len() + identity.len() + idempotency_value.len() + 2,
-            );
-            key.push_str(proxy_id);
-            key.push(':');
-            key.push_str(identity);
-            key.push(':');
-            key.push_str(idempotency_value);
-            return key;
+            hash_framed(&mut hasher, "principal", identity.as_bytes());
         }
+        hash_framed(
+            &mut hasher,
+            "idempotency_key",
+            idempotency_value.as_bytes(),
+        );
 
-        let mut key = String::with_capacity(proxy_id.len() + idempotency_value.len() + 1);
-        key.push_str(proxy_id);
-        key.push(':');
-        key.push_str(idempotency_value);
+        let mut key = String::with_capacity(67);
+        key.push_str("v2:");
+        key.push_str(&hex::encode(hasher.finalize()));
         key
     }
 
-    fn local_lookup_or_mark_inflight(&self, key: &str, now: Instant) -> LocalDeduplicationAction {
+    fn build_request_fingerprint(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> Result<String, PluginResult> {
+        let mut hasher = Sha256::new();
+        hash_framed(
+            &mut hasher,
+            "version",
+            DEDUP_FINGERPRINT_VERSION.as_bytes(),
+        );
+        hash_framed(
+            &mut hasher,
+            "method",
+            ctx.method.to_ascii_uppercase().as_bytes(),
+        );
+        hash_framed(
+            &mut hasher,
+            "authority",
+            canonical_authority(headers).as_bytes(),
+        );
+        hash_framed(&mut hasher, "path", ctx.path.as_bytes());
+        hash_framed(
+            &mut hasher,
+            "query",
+            ctx.raw_query_string().unwrap_or("").as_bytes(),
+        );
+        for header_name in FINGERPRINT_HEADERS {
+            if let Some(value) = header_value_case_insensitive(headers, header_name) {
+                hash_framed(&mut hasher, "header_name", header_name.as_bytes());
+                hash_framed(&mut hasher, "header_value", value.as_bytes());
+            }
+        }
+        let body_digest = request_body_digest(ctx, headers)?;
+        hash_framed(&mut hasher, "body_digest", body_digest.as_bytes());
+
+        Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+    }
+
+    fn local_lookup_or_mark_inflight(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        now: Instant,
+    ) -> LocalDeduplicationAction {
         match self.local_cache.entry(key.to_string()) {
             Entry::Vacant(entry) => {
-                entry.insert(DeduplicationEntry::InFlight { started_at: now });
+                entry.insert(DeduplicationEntry::InFlight {
+                    started_at: now,
+                    fingerprint: fingerprint.to_string(),
+                });
                 self.inflight_count.fetch_add(1, Ordering::Relaxed);
                 LocalDeduplicationAction::Fresh
             }
             Entry::Occupied(mut entry) => match entry.get() {
-                DeduplicationEntry::Completed { cached, sequence } => {
+                DeduplicationEntry::Completed {
+                    cached,
+                    sequence,
+                    fingerprint: cached_fingerprint,
+                } => {
                     if now.duration_since(cached.inserted_at) < self.ttl {
-                        LocalDeduplicationAction::Replay(cached.clone())
+                        if cached_fingerprint == fingerprint {
+                            LocalDeduplicationAction::Replay(cached.clone())
+                        } else {
+                            LocalDeduplicationAction::Conflict(
+                                DeduplicationConflict::FingerprintMismatch,
+                            )
+                        }
                     } else {
                         self.mark_completed_sequence_pruned(*sequence);
                         decrement_atomic(&self.completed_count);
                         self.inflight_count.fetch_add(1, Ordering::Relaxed);
-                        entry.insert(DeduplicationEntry::InFlight { started_at: now });
+                        entry.insert(DeduplicationEntry::InFlight {
+                            started_at: now,
+                            fingerprint: fingerprint.to_string(),
+                        });
                         LocalDeduplicationAction::Fresh
                     }
                 }
-                DeduplicationEntry::InFlight { started_at } => {
+                DeduplicationEntry::InFlight {
+                    started_at,
+                    fingerprint: cached_fingerprint,
+                } => {
                     if now.duration_since(*started_at) >= self.inflight_ttl {
-                        entry.insert(DeduplicationEntry::InFlight { started_at: now });
+                        entry.insert(DeduplicationEntry::InFlight {
+                            started_at: now,
+                            fingerprint: fingerprint.to_string(),
+                        });
                         LocalDeduplicationAction::Fresh
+                    } else if cached_fingerprint == fingerprint {
+                        LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight)
                     } else {
-                        LocalDeduplicationAction::Conflict
+                        LocalDeduplicationAction::Conflict(
+                            DeduplicationConflict::FingerprintMismatch,
+                        )
                     }
                 }
             },
@@ -273,31 +371,37 @@ impl RequestDeduplication {
     }
 
     /// Try to retrieve a cached response from Redis.
-    async fn redis_get(&self, key: &str) -> Option<CachedResponse> {
-        let redis = self.redis_client.as_ref()?;
+    async fn redis_get(&self, key: &str, fingerprint: &str) -> RedisDeduplicationAction {
+        let Some(redis) = self.redis_client.as_ref() else {
+            return RedisDeduplicationAction::Miss;
+        };
         if !redis.is_available() {
-            return None;
+            return RedisDeduplicationAction::Miss;
         }
 
         let redis_key = redis.make_key(&[key]);
         let data = match redis.get_bytes(&redis_key).await {
             Ok(Some(d)) => d,
-            Ok(None) => return None,
-            Err(()) => return None,
+            Ok(None) => return RedisDeduplicationAction::Miss,
+            Err(()) => return RedisDeduplicationAction::Miss,
         };
 
-        serde_json::from_slice::<SerializableCachedResponse>(&data)
-            .ok()
-            .map(|s| CachedResponse {
-                status_code: s.status_code,
-                headers: s.headers,
-                body: Bytes::from(s.body),
-                inserted_at: Instant::now(), // Not meaningful for Redis entries
-            })
+        match serde_json::from_slice::<SerializableCachedResponse>(&data) {
+            Ok(s) if s.fingerprint == fingerprint => {
+                RedisDeduplicationAction::Replay(CachedResponse {
+                    status_code: s.status_code,
+                    headers: s.headers,
+                    body: Bytes::from(s.body),
+                    inserted_at: Instant::now(), // Not meaningful for Redis entries
+                })
+            }
+            Ok(_) => RedisDeduplicationAction::Conflict,
+            Err(_) => RedisDeduplicationAction::Miss,
+        }
     }
 
     /// Store a cached response in Redis with TTL.
-    async fn redis_set(&self, key: &str, response: &CachedResponse) {
+    async fn redis_set(&self, key: &str, fingerprint: &str, response: &CachedResponse) {
         let Some(redis) = self.redis_client.as_ref() else {
             return;
         };
@@ -306,6 +410,7 @@ impl RequestDeduplication {
         }
 
         let serializable = SerializableCachedResponse {
+            fingerprint: fingerprint.to_string(),
             status_code: response.status_code,
             headers: response.headers.clone(),
             body: response.body.to_vec(),
@@ -369,7 +474,9 @@ impl RequestDeduplication {
         // instead of storing a full-scan snapshot, so concurrent inserts cannot
         // be overwritten by stale counts from this cleanup pass.
         self.local_cache.retain(|_, entry| match entry {
-            DeduplicationEntry::Completed { cached, sequence } => {
+            DeduplicationEntry::Completed {
+                cached, sequence, ..
+            } => {
                 let keep = now.duration_since(cached.inserted_at) < self.ttl;
                 if !keep {
                     self.mark_completed_sequence_pruned(*sequence);
@@ -382,7 +489,7 @@ impl RequestDeduplication {
             // connection drop) without ever reaching `on_final_response_body`.
             // Without this, duplicate requests would receive 409 Conflict
             // forever (until LRU max-entries eviction).
-            DeduplicationEntry::InFlight { started_at } => {
+            DeduplicationEntry::InFlight { started_at, .. } => {
                 let keep = now.duration_since(*started_at) < self.inflight_ttl;
                 if !keep {
                     decrement_atomic(&self.inflight_count);
@@ -592,9 +699,73 @@ enum CompletedSequenceRemoval {
 /// Serializable form of CachedResponse for Redis storage.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SerializableCachedResponse {
+    fingerprint: String,
     status_code: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+}
+
+fn hash_framed(hasher: &mut Sha256, label: &str, value: &[u8]) {
+    hasher.update(label.as_bytes());
+    hasher.update([0]);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn header_value_case_insensitive<'a>(
+    headers: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a str> {
+    headers.iter().find_map(|(key, value)| {
+        key.eq_ignore_ascii_case(name)
+            .then_some(value.as_str())
+    })
+}
+
+fn canonical_authority(headers: &HashMap<String, String>) -> String {
+    header_value_case_insensitive(headers, ":authority")
+        .or_else(|| header_value_case_insensitive(headers, "host"))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn request_declares_body(headers: &HashMap<String, String>) -> bool {
+    if header_value_case_insensitive(headers, "transfer-encoding").is_some() {
+        return true;
+    }
+
+    let Some(content_length) = header_value_case_insensitive(headers, "content-length") else {
+        return false;
+    };
+    let trimmed = content_length.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.parse::<u64>().map_or(true, |length| length > 0)
+}
+
+fn request_body_digest(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> Result<String, PluginResult> {
+    let body = match ctx.request_body_bytes.as_ref() {
+        Some(body) => body.as_ref(),
+        None if request_declares_body(headers) => {
+            return Err(PluginResult::Reject {
+                status_code: 400,
+                body: serde_json::json!({
+                    "error": "Request body unavailable for idempotency fingerprint"
+                })
+                .to_string(),
+                headers: HashMap::new(),
+            });
+        }
+        None => &[],
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(body);
+    Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
@@ -749,6 +920,21 @@ impl Plugin for RequestDeduplication {
             && !content_type.is_some_and(is_event_stream_content_type)
     }
 
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        true
+    }
+
+    fn needs_request_body_bytes(&self) -> bool {
+        true
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        self.applicable_methods
+            .iter()
+            .any(|method| method.eq_ignore_ascii_case(&ctx.method))
+            && header_value_case_insensitive(&ctx.headers, &self.header_name).is_some()
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -763,50 +949,68 @@ impl Plugin for RequestDeduplication {
             return PluginResult::Continue;
         }
 
-        let key = {
+        let (key, fingerprint) = {
             // Get idempotency key from headers. Keep the borrow scoped so no
             // header-map borrow survives across Redis/cache awaits below.
-            let idempotency_value = match headers.get(&self.header_name) {
-                Some(value) if !value.is_empty() => value.as_str(),
-                _ => {
-                    if self.enforce_required {
-                        return PluginResult::Reject {
-                            status_code: 400,
-                            body: missing_idempotency_body(&self.header_name),
-                            headers: HashMap::new(),
-                        };
+            let idempotency_value =
+                match header_value_case_insensitive(headers, &self.header_name) {
+                    Some(value) if !value.is_empty() => value,
+                    _ => {
+                        if self.enforce_required {
+                            return PluginResult::Reject {
+                                status_code: 400,
+                                body: missing_idempotency_body(&self.header_name),
+                                headers: HashMap::new(),
+                            };
+                        }
+                        return PluginResult::Continue;
                     }
-                    return PluginResult::Continue;
-                }
+                };
+            let key = self.build_key(ctx, idempotency_value);
+            let fingerprint = match self.build_request_fingerprint(ctx, headers) {
+                Ok(fingerprint) => fingerprint,
+                Err(reject) => return reject,
             };
-            self.build_key(ctx, idempotency_value)
+            (key, fingerprint)
         };
 
         // Periodic cleanup
         self.cleanup_local_cache();
 
         // Check Redis first (centralized dedup across instances)
-        if self.redis_client.is_some()
-            && let Some(cached) = self.redis_get(&key).await
-        {
-            debug!("request_deduplication: Redis cache hit, replaying response");
-            // Defense-in-depth: re-sanitize on replay even though insert
-            // already strips. A stored entry written before this fix landed,
-            // or by a peer running an older binary against a shared Redis,
-            // could still carry session-bearing headers.
-            let mut response_headers = sanitize_cached_headers(&cached.headers);
-            response_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
-            return PluginResult::RejectBinary {
-                status_code: cached.status_code,
-                body: cached.body.clone(),
-                headers: response_headers,
-            };
+        if self.redis_client.is_some() {
+            match self.redis_get(&key, &fingerprint).await {
+                RedisDeduplicationAction::Replay(cached) => {
+                    debug!("request_deduplication: Redis cache hit, replaying response");
+                    // Defense-in-depth: re-sanitize on replay even though insert
+                    // already strips. A stored entry written before this fix landed,
+                    // or by a peer running an older binary against a shared Redis,
+                    // could still carry session-bearing headers.
+                    let mut response_headers = sanitize_cached_headers(&cached.headers);
+                    response_headers
+                        .insert("x-idempotent-replayed".to_string(), "true".to_string());
+                    return PluginResult::RejectBinary {
+                        status_code: cached.status_code,
+                        body: cached.body.clone(),
+                        headers: response_headers,
+                    };
+                }
+                RedisDeduplicationAction::Conflict => {
+                    return PluginResult::Reject {
+                        status_code: 409,
+                        body: r#"{"error":"Idempotency key was reused for a different request"}"#
+                            .to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+                RedisDeduplicationAction::Miss => {}
+            }
         }
 
         // Check local cache and mark fresh keys as in-flight atomically under
         // the DashMap entry lock. This prevents two concurrent first requests
         // with the same idempotency key from both reaching the backend.
-        match self.local_lookup_or_mark_inflight(&key, Instant::now()) {
+        match self.local_lookup_or_mark_inflight(&key, &fingerprint, Instant::now()) {
             LocalDeduplicationAction::Replay(cached) => {
                 debug!("request_deduplication: local cache hit, replaying response");
                 // Defense-in-depth: re-sanitize on replay even though insert
@@ -821,7 +1025,7 @@ impl Plugin for RequestDeduplication {
                     headers: response_headers,
                 };
             }
-            LocalDeduplicationAction::Conflict => {
+            LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight) => {
                 return PluginResult::Reject {
                     status_code: 409,
                     body:
@@ -830,11 +1034,21 @@ impl Plugin for RequestDeduplication {
                     headers: HashMap::new(),
                 };
             }
+            LocalDeduplicationAction::Conflict(DeduplicationConflict::FingerprintMismatch) => {
+                return PluginResult::Reject {
+                    status_code: 409,
+                    body: r#"{"error":"Idempotency key was reused for a different request"}"#
+                        .to_string(),
+                    headers: HashMap::new(),
+                };
+            }
             LocalDeduplicationAction::Fresh => {}
         }
 
         // Store the key in metadata so on_final_response_body can cache the response
         ctx.metadata.insert(DEDUP_KEY_METADATA.to_string(), key);
+        ctx.metadata
+            .insert(DEDUP_FINGERPRINT_METADATA.to_string(), fingerprint);
 
         PluginResult::Continue
     }
@@ -849,6 +1063,10 @@ impl Plugin for RequestDeduplication {
         // Only cache if we have a dedup key from before_proxy
         let key = match ctx.metadata.get(DEDUP_KEY_METADATA) {
             Some(k) => k.clone(),
+            None => return PluginResult::Continue,
+        };
+        let fingerprint = match ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) {
+            Some(fingerprint) => fingerprint.clone(),
             None => return PluginResult::Continue,
         };
 
@@ -880,6 +1098,7 @@ impl Plugin for RequestDeduplication {
             DeduplicationEntry::Completed {
                 cached: cached.clone(),
                 sequence,
+                fingerprint: fingerprint.clone(),
             },
         );
         self.completed_order
@@ -908,7 +1127,7 @@ impl Plugin for RequestDeduplication {
 
         // Also store in Redis if available
         if self.redis_client.is_some() {
-            self.redis_set(&key, &cached).await;
+            self.redis_set(&key, &fingerprint, &cached).await;
         }
 
         PluginResult::Continue
@@ -924,5 +1143,17 @@ impl Plugin for RequestDeduplication {
 
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.local_cache.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SerializableCachedResponse;
+
+    #[test]
+    fn legacy_redis_cached_response_without_fingerprint_is_rejected() {
+        let legacy = br#"{"status_code":201,"headers":{},"body":[]}"#;
+
+        assert!(serde_json::from_slice::<SerializableCachedResponse>(legacy).is_err());
     }
 }

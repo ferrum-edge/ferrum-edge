@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
@@ -7,8 +8,69 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 
+const DEDUP_KEY_METADATA: &str = "_dedup_key";
+const DEDUP_FINGERPRINT_METADATA: &str = "_dedup_fingerprint";
+
 fn make_plugin(config: serde_json::Value) -> RequestDeduplication {
     RequestDeduplication::new(&config, PluginHttpClient::default()).unwrap()
+}
+
+fn keyed_headers(key: &str, host: &str, body_len: usize) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), key.to_string());
+    headers.insert("host".to_string(), host.to_string());
+    headers.insert("content-length".to_string(), body_len.to_string());
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers
+}
+
+fn body_ctx(method: &str, path: &str, body: &'static [u8]) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        path.to_string(),
+    );
+    ctx.request_body_bytes = Some(Bytes::from_static(body));
+    ctx
+}
+
+async fn complete_response(plugin: &RequestDeduplication, ctx: &mut RequestContext) {
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let result = plugin
+        .on_final_response_body(ctx, 201, &response_headers, b"{\"ok\":true}")
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+fn assert_fingerprint_conflict(result: PluginResult) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 409);
+            assert!(body.contains("different request"), "body was {body}");
+        }
+        other => panic!("Expected fingerprint mismatch conflict, got {other:?}"),
+    }
+}
+
+async fn assert_reused_key_for_different_request_conflicts(
+    first_ctx: &mut RequestContext,
+    first_headers: &mut HashMap<String, String>,
+    second_ctx: &mut RequestContext,
+    second_headers: &mut HashMap<String, String>,
+) {
+    let plugin = make_plugin(json!({
+        "applicable_methods": ["POST", "PUT", "PATCH"]
+    }));
+
+    let result = plugin.before_proxy(first_ctx, first_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response(&plugin, first_ctx).await;
+
+    let result = plugin.before_proxy(second_ctx, second_headers).await;
+    assert_fingerprint_conflict(result);
 }
 
 #[test]
@@ -22,7 +84,9 @@ fn test_new_default_config() {
     assert!(!plugin.is_auth_plugin());
     assert!(!plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
-    assert!(!plugin.requires_request_body_buffering());
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(plugin.needs_request_body_bytes());
 }
 
 #[test]
@@ -968,4 +1032,248 @@ async fn test_replay_strips_set_cookie_case_insensitively() {
         }
         other => panic!("Expected RejectBinary replay, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
+    let plugin = make_plugin(json!({}));
+
+    let mut keyed_post = body_ctx("POST", "/api", b"{\"a\":1}");
+    keyed_post.headers = keyed_headers("body-key", "api.example", 7);
+    assert!(plugin.should_buffer_request_body(&keyed_post));
+
+    let keyless_post = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    assert!(!plugin.should_buffer_request_body(&keyless_post));
+
+    let mut keyed_get = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    keyed_get.headers = keyed_headers("body-key", "api.example", 0);
+    assert!(!plugin.should_buffer_request_body(&keyed_get));
+}
+
+#[tokio::test]
+async fn test_identical_request_bodies_replay_cached_response() {
+    let plugin = make_plugin(json!({}));
+
+    let mut ctx1 = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut headers1 = keyed_headers("same-body", "api.example", 11);
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response(&plugin, &mut ctx1).await;
+
+    let mut ctx2 = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut headers2 = keyed_headers("same-body", "api.example", 11);
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 201);
+            assert_eq!(&body[..], b"{\"ok\":true}");
+        }
+        other => panic!("Expected replay for identical body, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_reused_key_different_method_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("method-key", "api.example", 11);
+    let mut second_ctx = body_ctx("PUT", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("method-key", "api.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_authority_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("authority-key", "api.example", 11);
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("authority-key", "other.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_raw_path_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders/1", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("path-key", "api.example", 11);
+    let mut second_ctx = body_ctx("POST", "/api/orders/2", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("path-key", "api.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_raw_query_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    first_ctx.set_raw_query_string("a=1&a=2".to_string());
+    let mut first_headers = keyed_headers("query-key", "api.example", 11);
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    second_ctx.set_raw_query_string("a=2&a=1".to_string());
+    let mut second_headers = keyed_headers("query-key", "api.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_body_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("body-key", "api.example", 11);
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":2}");
+    let mut second_headers = keyed_headers("body-key", "api.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_declared_body_unavailable_rejects_fingerprinting() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/orders".to_string(),
+    );
+    let mut headers = keyed_headers("missing-body", "api.example", 12);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("Request body unavailable"));
+        }
+        other => panic!("Expected body-unavailable reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_delimiter_containing_identities_and_keys_do_not_collide() {
+    let plugin = make_plugin(json!({
+        "scope_by_consumer": true
+    }));
+
+    let mut ctx1 = body_ctx("POST", "/api/orders", b"{}");
+    ctx1.authenticated_identity = Some("alice:tenant".to_string());
+    let mut headers1 = keyed_headers("key", "api.example", 2);
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut ctx2 = body_ctx("POST", "/api/orders", b"{}");
+    ctx2.authenticated_identity = Some("alice".to_string());
+    let mut headers2 = keyed_headers("tenant:key", "api.example", 2);
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let key1 = ctx1.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    let key2 = ctx2.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    assert_ne!(key1, key2);
+    assert!(!key1.contains("alice"));
+    assert!(!key1.contains("key"));
+    assert!(!key2.contains("tenant"));
+}
+
+#[tokio::test]
+async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = body_ctx("POST", "/api/orders", b"super-secret-body");
+    ctx.authenticated_identity = Some("identity-secret".to_string());
+    let mut headers = keyed_headers("secret-idempotency-key", "api.example", 17);
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer request-secret-token".to_string(),
+    );
+    headers.insert("cookie".to_string(), "session=request-secret".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let logical_key = ctx.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    let fingerprint = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA).unwrap();
+    assert!(logical_key.starts_with("v2:"));
+    assert!(fingerprint.starts_with("sha256-"));
+    for secret in [
+        "super-secret-body",
+        "secret-idempotency-key",
+        "identity-secret",
+        "request-secret-token",
+        "request-secret",
+    ] {
+        assert!(!logical_key.contains(secret));
+        assert!(!fingerprint.contains(secret));
+    }
+}
+
+#[tokio::test]
+async fn test_local_and_redis_modes_compute_identical_request_identity() {
+    let local_plugin = make_plugin(json!({}));
+    let redis_plugin = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_connect_timeout_seconds": 1
+    }));
+
+    let mut local_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    local_ctx.set_raw_query_string("expand=items".to_string());
+    let mut local_headers = keyed_headers("shared-key", "api.example", 11);
+    let local_result = local_plugin
+        .before_proxy(&mut local_ctx, &mut local_headers)
+        .await;
+    assert!(matches!(local_result, PluginResult::Continue));
+
+    let mut redis_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    redis_ctx.set_raw_query_string("expand=items".to_string());
+    let mut redis_headers = keyed_headers("shared-key", "api.example", 11);
+    let redis_result = redis_plugin
+        .before_proxy(&mut redis_ctx, &mut redis_headers)
+        .await;
+    assert!(matches!(redis_result, PluginResult::Continue));
+
+    assert_eq!(
+        local_ctx.metadata.get(DEDUP_KEY_METADATA),
+        redis_ctx.metadata.get(DEDUP_KEY_METADATA)
+    );
+    assert_eq!(
+        local_ctx.metadata.get(DEDUP_FINGERPRINT_METADATA),
+        redis_ctx.metadata.get(DEDUP_FINGERPRINT_METADATA)
+    );
 }
