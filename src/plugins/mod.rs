@@ -3418,10 +3418,10 @@ pub fn removed_plugin_registration(name: &str) -> Option<&'static PluginRegistra
 pub fn plugin_failure_policy(name: &str) -> Option<PluginFailurePolicy> {
     builtin_plugin_registration(name)
         .map(|registration| registration.failure_policy)
-        .or_else(|| crate::custom_plugins::custom_plugin_failure_policy(name))
         .or_else(|| {
             removed_plugin_registration(name).map(|registration| registration.failure_policy)
         })
+        .or_else(|| crate::custom_plugins::custom_plugin_failure_policy(name))
 }
 
 /// Returns true when `name` is handled by the built-in plugin factory.

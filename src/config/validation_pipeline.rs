@@ -336,8 +336,9 @@ impl<'a> ValidationPipeline<'a> {
                                 "Plugin '{}' (id={}): {}",
                                 plugin_config.plugin_name, plugin_config.id, err
                             );
-                            if crate::plugins::plugin_failure_policy(&plugin_config.plugin_name)
-                                == Some(crate::plugins::PluginFailurePolicy::OptionalFailOpen)
+                            if !matches!(&action, ValidationAction::Collect)
+                                && crate::plugins::plugin_failure_policy(&plugin_config.plugin_name)
+                                    == Some(crate::plugins::PluginFailurePolicy::OptionalFailOpen)
                             {
                                 warn!("Optional plugin config validation warning: {}", message);
                             } else {
@@ -409,7 +410,10 @@ fn handle_validation_errors(
 
 #[cfg(test)]
 mod tests {
-    use super::{ValidationAction, handle_validation_errors};
+    use super::{ValidationAction, ValidationPipeline, handle_validation_errors};
+    use crate::config::types::{GatewayConfig, PluginConfig, PluginScope, default_namespace};
+    use chrono::Utc;
+    use serde_json::json;
 
     #[test]
     fn collect_action_accumulates_errors() {
@@ -489,5 +493,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(collected, vec!["existing"]);
+    }
+
+    #[test]
+    fn collect_plugin_config_validation_keeps_optional_fail_open_errors() {
+        let mut config = GatewayConfig {
+            version: "1".to_string(),
+            plugin_configs: vec![PluginConfig {
+                id: "bad-stdout".to_string(),
+                namespace: default_namespace(),
+                plugin_name: "stdout_logging".to_string(),
+                config: json!("bad-config"),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            ..Default::default()
+        };
+
+        let errors = ValidationPipeline::new(&mut config)
+            .validate_plugin_configs(ValidationAction::Collect)
+            .run()
+            .expect("collect validation should return accumulated errors");
+
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("stdout_logging"), "{errors:?}");
+        assert!(errors[0].contains("bad-stdout"), "{errors:?}");
     }
 }

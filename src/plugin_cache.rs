@@ -467,6 +467,17 @@ struct ProxyGroupPluginInstance {
     config: PluginConfig,
 }
 
+fn remove_shadowed_global_plugin(
+    plugins: &mut Vec<Arc<dyn Plugin>>,
+    global_ptrs: &HashSet<usize>,
+    plugin_name: &str,
+) {
+    plugins.retain(|plugin| {
+        plugin.name() != plugin_name
+            || !global_ptrs.contains(&(Arc::as_ptr(plugin) as *const () as usize))
+    });
+}
+
 fn same_proxy_group_plugin_config(left: &PluginConfig, right: &PluginConfig) -> bool {
     left.id == right.id
         && left.namespace == right.namespace
@@ -1675,14 +1686,20 @@ impl PluginCache {
                                 // Remove only GLOBAL plugins of the same name —
                                 // other proxy-scoped instances are preserved,
                                 // allowing multiple instances of the same plugin type.
-                                merged.retain(|p| {
-                                    p.name() != plugin.name()
-                                        || !global_ptrs
-                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
-                                });
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    plugin.name(),
+                                );
                                 merged.push(plugin);
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    &pc.plugin_name,
+                                );
+                            }
                             Err(e) => plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e)),
                         }
                     }
@@ -1696,10 +1713,7 @@ impl PluginCache {
                     if let Some(existing) = group_plugin_instances.get(pc.id.as_str()) {
                         // Reuse the shared instance (Arc::clone is ~5ns)
                         let plugin = Arc::clone(&existing.plugin);
-                        merged.retain(|p| {
-                            p.name() != plugin.name()
-                                || !global_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
-                        });
+                        remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
                         merged.push(plugin);
                     } else {
                         // First proxy to reference this group plugin — create the instance
@@ -1712,14 +1726,20 @@ impl PluginCache {
                                         config: (*pc).clone(),
                                     },
                                 );
-                                merged.retain(|p| {
-                                    p.name() != plugin.name()
-                                        || !global_ptrs
-                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
-                                });
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    plugin.name(),
+                                );
                                 merged.push(plugin);
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    &pc.plugin_name,
+                                );
+                            }
                             Err(e) => plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e)),
                         }
                     }

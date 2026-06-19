@@ -234,6 +234,34 @@ fn test_proxy_scoped_plugins_override_globals_of_same_name() {
 }
 
 #[test]
+fn test_invalid_optional_proxy_scoped_plugin_still_shadows_global() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["ps1"]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![
+            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config_with_json(
+                "ps1",
+                "stdout_logging",
+                json!("bad-config"),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "failed proxy-scoped optional plugin must shadow the same-name global"
+    );
+    assert_eq!(cache.get_plugins("p2").len(), 1);
+    assert_eq!(cache.get_plugins("p2")[0].name(), "stdout_logging");
+}
+
+#[test]
 fn test_disabled_plugins_excluded() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec![])],
@@ -2641,6 +2669,34 @@ fn test_proxy_group_plugin_overrides_global_of_same_name() {
     let p1_ptr = std::sync::Arc::as_ptr(&p1_plugins[0]) as *const () as usize;
     let p2_ptr = std::sync::Arc::as_ptr(&p2_plugins[0]) as *const () as usize;
     assert_ne!(p1_ptr, p2_ptr);
+}
+
+#[test]
+fn test_invalid_optional_proxy_group_plugin_still_shadows_global() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group1"]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![
+            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config_with_json(
+                "group1",
+                "stdout_logging",
+                json!("bad-config"),
+                PluginScope::ProxyGroup,
+                None,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "failed proxy-group optional plugin must shadow the same-name global"
+    );
+    assert_eq!(cache.get_plugins("p2").len(), 1);
+    assert_eq!(cache.get_plugins("p2")[0].name(), "stdout_logging");
 }
 
 #[test]
