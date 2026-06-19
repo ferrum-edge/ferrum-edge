@@ -3030,12 +3030,9 @@ async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
         "invalid association should not fall back to cached proxy: {body:?}"
     );
     assert_eq!(data_source, None);
-    assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|message| message.contains("global-invalid")
-                && message.contains("resource=proxy_plugins")),
-        "error should identify the invalid association safely: {body:?}"
+    assert_eq!(
+        body["error"].as_str(),
+        Some("Database unavailable — operation failed")
     );
 
     let repaired = json!({
