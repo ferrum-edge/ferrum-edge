@@ -128,3 +128,7 @@ pub fn create_plugin(
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     Ok(Some(Arc::new(ExamplePlugin::new(config)?)))
 }
+
+pub fn failure_policy() -> crate::plugins::PluginFailurePolicy {
+    crate::plugins::PluginFailurePolicy::KeepLastKnownGood
+}

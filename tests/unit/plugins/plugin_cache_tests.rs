@@ -290,6 +290,78 @@ fn test_removed_security_plugin_fails_closed() {
 }
 
 #[test]
+fn test_builtin_plugin_registrations_are_unique_and_policy_backed() {
+    use ferrum_edge::plugins::{
+        BUILTIN_PLUGIN_REGISTRATIONS, PluginFailurePolicy, available_plugins,
+        plugin_failure_policy,
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let available = available_plugins();
+    let mut saw_fail_closed = false;
+    let mut saw_keep_last_known_good = false;
+    let mut saw_optional_fail_open = false;
+
+    for registration in BUILTIN_PLUGIN_REGISTRATIONS {
+        assert!(
+            seen.insert(registration.name),
+            "duplicate built-in plugin registration for {}",
+            registration.name
+        );
+        assert!(
+            available.contains(&registration.name),
+            "{} missing from available_plugins()",
+            registration.name
+        );
+        assert_eq!(
+            plugin_failure_policy(registration.name),
+            Some(registration.failure_policy),
+            "{} failure policy must come from registration metadata",
+            registration.name
+        );
+
+        match registration.failure_policy {
+            PluginFailurePolicy::FailClosed => saw_fail_closed = true,
+            PluginFailurePolicy::KeepLastKnownGood => saw_keep_last_known_good = true,
+            PluginFailurePolicy::OptionalFailOpen => saw_optional_fail_open = true,
+        }
+    }
+
+    assert!(saw_fail_closed);
+    assert!(saw_keep_last_known_good);
+    assert!(saw_optional_fail_open);
+}
+
+#[test]
+fn test_optional_custom_plugin_validation_failure_is_omitted() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_audit_plugin") {
+        return;
+    }
+
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("example_audit_plugin"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::OptionalFailOpen)
+    );
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "optional-audit",
+            "example_audit_plugin",
+            json!({"log_request_headers": "not-a-bool"}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+
+    let cache = PluginCache::new(&config).expect("optional plugin failure should not abort cache");
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "failed optional custom plugin must be omitted"
+    );
+}
+
+#[test]
 fn test_unknown_enabled_plugin_rejects_initial_cache() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec![])],
