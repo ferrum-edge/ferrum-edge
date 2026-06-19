@@ -321,7 +321,7 @@ async fn test_cache_hit_replaces_stored_age_with_current_age() {
     let (_, _, headers) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
     let age = cached_age(&headers);
     assert!(
-        (10..60).contains(&age),
+        age >= 10 && age < 60,
         "expected current Age to include upstream Age and remain fresh, got {age}"
     );
 }
@@ -516,7 +516,7 @@ async fn test_old_date_reduces_remaining_freshness() {
 }
 
 #[tokio::test]
-async fn test_date_dominated_age_adds_response_delay_before_storage() {
+async fn test_date_dominated_age_does_not_double_count_response_delay() {
     let plugin = default_plugin();
     let mut ctx = make_ctx("GET", "/api/date-delay");
     let mut headers = HashMap::new();
@@ -529,7 +529,8 @@ async fn test_date_dominated_age_adds_response_delay_before_storage() {
 
     let mut resp_headers = HashMap::new();
     resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
-    resp_headers.insert("date".to_string(), http_date_seconds_ago(50));
+    // The plugin clock is advanced by 5s above, making this Date appear 58s old.
+    resp_headers.insert("date".to_string(), http_date_seconds_ago(53));
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     plugin
         .on_final_response_body(&mut ctx, 200, &resp_headers, b"stale")
@@ -537,12 +538,11 @@ async fn test_date_dominated_age_adds_response_delay_before_storage() {
 
     let mut hit_ctx = make_ctx("GET", "/api/date-delay");
     let mut hit_headers = HashMap::new();
-    let result = plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await;
-    assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(
-        hit_ctx.metadata.get("cache_status").unwrap(),
-        "PREDICTED-BYPASS"
-    );
+    let (status, body, headers) =
+        expect_reject(plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"stale");
+    assert_eq!(headers.get("x-cache-status"), Some(&"HIT".to_string()));
 }
 
 #[tokio::test]
@@ -658,7 +658,7 @@ async fn test_s_maxage_freshness_accounts_for_age() {
     let (_, _, headers) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
     let age = cached_age(&headers);
     assert!(
-        (50..60).contains(&age),
+        age >= 50 && age < 60,
         "s-maxage should define freshness while Age still advances, got {age}"
     );
 }
@@ -767,6 +767,65 @@ async fn test_bypassed_stale_response_does_not_poison_fresh_entry() {
         .await;
 
     let mut hit_ctx = make_ctx("GET", "/api/no-cache-stale");
+    let mut hit_headers = HashMap::new();
+    let (status, body, headers) =
+        expect_reject(plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"fresh");
+    assert_eq!(headers.get("x-cache-status"), Some(&"HIT".to_string()));
+}
+
+#[tokio::test]
+async fn test_bypassed_fresh_response_clears_stale_predictor() {
+    let plugin = default_plugin();
+
+    let mut stale_ctx = make_ctx("GET", "/api/no-cache-refresh");
+    let mut stale_request_headers = HashMap::new();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut stale_ctx, &mut stale_request_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut stale_response_headers = HashMap::new();
+    stale_response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    stale_response_headers.insert("age".to_string(), "61".to_string());
+    plugin
+        .after_proxy(&mut stale_ctx, 200, &mut stale_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut stale_ctx, 200, &stale_response_headers, b"stale")
+        .await;
+
+    let mut bypass_ctx = make_ctx("GET", "/api/no-cache-refresh");
+    bypass_ctx
+        .headers
+        .insert("cache-control".to_string(), "no-cache".to_string());
+    let mut bypass_headers = HashMap::new();
+    bypass_headers.insert("cache-control".to_string(), "no-cache".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut bypass_ctx, &mut bypass_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(bypass_ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+    assert!(
+        !bypass_ctx.metadata.contains_key("cache_predict_key"),
+        "client no-cache bypass should not set a predictor key"
+    );
+
+    let mut fresh_response_headers = HashMap::new();
+    fresh_response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    plugin
+        .after_proxy(&mut bypass_ctx, 200, &mut fresh_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut bypass_ctx, 200, &fresh_response_headers, b"fresh")
+        .await;
+
+    let mut hit_ctx = make_ctx("GET", "/api/no-cache-refresh");
     let mut hit_headers = HashMap::new();
     let (status, body, headers) =
         expect_reject(plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await);
@@ -1128,7 +1187,7 @@ async fn test_if_none_match_returns_304_from_cache() {
     assert_eq!(headers.get("etag"), Some(&r#"W/"abc123""#.to_string()));
     let age = cached_age(&headers);
     assert!(
-        (9..60).contains(&age),
+        age >= 9 && age < 60,
         "local 304 should include current Age, got {age}"
     );
     assert_eq!(

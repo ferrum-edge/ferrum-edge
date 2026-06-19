@@ -1064,10 +1064,9 @@ impl ResponseCaching {
         let age_value = header_value(response_headers, "age")
             .and_then(parse_age_header)
             .unwrap_or_default();
-        duration_saturating_add(
-            apparent_age.max(age_value),
-            self.response_delay(ctx, response_time_monotonic),
-        )
+        let corrected_age_value =
+            duration_saturating_add(age_value, self.response_delay(ctx, response_time_monotonic));
+        apparent_age.max(corrected_age_value)
     }
 
     fn shared_cache_allows_authorized_response(
@@ -1652,10 +1651,10 @@ impl Plugin for ResponseCaching {
             sub_total_size(&self.total_size, old.approx_size());
         }
         self.total_size.fetch_add(entry_size, Ordering::Relaxed);
-        // Response was cacheable — remove from predictor if previously marked uncacheable
-        if let Some(predict_key) = predict_key.as_deref() {
-            self.uncacheable_predictor.mark_cacheable(predict_key);
-        }
+        // Response was cacheable; remove the exact cache key from the predictor
+        // even for client no-cache bypass refreshes, which return before
+        // `CACHE_PREDICT_KEY` is available.
+        self.uncacheable_predictor.mark_cacheable(&cache_key);
         self.vary_index.insert(base_key, vary_headers);
 
         debug!(
