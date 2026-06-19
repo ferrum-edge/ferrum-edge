@@ -1011,6 +1011,9 @@ fn request_body_digest(
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
+// External tests reach this through `crate::_test_support`; the binary target
+// still sees the crate-private helper itself as unused.
+#[allow(dead_code)]
 pub(crate) fn redis_cached_response_payload_is_valid_for_test(data: &[u8]) -> bool {
     serde_json::from_slice::<SerializableCachedResponse>(data).is_ok()
 }

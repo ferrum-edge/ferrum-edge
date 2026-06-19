@@ -23,7 +23,7 @@ use crate::common::TestGateway;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 use tokio::time::sleep;
@@ -335,6 +335,7 @@ async fn start_header_echo_backend(
 async fn start_blocking_counting_backend_on(
     listener: tokio::net::TcpListener,
     hits: Arc<AtomicUsize>,
+    blocked: Arc<AtomicBool>,
     release: Arc<Notify>,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let handle = tokio::spawn(async move {
@@ -343,6 +344,7 @@ async fn start_blocking_counting_backend_on(
                 continue;
             };
             let hits = Arc::clone(&hits);
+            let blocked = Arc::clone(&blocked);
             let release = Arc::clone(&release);
             tokio::spawn(async move {
                 let (reader, mut writer) = tokio::io::split(stream);
@@ -371,6 +373,7 @@ async fn start_blocking_counting_backend_on(
                 }
 
                 hits.fetch_add(1, Ordering::SeqCst);
+                blocked.store(true, Ordering::SeqCst);
                 release.notified().await;
 
                 let body = json!({
@@ -1370,10 +1373,12 @@ async fn test_request_deduplication_redis_blocks_concurrent_cross_instance() {
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
+    let backend_blocked = Arc::new(AtomicBool::new(false));
     let release_backend = Arc::new(Notify::new());
     let _backend = start_blocking_counting_backend_on(
         backend_listener,
         Arc::clone(&backend_hits),
+        Arc::clone(&backend_blocked),
         Arc::clone(&release_backend),
     )
     .await
@@ -1390,6 +1395,7 @@ proxies:
     backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
+    backend_read_timeout_ms: 120000
     strip_listen_path: true
     plugins:
       - plugin_config_id: "shared-dedup-plugin"
@@ -1466,7 +1472,7 @@ plugin_configs:
     let inflight_prefix = format!("{unique_prefix}:inflight:");
     let deadline = SystemTime::now() + Duration::from_secs(5);
     loop {
-        let backend_started = backend_hits.load(Ordering::SeqCst) > 0;
+        let backend_started = backend_blocked.load(Ordering::SeqCst);
         let redis_lock_visible = redis_key_count_by_prefix(&inflight_prefix).await > 0;
         if backend_started && redis_lock_visible {
             break;
