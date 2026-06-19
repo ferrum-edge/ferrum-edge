@@ -899,6 +899,39 @@ impl ResponseCaching {
         }
     }
 
+    fn invalidate_zero_freshness_response(
+        &self,
+        base_key: &str,
+        predict_key: Option<&str>,
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+        lookup_headers: &RestoredRequestHeadersView,
+    ) {
+        if let Some(predict_key) = predict_key {
+            self.invalidate_cache_key(base_key, predict_key);
+        }
+
+        match self.merged_vary_headers(response_headers) {
+            Some(mut vary_headers) => {
+                self.merge_existing_vary_headers(base_key, &mut vary_headers);
+                self.merge_present_sensitive_vary_headers(
+                    &mut vary_headers,
+                    &lookup_headers.headers,
+                );
+                let response_key = self.build_cache_key_with_ready_values(
+                    ctx,
+                    &vary_headers,
+                    &lookup_headers.headers,
+                    Some(&lookup_headers.cache_key_ready_headers),
+                );
+                if predict_key != Some(response_key.as_str()) {
+                    self.invalidate_cache_key(base_key, &response_key);
+                }
+            }
+            None => self.invalidate_base_key(base_key),
+        }
+    }
+
     /// Evict expired entries when cache exceeds max_entries.
     fn evict_if_needed(&self) {
         if self.cache.len() <= self.config.max_entries {
@@ -1372,17 +1405,6 @@ impl Plugin for ResponseCaching {
         // would miss.
         self.stash_request_headers_snapshot(ctx, headers);
 
-        if self.config.respect_no_cache
-            && let Some(cc) = headers.get("cache-control")
-        {
-            let directives = parse_cache_control(cc);
-            if directives.no_cache || directives.no_store {
-                ctx.metadata
-                    .insert(CACHE_STATUS.to_string(), "BYPASS".to_string());
-                return PluginResult::Continue;
-            }
-        }
-
         let mut vary_headers = self.cache_lookup_vary_headers(&base_key);
         // A request that carries credentials/session headers must never probe
         // the unvaried base key, even if this base key has only seen anonymous
@@ -1394,6 +1416,17 @@ impl Plugin for ResponseCaching {
         // can mark the correct variant-specific key in the uncacheable predictor.
         ctx.metadata
             .insert(CACHE_PREDICT_KEY.to_string(), cache_key.clone());
+
+        if self.config.respect_no_cache
+            && let Some(cc) = headers.get("cache-control")
+        {
+            let directives = parse_cache_control(cc);
+            if directives.no_cache || directives.no_store {
+                ctx.metadata
+                    .insert(CACHE_STATUS.to_string(), "BYPASS".to_string());
+                return PluginResult::Continue;
+            }
+        }
 
         // Fast-path: skip cache lookup if this specific variant is predicted uncacheable.
         // Uses the full cache_key (including Vary dimensions) so that one uncacheable
@@ -1506,6 +1539,27 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
+        // Restore the same header view `before_proxy` used so the
+        // shared-cache authorization check and the storage cache key
+        // both see the transformed values, not the untransformed
+        // `ctx.headers`. See `restore_request_headers_view` for why.
+        let lookup_headers = self.restore_request_headers_view(ctx);
+        let freshness_lifetime = self.freshness_lifetime(directives);
+
+        if freshness_lifetime.is_zero() {
+            self.invalidate_zero_freshness_response(
+                &base_key,
+                predict_key.as_deref(),
+                ctx,
+                response_headers,
+                &lookup_headers,
+            );
+            if let Some(predict_key) = predict_key.as_deref() {
+                self.uncacheable_predictor.mark_uncacheable(predict_key);
+            }
+            return PluginResult::Continue;
+        }
+
         // Never cache responses with Set-Cookie headers. These are
         // per-client and replaying them from a shared cache would leak
         // session cookies to other users (RFC 7234 §8).
@@ -1517,12 +1571,6 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
-        // Restore the same header view `before_proxy` used so the
-        // shared-cache authorization check and the storage cache key
-        // both see the transformed values, not the untransformed
-        // `ctx.headers`. See `restore_request_headers_view` for why.
-        let lookup_headers = self.restore_request_headers_view(ctx);
-
         if !self.shared_cache_allows_authorized_response(ctx, directives) {
             if let Some(predict_key) = predict_key.as_deref() {
                 self.uncacheable_predictor.mark_uncacheable(predict_key);
@@ -1532,37 +1580,12 @@ impl Plugin for ResponseCaching {
 
         let response_time_monotonic = self.now_monotonic();
         let response_time_wall = self.now_wall();
-        let freshness_lifetime = self.freshness_lifetime(directives);
         let corrected_initial_age = self.corrected_initial_age(
             ctx,
             response_headers,
             response_time_monotonic,
             response_time_wall,
         );
-
-        if freshness_lifetime.is_zero() {
-            match self.merged_vary_headers(response_headers) {
-                Some(mut vary_headers) => {
-                    self.merge_existing_vary_headers(&base_key, &mut vary_headers);
-                    self.merge_present_sensitive_vary_headers(
-                        &mut vary_headers,
-                        &lookup_headers.headers,
-                    );
-                    let cache_key = self.build_cache_key_with_ready_values(
-                        ctx,
-                        &vary_headers,
-                        &lookup_headers.headers,
-                        Some(&lookup_headers.cache_key_ready_headers),
-                    );
-                    self.invalidate_cache_key(&base_key, &cache_key);
-                }
-                None => self.invalidate_base_key(&base_key),
-            }
-            if let Some(predict_key) = predict_key.as_deref() {
-                self.uncacheable_predictor.mark_uncacheable(predict_key);
-            }
-            return PluginResult::Continue;
-        }
 
         if corrected_initial_age >= freshness_lifetime {
             if let Some(predict_key) = predict_key.as_deref() {

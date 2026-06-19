@@ -823,6 +823,136 @@ async fn test_bypassed_zero_freshness_response_invalidates_existing_entry() {
 }
 
 #[tokio::test]
+async fn test_bypassed_zero_freshness_with_new_vary_invalidates_matched_entry() {
+    let plugin = default_plugin();
+    let path = "/api/no-cache-zero-new-vary";
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    cache_response(&plugin, "GET", path, 200, &resp_headers, b"cached").await;
+    assert!(response_caching_current_total_size_for_test(&plugin) > 0);
+
+    let mut bypass_ctx = make_ctx("GET", path);
+    bypass_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    bypass_ctx
+        .headers
+        .insert("cache-control".to_string(), "no-cache".to_string());
+    let mut bypass_headers = bypass_ctx.headers.clone();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut bypass_ctx, &mut bypass_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(bypass_ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+
+    let mut zero_response_headers = HashMap::new();
+    zero_response_headers.insert("cache-control".to_string(), "max-age=0".to_string());
+    zero_response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+    plugin
+        .after_proxy(&mut bypass_ctx, 200, &mut zero_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut bypass_ctx, 200, &zero_response_headers, b"zero")
+        .await;
+
+    assert_eq!(response_caching_current_total_size_for_test(&plugin), 0);
+}
+
+#[tokio::test]
+async fn test_zero_freshness_set_cookie_response_invalidates_existing_entry() {
+    let plugin = default_plugin();
+    let path = "/api/no-cache-zero-cookie";
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    cache_response(&plugin, "GET", path, 200, &resp_headers, b"cached").await;
+    assert!(response_caching_current_total_size_for_test(&plugin) > 0);
+
+    let mut bypass_ctx = make_ctx("GET", path);
+    bypass_ctx
+        .headers
+        .insert("cache-control".to_string(), "no-cache".to_string());
+    let mut bypass_headers = bypass_ctx.headers.clone();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut bypass_ctx, &mut bypass_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut zero_response_headers = HashMap::new();
+    zero_response_headers.insert("cache-control".to_string(), "max-age=0".to_string());
+    zero_response_headers.insert("set-cookie".to_string(), "sid=rotated".to_string());
+    plugin
+        .after_proxy(&mut bypass_ctx, 200, &mut zero_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut bypass_ctx, 200, &zero_response_headers, b"zero")
+        .await;
+
+    assert_eq!(response_caching_current_total_size_for_test(&plugin), 0);
+}
+
+#[tokio::test]
+async fn test_zero_freshness_auth_rejection_invalidates_existing_entry() {
+    let plugin = default_plugin();
+    let path = "/api/no-cache-zero-auth";
+
+    let mut cache_ctx = make_ctx("GET", path);
+    cache_ctx.authenticated_identity = Some("alice".to_string());
+    cache_ctx
+        .headers
+        .insert("authorization".to_string(), "Bearer token-a".to_string());
+    let mut cache_headers = cache_ctx.headers.clone();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut cache_ctx, &mut cache_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let mut public_response_headers = HashMap::new();
+    public_response_headers.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    plugin
+        .after_proxy(&mut cache_ctx, 200, &mut public_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut cache_ctx, 200, &public_response_headers, b"cached")
+        .await;
+    assert!(response_caching_current_total_size_for_test(&plugin) > 0);
+
+    let mut bypass_ctx = make_ctx("GET", path);
+    bypass_ctx.authenticated_identity = Some("alice".to_string());
+    bypass_ctx
+        .headers
+        .insert("authorization".to_string(), "Bearer token-a".to_string());
+    bypass_ctx
+        .headers
+        .insert("cache-control".to_string(), "no-cache".to_string());
+    let mut bypass_headers = bypass_ctx.headers.clone();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut bypass_ctx, &mut bypass_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut zero_response_headers = HashMap::new();
+    zero_response_headers.insert("cache-control".to_string(), "max-age=0".to_string());
+    plugin
+        .after_proxy(&mut bypass_ctx, 200, &mut zero_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut bypass_ctx, 200, &zero_response_headers, b"zero")
+        .await;
+
+    assert_eq!(response_caching_current_total_size_for_test(&plugin), 0);
+}
+
+#[tokio::test]
 async fn test_bypassed_fresh_response_clears_stale_predictor() {
     let plugin = default_plugin();
 
