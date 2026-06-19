@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use ferrum_edge::_test_support::request_deduplication_redis_cached_response_payload_is_valid;
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
@@ -1058,8 +1059,8 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
         "/api".to_string(),
     );
     assert!(
-        plugin.should_buffer_request_body(&keyless_without_declared_body),
-        "applicable body-capable requests must prebuffer before an earlier plugin can add the key"
+        !plugin.should_buffer_request_body(&keyless_without_declared_body),
+        "keyless optional requests must not lose streaming semantics"
     );
 
     let mut keyless_declared_body = RequestContext::new(
@@ -1070,7 +1071,20 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
     keyless_declared_body
         .headers
         .insert("content-length".to_string(), "7".to_string());
-    assert!(plugin.should_buffer_request_body(&keyless_declared_body));
+    assert!(
+        !plugin.should_buffer_request_body(&keyless_declared_body),
+        "keyless optional requests must not be rejected by body buffering limits before this plugin ignores them"
+    );
+
+    let required_keyless = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let required_plugin = make_plugin(json!({
+        "enforce_required": true
+    }));
+    assert!(required_plugin.should_buffer_request_body(&required_keyless));
 
     let mut keyed_get = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -1082,12 +1096,14 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
 }
 
 #[tokio::test]
-async fn test_transformed_idempotency_header_can_fingerprint_prebuffered_body() {
+async fn test_keyed_idempotency_header_can_fingerprint_prebuffered_body() {
     let plugin = make_plugin(json!({}));
 
     let mut ctx = body_ctx("POST", "/api", b"{\"a\":1}");
     ctx.headers
         .insert("content-length".to_string(), "7".to_string());
+    ctx.headers
+        .insert("idempotency-key".to_string(), "transformed-key".to_string());
     assert!(
         plugin.should_buffer_request_body(&ctx),
         "declared-body applicable requests must prebuffer before earlier plugins can add the key"
@@ -1100,17 +1116,21 @@ async fn test_transformed_idempotency_header_can_fingerprint_prebuffered_body() 
 }
 
 #[tokio::test]
-async fn test_transformed_idempotency_header_buffers_implicit_http2_body() {
+async fn test_keyed_idempotency_header_buffers_implicit_http2_body() {
     let plugin = make_plugin(json!({}));
 
-    let ctx = RequestContext::new(
+    let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/api".to_string(),
     );
+    ctx.headers.insert(
+        "idempotency-key".to_string(),
+        "implicit-body-key".to_string(),
+    );
     assert!(
         plugin.should_buffer_request_body(&ctx),
-        "HTTP/2 and HTTP/3 POST bodies may arrive without length or transfer headers"
+        "keyed HTTP/2 and HTTP/3 POST bodies may arrive without length or transfer headers"
     );
 }
 
@@ -1239,7 +1259,7 @@ async fn test_reused_key_different_route_affecting_header_returns_409() {
 }
 
 #[tokio::test]
-async fn test_reused_key_different_client_trace_headers_conflicts() {
+async fn test_reused_key_different_client_trace_headers_replays() {
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -1268,7 +1288,7 @@ async fn test_reused_key_different_client_trace_headers_conflicts() {
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
-    assert_fingerprint_conflict(result);
+    assert!(matches!(result, PluginResult::RejectBinary { .. }));
 }
 
 #[tokio::test]
@@ -1324,6 +1344,33 @@ async fn test_unscoped_credentials_remain_in_fingerprint() {
     second_ctx.authenticated_identity = Some("consumer-1".to_string());
     let mut second_headers = keyed_headers("unscoped-credential-key", "api.example", 11);
     second_headers.insert("authorization".to_string(), "Bearer new-token".to_string());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert_fingerprint_conflict(result);
+}
+
+#[tokio::test]
+async fn test_anonymous_credentials_remain_in_fingerprint() {
+    let plugin = make_plugin(json!({}));
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("anonymous-credential-key", "api.example", 11);
+    first_headers.insert("authorization".to_string(), "Bearer old-token".to_string());
+    first_headers.insert("cookie".to_string(), "session=old".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("anonymous-credential-key", "api.example", 11);
+    second_headers.insert("authorization".to_string(), "Bearer new-token".to_string());
+    second_headers.insert("cookie".to_string(), "session=new".to_string());
 
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
@@ -1534,6 +1581,13 @@ async fn test_declared_body_unavailable_rejects_fingerprinting() {
         }
         other => panic!("Expected body-unavailable reject, got {other:?}"),
     }
+}
+
+#[test]
+fn test_legacy_redis_cached_response_without_fingerprint_is_rejected() {
+    let legacy = br#"{"status_code":201,"headers":{},"body":[]}"#;
+
+    assert!(!request_deduplication_redis_cached_response_payload_is_valid(legacy));
 }
 
 #[tokio::test]

@@ -86,6 +86,11 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    // ── plugins/request_deduplication ─────────────────────────────────────────
+    pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
+        crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)
+    }
+
     // ── plugins/soap_ws_security ────────────────────────────────────────────
     pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)

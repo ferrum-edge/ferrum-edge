@@ -77,6 +77,13 @@ const SCOPED_CREDENTIAL_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "x-goog-api-key",
     "x-forwarded-authorization",
 ];
+const SYNTHETIC_FINGERPRINT_EXCLUSIONS: &[&str] = &[
+    "traceparent",
+    "tracestate",
+    "x-request-id",
+    "x-correlation-id",
+    "correlation-id",
+];
 
 /// Monotonic seconds since process start. Immune to wall-clock steps, matching
 /// the `Instant`-based entry expiry.
@@ -327,8 +334,10 @@ impl RequestDeduplication {
             "query",
             ctx.raw_query_string().unwrap_or("").as_bytes(),
         );
+        let exclude_scoped_credentials =
+            self.scope_by_consumer && ctx.effective_identity().is_some();
         for (header_name, value) in
-            request_headers_for_fingerprint(headers, &self.header_name, self.scope_by_consumer)
+            request_headers_for_fingerprint(headers, &self.header_name, exclude_scoped_credentials)
         {
             hash_framed(&mut hasher, "header_name", header_name.as_bytes());
             hash_framed(&mut hasher, "header_value", value.as_bytes());
@@ -878,7 +887,7 @@ fn canonical_authority(headers: &HashMap<String, String>) -> String {
 fn request_headers_for_fingerprint<'a>(
     headers: &'a HashMap<String, String>,
     idempotency_header: &str,
-    scope_by_consumer: bool,
+    exclude_scoped_credentials: bool,
 ) -> Vec<(String, &'a str)> {
     let mut values = Vec::new();
     for (name, value) in headers {
@@ -889,7 +898,10 @@ fn request_headers_for_fingerprint<'a>(
             || HOP_BY_HOP_FINGERPRINT_EXCLUSIONS
                 .iter()
                 .any(|excluded| normalized == *excluded)
-            || (scope_by_consumer
+            || SYNTHETIC_FINGERPRINT_EXCLUSIONS
+                .iter()
+                .any(|excluded| normalized == *excluded)
+            || (exclude_scoped_credentials
                 && SCOPED_CREDENTIAL_FINGERPRINT_EXCLUSIONS
                     .iter()
                     .any(|excluded| normalized == *excluded))
@@ -997,6 +1009,10 @@ fn request_body_digest(
         hash_framed(&mut hasher, "content_encoding", encoding.trim().as_bytes());
     }
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+}
+
+pub(crate) fn redis_cached_response_payload_is_valid_for_test(data: &[u8]) -> bool {
+    serde_json::from_slice::<SerializableCachedResponse>(data).is_ok()
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
@@ -1164,6 +1180,8 @@ impl Plugin for RequestDeduplication {
             .iter()
             .any(|method| method.eq_ignore_ascii_case(&ctx.method))
             && crate::proxy::request_may_have_body(&ctx.method, &ctx.headers)
+            && (self.enforce_required
+                || header_value_case_insensitive(&ctx.headers, &self.header_name).is_some())
     }
 
     async fn before_proxy(
@@ -1423,17 +1441,5 @@ impl Plugin for RequestDeduplication {
 
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.local_cache.len())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SerializableCachedResponse;
-
-    #[test]
-    fn legacy_redis_cached_response_without_fingerprint_is_rejected() {
-        let legacy = br#"{"status_code":201,"headers":{},"body":[]}"#;
-
-        assert!(serde_json::from_slice::<SerializableCachedResponse>(legacy).is_err());
     }
 }
