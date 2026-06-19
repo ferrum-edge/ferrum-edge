@@ -332,10 +332,17 @@ impl<'a> ValidationPipeline<'a> {
                             &plugin_config.plugin_name,
                             &plugin_config.config,
                         ) {
-                            errors.push(format!(
+                            let message = format!(
                                 "Plugin '{}' (id={}): {}",
                                 plugin_config.plugin_name, plugin_config.id, err
-                            ));
+                            );
+                            if crate::plugins::plugin_failure_policy(&plugin_config.plugin_name)
+                                == Some(crate::plugins::PluginFailurePolicy::OptionalFailOpen)
+                            {
+                                warn!("Optional plugin config validation warning: {}", message);
+                            } else {
+                                errors.push(message);
+                            }
                         }
                     }
                     if !errors.is_empty() {

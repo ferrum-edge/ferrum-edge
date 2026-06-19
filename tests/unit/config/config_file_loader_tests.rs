@@ -824,6 +824,37 @@ plugin_configs:
 }
 
 #[test]
+fn test_optional_fail_open_plugin_validation_is_non_fatal_in_file_mode() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs:
+  - id: "plugin-optional-bad-config"
+    plugin_name: "stdout_logging"
+    config: "not-an-object"
+    scope: global
+    enabled: true
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
+    )
+    .expect("optional fail-open plugin config errors must not reject file-mode config load");
+
+    assert_eq!(config.plugin_configs.len(), 1);
+    assert_eq!(
+        config.plugin_configs[0].id,
+        "plugin-optional-bad-config"
+    );
+    assert_eq!(config.plugin_configs[0].plugin_name, "stdout_logging");
+}
+
+#[test]
 fn test_plugin_config_proxy_scope() {
     let yaml = r#"
 version: "1"

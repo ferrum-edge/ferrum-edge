@@ -330,6 +330,14 @@ fn test_builtin_plugin_registrations_are_unique_and_policy_backed() {
     assert!(saw_fail_closed);
     assert!(saw_keep_last_known_good);
     assert!(saw_optional_fail_open);
+    assert_eq!(
+        plugin_failure_policy("api_chargeback"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
+    assert_eq!(
+        plugin_failure_policy("api_chargeback_sink"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
 }
 
 #[test]
