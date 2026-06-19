@@ -1067,7 +1067,7 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
     keyless_declared_body
         .headers
         .insert("content-length".to_string(), "7".to_string());
-    assert!(!plugin.should_buffer_request_body(&keyless_declared_body));
+    assert!(plugin.should_buffer_request_body(&keyless_declared_body));
 
     let mut keyed_get = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -1076,6 +1076,24 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
     );
     keyed_get.headers = keyed_headers("body-key", "api.example", 0);
     assert!(!plugin.should_buffer_request_body(&keyed_get));
+}
+
+#[tokio::test]
+async fn test_transformed_idempotency_header_can_fingerprint_prebuffered_body() {
+    let plugin = make_plugin(json!({}));
+
+    let mut ctx = body_ctx("POST", "/api", b"{\"a\":1}");
+    ctx.headers
+        .insert("content-length".to_string(), "7".to_string());
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "declared-body applicable requests must prebuffer before earlier plugins can add the key"
+    );
+
+    let mut headers = keyed_headers("transformed-key", "api.example", 7);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key(DEDUP_FINGERPRINT_METADATA));
 }
 
 #[tokio::test]
@@ -1124,6 +1142,22 @@ async fn test_reused_key_different_authority_returns_409() {
     let mut first_headers = keyed_headers("authority-key", "api.example", 11);
     let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
     let mut second_headers = keyed_headers("authority-key", "other.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_authority_case_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("authority-case-key", "API.example", 11);
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("authority-case-key", "api.example", 11);
 
     assert_reused_key_for_different_request_conflicts(
         &mut first_ctx,
@@ -1220,7 +1254,7 @@ async fn test_reused_key_different_synthetic_headers_replays() {
 }
 
 #[tokio::test]
-async fn test_reused_key_different_connection_listed_header_replays() {
+async fn test_reused_key_different_connection_listed_header_returns_409() {
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -1243,7 +1277,7 @@ async fn test_reused_key_different_connection_listed_header_replays() {
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
-    assert!(matches!(result, PluginResult::RejectBinary { .. }));
+    assert_fingerprint_conflict(result);
 }
 
 #[tokio::test]
@@ -1299,6 +1333,54 @@ async fn test_reused_key_equivalent_gzip_body_replays() {
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
     assert!(matches!(result, PluginResult::RejectBinary { .. }));
+}
+
+#[tokio::test]
+async fn test_unsupported_content_encoding_stays_in_fingerprint() {
+    let plugin = make_plugin(json!({}));
+    let body = b"same wire bytes";
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", body);
+    let mut first_headers = keyed_headers("unsupported-encoding-key", "api.example", body.len());
+    first_headers.insert("content-encoding".to_string(), "deflate".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", body);
+    let mut second_headers = keyed_headers("unsupported-encoding-key", "api.example", body.len());
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert_fingerprint_conflict(result);
+}
+
+#[tokio::test]
+async fn test_malformed_supported_content_encoding_stays_in_fingerprint() {
+    let plugin = make_plugin(json!({}));
+    let body = b"not actually gzip";
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", body);
+    let mut first_headers = keyed_headers("malformed-encoding-key", "api.example", body.len());
+    first_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", body);
+    let mut second_headers = keyed_headers("malformed-encoding-key", "api.example", body.len());
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert_fingerprint_conflict(result);
 }
 
 #[tokio::test]

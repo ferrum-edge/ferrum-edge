@@ -868,7 +868,7 @@ fn header_value_case_insensitive<'a>(
 fn canonical_authority(headers: &HashMap<String, String>) -> String {
     header_value_case_insensitive(headers, ":authority")
         .or_else(|| header_value_case_insensitive(headers, "host"))
-        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| value.trim().to_string())
         .unwrap_or_default()
 }
 
@@ -877,7 +877,6 @@ fn request_headers_for_fingerprint<'a>(
     idempotency_header: &str,
 ) -> Vec<(String, &'a str)> {
     let mut values = Vec::new();
-    let connection_listed = crate::proxy::headers::parse_connection_listed_from_str_map(headers);
     for (name, value) in headers {
         let normalized = name.to_ascii_lowercase();
         if normalized == ":authority"
@@ -889,9 +888,6 @@ fn request_headers_for_fingerprint<'a>(
             || SYNTHETIC_FINGERPRINT_EXCLUSIONS
                 .iter()
                 .any(|excluded| normalized == *excluded)
-            || connection_listed
-                .iter()
-                .any(|listed| normalized == listed.as_str())
         {
             continue;
         }
@@ -950,11 +946,15 @@ fn read_decoded_body_with_limit(reader: &mut dyn Read, algo_name: &str) -> Resul
 fn canonical_body_for_fingerprint<'a>(
     headers: &HashMap<String, String>,
     body: &'a [u8],
-) -> Cow<'a, [u8]> {
-    let Some(encoding) = header_value_case_insensitive(headers, "content-encoding")
-        .and_then(supported_fingerprint_body_encoding)
-    else {
-        return Cow::Borrowed(body);
+) -> (Cow<'a, [u8]>, Option<String>) {
+    let Some(content_encoding) = header_value_case_insensitive(headers, "content-encoding") else {
+        return (Cow::Borrowed(body), None);
+    };
+    let Some(encoding) = supported_fingerprint_body_encoding(content_encoding) else {
+        return (
+            Cow::Borrowed(body),
+            Some(content_encoding.trim().to_string()),
+        );
     };
 
     let decoded = match encoding {
@@ -966,10 +966,21 @@ fn canonical_body_for_fingerprint<'a>(
             let mut decoder = brotli::Decompressor::new(body, 4096);
             read_decoded_body_with_limit(&mut decoder, "brotli")
         }
-        _ => return Cow::Borrowed(body),
+        _ => {
+            return (
+                Cow::Borrowed(body),
+                Some(content_encoding.trim().to_string()),
+            );
+        }
     };
 
-    decoded.map(Cow::Owned).unwrap_or(Cow::Borrowed(body))
+    match decoded {
+        Ok(decoded) => (Cow::Owned(decoded), None),
+        Err(_) => (
+            Cow::Borrowed(body),
+            Some(content_encoding.trim().to_string()),
+        ),
+    }
 }
 
 fn request_body_digest(
@@ -991,9 +1002,12 @@ fn request_body_digest(
         None => &[],
     };
 
-    let body = canonical_body_for_fingerprint(headers, body);
+    let (body, uncached_encoding) = canonical_body_for_fingerprint(headers, body);
     let mut hasher = Sha256::new();
     hasher.update(body.as_ref());
+    if let Some(encoding) = uncached_encoding {
+        hash_framed(&mut hasher, "content_encoding", encoding.as_bytes());
+    }
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
@@ -1161,7 +1175,8 @@ impl Plugin for RequestDeduplication {
         self.applicable_methods
             .iter()
             .any(|method| method.eq_ignore_ascii_case(&ctx.method))
-            && header_value_case_insensitive(&ctx.headers, &self.header_name).is_some()
+            && (header_value_case_insensitive(&ctx.headers, &self.header_name).is_some()
+                || request_declares_body(&ctx.headers))
     }
 
     async fn before_proxy(

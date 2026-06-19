@@ -551,6 +551,59 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Create a one-off connection manager that is not stored in the shared hot-path cache.
+    ///
+    /// Redis transactions that rely on connection-local state (`WATCH`/`MULTI`/`EXEC`)
+    /// must not share the cached multiplexed manager with unrelated concurrent commands,
+    /// because another command sequence on that same manager can interleave `UNWATCH` or
+    /// `EXEC` and break the optimistic transaction boundary.
+    async fn get_dedicated_connection(&self) -> Option<redis::aio::ConnectionManager> {
+        let url = self.resolve_url().await;
+        let client = match self.build_client(&url) {
+            Ok(client) => client,
+            Err(e) => {
+                warn!(
+                    redis_url = %self.config.url,
+                    error = %e,
+                    "Failed to create dedicated Redis client"
+                );
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                return None;
+            }
+        };
+
+        let connect_timeout = Duration::from_secs(self.config.connect_timeout_seconds);
+        match tokio::time::timeout(connect_timeout, redis::aio::ConnectionManager::new(client))
+            .await
+        {
+            Ok(Ok(manager)) => {
+                self.available.store(true, Ordering::Relaxed);
+                Some(manager)
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    redis_url = %self.config.url,
+                    error = %e,
+                    "Failed to connect dedicated Redis client"
+                );
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                None
+            }
+            Err(_) => {
+                warn!(
+                    redis_url = %self.config.url,
+                    timeout_seconds = self.config.connect_timeout_seconds,
+                    "Timed out connecting dedicated Redis client"
+                );
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                None
+            }
+        }
+    }
+
     /// Clear the cached connection so the next `get_connection()` call
     /// re-resolves DNS and creates a fresh connection.
     fn clear_connection(&self) {
@@ -968,7 +1021,7 @@ impl RedisRateLimitClient {
     /// RESP-compatible Redis backends that do not support scripting can still
     /// use ownership-token lock release.
     pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
-        let mut conn = self.get_connection().await.ok_or(())?;
+        let mut conn = self.get_dedicated_connection().await.ok_or(())?;
 
         let watch_result: Result<(), redis::RedisError> =
             redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
