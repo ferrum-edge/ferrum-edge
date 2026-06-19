@@ -2167,11 +2167,12 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `redis_password` | String (optional) | — | Redis password |
 
 **Behavior:**
-- Logical idempotency keys are scoped by proxy, authenticated identity when `scope_by_consumer: true`, and the idempotency header value. The stored key is a framed SHA-256 digest, not a delimiter-joined raw string
-- Request fingerprints bind the logical key to the HTTP method, authority/host, exact path, raw query string, selected representation headers (`Content-Type`, `Content-Encoding`, `Content-Language`), and a SHA-256 request-body digest. Raw request bodies, credentials, cookies, identities, and idempotency values are not stored in keys or fingerprints
+- Logical idempotency keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when `scope_by_consumer: true`, and the idempotency header value. The stored key is a framed SHA-256 digest, not a delimiter-joined raw string
+- Request fingerprints bind the logical key to the HTTP method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and a SHA-256 request-body digest. Raw request bodies, credentials, cookies, identities, and idempotency values are not stored in keys or fingerprints
 - On cache hit with the same fingerprint: returns the cached response with `X-Idempotent-Replayed: true` header
 - Reusing the same logical idempotency key for a different fingerprint returns `409 Conflict`
 - Concurrent duplicates with the same fingerprint return `409 Conflict` while the first request is still in-flight
+- Applicable methods with a declared body are buffered before `before_proxy`, even if the idempotency header is not present yet, so earlier header-transform plugins can add the key without making the body unavailable for fingerprinting
 - If a request declares a body but the body bytes are unavailable for fingerprinting, the request is rejected with 400 instead of being deduplicated unsafely
 - Stale in-flight markers (request died after `before_proxy` but before `on_final_response_body` — e.g., backend timeout, downstream plugin reject, dropped connection) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
 - LRU eviction under `max_entries` pressure only evicts completed entries. Active (non-stale) in-flight markers are never evicted — evicting a live marker would release the in-flight lock while the original request is still executing. As a result, `max_entries` can be temporarily exceeded if the cache is saturated with active in-flight work; correctness is preferred over the memory cap

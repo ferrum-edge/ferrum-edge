@@ -53,7 +53,15 @@ const DEDUP_KEY_METADATA: &str = "_dedup_key";
 const DEDUP_FINGERPRINT_METADATA: &str = "_dedup_fingerprint";
 const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v2";
 const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
-const FINGERPRINT_HEADERS: &[&str] = &["content-type", "content-encoding", "content-language"];
+const HOP_BY_HOP_FINGERPRINT_EXCLUSIONS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
 /// Monotonic seconds since process start. Immune to wall-clock steps, matching
 /// the `Instant`-based entry expiry.
@@ -252,6 +260,9 @@ impl RequestDeduplication {
         {
             hash_framed(&mut hasher, "principal", identity.as_bytes());
         }
+        if let Some(peer_spiffe_id) = ctx.peer_spiffe_id.as_ref() {
+            hash_framed(&mut hasher, "peer_spiffe_id", peer_spiffe_id.as_str().as_bytes());
+        }
         hash_framed(&mut hasher, "idempotency_key", idempotency_value.as_bytes());
 
         let mut key = String::with_capacity(67);
@@ -283,11 +294,9 @@ impl RequestDeduplication {
             "query",
             ctx.raw_query_string().unwrap_or("").as_bytes(),
         );
-        for header_name in FINGERPRINT_HEADERS {
-            if let Some(value) = header_value_case_insensitive(headers, header_name) {
-                hash_framed(&mut hasher, "header_name", header_name.as_bytes());
-                hash_framed(&mut hasher, "header_value", value.as_bytes());
-            }
+        for (header_name, value) in request_headers_for_fingerprint(headers, &self.header_name) {
+            hash_framed(&mut hasher, "header_name", header_name.as_bytes());
+            hash_framed(&mut hasher, "header_value", value.as_bytes());
         }
         let body_digest = request_body_digest(ctx, headers)?;
         hash_framed(&mut hasher, "body_digest", body_digest.as_bytes());
@@ -715,6 +724,32 @@ fn canonical_authority(headers: &HashMap<String, String>) -> String {
         .unwrap_or_default()
 }
 
+fn request_headers_for_fingerprint<'a>(
+    headers: &'a HashMap<String, String>,
+    idempotency_header: &str,
+) -> Vec<(String, &'a str)> {
+    let mut values = Vec::new();
+    for (name, value) in headers {
+        let normalized = name.to_ascii_lowercase();
+        if normalized == ":authority"
+            || normalized == "host"
+            || normalized.eq_ignore_ascii_case(idempotency_header)
+            || HOP_BY_HOP_FINGERPRINT_EXCLUSIONS
+                .iter()
+                .any(|excluded| normalized == *excluded)
+        {
+            continue;
+        }
+        values.push((normalized, value.as_str()));
+    }
+    values.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(right.1))
+    });
+    values
+}
+
 fn request_declares_body(headers: &HashMap<String, String>) -> bool {
     if header_value_case_insensitive(headers, "transfer-encoding").is_some() {
         return true;
@@ -918,7 +953,8 @@ impl Plugin for RequestDeduplication {
         self.applicable_methods
             .iter()
             .any(|method| method.eq_ignore_ascii_case(&ctx.method))
-            && header_value_case_insensitive(&ctx.headers, &self.header_name).is_some()
+            && (header_value_case_insensitive(&ctx.headers, &self.header_name).is_some()
+                || request_declares_body(&ctx.headers))
     }
 
     async fn before_proxy(

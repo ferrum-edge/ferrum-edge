@@ -15313,7 +15313,7 @@ components:
 
     RequestDeduplicationConfig:
       type: object
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by proxy, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, selected representation headers, and request-body digest. Reusing a logical idempotency key for a different fingerprint returns 409. Supports centralized Redis-backed mode for cross-instance deduplication; Redis values include the fingerprint and are not backward-compatible with pre-fingerprint values."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. Supports centralized Redis-backed mode for cross-instance deduplication; Redis values include the fingerprint and are not backward-compatible with pre-fingerprint values."
       properties:
         header_name:
           type: string

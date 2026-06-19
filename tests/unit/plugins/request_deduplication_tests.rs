@@ -1042,12 +1042,22 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
     keyed_post.headers = keyed_headers("body-key", "api.example", 7);
     assert!(plugin.should_buffer_request_body(&keyed_post));
 
-    let keyless_post = RequestContext::new(
+    let keyless_without_declared_body = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/api".to_string(),
     );
-    assert!(!plugin.should_buffer_request_body(&keyless_post));
+    assert!(!plugin.should_buffer_request_body(&keyless_without_declared_body));
+
+    let mut keyless_declared_body = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    keyless_declared_body
+        .headers
+        .insert("content-length".to_string(), "7".to_string());
+    assert!(plugin.should_buffer_request_body(&keyless_declared_body));
 
     let mut keyed_get = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -1056,6 +1066,27 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
     );
     keyed_get.headers = keyed_headers("body-key", "api.example", 0);
     assert!(!plugin.should_buffer_request_body(&keyed_get));
+}
+
+#[tokio::test]
+async fn test_generated_key_after_buffer_decision_can_fingerprint_declared_body() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/orders".to_string(),
+    );
+    ctx.headers
+        .insert("content-length".to_string(), "2".to_string());
+    assert!(plugin.should_buffer_request_body(&ctx));
+
+    ctx.request_body_bytes = Some(Bytes::from_static(b"{}"));
+    let mut headers = ctx.headers.clone();
+    headers.insert("idempotency-key".to_string(), "generated-key".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key(DEDUP_KEY_METADATA));
 }
 
 #[tokio::test]
@@ -1149,6 +1180,24 @@ async fn test_reused_key_different_raw_query_returns_409() {
 }
 
 #[tokio::test]
+async fn test_reused_key_different_route_affecting_header_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("route-header-key", "api.example", 11);
+    first_headers.insert("x-canary".to_string(), "blue".to_string());
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("route-header-key", "api.example", 11);
+    second_headers.insert("x-canary".to_string(), "green".to_string());
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_reused_key_different_body_returns_409() {
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
     let mut first_headers = keyed_headers("body-key", "api.example", 11);
@@ -1210,6 +1259,35 @@ async fn test_delimiter_containing_identities_and_keys_do_not_collide() {
     assert!(!key1.contains("alice"));
     assert!(!key1.contains("key"));
     assert!(!key2.contains("tenant"));
+}
+
+#[tokio::test]
+async fn test_peer_spiffe_id_scopes_logical_key() {
+    let plugin = make_plugin(json!({}));
+
+    let mut ctx1 = body_ctx("POST", "/api/orders", b"{}");
+    ctx1.peer_spiffe_id = Some(
+        ferrum_edge::identity::SpiffeId::new("spiffe://mesh.local/ns/blue/sa/default")
+            .expect("valid SPIFFE ID"),
+    );
+    let mut headers1 = keyed_headers("mesh-key", "api.example", 2);
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut ctx2 = body_ctx("POST", "/api/orders", b"{}");
+    ctx2.peer_spiffe_id = Some(
+        ferrum_edge::identity::SpiffeId::new("spiffe://mesh.local/ns/green/sa/default")
+            .expect("valid SPIFFE ID"),
+    );
+    let mut headers2 = keyed_headers("mesh-key", "api.example", 2);
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let key1 = ctx1.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    let key2 = ctx2.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    assert_ne!(key1, key2);
+    assert!(!key1.contains("blue"));
+    assert!(!key2.contains("green"));
 }
 
 #[tokio::test]
