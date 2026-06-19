@@ -209,6 +209,7 @@ export FERRUM_ADMIN_TLS_KEY_PATH="/prod/certs/admin.key"
 ```
 
 > **Tip**: Setting port to `0` prevents the listener from binding at all, which is more secure than relying on a firewall to block the port. The gateway logs `FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled` and `FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled` at startup to confirm.
+> In database and file modes, the same disable behavior applies to `FERRUM_PROXY_HTTPS_PORT=0` and `FERRUM_ADMIN_HTTPS_PORT=0` when TLS material is configured.
 
 ## Use Cases
 

@@ -13,6 +13,7 @@
 //! write endpoints — when the DB is unreachable, the admin API becomes temporarily
 //! read-only and returns 503 on mutations.
 
+use anyhow::Context;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use chrono::{DateTime, Utc};
+use tokio::task::JoinHandle;
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
@@ -29,9 +31,30 @@ use crate::config::config_backup::load_config_backup;
 use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::dns::{DnsCache, DnsConfig};
+use crate::modes::file::{
+    ListenerJoinHandle, await_fallible_listener_handles, join_background_handles,
+};
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
+
+async fn shutdown_database_runtime_tasks(
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    proxy_state: &ProxyState,
+    listener_handles: Vec<(String, ListenerJoinHandle)>,
+    mut background_handles: Vec<JoinHandle<()>>,
+) -> Result<(), anyhow::Error> {
+    let _ = shutdown_tx.send(true);
+    let listener_result = if listener_handles.is_empty() {
+        Ok(())
+    } else {
+        await_fallible_listener_handles(listener_handles, || {}).await
+    };
+    proxy_state.stream_listener_manager.shutdown_all().await;
+    background_handles.extend(proxy_state.health_checker.take_active_check_handles());
+    join_background_handles(background_handles, Duration::from_secs(5)).await;
+    listener_result
+}
 
 pub async fn run(
     env_config: EnvConfig,
@@ -407,6 +430,27 @@ pub async fn run(
     let acme_renewal_handle =
         crate::modes::start_acme_renewal_scheduler(&env_config, shutdown_tx.subscribe());
 
+    let mut background_handles: Vec<JoinHandle<()>> = vec![
+        dns_handle,
+        overload_handle,
+        metrics_handle,
+        runtime_system_handle,
+        runtime_window_handle,
+    ];
+    if let Some(h) = dns_retry_handle {
+        background_handles.push(h);
+    }
+    if let Some(h) = per_ip_cleanup_handle {
+        background_handles.push(h);
+    }
+    if let Some(h) = db_tls_reload_handle {
+        background_handles.push(h);
+    }
+    if let Some(h) = acme_renewal_handle {
+        background_handles.push(h);
+    }
+    background_handles.extend(health_check_handles);
+
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
         &env_config.frontend_tls_cert_path,
@@ -445,8 +489,21 @@ pub async fn run(
                 Some(config)
             }
             Err(e) => {
+                let startup_err = anyhow::anyhow!("Invalid TLS configuration: {}", e);
                 error!("TLS configuration validation failed: {}", e);
-                return Err(anyhow::anyhow!("Invalid TLS configuration: {}", e));
+                if let Err(listener_err) = shutdown_database_runtime_tasks(
+                    &shutdown_tx,
+                    &proxy_state,
+                    Vec::new(),
+                    background_handles,
+                )
+                .await
+                {
+                    return Err(
+                        listener_err.context(format!("Gateway startup failed: {startup_err}"))
+                    );
+                }
+                return Err(startup_err);
             }
         }
     } else {
@@ -461,7 +518,7 @@ pub async fn run(
     // is set, a background watcher polls cert/key files and atomically swaps
     // the slot on validated changes; the HTTPS / H2 / H3 listeners read from
     // the slot on every new handshake.
-    let proxy_frontend_reload_handles = tls_config.as_ref().map(|cfg| {
+    let mut proxy_frontend_reload_handles = tls_config.as_ref().map(|cfg| {
         crate::modes::tls_reload::prepare_proxy_frontend_tls(
             cfg.clone(),
             &env_config,
@@ -477,6 +534,11 @@ pub async fn run(
             interval_secs = env_config.frontend_tls_watch_interval_seconds,
             "Frontend TLS live reload enabled for proxy HTTPS (H1/H2) and HTTP/3"
         );
+    }
+    if let Some(handles) = proxy_frontend_reload_handles.as_mut()
+        && let Some(handle) = handles.watcher_handle.take()
+    {
+        background_handles.push(handle);
     }
 
     // Set TLS config on stream listener manager for TCP proxies with frontend_tls.
@@ -494,18 +556,43 @@ pub async fn run(
     if let (Some(cert_path), Some(key_path)) =
         (&env_config.dtls_cert_path, &env_config.dtls_key_path)
     {
-        // Check DTLS certificate expiration
-        tls::check_cert_expiry(
+        if let Err(e) = tls::check_cert_expiry(
             cert_path,
             "DTLS frontend cert",
             env_config.tls_cert_expiry_warning_days,
-        )?;
-        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path {
-            tls::check_cert_expiry(
+        ) {
+            let startup_err = e.context("Invalid DTLS frontend cert");
+            if let Err(listener_err) = shutdown_database_runtime_tasks(
+                &shutdown_tx,
+                &proxy_state,
+                Vec::new(),
+                background_handles,
+            )
+            .await
+            {
+                return Err(listener_err.context(format!("Gateway startup failed: {startup_err}")));
+            }
+            return Err(startup_err);
+        }
+        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path
+            && let Err(e) = tls::check_cert_expiry(
                 ca_path,
                 "DTLS client CA cert",
                 env_config.tls_cert_expiry_warning_days,
-            )?;
+            )
+        {
+            let startup_err = e.context("Invalid DTLS client CA cert");
+            if let Err(listener_err) = shutdown_database_runtime_tasks(
+                &shutdown_tx,
+                &proxy_state,
+                Vec::new(),
+                background_handles,
+            )
+            .await
+            {
+                return Err(listener_err.context(format!("Gateway startup failed: {startup_err}")));
+            }
+            return Err(startup_err);
         }
         proxy_state
             .stream_listener_manager
@@ -518,7 +605,7 @@ pub async fn run(
     }
 
     // Start separate listeners for HTTP and HTTPS
-    let mut handles = Vec::new();
+    let mut handles: Vec<(String, ListenerJoinHandle)> = Vec::new();
     let mut startup_signals = Vec::new();
 
     // HTTP listener (disabled when port is 0)
@@ -529,7 +616,7 @@ pub async fn run(
         let (http_started_tx, http_started_rx) = tokio::sync::oneshot::channel();
         let http_handle = tokio::spawn(async move {
             info!("Starting HTTP proxy listener on {}", http_addr);
-            if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
+            proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
                 http_state,
                 http_shutdown,
@@ -537,11 +624,9 @@ pub async fn run(
                 Some(http_started_tx),
             )
             .await
-            {
-                error!("HTTP proxy listener error: {}", e);
-            }
+            .context("HTTP proxy listener failed")
         });
-        handles.push(http_handle);
+        handles.push(("HTTP proxy listener".to_string(), http_handle));
         startup_signals.push(("HTTP proxy listener".to_string(), http_started_rx));
     } else {
         info!("FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled");
@@ -549,40 +634,42 @@ pub async fn run(
 
     // HTTPS listener (only if TLS is configured)
     if let Some(tls_config) = tls_config.clone() {
-        let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
-        let https_state = proxy_state.clone();
-        let https_shutdown = shutdown_tx.subscribe();
-        let (https_started_tx, https_started_rx) = tokio::sync::oneshot::channel();
-        let reload_slot = proxy_frontend_reload_handles
-            .as_ref()
-            .and_then(|h| h.slot.clone());
-        let https_handle = tokio::spawn(async move {
-            info!("Starting HTTPS proxy listener on {}", https_addr);
-            let result = if let Some(slot) = reload_slot {
-                proxy::start_proxy_listener_with_dynamic_tls_and_signal(
-                    https_addr,
-                    https_state,
-                    https_shutdown,
-                    slot,
-                    Some(https_started_tx),
-                )
-                .await
-            } else {
-                proxy::start_proxy_listener_with_tls_and_signal(
-                    https_addr,
-                    https_state,
-                    https_shutdown,
-                    Some(tls_config),
-                    Some(https_started_tx),
-                )
-                .await
-            };
-            if let Err(e) = result {
-                error!("HTTPS proxy listener error: {}", e);
-            }
-        });
-        handles.push(https_handle);
-        startup_signals.push(("HTTPS proxy listener".to_string(), https_started_rx));
+        if env_config.proxy_https_port == 0 {
+            info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTPS proxy listener disabled");
+        } else {
+            let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
+            let https_state = proxy_state.clone();
+            let https_shutdown = shutdown_tx.subscribe();
+            let (https_started_tx, https_started_rx) = tokio::sync::oneshot::channel();
+            let reload_slot = proxy_frontend_reload_handles
+                .as_ref()
+                .and_then(|h| h.slot.clone());
+            let https_handle = tokio::spawn(async move {
+                info!("Starting HTTPS proxy listener on {}", https_addr);
+                let result = if let Some(slot) = reload_slot {
+                    proxy::start_proxy_listener_with_dynamic_tls_and_signal(
+                        https_addr,
+                        https_state,
+                        https_shutdown,
+                        slot,
+                        Some(https_started_tx),
+                    )
+                    .await
+                } else {
+                    proxy::start_proxy_listener_with_tls_and_signal(
+                        https_addr,
+                        https_state,
+                        https_shutdown,
+                        Some(tls_config),
+                        Some(https_started_tx),
+                    )
+                    .await
+                };
+                result.context("HTTPS proxy listener failed")
+            });
+            handles.push(("HTTPS proxy listener".to_string(), https_handle));
+            startup_signals.push(("HTTPS proxy listener".to_string(), https_started_rx));
+        }
     } else {
         info!("TLS not configured - HTTPS listener disabled");
     }
@@ -590,55 +677,74 @@ pub async fn run(
     // HTTP/3 (QUIC) listener (only if enabled and TLS is configured)
     if env_config.enable_http3 {
         if let Some(tls_config) = tls_config.clone() {
-            let h3_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
-            let h3_state = proxy_state.clone();
-            let h3_shutdown = shutdown_tx.subscribe();
-            let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
-            let h3_tls_policy = tls_policy.clone();
-            let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
-            let h3_client_crls = crls.clone();
-            let (h3_started_tx, h3_started_rx) = tokio::sync::oneshot::channel();
-            let h3_reload = crate::modes::tls_reload::build_h3_frontend_tls_reload(
-                proxy_frontend_reload_handles.as_ref(),
-            );
-            let h3_handle = tokio::spawn(async move {
-                info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
-                if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
-                    h3_addr,
-                    h3_state,
-                    h3_shutdown,
-                    tls_config,
-                    h3_config,
-                    &h3_tls_policy,
-                    crate::http3::server::Http3ListenerOptions {
-                        client_ca_bundle_path: h3_client_ca,
-                        client_crls: h3_client_crls,
-                        started_tx: Some(h3_started_tx),
-                        frontend_tls_reload: h3_reload,
-                    },
-                )
-                .await
-                {
-                    error!("HTTP/3 proxy listener error: {}", e);
-                }
-            });
-            handles.push(h3_handle);
-            startup_signals.push(("HTTP/3 proxy listener".to_string(), h3_started_rx));
+            if env_config.proxy_https_port == 0 {
+                info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTP/3 proxy listener disabled");
+            } else {
+                let h3_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
+                let h3_state = proxy_state.clone();
+                let h3_shutdown = shutdown_tx.subscribe();
+                let h3_config =
+                    crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
+                let h3_tls_policy = tls_policy.clone();
+                let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
+                let h3_client_crls = crls.clone();
+                let (h3_started_tx, h3_started_rx) = tokio::sync::oneshot::channel();
+                let h3_reload = crate::modes::tls_reload::build_h3_frontend_tls_reload(
+                    proxy_frontend_reload_handles.as_ref(),
+                );
+                let h3_handle = tokio::spawn(async move {
+                    info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
+                    crate::http3::server::start_http3_listener_with_signal(
+                        h3_addr,
+                        h3_state,
+                        h3_shutdown,
+                        tls_config,
+                        h3_config,
+                        &h3_tls_policy,
+                        crate::http3::server::Http3ListenerOptions {
+                            client_ca_bundle_path: h3_client_ca,
+                            client_crls: h3_client_crls,
+                            started_tx: Some(h3_started_tx),
+                            frontend_tls_reload: h3_reload,
+                        },
+                    )
+                    .await
+                    .context("HTTP/3 proxy listener failed")
+                });
+                handles.push(("HTTP/3 proxy listener".to_string(), h3_handle));
+                startup_signals.push(("HTTP/3 proxy listener".to_string(), h3_started_rx));
+            }
         } else {
             error!("HTTP/3 requires TLS configuration - HTTP/3 listener disabled");
         }
     }
 
-    if env_config.proxy_http_port == 0 && tls_config.is_none() {
+    if env_config.proxy_http_port == 0 && (tls_config.is_none() || env_config.proxy_https_port == 0)
+    {
         warn!(
-            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and no TLS configured. Only stream proxies (TCP/UDP) will serve traffic."
+            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and HTTPS is not configured or disabled. Only stream proxies (TCP/UDP) will serve traffic."
         );
     }
 
     // Start separate listeners for Admin API (HTTP and HTTPS)
     let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
-    let jwt_manager = create_jwt_manager_from_env()
-        .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?;
+    let jwt_manager = match create_jwt_manager_from_env() {
+        Ok(jwt_manager) => jwt_manager,
+        Err(e) => {
+            let startup_err = anyhow::anyhow!("Failed to create JWT manager: {}", e);
+            if let Err(listener_err) = shutdown_database_runtime_tasks(
+                &shutdown_tx,
+                &proxy_state,
+                handles,
+                background_handles,
+            )
+            .await
+            {
+                return Err(listener_err.context(format!("Gateway startup failed: {startup_err}")));
+            }
+            return Err(startup_err);
+        }
+    };
 
     // Shared flag: DB polling loop sets this to false when the database is
     // unreachable, causing the admin API to reject writes early and preserve
@@ -681,15 +787,21 @@ pub async fn run(
 
     // Admin HTTP listener (disabled when port is 0)
     if env_config.admin_http_port != 0 {
+        let (admin_started_tx, admin_started_rx) = tokio::sync::oneshot::channel();
         let admin_http_handle = tokio::spawn(async move {
             info!("Starting Admin HTTP listener on {}", admin_http_addr);
-            if let Err(e) =
-                admin::start_admin_listener(admin_http_addr, admin_state, admin_shutdown).await
-            {
-                error!("Admin HTTP listener error: {}", e);
-            }
+            admin::start_admin_listener_with_tls_and_signal(
+                admin_http_addr,
+                admin_state,
+                admin_shutdown,
+                None,
+                Some(admin_started_tx),
+            )
+            .await
+            .context("Admin HTTP listener failed")
         });
-        handles.push(admin_http_handle);
+        handles.push(("Admin HTTP listener".to_string(), admin_http_handle));
+        startup_signals.push(("Admin HTTP listener".to_string(), admin_started_rx));
     } else {
         info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
     }
@@ -699,98 +811,143 @@ pub async fn run(
         &env_config.admin_tls_cert_path,
         &env_config.admin_tls_key_path,
     ) {
-        let admin_https_addr: SocketAddr =
-            env_config.admin_socket_addr(env_config.admin_https_port);
-        let admin_https_shutdown = shutdown_tx.subscribe();
+        if env_config.admin_https_port == 0 {
+            info!("FERRUM_ADMIN_HTTPS_PORT=0 — admin HTTPS listener disabled");
+        } else {
+            let admin_https_addr: SocketAddr =
+                env_config.admin_socket_addr(env_config.admin_https_port);
+            let admin_https_shutdown = shutdown_tx.subscribe();
 
-        // Load admin TLS configuration
-        let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
-            admin_cert_path,
-            admin_key_path,
-            admin_client_ca_bundle,
-            env_config.admin_tls_ocsp_response_source.as_deref(),
-            env_config.admin_tls_no_verify,
-            &tls_policy,
-            env_config.tls_cert_expiry_warning_days,
-            &crls,
-        ) {
-            Ok(config) => {
-                if admin_client_ca_bundle.is_some() {
-                    info!(
-                        "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
-                    );
-                } else if env_config.admin_tls_no_verify {
-                    warn!(
-                        "Admin TLS configuration loaded with certificate verification DISABLED (testing mode)"
-                    );
-                } else {
-                    info!(
-                        "Admin TLS configuration loaded without client certificate verification (HTTPS available)"
-                    );
+            // Load admin TLS configuration
+            let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
+            let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
+                admin_cert_path,
+                admin_key_path,
+                admin_client_ca_bundle,
+                env_config.admin_tls_ocsp_response_source.as_deref(),
+                env_config.admin_tls_no_verify,
+                &tls_policy,
+                env_config.tls_cert_expiry_warning_days,
+                &crls,
+            ) {
+                Ok(config) => {
+                    if admin_client_ca_bundle.is_some() {
+                        info!(
+                            "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
+                        );
+                    } else if env_config.admin_tls_no_verify {
+                        warn!(
+                            "Admin TLS configuration loaded with certificate verification DISABLED (testing mode)"
+                        );
+                    } else {
+                        info!(
+                            "Admin TLS configuration loaded without client certificate verification (HTTPS available)"
+                        );
+                    }
+                    config
                 }
-                config
-            }
-            Err(e) => {
-                error!("Failed to load admin TLS configuration: {}", e);
-                return Err(anyhow::anyhow!("Invalid admin TLS configuration: {}", e));
-            }
-        };
-
-        // Wire opt-in admin frontend TLS live reload (no early-data / no
-        // kTLS — admin doesn't apply those opt-ins).
-        let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
-            admin_tls_config.clone(),
-            &env_config,
-            &tls_policy,
-            &crls,
-            Some(shutdown_tx.subscribe()),
-        );
-        if admin_reload_handles.watcher_handle.is_some() {
-            info!("Frontend TLS live reload enabled for admin HTTPS");
-        }
-        let admin_tls_slot = admin_reload_handles.slot.clone();
-
-        let admin_https_handle = tokio::spawn(async move {
-            info!("Starting Admin HTTPS listener on {}", admin_https_addr);
-            let result = if let Some(slot) = admin_tls_slot {
-                admin::start_admin_listener_with_dynamic_tls(
-                    admin_https_addr,
-                    admin_state_for_https,
-                    admin_https_shutdown,
-                    slot,
-                )
-                .await
-            } else {
-                admin::start_admin_listener_with_tls(
-                    admin_https_addr,
-                    admin_state_for_https,
-                    admin_https_shutdown,
-                    Some(admin_tls_config),
-                )
-                .await
+                Err(e) => {
+                    let startup_err = anyhow::anyhow!("Invalid admin TLS configuration: {}", e);
+                    error!("Failed to load admin TLS configuration: {}", e);
+                    if let Err(listener_err) = shutdown_database_runtime_tasks(
+                        &shutdown_tx,
+                        &proxy_state,
+                        handles,
+                        background_handles,
+                    )
+                    .await
+                    {
+                        return Err(
+                            listener_err.context(format!("Gateway startup failed: {startup_err}"))
+                        );
+                    }
+                    return Err(startup_err);
+                }
             };
-            if let Err(e) = result {
-                error!("Admin HTTPS listener error: {}", e);
+
+            // Wire opt-in admin frontend TLS live reload (no early-data / no
+            // kTLS — admin doesn't apply those opt-ins).
+            let mut admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
+                admin_tls_config.clone(),
+                &env_config,
+                &tls_policy,
+                &crls,
+                Some(shutdown_tx.subscribe()),
+            );
+            if admin_reload_handles.watcher_handle.is_some() {
+                info!("Frontend TLS live reload enabled for admin HTTPS");
             }
-        });
-        handles.push(admin_https_handle);
+            if let Some(handle) = admin_reload_handles.watcher_handle.take() {
+                background_handles.push(handle);
+            }
+            let admin_tls_slot = admin_reload_handles.slot.clone();
+
+            let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
+            let admin_https_handle = tokio::spawn(async move {
+                info!("Starting Admin HTTPS listener on {}", admin_https_addr);
+                let result = if let Some(slot) = admin_tls_slot {
+                    admin::start_admin_listener_with_dynamic_tls_and_signal(
+                        admin_https_addr,
+                        admin_state_for_https,
+                        admin_https_shutdown,
+                        slot,
+                        Some(admin_https_started_tx),
+                    )
+                    .await
+                } else {
+                    admin::start_admin_listener_with_tls_and_signal(
+                        admin_https_addr,
+                        admin_state_for_https,
+                        admin_https_shutdown,
+                        Some(admin_tls_config),
+                        Some(admin_https_started_tx),
+                    )
+                    .await
+                };
+                result.context("Admin HTTPS listener failed")
+            });
+            handles.push(("Admin HTTPS listener".to_string(), admin_https_handle));
+            startup_signals.push(("Admin HTTPS listener".to_string(), admin_https_started_rx));
+        }
     } else {
         info!("Admin TLS not configured - HTTPS listener disabled");
     }
-    if env_config.admin_http_port == 0 && env_config.admin_tls_cert_path.is_none() {
+    if env_config.admin_http_port == 0
+        && !(env_config.admin_tls_cert_path.is_some()
+            && env_config.admin_tls_key_path.is_some()
+            && env_config.admin_https_port != 0)
+    {
         warn!(
-            "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and no admin TLS configured. The admin API is unreachable."
+            "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and admin HTTPS is not configured or disabled. The admin API is unreachable."
         );
     }
 
     // Start stream proxy listeners (TCP/UDP) — bind failures are fatal in database mode.
-    proxy_state.initial_reconcile_stream_listeners().await?;
-    wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
-    proxy_state
-        .stream_listener_manager
-        .wait_until_started(Duration::from_secs(10))
-        .await?;
+    let startup_result: Result<(), anyhow::Error> = async {
+        proxy_state.initial_reconcile_stream_listeners().await?;
+        wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
+        proxy_state
+            .stream_listener_manager
+            .wait_until_started(Duration::from_secs(10))
+            .await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = startup_result {
+        warn!(
+            "Gateway startup failed after spawning listener / background tasks: {}; \
+             draining spawned tasks before returning",
+            e
+        );
+        if let Err(listener_err) =
+            shutdown_database_runtime_tasks(&shutdown_tx, &proxy_state, handles, background_handles)
+                .await
+        {
+            return Err(listener_err.context(format!("Gateway startup failed: {e}")));
+        }
+        return Err(e);
+    }
 
     // Mark the gateway as ready to serve traffic. At this point:
     //   - Initial full config was loaded from DB (or backup)
@@ -1174,22 +1331,26 @@ pub async fn run(
             }
         }
     });
+    background_handles.push(db_poll_handle);
 
     // Wait for all listeners to complete (these exit when the shutdown signal fires).
     // If no listener handles were spawned (e.g., all plaintext ports disabled and no
     // TLS configured), block on the shutdown signal so stream proxies keep running.
-    if handles.is_empty() {
+    let listener_result = if handles.is_empty() {
         let mut wait_shutdown = shutdown_tx.subscribe();
         while !*wait_shutdown.borrow() {
             if wait_shutdown.changed().await.is_err() {
                 break;
             }
         }
+        Ok(())
     } else {
-        for handle in handles {
-            handle.await?;
-        }
-    }
+        let shutdown_tx_on_failure = shutdown_tx.clone();
+        await_fallible_listener_handles(handles, move || {
+            let _ = shutdown_tx_on_failure.send(true);
+        })
+        .await
+    };
 
     // Stop accepting new TCP/UDP/DTLS stream connections. The accept loops
     // also observe the global shutdown receiver wired above and will already
@@ -1214,37 +1375,10 @@ pub async fn run(
     // shutdown watch channel via `tokio::select!` (see `start_with_shutdown`)
     // so they exit cleanly within the 5s cap rather than racing the
     // `Drop for HealthChecker` abort that fires at process exit.
-    let mut health_check_handles = health_check_handles;
-    health_check_handles.extend(proxy_state.health_checker.take_active_check_handles());
-    let bg_drain = async {
-        let _ = dns_handle.await;
-        if let Some(h) = dns_retry_handle {
-            let _ = h.await;
-        }
-        let _ = db_poll_handle.await;
-        let _ = overload_handle.await;
-        let _ = metrics_handle.await;
-        let _ = runtime_system_handle.await;
-        let _ = runtime_window_handle.await;
-        if let Some(h) = per_ip_cleanup_handle {
-            let _ = h.await;
-        }
-        if let Some(h) = db_tls_reload_handle {
-            let _ = h.await;
-        }
-        if let Some(h) = acme_renewal_handle {
-            let _ = h.await;
-        }
-        for h in health_check_handles {
-            let _ = h.await;
-        }
-    };
-    if tokio::time::timeout(Duration::from_secs(5), bg_drain)
-        .await
-        .is_err()
-    {
-        warn!("Background tasks did not drain within 5s, proceeding with shutdown");
-    }
+    background_handles.extend(proxy_state.health_checker.take_active_check_handles());
+    join_background_handles(background_handles, Duration::from_secs(5)).await;
+
+    listener_result?;
 
     Ok(())
 }

@@ -115,7 +115,7 @@ use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::backend::BackendTlsConfigBuilder;
 use crate::tls::source::{CertSource, MaterialKind};
 use crate::util::http_headers::{
-    cache_control_has_directive, headers_have_cache_control_directive,
+    cache_control_has_directive, headers_have_cache_control_directive, headers_have_strong_etag,
 };
 
 use self::backend_capabilities::{
@@ -170,11 +170,23 @@ pub(crate) const RANGE_RESPONSE_METADATA_KEY: &str = "ferrum:range_response";
 /// or renames `Cache-Control` before compression's own `after_proxy` hook.
 pub(crate) const NO_TRANSFORM_RESPONSE_METADATA_KEY: &str = "ferrum:no_transform_response";
 
+/// Marker recorded in `ctx.metadata` when the ORIGINAL backend response carried
+/// a strong `ETag`, captured before any `after_proxy` hook can mutate response
+/// headers. Compression reads this to avoid returning transformed bytes with
+/// the origin's strong validator.
+pub(crate) const STRONG_ETAG_RESPONSE_METADATA_KEY: &str = "ferrum:strong_etag_response";
+
 /// Transient marker set while running `after_proxy` hooks when a later hook may
 /// add `Cache-Control: no-transform`. Compression reads this before committing
 /// `Content-Encoding`, then `run_after_proxy_hooks` clears it before returning.
 pub(crate) const LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY: &str =
     "ferrum:later_no_transform_response";
+
+/// Transient marker set while running `after_proxy` hooks when a later hook may
+/// add a strong `ETag`. Compression reads this before committing
+/// `Content-Encoding`, then `run_after_proxy_hooks` clears it before returning.
+pub(crate) const LATER_STRONG_ETAG_RESPONSE_METADATA_KEY: &str =
+    "ferrum:later_strong_etag_response";
 
 /// Marker recorded in `ctx.metadata` when the ORIGINAL client request carried
 /// `Cache-Control: no-transform`, captured before any `before_proxy` hook can
@@ -207,6 +219,12 @@ pub(crate) fn stamp_original_response_metadata(
     if headers_have_cache_control_directive(response_headers, "no-transform") {
         ctx.metadata.insert(
             NO_TRANSFORM_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+    if headers_have_strong_etag(response_headers) {
+        ctx.metadata.insert(
+            STRONG_ETAG_RESPONSE_METADATA_KEY.to_string(),
             "true".to_string(),
         );
     }
@@ -926,21 +944,33 @@ pub(crate) fn should_stream_response_body(
     }
 }
 
-fn simulated_after_proxy_headers_have_cache_control_no_transform(
+#[derive(Debug, Default)]
+struct LaterHeaderSimulation {
+    cache_control_no_transform: bool,
+    strong_etag: bool,
+}
+
+fn simulate_later_after_proxy_headers(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
     response_headers: &HashMap<String, String>,
-) -> bool {
-    let mut exact_builtin_may_add = false;
+) -> LaterHeaderSimulation {
+    let mut exact_builtin_may_add_no_transform = false;
+    let mut exact_builtin_may_add_strong_etag = false;
     for plugin in plugins {
         if !is_builtin_plugin_name(plugin.name()) {
-            return true;
+            return LaterHeaderSimulation {
+                cache_control_no_transform: true,
+                strong_etag: true,
+            };
         }
-        exact_builtin_may_add |=
+        exact_builtin_may_add_no_transform |=
             plugin.may_add_response_cache_control_no_transform(ctx, response_headers);
+        exact_builtin_may_add_strong_etag |=
+            plugin.may_add_response_strong_etag(ctx, response_headers);
     }
-    if !exact_builtin_may_add {
-        return false;
+    if !exact_builtin_may_add_no_transform && !exact_builtin_may_add_strong_etag {
+        return LaterHeaderSimulation::default();
     }
 
     let mut simulated_ctx = ctx.clone();
@@ -948,7 +978,13 @@ fn simulated_after_proxy_headers_have_cache_control_no_transform(
     for plugin in plugins {
         plugin.simulate_after_proxy_response_headers(&mut simulated_ctx, &mut simulated_headers);
     }
-    headers_have_cache_control_directive(&simulated_headers, "no-transform")
+    LaterHeaderSimulation {
+        cache_control_no_transform: headers_have_cache_control_directive(
+            &simulated_headers,
+            "no-transform",
+        ),
+        strong_etag: headers_have_strong_etag(&simulated_headers),
+    }
 }
 
 /// Refine the pre-flight `stream_response` decision once the backend response
@@ -1001,22 +1037,27 @@ pub(crate) fn refine_stream_response_for_content_type(
         plugins.iter().enumerate().all(|(index, plugin)| {
             let can_release = if plugin.should_buffer_response_body(&simulated_ctx) {
                 saw_active_buffering_plugin = true;
-                let later_may_add_no_transform =
-                    simulated_after_proxy_headers_have_cache_control_no_transform(
-                        &plugins[index + 1..],
-                        &simulated_ctx,
-                        &simulated_response_headers,
-                    );
+                let later_headers = simulate_later_after_proxy_headers(
+                    &plugins[index + 1..],
+                    &simulated_ctx,
+                    &simulated_response_headers,
+                );
                 plugin.should_release_response_body_before_content_type_rewrite(
                     &simulated_ctx,
                     response_status,
                     &simulated_response_headers,
-                ) || (later_may_add_no_transform
+                ) || (later_headers.cache_control_no_transform
                     && plugin.should_release_response_body_for_later_no_transform(
                         &simulated_ctx,
                         response_status,
                         &simulated_response_headers,
                     ))
+                    || (later_headers.strong_etag
+                        && plugin.should_release_response_body_for_later_strong_etag(
+                            &simulated_ctx,
+                            response_status,
+                            &simulated_response_headers,
+                        ))
             } else {
                 true
             };
@@ -10917,19 +10958,33 @@ pub(crate) async fn run_after_proxy_hooks(
 ) -> Option<AfterProxyReject> {
     for (index, plugin) in plugins.iter().enumerate() {
         if plugin.needs_later_response_cache_control_no_transform()
-            && simulated_after_proxy_headers_have_cache_control_no_transform(
-                &plugins[index + 1..],
-                ctx,
-                response_headers,
-            )
+            || plugin.needs_later_response_strong_etag()
         {
-            ctx.metadata.insert(
-                LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY.to_string(),
-                "true".to_string(),
-            );
+            let later_headers =
+                simulate_later_after_proxy_headers(&plugins[index + 1..], ctx, response_headers);
+            if plugin.needs_later_response_cache_control_no_transform()
+                && later_headers.cache_control_no_transform
+            {
+                ctx.metadata.insert(
+                    LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                );
+            } else {
+                ctx.metadata
+                    .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
+            }
+            if plugin.needs_later_response_strong_etag() && later_headers.strong_etag {
+                ctx.metadata.insert(
+                    LATER_STRONG_ETAG_RESPONSE_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                );
+            } else {
+                ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
+            }
         } else {
             ctx.metadata
                 .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
+            ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
         }
 
         match plugin
@@ -10951,6 +11006,7 @@ pub(crate) async fn run_after_proxy_hooks(
                 );
                 ctx.metadata
                     .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
+                ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
                 apply_after_proxy_hooks_to_rejection(plugins, ctx, status_code, &mut headers).await;
                 return Some(AfterProxyReject {
                     status_code,
@@ -10963,6 +11019,7 @@ pub(crate) async fn run_after_proxy_hooks(
 
     ctx.metadata
         .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
+    ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
     None
 }
 
@@ -22513,6 +22570,8 @@ mod tests {
 
     struct CustomNoTransformHeaderPlugin;
 
+    struct CustomStrongEtagHeaderPlugin;
+
     #[async_trait]
     impl Plugin for ResponseBufferPlugin {
         fn name(&self) -> &str {
@@ -22600,6 +22659,23 @@ mod tests {
             response_headers: &mut HashMap<String, String>,
         ) -> PluginResult {
             response_headers.insert("cache-control".to_string(), "no-transform".to_string());
+            PluginResult::Continue
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for CustomStrongEtagHeaderPlugin {
+        fn name(&self) -> &str {
+            "custom_strong_etag_header"
+        }
+
+        async fn after_proxy(
+            &self,
+            _ctx: &mut RequestContext,
+            _response_status: u16,
+            response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            response_headers.insert("etag".to_string(), "\"custom\"".to_string());
             PluginResult::Continue
         }
     }
@@ -22847,6 +22923,129 @@ mod tests {
             "compression must not commit an encoding before an unknown later hook"
         );
         assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    }
+
+    #[tokio::test]
+    async fn run_after_proxy_hooks_prevents_compression_before_late_strong_etag_header() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(
+                CompressionPlugin::new(&json!({"min_content_length": 10, "algorithms": ["gzip"]}))
+                    .unwrap(),
+            ),
+            Arc::new(
+                SecurityHeaders::new(&json!({
+                    "set": {"ETag": "\"late\""}
+                }))
+                .unwrap(),
+            ),
+        ];
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/body".into());
+        ctx.headers
+            .insert("accept-encoding".to_string(), "gzip".to_string());
+        let mut response_headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-length".to_string(), "5000".to_string()),
+        ]);
+
+        let reject = run_after_proxy_hooks(&plugins, &mut ctx, 200, &mut response_headers).await;
+
+        assert!(reject.is_none());
+        assert_eq!(
+            response_headers.get("etag").map(String::as_str),
+            Some("\"late\"")
+        );
+        assert!(
+            !response_headers.contains_key("content-encoding"),
+            "compression must not commit an encoding before a later strong ETag hook"
+        );
+        assert!(!ctx.metadata.contains_key("compression:algorithm"));
+        assert!(
+            !ctx.metadata
+                .contains_key(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_after_proxy_hooks_treats_custom_late_strong_etag_hooks_conservatively() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(
+                CompressionPlugin::new(&json!({"min_content_length": 10, "algorithms": ["gzip"]}))
+                    .unwrap(),
+            ),
+            Arc::new(CustomStrongEtagHeaderPlugin),
+        ];
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/body".into());
+        ctx.headers
+            .insert("accept-encoding".to_string(), "gzip".to_string());
+        let mut response_headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-length".to_string(), "5000".to_string()),
+        ]);
+
+        let reject = run_after_proxy_hooks(&plugins, &mut ctx, 200, &mut response_headers).await;
+
+        assert!(reject.is_none());
+        assert_eq!(
+            response_headers.get("etag").map(String::as_str),
+            Some("\"custom\"")
+        );
+        assert!(
+            !response_headers.contains_key("content-encoding"),
+            "compression must not commit an encoding before an unknown later strong ETag hook"
+        );
+        assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    }
+
+    #[tokio::test]
+    async fn run_after_proxy_hooks_simulates_later_strong_etag_headers_cumulatively() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(
+                CompressionPlugin::new(&json!({"min_content_length": 10, "algorithms": ["gzip"]}))
+                    .unwrap(),
+            ),
+            Arc::new(
+                crate::plugins::response_transformer::ResponseTransformer::new(&json!({
+                    "rules": [{
+                        "operation": "remove",
+                        "target": "header",
+                        "key": "ETag"
+                    }]
+                }))
+                .expect("response transformer config should be valid"),
+            ),
+            Arc::new(
+                SecurityHeaders::new(&json!({
+                    "override_existing": false,
+                    "set": {"ETag": "\"late\""}
+                }))
+                .unwrap(),
+            ),
+        ];
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/body".into());
+        ctx.headers
+            .insert("accept-encoding".to_string(), "gzip".to_string());
+        let mut response_headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-length".to_string(), "5000".to_string()),
+            ("etag".to_string(), "W/\"weak\"".to_string()),
+        ]);
+
+        let reject = run_after_proxy_hooks(&plugins, &mut ctx, 200, &mut response_headers).await;
+
+        assert!(reject.is_none());
+        assert_eq!(
+            response_headers.get("etag").map(String::as_str),
+            Some("\"late\"")
+        );
+        assert!(
+            !response_headers.contains_key("content-encoding"),
+            "compression must not commit before cumulative later hooks add a strong ETag"
+        );
+        assert!(!ctx.metadata.contains_key("compression:algorithm"));
+        assert!(
+            !ctx.metadata
+                .contains_key(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY)
+        );
     }
 
     #[tokio::test]
@@ -24807,6 +25006,79 @@ mod tests {
             Some(&compression_ctx),
             200,
             &cacheable_json_headers,
+        ));
+
+        let strong_etag_headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("etag".to_string(), "\"abc123\"".to_string()),
+        ]);
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &compression_relabel_plugins,
+            Some(&compression_ctx),
+            200,
+            &strong_etag_headers,
+        ));
+
+        let weak_etag_headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("etag".to_string(), "W/\"abc123\"".to_string()),
+        ]);
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &compression_relabel_plugins,
+            Some(&compression_ctx),
+            200,
+            &weak_etag_headers,
+        ));
+
+        let late_strong_etag_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(CompressionPlugin::new(&json!({})).unwrap()),
+            Arc::new(
+                SecurityHeaders::new(&json!({
+                    "set": {"ETag": "\"late\""}
+                }))
+                .expect("security headers config should be valid"),
+            ),
+        ];
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &late_strong_etag_plugins,
+            Some(&compression_ctx),
+            200,
+            &json_headers,
+        ));
+
+        let cumulative_late_strong_etag_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(CompressionPlugin::new(&json!({})).unwrap()),
+            Arc::new(
+                crate::plugins::response_transformer::ResponseTransformer::new(&json!({
+                    "rules": [{
+                        "operation": "remove",
+                        "target": "header",
+                        "key": "ETag"
+                    }]
+                }))
+                .expect("response transformer config should be valid"),
+            ),
+            Arc::new(
+                SecurityHeaders::new(&json!({
+                    "override_existing": false,
+                    "set": {"ETag": "\"late\""}
+                }))
+                .expect("security headers config should be valid"),
+            ),
+        ];
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &cumulative_late_strong_etag_plugins,
+            Some(&compression_ctx),
+            200,
+            &weak_etag_headers,
         ));
 
         let inspected_late_no_transform_plugins: Vec<Arc<dyn Plugin>> = vec![

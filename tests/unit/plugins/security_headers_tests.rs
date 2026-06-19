@@ -99,6 +99,35 @@ fn may_add_no_transform_reports_conservative_capability() {
     assert!(remove_then_set.may_add_response_cache_control_no_transform(&ctx, &headers));
 }
 
+#[test]
+fn may_add_strong_etag_reports_conservative_capability() {
+    let headers = HashMap::from([("etag".to_string(), "W/\"weak\"".to_string())]);
+    let ctx = ctx();
+    let strong = SecurityHeaders::new(&json!({
+        "set": { "ETag": "\"strong\"" }
+    }))
+    .unwrap();
+    assert!(strong.may_add_response_strong_etag(&ctx, &headers));
+
+    let weak = SecurityHeaders::new(&json!({
+        "set": { "ETag": "W/\"weak\"" }
+    }))
+    .unwrap();
+    assert!(!weak.may_add_response_strong_etag(&ctx, &headers));
+
+    let malformed_weak = SecurityHeaders::new(&json!({
+        "set": { "ETag": "w/\"weak\"" }
+    }))
+    .unwrap();
+    assert!(malformed_weak.may_add_response_strong_etag(&ctx, &headers));
+
+    let spaced_weak = SecurityHeaders::new(&json!({
+        "set": { "ETag": "W/ \"weak\"" }
+    }))
+    .unwrap();
+    assert!(spaced_weak.may_add_response_strong_etag(&ctx, &headers));
+}
+
 #[tokio::test]
 async fn applies_to_gateway_rejection_responses() {
     let plugin = SecurityHeaders::new(&json!({})).unwrap();

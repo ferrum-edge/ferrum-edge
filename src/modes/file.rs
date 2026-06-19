@@ -24,6 +24,7 @@
 //! `serve()` deliberately omits the SIGHUP handler — caller-driven config
 //! updates go through `proxy_state.update_config()` directly.
 
+use anyhow::Context;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -126,7 +127,7 @@ pub struct ServeHandles {
     /// Listener task handles (proxy HTTP/HTTPS/H3 + admin HTTP/HTTPS).
     /// These exit cleanly when the shutdown signal fires, so [`Self::join`]
     /// awaits them unbounded.
-    listener_handles: Vec<JoinHandle<()>>,
+    listener_handles: Vec<(String, ListenerJoinHandle)>,
     /// Background task handles (DNS refresh, overload monitor, metrics).
     /// [`Self::join`] caps the wait on these at [`BACKGROUND_DRAIN_TIMEOUT`]
     /// so a stuck task can never wedge graceful shutdown indefinitely
@@ -141,11 +142,11 @@ pub struct ServeHandles {
     ///    Without this, `join()` would return after the background-drain
     ///    timeout and `run()` would exit ~5 s after startup even though
     ///    stream proxies were still serving.
-    /// 2. **Send `true`** when one listener task panics, so the remaining
+    /// 2. **Send `true`** when one listener task fails, so the remaining
     ///    listeners observe shutdown via their own subscribers and exit
     ///    promptly. Without this, an in-flight `handle.await` for a
-    ///    still-serving listener blocks forever — the panic never bubbles
-    ///    up and the binary stays alive with one dead listener.
+    ///    still-serving listener blocks forever and the binary stays alive
+    ///    with one dead listener.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// `FERRUM_SHUTDOWN_DRAIN_SECONDS` snapshot — bound on the in-flight
     /// request drain that runs between listener exit and background-task
@@ -161,6 +162,20 @@ pub struct ServeHandles {
 /// timeout — without it, a stuck background task wedges the whole
 /// shutdown.
 const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) type ListenerTaskResult = Result<(), anyhow::Error>;
+pub(crate) type ListenerJoinHandle = JoinHandle<ListenerTaskResult>;
+
+async fn shutdown_file_background_startup_tasks(
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    proxy_state: &ProxyState,
+    mut background_handles: Vec<JoinHandle<()>>,
+) {
+    let _ = shutdown_tx.send(true);
+    proxy_state.stream_listener_manager.shutdown_all().await;
+    background_handles.extend(proxy_state.health_checker.take_active_check_handles());
+    join_background_handles(background_handles, BACKGROUND_DRAIN_TIMEOUT).await;
+}
 
 /// Resolved listener addresses returned by [`serve`].
 #[derive(Default, Clone, Debug)]
@@ -195,13 +210,12 @@ impl ServeHandles {
     ///    warning instead of wedging shutdown — without this cap a
     ///    rolling restart could hang on a single misbehaving task.
     ///
-    /// Returns the first listener-task `JoinError` if any listener panicked.
-    /// Every listener is still awaited (so `JoinError`s on later handles get
-    /// logged) and the drain phases still run, but the returned `Err`
-    /// propagates up to `run()` so the binary surfaces a panicked listener
-    /// instead of silently exiting with one listener missing — matching
-    /// the pre-refactor `handle.await?` semantics.
-    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
+    /// Returns the first listener-task error if any listener fails or panics.
+    /// Every listener is still awaited (so later errors get logged) and the
+    /// drain phases still run, but the returned `Err` propagates up to
+    /// `run()` so the binary surfaces a failed listener instead of silently
+    /// continuing with one listener missing.
+    pub async fn join(self) -> Result<(), anyhow::Error> {
         let listener_result = if self.listener_handles.is_empty() {
             // Stream-only deployment: there are no JoinHandles to await,
             // so block on the shutdown watch channel until somebody fires
@@ -217,12 +231,12 @@ impl ServeHandles {
             }
             Ok(())
         } else {
-            // Pass a closure that fires shutdown on first panic so
+            // Pass a closure that fires shutdown on first failure so
             // remaining listeners observe it and exit promptly. Without
-            // this, a panicked listener would leave the others stuck on
-            // their accept loops forever and `join()` would never return.
+            // this, a failed listener would leave the others stuck on their
+            // accept loops forever and `join()` would never return.
             let shutdown_tx = self.shutdown_tx.clone();
-            await_listener_handles(self.listener_handles, move || {
+            await_fallible_listener_handles(self.listener_handles, move || {
                 let _ = shutdown_tx.send(true);
             })
             .await
@@ -261,12 +275,10 @@ impl ServeHandles {
     /// after some tasks have already been spawned: without this the
     /// spawned `JoinHandle`s drop unawaited and the underlying listener
     /// loops orphan, holding sockets across the in-process retry path
-    /// and poisoning subsequent attempts in the same process. Discards
-    /// any listener `JoinError` because the original startup error is
-    /// the more useful one to surface.
-    pub async fn shutdown_and_join(self) {
+    /// and poisoning subsequent attempts in the same process.
+    pub async fn shutdown_and_join(self) -> Result<(), anyhow::Error> {
         let _ = self.shutdown_tx.send(true);
-        let _ = self.join().await;
+        self.join().await
     }
 }
 
@@ -311,6 +323,55 @@ pub(crate) async fn await_listener_handles(
                 first_error = Some(err);
                 if let Some(trigger) = shutdown_on_panic.take() {
                     trigger();
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Await fallible listener handles concurrently. Logs every task failure and
+/// returns the first one while still draining all siblings after triggering
+/// shutdown. Used by file/database modes where listener task bodies return
+/// bind/runtime errors instead of logging and pretending to succeed.
+pub(crate) async fn await_fallible_listener_handles(
+    handles: Vec<(String, ListenerJoinHandle)>,
+    shutdown_on_failure: impl FnOnce(),
+) -> Result<(), anyhow::Error> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let mut futures: FuturesUnordered<_> = handles
+        .into_iter()
+        .map(|(name, handle)| async move { (name, handle.await) })
+        .collect();
+    let mut first_error: Option<anyhow::Error> = None;
+    let mut shutdown_on_failure = Some(shutdown_on_failure);
+    while let Some((name, result)) = futures.next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                error!("Gateway listener task '{}' failed: {}", name, err);
+                if first_error.is_none() {
+                    first_error = Some(err.context(format!("{name} failed")));
+                    if let Some(trigger) = shutdown_on_failure.take() {
+                        trigger();
+                    }
+                }
+            }
+            Err(err) => {
+                error!("Gateway listener task '{}' failed: {}", name, err);
+                if first_error.is_none() {
+                    first_error = Some(if err.is_panic() {
+                        anyhow::anyhow!("{name} panicked: {err}")
+                    } else {
+                        anyhow::anyhow!("{name} failed to join: {err}")
+                    });
+                    if let Some(trigger) = shutdown_on_failure.take() {
+                        trigger();
+                    }
                 }
             }
         }
@@ -539,7 +600,7 @@ pub async fn run(
     // SIGHUP listener exits via shutdown_rx — wait for it too with a timeout.
     let _ = tokio::time::timeout(Duration::from_secs(5), sighup_handle).await;
 
-    listener_result.map_err(|e| anyhow::anyhow!("Gateway listener task panicked: {e}"))
+    listener_result.map_err(|e| anyhow::anyhow!("Gateway listener task failed: {e}"))
 }
 
 /// In-process entry point.
@@ -720,6 +781,24 @@ pub async fn serve(
     let acme_renewal_handle =
         crate::modes::start_acme_renewal_scheduler(&env_config, shutdown_tx.subscribe());
 
+    let mut background_handles: Vec<JoinHandle<()>> = vec![
+        dns_handle,
+        overload_handle,
+        metrics_handle,
+        runtime_system_handle,
+        runtime_window_handle,
+    ];
+    if let Some(h) = dns_retry_handle {
+        background_handles.push(h);
+    }
+    if let Some(h) = per_ip_cleanup_handle {
+        background_handles.push(h);
+    }
+    if let Some(h) = acme_renewal_handle {
+        background_handles.push(h);
+    }
+    background_handles.extend(health_check_handles);
+
     // Validate frontend TLS config if provided (paths, expiry, key match).
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
         &env_config.frontend_tls_cert_path,
@@ -745,8 +824,15 @@ pub async fn serve(
                 Some(config)
             }
             Err(e) => {
+                let startup_err = anyhow::anyhow!("Invalid TLS configuration: {}", e);
                 error!("TLS configuration validation failed: {}", e);
-                return Err(anyhow::anyhow!("Invalid TLS configuration: {}", e));
+                shutdown_file_background_startup_tasks(
+                    &shutdown_tx,
+                    &proxy_state,
+                    background_handles,
+                )
+                .await;
+                return Err(startup_err);
             }
         }
     } else {
@@ -757,7 +843,7 @@ pub async fn serve(
     // rationale). File-mode listeners participate identically: live reload is
     // opt-in via FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED and disabled by
     // default.
-    let proxy_frontend_reload_handles = tls_config.as_ref().map(|cfg| {
+    let mut proxy_frontend_reload_handles = tls_config.as_ref().map(|cfg| {
         crate::modes::tls_reload::prepare_proxy_frontend_tls(
             cfg.clone(),
             &env_config,
@@ -774,6 +860,11 @@ pub async fn serve(
             "Frontend TLS live reload enabled for file-mode proxy HTTPS (H1/H2) and HTTP/3"
         );
     }
+    if let Some(handles) = proxy_frontend_reload_handles.as_mut()
+        && let Some(handle) = handles.watcher_handle.take()
+    {
+        background_handles.push(handle);
+    }
 
     if let Some(ref tls_cfg) = tls_config {
         proxy_state
@@ -785,17 +876,27 @@ pub async fn serve(
     if let (Some(cert_path), Some(key_path)) =
         (&env_config.dtls_cert_path, &env_config.dtls_key_path)
     {
-        tls::check_cert_expiry(
+        if let Err(e) = tls::check_cert_expiry(
             cert_path,
             "DTLS frontend cert",
             env_config.tls_cert_expiry_warning_days,
-        )?;
-        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path {
-            tls::check_cert_expiry(
+        ) {
+            let startup_err = e.context("Invalid DTLS frontend cert");
+            shutdown_file_background_startup_tasks(&shutdown_tx, &proxy_state, background_handles)
+                .await;
+            return Err(startup_err);
+        }
+        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path
+            && let Err(e) = tls::check_cert_expiry(
                 ca_path,
                 "DTLS client CA cert",
                 env_config.tls_cert_expiry_warning_days,
-            )?;
+            )
+        {
+            let startup_err = e.context("Invalid DTLS client CA cert");
+            shutdown_file_background_startup_tasks(&shutdown_tx, &proxy_state, background_handles)
+                .await;
+            return Err(startup_err);
         }
         proxy_state
             .stream_listener_manager
@@ -855,46 +956,15 @@ pub async fn serve(
         backend_allow_ips: env_config.backend_allow_ips.clone(),
     };
 
-    // Listener handles (proxy/admin HTTP/HTTPS/H3) — `join()` waits on
-    // these unbounded; they exit promptly on the shutdown watch channel.
-    let mut handles: Vec<JoinHandle<()>> = Vec::new();
-    let mut bound = BoundAddresses::default();
-
-    // ── Admin HTTP listener ──────────────────────────────────────────────
-    if let Some(listener) = prebound.admin_http.take() {
-        bound.admin_http = listener.local_addr().ok();
-        let st = admin_state.clone();
-        let sh = shutdown_tx.subscribe();
-        let h = tokio::spawn(async move {
-            if let Err(e) = admin::serve_admin_on_listener(listener, st, sh, None).await {
-                error!("Admin HTTP listener error: {}", e);
-            }
-        });
-        handles.push(h);
-    } else if env_config.admin_http_port != 0 {
-        let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
-        bound.admin_http = Some(admin_http_addr);
-        let st = admin_state.clone();
-        let sh = shutdown_tx.subscribe();
-        let h = tokio::spawn(async move {
-            info!("Starting admin HTTP listener on {}", admin_http_addr);
-            if let Err(e) = admin::start_admin_listener(admin_http_addr, st, sh).await {
-                error!("Admin HTTP listener error: {}", e);
-            }
-        });
-        handles.push(h);
-    } else {
-        info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
-    }
-
-    // ── Admin HTTPS listener ─────────────────────────────────────────────
-    if let (Some(admin_cert), Some(admin_key)) = (
-        &env_config.admin_tls_cert_path,
-        &env_config.admin_tls_key_path,
-    ) {
+    let admin_https_enabled = prebound.admin_https.is_some() || env_config.admin_https_port != 0;
+    let admin_tls_runtime = if admin_https_enabled
+        && let (Some(admin_cert), Some(admin_key)) = (
+            &env_config.admin_tls_cert_path,
+            &env_config.admin_tls_key_path,
+        ) {
         let admin_tls_policy = TlsPolicy::from_env_config(&env_config)?;
         let admin_client_ca = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        match tls::load_tls_config_with_client_auth_and_ocsp(
+        let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
             admin_cert,
             admin_key,
             admin_client_ca,
@@ -904,91 +974,151 @@ pub async fn serve(
             env_config.tls_cert_expiry_warning_days,
             &crls,
         ) {
-            Ok(admin_tls_config) => {
-                let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
-                    admin_tls_config.clone(),
-                    &env_config,
-                    &admin_tls_policy,
-                    &crls,
-                    Some(shutdown_tx.subscribe()),
-                );
-                if admin_reload_handles.watcher_handle.is_some() {
-                    info!("Frontend TLS live reload enabled for file-mode admin HTTPS");
-                }
-                let admin_tls_slot = admin_reload_handles.slot.clone();
-                if let Some(listener) = prebound.admin_https.take() {
-                    bound.admin_https = listener.local_addr().ok();
-                    let st = admin_state.clone();
-                    let sh = shutdown_tx.subscribe();
-                    let cfg = Some(admin_tls_config);
-                    let h = tokio::spawn(async move {
-                        if let Err(e) = admin::serve_admin_on_listener(listener, st, sh, cfg).await
-                        {
-                            error!("Admin HTTPS listener error: {}", e);
-                        }
-                    });
-                    handles.push(h);
-                } else {
-                    let admin_https_addr: SocketAddr =
-                        env_config.admin_socket_addr(env_config.admin_https_port);
-                    bound.admin_https = Some(admin_https_addr);
-                    let st = admin_state.clone();
-                    let sh = shutdown_tx.subscribe();
-                    let cfg = Some(admin_tls_config);
-                    let h = tokio::spawn(async move {
-                        info!("Starting admin HTTPS listener on {}", admin_https_addr);
-                        let result = if let Some(slot) = admin_tls_slot {
-                            admin::start_admin_listener_with_dynamic_tls(
-                                admin_https_addr,
-                                st,
-                                sh,
-                                slot,
-                            )
-                            .await
-                        } else {
-                            admin::start_admin_listener_with_tls(admin_https_addr, st, sh, cfg)
-                                .await
-                        };
-                        if let Err(e) = result {
-                            error!("Admin HTTPS listener error: {}", e);
-                        }
-                    });
-                    handles.push(h);
-                }
-            }
+            Ok(config) => config,
             Err(e) => {
-                warn!(
-                    "Admin TLS configuration failed, HTTPS admin disabled: {}",
-                    e
-                );
+                let startup_err = anyhow::anyhow!("Invalid admin TLS configuration: {}", e);
+                error!("Admin TLS configuration failed: {}", e);
+                shutdown_file_background_startup_tasks(
+                    &shutdown_tx,
+                    &proxy_state,
+                    background_handles,
+                )
+                .await;
+                return Err(startup_err);
             }
+        };
+        let mut admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
+            admin_tls_config.clone(),
+            &env_config,
+            &admin_tls_policy,
+            &crls,
+            Some(shutdown_tx.subscribe()),
+        );
+        if admin_reload_handles.watcher_handle.is_some() {
+            info!("Frontend TLS live reload enabled for file-mode admin HTTPS");
+        }
+        if let Some(handle) = admin_reload_handles.watcher_handle.take() {
+            background_handles.push(handle);
+        }
+        Some((admin_tls_config, admin_reload_handles.slot.clone()))
+    } else {
+        None
+    };
+    if !admin_https_enabled
+        && (env_config.admin_tls_cert_path.is_some() || env_config.admin_tls_key_path.is_some())
+    {
+        info!("FERRUM_ADMIN_HTTPS_PORT=0 — admin HTTPS listener disabled");
+    }
+
+    // Listener handles (proxy/admin HTTP/HTTPS/H3) — `join()` waits on
+    // these unbounded; they exit promptly on the shutdown watch channel.
+    let mut handles: Vec<(String, ListenerJoinHandle)> = Vec::new();
+    let mut bound = BoundAddresses::default();
+    let mut startup_signals = Vec::new();
+
+    // ── Admin HTTP listener ──────────────────────────────────────────────
+    if let Some(listener) = prebound.admin_http.take() {
+        bound.admin_http = listener.local_addr().ok();
+        let st = admin_state.clone();
+        let sh = shutdown_tx.subscribe();
+        let h = tokio::spawn(async move {
+            admin::serve_admin_on_listener(listener, st, sh, None)
+                .await
+                .context("Admin HTTP listener failed")
+        });
+        handles.push(("Admin HTTP listener".to_string(), h));
+    } else if env_config.admin_http_port != 0 {
+        let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
+        bound.admin_http = Some(admin_http_addr);
+        let st = admin_state.clone();
+        let sh = shutdown_tx.subscribe();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let h = tokio::spawn(async move {
+            info!("Starting admin HTTP listener on {}", admin_http_addr);
+            admin::start_admin_listener_with_tls_and_signal(
+                admin_http_addr,
+                st,
+                sh,
+                None,
+                Some(started_tx),
+            )
+            .await
+            .context("Admin HTTP listener failed")
+        });
+        handles.push(("Admin HTTP listener".to_string(), h));
+        startup_signals.push(("Admin HTTP listener".to_string(), started_rx));
+    } else {
+        info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
+    }
+
+    // ── Admin HTTPS listener ─────────────────────────────────────────────
+    if let Some((admin_tls_config, admin_tls_slot)) = admin_tls_runtime {
+        if let Some(listener) = prebound.admin_https.take() {
+            bound.admin_https = listener.local_addr().ok();
+            let st = admin_state.clone();
+            let sh = shutdown_tx.subscribe();
+            let cfg = Some(admin_tls_config);
+            let h = tokio::spawn(async move {
+                admin::serve_admin_on_listener(listener, st, sh, cfg)
+                    .await
+                    .context("Admin HTTPS listener failed")
+            });
+            handles.push(("Admin HTTPS listener".to_string(), h));
+        } else if env_config.admin_https_port != 0 {
+            let admin_https_addr: SocketAddr =
+                env_config.admin_socket_addr(env_config.admin_https_port);
+            bound.admin_https = Some(admin_https_addr);
+            let st = admin_state.clone();
+            let sh = shutdown_tx.subscribe();
+            let cfg = Some(admin_tls_config);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let h = tokio::spawn(async move {
+                info!("Starting admin HTTPS listener on {}", admin_https_addr);
+                let result = if let Some(slot) = admin_tls_slot {
+                    admin::start_admin_listener_with_dynamic_tls_and_signal(
+                        admin_https_addr,
+                        st,
+                        sh,
+                        slot,
+                        Some(started_tx),
+                    )
+                    .await
+                } else {
+                    admin::start_admin_listener_with_tls_and_signal(
+                        admin_https_addr,
+                        st,
+                        sh,
+                        cfg,
+                        Some(started_tx),
+                    )
+                    .await
+                };
+                result.context("Admin HTTPS listener failed")
+            });
+            handles.push(("Admin HTTPS listener".to_string(), h));
+            startup_signals.push(("Admin HTTPS listener".to_string(), started_rx));
+        } else {
+            info!("FERRUM_ADMIN_HTTPS_PORT=0 — admin HTTPS listener disabled");
         }
     }
-    if env_config.admin_http_port == 0
-        && env_config.admin_tls_cert_path.is_none()
-        && bound.admin_http.is_none()
-        && bound.admin_https.is_none()
+    if env_config.admin_http_port == 0 && bound.admin_http.is_none() && bound.admin_https.is_none()
     {
         warn!(
-            "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and no admin TLS configured. The admin API is unreachable."
+            "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and admin HTTPS is not configured or disabled. The admin API is unreachable."
         );
     }
 
     // ── Proxy HTTP listener ──────────────────────────────────────────────
-    let mut startup_signals = Vec::new();
-
     if let Some(listener) = prebound.proxy_http.take() {
         bound.proxy_http = listener.local_addr().ok();
         let st = proxy_state.clone();
         let sh = shutdown_tx.subscribe();
         let h = tokio::spawn(async move {
-            if let Err(e) =
-                proxy::start_proxy_listener_with_bound_listener(listener, st, sh, None).await
-            {
-                error!("HTTP proxy listener error: {}", e);
-            }
+            proxy::start_proxy_listener_with_bound_listener(listener, st, sh, None)
+                .await
+                .context("HTTP proxy listener failed")
         });
-        handles.push(h);
+        handles.push(("HTTP proxy listener".to_string(), h));
         // Pre-bound listener is already accepting — no startup signal needed.
     } else if env_config.proxy_http_port != 0 {
         let http_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_http_port);
@@ -998,7 +1128,7 @@ pub async fn serve(
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let h = tokio::spawn(async move {
             info!("Starting HTTP proxy listener on {}", http_addr);
-            if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
+            proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
                 st,
                 sh,
@@ -1006,11 +1136,9 @@ pub async fn serve(
                 Some(started_tx),
             )
             .await
-            {
-                error!("HTTP proxy listener error: {}", e);
-            }
+            .context("HTTP proxy listener failed")
         });
-        handles.push(h);
+        handles.push(("HTTP proxy listener".to_string(), h));
         startup_signals.push(("HTTP proxy listener".to_string(), started_rx));
     } else {
         info!("FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled");
@@ -1024,14 +1152,12 @@ pub async fn serve(
             let sh = shutdown_tx.subscribe();
             let cfg = Some(tls_cfg_arc.clone());
             let h = tokio::spawn(async move {
-                if let Err(e) =
-                    proxy::start_proxy_listener_with_bound_listener(listener, st, sh, cfg).await
-                {
-                    error!("HTTPS proxy listener error: {}", e);
-                }
+                proxy::start_proxy_listener_with_bound_listener(listener, st, sh, cfg)
+                    .await
+                    .context("HTTPS proxy listener failed")
             });
-            handles.push(h);
-        } else {
+            handles.push(("HTTPS proxy listener".to_string(), h));
+        } else if env_config.proxy_https_port != 0 {
             let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
             bound.proxy_https = Some(https_addr);
             let st = proxy_state.clone();
@@ -1062,12 +1188,12 @@ pub async fn serve(
                     )
                     .await
                 };
-                if let Err(e) = result {
-                    error!("HTTPS proxy listener error: {}", e);
-                }
+                result.context("HTTPS proxy listener failed")
             });
-            handles.push(h);
+            handles.push(("HTTPS proxy listener".to_string(), h));
             startup_signals.push(("HTTPS proxy listener".to_string(), started_rx));
+        } else {
+            info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTPS proxy listener disabled");
         }
     } else {
         info!("TLS not configured - HTTPS listener disabled");
@@ -1080,9 +1206,12 @@ pub async fn serve(
     // this warn during the lift; restored in PR #500's CI fix because
     // `functional_tls_only_warn_when_plaintext_disabled_and_no_tls`
     // pinpoints its absence.)
-    if env_config.proxy_http_port == 0 && tls_config.is_none() {
+    if env_config.proxy_http_port == 0
+        && (tls_config.is_none()
+            || (env_config.proxy_https_port == 0 && bound.proxy_https.is_none()))
+    {
         warn!(
-            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and no TLS configured. Only stream proxies (TCP/UDP) will serve traffic."
+            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and HTTPS is not configured or disabled. Only stream proxies (TCP/UDP) will serve traffic."
         );
     }
 
@@ -1096,75 +1225,47 @@ pub async fn serve(
     // somewhere else and clients see the protocols diverge.
     if env_config.enable_http3 {
         if let Some(tls_cfg_arc) = tls_config.clone() {
-            let h3_addr = resolve_http3_bind_addr(&env_config, bound.proxy_https);
-            let st = proxy_state.clone();
-            let sh = shutdown_tx.subscribe();
-            let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
-            let h3_tls_policy = tls_policy.clone();
-            let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
-            let h3_client_crls = crls.clone();
-            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let h3_reload = crate::modes::tls_reload::build_h3_frontend_tls_reload(
-                proxy_frontend_reload_handles.as_ref(),
-            );
-            let h = tokio::spawn(async move {
-                info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
-                if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
-                    h3_addr,
-                    st,
-                    sh,
-                    tls_cfg_arc,
-                    h3_config,
-                    &h3_tls_policy,
-                    crate::http3::server::Http3ListenerOptions {
-                        client_ca_bundle_path: h3_client_ca,
-                        client_crls: h3_client_crls,
-                        started_tx: Some(started_tx),
-                        frontend_tls_reload: h3_reload,
-                    },
-                )
-                .await
-                {
-                    error!("HTTP/3 proxy listener error: {}", e);
-                }
-            });
-            handles.push(h);
-            startup_signals.push(("HTTP/3 proxy listener".to_string(), started_rx));
+            if bound.proxy_https.is_some() || env_config.proxy_https_port != 0 {
+                let h3_addr = resolve_http3_bind_addr(&env_config, bound.proxy_https);
+                let st = proxy_state.clone();
+                let sh = shutdown_tx.subscribe();
+                let h3_config =
+                    crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
+                let h3_tls_policy = tls_policy.clone();
+                let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
+                let h3_client_crls = crls.clone();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let h3_reload = crate::modes::tls_reload::build_h3_frontend_tls_reload(
+                    proxy_frontend_reload_handles.as_ref(),
+                );
+                let h = tokio::spawn(async move {
+                    info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
+                    crate::http3::server::start_http3_listener_with_signal(
+                        h3_addr,
+                        st,
+                        sh,
+                        tls_cfg_arc,
+                        h3_config,
+                        &h3_tls_policy,
+                        crate::http3::server::Http3ListenerOptions {
+                            client_ca_bundle_path: h3_client_ca,
+                            client_crls: h3_client_crls,
+                            started_tx: Some(started_tx),
+                            frontend_tls_reload: h3_reload,
+                        },
+                    )
+                    .await
+                    .context("HTTP/3 proxy listener failed")
+                });
+                handles.push(("HTTP/3 proxy listener".to_string(), h));
+                startup_signals.push(("HTTP/3 proxy listener".to_string(), started_rx));
+            } else {
+                info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTP/3 proxy listener disabled");
+            }
         } else {
             error!("HTTP/3 requires TLS configuration - HTTP/3 listener disabled");
         }
     }
-
-    // Background-task handles tracked separately so `ServeHandles::join`
-    // can apply a hard `BACKGROUND_DRAIN_TIMEOUT` cap to them. The
-    // pre-refactor `run()` did the same with an explicit
-    // `tokio::time::timeout(Duration::from_secs(5), bg_drain)` block —
-    // mixing them in with listener handles loses that bound and lets a
-    // stuck DNS / metrics task wedge shutdown indefinitely.
-    let mut background_handles: Vec<JoinHandle<()>> = vec![
-        dns_handle,
-        overload_handle,
-        metrics_handle,
-        runtime_system_handle,
-        runtime_window_handle,
-    ];
-    if let Some(h) = dns_retry_handle {
-        background_handles.push(h);
-    }
-    if let Some(h) = per_ip_cleanup_handle {
-        background_handles.push(h);
-    }
-    if let Some(h) = acme_renewal_handle {
-        background_handles.push(h);
-    }
-    // Active-health-check probes and the passive recovery timer race
-    // their `interval.tick()` against the shutdown watch channel passed
-    // into `ProxyState::new`, so awaiting them here gives them a clean
-    // exit before `BACKGROUND_DRAIN_TIMEOUT`. Without this they'd live
-    // until `Drop for HealthChecker` aborts at process exit (after the
-    // drain window has already closed), which lets a probe mid-`http_probe`
-    // emit a misleading "unhealthy" log line right before tear-down.
-    background_handles.extend(health_check_handles);
 
     // Build `ServeHandles` BEFORE the late-startup `?` calls so that
     // failure to bind stream listeners / receive listener-started
@@ -1207,7 +1308,9 @@ pub async fn serve(
              draining spawned tasks before returning",
             e
         );
-        serve_handles.shutdown_and_join().await;
+        if let Err(listener_err) = serve_handles.shutdown_and_join().await {
+            return Err(listener_err.context(format!("Gateway startup failed: {e}")));
+        }
         return Err(e);
     }
 
@@ -1351,6 +1454,74 @@ mod tests {
         // 2 s is generous compared to the actual cost (one watch-channel
         // notification + two `changed()` wakeups). Without the shutdown
         // trigger this would block forever.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "helper should drain remaining listeners via shutdown trigger; took {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn await_fallible_listener_handles_returns_err_when_listener_returns_err() {
+        let healthy = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        let failing =
+            tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("bind failed")) });
+
+        let result = await_fallible_listener_handles(
+            vec![
+                ("healthy listener".to_string(), healthy),
+                ("failing listener".to_string(), failing),
+            ],
+            || {},
+        )
+        .await;
+        let err = result.expect_err("listener Err must propagate");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failing listener failed"),
+            "error should include listener name; got {rendered}",
+        );
+        assert!(
+            rendered.contains("bind failed"),
+            "error should include listener failure cause; got {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn await_fallible_listener_handles_signals_shutdown_so_remaining_listeners_can_exit() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let mut listener_a_rx = shutdown_tx.subscribe();
+        let listener_a = tokio::spawn(async move {
+            let _ = listener_a_rx.changed().await;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let failing =
+            tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("accept loop failed")) });
+
+        let mut listener_b_rx = shutdown_tx.subscribe();
+        let listener_b = tokio::spawn(async move {
+            let _ = listener_b_rx.changed().await;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let trigger_tx = shutdown_tx.clone();
+        let started = Instant::now();
+        let result = await_fallible_listener_handles(
+            vec![
+                ("listener a".to_string(), listener_a),
+                ("failing listener".to_string(), failing),
+                ("listener b".to_string(), listener_b),
+            ],
+            move || {
+                let _ = trigger_tx.send(true);
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("listener Err should produce an Err");
+        assert!(format!("{err:#}").contains("accept loop failed"));
         assert!(
             elapsed < Duration::from_secs(2),
             "helper should drain remaining listeners via shutdown trigger; took {elapsed:?}",

@@ -45,7 +45,7 @@ use super::utils::route_header_transform::{
     RouteHeaderTransformOp, RouteHeaderTransformRule, apply_route_header_transforms,
 };
 use super::{Plugin, PluginResult, RequestContext};
-use crate::util::http_headers::cache_control_has_directive;
+use crate::util::http_headers::{cache_control_has_directive, etag_value_is_strong};
 
 pub mod runtime_overlay;
 
@@ -129,6 +129,30 @@ impl ResponseTransformer {
                             && rule.value.as_deref().is_some_and(|value| {
                                 cache_control_has_directive(value, "no-transform")
                             })
+                    }
+                    RouteHeaderTransformOp::Remove => false,
+                })
+            })
+    }
+
+    fn static_rules_may_add_strong_etag(&self) -> bool {
+        self.header_rules.iter().any(|rule| match rule.operation {
+            HeaderOp::Add | HeaderOp::Update => {
+                rule.key == "etag" && rule.value.as_deref().is_some_and(etag_value_is_strong)
+            }
+            HeaderOp::Remove => false,
+            HeaderOp::Rename => rule.new_key.as_deref() == Some("etag"),
+        })
+    }
+
+    fn route_rules_may_add_strong_etag(ctx: &RequestContext) -> bool {
+        ctx.route_override_response_transform
+            .as_ref()
+            .is_some_and(|rules| {
+                rules.iter().any(|rule| match rule.operation {
+                    RouteHeaderTransformOp::Add | RouteHeaderTransformOp::Update => {
+                        rule.key == "etag"
+                            && rule.value.as_deref().is_some_and(etag_value_is_strong)
                     }
                     RouteHeaderTransformOp::Remove => false,
                 })
@@ -449,6 +473,16 @@ impl Plugin for ResponseTransformer {
         self.rules_enabled()
             && (self.static_rules_may_add_cache_control_no_transform()
                 || Self::route_rules_may_add_cache_control_no_transform(ctx))
+    }
+
+    fn may_add_response_strong_etag(
+        &self,
+        ctx: &RequestContext,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.rules_enabled()
+            && (self.static_rules_may_add_strong_etag()
+                || Self::route_rules_may_add_strong_etag(ctx))
     }
 
     fn simulate_after_proxy_response_headers(

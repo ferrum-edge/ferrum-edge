@@ -527,8 +527,8 @@ async fn functional_tls_only_warn_when_plaintext_disabled_and_no_tls() {
         };
 
         // The warn log is: "No HTTP or HTTPS proxy listeners are active —
-        // FERRUM_PROXY_HTTP_PORT=0 and no TLS configured. Only stream proxies
-        // (TCP/UDP) will serve traffic."
+        // FERRUM_PROXY_HTTP_PORT=0 and HTTPS is not configured or disabled.
+        // Only stream proxies (TCP/UDP) will serve traffic."
         assert!(
             out.contains("No HTTP or HTTPS proxy listeners are active")
                 && out.contains("FERRUM_PROXY_HTTP_PORT=0"),

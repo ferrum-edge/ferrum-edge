@@ -15,10 +15,9 @@
 //! The `PluginCache` pre-filters plugins per protocol at config reload time
 //! so the hot path does zero filtering.
 //!
-//! Security plugins (auth, ACL, IP restriction, WAF, and mesh policy gates)
-//! that fail config validation cause the gateway to refuse startup — they
-//! never silently degrade.
-//! Non-security plugins that fail validation are skipped with a warning.
+//! Enabled plugin configs that fail validation cause startup or config reload
+//! publication to fail; the gateway keeps the last known-good plugin cache on
+//! reload. Disabled plugin configs are not instantiated.
 
 pub mod a2a_gateway;
 pub mod access_control;
@@ -2410,6 +2409,20 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin may add a strong `ETag` response
+    /// validator in a later `after_proxy` hook.
+    ///
+    /// Compression uses this to avoid transforming a representation before a
+    /// later response-header plugin attaches a strong validator for the
+    /// untransformed bytes.
+    fn may_add_response_strong_etag(
+        &self,
+        _ctx: &RequestContext,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
     /// Applies this plugin's deterministic `after_proxy` response-header
     /// mutations to a simulated header map.
     ///
@@ -2434,6 +2447,26 @@ pub trait Plugin: Send + Sync {
     /// consumer because it must not commit `Content-Encoding` before a later
     /// hook marks the final representation `Cache-Control: no-transform`.
     fn needs_later_response_cache_control_no_transform(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin reads `ferrum:later_strong_etag_response`
+    /// from request metadata before committing response headers.
+    ///
+    /// Compression is the built-in consumer because it must not commit
+    /// `Content-Encoding` before a later hook attaches a strong `ETag`.
+    fn needs_later_response_strong_etag(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin can release response body buffering if a
+    /// later hook will add a strong `ETag`.
+    fn should_release_response_body_for_later_strong_etag(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
         false
     }
 
@@ -3236,6 +3269,7 @@ pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> 
 ///
 /// Validation failures for these plugins are fatal at startup — the gateway
 /// refuses to start rather than serving traffic without the intended security.
+#[allow(dead_code)]
 pub fn is_security_plugin(name: &str) -> bool {
     matches!(
         name,
