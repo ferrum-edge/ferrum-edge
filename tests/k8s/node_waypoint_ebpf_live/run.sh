@@ -410,6 +410,87 @@ dump_node_waypoint_registry() {
   cat "$out" >&2 || true
 }
 
+dump_node_waypoint_runtime_state() {
+  local node="$1"
+  local out="$RESULTS_DIR/node-waypoint-runtime-$node.txt"
+  mkdir -p "$RESULTS_DIR"
+  if [[ "$DOCKER_NODE_EVIDENCE" == "true" ]]; then
+    docker exec "$node" sh -eu -c '
+      echo "## host interfaces"
+      ip -o link show 2>/dev/null || true
+      echo
+      echo "## pod cgroups and process netns views"
+      find /sys/fs/cgroup -maxdepth 8 \( -name "pod*" -o -name "*pod*.slice" \) -type d 2>/dev/null |
+        sort |
+        head -n 200 |
+        while IFS= read -r cg; do
+          echo "--- cgroup $cg"
+          find "$cg" -maxdepth 3 -name cgroup.procs -type f 2>/dev/null |
+            sort |
+            while IFS= read -r procs; do
+              pids="$(tr "\n" " " < "$procs" 2>/dev/null || true)"
+              [ -n "$pids" ] || continue
+              echo "### $procs: $pids"
+              for pid in $pids; do
+                [ -d "/proc/$pid" ] || continue
+                echo "pid=$pid netns=$(readlink "/proc/$pid/ns/net" 2>/dev/null || true)"
+                net_dir="/proc/$pid/root/sys/class/net"
+                if [ -d "$net_dir" ]; then
+                  for iface in "$net_dir"/*; do
+                    [ -e "$iface/ifindex" ] || continue
+                    name="$(basename "$iface")"
+                    ifindex="$(cat "$iface/ifindex" 2>/dev/null || true)"
+                    iflink="$(cat "$iface/iflink" 2>/dev/null || true)"
+                    echo "  iface=$name ifindex=$ifindex iflink=$iflink"
+                  done
+                else
+                  echo "  missing $net_dir"
+                fi
+              done
+            done
+        done
+    ' >"$out" 2>&1 || true
+  else
+    kubectl debug "node/$node" -n default --image=busybox:1.36 --quiet -- \
+      chroot /host sh -eu -c '
+        echo "## host interfaces"
+        ip -o link show 2>/dev/null || true
+        echo
+        echo "## pod cgroups and process netns views"
+        find /sys/fs/cgroup -maxdepth 8 \( -name "pod*" -o -name "*pod*.slice" \) -type d 2>/dev/null |
+          sort |
+          head -n 200 |
+          while IFS= read -r cg; do
+            echo "--- cgroup $cg"
+            find "$cg" -maxdepth 3 -name cgroup.procs -type f 2>/dev/null |
+              sort |
+              while IFS= read -r procs; do
+                pids="$(tr "\n" " " < "$procs" 2>/dev/null || true)"
+                [ -n "$pids" ] || continue
+                echo "### $procs: $pids"
+                for pid in $pids; do
+                  [ -d "/proc/$pid" ] || continue
+                  echo "pid=$pid netns=$(readlink "/proc/$pid/ns/net" 2>/dev/null || true)"
+                  net_dir="/proc/$pid/root/sys/class/net"
+                  if [ -d "$net_dir" ]; then
+                    for iface in "$net_dir"/*; do
+                      [ -e "$iface/ifindex" ] || continue
+                      name="$(basename "$iface")"
+                      ifindex="$(cat "$iface/ifindex" 2>/dev/null || true)"
+                      iflink="$(cat "$iface/iflink" 2>/dev/null || true)"
+                      echo "  iface=$name ifindex=$ifindex iflink=$iflink"
+                    done
+                  else
+                    echo "  missing $net_dir"
+                  fi
+                done
+              done
+          done
+      ' >"$out" 2>&1 || true
+  fi
+  cat "$out" >&2 || true
+}
+
 wait_for_node_waypoint_ready_markers() {
   log "checking node-waypoint pod registry and in-netns ready markers"
   local missing_file="$RESULTS_DIR/node-waypoint-ready-missing.txt"
@@ -441,6 +522,7 @@ wait_for_node_waypoint_ready_markers() {
   collect_node_agent_metrics
   for node in "$NODE_A" "$NODE_B"; do
     dump_node_waypoint_registry "$node"
+    dump_node_waypoint_runtime_state "$node"
   done
   exit 1
 }

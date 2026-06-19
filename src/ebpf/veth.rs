@@ -50,7 +50,7 @@ pub fn discover_veth_for_pod(pod_pid: Option<u32>, cgroup_path: Option<&str>) ->
 
 #[cfg(target_os = "linux")]
 fn discover_veth_linux(pid: u32) -> Option<String> {
-    let peer = read_pod_peer_indexes(pid)?;
+    let peer = read_pod_peer_indexes_from_proc_root(pid).or_else(|| read_pod_peer_indexes(pid))?;
     resolve_iface_by_peer(peer)
 }
 
@@ -102,6 +102,18 @@ fn read_pod_peer_indexes(pid: u32) -> Option<PodPeerIndexes> {
     .join()
     .ok()
     .flatten()
+}
+
+#[cfg(target_os = "linux")]
+fn read_pod_peer_indexes_from_proc_root(pid: u32) -> Option<PodPeerIndexes> {
+    read_pod_peer_indexes_from_proc_root_at(Path::new("/proc"), pid)
+}
+
+#[cfg(target_os = "linux")]
+fn read_pod_peer_indexes_from_proc_root_at(proc_root: &Path, pid: u32) -> Option<PodPeerIndexes> {
+    read_pod_peer_indexes_from_net_class(
+        &proc_root.join(pid.to_string()).join("root/sys/class/net"),
+    )
 }
 
 /// Read the host peer interface index from the pod's network namespace sysfs.
@@ -167,16 +179,21 @@ fn resolve_iface_by_peer(peer: PodPeerIndexes) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn resolve_iface_by_peer_in_sysfs(sysfs_net: &Path, peer: PodPeerIndexes) -> Option<String> {
     let entries = std::fs::read_dir(sysfs_net).ok()?;
+    let mut ifindex_match = None;
     for entry in entries.flatten() {
         let iface_name = entry.file_name().to_string_lossy().to_string();
         let iface_path = entry.path();
-        if read_u32_from_file(&iface_path.join("ifindex")) == Some(peer.host_ifindex)
-            && read_u32_from_file(&iface_path.join("iflink")) == Some(peer.pod_ifindex)
-        {
+        if read_u32_from_file(&iface_path.join("ifindex")) != Some(peer.host_ifindex) {
+            continue;
+        }
+        if read_u32_from_file(&iface_path.join("iflink")) == Some(peer.pod_ifindex) {
             return Some(iface_name);
         }
+        if ifindex_match.is_none() {
+            ifindex_match = Some(iface_name);
+        }
     }
-    None
+    ifindex_match
 }
 
 #[cfg(target_os = "linux")]
@@ -349,6 +366,24 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn read_pod_peer_ifindex_uses_proc_root_sysfs_view() {
+        let dir = tempdir().unwrap();
+        let net = dir.path().join("123/root/sys/class/net");
+        std::fs::create_dir_all(net.join("eth0")).unwrap();
+        write(&net.join("eth0/ifindex"), "7\n");
+        write(&net.join("eth0/iflink"), "42\n");
+
+        assert_eq!(
+            read_pod_peer_indexes_from_proc_root_at(dir.path(), 123),
+            Some(PodPeerIndexes {
+                pod_ifindex: 7,
+                host_ifindex: 42
+            })
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn resolve_iface_by_peer_uses_host_ifindex_and_reciprocal_iflink() {
         let dir = tempdir().unwrap();
         let net = dir.path();
@@ -374,12 +409,12 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_iface_by_peer_rejects_non_reciprocal_iflink() {
+    fn resolve_iface_by_peer_accepts_unique_host_ifindex_without_reciprocal_iflink() {
         let dir = tempdir().unwrap();
         let net = dir.path();
-        std::fs::create_dir(net.join("eth0")).unwrap();
-        write(&net.join("eth0/ifindex"), "42\n");
-        write(&net.join("eth0/iflink"), "42\n");
+        std::fs::create_dir(net.join("vethabc")).unwrap();
+        write(&net.join("vethabc/ifindex"), "42\n");
+        write(&net.join("vethabc/iflink"), "0\n");
 
         assert_eq!(
             resolve_iface_by_peer_in_sysfs(
@@ -388,8 +423,9 @@ pub(crate) mod tests {
                     pod_ifindex: 7,
                     host_ifindex: 42
                 }
-            ),
-            None
+            )
+            .as_deref(),
+            Some("vethabc")
         );
     }
 
