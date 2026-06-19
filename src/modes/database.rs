@@ -951,11 +951,13 @@ pub async fn run(
                                     "after DB DNS reconnect",
                                     outcome,
                                     &proxy_state_poll,
-                                    &mut known_proxy_ids,
-                                    &mut known_consumer_ids,
-                                    &mut known_plugin_config_ids,
-                                    &mut known_upstream_ids,
-                                    &mut last_poll_at,
+                                    full_reload_poll_state(
+                                        &mut known_proxy_ids,
+                                        &mut known_consumer_ids,
+                                        &mut known_plugin_config_ids,
+                                        &mut known_upstream_ids,
+                                        &mut last_poll_at,
+                                    ),
                                 ) {
                                     force_full_reload = false;
                                     db_available_poll.store(true, Ordering::Relaxed);
@@ -1068,11 +1070,13 @@ pub async fn run(
                                             "full fallback",
                                             outcome,
                                             &proxy_state_poll,
-                                            &mut known_proxy_ids,
-                                            &mut known_consumer_ids,
-                                            &mut known_plugin_config_ids,
-                                            &mut known_upstream_ids,
-                                            &mut last_poll_at,
+                                            full_reload_poll_state(
+                                                &mut known_proxy_ids,
+                                                &mut known_consumer_ids,
+                                                &mut known_plugin_config_ids,
+                                                &mut known_upstream_ids,
+                                                &mut last_poll_at,
+                                            ),
                                         );
                                     }
                                     Err(e2) => {
@@ -1089,11 +1093,13 @@ pub async fn run(
                                                             "failover",
                                                             outcome,
                                                             &proxy_state_poll,
-                                                            &mut known_proxy_ids,
-                                                            &mut known_consumer_ids,
-                                                            &mut known_plugin_config_ids,
-                                                            &mut known_upstream_ids,
-                                                            &mut last_poll_at,
+                                                            full_reload_poll_state(
+                                                                &mut known_proxy_ids,
+                                                                &mut known_consumer_ids,
+                                                                &mut known_plugin_config_ids,
+                                                                &mut known_upstream_ids,
+                                                                &mut last_poll_at,
+                                                            ),
                                                         );
                                                     }
                                                     Err(e3) => {
@@ -1142,11 +1148,13 @@ pub async fn run(
                                     "initial full poll",
                                     outcome,
                                     &proxy_state_poll,
-                                    &mut known_proxy_ids,
-                                    &mut known_consumer_ids,
-                                    &mut known_plugin_config_ids,
-                                    &mut known_upstream_ids,
-                                    &mut last_poll_at,
+                                    full_reload_poll_state(
+                                        &mut known_proxy_ids,
+                                        &mut known_consumer_ids,
+                                        &mut known_plugin_config_ids,
+                                        &mut known_upstream_ids,
+                                        &mut last_poll_at,
+                                    ),
                                 );
                             }
                             Err(e) => {
@@ -1241,46 +1249,61 @@ pub async fn run(
     Ok(())
 }
 
+struct FullReloadPollState<'a> {
+    known_proxy_ids: &'a mut HashSet<String>,
+    known_consumer_ids: &'a mut HashSet<String>,
+    known_plugin_config_ids: &'a mut HashSet<String>,
+    known_upstream_ids: &'a mut HashSet<String>,
+    last_poll_at: &'a mut Option<DateTime<Utc>>,
+}
+
+impl FullReloadPollState<'_> {
+    fn commit_from_proxy_state(self, proxy_state: &ProxyState) {
+        let published_config = proxy_state.current_config();
+        let (
+            next_known_proxy_ids,
+            next_known_consumer_ids,
+            next_known_plugin_config_ids,
+            next_known_upstream_ids,
+        ) = db_backend::extract_known_ids(&published_config);
+        *self.known_proxy_ids = next_known_proxy_ids;
+        *self.known_consumer_ids = next_known_consumer_ids;
+        *self.known_plugin_config_ids = next_known_plugin_config_ids;
+        *self.known_upstream_ids = next_known_upstream_ids;
+        *self.last_poll_at = Some(published_config.loaded_at);
+    }
+}
+
+fn full_reload_poll_state<'a>(
+    known_proxy_ids: &'a mut HashSet<String>,
+    known_consumer_ids: &'a mut HashSet<String>,
+    known_plugin_config_ids: &'a mut HashSet<String>,
+    known_upstream_ids: &'a mut HashSet<String>,
+    last_poll_at: &'a mut Option<DateTime<Utc>>,
+) -> FullReloadPollState<'a> {
+    FullReloadPollState {
+        known_proxy_ids,
+        known_consumer_ids,
+        known_plugin_config_ids,
+        known_upstream_ids,
+        last_poll_at,
+    }
+}
+
 fn commit_full_reload_poll_state(
     context: &str,
     outcome: proxy::ConfigApplyOutcome,
     proxy_state: &ProxyState,
-    known_proxy_ids: &mut HashSet<String>,
-    known_consumer_ids: &mut HashSet<String>,
-    known_plugin_config_ids: &mut HashSet<String>,
-    known_upstream_ids: &mut HashSet<String>,
-    last_poll_at: &mut Option<DateTime<Utc>>,
+    poll_state: FullReloadPollState<'_>,
 ) -> bool {
     match outcome {
         proxy::ConfigApplyOutcome::Applied => {
-            let published_config = proxy_state.current_config();
-            let (
-                next_known_proxy_ids,
-                next_known_consumer_ids,
-                next_known_plugin_config_ids,
-                next_known_upstream_ids,
-            ) = db_backend::extract_known_ids(&published_config);
-            *known_proxy_ids = next_known_proxy_ids;
-            *known_consumer_ids = next_known_consumer_ids;
-            *known_plugin_config_ids = next_known_plugin_config_ids;
-            *known_upstream_ids = next_known_upstream_ids;
-            *last_poll_at = Some(published_config.loaded_at);
+            poll_state.commit_from_proxy_state(proxy_state);
             info!("Configuration applied from database ({})", context);
             true
         }
         proxy::ConfigApplyOutcome::Unchanged => {
-            let published_config = proxy_state.current_config();
-            let (
-                next_known_proxy_ids,
-                next_known_consumer_ids,
-                next_known_plugin_config_ids,
-                next_known_upstream_ids,
-            ) = db_backend::extract_known_ids(&published_config);
-            *known_proxy_ids = next_known_proxy_ids;
-            *known_consumer_ids = next_known_consumer_ids;
-            *known_plugin_config_ids = next_known_plugin_config_ids;
-            *known_upstream_ids = next_known_upstream_ids;
-            *last_poll_at = Some(published_config.loaded_at);
+            poll_state.commit_from_proxy_state(proxy_state);
             debug!("Database configuration valid but unchanged ({})", context);
             true
         }
@@ -1317,8 +1340,8 @@ mod tests {
         state
     }
 
-    #[test]
-    fn full_reload_unchanged_commits_cursor_and_known_ids() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_reload_unchanged_commits_cursor_and_known_ids() {
         let state = empty_proxy_state_for_poll_tests();
         let previous_poll_at = Utc::now() - chrono::Duration::seconds(60);
         let mut last_poll_at = Some(previous_poll_at);
@@ -1332,11 +1355,13 @@ mod tests {
             "test unchanged",
             proxy::ConfigApplyOutcome::Unchanged,
             &state,
-            &mut known_proxy_ids,
-            &mut known_consumer_ids,
-            &mut known_plugin_config_ids,
-            &mut known_upstream_ids,
-            &mut last_poll_at,
+            full_reload_poll_state(
+                &mut known_proxy_ids,
+                &mut known_consumer_ids,
+                &mut known_plugin_config_ids,
+                &mut known_upstream_ids,
+                &mut last_poll_at,
+            ),
         );
 
         assert!(accepted);
@@ -1348,8 +1373,8 @@ mod tests {
         assert_ne!(last_poll_at, Some(previous_poll_at));
     }
 
-    #[test]
-    fn full_reload_rejected_preserves_cursor_and_known_ids() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_reload_rejected_preserves_cursor_and_known_ids() {
         let state = empty_proxy_state_for_poll_tests();
         let previous_poll_at = Utc::now() - chrono::Duration::seconds(60);
         let mut last_poll_at = Some(previous_poll_at);
@@ -1364,11 +1389,13 @@ mod tests {
                 errors: vec!["invalid candidate".to_string()],
             },
             &state,
-            &mut known_proxy_ids,
-            &mut known_consumer_ids,
-            &mut known_plugin_config_ids,
-            &mut known_upstream_ids,
-            &mut last_poll_at,
+            full_reload_poll_state(
+                &mut known_proxy_ids,
+                &mut known_consumer_ids,
+                &mut known_plugin_config_ids,
+                &mut known_upstream_ids,
+                &mut last_poll_at,
+            ),
         );
 
         assert!(!accepted);
